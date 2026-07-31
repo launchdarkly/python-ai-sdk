@@ -13,13 +13,13 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "launchdarkly-ai",
     "launchdarkly-ai-claude-agents",
     "launchdarkly-ai-claude-messages",
     "launchdarkly-ai-langchain-agents",
     "launchdarkly-ai-langchain-messages",
     "launchdarkly-ai-openai-agents",
     "launchdarkly-ai-openai-messages",
+    "launchdarkly-ai-python",
     "launchdarkly-ai-server",
 ]
 
@@ -789,26 +789,6 @@ wheels = [
 ]
 
 [[package]]
-name = "launchdarkly-ai"
-version = "0.0.0"
-source = { editable = "packages/ai" }
-dependencies = [
-    { name = "launchdarkly-ai-server" },
-]
-
-[package.optional-dependencies]
-otel = [
-    { name = "launchdarkly-ai-server", extra = ["otel"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "launchdarkly-ai-server", editable = "packages/client" },
-    { name = "launchdarkly-ai-server", extras = ["otel"], marker = "extra == 'otel'", editable = "packages/client" },
-]
-provides-extras = ["otel"]
-
-[[package]]
 name = "launchdarkly-ai-claude-agents"
 version = "0.0.0"
 source = { editable = "packages/claude-agents" }
@@ -915,6 +895,26 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
 ]
+
+[[package]]
+name = "launchdarkly-ai-python"
+version = "0.0.0"
+source = { editable = "packages/ai" }
+dependencies = [
+    { name = "launchdarkly-ai-server" },
+]
+
+[package.optional-dependencies]
+otel = [
+    { name = "launchdarkly-ai-server", extra = ["otel"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "launchdarkly-ai-server", editable = "packages/client" },
+    { name = "launchdarkly-ai-server", extras = ["otel"], marker = "extra == 'otel'", editable = "packages/client" },
+]
+provides-extras = ["otel"]
 
 [[package]]
 name = "launchdarkly-ai-server"

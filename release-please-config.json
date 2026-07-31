@@ -22,7 +22,7 @@
       "extra-files": [
         "src/launchdarkly_ai/__init__.py"
       ],
-      "component": "launchdarkly-ai"
+      "component": "launchdarkly-ai-python"
     },
     "packages/claude-agents": {
       "release-type": "python",

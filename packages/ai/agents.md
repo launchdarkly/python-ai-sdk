@@ -51,7 +51,7 @@ Install the OTel packages alongside this package:
 ```sh
 pip install "launchdarkly-ai[otel]"
 # or:
-pip install launchdarkly-ai opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+pip install launchdarkly-ai-python opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 ```
 
 Once the OTel packages are installed, spans from all handler packages are automatically collected when `init_client()` runs.
@@ -69,7 +69,7 @@ For OTLP endpoint configuration see the [`launchdarkly-ai-server` agents.md](../
 - **You don't need to call it** — lazy init runs automatically on the first `config().invoke()` call as long as `LD_SDK_KEY` is set.
 - **Call it explicitly** when you need custom `serviceName`/`environment`, a custom OTLP endpoint, or want to pre-warm the connection before the first user request:
   ```python
-  from launchdarkly_ai import init_client
+  from launchdarkly_ai_python import init_client
   await init_client({"serviceName": "my-service", "environment": "production"})
   ```
 - **For BYOC / custom runtimes**, use `launchdarkly-ai-server` directly and pass a pre-initialized client: `await init_client(my_custom_client)`. Do not use this package for custom runtimes — it carries `launchdarkly-server-sdk` as a hard dependency which may conflict.
