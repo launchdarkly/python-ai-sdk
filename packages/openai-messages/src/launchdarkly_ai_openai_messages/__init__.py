@@ -1,4 +1,4 @@
-__version__ = "0.1.0"  # x-release-please-version
+__version__ = "0.0.0"  # x-release-please-version
 
 from .handler import create_openai_messages_handler, openai_messages
 

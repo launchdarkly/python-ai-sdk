@@ -1,4 +1,4 @@
-__version__ = "0.1.0"  # x-release-please-version
+__version__ = "0.0.0"  # x-release-please-version
 
 from .graph import langchain_graph
 from .handler import create_langchain_agents_handler, langchain_agents

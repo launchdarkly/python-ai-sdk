@@ -1,10 +1,10 @@
 {
-  "packages/client": "0.1.0",
-  "packages/ai": "0.1.0",
-  "packages/claude-agents": "0.1.0",
-  "packages/claude-messages": "0.1.0",
-  "packages/openai-agents": "0.1.0",
-  "packages/openai-messages": "0.1.0",
-  "packages/langchain-agents": "0.1.0",
-  "packages/langchain-messages": "0.1.0"
+  "packages/client": "0.0.0",
+  "packages/ai": "0.0.0",
+  "packages/claude-agents": "0.0.0",
+  "packages/claude-messages": "0.0.0",
+  "packages/openai-agents": "0.0.0",
+  "packages/openai-messages": "0.0.0",
+  "packages/langchain-agents": "0.0.0",
+  "packages/langchain-messages": "0.0.0"
 }
