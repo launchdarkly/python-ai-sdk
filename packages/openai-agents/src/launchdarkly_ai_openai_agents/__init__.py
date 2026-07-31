@@ -1,4 +1,4 @@
-__version__ = "0.1.0"  # x-release-please-version
+__version__ = "0.0.0"  # x-release-please-version
 
 from . import native_graph  # noqa: F401
 from .graph import openai_graph

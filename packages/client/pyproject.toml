@@ -1,6 +1,6 @@
 [project]
 name = "launchdarkly-ai-server"
-version = "0.1.0"
+version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = ["opentelemetry-api>=1.25"]
 description = "LaunchDarkly AI SDK core client for Python"
