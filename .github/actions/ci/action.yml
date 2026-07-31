@@ -1,0 +1,34 @@
+name: CI
+description: Install dependencies, lint, and test a workspace package
+
+inputs:
+  workspace_path:
+    description: 'Path to the workspace package'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      shell: bash
+      run: uv sync --all-packages
+
+    - name: Lint
+      shell: bash
+      run: uv run ruff check .
+
+    - name: Format check
+      shell: bash
+      run: uv run ruff format --check .
+
+    - name: Type check
+      shell: bash
+      run: uv run mypy ${{ inputs.workspace_path }}/src
+
+    - name: Test
+      shell: bash
+      run: uv run pytest ${{ inputs.workspace_path }}/tests

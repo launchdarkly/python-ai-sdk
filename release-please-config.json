@@ -1,0 +1,94 @@
+{
+  "include-component-in-tag": true,
+  "bootstrap-sha": "REPLACE_WITH_FIRST_COMMIT_SHA_AFTER_MIGRATION",
+  "packages": {
+    "packages/client": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_server/__init__.py"
+      ],
+      "component": "launchdarkly-ai-server"
+    },
+    "packages/ai": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai/__init__.py"
+      ],
+      "component": "launchdarkly-ai"
+    },
+    "packages/claude-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_claude_agents/__init__.py"
+      ],
+      "component": "launchdarkly-ai-claude-agents"
+    },
+    "packages/claude-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_claude_messages/__init__.py"
+      ],
+      "component": "launchdarkly-ai-claude-messages"
+    },
+    "packages/openai-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_openai_agents/__init__.py"
+      ],
+      "component": "launchdarkly-ai-openai-agents"
+    },
+    "packages/openai-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_openai_messages/__init__.py"
+      ],
+      "component": "launchdarkly-ai-openai-messages"
+    },
+    "packages/langchain-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_langchain_agents/__init__.py"
+      ],
+      "component": "launchdarkly-ai-langchain-agents"
+    },
+    "packages/langchain-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_langchain_messages/__init__.py"
+      ],
+      "component": "launchdarkly-ai-langchain-messages"
+    }
+  }
+}

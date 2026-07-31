@@ -1,0 +1,108 @@
+{
+    "user-123": {
+      "travel_preferences": ["beach", "tropical", "resort"],
+      "leisure_activities": ["swimming", "snorkeling", "beach volleyball", "sunbathing"],
+      "food_preferences": ["seafood", "tropical", "fresh fruit", "cocktails"]
+    },
+    "user-124": {
+      "travel_preferences": ["mountains", "adventure", "outdoor"],
+      "leisure_activities": ["hiking", "rock climbing", "camping", "photography"],
+      "food_preferences": ["organic", "local cuisine", "trail mix", "energy bars"]
+    },
+    "user-125": {
+      "travel_preferences": ["urban", "city", "cultural"],
+      "leisure_activities": ["museums", "art galleries", "theater", "shopping"],
+      "food_preferences": ["fine dining", "wine", "french", "italian"]
+    },
+    "user-126": {
+      "travel_preferences": ["historical", "architectural", "european"],
+      "leisure_activities": ["walking tours", "historical sites", "photography", "cafes"],
+      "food_preferences": ["pastries", "coffee", "mediterranean", "tapas"]
+    },
+    "user-127": {
+      "travel_preferences": ["nature", "wildlife", "safari"],
+      "leisure_activities": ["wildlife watching", "photography", "bird watching", "nature walks"],
+      "food_preferences": ["local cuisine", "grilled", "fresh vegetables", "exotic fruits"]
+    },
+    "user-128": {
+      "travel_preferences": ["skiing", "winter sports", "alpine"],
+      "leisure_activities": ["skiing", "snowboarding", "ice skating", "après-ski"],
+      "food_preferences": ["comfort food", "hot chocolate", "swiss", "fondue"]
+    },
+    "user-129": {
+      "travel_preferences": ["spiritual", "wellness", "retreat"],
+      "leisure_activities": ["yoga", "meditation", "spa", "nature walks"],
+      "food_preferences": ["vegetarian", "vegan", "organic", "juice cleanses"]
+    },
+    "user-130": {
+      "travel_preferences": ["nightlife", "entertainment", "urban"],
+      "leisure_activities": ["clubbing", "live music", "bars", "dancing"],
+      "food_preferences": ["street food", "late night dining", "asian fusion", "cocktails"]
+    },
+    "user-131": {
+      "travel_preferences": ["family-friendly", "theme parks", "resort"],
+      "leisure_activities": ["theme parks", "water parks", "mini golf", "arcade"],
+      "food_preferences": ["kid-friendly", "pizza", "burgers", "ice cream"]
+    },
+    "user-132": {
+      "travel_preferences": ["romantic", "secluded", "luxury"],
+      "leisure_activities": ["couples spa", "sunset watching", "private dining", "beach walks"],
+      "food_preferences": ["romantic dining", "wine", "chocolate", "fine dining"]
+    },
+    "user-133": {
+      "travel_preferences": ["backpacking", "budget", "hostels"],
+      "leisure_activities": ["hiking", "meeting locals", "street markets", "free walking tours"],
+      "food_preferences": ["street food", "local markets", "budget-friendly", "authentic local"]
+    },
+    "user-134": {
+      "travel_preferences": ["business", "conferences", "urban"],
+      "leisure_activities": ["networking", "business centers", "gyms", "fine dining"],
+      "food_preferences": ["business lunches", "steak", "sushi", "wine"]
+    },
+    "user-135": {
+      "travel_preferences": ["adventure", "extreme sports", "outdoor"],
+      "leisure_activities": ["bungee jumping", "paragliding", "white water rafting", "zip-lining"],
+      "food_preferences": ["high energy", "protein-rich", "local", "hearty meals"]
+    },
+    "user-136": {
+      "travel_preferences": ["culinary", "food tours", "local markets"],
+      "leisure_activities": ["cooking classes", "food tours", "market visits", "wine tasting"],
+      "food_preferences": ["gourmet", "local specialties", "street food", "fine dining"]
+    },
+    "user-137": {
+      "travel_preferences": ["beach", "relaxation", "all-inclusive"],
+      "leisure_activities": ["beach lounging", "pool", "massage", "reading"],
+      "food_preferences": ["buffet", "tropical", "seafood", "cocktails"]
+    },
+    "user-138": {
+      "travel_preferences": ["photography", "scenic", "landscapes"],
+      "leisure_activities": ["photography", "sunrise/sunset watching", "scenic drives", "nature walks"],
+      "food_preferences": ["picnic", "local", "fresh", "light meals"]
+    },
+    "user-139": {
+      "travel_preferences": ["festivals", "events", "cultural"],
+      "leisure_activities": ["music festivals", "cultural events", "street performances", "local celebrations"],
+      "food_preferences": ["festival food", "local specialties", "street vendors", "traditional"]
+    },
+    "user-140": {
+      "travel_preferences": ["luxury", "exclusive", "private"],
+      "leisure_activities": ["private tours", "luxury spa", "yacht", "helicopter tours"],
+      "food_preferences": ["michelin star", "fine dining", "wine pairings", "gourmet"]
+    },
+    "user-141": {
+      "travel_preferences": ["eco-tourism", "sustainable", "nature"],
+      "leisure_activities": ["eco-tours", "wildlife conservation", "hiking", "bird watching"],
+      "food_preferences": ["organic", "local", "sustainable", "plant-based"]
+    },
+    "user-142": {
+      "travel_preferences": ["sports", "stadiums", "events"],
+      "leisure_activities": ["sports events", "stadium tours", "sports bars", "fan zones"],
+      "food_preferences": ["stadium food", "beer", "wings", "nachos"]
+    },
+    "user-143": {
+      "travel_preferences": ["cruise", "islands", "tropical"],
+      "leisure_activities": ["cruise activities", "shore excursions", "swimming", "entertainment"],
+      "food_preferences": ["buffet", "seafood", "international", "desserts"]
+    }
+  }
+  

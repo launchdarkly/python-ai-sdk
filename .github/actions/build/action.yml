@@ -1,0 +1,22 @@
+name: Build
+description: Build a workspace package
+
+inputs:
+  workspace_path:
+    description: 'Path to the workspace package'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      shell: bash
+      run: uv sync --all-packages
+
+    - name: Build
+      shell: bash
+      run: cd ${{ inputs.workspace_path }} && uv build --out-dir dist

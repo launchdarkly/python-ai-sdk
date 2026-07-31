@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.cursor/
+
+# Logs
+*.log
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Test cache
+.pytest_cache/
+
+# Run output / scratch
+tmp/
+output/
+
+.claude/

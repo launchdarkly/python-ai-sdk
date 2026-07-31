@@ -1,0 +1,67 @@
+[tool.agents]
+instructions = "AGENTS.md"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+launchdarkly-ai-server = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pytest-mock>=3",
+  "mypy>=1.10",
+  "opentelemetry-sdk>=1.25",
+  "python-dotenv>=1.2.2",
+  "claude-agent-sdk>=0.2.110",
+  "opentelemetry-exporter-otlp-proto-http>=1.43.0",
+  "launchdarkly-server-sdk>=9.0",
+  "langchain-openai>=0.3",
+  "langchain-anthropic>=1.4.8",
+  "ruff>=0.15.20",
+  "pre-commit>=4.6.0",
+  "brotlicffi>=1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "--import-mode=importlib"
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "UP",  # pyupgrade
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "RUF", # ruff-specific rules
+]
+ignore = [
+  "E501",                  # line too long — handled by the formatter where possible
+  "RUF001", "RUF002", "RUF003",  # ambiguous unicode in strings/docstrings/comments — intentional
+  "UP046",                 # Generic[T] → PEP 695 syntax — deliberate migration
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "launchdarkly_ai",
+  "launchdarkly_ai_server",
+  "launchdarkly_ai_claude_agents",
+  "launchdarkly_ai_claude_messages",
+  "launchdarkly_ai_langchain_agents",
+  "launchdarkly_ai_langchain_messages",
+  "launchdarkly_ai_openai_agents",
+  "launchdarkly_ai_openai_messages",
+]
