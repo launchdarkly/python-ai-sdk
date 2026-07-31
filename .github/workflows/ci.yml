@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # ─── Lint & format ──────────────────────────────────────────────────────────
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-packages
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  # ─── Setup ──────────────────────────────────────────────────────────────────
+  setup:
+    name: Install & sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-packages
+
+  # ─── Type check ─────────────────────────────────────────────────────────────
+  typecheck:
+    name: Type check
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-packages
+      - run: uv run mypy packages/*/src
+
+  # ─── Test ───────────────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-packages
+      - run: uv run pytest packages/*/tests
+
+  # ─── Build ────────────────────────────────────────────────────────────────
+  build:
+    name: Build all packages
+    needs: [lint, typecheck, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-packages
+      - name: Build all packages
+        run: |
+          for pkg in packages/*/; do
+            echo "Building $pkg..."
+            (cd "$pkg" && uv build --out-dir dist)
+          done

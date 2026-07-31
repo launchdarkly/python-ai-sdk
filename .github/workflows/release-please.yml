@@ -1,0 +1,337 @@
+# This workflow handles both automated and manual package publishing:
+#
+# AUTOMATED PUBLISHING (on push to main):
+#   - Triggered automatically when changes are pushed to the main branch
+#   - Uses release-please to create releases based on conventional commits
+#   - Publishes packages to PyPI automatically when release PRs are merged
+#
+# MANUAL PUBLISHING (via workflow_dispatch):
+#   - Can be triggered manually from the Actions tab
+#   - Allows publishing a specific package to PyPI
+#   - Supports dry-run mode
+#
+name: release-please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      workspace_path:
+        description: 'The workspace to publish'
+        required: true
+        default: 'packages/client'
+        type: choice
+        options:
+          - packages/client
+          - packages/ai
+          - packages/claude-agents
+          - packages/claude-messages
+          - packages/openai-agents
+          - packages/openai-messages
+          - packages/langchain-agents
+          - packages/langchain-messages
+      dry_run:
+        description: 'Is this a dry run. If so no package will be published.'
+        type: boolean
+        required: true
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    if: github.event_name == 'push'
+    outputs:
+      package-client-released: ${{ steps.release.outputs['packages/client--release_created'] }}
+      package-client-tag-name: ${{ steps.release.outputs['packages/client--tag_name'] }}
+      package-ai-released: ${{ steps.release.outputs['packages/ai--release_created'] }}
+      package-ai-tag-name: ${{ steps.release.outputs['packages/ai--tag_name'] }}
+      package-claude-agents-released: ${{ steps.release.outputs['packages/claude-agents--release_created'] }}
+      package-claude-agents-tag-name: ${{ steps.release.outputs['packages/claude-agents--tag_name'] }}
+      package-claude-messages-released: ${{ steps.release.outputs['packages/claude-messages--release_created'] }}
+      package-claude-messages-tag-name: ${{ steps.release.outputs['packages/claude-messages--tag_name'] }}
+      package-openai-agents-released: ${{ steps.release.outputs['packages/openai-agents--release_created'] }}
+      package-openai-agents-tag-name: ${{ steps.release.outputs['packages/openai-agents--tag_name'] }}
+      package-openai-messages-released: ${{ steps.release.outputs['packages/openai-messages--release_created'] }}
+      package-openai-messages-tag-name: ${{ steps.release.outputs['packages/openai-messages--tag_name'] }}
+      package-langchain-agents-released: ${{ steps.release.outputs['packages/langchain-agents--release_created'] }}
+      package-langchain-agents-tag-name: ${{ steps.release.outputs['packages/langchain-agents--tag_name'] }}
+      package-langchain-messages-released: ${{ steps.release.outputs['packages/langchain-messages--release_created'] }}
+      package-langchain-messages-tag-name: ${{ steps.release.outputs['packages/langchain-messages--tag_name'] }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+
+  # --- Per-package publish jobs ---
+
+  release-client:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-client-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/client
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/client
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/client/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/client/dist/
+
+  release-ai:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-ai-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/ai
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/ai
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/ai/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/ai/dist/
+
+  release-claude-agents:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-claude-agents-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/claude-agents
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/claude-agents
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/claude-agents/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/claude-agents/dist/
+
+  release-claude-messages:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-claude-messages-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/claude-messages
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/claude-messages
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/claude-messages/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/claude-messages/dist/
+
+  release-openai-agents:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-openai-agents-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/openai-agents
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/openai-agents
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/openai-agents/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/openai-agents/dist/
+
+  release-openai-messages:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-openai-messages-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/openai-messages
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/openai-messages
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/openai-messages/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/openai-messages/dist/
+
+  release-langchain-agents:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-langchain-agents-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/langchain-agents
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/langchain-agents
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/langchain-agents/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/langchain-agents/dist/
+
+  release-langchain-messages:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-langchain-messages-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/langchain-messages
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/langchain-messages
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/langchain-messages/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/langchain-messages/dist/
+
+  # --- Manual publish ---
+
+  manual-publish:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: ${{ inputs.workspace_path }}
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: ${{ inputs.workspace_path }}
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        if: ${{ format('{0}', inputs.dry_run) != 'true' }}
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        if: ${{ format('{0}', inputs.dry_run) != 'true' }}
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: ${{ inputs.workspace_path }}/dist/
