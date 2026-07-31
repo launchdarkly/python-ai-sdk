@@ -18,6 +18,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - run: uv lock
       - run: uv sync --all-packages
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -31,6 +32,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - run: uv lock
       - run: uv sync --all-packages
 
   # ─── Type check ─────────────────────────────────────────────────────────────
@@ -43,6 +45,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - run: uv lock
       - run: uv sync --all-packages
       - run: uv run mypy packages/*/src
 
@@ -56,6 +59,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - run: uv lock
       - run: uv sync --all-packages
       - run: uv run pytest packages/*/tests
 
@@ -69,6 +73,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+      - run: uv lock
       - run: uv sync --all-packages
       - name: Build all packages
         run: |

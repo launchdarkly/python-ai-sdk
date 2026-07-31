@@ -13,6 +13,10 @@ runs:
       with:
         python-version: "3.12"
 
+    - name: Resolve lock file
+      shell: bash
+      run: uv lock
+
     - name: Install dependencies
       shell: bash
       run: uv sync --all-packages
