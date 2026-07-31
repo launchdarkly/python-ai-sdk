@@ -160,7 +160,7 @@ Span names and attributes are described in [Implementation Details → Telemetry
 
 - **Pass custom options** — `serviceName`, `environment`, or OTel configuration:
   ```python
-  from launchdarkly_ai import init_client  # or launchdarkly_ai_server
+  from launchdarkly_ai_python import init_client  # or launchdarkly_ai_server
   await init_client({"serviceName": "my-service", "environment": "production"})
   ```
 - **Use a custom or edge runtime (BYOC path)** — pass a pre-initialized client that satisfies `LDClientInterface`:

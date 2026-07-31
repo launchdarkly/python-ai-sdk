@@ -40,7 +40,7 @@ python-ai-sdk/
 │   └── utils.py         # Shared helpers (new_context, write_output)
 ├── packages/
 │   ├── client/          # launchdarkly-ai-server       — core client (Tier 0)
-│   ├── ai/              # launchdarkly-ai              — convenience barrel re-export
+│   ├── ai/              # launchdarkly-ai-python        — convenience barrel re-export
 │   ├── claude-agents/   # launchdarkly-ai-claude-agents
 │   ├── claude-messages/ # launchdarkly-ai-claude-messages
 │   ├── openai-agents/   # launchdarkly-ai-openai-agents
@@ -95,7 +95,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 ### 1. Install
 
 ```bash
-pip install launchdarkly-ai launchdarkly-ai-openai-messages
+pip install launchdarkly-ai-python launchdarkly-ai-openai-messages
 ```
 
 `launchdarkly-ai` is a thin barrel that re-exports all of `launchdarkly-ai-server`. `init_client()` auto-discovers `launchdarkly-server-sdk` at runtime — no extra setup required.

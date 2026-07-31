@@ -56,7 +56,7 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = [
-  "launchdarkly_ai",
+  "launchdarkly_ai_python",
   "launchdarkly_ai_server",
   "launchdarkly_ai_claude_agents",
   "launchdarkly_ai_claude_messages",
