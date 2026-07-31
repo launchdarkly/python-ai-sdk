@@ -1,6 +1,6 @@
 {
   "include-component-in-tag": true,
-  "bootstrap-sha": "1cfbf4259aa3e75f4c30a0594636b889626eb6a6",
+  "bootstrap-sha": "7a6f4208a4551adbef530a3e1eeee1ae49671e93",
   "packages": {
     "packages/client": {
       "release-type": "python",
