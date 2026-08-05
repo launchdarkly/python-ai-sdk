@@ -1,6 +1,6 @@
 [project]
 name = "launchdarkly-ai-python"
-version = "0.1.0"
+version = "0.1.1"
 requires-python = ">=3.12"
 dependencies = ["launchdarkly-ai-server"]
 description = "LaunchDarkly AI SDK for Python — convenience barrel re-export"
