@@ -43,6 +43,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      id-token: write
     if: github.event_name == 'push'
     outputs:
       package-client-released: ${{ steps.release.outputs['packages/client--release_created'] }}
