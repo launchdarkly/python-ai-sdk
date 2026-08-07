@@ -1,4 +1,4 @@
-"""LaunchDarkly AI SDK integration for LangChain messages."""
+"""LaunchDarkly AI SDK - integration for LangChain messages."""
 
 __version__ = "0.1.3"  # x-release-please-version
 

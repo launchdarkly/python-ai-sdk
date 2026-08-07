@@ -1,4 +1,4 @@
-"""LaunchDarkly AI SDK convenience package for Python."""
+"""LaunchDarkly AI SDK - convenience package for Python."""
 
 __version__ = "0.1.2"  # x-release-please-version
 
