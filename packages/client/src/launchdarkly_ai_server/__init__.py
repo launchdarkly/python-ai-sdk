@@ -1,4 +1,4 @@
-"""LaunchDarkly AI SDK core client for Python."""
+"""LaunchDarkly AI SDK - core client for Python."""
 
 __version__ = "0.1.2"  # x-release-please-version
 
