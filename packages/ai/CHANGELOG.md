@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.1...launchdarkly-ai-python-0.1.2) (2026-08-07)
+
+
+### Features
+
+* initial commit — LaunchDarkly AI SDK for Python ([0c74677](https://github.com/launchdarkly/python-ai-sdk/commit/0c7467797a86b3346631c1289941df0f6ac6595b))
+* initial commit — LaunchDarkly AI SDK for Python ([#1](https://github.com/launchdarkly/python-ai-sdk/issues/1)) ([1cfbf42](https://github.com/launchdarkly/python-ai-sdk/commit/1cfbf4259aa3e75f4c30a0594636b889626eb6a6))
+
+
+### Bug Fixes
+
+* add module docstring to ai package ([c916e7a](https://github.com/launchdarkly/python-ai-sdk/commit/c916e7aa8db24e4cf0d04347eb1ce288d602f9f2))
+* add module docstring to ai package ([#19](https://github.com/launchdarkly/python-ai-sdk/issues/19)) ([47fd243](https://github.com/launchdarkly/python-ai-sdk/commit/47fd24361596f7828f06179b2be275b28619469e))
+
 ## 0.1.0 (2026-07-31)
 
 

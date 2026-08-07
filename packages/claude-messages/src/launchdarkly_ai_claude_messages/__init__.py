@@ -1,4 +1,4 @@
-__version__ = "0.1.1"  # x-release-please-version
+__version__ = "0.1.2"  # x-release-please-version
 
 from .handler import claude_messages, create_claude_messages_handler
 
