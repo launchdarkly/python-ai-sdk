@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-messages-0.1.1...launchdarkly-ai-claude-messages-0.1.2) (2026-08-07)
+
+
+### Features
+
+* initial commit — LaunchDarkly AI SDK for Python ([0c74677](https://github.com/launchdarkly/python-ai-sdk/commit/0c7467797a86b3346631c1289941df0f6ac6595b))
+* initial commit — LaunchDarkly AI SDK for Python ([#1](https://github.com/launchdarkly/python-ai-sdk/issues/1)) ([1cfbf42](https://github.com/launchdarkly/python-ai-sdk/commit/1cfbf4259aa3e75f4c30a0594636b889626eb6a6))
+
 ## 0.1.0 (2026-07-31)
 
 
