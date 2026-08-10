@@ -13,8 +13,11 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    compose_history,
     config,
+    content_to_text,
     create_handler,
+    image_block_to_url,
     parse_template,
     set_ld_span_attributes,
     set_openllmetry_completion,
@@ -64,15 +67,40 @@ def _build_agent_tools(
     return result
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
+def _parse_message_content(content: Any, variables: dict[str, Any]) -> Any:
+    """Apply templates to text content while preserving structured blocks."""
+    return parse_template(content, variables) if isinstance(content, str) else content
+
+
+def _to_openai_agent_items(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map LaunchDarkly canonical turns to OpenAI Agents input items."""
+    items: list[dict[str, Any]] = []
+    for turn in turns:
+        role = turn["role"]
+        content = turn["content"]
+        if role == "assistant":
+            items.append({"role": "assistant", "content": content_to_text(content)})
+            continue
+
+        blocks = (
+            content
+            if isinstance(content, list)
+            else [{"type": "text", "text": content}]
+        )
+        parts: list[dict[str, Any]] = []
+        for block in blocks:
+            if block.get("type") == "image":
+                parts.append(
+                    {"type": "input_image", "image_url": image_block_to_url(block)}
+                )
+            elif block.get("type") == "text":
+                parts.append({"type": "input_text", "text": block.get("text", "")})
+        items.append({"role": "user", "content": parts})
+    return items
+
+
+def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
+    return prompt if isinstance(prompt, str) else json.dumps(prompt)
 
 
 def _build_agent_and_prompt(
@@ -81,7 +109,7 @@ def _build_agent_and_prompt(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
-) -> tuple[Any, str, str | None]:
+) -> tuple[Any, str | list[dict[str, Any]], str | None]:
     import importlib
 
     agents_mod = importlib.import_module("agents")
@@ -89,27 +117,38 @@ def _build_agent_and_prompt(
 
     safe_input = user_input or ""
     instructions: str | None = None
-    prompt = safe_input
+    prompt: str | list[dict[str, Any]] = safe_input
+
+    config_messages = config.get("messages") or []
+    parsed_messages = [
+        {
+            **message,
+            "content": _parse_message_content(message.get("content", ""), variables),
+        }
+        for message in config_messages
+    ]
 
     if config.get("instructions"):
         instructions = parse_template(config["instructions"], variables)
-    elif config.get("messages"):
-        system_msgs = [m for m in config["messages"] if m.get("role") == "system"]
-        conv_msgs = [m for m in config["messages"] if m.get("role") != "system"]
+    elif parsed_messages:
+        system_msgs = [m for m in parsed_messages if m.get("role") == "system"]
+        conv_msgs = [m for m in parsed_messages if m.get("role") != "system"]
         if system_msgs:
-            instructions = parse_template(
-                "\n".join(m["content"] for m in system_msgs), variables
-            )
-        conv_history = "\n".join(
-            parse_template(m["content"], variables) for m in conv_msgs
-        )
+            instructions = "\n".join(content_to_text(m["content"]) for m in system_msgs)
+        conv_history = "\n".join(content_to_text(m["content"]) for m in conv_msgs)
         prompt = f"{conv_history}\n\n{safe_input}" if conv_history else safe_input
 
-    history_text = _format_history(history)
-    if history_text:
-        instructions = (
-            f"{instructions}\n\n{history_text}" if instructions else history_text
+    if history:
+        turns = compose_history(
+            history=history,
+            user_input=user_input,
+            config_messages=[
+                message
+                for message in parsed_messages
+                if message.get("role") != "system"
+            ],
         )
+        prompt = _to_openai_agent_items(turns)
 
     tools = _build_agent_tools(config.get("tools") or {}, tool_handlers)
 
@@ -176,14 +215,15 @@ def create_openai_agent_handler() -> ProviderHandler:
         )
 
         if span:
+            serialized_prompt = _prompt_to_text(prompt)
             prompt_text = (
                 f"system: {instructions}\n\n" if instructions else ""
-            ) + prompt
+            ) + serialized_prompt
             span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
             prompt_msgs: list[dict[str, str]] = []
             if instructions:
                 prompt_msgs.append({"role": "system", "content": instructions})
-            prompt_msgs.append({"role": "user", "content": prompt})
+            prompt_msgs.append({"role": "user", "content": serialized_prompt})
             set_openllmetry_prompt(span, prompt_msgs)
 
         try:
@@ -274,12 +314,15 @@ async def _stream_gen(
     )
 
     if span:
-        prompt_text = (f"system: {instructions}\n\n" if instructions else "") + prompt
+        serialized_prompt = _prompt_to_text(prompt)
+        prompt_text = (
+            f"system: {instructions}\n\n" if instructions else ""
+        ) + serialized_prompt
         span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
         prompt_msgs: list[dict[str, str]] = []
         if instructions:
             prompt_msgs.append({"role": "system", "content": instructions})
-        prompt_msgs.append({"role": "user", "content": prompt})
+        prompt_msgs.append({"role": "user", "content": serialized_prompt})
         set_openllmetry_prompt(span, prompt_msgs)
 
     try:

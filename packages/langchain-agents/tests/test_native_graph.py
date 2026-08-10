@@ -5,6 +5,7 @@ Reference: TESTING.md §2.2, §2.x.3
 
 from __future__ import annotations
 
+import json
 import sys
 from contextlib import contextmanager
 from typing import Any
@@ -186,6 +187,38 @@ def _make_langgraph_mocks(ai_msg: Any) -> dict[str, Any]:
         "_edges": edges_added,
         "_chat_model": mock_chat_model,
     }
+
+
+def _capture_compiled_state(mocks: dict[str, Any], ai_msg: Any) -> list[dict[str, Any]]:
+    """Swaps in a StateGraph whose compiled graph records the state it is invoked
+    with, so a test can assert on the root's initial messages."""
+    states: list[dict[str, Any]] = []
+
+    class _CapturingStateGraph:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def add_node(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def add_edge(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def add_conditional_edges(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def compile(self) -> Any:
+            compiled = MagicMock()
+
+            async def _ainvoke(state: dict[str, Any]) -> Any:
+                states.append(state)
+                return {"messages": [ai_msg]}
+
+            compiled.ainvoke = _ainvoke
+            return compiled
+
+    mocks["langgraph.graph"].StateGraph = _CapturingStateGraph
+    return states
 
 
 @contextmanager
@@ -691,6 +724,54 @@ class TestToLangGraphLangChainSpecific:
         ]
         assert system_msgs, "No SystemMessage found"
         assert "expert" in system_msgs[0].content
+
+    @pytest.mark.asyncio
+    async def test_no_history_seeds_root_with_plain_human_message(self) -> None:
+        ai_msg = _make_ai_msg()
+        mocks = _make_langgraph_mocks(ai_msg)
+        states = _capture_compiled_state(mocks, ai_msg)
+        graph_def = _make_graph_def()
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        messages = states[0]["messages"]
+        assert len(messages) == 1
+        assert messages[0].content == "hi"
+
+    @pytest.mark.asyncio
+    async def test_history_seeds_root_with_native_image_content(self) -> None:
+        """A multimodal history reaches the root as LangChain image content."""
+        ai_msg = _make_ai_msg()
+        mocks = _make_langgraph_mocks(ai_msg)
+        states = _capture_compiled_state(mocks, ai_msg)
+        graph_def = _make_graph_def()
+
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke(
+                "describe", {}, history
+            )
+
+        serialized = json.dumps([m.content for m in states[0]["messages"]])
+        assert "image_url" in serialized or '"type": "image"' in serialized
+        assert "abc123" in serialized
+        assert "describe" in serialized
 
     @pytest.mark.asyncio
     async def test_config_tools_creates_tool_node(self) -> None:

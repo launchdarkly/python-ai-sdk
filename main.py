@@ -9,6 +9,7 @@ Examples:
     python main.py streaming                launch-darkly-documentation-summarizer "Summarise feature flags in 3 bullets"
     python main.py judge                    launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py graph                    my-agent-graph "What is the LaunchDarkly AI SDK?"
+    python main.py graph-history            my-agent-graph ""
     python main.py openai-only              my-openai-flag "Tell me about feature flags"
     python main.py langchain                my-langchain-flag "Tell me about feature flags"
     python main.py claude-agents            launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
@@ -43,6 +44,7 @@ EXAMPLES: dict[str, str] = {
     "agent": "examples.agent",
     "streaming": "examples.streaming",
     "graph": "examples.graph_example",
+    "graph-history": "examples.graph_history",
     "history": "examples.history",
     "judge": "examples.judge_example",
     "claude-agents": "examples.claude_agents_example",

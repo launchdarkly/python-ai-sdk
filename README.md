@@ -541,6 +541,7 @@ uv run python main.py [example] [flag-key] [user-input]
 | --- | --- | --- |
 | `agent` *(default)* | `uv run python main.py agent` | `config()` via the global registry — switches providers without code changes |
 | `graph` | `uv run python main.py graph` | `graph()` multi-agent workflow driven by a LaunchDarkly agent graph flag |
+| `graph-history` | `uv run python main.py graph-history` | `graph().invoke()` with multimodal `history` forwarded to the root node |
 | `openai-only` | `uv run python main.py openai-only` | `config()` with a custom `Registry` restricted to OpenAI handlers |
 | `streaming` | `uv run python main.py streaming` | `config().stream()` — token-by-token output |
 

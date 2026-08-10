@@ -9,8 +9,12 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    compose_history,
     config,
+    content_to_text,
     create_handler,
+    image_block_to_url,
+    is_content_blocks,
     parse_template,
     set_ld_span_attributes,
     set_openllmetry_completion,
@@ -41,34 +45,75 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _build_input_messages(
     config: AiConfigRep,
-    user_input: str,
+    user_input: str | None,
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    system_messages: list[dict[str, Any]] = []
+    config_messages: list[dict[str, Any]] = []
+
     if config.get("messages"):
-        msgs = [
-            {"role": m["role"], "content": parse_template(m["content"], variables)}
-            for m in config["messages"]
-        ]
-        if history:
-            for msg in history:
-                role = msg.get("role", "user")
-                if role in ("user", "assistant"):
-                    msgs.append({"role": role, "content": msg.get("content", "")})
-        if user_input and (not msgs or msgs[-1].get("role") != "user"):
-            msgs.append({"role": "user", "content": user_input})
-        return msgs
-    instructions = parse_template(config.get("instructions") or "", variables)
-    result: list[dict[str, Any]] = []
-    if instructions:
-        result.append({"role": "system", "content": instructions})
-    if history:
-        for msg in history:
-            role = msg.get("role", "user")
-            if role in ("user", "assistant"):
-                result.append({"role": role, "content": msg.get("content", "")})
-    result.append({"role": "user", "content": user_input or ""})
-    return result
+        for message in config["messages"]:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                content = parse_template(content, variables)
+            mapped = {"role": message["role"], "content": content}
+            if message["role"] == "system":
+                system_messages.append(mapped)
+            else:
+                config_messages.append(mapped)
+    else:
+        instructions = parse_template(config.get("instructions") or "", variables)
+        if instructions:
+            system_messages.append({"role": "system", "content": instructions})
+
+    turns = compose_history(
+        history=history or [],
+        user_input=user_input,
+        config_messages=config_messages,
+    )
+    return system_messages + [
+        {"role": turn["role"], "content": _map_message_content(turn)}
+        for turn in turns
+        if turn.get("role") in ("user", "assistant")
+    ]
+
+
+def _map_message_content(message: dict[str, Any]) -> Any:
+    raw_content = message.get("content")
+    content: str | list[dict[str, Any]] = (
+        raw_content if isinstance(raw_content, (str, list)) else ""
+    )
+    if not is_content_blocks(content):
+        return content
+    assert isinstance(content, list)
+
+    if message.get("role") != "user":
+        return content_to_text(content)
+
+    parts: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            parts.append({"type": "input_text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            parts.append(
+                {"type": "input_image", "image_url": image_block_to_url(block)}
+            )
+    return parts
+
+
+def _telemetry_messages(
+    input_messages: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "role": message["role"],
+            "content": message["content"]
+            if isinstance(message["content"], str)
+            else json.dumps(message["content"]),
+        }
+        for message in input_messages
+    ]
 
 
 def _is_coroutine(fn: Any) -> bool:
@@ -120,7 +165,7 @@ def create_openai_messages_handler() -> ProviderHandler:
             )
             set_openllmetry_prompt(
                 span,
-                [{"role": m["role"], "content": m["content"]} for m in input_messages],
+                _telemetry_messages(input_messages),
             )
 
         try:
@@ -268,7 +313,8 @@ async def _stream_gen(
             "gen_ai.content.prompt", {"gen_ai.prompt": json.dumps(input_messages)}
         )
         set_openllmetry_prompt(
-            span, [{"role": m["role"], "content": m["content"]} for m in input_messages]
+            span,
+            _telemetry_messages(input_messages),
         )
 
     total_input = 0

@@ -13,13 +13,17 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    compose_history,
     config,
+    content_to_text,
     create_handler,
     parse_template,
     set_ld_span_attributes,
     set_openllmetry_completion,
     set_openllmetry_prompt,
 )
+
+from .messages import to_lang_chain_messages
 
 try:
     from opentelemetry import trace
@@ -60,47 +64,61 @@ def _build_agent_tools(
     return result
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
-
-
 def _extract_system_prompt(
     config: AiConfigRep,
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
 ) -> str | None:
-    system_prompt: str | None = None
+    """The system prompt, from ``instructions`` or the system-role config messages.
+
+    ``history`` is accepted so callers can pass it uniformly, but it never
+    reaches the system prompt: history is conversation, and it goes through the
+    structured message path in ``_build_initial_messages`` (TESTING.md §1.11).
+    """
     if config.get("instructions"):
-        system_prompt = parse_template(config["instructions"], variables)
-    elif config.get("messages"):
+        return parse_template(config["instructions"], variables)
+    if config.get("messages"):
         sys_msgs = [m for m in config["messages"] if m.get("role") == "system"]
         if sys_msgs:
-            system_prompt = parse_template(
-                "\n".join(m["content"] for m in sys_msgs), variables
-            )
+            return parse_template("\n".join(m["content"] for m in sys_msgs), variables)
+    return None
 
-    history_text = _format_history(history)
-    if history_text:
-        system_prompt = (
-            f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
-        )
 
-    return system_prompt
+def _config_conversation_turns(
+    config: AiConfigRep,
+    variables: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Non-system config conversation messages, template-applied, in canonical form."""
+    return [
+        {"role": m["role"], "content": parse_template(m["content"], variables)}
+        for m in (config.get("messages") or [])
+        if m.get("role") != "system"
+    ]
 
 
 def _build_initial_messages(
     config: AiConfigRep,
-    user_input: str,
+    user_input: str | None,
     variables: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
 ) -> list[Any]:
     import importlib
+
+    # With history, the whole conversation is composed as LangChain messages —
+    # the framework's native input path. `config.instructions` / system messages
+    # stay on the system prompt; history never becomes system-prompt text.
+    if history:
+        return to_lang_chain_messages(
+            compose_history(
+                history=history,
+                user_input=user_input,
+                config_messages=(
+                    []
+                    if config.get("instructions")
+                    else _config_conversation_turns(config, variables)
+                ),
+            )
+        )
 
     msgs_mod = importlib.import_module("langchain_core.messages")
     HumanMessage = msgs_mod.HumanMessage
@@ -108,19 +126,54 @@ def _build_initial_messages(
 
     messages: list[Any] = []
     last_role: str | None = None
-    if config.get("messages"):
-        for msg in config["messages"]:
-            if msg.get("role") == "system":
-                continue
-            content = parse_template(msg["content"], variables)
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content))
-            else:
-                messages.append(AIMessage(content))
-            last_role = msg["role"]
+    for msg in _config_conversation_turns(config, variables):
+        if msg["role"] == "user":
+            messages.append(HumanMessage(msg["content"]))
+        else:
+            messages.append(AIMessage(msg["content"]))
+        last_role = msg["role"]
     if last_role != "user":
         messages.append(HumanMessage(user_input or ""))
     return messages
+
+
+def _message_text(message: Any) -> str:
+    """Span-safe text for a message. Multimodal content contributes only its text
+    parts, so an image never lands in a span attribute as a base64 payload."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str | list):
+        return content_to_text(content)
+    return str(content)
+
+
+def _record_prompt(
+    span: Any,
+    system_prompt: str | None,
+    messages: list[Any],
+) -> None:
+    prompt_text = "\n".join(
+        [
+            *(["system: " + system_prompt] if system_prompt else []),
+            *[
+                f"{getattr(m, 'type', type(m).__name__)}: {_message_text(m)}"
+                for m in messages
+            ],
+        ]
+    )
+    span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
+    prompt_msgs: list[dict[str, str]] = []
+    if system_prompt:
+        prompt_msgs.append({"role": "system", "content": system_prompt})
+    prompt_msgs.extend(
+        [
+            {
+                "role": getattr(m, "type", type(m).__name__),
+                "content": _message_text(m),
+            }
+            for m in messages
+        ]
+    )
+    set_openllmetry_prompt(span, prompt_msgs)
 
 
 def _make_default_chat_model(config: AiConfigRep) -> Any:
@@ -172,41 +225,17 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
         else:
             span = None
 
-        system_prompt = _extract_system_prompt(config, vs, history)
+        system_prompt = _extract_system_prompt(config, vs)
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
             system_prompt = (
                 f"{system_prompt}\n\n{schema_instr}" if system_prompt else schema_instr
             )
 
-        initial_messages = _build_initial_messages(config, user_input, vs)
+        initial_messages = _build_initial_messages(config, user_input, vs, history)
 
         if span:
-            prompt_text = "\n".join(
-                [
-                    *(["system: " + system_prompt] if system_prompt else []),
-                    *[
-                        f"{getattr(m, 'type', type(m).__name__)}: {m.content}"
-                        for m in initial_messages
-                    ],
-                ]
-            )
-            span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-            prompt_msgs: list[dict[str, str]] = []
-            if system_prompt:
-                prompt_msgs.append({"role": "system", "content": system_prompt})
-            prompt_msgs.extend(
-                [
-                    {
-                        "role": getattr(m, "type", type(m).__name__),
-                        "content": m.content
-                        if isinstance(m.content, str)
-                        else str(m.content),
-                    }
-                    for m in initial_messages
-                ]
-            )
-            set_openllmetry_prompt(span, prompt_msgs)
+            _record_prompt(span, system_prompt, initial_messages)
 
         try:
             base_model = llm
@@ -319,35 +348,11 @@ async def _stream_gen(
     else:
         span = None
 
-    system_prompt = _extract_system_prompt(config, variables, history)
-    initial_messages = _build_initial_messages(config, user_input, variables)
+    system_prompt = _extract_system_prompt(config, variables)
+    initial_messages = _build_initial_messages(config, user_input, variables, history)
 
     if span:
-        prompt_text = "\n".join(
-            [
-                *(["system: " + system_prompt] if system_prompt else []),
-                *[
-                    f"{getattr(m, 'type', type(m).__name__)}: {m.content}"
-                    for m in initial_messages
-                ],
-            ]
-        )
-        span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-        prompt_msgs: list[dict[str, str]] = []
-        if system_prompt:
-            prompt_msgs.append({"role": "system", "content": system_prompt})
-        prompt_msgs.extend(
-            [
-                {
-                    "role": getattr(m, "type", type(m).__name__),
-                    "content": m.content
-                    if isinstance(m.content, str)
-                    else str(m.content),
-                }
-                for m in initial_messages
-            ]
-        )
-        set_openllmetry_prompt(span, prompt_msgs)
+        _record_prompt(span, system_prompt, initial_messages)
 
     try:
         base_model = llm
