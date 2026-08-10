@@ -75,6 +75,34 @@ def _template_content(content: Any, variables: dict[str, Any]) -> Any:
     return parse_template(content, variables) if isinstance(content, str) else content
 
 
+def _anthropic_blocks(content: Any) -> list[dict[str, Any]]:
+    """Normalize Anthropic message content to a list of content blocks."""
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": content}] if content else []
+
+
+def _merge_adjacent_same_role(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge consecutive same-role turns into one multi-block message.
+
+    Anthropic's Messages API requires strictly alternating user/assistant roles.
+    Composed history can place an image-only user turn immediately before the
+    appended ``user_input`` question, which would otherwise send two consecutive
+    user turns and be rejected. Merging keeps both as a single user message.
+    """
+    merged: list[dict[str, Any]] = []
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            merged[-1]["content"] = _anthropic_blocks(
+                merged[-1]["content"]
+            ) + _anthropic_blocks(message.get("content"))
+        else:
+            merged.append({"role": message["role"], "content": message.get("content")})
+    return merged
+
+
 def _build_messages(
     config: AiConfigRep,
     user_input: str | None,
@@ -113,14 +141,16 @@ def _build_messages(
             user_input=user_input,
             config_messages=config_messages,
         )
-        messages = [
-            {
-                "role": msg["role"],
-                "content": _anthropic_content(msg.get("content", "")),
-            }
-            for msg in composed
-            if msg.get("role") in ("user", "assistant")
-        ]
+        messages = _merge_adjacent_same_role(
+            [
+                {
+                    "role": msg["role"],
+                    "content": _anthropic_content(msg.get("content", "")),
+                }
+                for msg in composed
+                if msg.get("role") in ("user", "assistant")
+            ]
+        )
     else:
         messages = config_messages
         if user_input or not messages:

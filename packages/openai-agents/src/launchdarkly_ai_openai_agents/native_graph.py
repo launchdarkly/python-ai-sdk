@@ -222,14 +222,23 @@ def to_openai_agents(
 
         root_prompt: str | list[dict[str, Any]] = input_text
         if history:
-            config_messages = [
-                {
-                    **message,
-                    "content": _parse_message_content(message.get("content", ""), vs),
-                }
-                for message in (root.config.get("messages") or [])
-                if message.get("role") != "system"
-            ]
+            # config.instructions takes priority over config.messages, so skip
+            # config conversation turns when instructions are set (parity with the
+            # single-node handler and TESTING.md §1.11 composition order).
+            config_messages = (
+                []
+                if root.config.get("instructions")
+                else [
+                    {
+                        **message,
+                        "content": _parse_message_content(
+                            message.get("content", ""), vs
+                        ),
+                    }
+                    for message in (root.config.get("messages") or [])
+                    if message.get("role") != "system"
+                ]
+            )
             turns = compose_history(
                 history=history,
                 user_input=input_text,

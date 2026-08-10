@@ -1139,3 +1139,22 @@ class TestHistory:
         serialized = str(prompt)
         assert "input_image" in serialized
         assert "data:image/png;base64,abc123" in serialized
+
+    def test_history_with_instructions_ignores_config_messages(self) -> None:
+        # config.instructions takes priority over config.messages, so history
+        # composition must not resurrect those conversation turns.
+        config = _make_config(
+            instructions="Use instructions.",
+            messages=[{"role": "user", "content": "config-only turn"}],
+        )
+        agents_mock = self._mock_agents()
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            _, prompt, instructions = _build_agent_and_prompt(
+                config, "hi", {}, {}, self.SAMPLE_HISTORY
+            )
+        assert instructions == "Use instructions."
+        assert isinstance(prompt, list)
+        assert "config-only turn" not in str(prompt)

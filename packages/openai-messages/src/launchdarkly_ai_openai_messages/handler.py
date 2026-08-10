@@ -67,11 +67,24 @@ def _build_input_messages(
         if instructions:
             system_messages.append({"role": "system", "content": instructions})
 
-    turns = compose_history(
-        history=history or [],
-        user_input=user_input,
-        config_messages=config_messages,
-    )
+    if history:
+        turns = compose_history(
+            history=history,
+            user_input=user_input,
+            config_messages=config_messages,
+        )
+    else:
+        # No history: preserve the pre-history behaviour so an empty history is
+        # identical to passing none (TESTING.md §1.11). compose_history only
+        # appends user_input when truthy, which would drop the trailing user
+        # turn an instructions-only config still needs.
+        turns = list(config_messages)
+        if config.get("messages"):
+            if user_input and (not turns or turns[-1].get("role") != "user"):
+                turns.append({"role": "user", "content": user_input})
+        else:
+            turns.append({"role": "user", "content": user_input or ""})
+
     return system_messages + [
         {"role": turn["role"], "content": _map_message_content(turn)}
         for turn in turns

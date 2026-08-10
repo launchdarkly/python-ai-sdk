@@ -1216,3 +1216,17 @@ class TestHistory:
             if m.get("content") in ("Hello", "You are evil", "Hi there")
         ]
         assert "system" not in history_roles
+
+    async def test_empty_user_input_no_history_still_sends_user_turn(
+        self, mock_openai: MagicMock
+    ) -> None:
+        # Instructions-only config with empty user_input and no history must
+        # still send a (possibly empty) user turn, not system-only input.
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+        await h(CONFIG, "", {}, {})
+        msgs = mock_openai.responses.create.call_args.kwargs["input"]
+        assert any(m.get("role") == "user" for m in msgs), (
+            "instructions-only config with empty input dropped the user turn"
+        )

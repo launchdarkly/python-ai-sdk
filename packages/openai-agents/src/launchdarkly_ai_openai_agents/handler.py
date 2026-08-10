@@ -139,14 +139,22 @@ def _build_agent_and_prompt(
         prompt = f"{conv_history}\n\n{safe_input}" if conv_history else safe_input
 
     if history:
-        turns = compose_history(
-            history=history,
-            user_input=user_input,
-            config_messages=[
+        # When config.instructions is set, config.messages conversation turns are
+        # ignored (see the no-history branches above), so history composition must
+        # not resurrect them — mirror that priority here.
+        config_history_messages = (
+            []
+            if config.get("instructions")
+            else [
                 message
                 for message in parsed_messages
                 if message.get("role") != "system"
-            ],
+            ]
+        )
+        turns = compose_history(
+            history=history,
+            user_input=user_input,
+            config_messages=config_history_messages,
         )
         prompt = _to_openai_agent_items(turns)
 
