@@ -1,6 +1,6 @@
 """LaunchDarkly AI SDK - integration for Claude agents."""
 
-__version__ = "0.1.3"  # x-release-please-version
+__version__ = "0.1.4"  # x-release-please-version
 
 from . import native_graph  # noqa: F401
 from .builtins import (

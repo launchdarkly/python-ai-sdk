@@ -1,6 +1,6 @@
 """LaunchDarkly AI SDK - integration for LangChain agents."""
 
-__version__ = "0.1.3"  # x-release-please-version
+__version__ = "0.1.4"  # x-release-please-version
 
 from .graph import langchain_graph
 from .handler import create_langchain_agents_handler, langchain_agents
