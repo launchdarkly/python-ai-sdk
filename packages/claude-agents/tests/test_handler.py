@@ -1025,19 +1025,12 @@ class TestHistory:
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
 
-    def test_history_appended_to_system_prompt(self) -> None:
+    def test_history_not_stuffed_into_system_prompt(self) -> None:
         config = _make_config(instructions="Be concise.")
         _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
         assert system is not None
-        assert "Conversation History:" in system
         assert "Be concise." in system
-
-    def test_history_format_is_correct(self) -> None:
-        config = _make_config(instructions="Be helpful.")
-        _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "user: What is feature flagging?" in system
-        assert "assistant: Feature flagging is a technique..." in system
+        assert "Conversation History:" not in system
 
     def test_empty_history_treated_like_no_history(self) -> None:
         config = _make_config(instructions="Be concise.")
@@ -1046,9 +1039,8 @@ class TestHistory:
         assert system_with_empty == system_without
         assert "Conversation History:" not in (system_with_empty or "")
 
-    def test_history_without_prior_system_prompt(self) -> None:
+    def test_history_without_instructions_keeps_system_none(self) -> None:
+        """History is structured input — it must not invent a Conversation History system prompt."""
         config = _make_config()
         _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "Conversation History:" in system
-        assert "user: What is feature flagging?" in system
+        assert system is None or "Conversation History:" not in system

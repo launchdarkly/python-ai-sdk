@@ -423,3 +423,64 @@ class TestGraphInvoke:
 
         assert gd.enabled is False
         mock_logger.error.assert_called()
+
+    async def test_history_forwarded_to_root_handler_only(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc",
+                        },
+                    }
+                ],
+            }
+        ]
+        await graph("graph-key", handlers=[handler]).invoke(
+            "hi", CONTEXT, history=history
+        )
+        assert len(received) >= 2
+        assert received[0] == history
+        assert all(h is None for h in received[1:])
+
+    async def test_omitted_history_leaves_root_handler_history_none(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        await graph("graph-key", handlers=[handler]).invoke("hi", CONTEXT)
+        assert received[0] is None

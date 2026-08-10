@@ -187,6 +187,41 @@ class TestToOpenAIAgentsTopology:
         assert "input-text" in call_args[0] or "input-text" == call_args[0][1]
 
     @pytest.mark.asyncio
+    async def test_multimodal_history_is_structured_root_input(self) -> None:
+        run_result = _make_run_result("out")
+        agents_mock = _make_agents_mock(run_result)
+        graph_def = _make_graph_def()
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            await to_openai_agents(_make_def_promise(graph_def)).invoke(
+                "describe", None, history
+            )
+
+        root_input = agents_mock.Runner.run.call_args.args[1]
+        assert isinstance(root_input, list)
+        serialized = str(root_input)
+        assert "input_image" in serialized
+        assert "data:image/png;base64,abc123" in serialized
+
+    @pytest.mark.asyncio
     async def test_terminal_nodes_no_handoff_tools(self) -> None:
         run_result = _make_run_result("out")
         agents_mock = _make_agents_mock(run_result)

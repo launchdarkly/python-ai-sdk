@@ -206,6 +206,7 @@ async def _build_graph(
                 tool_handlers=tool_handlers,
                 variables=opts.get("variables"),
                 graph_key=key,
+                history=opts.get("history"),
             )
             response = (
                 result["response"]
@@ -338,6 +339,7 @@ async def _build_graph(
                 tool_handlers=merged_tool_handlers,
                 variables=opts.get("variables"),
                 graph_key=key,
+                history=opts.get("history"),
             )
             response = (
                 result["response"]
@@ -524,6 +526,7 @@ class GraphInstance:
         user_input: str | None,
         context: LDContext,
         variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> ProviderGraphResponse:
         from .judges import run_judges
         from .lifecycle import get_client
@@ -584,6 +587,11 @@ class GraphInstance:
                 opts: dict[str, Any] = {"variables": variables}
                 if previous_node:
                     opts["from"] = previous_node
+                # History seeds the entry point only. After the root hop, nodes
+                # stay oriented through the string threading built below, so
+                # history is not re-sent to downstream handlers.
+                elif history:
+                    opts["history"] = history
 
                 res = await graph_def.route(current, current_input, opts)
                 path.append(current.key)

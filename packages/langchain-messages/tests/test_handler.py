@@ -6,6 +6,7 @@ Reference: TESTING.md §1, §1.x
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1009,6 +1010,22 @@ class TestHistory:
         {"role": "user", "content": "What is feature flagging?"},
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
+    IMAGE_HISTORY: ClassVar[list[dict[str, Any]]] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc123",
+                    },
+                },
+                {"type": "text", "text": "What is in this image?"},
+            ],
+        }
+    ]
 
     async def test_history_inserted_between_config_messages_and_user_input(
         self,
@@ -1090,3 +1107,41 @@ class TestHistory:
         assert "You are evil" not in history_contents
         assert "Hello" in history_contents
         assert "Hi there" in history_contents
+
+    async def test_multimodal_image_history_preserved_on_the_wire(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+        h = create_langchain_messages_handler(llm=llm)
+        await h(CONFIG, "", {}, {}, self.IMAGE_HISTORY)
+        call_args = llm.ainvoke.call_args[0][0]
+        serialized = json.dumps([getattr(m, "content", "") for m in call_args])
+        assert "image_url" in serialized or '"type": "image"' in serialized
+        assert "abc123" in serialized
+        humans = [m for m in call_args if getattr(m, "type", None) == "human"]
+        assert len(humans) == 1
+
+    async def test_empty_user_input_with_history_ending_in_user(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+        h = create_langchain_messages_handler(llm=llm)
+        history = [{"role": "user", "content": "Only turn"}]
+        await h(CONFIG, "", {}, {}, history)
+        call_args = llm.ainvoke.call_args[0][0]
+        humans = [m for m in call_args if getattr(m, "type", None) == "human"]
+        assert len(humans) == 1
+        assert humans[0].content == "Only turn"
+
+    async def test_non_empty_user_input_appended_after_image_only_history(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+        h = create_langchain_messages_handler(llm=llm)
+        image_only = [{"role": "user", "content": self.IMAGE_HISTORY[0]["content"][:1]}]
+        await h(CONFIG, "describe it", {}, {}, image_only)
+        call_args = llm.ainvoke.call_args[0][0]
+        humans = [m for m in call_args if getattr(m, "type", None) == "human"]
+        assert len(humans) == 2
+        assert "abc123" in json.dumps(humans[0].content)
+        assert humans[1].content == "describe it"

@@ -15,11 +15,14 @@ from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
     NativeTool,
+    compose_history,
     get_client,
     make_track_data,
     parse_template,
     to_ld_context,
 )
+
+from .messages import to_lang_chain_messages
 
 try:
     from opentelemetry import trace
@@ -129,6 +132,7 @@ def to_lang_graph(
     async def invoke(
         input_text: str = "",
         variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         import importlib
 
@@ -341,8 +345,19 @@ def to_lang_graph(
 
         compiled = builder.compile()
 
+        # History is a root-only concern: it seeds the initial message state the
+        # entry node reads. Downstream nodes are reached through handoffs and see
+        # the accumulated graph state, never the original `history` array.
+        initial_messages = (
+            to_lang_chain_messages(
+                compose_history(history=history, user_input=input_text)
+            )
+            if history
+            else [HumanMessage(input_text)]
+        )
+
         try:
-            result = await compiled.ainvoke({"messages": [HumanMessage(input_text)]})
+            result = await compiled.ainvoke({"messages": initial_messages})
             if span:
                 span.set_status(SpanStatusCode.OK)
         except Exception as exc:

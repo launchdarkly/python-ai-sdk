@@ -16,7 +16,9 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeTool,
     ProviderHandler,
+    compose_history,
     config,
+    content_to_text,
     create_handler,
     parse_template,
     set_ld_span_attributes,
@@ -96,17 +98,6 @@ def partition_tools(
     return native_tool_map, user_config_tools, list(native_tool_map.keys())
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
-
-
 def build_prompt(
     config: AiConfigRep,
     user_input: str | None,
@@ -134,13 +125,89 @@ def build_prompt(
             f"{config_history}\n\n{safe_input}" if config_history else safe_input
         )
 
-    history_text = _format_history(history)
-    if history_text:
-        system_prompt = (
-            f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
-        )
-
     return safe_input, system_prompt
+
+
+def _parse_message_content(content: Any, variables: dict[str, Any]) -> Any:
+    """Apply templates only to string content."""
+    return parse_template(content, variables) if isinstance(content, str) else content
+
+
+def _config_conversation_turns(
+    config: AiConfigRep, variables: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return non-system config messages with string templates applied."""
+    return [
+        {
+            "role": message.get("role"),
+            "content": _parse_message_content(message.get("content", ""), variables),
+        }
+        for message in (config.get("messages") or [])
+        if message.get("role") != "system"
+    ]
+
+
+def _to_anthropic_user_content(content: Any) -> Any:
+    """Map canonical user content to Anthropic-native content blocks."""
+    if isinstance(content, str):
+        return content
+
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            source = block.get("source", {})
+            if source.get("type") == "url":
+                mapped_source = {"type": "url", "url": source.get("url", "")}
+            else:
+                mapped_source = {
+                    "type": "base64",
+                    "media_type": source.get("media_type", ""),
+                    "data": source.get("data", ""),
+                }
+            blocks.append({"type": "image", "source": mapped_source})
+    return blocks
+
+
+async def _to_streamed_prompt(
+    turns: list[dict[str, Any]],
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Yield composed turns in the Claude Agent SDK streaming-input shape."""
+    for turn in turns:
+        content = turn.get("content", "")
+        if turn.get("role") == "assistant":
+            content = content_to_text(content)
+        else:
+            content = _to_anthropic_user_content(content)
+        yield {
+            "type": "user",
+            "message": {"role": turn.get("role"), "content": content},
+            "parent_tool_use_id": None,
+        }
+
+
+def build_query_prompt(
+    config: AiConfigRep,
+    user_input: str | None,
+    variables: dict[str, Any],
+    history: list[dict[str, Any]] | None,
+    fallback_prompt: str,
+) -> str | AsyncGenerator[dict[str, Any], None]:
+    """Build a plain prompt without history, or a structured streamed prompt."""
+    if not history:
+        return fallback_prompt
+
+    turns = compose_history(
+        history=history,
+        user_input=user_input,
+        config_messages=(
+            []
+            if config.get("instructions")
+            else _config_conversation_turns(config, variables)
+        ),
+    )
+    return _to_streamed_prompt(turns)
 
 
 def _is_coroutine(fn: Any) -> bool:
@@ -210,6 +277,7 @@ def create_claude_agents_handler() -> ProviderHandler:
             span = None
 
         prompt, system_prompt = build_prompt(config, user_input, vs, history)
+        query_prompt = build_query_prompt(config, user_input, vs, history, prompt)
 
         # Append outputFormat instruction to system prompt
         if config.get("outputFormat"):
@@ -258,7 +326,7 @@ def create_claude_agents_handler() -> ProviderHandler:
             # generator — Python's asyncio finalizer later tries to aclose() it
             # and raises RuntimeError if the generator is suspended inside a real
             # await in the SDK (AIC-2950).  See Appendix A.4 in TESTING.md.
-            gen = query_fn(prompt=prompt, options=options)
+            gen = query_fn(prompt=query_prompt, options=options)
             try:
                 async for message in gen:
                     if isinstance(message, ResultMessage):
@@ -360,6 +428,7 @@ async def _stream_gen(
         span = None
 
     prompt, system_prompt = build_prompt(config, user_input, variables, history)
+    query_prompt = build_query_prompt(config, user_input, variables, history, prompt)
     if span:
         span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt})
         prompt_msgs: list[dict[str, str]] = []
@@ -392,50 +461,58 @@ async def _stream_gen(
 
         full_output = ""
 
-        async for message in query_fn(prompt=prompt, options=options):
-            if isinstance(message, StreamEvent):
-                event = message.event
-                if (
-                    event.get("type") == "content_block_delta"
-                    and event.get("delta", {}).get("type") == "text_delta"
-                ):
-                    text = event["delta"].get("text", "")
-                    if text:
-                        yield {"type": "chunk", "text": text}
-                        full_output += text
-            elif isinstance(message, ResultMessage):
-                raw_usage = message.usage or {}
-                input_tokens = int(raw_usage.get("input_tokens", 0))
-                output_tokens = int(raw_usage.get("output_tokens", 0))
-                final_output = message.result or full_output
-                if span:
-                    span.set_attribute(
-                        "gen_ai.response.model", config.get("model", {}).get("name", "")
-                    )
-                    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-                    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-                    span.set_attribute(
-                        "gen_ai.usage.total_tokens", input_tokens + output_tokens
-                    )
-                    span.add_event(
-                        "gen_ai.content.completion",
-                        {
-                            "gen_ai.completion": final_output
+        gen = query_fn(prompt=query_prompt, options=options)
+        try:
+            async for message in gen:
+                if isinstance(message, StreamEvent):
+                    event = message.event
+                    if (
+                        event.get("type") == "content_block_delta"
+                        and event.get("delta", {}).get("type") == "text_delta"
+                    ):
+                        text = event["delta"].get("text", "")
+                        if text:
+                            yield {"type": "chunk", "text": text}
+                            full_output += text
+                elif isinstance(message, ResultMessage):
+                    raw_usage = message.usage or {}
+                    input_tokens = int(raw_usage.get("input_tokens", 0))
+                    output_tokens = int(raw_usage.get("output_tokens", 0))
+                    final_output = message.result or full_output
+                    if span:
+                        span.set_attribute(
+                            "gen_ai.response.model",
+                            config.get("model", {}).get("name", ""),
+                        )
+                        span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+                        span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+                        span.set_attribute(
+                            "gen_ai.usage.total_tokens", input_tokens + output_tokens
+                        )
+                        span.add_event(
+                            "gen_ai.content.completion",
+                            {
+                                "gen_ai.completion": final_output
+                                if isinstance(final_output, str)
+                                else json.dumps(final_output)
+                            },
+                        )
+                        set_openllmetry_completion(
+                            span,
+                            final_output
                             if isinstance(final_output, str)
-                            else json.dumps(final_output)
-                        },
-                    )
-                    set_openllmetry_completion(
-                        span,
-                        final_output
-                        if isinstance(final_output, str)
-                        else json.dumps(final_output),
-                        {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                    )
-                    span.set_status(SpanStatusCode.OK)
-                    span.end()
-                yield {"type": "done", "output": final_output, "usage": raw_usage}
-                return
+                            else json.dumps(final_output),
+                            {
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                            },
+                        )
+                        span.set_status(SpanStatusCode.OK)
+                        span.end()
+                    yield {"type": "done", "output": final_output, "usage": raw_usage}
+                    return
+        finally:
+            await gen.aclose()
 
         if span:
             span.set_status(SpanStatusCode.OK)

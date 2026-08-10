@@ -15,11 +15,14 @@ from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
     NativeTool,
+    compose_history,
     get_client,
     make_track_data,
     parse_template,
     to_ld_context,
 )
+
+from .handler import _parse_message_content, _to_openai_agent_items
 
 try:
     from opentelemetry import trace
@@ -99,6 +102,7 @@ def to_openai_agents(
     async def invoke(
         input_text: str = "",
         variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         import importlib
 
@@ -216,8 +220,34 @@ def to_openai_agents(
 
         hooks = _LDHooks()
 
+        root_prompt: str | list[dict[str, Any]] = input_text
+        if history:
+            # config.instructions takes priority over config.messages, so skip
+            # config conversation turns when instructions are set (parity with the
+            # single-node handler and TESTING.md §1.11 composition order).
+            config_messages = (
+                []
+                if root.config.get("instructions")
+                else [
+                    {
+                        **message,
+                        "content": _parse_message_content(
+                            message.get("content", ""), vs
+                        ),
+                    }
+                    for message in (root.config.get("messages") or [])
+                    if message.get("role") != "system"
+                ]
+            )
+            turns = compose_history(
+                history=history,
+                user_input=input_text,
+                config_messages=config_messages,
+            )
+            root_prompt = _to_openai_agent_items(turns)
+
         try:
-            result = await Runner.run(root_agent, input_text, hooks=hooks)
+            result = await Runner.run(root_agent, root_prompt, hooks=hooks)
             if span:
                 span.set_status(SpanStatusCode.OK)
         except Exception as exc:

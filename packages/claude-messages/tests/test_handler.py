@@ -1238,3 +1238,68 @@ class TestHistory:
         msgs = mock_anthropic.messages.create.call_args.kwargs["messages"]
         roles = [m["role"] for m in msgs]
         assert "system" not in roles
+
+    async def test_image_history_plus_user_input_merges_into_one_user_turn(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Image-only history + a separate question must not produce two
+        # consecutive user turns (Anthropic requires alternating roles); they
+        # merge into a single user message carrying both blocks.
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    }
+                ],
+            }
+        ]
+        h = create_claude_messages_handler()
+        await h(CONFIG, "What colour is this?", {}, {}, history)
+        msgs = mock_anthropic.messages.create.call_args.kwargs["messages"]
+
+        # No two consecutive user turns.
+        roles = [m["role"] for m in msgs]
+        assert not any(
+            roles[i] == "user" and roles[i + 1] == "user" for i in range(len(roles) - 1)
+        )
+        # The trailing user turn carries both the image and the question text.
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert isinstance(last["content"], list)
+        block_types = [b["type"] for b in last["content"]]
+        assert "image" in block_types
+        assert any(
+            b["type"] == "text" and b["text"] == "What colour is this?"
+            for b in last["content"]
+        )
+
+    async def test_history_ending_in_user_text_plus_user_input_merges(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        history = [{"role": "user", "content": "prior question"}]
+        h = create_claude_messages_handler()
+        await h(CONFIG, "follow-up", {}, {}, history)
+        msgs = mock_anthropic.messages.create.call_args.kwargs["messages"]
+        roles = [m["role"] for m in msgs]
+        assert not any(
+            roles[i] == "user" and roles[i + 1] == "user" for i in range(len(roles) - 1)
+        )
+        # Both the prior question and the follow-up survive in the merged turn.
+        merged_text = "".join(
+            b["text"]
+            for b in msgs[-1]["content"]
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+        assert "prior question" in merged_text
+        assert "follow-up" in merged_text

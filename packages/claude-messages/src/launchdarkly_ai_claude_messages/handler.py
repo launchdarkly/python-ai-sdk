@@ -9,8 +9,11 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    compose_history,
     config,
+    content_to_text,
     create_handler,
+    is_content_blocks,
     parse_template,
     set_ld_span_attributes,
     set_openllmetry_completion,
@@ -44,9 +47,65 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _anthropic_content(content: Any) -> str | list[dict[str, Any]]:
+    """Map LaunchDarkly-canonical content to Anthropic message content."""
+    if not is_content_blocks(content):
+        return content if isinstance(content, str) else ""
+
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            source = block.get("source", {})
+            if source.get("type") == "url":
+                mapped_source = {"type": "url", "url": source.get("url", "")}
+            else:
+                mapped_source = {
+                    "type": "base64",
+                    "media_type": source.get("media_type", ""),
+                    "data": source.get("data", ""),
+                }
+            blocks.append({"type": "image", "source": mapped_source})
+    return blocks
+
+
+def _template_content(content: Any, variables: dict[str, Any]) -> Any:
+    """Apply templates to text content without parsing structured blocks."""
+    return parse_template(content, variables) if isinstance(content, str) else content
+
+
+def _anthropic_blocks(content: Any) -> list[dict[str, Any]]:
+    """Normalize Anthropic message content to a list of content blocks."""
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": content}] if content else []
+
+
+def _merge_adjacent_same_role(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge consecutive same-role turns into one multi-block message.
+
+    Anthropic's Messages API requires strictly alternating user/assistant roles.
+    Composed history can place an image-only user turn immediately before the
+    appended ``user_input`` question, which would otherwise send two consecutive
+    user turns and be rejected. Merging keeps both as a single user message.
+    """
+    merged: list[dict[str, Any]] = []
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            merged[-1]["content"] = _anthropic_blocks(
+                merged[-1]["content"]
+            ) + _anthropic_blocks(message.get("content"))
+        else:
+            merged.append({"role": message["role"], "content": message.get("content")})
+    return merged
+
+
 def _build_messages(
     config: AiConfigRep,
-    user_input: str,
+    user_input: str | None,
     variables: dict[str, Any],
     *,
     include_output_format: bool = True,
@@ -54,33 +113,48 @@ def _build_messages(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Returns (messages, system_prompt)."""
     system: str | None = None
-    messages: list[dict[str, Any]] = []
+    config_messages: list[dict[str, Any]] = []
 
     if config.get("messages"):
         system_msgs = [m for m in config["messages"] if m.get("role") == "system"]
         conv_msgs = [m for m in config["messages"] if m.get("role") != "system"]
         if system_msgs:
             system = parse_template(
-                "\n".join(m["content"] for m in system_msgs), variables
+                "\n".join(content_to_text(m.get("content", "")) for m in system_msgs),
+                variables,
             )
         for msg in conv_msgs:
-            messages.append(
+            config_messages.append(
                 {
                     "role": msg["role"],
-                    "content": parse_template(msg["content"], variables),
+                    "content": _anthropic_content(
+                        _template_content(msg.get("content", ""), variables)
+                    ),
                 }
             )
     elif config.get("instructions"):
         system = parse_template(config["instructions"], variables)
 
     if history:
-        for msg in history:
-            role = msg.get("role", "user")
-            if role in ("user", "assistant"):
-                messages.append({"role": role, "content": msg.get("content", "")})
-
-    if not messages or messages[-1].get("role") != "user":
-        messages.append({"role": "user", "content": user_input or ""})
+        composed = compose_history(
+            history=history,
+            user_input=user_input,
+            config_messages=config_messages,
+        )
+        messages = _merge_adjacent_same_role(
+            [
+                {
+                    "role": msg["role"],
+                    "content": _anthropic_content(msg.get("content", "")),
+                }
+                for msg in composed
+                if msg.get("role") in ("user", "assistant")
+            ]
+        )
+    else:
+        messages = config_messages
+        if user_input or not messages:
+            messages.append({"role": "user", "content": user_input or ""})
 
     if include_output_format and config.get("outputFormat"):
         schema_instruction = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
@@ -199,12 +273,15 @@ def create_claude_messages_handler() -> ProviderHandler:
         messages, system = _build_messages(config, user_input, vs, history=history)
         if span:
             prompt_text = (f"system: {system}\n" if system else "") + "\n".join(
-                f"{m['role']}: {m['content']}" for m in messages
+                f"{m['role']}: {content_to_text(m['content'])}" for m in messages
             )
             span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
             prompt_msgs = (
                 [{"role": "system", "content": system}] if system else []
-            ) + [{"role": m["role"], "content": m["content"]} for m in messages]
+            ) + [
+                {"role": m["role"], "content": content_to_text(m["content"])}
+                for m in messages
+            ]
             set_openllmetry_prompt(span, prompt_msgs)
 
         try:
@@ -283,11 +360,12 @@ async def _stream_gen(
     )
     if span:
         prompt_text = (f"system: {system}\n" if system else "") + "\n".join(
-            f"{m['role']}: {m['content']}" for m in messages
+            f"{m['role']}: {content_to_text(m['content'])}" for m in messages
         )
         span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
         prompt_msgs = ([{"role": "system", "content": system}] if system else []) + [
-            {"role": m["role"], "content": m["content"]} for m in messages
+            {"role": m["role"], "content": content_to_text(m["content"])}
+            for m in messages
         ]
         set_openllmetry_prompt(span, prompt_msgs)
 
