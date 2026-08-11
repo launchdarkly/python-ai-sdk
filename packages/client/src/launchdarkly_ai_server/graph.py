@@ -668,7 +668,15 @@ class GraphInstance:
 
             return ProviderGraphResponse(
                 response=final_response,
-                usage=UsageDict(**total_usage),
+                # Named rather than splatted, so a new UsageDict member cannot silently arrive
+                # here from a dict that has no business filling it. Graph totals carry no cache
+                # breakdown: they are a sum across nodes, and the per-node detail is on the node's
+                # own spans.
+                usage=UsageDict(
+                    input=total_usage["input"],
+                    output=total_usage["output"],
+                    total=total_usage["total"],
+                ),
                 judge_results=judge_results,
             )
 

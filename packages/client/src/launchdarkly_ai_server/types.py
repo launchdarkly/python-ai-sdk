@@ -193,10 +193,25 @@ class ProviderHandler:
 
 
 @dataclass
+class InputTokenDetails:
+    """The cache breakdown behind an inclusive ``input`` figure.
+
+    Present only when the provider reported at least one cache field. ``uncached + cache_read +
+    cache_creation`` equals :attr:`UsageDict.input`.
+    """
+
+    uncached: int = 0
+    cache_read: int = 0
+    cache_creation: int = 0
+
+
+@dataclass
 class UsageDict:
     input: int = 0
     output: int = 0
     total: int = 0
+    #: Cache breakdown, when the provider reported one. See :class:`InputTokenDetails`.
+    input_details: InputTokenDetails | None = None
 
 
 @dataclass
