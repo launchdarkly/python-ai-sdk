@@ -39,14 +39,6 @@ from .spans import (
 )
 
 try:
-    from opentelemetry import trace  # noqa: F401
-    from opentelemetry.trace import StatusCode as SpanStatusCode  # noqa: F401
-
-    _HAS_OTEL = True
-except ImportError:
-    _HAS_OTEL = False
-
-try:
     import anthropic as _anthropic_mod  # noqa: F401
 
     _HAS_ANTHROPIC = True
