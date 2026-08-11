@@ -1,6 +1,19 @@
 """
 OpenAI Agents handler — uses the openai-agents SDK (``agents`` package).
 Mirrors the TypeScript @launchdarkly/ai-openai-agents handler.
+
+Span construction lives in ``spans.py``. This module drives the ``agents`` SDK's own ``Runner``
+and reports each per-turn and per-tool-call boundary the SDK gives us, through ``RunHooks``.
+
+The TypeScript handler intercepts model calls by wrapping the Agents SDK's ``Model`` /
+``ModelProvider`` interfaces (``SpanningModel`` / ``SpanningModelProvider``) and tool calls by
+listening for the ``Agent``'s ``agent_tool_start`` / ``agent_tool_end`` events. The Python
+``agents`` SDK exposes the same two boundaries more directly, as ``RunHooks`` callbacks
+(``on_llm_start`` / ``on_llm_end`` for a model turn, ``on_tool_start`` / ``on_tool_end`` for a tool
+call), and both fire identically on the blocking and the streaming path. Using them is simpler than
+building a parallel ``Model`` wrapper and produces the same span tree, because ``Model.get_response``
+in this SDK discards the same information (see ``spans.derive_finish_reason``) no matter which
+interface intercepts it.
 """
 
 from __future__ import annotations
@@ -13,27 +26,61 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    SpanUsage,
     config,
     create_handler,
+    create_run_usage,
+    end_span_once,
     parse_template,
-    set_ld_span_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    set_tool_call_content_attributes,
+    text_message,
+)
+
+from .spans import (
+    derive_finish_reason,
+    fail_span,
+    finish_model_span,
+    finish_root_span,
+    mark_ok,
+    parent_context_of,
+    start_model_span,
+    start_root_span,
+    start_tool_span,
+    succeed_span,
+    to_request_span_messages,
+    to_response_span_messages,
+    to_span_usage,
+    to_tool_definitions,
 )
 
 try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode as SpanStatusCode
+    from opentelemetry import trace  # noqa: F401
+    from opentelemetry.trace import StatusCode as SpanStatusCode  # noqa: F401
 
     _HAS_OTEL = True
 except ImportError:
     _HAS_OTEL = False
+
+try:
+    # The `agents` SDK validates that anything passed as `hooks=` is a `RunHooksBase` instance, so
+    # `_SpanningHooks` below has to actually subclass it rather than merely duck-type it. Imported
+    # once at module load, unlike the rest of this handler's dynamic `importlib.import_module`
+    # calls, because a class statement needs its base at class-definition time.
+    from agents.lifecycle import RunHooksBase as _RunHooksBase
+except ImportError:  # pragma: no cover - `agents` is a hard dependency of this package
+    _RunHooksBase = object  # type: ignore[assignment,misc]
 
 
 def _build_agent_tools(
     config_tools: dict[str, Any],
     tool_handlers: dict[str, Any],
 ) -> list[Any]:
+    # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK, which
+    # excludes an unregistered tool from the catalog entirely. This difference predates the span
+    # work and changes what the model is offered, not what a span reports, so it is left as it is;
+    # `to_tool_definitions` below records the catalog actually sent, whatever it is.
     import importlib
 
     agents_mod = importlib.import_module("agents")
@@ -113,6 +160,13 @@ def _build_agent_and_prompt(
 
     tools = _build_agent_tools(config.get("tools") or {}, tool_handlers)
 
+    # `outputFormat` is not wired into `Agent(output_type=...)` here, matching this handler's
+    # pre-existing behaviour (and unlike the TypeScript handler, which does wire it): the Python
+    # Agents SDK requires a concrete Python type for `output_type`, not a raw JSON Schema dict (see
+    # `utils.build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
+    # change, not a telemetry one, so it is left alone. `_call_impl` still returns the parsed
+    # `final_output` object as-is when `outputFormat` is configured, matching the pre-existing
+    # return-shape contract.
     agent = Agent(
         name="assistant",
         model=config.get("model", {}).get("name", "gpt-4o"),
@@ -122,28 +176,148 @@ def _build_agent_and_prompt(
     return agent, prompt, instructions
 
 
-def _sum_usage(raw_responses: list[Any]) -> tuple[int, int, int]:
-    input_tokens = sum(
-        getattr(r.usage, "input_tokens", 0)
-        for r in raw_responses
-        if hasattr(r, "usage")
-    )
-    output_tokens = sum(
-        getattr(r.usage, "output_tokens", 0)
-        for r in raw_responses
-        if hasattr(r, "usage")
-    )
-    total_tokens = sum(
-        getattr(r.usage, "total_tokens", 0)
-        for r in raw_responses
-        if hasattr(r, "usage")
-    )
-    return input_tokens, output_tokens, total_tokens
+class _SpanningHooks(_RunHooksBase):
+    """Opens and closes one ``chat`` span per model turn and one ``execute_tool`` span per tool
+    call, all parented to the root's context.
+
+    Subclasses ``agents.RunHooksBase``: the ``Runner`` validates that ``hooks=`` is an instance of
+    it before running, so a merely duck-typed object is rejected outright.
+
+    Owns the run's usage accumulator too, so a run that raises mid-flight still has the completed
+    turns' spend somewhere the caller can read it from, via :attr:`run_usage`.
+    """
+
+    def __init__(
+        self,
+        config: AiConfigRep,
+        parent: Any,
+        capture_content: bool,
+        run_usage: Any,
+    ) -> None:
+        self.config = config
+        self.parent = parent
+        self.capture_content = capture_content
+        self.run_usage = run_usage
+        self.open_model_span: Any = None
+        self.open_tool_spans: dict[str, Any] = {}
+
+    async def on_llm_start(
+        self, context: Any, agent: Any, system_prompt: str | None, input_items: Any
+    ) -> None:
+        span = start_model_span(self.config, self.parent)
+        self.open_model_span = span
+        if self.capture_content:
+            set_input_content_attributes(
+                span,
+                self.capture_content,
+                system_instructions=system_prompt,
+                messages=to_request_span_messages(input_items),
+                tool_definitions=to_tool_definitions(getattr(agent, "tools", []) or []),
+            )
+
+    async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
+        span = self.open_model_span
+        self.open_model_span = None
+        if span is None:
+            return
+        output = getattr(response, "output", None) or []
+        finish_reason = derive_finish_reason(output)
+        if self.capture_content:
+            set_output_content_attributes(
+                span,
+                self.capture_content,
+                to_response_span_messages(output, finish_reason),
+            )
+        usage = to_span_usage(getattr(response, "usage", None))
+        finish_model_span(span, self.config, usage, finish_reason)
+        self.run_usage.add(usage)
+
+    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+        call_id = getattr(context, "tool_call_id", None) or getattr(
+            tool, "name", "tool"
+        )
+        name = getattr(context, "tool_name", None) or getattr(tool, "name", "tool")
+        span = start_tool_span(str(name), str(call_id), self.parent)
+        if self.capture_content:
+            # `tool_arguments` is the raw JSON args string the model produced. Passed through as a
+            # string rather than parsed and re-serialised, per TELEMETRY-CONTRACT.md section 7: a
+            # string passes through unchanged.
+            args = getattr(context, "tool_arguments", None)
+            if args is not None:
+                set_tool_call_content_attributes(
+                    span, self.capture_content, arguments=args
+                )
+        self.open_tool_spans[str(call_id)] = span
+
+    async def on_tool_end(
+        self, context: Any, agent: Any, tool: Any, result: Any
+    ) -> None:
+        call_id = str(getattr(context, "tool_call_id", None))
+        span = self.open_tool_spans.pop(call_id, None)
+        if span is None:
+            return
+        if self.capture_content:
+            set_tool_call_content_attributes(span, self.capture_content, result=result)
+        succeed_span(span)
+
+    def close_open_spans(self, error: BaseException) -> None:
+        """Fails every span this run has open, for the crash path.
+
+        A tool handler's own exception, or the run raising for any other reason, propagates before
+        ``on_tool_end``/``on_llm_end`` ever fire, so those spans are still open when the caller's
+        ``except`` runs. Mirrors the TypeScript handler's ``attachToolSpanHooks(...).closeOpenSpans``.
+        """
+        for span in self.open_tool_spans.values():
+            fail_span(span, error)
+        self.open_tool_spans.clear()
+        if self.open_model_span is not None:
+            fail_span(self.open_model_span, error)
+            self.open_model_span = None
+
+    def abandon_open_spans(self, ended: set[int]) -> None:
+        """Ends every span this run has open, for stream abandonment.
+
+        Unlike :meth:`close_open_spans`, nothing failed: a consumer stopping early is normal.
+        ``end_span_once`` leaves each span at ``UNSET`` and marks ``launchdarkly.stream.abandoned``,
+        rather than recording an exception and setting ``ERROR``.
+        """
+        for span in self.open_tool_spans.values():
+            end_span_once(span, ended, abandoned=True)
+        self.open_tool_spans.clear()
+        if self.open_model_span is not None:
+            end_span_once(self.open_model_span, ended, abandoned=True)
+            self.open_model_span = None
 
 
-def create_openai_agent_handler() -> ProviderHandler:
-    """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK."""
-    tracer_name = "@launchdarkly/ai-openai-agents"
+def _usage_from_error(error: BaseException) -> SpanUsage | None:
+    """The run's spend at the point it raised, when the SDK attached one.
+
+    ``AgentsException`` carries ``run_data.context_wrapper.usage``, the same aggregate the success
+    path reads off ``result.state.usage``. The tokens a failed run already spent were really
+    billed, and the root is the only span a config-scoped cost query can find them on, so dropping
+    this would silently zero out a run that failed after several paid turns.
+
+    Read structurally rather than with a provider import: a tool handler's own error propagates
+    unwrapped and carries no ``run_data``, and that case has to yield ``None`` so nothing is
+    written, rather than asserting the run spent nothing.
+    """
+    run_data = getattr(error, "run_data", None)
+    if run_data is None:
+        return None
+    context_wrapper = getattr(run_data, "context_wrapper", None)
+    usage = getattr(context_wrapper, "usage", None) if context_wrapper else None
+    if usage is None:
+        return None
+    return to_span_usage(usage)
+
+
+def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
+    """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK.
+
+    Set *capture_content* to put prompts, model output, tool arguments and tool results on the
+    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
+    meaning models, token counts, timings and tool names, until a caller asks for more.
+    """
 
     async def _call_impl(
         config: AiConfigRep,
@@ -160,75 +334,51 @@ def create_openai_agent_handler() -> ProviderHandler:
         th = tool_handlers or {}
         vs = variables or {}
 
-        if _HAS_OTEL:
-            span = trace.get_tracer(tracer_name).start_span("openai.agent.run")
-            span.set_attribute("gen_ai.operation.name", "chat")
-            span.set_attribute("gen_ai.system", "openai")
-            span.set_attribute(
-                "gen_ai.request.model", config.get("model", {}).get("name", "")
-            )
-            set_ld_span_attributes(span, vs)
-        else:
-            span = None
+        span = start_root_span(config, vs)
+        parent = parent_context_of(span)
 
         agent, prompt, instructions = _build_agent_and_prompt(
             config, user_input, th, vs, history
         )
+        set_input_content_attributes(
+            span,
+            capture_content,
+            system_instructions=instructions,
+            messages=[text_message("user", prompt)],
+        )
 
-        if span:
-            prompt_text = (
-                f"system: {instructions}\n\n" if instructions else ""
-            ) + prompt
-            span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-            prompt_msgs: list[dict[str, str]] = []
-            if instructions:
-                prompt_msgs.append({"role": "system", "content": instructions})
-            prompt_msgs.append({"role": "user", "content": prompt})
-            set_openllmetry_prompt(span, prompt_msgs)
-
+        run_usage = create_run_usage()
+        hooks = _SpanningHooks(config, parent, capture_content, run_usage)
         try:
-            result = await Runner.run(agent, prompt)
+            result = await Runner.run(agent, prompt, hooks=hooks)
             final_output = result.final_output
-            input_tokens, output_tokens, total_tokens = _sum_usage(result.raw_responses)
-
-            if span:
-                span.set_attribute(
-                    "gen_ai.response.model", config.get("model", {}).get("name", "")
-                )
-                span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-                span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-                span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
-                span.add_event(
-                    "gen_ai.content.completion",
-                    {
-                        "gen_ai.completion": final_output
-                        if isinstance(final_output, str)
-                        else json.dumps(final_output)
-                    },
-                )
-                set_openllmetry_completion(
-                    span,
-                    final_output
-                    if isinstance(final_output, str)
-                    else json.dumps(final_output),
-                    {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                )
-                span.set_status(SpanStatusCode.OK)
-                span.end()
-
+            set_output_content_attributes(
+                span,
+                capture_content,
+                [text_message("assistant", _stringify_output(final_output))],
+            )
+            finish_root_span(span, config, run_usage.total)
+            succeed_span(span)
             output = (
-                final_output if config.get("outputFormat") else str(final_output or "")
+                final_output
+                if config.get("outputFormat")
+                else _stringify_output(final_output)
             )
             return {
                 "output": output,
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "usage": {
+                    "input_tokens": run_usage.total.input,
+                    "output_tokens": run_usage.total.output,
+                },
             }
-
         except Exception as exc:
-            if span:
-                span.record_exception(exc)
-                span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            hooks.close_open_spans(exc)
+            spent = _usage_from_error(exc)
+            if spent is not None:
+                run_usage.add(spent)
+            if run_usage.reported:
+                finish_root_span(span, config, run_usage.total)
+            fail_span(span, exc)
             raise
 
     def _stream_impl(
@@ -239,10 +389,26 @@ def create_openai_agent_handler() -> ProviderHandler:
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         return _stream_gen(
-            config, user_input, tool_handlers or {}, variables or {}, history
+            config,
+            user_input,
+            tool_handlers or {},
+            variables or {},
+            history,
+            capture_content=capture_content,
         )
 
     return create_handler(("OpenAI", "agent"), _call_impl, _stream_impl)  # type: ignore[arg-type]
+
+
+def _stringify_output(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 async def _stream_gen(
@@ -251,39 +417,45 @@ async def _stream_gen(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
+    *,
+    capture_content: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
+    """Streams the run, emitting the same span tree as the blocking path.
+
+    A consumer that breaks out of ``async for``, or raises inside the loop body, makes this
+    generator run its ``finally`` without ever entering ``except``: ``GeneratorExit`` inherits from
+    ``BaseException``, so ``except Exception`` does not see it. Without the cleanup in ``finally``
+    the root span, and any still-open ``chat``/``execute_tool`` span, would never be ended.
+
+    Ending the spans is not the whole story here: the ``Runner.run_streamed`` background task keeps
+    the agent run going, and spending tokens, after a consumer stops reading. ``finally`` also
+    cancels the streamed run itself, mirroring the TypeScript handler's ``AbortController``.
+    """
     import importlib
 
     agents_mod = importlib.import_module("agents")
     Runner = agents_mod.Runner
 
-    tracer_name = "@launchdarkly/ai-openai-agents"
-    if _HAS_OTEL:
-        span = trace.get_tracer(tracer_name).start_span("openai.agent.run.stream")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute("gen_ai.system", "openai")
-        span.set_attribute(
-            "gen_ai.request.model", config.get("model", {}).get("name", "")
-        )
-        set_ld_span_attributes(span, variables)
-    else:
-        span = None
+    span = start_root_span(config, variables)
+    parent = parent_context_of(span)
 
     agent, prompt, instructions = _build_agent_and_prompt(
         config, user_input, tool_handlers, variables, history
     )
+    set_input_content_attributes(
+        span,
+        capture_content,
+        system_instructions=instructions,
+        messages=[text_message("user", prompt)],
+    )
 
-    if span:
-        prompt_text = (f"system: {instructions}\n\n" if instructions else "") + prompt
-        span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-        prompt_msgs: list[dict[str, str]] = []
-        if instructions:
-            prompt_msgs.append({"role": "system", "content": instructions})
-        prompt_msgs.append({"role": "user", "content": prompt})
-        set_openllmetry_prompt(span, prompt_msgs)
+    ended: set[int] = set()
+    run_usage = create_run_usage()
+    hooks = _SpanningHooks(config, parent, capture_content, run_usage)
+    streamed: Any = None
 
     try:
-        streamed = Runner.run_streamed(agent, prompt)
+        streamed = Runner.run_streamed(agent, prompt, hooks=hooks)
         full_output = ""
 
         async for event in streamed.stream_events():
@@ -298,46 +470,52 @@ async def _stream_gen(
                         yield {"type": "chunk", "text": delta}
                         full_output += delta
 
-        input_tokens, output_tokens, total_tokens = _sum_usage(streamed.raw_responses)
-        final_output = streamed.final_output or full_output
+        final_output = streamed.final_output
+        output = (
+            _stringify_output(final_output) if final_output is not None else full_output
+        )
 
-        if span:
-            span.set_attribute(
-                "gen_ai.response.model", config.get("model", {}).get("name", "")
-            )
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-            span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
-            span.add_event(
-                "gen_ai.content.completion",
-                {
-                    "gen_ai.completion": str(final_output)
-                    if isinstance(final_output, str)
-                    else json.dumps(final_output)
-                },
-            )
-            set_openllmetry_completion(
-                span,
-                str(final_output)
-                if isinstance(final_output, str)
-                else json.dumps(final_output),
-                {"input_tokens": input_tokens, "output_tokens": output_tokens},
-            )
-            span.set_status(SpanStatusCode.OK)
-            span.end()
+        set_output_content_attributes(
+            span, capture_content, [text_message("assistant", output)]
+        )
+        finish_root_span(span, config, run_usage.total)
+        mark_ok(span)
+        end_span_once(span, ended)
 
         yield {
             "type": "done",
-            "output": str(final_output),
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "output": output,
+            "usage": {
+                "input_tokens": run_usage.total.input,
+                "output_tokens": run_usage.total.output,
+            },
         }
 
     except Exception as exc:
-        if span:
-            span.record_exception(exc)
-            span.set_status(SpanStatusCode.ERROR, str(exc))
-            span.end()
+        hooks.close_open_spans(exc)
+        spent = _usage_from_error(exc)
+        if spent is not None:
+            run_usage.add(spent)
+        if run_usage.reported:
+            finish_root_span(span, config, run_usage.total)
+        fail_span(span, exc, ended)
         raise
+    finally:
+        # A no-op on the success and failure paths: both already ended their spans through
+        # `ended`. On abandonment it is the only chance to close the tree, and the only chance to
+        # stop the vendor's run — breaking out of `async for` above only stops us reading; the
+        # Runner's own background task keeps calling the model and spending tokens until told to
+        # stop.
+        if span is not None and id(span) not in ended:
+            hooks.abandon_open_spans(ended)
+            if streamed is not None:
+                try:
+                    streamed.cancel()
+                except Exception:  # pragma: no cover - best-effort teardown
+                    pass
+            if run_usage.reported:
+                finish_root_span(span, config, run_usage.total)
+        end_span_once(span, ended, abandoned=True)
 
 
 def openai_agents(
