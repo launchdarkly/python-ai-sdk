@@ -15,6 +15,7 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 
 import launchdarkly_ai_langchain_agents.handler as handler_mod
+import launchdarkly_ai_langchain_agents.spans as spans_mod
 from launchdarkly_ai_langchain_agents.handler import (
     _build_initial_messages,
     _extract_system_prompt,
@@ -147,7 +148,7 @@ class TestAgentCreationAPI:
             return __import__(name)
 
         with patch("importlib.import_module", side_effect=_import_side_effect):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_langchain_agents_handler(llm=MagicMock())
                 await h(_make_config(instructions="Be helpful."), "hi")
 
@@ -1107,7 +1108,7 @@ class TestErrorHandling:
         mocks["_agent"].ainvoke = AsyncMock(side_effect=RuntimeError("specific error"))
 
         with _patch_lc(mocks):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_langchain_agents_handler(llm=MagicMock())
                 with pytest.raises(RuntimeError, match="specific error"):
                     await h(_make_config(), "hi")
@@ -1135,7 +1136,6 @@ class TestConvenienceExport:
         assert "context" in sig.parameters
 
     def test_config_key_forwarded_as_key(self) -> None:
-        import launchdarkly_ai_langchain_agents.handler as handler_mod
 
         mock_config_instance = MagicMock()
         mock_config_fn = MagicMock(return_value=mock_config_instance)
@@ -1158,7 +1158,6 @@ class TestConvenienceExport:
         )
 
     def test_callable_without_extra_kwargs(self) -> None:
-        import launchdarkly_ai_langchain_agents.handler as handler_mod
 
         mock_config_instance = MagicMock()
         mock_config_fn = MagicMock(return_value=mock_config_instance)
@@ -1199,7 +1198,7 @@ class TestStreaming:
         mocks["_agent"].astream = _mock_astream
 
         with _patch_lc(mocks):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_langchain_agents_handler(llm=MagicMock())
                 gen = await h.stream(_make_config(), "hi")
                 assert inspect.isasyncgen(gen) or hasattr(gen, "__aiter__")
@@ -1215,7 +1214,7 @@ class TestStreaming:
         mocks["_agent"].astream = _mock_astream
 
         with _patch_lc(mocks):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_langchain_agents_handler(llm=MagicMock())
                 events = [e async for e in await h.stream(_make_config(), "hi")]
 
@@ -1233,7 +1232,7 @@ class TestStreaming:
         mocks["_agent"].astream = _bad_astream
 
         with _patch_lc(mocks):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_langchain_agents_handler(llm=MagicMock())
                 with pytest.raises(RuntimeError, match="stream fail"):
                     async for _ in await h.stream(_make_config(), "hi"):
@@ -1376,7 +1375,7 @@ class TestOutputFormat:
     async def test_absent_output_format_no_change(self) -> None:
         mocks = _make_langchain_mock()
         with _patch_lc(mocks):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_langchain_agents_handler(
                     llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
                 )
@@ -1397,7 +1396,7 @@ class TestOutputFormat:
         )
 
         with _patch_lc(mocks):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_langchain_agents_handler(
                     llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
                 )
@@ -1567,7 +1566,6 @@ class TestConvenienceWrapperForwardsCaptureContent:
     """
 
     def _run(self, **kwargs: Any) -> dict[str, Any]:
-        import launchdarkly_ai_langchain_agents.handler as handler_mod
 
         seen: dict[str, Any] = {}
 
