@@ -1,0 +1,396 @@
+"""Cross-handler invariants: the six handlers must agree with each other.
+
+Every handler package tests its own spans. Nothing tested that the six agree, and that is exactly
+how they drifted apart: each was correct on its own terms while a single run emitted `chat` spans
+that disagreed about what a finish reason or a cached token was.
+
+These tests are the oracle for that. They live outside the packages because no package can own an
+invariant about all six.
+
+There are two kinds of check here.
+
+The shape checks call each package's span constructors directly, with a recording tracer, so they
+need no provider mocks and cannot be fooled by a handler that never reaches its own span code.
+
+The vocabulary lock reads every span attribute literal out of the source and compares it to a
+committed set. It fails whenever a key is added, removed or renamed anywhere in the SDK. That is
+deliberate: an attribute is a public contract with whatever reads the traces, and changing one
+should require editing this list and saying why in the commit.
+
+See TELEMETRY-CONTRACT.md.
+"""
+
+from __future__ import annotations
+
+import importlib
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: Package directory to the module that holds its span construction.
+HANDLERS: dict[str, str] = {
+    "claude-messages": "launchdarkly_ai_claude_messages.spans",
+    "claude-agents": "launchdarkly_ai_claude_agents.spans",
+    "openai-messages": "launchdarkly_ai_openai_messages.spans",
+    "openai-agents": "launchdarkly_ai_openai_agents.spans",
+    "langchain-messages": "launchdarkly_ai_langchain_messages.spans",
+    "langchain-agents": "launchdarkly_ai_langchain_agents.spans",
+}
+
+#: `claude-agents` builds its `chat` span inside an inference tracker rather than in a standalone
+#: function, because the Claude Agent SDK reports each inference as it streams rather than returning
+#: one response per turn. The span it produces is still `chat {model}`; only the call site differs.
+NO_STANDALONE_MODEL_SPAN = {"claude-agents"}
+
+CONFIG: dict[str, Any] = {
+    "model": {"name": "test-model-1"},
+    "provider": {"name": "Anthropic"},
+    "instructions": "Be helpful.",
+}
+
+LD_VARIABLES: dict[str, Any] = {
+    "__ld": {
+        "configKey": "cfg",
+        "variationKey": "var",
+        "runId": "run-1",
+        "graphKey": "graph-1",
+        "environmentId": "env-1",
+    }
+}
+
+
+class RecordedSpan:
+    def __init__(self, name: str, context: Any = None) -> None:
+        self.name = name
+        self.context = context
+        self.attributes: dict[str, Any] = {}
+        self.events: list[str] = []
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+    def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
+        self.events.append(name)
+
+    def set_status(self, code: Any, description: str | None = None) -> None:
+        pass
+
+    def record_exception(self, exc: BaseException) -> None:
+        pass
+
+    def end(self) -> None:
+        pass
+
+
+class RecordingTracer:
+    """Stands in for the `trace` module inside a package's spans module."""
+
+    def __init__(self) -> None:
+        self.spans: list[RecordedSpan] = []
+
+    def get_tracer(self, name: str) -> RecordingTracer:
+        return self
+
+    def start_span(self, name: str, context: Any = None) -> RecordedSpan:
+        span = RecordedSpan(name, context)
+        self.spans.append(span)
+        return span
+
+    def set_span_in_context(self, span: RecordedSpan) -> Any:
+        return ("context-of", span)
+
+
+@pytest.fixture(params=sorted(HANDLERS), ids=sorted(HANDLERS))
+def handler_spans(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """Each package's spans module, with its tracer replaced by a recorder."""
+    package = request.param
+    module = importlib.import_module(HANDLERS[package])
+    tracer = RecordingTracer()
+    monkeypatch.setattr(module, "trace", tracer)
+    return package, module, tracer
+
+
+# ─── The surface every handler must expose ───────────────────────────────────
+
+REQUIRED_FUNCTIONS = (
+    "model_name",
+    "start_root_span",
+    "parent_context_of",
+    "start_tool_span",
+    "finish_root_span",
+    "succeed_span",
+    "mark_ok",
+    "fail_span",
+)
+
+
+class TestSharedSurface:
+    def test_every_package_exposes_the_same_span_functions(
+        self, handler_spans: Any
+    ) -> None:
+        package, module, _ = handler_spans
+        missing = [name for name in REQUIRED_FUNCTIONS if not hasattr(module, name)]
+        assert missing == [], f"{package} is missing {missing}"
+
+    def test_every_package_has_a_model_span_constructor(
+        self, handler_spans: Any
+    ) -> None:
+        package, module, _ = handler_spans
+        if package in NO_STANDALONE_MODEL_SPAN:
+            pytest.skip(f"{package} builds its chat span inside an inference tracker")
+        assert hasattr(module, "start_model_span")
+
+
+# ─── Span names ──────────────────────────────────────────────────────────────
+
+
+class TestSpanNames:
+    def test_the_root_span_is_always_named_invoke_agent(
+        self, handler_spans: Any
+    ) -> None:
+        _, module, tracer = handler_spans
+        module.start_root_span(CONFIG, {})
+        assert tracer.spans[0].name == "invoke_agent"
+
+    def test_the_root_span_always_declares_its_operation(
+        self, handler_spans: Any
+    ) -> None:
+        _, module, tracer = handler_spans
+        module.start_root_span(CONFIG, {})
+        assert tracer.spans[0].attributes["gen_ai.operation.name"] == "invoke_agent"
+
+    def test_the_model_span_is_always_chat_plus_the_model(
+        self, handler_spans: Any
+    ) -> None:
+        # The semantic conventions name an inference span `{operation} {model}`. A handler that
+        # emitted a bare `chat` would aggregate more neatly and tell a reader nothing.
+        package, module, tracer = handler_spans
+        if package in NO_STANDALONE_MODEL_SPAN:
+            pytest.skip(f"{package} builds its chat span inside an inference tracker")
+        module.start_model_span(CONFIG, None)
+        assert tracer.spans[0].name == "chat test-model-1"
+        assert tracer.spans[0].attributes["gen_ai.operation.name"] == "chat"
+
+    def test_the_tool_span_is_always_execute_tool_plus_the_name(
+        self, handler_spans: Any
+    ) -> None:
+        _, module, tracer = handler_spans
+        module.start_tool_span("get_weather", "call-1", None)
+        span = tracer.spans[0]
+        assert span.name == "execute_tool get_weather"
+        assert span.attributes["gen_ai.operation.name"] == "execute_tool"
+        assert span.attributes["gen_ai.tool.name"] == "get_weather"
+        assert span.attributes["gen_ai.tool.call.id"] == "call-1"
+
+
+# ─── Where the LaunchDarkly identity lives ───────────────────────────────────
+
+LD_ROOT_ATTRIBUTES = (
+    "launchdarkly.operation.type",
+    "launchdarkly.config.key",
+    "launchdarkly.variation.key",
+    "launchdarkly.run.id",
+    "launchdarkly.graph.key",
+)
+
+
+class TestLaunchDarklyIdentity:
+    def test_the_root_carries_the_full_launchdarkly_identity(
+        self, handler_spans: Any
+    ) -> None:
+        _, module, tracer = handler_spans
+        module.start_root_span(CONFIG, LD_VARIABLES)
+        attrs = tracer.spans[0].attributes
+        missing = [k for k in LD_ROOT_ATTRIBUTES if k not in attrs]
+        assert missing == []
+
+    def test_the_root_emits_the_feature_flag_event(self, handler_spans: Any) -> None:
+        # The AI Config Monitoring traces tab finds a run through this event, not an attribute.
+        _, module, tracer = handler_spans
+        module.start_root_span(CONFIG, LD_VARIABLES)
+        assert "feature_flag" in tracer.spans[0].events
+
+    def test_a_tool_span_carries_no_launchdarkly_identity(
+        self, handler_spans: Any
+    ) -> None:
+        # The root is the only span a config-scoped query finds. Duplicating the identity onto
+        # children makes one run look like several.
+        _, module, tracer = handler_spans
+        module.start_tool_span("get_weather", "call-1", None)
+        span = tracer.spans[0]
+        assert [k for k in span.attributes if k.startswith("launchdarkly.")] == []
+        assert "feature_flag" not in span.events
+
+    def test_a_model_span_carries_no_launchdarkly_identity(
+        self, handler_spans: Any
+    ) -> None:
+        package, module, tracer = handler_spans
+        if package in NO_STANDALONE_MODEL_SPAN:
+            pytest.skip(f"{package} builds its chat span inside an inference tracker")
+        module.start_model_span(CONFIG, None)
+        span = tracer.spans[0]
+        assert [k for k in span.attributes if k.startswith("launchdarkly.")] == []
+        assert "feature_flag" not in span.events
+
+
+# ─── Model identity ──────────────────────────────────────────────────────────
+
+
+class TestModelIdentity:
+    def test_the_root_writes_both_provider_keys_and_the_request_model(
+        self, handler_spans: Any
+    ) -> None:
+        # `gen_ai.system` is the pre-1.37 name and `gen_ai.provider.name` the current one. Emitting
+        # only one of them either breaks old dashboards or leaves the SDK off-spec.
+        _, module, tracer = handler_spans
+        module.start_root_span(CONFIG, {})
+        attrs = tracer.spans[0].attributes
+        assert "gen_ai.system" in attrs
+        assert "gen_ai.provider.name" in attrs
+        assert attrs["gen_ai.request.model"] == "test-model-1"
+
+    def test_the_langchain_handlers_keep_the_framework_on_the_legacy_key(
+        self, handler_spans: Any
+    ) -> None:
+        # `gen_ai.provider.name` names who served the model, and its enum has no `langchain`
+        # member, so the framework name stays on the older key.
+        package, module, tracer = handler_spans
+        if not package.startswith("langchain-"):
+            pytest.skip("only the LangChain handlers split the two keys")
+        module.start_root_span(CONFIG, {})
+        attrs = tracer.spans[0].attributes
+        assert attrs["gen_ai.system"] == "langchain"
+        assert attrs["gen_ai.provider.name"] == "anthropic"
+
+    def test_the_langchain_provider_name_is_binary_not_a_passthrough(
+        self, handler_spans: Any
+    ) -> None:
+        # Anything that is not Anthropic is served by the OpenAI client, so the attribute follows the
+        # client actually instantiated rather than whatever the config happens to name.
+        package, module, _ = handler_spans
+        if not package.startswith("langchain-"):
+            pytest.skip("only the LangChain handlers make this choice")
+        for configured, expected in (
+            ("Anthropic", "anthropic"),
+            ("OpenAI", "openai"),
+            ("Bedrock", "openai"),
+            ("Azure", "openai"),
+            ("", "openai"),
+        ):
+            config = {**CONFIG, "provider": {"name": configured}}
+            assert module.serving_provider(config) == expected, configured
+
+
+# ─── The vocabulary lock ─────────────────────────────────────────────────────
+
+#: Every span attribute key, event name and naming template the SDK emits.
+#:
+#: Locked on purpose. An attribute is a public contract with whatever reads the traces, so adding,
+#: removing or renaming one should mean editing this list and saying why in the commit message.
+#:
+#: Derived from the TypeScript SDK at 5178db1 and verified to match it exactly.
+EXPECTED_VOCABULARY = {
+    # Operation and identity
+    "gen_ai.operation.name",
+    "gen_ai.system",
+    "gen_ai.provider.name",
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "gen_ai.response.id",
+    "gen_ai.response.finish_reasons",
+    "gen_ai.agent.name",
+    "gen_ai.conversation.id",
+    # Usage
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.total_tokens",
+    "gen_ai.usage.cache_read.input_tokens",
+    "gen_ai.usage.cache_creation.input_tokens",
+    "gen_ai.usage.prompt_tokens",
+    "gen_ai.usage.completion_tokens",
+    # Content, canonical
+    "gen_ai.system_instructions",
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+    "gen_ai.tool.definitions",
+    # Content, OpenLLMetry
+    "gen_ai.prompt",
+    "gen_ai.completion",
+    "gen_ai.completion.0.role",
+    "gen_ai.completion.0.content",
+    # Tool calls
+    "gen_ai.tool.name",
+    "gen_ai.tool.call.id",
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.result",
+    # Content events
+    "gen_ai.content.prompt",
+    "gen_ai.content.completion",
+    # LaunchDarkly
+    "launchdarkly.operation.type",
+    "launchdarkly.config.key",
+    "launchdarkly.variation.key",
+    "launchdarkly.run.id",
+    "launchdarkly.graph.key",
+    "launchdarkly.stream.abandoned",
+    "feature_flag",
+    "feature_flag.key",
+    "feature_flag.provider.name",
+    "feature_flag.set.id",
+    # Graph spans, unchanged from before the span work
+    "ld.ai.graph",
+    "ld.ai.graph.key",
+    "ld.ai.graph.path",
+}
+
+_KEY_PATTERN = re.compile(
+    r'set_attribute\(\s*f?"([^"{]+)"'
+    r'|add_event\(\s*"([^"]+)"'
+    r'|start_span\(\s*"(ld\.ai\.graph)"'
+    r'|"(gen_ai\.[a-z_.0-9]+)"'
+    r'|f"(gen_ai\.[a-z_.]+)\.\{'
+    # The feature_flag event's own attributes are built as a plain dict before being handed to
+    # add_event, so they never appear inside a set_attribute call.
+    r'|"(feature_flag\.[a-z_.]+)"'
+)
+
+
+def _emitted_vocabulary() -> set[str]:
+    """Every attribute key, event name and template found in the package sources."""
+    found: set[str] = set()
+    for path in (REPO_ROOT / "packages").glob("*/src/*/*.py"):
+        for match in _KEY_PATTERN.finditer(path.read_text()):
+            key = next((g for g in match.groups() if g), None)
+            if key and key.split(".")[0] in (
+                "gen_ai",
+                "launchdarkly",
+                "feature_flag",
+                "ld",
+            ):
+                found.add(key)
+    return found
+
+
+class TestVocabularyLock:
+    def test_the_sdk_emits_no_key_this_list_does_not_know_about(self) -> None:
+        unexpected = _emitted_vocabulary() - EXPECTED_VOCABULARY
+        assert unexpected == set(), (
+            "New span attribute keys found. If this is deliberate, add them to "
+            "EXPECTED_VOCABULARY and say why in the commit message. If the two SDKs should agree, "
+            "add the key to the TypeScript SDK in the same change."
+        )
+
+    def test_every_key_this_list_names_is_still_emitted(self) -> None:
+        # Catches a key silently disappearing, which is how a dashboard goes blank without anything
+        # failing.
+        emitted = _emitted_vocabulary()
+        # `gen_ai.prompt.{i}` and `gen_ai.completion.{i}` are written by template, so the base names
+        # appear rather than the indexed forms.
+        missing = EXPECTED_VOCABULARY - emitted
+        assert missing == set(), f"keys no longer emitted anywhere: {sorted(missing)}"
