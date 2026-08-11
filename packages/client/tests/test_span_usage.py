@@ -22,6 +22,7 @@ from launchdarkly_ai_server.utils import (
     parse_usage,
     set_model_identity_attributes,
     set_usage_span_attributes,
+    to_usage_dict,
 )
 
 
@@ -380,3 +381,60 @@ class TestEndSpanOnce:
         end_span_once(span, tracker)
         end_span_once(span, tracker)
         assert span.ended == 1
+
+
+# ─── to_usage_dict ───────────────────────────────────────────────────────────
+
+
+class TestToUsageDict:
+    """The public UsageDict must carry everything parse_usage reported.
+
+    Both call sites used to build the dataclass by hand from three keys, so the cache breakdown
+    vanished the moment parse_usage started reporting one: a caller reading input_details off a
+    blocking call got None while the streaming path handed back the nested dict.
+    """
+
+    def test_carries_the_three_totals(self) -> None:
+        usage = to_usage_dict({"input": 10, "output": 5, "total": 15})
+        assert (usage.input, usage.output, usage.total) == (10, 5, 15)
+
+    def test_carries_the_cache_breakdown_when_present(self) -> None:
+        usage = to_usage_dict(
+            {
+                "input": 23554,
+                "output": 10,
+                "total": 23564,
+                "input_details": {
+                    "uncached": 3,
+                    "cache_read": 19971,
+                    "cache_creation": 3580,
+                },
+            }
+        )
+        assert usage.input_details is not None
+        assert usage.input_details.uncached == 3
+        assert usage.input_details.cache_read == 19971
+        assert usage.input_details.cache_creation == 3580
+
+    def test_is_none_when_the_provider_reported_no_cache(self) -> None:
+        assert (
+            to_usage_dict({"input": 1, "output": 2, "total": 3}).input_details is None
+        )
+
+    def test_round_trips_a_parse_usage_result(self) -> None:
+        # The two functions are used together, so pin them together.
+        raw = {
+            "input_tokens": 3,
+            "output_tokens": 10,
+            "cache_read_input_tokens": 19971,
+            "cache_creation_input_tokens": 3580,
+        }
+        usage = to_usage_dict(parse_usage(raw))
+        assert usage.input == 23554
+        assert usage.input_details is not None
+        assert usage.input_details.cache_read == 19971
+
+    def test_a_missing_field_defaults_rather_than_raising(self) -> None:
+        usage = to_usage_dict({})
+        assert (usage.input, usage.output, usage.total) == (0, 0, 0)
+        assert usage.input_details is None

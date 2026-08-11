@@ -13,7 +13,6 @@ from .types import (
     NativeTool,
     ProviderHandler,
     TrackData,
-    UsageDict,
 )
 from .utils import (
     collapse_messages_to_instructions as _collapse_messages_to_instructions,
@@ -22,6 +21,7 @@ from .utils import (
     normalize_mode,
     parse_json_with_possible_fences,
     to_ld_context,
+    to_usage_dict,
 )
 
 
@@ -409,11 +409,7 @@ async def run_judge(
     reasoning = parsed.get("reasoning", "")
     raw_usage = result["usage"]
 
-    usage = UsageDict(
-        input=raw_usage.get("input", 0),
-        output=raw_usage.get("output", 0),
-        total=raw_usage.get("total", 0),
-    )
+    usage = to_usage_dict(raw_usage)
 
     merged_track_data: TrackData = {
         **task.parent_track_data,

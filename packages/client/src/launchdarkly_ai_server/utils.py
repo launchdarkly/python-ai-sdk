@@ -8,7 +8,9 @@ from typing import Any, Literal
 from .types import (
     AiConfigRep,
     GraphNode,
+    InputTokenDetails,
     ProviderHandler,
+    UsageDict,
     VariationMeta,
     _HandlerFn,
     _StreamFn,
@@ -140,6 +142,31 @@ def parse_usage(usage: dict[str, Any]) -> dict[str, Any]:
                 }
             return result
     return {"input": 0, "output": 0, "total": 0}
+
+
+def to_usage_dict(usage: dict[str, Any]) -> UsageDict:
+    """Builds the public :class:`UsageDict` from a :func:`parse_usage` result.
+
+    Shared because ``invoke`` and the judge runner both need it and both used to build the dataclass
+    by hand from three keys, which silently dropped the cache breakdown the moment ``parse_usage``
+    started reporting one. A caller reading ``input_details`` off a blocking call got ``None`` while
+    the streaming path handed back the nested dict, so the two paths disagreed about the same run.
+    """
+    details = usage.get("input_details")
+    return UsageDict(
+        input=usage.get("input", 0),
+        output=usage.get("output", 0),
+        total=usage.get("total", 0),
+        input_details=(
+            InputTokenDetails(
+                uncached=details.get("uncached", 0),
+                cache_read=details.get("cache_read", 0),
+                cache_creation=details.get("cache_creation", 0),
+            )
+            if isinstance(details, dict)
+            else None
+        ),
+    )
 
 
 @dataclass

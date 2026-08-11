@@ -76,6 +76,7 @@ from .utils import (
     set_openllmetry_prompt,
     set_usage_span_attributes,
     to_ld_context,
+    to_usage_dict,
 )
 
 __all__ = [  # noqa: RUF022
@@ -121,6 +122,7 @@ __all__ = [  # noqa: RUF022
     "number_or_zero",
     "set_model_identity_attributes",
     "set_usage_span_attributes",
+    "to_usage_dict",
     "VariationMeta",
     # utils
     "create_handler",
