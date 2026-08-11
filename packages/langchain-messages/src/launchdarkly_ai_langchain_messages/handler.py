@@ -356,8 +356,14 @@ def create_langchain_messages_handler(
 
             # For OpenAI models with both outputFormat and tools: bind response_format so the
             # final text response is structured JSON. The client layer parses the returned string.
+            #
+            # When this binding applies, the tool loop's own final reply is already structured, so
+            # the structured follow-up turn below must not run: it would discard that reply, bill a
+            # second turn, and leave the two strategies fighting over the same output.
+            format_is_bound = False
             bound_model = base_model
             if output_format and tool_defs and is_openai:
+                format_is_bound = True
                 bound_model = base_model.bind(
                     response_format={
                         "type": "json_schema",
@@ -414,7 +420,10 @@ def create_langchain_messages_handler(
                 run_usage.add(lang_chain_span_usage(usage))
 
                 if not tool_calls:
-                    if output_format:
+                    # Only when response_format was not already bound above. Anthropic and any other
+                    # non-OpenAI provider reach the model through this second turn, because binding
+                    # response_format is an OpenAI-only mechanism.
+                    if output_format and not format_is_bound:
                         output = await _run_structured_turn(
                             base_model,
                             config,
@@ -613,6 +622,7 @@ async def _stream_gen(
             # the terminal chunk reports it, and dropping it would make the streaming span omit a
             # finish reason where the blocking path emits the real one.
             finish_reasons: list[str] | None = None
+            usage_reported = False
 
             try:
                 chunk_stream = tool_model.astream(conversation_messages)
@@ -624,6 +634,7 @@ async def _stream_gen(
                         accumulated_content += text
                     usage = getattr(chunk, "usage_metadata", None)
                     if usage:
+                        usage_reported = True
                         details = usage.get("input_token_details") or {}
                         turn_usage.input += number_or_zero(usage.get("input_tokens"))
                         turn_usage.output += number_or_zero(usage.get("output_tokens"))
@@ -661,7 +672,13 @@ async def _stream_gen(
             # The already-mapped figures, not a bag rebuilt from them: this path summed the chunks
             # into a SpanUsage to begin with, so re-parsing its own output would be a round trip
             # whose only effect is another chance to disagree with itself.
-            run_usage.add(turn_usage)
+            #
+            # Only when a chunk actually carried usage. Adding unconditionally marks the run as
+            # having reported, so a later failure or abandonment writes all-zero totals on the root
+            # and claims the run cost nothing, which is the one thing `reported` exists to prevent.
+            # The blocking path gets this for free, because lang_chain_span_usage returns None for a
+            # bag the provider never filled.
+            run_usage.add(turn_usage if usage_reported else None)
 
             if not accumulated_tool_calls:
                 full_output = (full_output or "") + accumulated_content

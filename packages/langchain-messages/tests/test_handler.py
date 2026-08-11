@@ -1468,3 +1468,74 @@ class TestHistory:
         call_args = llm.ainvoke.call_args[0][0]
         contents = [str(getattr(m, "content", "")) for m in call_args]
         assert "ignored" not in contents
+
+
+# ---------------------------------------------------------------------------
+# TELEMETRY-CONTRACT.md section 6: reported is not the same as reported zero
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingUsageReported:
+    """A stream whose chunks carried no usage must not mark the run as having reported.
+
+    Adding an all-zero turn to the accumulator makes a later failure or abandonment write all-zero
+    totals on the root, which asserts the run cost nothing. That is a different claim from "unknown",
+    and it is the one thing the reported flag exists to prevent. The blocking path gets this for
+    free, because `lang_chain_span_usage` returns None for a bag the provider never filled.
+    """
+
+    def _two_turn_llm(self, *, first_turn_usage: bool) -> MagicMock:
+        """One turn that completes with a tool call, then a second turn that dies.
+
+        The first turn is what puts something in the accumulator. Whether it carried usage is the
+        variable under test, and a turn that dies mid-iteration never reaches the accumulator at
+        all, which is why a single failing turn cannot exercise this.
+        """
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        state = {"turn": 0}
+
+        async def _astream(msgs: Any) -> AsyncGenerator[Any, None]:
+            state["turn"] += 1
+            if state["turn"] == 1:
+                msg = FakeAIMessage(
+                    "calling",
+                    tool_calls=[{"name": "search", "id": "c1", "args": {}}],
+                    input_tokens=12,
+                    output_tokens=3,
+                )
+                if not first_turn_usage:
+                    msg.usage_metadata = None
+                yield msg
+                return
+            raise RuntimeError("second turn died")
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        return llm
+
+    async def test_a_completed_turn_with_no_usage_does_not_mark_reported(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        ctx, rec = _recording()
+        llm = self._two_turn_llm(first_turn_usage=False)
+        with ctx, pytest.raises(RuntimeError):
+            async for _ in await create_langchain_messages_handler(llm=llm).stream(
+                CONFIG, "q", {"search": lambda _: "ok"}
+            ):
+                pass
+        # Zeros here would assert the run cost nothing. It is unknown, so nothing is written.
+        assert "gen_ai.usage.input_tokens" not in rec.root.attributes
+
+    async def test_a_completed_turn_with_usage_still_reaches_the_root(self) -> None:
+        # The guard must not cost the run its real numbers.
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        ctx, rec = _recording()
+        llm = self._two_turn_llm(first_turn_usage=True)
+        with ctx, pytest.raises(RuntimeError):
+            async for _ in await create_langchain_messages_handler(llm=llm).stream(
+                CONFIG, "q", {"search": lambda _: "ok"}
+            ):
+                pass
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 12
