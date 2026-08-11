@@ -80,7 +80,7 @@ able to tell from the trace which path ran.
 | `gen_ai.operation.name` | `invoke_agent` | Literal. Set explicitly, not derived from the span name. |
 | `gen_ai.system` | provider name, or `langchain` on the two LangChain handlers | `set_model_identity_attributes` |
 | `gen_ai.provider.name` | the real provider name, always | `set_model_identity_attributes` |
-| `gen_ai.request.model` | requested model name | `set_model_identity_attributes` |
+| `gen_ai.request.model` | requested model name, except on `claude-agents`. See section 2a | `set_model_identity_attributes` |
 | `gen_ai.response.model` | see section 2a. It differs by handler | `finish_root_span` |
 | `gen_ai.usage.input_tokens` | run total | `set_usage_span_attributes` |
 | `gen_ai.usage.output_tokens` | run total | `set_usage_span_attributes` |
@@ -134,6 +134,18 @@ response, and one other reports a real per-turn model. Copy this table exactly.
 So four of the six handlers write the requested name everywhere, and section 3's table must be
 read through this one.
 
+### `gen_ai.request.model` has one exception too
+
+Five handlers write the requested name, which is what the caller asked for.
+
+`claude-agents` writes the model the inference actually used, on its `chat` span, the same value it
+writes to `gen_ai.response.model`. That is deliberate in the TypeScript source, which says the two
+must not disagree: the CLI reports the model it really ran, and this handler has no separate
+requested name per turn to report. Its root span still writes the requested name.
+
+An earlier draft of this file claimed the requested name for all six, which reads as a defect in the
+handler rather than in this document.
+
 Do not "fix" `openai-agents` to resolve the answering model. It never has, no test pins it, and
 adding it invents behaviour the TypeScript SDK does not have. The reason `openai-messages` differs
 is that OpenAI resolves an alias such as `gpt-4o` to a dated snapshot and that handler has the
@@ -154,6 +166,9 @@ resolved value to hand.
 | the seven `gen_ai.usage.*` keys | this turn's counts, not the run total |
 
 On success, set the span status to OK and end it. On failure, see section 6.
+
+On `claude-agents`, `gen_ai.request.model` is the model the turn actually used rather than the
+requested name. See section 2a.
 
 `claude-agents` sets three more, each only when the Claude Agent SDK reports it:
 
