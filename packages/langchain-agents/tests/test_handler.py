@@ -1651,3 +1651,33 @@ class TestCallbackSpansNeverLeak:
             bundle.abandon_open_spans(set())
 
         assert recorder.named("execute_tool ")[0].ended == 1
+
+
+class TestModelSpanTrackedBeforeContent:
+    """`_start_model` must insert the span before writing content that can raise.
+
+    A span created but never inserted is unreachable by close_open_spans, abandon_open_spans and the
+    end callbacks alike, so it never ends and never exports. `on_tool_start` already had this fix.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_raise_while_writing_input_still_leaves_the_span_reachable(
+        self,
+    ) -> None:
+        import launchdarkly_ai_langchain_agents.spans as spans_mod
+        from launchdarkly_ai_langchain_agents.spans import build_span_callbacks
+
+        class _Exploding:
+            def _get_type(self) -> str:
+                raise TypeError("cannot narrow this message")
+
+        recorder = SpanRecorder()
+        with patch.object(spans_mod, "trace", recorder):
+            bundle = build_span_callbacks(BASE_CONFIG, None, capture_content=True)
+            handler = bundle._handler
+            with pytest.raises(TypeError):
+                await handler.on_chat_model_start({}, [[_Exploding()]], run_id="r1")
+            assert "r1" in handler.model_spans, "the chat span was never tracked"
+            bundle.abandon_open_spans(set())
+
+        assert recorder.named("chat ")[0].ended == 1

@@ -299,6 +299,10 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         if key in self.model_spans:
             return
         span = start_model_span(self._config, self._parent_context)
+        # Tracked before the content write, for the same reason as on_tool_start: serialising the
+        # conversation can raise, and a span created but never inserted is unreachable by every
+        # cleanup path there is.
+        self.model_spans[key] = span
         if self._capture_content:
             # `on_chat_model_start` hands over `list[list[BaseMessage]]`, one list per generation.
             # The agent graph sends a single list; flattening keeps a multi-generation caller from
@@ -316,7 +320,6 @@ class SpanCallbackHandler(AsyncCallbackHandler):
                 messages=turn_messages,
                 tool_definitions=self._tool_definitions,
             )
-        self.model_spans[key] = span
 
     async def on_chat_model_start(
         self,
