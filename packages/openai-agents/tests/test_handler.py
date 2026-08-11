@@ -1475,3 +1475,51 @@ class TestFailedRunUsage:
             await create_openai_agent_handler()(CONFIG, "q", {}, {})
 
         assert "gen_ai.usage.input_tokens" not in rec.root.attributes
+
+
+class TestConvenienceWrapperForwardsCaptureContent:
+    """`capture_content` must reach the handler, not fall through into `config()`.
+
+    `config()` takes no such argument, so leaving it in kwargs raised TypeError: a caller asking for
+    content on spans got an exception instead. Five of the six wrappers had this.
+    """
+
+    async def test_capture_content_reaches_the_factory(self) -> None:
+        import launchdarkly_ai_openai_agents.handler as handler_mod
+
+        seen: dict[str, Any] = {}
+
+        def _factory(*, capture_content: bool = False) -> Any:
+            seen["capture_content"] = capture_content
+            return MagicMock()
+
+        fake_config = MagicMock()
+        fake_config.return_value.invoke = MagicMock(return_value="ok")
+        with (
+            patch.object(handler_mod, "create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "config", fake_config),
+        ):
+            handler_mod.openai_agents("k", "q", {}, capture_content=True)
+
+        assert seen["capture_content"] is True
+        # And it must not have been forwarded to config(), which does not accept it.
+        assert "capture_content" not in fake_config.call_args.kwargs
+
+    async def test_defaults_to_off(self) -> None:
+        import launchdarkly_ai_openai_agents.handler as handler_mod
+
+        seen: dict[str, Any] = {}
+
+        def _factory(*, capture_content: bool = False) -> Any:
+            seen["capture_content"] = capture_content
+            return MagicMock()
+
+        fake_config = MagicMock()
+        fake_config.return_value.invoke = MagicMock(return_value="ok")
+        with (
+            patch.object(handler_mod, "create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "config", fake_config),
+        ):
+            handler_mod.openai_agents("k", "q", {})
+
+        assert seen["capture_content"] is False
