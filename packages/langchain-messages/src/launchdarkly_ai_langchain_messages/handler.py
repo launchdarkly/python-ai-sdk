@@ -397,26 +397,29 @@ def create_langchain_messages_handler(
                         messages=span_messages,
                         tool_definitions=tool_definitions,
                     )
+                # The output write and the finish live inside the guard too. Serialising completion
+                # content raises on anything that is not JSON-serialisable, and a raise out here
+                # would leave this chat span open: the blocking path has no `finally` to recover it.
                 try:
                     response = await tool_model.ainvoke(conversation_messages)
+
+                    usage = getattr(response, "usage_metadata", None) or {}
+                    tool_calls = getattr(response, "tool_calls", None) or []
+                    if capture_content:
+                        set_output_content_attributes(
+                            model_span,
+                            capture_content,
+                            _assistant_output_messages(response.content, tool_calls),
+                        )
+                    finish_model_span(
+                        model_span,
+                        config,
+                        lang_chain_span_usage(usage) or SpanUsage(),
+                        lang_chain_finish_reasons(response),
+                    )
                 except Exception as exc:
                     fail_span(model_span, exc)
                     raise
-
-                usage = getattr(response, "usage_metadata", None) or {}
-                tool_calls = getattr(response, "tool_calls", None) or []
-                if capture_content:
-                    set_output_content_attributes(
-                        model_span,
-                        capture_content,
-                        _assistant_output_messages(response.content, tool_calls),
-                    )
-                finish_model_span(
-                    model_span,
-                    config,
-                    lang_chain_span_usage(usage) or SpanUsage(),
-                    lang_chain_finish_reasons(response),
-                )
                 run_usage.add(lang_chain_span_usage(usage))
 
                 if not tool_calls:
@@ -773,13 +776,20 @@ async def _stream_gen(
         # completed turns already cost. An abandoned span is left UNSET rather than ERROR: stopping
         # early is a normal thing for a consumer to do, and LaunchDarkly's own metrics record
         # neither a success nor an error for it, so ERROR would put two dashboards in disagreement.
-        if open_chunk_stream is not None:
-            await open_chunk_stream.aclose()
+        # Spans first, and the vendor generator after. aclose() can raise, and doing it first would
+        # take the whole teardown with it: the root would never end, never export, and the run would
+        # vanish from AI Config Monitoring along with the feature_flag event this block exists to
+        # protect. Its own failure is not worth losing the trace over, so it is contained.
         if open_model_span is not None:
             end_span_once(open_model_span, ended, abandoned=True)
         if span is not None and id(span) not in ended and run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         end_span_once(span, ended, abandoned=True)
+        if open_chunk_stream is not None:
+            try:
+                await open_chunk_stream.aclose()
+            except Exception:  # pragma: no cover - best-effort vendor teardown
+                pass
 
 
 def langchain_messages(

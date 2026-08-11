@@ -1575,3 +1575,77 @@ class TestConvenienceWrapperForwardsCaptureContent:
 
     def test_defaults_to_off(self) -> None:
         assert self._run()["capture_content"] is False
+
+
+class TestChatSpanAndTeardownNeverLeak:
+    """Two ways the run could vanish from the trace, both reachable through content serialisation."""
+
+    @pytest.mark.asyncio
+    async def test_an_unserialisable_completion_still_ends_the_chat_span(self) -> None:
+        # The blocking path has no `finally`, so a raise outside the guard leaves the span open with
+        # nothing able to recover it.
+        from opentelemetry.trace import StatusCode
+
+        class _Exploding:
+            """Shaped like an AIMessage, but reading its content raises."""
+
+            usage_metadata: ClassVar[dict[str, Any]] = {
+                "input_tokens": 5,
+                "output_tokens": 1,
+            }
+            tool_calls: ClassVar[list[Any]] = []
+            response_metadata: ClassVar[dict[str, Any]] = {}
+
+            @property
+            def content(self) -> Any:
+                raise TypeError("cannot serialise this content")
+
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        llm.ainvoke = AsyncMock(return_value=_Exploding())
+        with ctx, pytest.raises(TypeError):
+            await create_langchain_messages_handler(llm=llm, capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+        chat = rec.named("chat ")
+        assert len(chat) == 1
+        assert chat[0].ended == 1, "the chat span leaked"
+        assert StatusCode.ERROR in chat[0].statuses
+
+    @pytest.mark.asyncio
+    async def test_an_aclose_failure_does_not_cost_the_run_its_root_span(self) -> None:
+        # aclose() runs after span teardown, so its own failure cannot take the trace with it.
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        class _BadStream:
+            def __aiter__(self) -> Any:
+                return self
+
+            async def __anext__(self) -> Any:
+                return FakeAIMessage("chunk")
+
+            async def aclose(self) -> None:
+                raise RuntimeError("vendor teardown exploded")
+
+        llm.astream = MagicMock(return_value=_BadStream())
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        with ctx:
+            gen = await create_langchain_messages_handler(llm=llm).stream(CONFIG, "q")
+            async for _ in gen:
+                break
+            await gen.aclose()
+        assert rec.root.ended == 1, (
+            "the root span was lost to a vendor teardown failure"
+        )
+        assert rec.root.attributes["launchdarkly.stream.abandoned"] is True
