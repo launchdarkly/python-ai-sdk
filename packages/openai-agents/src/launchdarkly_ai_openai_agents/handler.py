@@ -26,6 +26,7 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    RunUsage,
     SpanUsage,
     config,
     create_handler,
@@ -289,6 +290,34 @@ class _SpanningHooks(_RunHooksBase):
             self.open_model_span = None
 
 
+def _write_failed_run_usage(
+    span: Any,
+    config: AiConfigRep,
+    error: BaseException,
+    run_usage: RunUsage,
+) -> None:
+    """Writes what a failed run spent onto the root, without counting it twice.
+
+    Two sources describe the same spend, and they overlap. The run hooks add each turn as it
+    finishes, so by the time the run raises they already hold every completed turn. The exception
+    also carries the SDK's own aggregate over those same turns.
+
+    Adding the aggregate to the accumulator therefore roughly doubles the reported cost of any run
+    that failed after paid turns, which MaxTurnsExceeded does by definition. The aggregate is the
+    authoritative figure, so it replaces the accumulator rather than adding to it.
+
+    When the error carries no aggregate, which is what a tool handler's own error looks like, the
+    accumulator is all there is and is used instead. Nothing is written when neither has anything:
+    all-zero attributes would assert the run cost nothing, which a run that died on its first call
+    cannot claim.
+    """
+    spent = _usage_from_error(error)
+    if spent is not None:
+        finish_root_span(span, config, spent)
+    elif run_usage.reported:
+        finish_root_span(span, config, run_usage.total)
+
+
 def _usage_from_error(error: BaseException) -> SpanUsage | None:
     """The run's spend at the point it raised, when the SDK attached one.
 
@@ -373,11 +402,7 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
             }
         except Exception as exc:
             hooks.close_open_spans(exc)
-            spent = _usage_from_error(exc)
-            if spent is not None:
-                run_usage.add(spent)
-            if run_usage.reported:
-                finish_root_span(span, config, run_usage.total)
+            _write_failed_run_usage(span, config, exc, run_usage)
             fail_span(span, exc)
             raise
 
@@ -493,11 +518,7 @@ async def _stream_gen(
 
     except Exception as exc:
         hooks.close_open_spans(exc)
-        spent = _usage_from_error(exc)
-        if spent is not None:
-            run_usage.add(spent)
-        if run_usage.reported:
-            finish_root_span(span, config, run_usage.total)
+        _write_failed_run_usage(span, config, exc, run_usage)
         fail_span(span, exc, ended)
         raise
     finally:

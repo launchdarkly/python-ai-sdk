@@ -1381,3 +1381,97 @@ class TestHistory:
         assert instructions is not None
         assert "Conversation History:" in instructions
         assert "user: What is feature flagging?" in instructions
+
+
+# ---------------------------------------------------------------------------
+# TELEMETRY-CONTRACT.md section 6: what a failed run reports it spent
+# ---------------------------------------------------------------------------
+
+
+class _AgentsError(Exception):
+    """An AgentsException-shaped error: it carries the SDK's own run aggregate.
+
+    MaxTurnsExceeded is the common case, and by definition it happens after paid turns.
+    """
+
+    def __init__(self, input_tokens_: int, output_tokens_: int) -> None:
+        super().__init__("max turns exceeded")
+
+        class _Usage:
+            # Matches agents.Usage, which is snake_case.
+            input_tokens = input_tokens_
+            output_tokens = output_tokens_
+            input_tokens_details = None
+
+        class _Ctx:
+            usage = _Usage()
+
+        class _RunData:
+            context_wrapper = _Ctx()
+
+        self.run_data = _RunData()
+
+
+class TestFailedRunUsage:
+    async def test_reports_the_sdk_aggregate_once_not_twice(self) -> None:
+        # The hooks already added every completed turn by the time the run raises, and the exception
+        # carries the SDK's aggregate over those same turns. Adding one to the other roughly doubles
+        # the reported cost of any run that failed after paid turns.
+        turns = [
+            {
+                "output": _text_output("one"),
+                "usage": {"input_tokens": 30, "output_tokens": 5},
+            },
+            {
+                "output": _text_output("two"),
+                "usage": {"input_tokens": 40, "output_tokens": 7},
+            },
+        ]
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            await _drive_turns(hooks, agent, prompt, turns)
+            raise _AgentsError(70, 12)
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=run)
+        with ctx, _patched_agents(agents_mod), pytest.raises(_AgentsError):
+            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+
+        # 70 and 12 are the aggregate. 140 and 24 would be the aggregate counted twice.
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 70
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 12
+
+    async def test_falls_back_to_the_turns_it_saw_when_the_error_carries_nothing(
+        self,
+    ) -> None:
+        # A tool handler's own error propagates unwrapped and has no run_data, so the accumulated
+        # turns are the only record of what the run spent.
+        turns = [
+            {
+                "output": _text_output("one"),
+                "usage": {"input_tokens": 30, "output_tokens": 5},
+            }
+        ]
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            await _drive_turns(hooks, agent, prompt, turns)
+            raise RuntimeError("tool exploded")
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=run)
+        with ctx, _patched_agents(agents_mod), pytest.raises(RuntimeError):
+            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 30
+
+    async def test_writes_nothing_when_the_run_died_before_any_turn(self) -> None:
+        # All-zero attributes would assert the run cost nothing, which is a different claim.
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            raise RuntimeError("died immediately")
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=run)
+        with ctx, _patched_agents(agents_mod), pytest.raises(RuntimeError):
+            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+
+        assert "gen_ai.usage.input_tokens" not in rec.root.attributes
