@@ -355,12 +355,17 @@ def _build_query_options(
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
     kwargs: dict[str, Any] = {
         "model": config["model"]["name"],
-        "tools": native_tool_names if native_tool_names else [],
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
         "hooks": hooks or {},
         **extra,
     }
+    # Omitted rather than passed empty. `tools=[]` is an explicit "no tools", which switches off the
+    # Claude Code built-ins; leaving the key out keeps the SDK default, which is what a run with only
+    # MCP tools, or none, has always had. A config with no native tools would otherwise silently lose
+    # Read, Bash and the rest.
+    if native_tool_names:
+        kwargs["tools"] = native_tool_names
     if system_prompt:
         kwargs["system_prompt"] = system_prompt
     return ClaudeAgentOptions(**kwargs)

@@ -1689,3 +1689,24 @@ class TestHistory:
         assert system is not None
         assert "Conversation History:" in system
         assert "user: What is feature flagging?" in system
+
+
+class TestBuiltinsSurviveAnEmptyToolList:
+    """`tools=[]` is not the same as omitting `tools`.
+
+    An explicit empty list switches off the Claude Code built-ins. Omitting the key leaves the SDK
+    default, which is what a run with only MCP tools, or none at all, has always had. Passing the
+    empty list silently cost such a run Read, Bash and the rest.
+    """
+
+    def test_no_native_tools_omits_the_key_entirely(self) -> None:
+        from launchdarkly_ai_claude_agents.handler import _build_query_options
+
+        opts = _build_query_options(BASE_CONFIG, None, [], [], None, None)
+        assert not hasattr(opts, "tools") or getattr(opts, "tools", None) is None
+
+    def test_native_tools_are_still_passed(self) -> None:
+        from launchdarkly_ai_claude_agents.handler import _build_query_options
+
+        opts = _build_query_options(BASE_CONFIG, None, ["Read"], [], None, None)
+        assert opts.tools == ["Read"]
