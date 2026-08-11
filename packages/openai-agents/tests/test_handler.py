@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import launchdarkly_ai_openai_agents.handler as handler_mod
+import launchdarkly_ai_openai_agents.spans as spans_mod
 from launchdarkly_ai_openai_agents.handler import (
     _build_agent_and_prompt,
     _build_agent_tools,
@@ -1112,7 +1113,7 @@ class TestStreaming:
             "importlib.import_module",
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_openai_agent_handler()
                 gen = await h.stream(_make_config(), "hi")
                 assert inspect.isasyncgen(gen) or hasattr(gen, "__aiter__")
@@ -1136,7 +1137,7 @@ class TestStreaming:
             "importlib.import_module",
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_openai_agent_handler()
                 events = [e async for e in await h.stream(_make_config(), "hi")]
 
@@ -1324,7 +1325,7 @@ class TestNoneUserInput:
             "importlib.import_module",
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
-            with patch.object(handler_mod, "_HAS_OTEL", False):
+            with patch.object(spans_mod, "_HAS_OTEL", False):
                 h = create_openai_agent_handler()
                 await h(_make_config(instructions="Be helpful."), None)
 

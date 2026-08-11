@@ -57,14 +57,6 @@ from .spans import (
 )
 
 try:
-    from opentelemetry import trace  # noqa: F401
-    from opentelemetry.trace import StatusCode as SpanStatusCode  # noqa: F401
-
-    _HAS_OTEL = True
-except ImportError:
-    _HAS_OTEL = False
-
-try:
     # The `agents` SDK validates that anything passed as `hooks=` is a `RunHooksBase` instance, so
     # `_SpanningHooks` below has to actually subclass it rather than merely duck-type it. Imported
     # once at module load, unlike the rest of this handler's dynamic `importlib.import_module`
