@@ -3,23 +3,46 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    SpanMessage,
+    SpanMessagePart,
+    SpanUsage,
     config,
     create_handler,
+    create_run_usage,
+    end_span_once,
+    lang_chain_finish_reasons,
+    lang_chain_span_messages,
+    lang_chain_span_usage,
+    number_or_zero,
     parse_template,
-    set_ld_span_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    set_tool_call_content_attributes,
+)
+
+from .spans import (
+    fail_span,
+    finish_model_span,
+    finish_root_span,
+    mark_ok,
+    parent_context_of,
+    start_model_span,
+    start_root_span,
+    start_tool_span,
+    succeed_span,
+    to_tool_definitions,
 )
 
 try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode as SpanStatusCode
+    from opentelemetry import trace  # noqa: F401
+    from opentelemetry.trace import StatusCode as SpanStatusCode  # noqa: F401
 
     _HAS_OTEL = True
 except ImportError:
@@ -27,6 +50,10 @@ except ImportError:
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
+    # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK's
+    # `buildTools`. That difference predates this span work and changes what the model is offered,
+    # not what the span reports, so it stays as it is: the catalog recorded below (via
+    # `to_tool_definitions`) is the catalog actually sent.
     return [
         {
             "type": "function",
@@ -95,6 +122,54 @@ def _build_messages(
     return messages
 
 
+def _assistant_output_messages(
+    content: Any, tool_calls: list[Any] | None
+) -> list[SpanMessage]:
+    """One assistant reply as a canonical output message, tool calls included.
+
+    Built as a duck-typed stand-in rather than a real ``AIMessage``, matching the TypeScript
+    handler's ``assistantOutput``: :func:`lang_chain_span_messages` only reads ``_get_type()``,
+    ``content`` and ``tool_calls``, so constructing a real message here would be extra ceremony for
+    fields nothing downstream reads.
+    """
+    msg = SimpleNamespace(content=content, tool_calls=tool_calls or [])
+    msg._get_type = lambda: "ai"
+    _, messages = lang_chain_span_messages([msg])
+    return messages
+
+
+def _with_get_type(msg: Any) -> Any:
+    """Adapts one LangChain message to the interface the client's ``lang_chain_span_messages``
+    narrows on.
+
+    Works around a version-skew bug in the shared client helper rather than fixing it there:
+    ``lang_chain_span_messages`` reads a message's role off ``_get_type()``, which older LangChain
+    releases exposed as the canonical accessor. The ``langchain-core`` release this package
+    actually depends on replaced it with a plain ``type`` field and dropped the method entirely, so
+    every real ``SystemMessage``/``HumanMessage``/``AIMessage`` reaching the client helper
+    unmodified is misclassified as role ``user`` with no error raised: ``getattr(raw,
+    '_get_type', None)`` returns ``None`` for a missing attribute rather than raising, and the
+    caller has no way to tell "the method is absent" from "this message really has no type".
+    Reported in this package's TELEMETRY-CONTRACT.md report rather than patched in
+    ``packages/client``, which is out of scope for this change.
+    """
+    if callable(getattr(msg, "_get_type", None)):
+        return msg
+    msg_type = getattr(msg, "type", None)
+    shim = SimpleNamespace(
+        content=getattr(msg, "content", None),
+        tool_calls=getattr(msg, "tool_calls", None),
+        tool_call_id=getattr(msg, "tool_call_id", None),
+    )
+    shim._get_type = lambda: msg_type
+    return shim
+
+
+def _span_messages(messages: list[Any]) -> tuple[str | None, list[SpanMessage]]:
+    """``lang_chain_span_messages``, after adapting each message. See :func:`_with_get_type`."""
+    return lang_chain_span_messages([_with_get_type(m) for m in messages])
+
+
 def _is_coroutine(fn: Any) -> bool:
     return asyncio.iscoroutinefunction(fn)
 
@@ -119,14 +194,89 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     return lc_openai.ChatOpenAI(model=model_name or "gpt-4o")
 
 
-def create_langchain_messages_handler(llm: Any = None) -> ProviderHandler:
+async def _run_structured_turn(
+    base_model: Any,
+    config: AiConfigRep,
+    messages: list[Any],
+    output_format: dict[str, Any],
+    parent: Any,
+    *,
+    capture_content: bool,
+    run_usage: Any,
+) -> Any:
+    """Runs one structured-output turn under its own ``chat`` child span. Returns the parsed value.
+
+    Used both for the outputFormat-only path and for the final turn of a tool loop that also has an
+    outputFormat, mirroring the TypeScript handler's ``runStructuredTurn``.
+    """
+    model_span = start_model_span(config, parent)
+    if capture_content:
+        system_instructions, span_messages = _span_messages(messages)
+        set_input_content_attributes(
+            model_span,
+            capture_content,
+            system_instructions=system_instructions,
+            messages=span_messages,
+        )
+    try:
+        structured_model = base_model.with_structured_output(
+            output_format, include_raw=True
+        )
+        result = await structured_model.ainvoke(messages)
+    except Exception as exc:
+        fail_span(model_span, exc)
+        raise
+
+    raw: Any = (
+        result.get("raw") if isinstance(result, dict) else getattr(result, "raw", None)
+    )
+    raw_usage = getattr(raw, "usage_metadata", None) or {}
+    parsed: Any = (
+        result.get("parsed")
+        if isinstance(result, dict)
+        else getattr(result, "parsed", None)
+    )
+    if capture_content:
+        set_output_content_attributes(
+            model_span,
+            capture_content,
+            [
+                SpanMessage(
+                    role="assistant",
+                    parts=[
+                        SpanMessagePart(
+                            type="text",
+                            content=parsed
+                            if isinstance(parsed, str)
+                            else json.dumps(parsed),
+                        )
+                    ],
+                )
+            ],
+        )
+    finish_model_span(
+        model_span,
+        config,
+        lang_chain_span_usage(raw_usage) or SpanUsage(),
+        lang_chain_finish_reasons(raw),
+    )
+    run_usage.add(lang_chain_span_usage(raw_usage))
+    return parsed
+
+
+def create_langchain_messages_handler(
+    llm: Any = None, *, capture_content: bool = False
+) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
     Requires ``langchain-openai`` or another LangChain integration to be installed.
     Pass *llm* to use a specific chat model; omit to default to
     ``ChatOpenAI(model=<config model name>)`` resolved at call time.
+
+    Set *capture_content* to put prompts, model output, tool arguments and tool results on the
+    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
+    meaning models, token counts, timings and tool names, until a caller asks for more.
     """
-    tracer_name = "@launchdarkly/ai-langchain-messages"
 
     async def _call_impl(
         config: AiConfigRep,
@@ -140,88 +290,69 @@ def create_langchain_messages_handler(llm: Any = None) -> ProviderHandler:
         th = tool_handlers or {}
         vs = variables or {}
 
-        base_model = llm
-        if base_model is None:
-            base_model = _make_default_chat_model(config, importlib)
-
-        if _HAS_OTEL:
-            span = trace.get_tracer(tracer_name).start_span("langchain.invoke")
-            span.set_attribute("gen_ai.operation.name", "chat")
-            span.set_attribute(
-                "gen_ai.system",
-                config.get("provider", {}).get("name", "langchain").lower(),
-            )
-            span.set_attribute(
-                "gen_ai.request.model", config.get("model", {}).get("name", "")
-            )
-            set_ld_span_attributes(span, vs)
-        else:
-            span = None
+        span = start_root_span(config, vs)
+        parent = parent_context_of(span)
 
         initial_messages = _build_messages(config, user_input, vs, history)
-
-        if span:
-            prompt_text = "\n".join(
-                f"{getattr(m, 'type', type(m).__name__)}: {m.content if isinstance(m.content, str) else json.dumps(m.content)}"
-                for m in initial_messages
-            )
-            span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-            set_openllmetry_prompt(
+        if capture_content:
+            system_instructions, span_messages = _span_messages(initial_messages)
+            set_input_content_attributes(
                 span,
-                [
-                    {
-                        "role": getattr(m, "type", type(m).__name__),
-                        "content": m.content
-                        if isinstance(m.content, str)
-                        else json.dumps(m.content),
-                    }
-                    for m in initial_messages
-                ],
+                capture_content,
+                system_instructions=system_instructions,
+                messages=span_messages,
             )
 
+        # Outside the try, so the failure path can still report the spend of the turns that
+        # completed before it.
+        run_usage = create_run_usage()
         try:
+            base_model = (
+                llm if llm is not None else _make_default_chat_model(config, importlib)
+            )
+
             tool_defs = _build_tools(config.get("tools") or {})
             output_format = config.get("outputFormat")
-            provider_name = config.get("provider", {}).get("name", "openai").lower()
-            is_openai = provider_name == "openai"
 
-            # Structured output path — only when no tools are present.
+            # CASE 1: outputFormat only, no tools -> withStructuredOutput (all providers).
             # LangChain cannot apply with_structured_output and bind_tools to the same model.
             if output_format and not tool_defs:
-                structured_model = base_model.with_structured_output(
-                    output_format, include_raw=True
+                parsed = await _run_structured_turn(
+                    base_model,
+                    config,
+                    initial_messages,
+                    output_format,
+                    parent,
+                    capture_content=capture_content,
+                    run_usage=run_usage,
                 )
-                result = await structured_model.ainvoke(initial_messages)
-                raw_usage = getattr(result.get("raw"), "usage_metadata", None) or {}
-                input_tokens = raw_usage.get("input_tokens", 0)
-                output_tokens = raw_usage.get("output_tokens", 0)
-                if span:
-                    span.set_attribute(
-                        "gen_ai.response.model", config.get("model", {}).get("name", "")
-                    )
-                    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-                    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-                    span.set_attribute(
-                        "gen_ai.usage.total_tokens", input_tokens + output_tokens
-                    )
-                    span.add_event(
-                        "gen_ai.content.completion",
-                        {"gen_ai.completion": json.dumps(result.get("parsed"))},
-                    )
-                    set_openllmetry_completion(
-                        span,
-                        json.dumps(result.get("parsed")),
-                        {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                    )
-                    span.set_status(SpanStatusCode.OK)
-                    span.end()
+                output_str = parsed if isinstance(parsed, str) else json.dumps(parsed)
+                set_output_content_attributes(
+                    span,
+                    capture_content,
+                    [
+                        SpanMessage(
+                            role="assistant",
+                            parts=[SpanMessagePart(type="text", content=output_str)],
+                        )
+                    ],
+                )
+                finish_root_span(span, config, run_usage.total)
+                succeed_span(span)
                 return {
-                    "output": result.get("parsed"),
+                    "output": parsed,
                     "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
+                        "input_tokens": run_usage.total.input,
+                        "output_tokens": run_usage.total.output,
                     },
                 }
+
+            # CASE 2: tools present -> agentic loop, then withStructuredOutput for the final
+            # response when outputFormat is set.
+            provider_name = str(
+                (config.get("provider") or {}).get("name") or "openai"
+            ).lower()
+            is_openai = provider_name == "openai"
 
             # For OpenAI models with both outputFormat and tools: bind response_format so the
             # final text response is structured JSON. The client layer parses the returned string.
@@ -238,27 +369,67 @@ def create_langchain_messages_handler(llm: Any = None) -> ProviderHandler:
                     }
                 )
 
-            active_model = (
-                bound_model.bind_tools(tool_defs) if tool_defs else bound_model
-            )
+            tool_model = bound_model.bind_tools(tool_defs) if tool_defs else bound_model
+            tool_definitions = to_tool_definitions(tool_defs)
             conversation_messages = list(initial_messages)
-            total_input = 0
-            total_output = 0
-            output = ""
+            output: Any = ""
             steps = 0
 
-            while True:
-                response = await active_model.ainvoke(conversation_messages)
-                usage = getattr(response, "usage_metadata", None) or {}
-                total_input += usage.get("input_tokens", 0)
-                total_output += usage.get("output_tokens", 0)
-                conversation_messages.append(response)
+            msgs_mod = importlib.import_module("langchain_core.messages")
+            ToolMessage = msgs_mod.ToolMessage
 
-                tool_calls = getattr(response, "tool_calls", []) or []
-                if not tool_calls:
-                    output = (
-                        response.content if isinstance(response.content, str) else ""
+            while True:
+                model_span = start_model_span(config, parent)
+                if capture_content:
+                    system_instructions, span_messages = _span_messages(
+                        conversation_messages
                     )
+                    set_input_content_attributes(
+                        model_span,
+                        capture_content,
+                        system_instructions=system_instructions,
+                        messages=span_messages,
+                        tool_definitions=tool_definitions,
+                    )
+                try:
+                    response = await tool_model.ainvoke(conversation_messages)
+                except Exception as exc:
+                    fail_span(model_span, exc)
+                    raise
+
+                usage = getattr(response, "usage_metadata", None) or {}
+                tool_calls = getattr(response, "tool_calls", None) or []
+                if capture_content:
+                    set_output_content_attributes(
+                        model_span,
+                        capture_content,
+                        _assistant_output_messages(response.content, tool_calls),
+                    )
+                finish_model_span(
+                    model_span,
+                    config,
+                    lang_chain_span_usage(usage) or SpanUsage(),
+                    lang_chain_finish_reasons(response),
+                )
+                run_usage.add(lang_chain_span_usage(usage))
+
+                if not tool_calls:
+                    if output_format:
+                        output = await _run_structured_turn(
+                            base_model,
+                            config,
+                            conversation_messages,
+                            output_format,
+                            parent,
+                            capture_content=capture_content,
+                            run_usage=run_usage,
+                        )
+                    else:
+                        output = (
+                            response.content
+                            if isinstance(response.content, str)
+                            else ""
+                        )
                     break
 
                 if steps >= _MAX_STEPS:
@@ -267,23 +438,34 @@ def create_langchain_messages_handler(llm: Any = None) -> ProviderHandler:
                     )
                 steps += 1
 
-                import importlib
-
-                msgs_mod = importlib.import_module("langchain_core.messages")
-                ToolMessage = msgs_mod.ToolMessage
+                conversation_messages.append(response)
 
                 tool_results: list[Any] = []
                 for tc in tool_calls:
-                    handler_fn = th.get(tc["name"])
-                    if not handler_fn or not callable(handler_fn):
-                        raise ValueError(
-                            f'No handler registered for tool "{tc["name"]}"'
-                        )
-                    result_val = (
-                        await handler_fn(tc["args"])
-                        if _is_coroutine(handler_fn)
-                        else handler_fn(tc["args"])
+                    tool_span = start_tool_span(
+                        tc["name"], tc.get("id") or tc["name"], parent
                     )
+                    set_tool_call_content_attributes(
+                        tool_span, capture_content, arguments=tc.get("args")
+                    )
+                    try:
+                        handler_fn = th.get(tc["name"])
+                        if not handler_fn or not callable(handler_fn):
+                            raise ValueError(
+                                f'No handler registered for tool "{tc["name"]}"'
+                            )
+                        result_val = (
+                            await handler_fn(tc["args"])
+                            if _is_coroutine(handler_fn)
+                            else handler_fn(tc["args"])
+                        )
+                    except Exception as exc:
+                        fail_span(tool_span, exc)
+                        raise
+                    set_tool_call_content_attributes(
+                        tool_span, capture_content, result=result_val
+                    )
+                    succeed_span(tool_span)
                     tool_results.append(
                         ToolMessage(
                             tool_call_id=tc.get("id") or tc["name"],
@@ -292,41 +474,32 @@ def create_langchain_messages_handler(llm: Any = None) -> ProviderHandler:
                     )
                 conversation_messages.extend(tool_results)
 
-            if span:
-                span.set_attribute(
-                    "gen_ai.response.model", config.get("model", {}).get("name", "")
-                )
-                span.set_attribute("gen_ai.usage.input_tokens", total_input)
-                span.set_attribute("gen_ai.usage.output_tokens", total_output)
-                span.set_attribute(
-                    "gen_ai.usage.total_tokens", total_input + total_output
-                )
-                span.add_event(
-                    "gen_ai.content.completion",
-                    {
-                        "gen_ai.completion": output
-                        if isinstance(output, str)
-                        else json.dumps(output)
-                    },
-                )
-                set_openllmetry_completion(
-                    span,
-                    output if isinstance(output, str) else json.dumps(output),
-                    {"input_tokens": total_input, "output_tokens": total_output},
-                )
-                span.set_status(SpanStatusCode.OK)
-                span.end()
-
+            output_str = output if isinstance(output, str) else json.dumps(output)
+            set_output_content_attributes(
+                span,
+                capture_content,
+                [
+                    SpanMessage(
+                        role="assistant",
+                        parts=[SpanMessagePart(type="text", content=output_str)],
+                    )
+                ],
+            )
+            finish_root_span(span, config, run_usage.total)
+            succeed_span(span)
             return {
                 "output": output,
-                "usage": {"input_tokens": total_input, "output_tokens": total_output},
+                "usage": {
+                    "input_tokens": run_usage.total.input,
+                    "output_tokens": run_usage.total.output,
+                },
             }
-
         except Exception as exc:
-            if span:
-                span.record_exception(exc)
-                span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            # The turns that completed were billed, and the root is the only span a config-scoped
+            # cost query can find them on.
+            if run_usage.reported:
+                finish_root_span(span, config, run_usage.total)
+            fail_span(span, exc)
             raise
 
     def _stream_impl(
@@ -337,7 +510,13 @@ def create_langchain_messages_handler(llm: Any = None) -> ProviderHandler:
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         return _stream_gen(
-            llm, config, user_input, tool_handlers or {}, variables or {}, history
+            llm,
+            config,
+            user_input,
+            tool_handlers or {},
+            variables or {},
+            history,
+            capture_content=capture_content,
         )
 
     return create_handler(("*", "messages"), _call_impl, _stream_impl)  # type: ignore[arg-type]
@@ -350,87 +529,142 @@ async def _stream_gen(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
+    *,
+    capture_content: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
+    """Streams the run, emitting the same span tree as the blocking path.
+
+    A consumer that breaks out of ``async for``, or raises inside the loop body, makes this
+    generator run its ``finally`` without ever entering ``except``: ``GeneratorExit`` inherits from
+    ``BaseException``, so ``except Exception`` does not see it. Without the cleanup in ``finally``
+    the root span is never ended, so it is never exported, and the whole run disappears from AI
+    Config Monitoring along with the ``feature_flag`` event it carries.
+
+    ``ended`` stops the success, failure and abandonment paths from ending the same span twice.
+
+    ``open_chunk_stream`` holds LangChain's own ``astream`` generator, closed by hand in the same
+    ``finally``. LangChain's ``BaseChatModel.astream`` is itself an async generator that awaits
+    ``run_manager.on_llm_error(...)`` inside a ``except BaseException`` block, the same shape that
+    makes ``claude_agent_sdk``'s generator unsafe to abandon bare: a consumer breaking out of this
+    generator leaves that inner one suspended mid-await with nothing to resume it until Python's
+    garbage collector finalizes it, which can raise rather than clean up quietly. Calling
+    ``aclose()`` on it here, on the same object the loop was iterating, drives that cleanup
+    immediately instead of leaving it to GC.
+    """
     import importlib
 
-    base_model = llm
-    if base_model is None:
-        base_model = _make_default_chat_model(config, importlib)
+    base_model = llm if llm is not None else _make_default_chat_model(config, importlib)
 
-    tracer_name = "@launchdarkly/ai-langchain-messages"
-    if _HAS_OTEL:
-        span = trace.get_tracer(tracer_name).start_span("langchain.stream")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute(
-            "gen_ai.system", config.get("provider", {}).get("name", "langchain").lower()
-        )
-        span.set_attribute(
-            "gen_ai.request.model", config.get("model", {}).get("name", "")
-        )
-        set_ld_span_attributes(span, variables)
-    else:
-        span = None
+    span = start_root_span(config, variables)
+    parent = parent_context_of(span)
 
     initial_messages = _build_messages(config, user_input, variables, history)
-    if span:
-        prompt_text = "\n".join(
-            f"{getattr(m, 'type', type(m).__name__)}: {m.content if isinstance(m.content, str) else json.dumps(m.content)}"
-            for m in initial_messages
-        )
-        span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-        set_openllmetry_prompt(
+    if capture_content:
+        system_instructions, span_messages = _span_messages(initial_messages)
+        set_input_content_attributes(
             span,
-            [
-                {
-                    "role": getattr(m, "type", type(m).__name__),
-                    "content": m.content
-                    if isinstance(m.content, str)
-                    else json.dumps(m.content),
-                }
-                for m in initial_messages
-            ],
+            capture_content,
+            system_instructions=system_instructions,
+            messages=span_messages,
         )
 
     tool_defs = _build_tools(config.get("tools") or {})
-    active_model = base_model.bind_tools(tool_defs) if tool_defs else base_model
+    tool_model = base_model.bind_tools(tool_defs) if tool_defs else base_model
+    tool_definitions = to_tool_definitions(tool_defs)
     conversation_messages = list(initial_messages)
-    total_input = 0
-    total_output = 0
-    full_output = ""
+    full_output: Any = ""
     steps = 0
 
+    ended: set[int] = set()
+    open_model_span: Any = None
+    open_chunk_stream: Any = None
+    # Outside the try, so the failure and abandonment paths can still report the spend.
+    run_usage = create_run_usage()
+
+    msgs_mod = importlib.import_module("langchain_core.messages")
+    AIMessage = msgs_mod.AIMessage
+    ToolMessage = msgs_mod.ToolMessage
+
     try:
-        import importlib
-
-        msgs_mod = importlib.import_module("langchain_core.messages")
-        AIMessage = msgs_mod.AIMessage
-        ToolMessage = msgs_mod.ToolMessage
-
         while True:
-            chunk_stream = active_model.astream(conversation_messages)
+            model_span = start_model_span(config, parent)
+            open_model_span = model_span
+            if capture_content:
+                system_instructions, span_messages = _span_messages(
+                    conversation_messages
+                )
+                set_input_content_attributes(
+                    model_span,
+                    capture_content,
+                    system_instructions=system_instructions,
+                    messages=span_messages,
+                    tool_definitions=tool_definitions,
+                )
+
             accumulated_content = ""
             accumulated_tool_calls: list[Any] = []
-            turn_input = 0
-            turn_output = 0
+            # The cache breakdown has to be accumulated alongside the scalars. LangChain reports it
+            # per chunk in `usage_metadata.input_token_details`, and synthesizing a usage bag
+            # without it would make the streaming span emit `cache_read = 0` where the blocking path
+            # emits the real figure: a zero that reads as "no cached tokens" rather than "not
+            # reported".
+            turn_usage = SpanUsage()
+            # Carried forward chunk by chunk for the same reason as the cache breakdown above: only
+            # the terminal chunk reports it, and dropping it would make the streaming span omit a
+            # finish reason where the blocking path emits the real one.
+            finish_reasons: list[str] | None = None
 
-            async for chunk in chunk_stream:
-                text = chunk.content if isinstance(chunk.content, str) else ""
-                if text:
-                    yield {"type": "chunk", "text": text}
-                    accumulated_content += text
-                usage = getattr(chunk, "usage_metadata", None)
-                if usage:
-                    turn_input += usage.get("input_tokens", 0)
-                    turn_output += usage.get("output_tokens", 0)
-                chunk_tools = getattr(chunk, "tool_calls", []) or []
-                if chunk_tools:
-                    accumulated_tool_calls = chunk_tools
+            try:
+                chunk_stream = tool_model.astream(conversation_messages)
+                open_chunk_stream = chunk_stream
+                async for chunk in chunk_stream:
+                    text = chunk.content if isinstance(chunk.content, str) else ""
+                    if text:
+                        yield {"type": "chunk", "text": text}
+                        accumulated_content += text
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if usage:
+                        details = usage.get("input_token_details") or {}
+                        turn_usage.input += number_or_zero(usage.get("input_tokens"))
+                        turn_usage.output += number_or_zero(usage.get("output_tokens"))
+                        turn_usage.cache_read += number_or_zero(
+                            details.get("cache_read")
+                        )
+                        turn_usage.cache_creation += number_or_zero(
+                            details.get("cache_creation")
+                        )
+                    chunk_tools = getattr(chunk, "tool_calls", None) or []
+                    if chunk_tools:
+                        accumulated_tool_calls = chunk_tools
+                    finish_reasons = lang_chain_finish_reasons(chunk) or finish_reasons
+                open_chunk_stream = None
+            except Exception as exc:
+                # The tracker matters here: the outer `except` also fails `open_model_span`, which
+                # still points at this span because the line that clears it is unreachable on this
+                # path.
+                fail_span(model_span, exc, ended)
+                open_model_span = None
+                raise
 
-            total_input += turn_input
-            total_output += turn_output
+            if capture_content:
+                set_output_content_attributes(
+                    model_span,
+                    capture_content,
+                    _assistant_output_messages(
+                        accumulated_content, accumulated_tool_calls
+                    ),
+                )
+            # finish_model_span ends the span. Clearing open_model_span is what stops the
+            # `finally` from ending it a second time.
+            finish_model_span(model_span, config, turn_usage, finish_reasons)
+            open_model_span = None
+            # The already-mapped figures, not a bag rebuilt from them: this path summed the chunks
+            # into a SpanUsage to begin with, so re-parsing its own output would be a round trip
+            # whose only effect is another chance to disagree with itself.
+            run_usage.add(turn_usage)
 
             if not accumulated_tool_calls:
-                full_output += accumulated_content
+                full_output = (full_output or "") + accumulated_content
                 break
 
             if steps >= _MAX_STEPS:
@@ -439,7 +673,7 @@ async def _stream_gen(
                 )
             steps += 1
 
-            full_output += accumulated_content
+            full_output = (full_output or "") + accumulated_content
             assistant_msg = AIMessage(
                 content=accumulated_content, tool_calls=accumulated_tool_calls
             )
@@ -447,14 +681,30 @@ async def _stream_gen(
 
             tool_results: list[Any] = []
             for tc in accumulated_tool_calls:
-                handler_fn = tool_handlers.get(tc["name"])
-                if not handler_fn or not callable(handler_fn):
-                    raise ValueError(f'No handler registered for tool "{tc["name"]}"')
-                result_val = (
-                    await handler_fn(tc["args"])
-                    if _is_coroutine(handler_fn)
-                    else handler_fn(tc["args"])
+                tool_span = start_tool_span(
+                    tc["name"], tc.get("id") or tc["name"], parent
                 )
+                set_tool_call_content_attributes(
+                    tool_span, capture_content, arguments=tc.get("args")
+                )
+                try:
+                    handler_fn = tool_handlers.get(tc["name"])
+                    if not handler_fn or not callable(handler_fn):
+                        raise ValueError(
+                            f'No handler registered for tool "{tc["name"]}"'
+                        )
+                    result_val = (
+                        await handler_fn(tc["args"])
+                        if _is_coroutine(handler_fn)
+                        else handler_fn(tc["args"])
+                    )
+                except Exception as exc:
+                    fail_span(tool_span, exc, ended)
+                    raise
+                set_tool_call_content_attributes(
+                    tool_span, capture_content, result=result_val
+                )
+                succeed_span(tool_span)
                 tool_results.append(
                     ToolMessage(
                         tool_call_id=tc.get("id") or tc["name"], content=str(result_val)
@@ -462,43 +712,51 @@ async def _stream_gen(
                 )
             conversation_messages.extend(tool_results)
 
-        if span:
-            span.set_attribute(
-                "gen_ai.response.model", config.get("model", {}).get("name", "")
-            )
-            span.set_attribute("gen_ai.usage.input_tokens", total_input)
-            span.set_attribute("gen_ai.usage.output_tokens", total_output)
-            span.set_attribute("gen_ai.usage.total_tokens", total_input + total_output)
-            span.add_event(
-                "gen_ai.content.completion",
-                {
-                    "gen_ai.completion": full_output
-                    if isinstance(full_output, str)
-                    else json.dumps(full_output)
-                },
-            )
-            set_openllmetry_completion(
-                span,
-                full_output
-                if isinstance(full_output, str)
-                else json.dumps(full_output),
-                {"input_tokens": total_input, "output_tokens": total_output},
-            )
-            span.set_status(SpanStatusCode.OK)
-            span.end()
+        full_output_str = (
+            full_output if isinstance(full_output, str) else json.dumps(full_output)
+        )
+        set_output_content_attributes(
+            span,
+            capture_content,
+            [
+                SpanMessage(
+                    role="assistant",
+                    parts=[SpanMessagePart(type="text", content=full_output_str)],
+                )
+            ],
+        )
+        finish_root_span(span, config, run_usage.total)
+        mark_ok(span)
+        end_span_once(span, ended)
 
         yield {
             "type": "done",
-            "output": full_output,
-            "usage": {"input_tokens": total_input, "output_tokens": total_output},
+            "output": full_output_str,
+            "usage": {
+                "input_tokens": run_usage.total.input,
+                "output_tokens": run_usage.total.output,
+            },
         }
 
     except Exception as exc:
-        if span:
-            span.record_exception(exc)
-            span.set_status(SpanStatusCode.ERROR, str(exc))
-            span.end()
+        if run_usage.reported:
+            finish_root_span(span, config, run_usage.total)
+        fail_span(span, exc, ended)
         raise
+    finally:
+        # A no-op on the success and failure paths, because both already ended their spans through
+        # `ended` and already drove `chunk_stream` to completion. On abandonment this is the only
+        # chance to close the tree, to close LangChain's own generator, and to report what the
+        # completed turns already cost. An abandoned span is left UNSET rather than ERROR: stopping
+        # early is a normal thing for a consumer to do, and LaunchDarkly's own metrics record
+        # neither a success nor an error for it, so ERROR would put two dashboards in disagreement.
+        if open_chunk_stream is not None:
+            await open_chunk_stream.aclose()
+        if open_model_span is not None:
+            end_span_once(open_model_span, ended, abandoned=True)
+        if span is not None and id(span) not in ended and run_usage.reported:
+            finish_root_span(span, config, run_usage.total)
+        end_span_once(span, ended, abandoned=True)
 
 
 def langchain_messages(
