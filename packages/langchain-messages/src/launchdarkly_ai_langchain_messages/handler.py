@@ -468,13 +468,16 @@ def create_langchain_messages_handler(
                             if _is_coroutine(handler_fn)
                             else handler_fn(tc["args"])
                         )
+                        # Inside the try on purpose. Serialising a tool result can raise, most easily
+                        # when capture_content is on and the result is not JSON-serialisable, and a
+                        # raise out here would leave this span open: nothing else knows it exists.
+                        set_tool_call_content_attributes(
+                            tool_span, capture_content, result=result_val
+                        )
+                        succeed_span(tool_span)
                     except Exception as exc:
                         fail_span(tool_span, exc)
                         raise
-                    set_tool_call_content_attributes(
-                        tool_span, capture_content, result=result_val
-                    )
-                    succeed_span(tool_span)
                     tool_results.append(
                         ToolMessage(
                             tool_call_id=tc.get("id") or tc["name"],
@@ -715,13 +718,16 @@ async def _stream_gen(
                         if _is_coroutine(handler_fn)
                         else handler_fn(tc["args"])
                     )
+                    # Inside the try on purpose. Serialising a tool result can raise, most easily
+                    # when capture_content is on and the result is not JSON-serialisable, and a
+                    # raise out here would leave this span open: nothing else knows it exists.
+                    set_tool_call_content_attributes(
+                        tool_span, capture_content, result=result_val
+                    )
+                    succeed_span(tool_span)
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     raise
-                set_tool_call_content_attributes(
-                    tool_span, capture_content, result=result_val
-                )
-                succeed_span(tool_span)
                 tool_results.append(
                     ToolMessage(
                         tool_call_id=tc.get("id") or tc["name"], content=str(result_val)
