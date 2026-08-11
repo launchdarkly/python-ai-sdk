@@ -34,18 +34,40 @@ def _tool_use_block(name: str, id: str = "tu1", input: dict | None = None) -> Ma
     return b
 
 
+class _Usage:
+    """Anthropic's usage object, with only the fields Anthropic actually sets.
+
+    A bare MagicMock would answer every cache attribute with a mock, which is not what a real
+    response looks like and would let a handler read a cache field that was never reported.
+    """
+
+    def __init__(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int | None = None,
+        cache_creation: int | None = None,
+    ) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        if cache_read is not None:
+            self.cache_read_input_tokens = cache_read
+        if cache_creation is not None:
+            self.cache_creation_input_tokens = cache_creation
+
+
 def _anthropic_response(
     content: list[Any],
     stop_reason: str = "end_turn",
     input_tokens: int = 10,
     output_tokens: int = 5,
+    cache_read: int | None = None,
+    cache_creation: int | None = None,
 ) -> MagicMock:
     r = MagicMock()
     r.content = content
     r.stop_reason = stop_reason
-    r.usage = MagicMock()
-    r.usage.input_tokens = input_tokens
-    r.usage.output_tokens = output_tokens
+    r.usage = _Usage(input_tokens, output_tokens, cache_read, cache_creation)
     return r
 
 
@@ -438,10 +460,81 @@ class TestToolExecutionLoop:
 # ---------------------------------------------------------------------------
 # §1.5 Telemetry
 # ---------------------------------------------------------------------------
+# Span recording
+# ---------------------------------------------------------------------------
+
+
+class RecordedSpan:
+    """A span that remembers what a handler did to it, so a test can assert on the whole thing."""
+
+    def __init__(self, name: str, context: Any = None) -> None:
+        self.name = name
+        self.context = context
+        self.attributes: dict[str, Any] = {}
+        self.events: list[tuple[str, dict[str, Any]]] = []
+        self.statuses: list[Any] = []
+        self.exceptions: list[BaseException] = []
+        self.ended = 0
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+    def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
+        self.events.append((name, attributes or {}))
+
+    def set_status(self, code: Any, description: str | None = None) -> None:
+        self.statuses.append(code)
+
+    def record_exception(self, exc: BaseException) -> None:
+        self.exceptions.append(exc)
+
+    def end(self) -> None:
+        self.ended += 1
+
+
+class SpanRecorder:
+    """Stands in for the ``trace`` module inside ``spans.py`` and records every span opened.
+
+    Replaces the old single-MagicMock approach, which could not see a span tree at all: every span
+    was the same object, so a parent and its children were indistinguishable.
+    """
+
+    def __init__(self) -> None:
+        self.spans: list[RecordedSpan] = []
+
+    def get_tracer(self, name: str) -> SpanRecorder:
+        return self
+
+    def start_span(self, name: str, context: Any = None) -> RecordedSpan:
+        span = RecordedSpan(name, context)
+        self.spans.append(span)
+        return span
+
+    def set_span_in_context(self, span: RecordedSpan) -> Any:
+        return ("context-of", span)
+
+    @property
+    def root(self) -> RecordedSpan:
+        return self.spans[0]
+
+    def named(self, prefix: str) -> list[RecordedSpan]:
+        return [s for s in self.spans if s.name.startswith(prefix)]
+
+    @property
+    def names(self) -> list[str]:
+        return [s.name for s in self.spans]
+
+
+def _recording() -> Any:
+    """Patches the tracer that ``spans.py`` holds, and yields the recorder."""
+    import launchdarkly_ai_claude_messages.spans as spans_mod
+
+    recorder = SpanRecorder()
+    return patch.object(spans_mod, "trace", recorder), recorder
 
 
 def _make_tracer_patch(mock_span: MagicMock) -> Any:
-    """Creates a patched trace module targeting the handler's imported `trace`."""
+    """Kept for the tests that only need to know a span was opened."""
     mock_tracer = MagicMock()
     mock_tracer.start_span = MagicMock(return_value=mock_span)
     mock_trace_mod = MagicMock()
@@ -449,202 +542,467 @@ def _make_tracer_patch(mock_span: MagicMock) -> Any:
     return mock_trace_mod, mock_tracer
 
 
-class TestTelemetry:
-    async def test_span_name(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, mock_tracer = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+class TestSpanTree:
+    """TELEMETRY-CONTRACT.md section 1."""
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+    async def test_opens_a_root_span_named_invoke_agent(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        mock_tracer.start_span.assert_called_with("claude.messages")
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert rec.root.name == "invoke_agent"
+        assert rec.root.attributes["gen_ai.operation.name"] == "invoke_agent"
 
-    async def test_gen_ai_system(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+    async def test_emits_one_chat_child_per_model_turn(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        chats = rec.named("chat ")
+        assert len(chats) == 1
+        assert chats[0].name == "chat claude-3-sonnet-20240229"
+        assert chats[0].attributes["gen_ai.operation.name"] == "chat"
+        # Parented to the root, not to nothing.
+        assert chats[0].context == ("context-of", rec.root)
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("gen_ai.system") == "anthropic"
+    async def test_names_the_chat_span_after_the_model(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # The semantic conventions name an inference span `{operation} {model}`. A bare `chat` tells
+        # a reader nothing about which model ran.
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-    async def test_gen_ai_request_model(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        cfg = {**CONFIG, "model": {"name": "claude-opus-4"}}
+        with ctx:
+            await create_claude_messages_handler()(cfg, "q", {}, {})
+        assert "chat claude-opus-4" in rec.names
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+    async def test_emits_a_chat_span_per_turn_of_a_tool_loop(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1", {"a": 1})], stop_reason="tool_use"
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("gen_ai.request.model") == CONFIG["model"]["name"]
+        with ctx:
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "result"}, {}
+            )
+        assert len(rec.named("chat ")) == 2
 
-    async def test_token_attributes_set(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+    async def test_emits_an_execute_tool_span_per_tool_call(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1", {"a": 1})], stop_reason="tool_use"
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+        with ctx:
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "result"}, {}
+            )
+        tools = rec.named("execute_tool ")
+        assert len(tools) == 1
+        assert tools[0].name == "execute_tool myTool"
+        assert tools[0].attributes["gen_ai.operation.name"] == "execute_tool"
+        assert tools[0].attributes["gen_ai.tool.name"] == "myTool"
+        assert tools[0].attributes["gen_ai.tool.call.id"] == "tu1"
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert "gen_ai.usage.input_tokens" in attrs
-        assert "gen_ai.usage.output_tokens" in attrs
+    async def test_tool_spans_are_siblings_of_chat_not_children(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Both take the root's context. See TELEMETRY-CONTRACT.md section 1.
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1")], stop_reason="tool_use"
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-    async def test_span_status_ok(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        with ctx:
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+            )
+        assert rec.named("execute_tool ")[0].context == ("context-of", rec.root)
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+    async def test_every_span_is_ended(self, mock_anthropic: MagicMock) -> None:
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1")], stop_reason="tool_use"
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
+        with ctx:
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+            )
+        assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
+
+
+class TestRootSpanAttributes:
+    """TELEMETRY-CONTRACT.md sections 2 and 2a."""
+
+    async def test_writes_both_provider_keys_and_the_requested_model(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        attrs = rec.root.attributes
+        assert attrs["gen_ai.system"] == "anthropic"
+        assert attrs["gen_ai.provider.name"] == "anthropic"
+        assert attrs["gen_ai.request.model"] == "claude-3-sonnet-20240229"
+
+    async def test_response_model_is_the_requested_name(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Anthropic does not resolve an alias to a different snapshot, so there is no other value
+        # to report. Section 2a.
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert (
+            rec.root.attributes["gen_ai.response.model"] == "claude-3-sonnet-20240229"
+        )
+
+    async def test_carries_the_launchdarkly_attributes_and_feature_flag_event(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        variables = {
+            "__ld": {
+                "configKey": "k",
+                "variationKey": "v",
+                "runId": "r",
+                "graphKey": "g",
+            }
+        }
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, variables)
+        attrs = rec.root.attributes
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "k"
+        assert attrs["launchdarkly.variation.key"] == "v"
+        assert attrs["launchdarkly.run.id"] == "r"
+        assert attrs["launchdarkly.graph.key"] == "g"
+        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+
+    async def test_child_spans_carry_no_launchdarkly_identity(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # The root is the only span a config-scoped query finds; children must not duplicate it.
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1")], stop_reason="tool_use"
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        variables = {"__ld": {"configKey": "k", "variationKey": "v", "runId": "r"}}
+        with ctx:
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "r"}, variables
+            )
+        for child in rec.spans[1:]:
+            assert not [k for k in child.attributes if k.startswith("launchdarkly.")]
+            assert "feature_flag" not in [n for n, _ in child.events]
+
+    async def test_carries_the_run_total_not_one_turn(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1")],
+                    stop_reason="tool_use",
+                    input_tokens=10,
+                    output_tokens=1,
+                ),
+                _anthropic_response(
+                    [_text_block("done")], input_tokens=20, output_tokens=2
+                ),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 30
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 3
+        assert rec.root.attributes["gen_ai.usage.total_tokens"] == 33
+
+
+class TestChatSpanAttributes:
+    """TELEMETRY-CONTRACT.md sections 3, 5 and 8."""
+
+    async def test_writes_all_seven_usage_attributes_including_zeros(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        attrs = rec.named("chat ")[0].attributes
+        assert attrs["gen_ai.usage.input_tokens"] == 10
+        assert attrs["gen_ai.usage.output_tokens"] == 5
+        assert attrs["gen_ai.usage.total_tokens"] == 15
+        assert attrs["gen_ai.usage.cache_read.input_tokens"] == 0
+        assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 0
+        assert attrs["gen_ai.usage.prompt_tokens"] == 10
+        assert attrs["gen_ai.usage.completion_tokens"] == 5
+
+    async def test_folds_cache_tokens_into_the_input_total(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Anthropic reports cache beside input, so the real input is the sum of all three. This is
+        # the assertion that catches a fold in the wrong direction.
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_anthropic_response(
+                [_text_block("hi")],
+                input_tokens=3,
+                output_tokens=10,
+                cache_read=19971,
+                cache_creation=3580,
+            )
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        attrs = rec.named("chat ")[0].attributes
+        assert attrs["gen_ai.usage.input_tokens"] == 23554
+        assert attrs["gen_ai.usage.cache_read.input_tokens"] == 19971
+        assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 3580
+        assert attrs["gen_ai.usage.total_tokens"] == 23564
+
+    async def test_yields_raw_usage_so_parse_usage_folds_exactly_once(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # The returned bag keeps the cache fields unfolded. Returning a pre-folded input alongside
+        # them would count the cache twice downstream.
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_anthropic_response(
+                [_text_block("hi")],
+                input_tokens=3,
+                output_tokens=1,
+                cache_read=100,
+                cache_creation=50,
+            )
+        )
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        result = await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert result["usage"]["input_tokens"] == 3
+        assert result["usage"]["cache_read_input_tokens"] == 100
+        assert result["usage"]["cache_creation_input_tokens"] == 50
+
+    async def test_reports_the_mapped_finish_reason(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Anthropic's `end_turn` is semconv's `stop`.
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert rec.named("chat ")[0].attributes["gen_ai.response.finish_reasons"] == [
+            "stop"
+        ]
+
+    async def test_maps_tool_use_to_tool_calls(self, mock_anthropic: MagicMock) -> None:
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1")], stop_reason="tool_use"
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+            )
+        first = rec.named("chat ")[0]
+        assert first.attributes["gen_ai.response.finish_reasons"] == ["tool_calls"]
+
+    async def test_omits_the_finish_reason_when_the_provider_gives_none(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_anthropic_response([_text_block("hi")], stop_reason=None)
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert "gen_ai.response.finish_reasons" not in rec.named("chat ")[0].attributes
+
+    async def test_sets_status_ok_on_a_successful_turn(
+        self, mock_anthropic: MagicMock
+    ) -> None:
         from opentelemetry.trace import StatusCode
 
-        mock_span.set_status.assert_called_with(StatusCode.OK)
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-    async def test_span_end_always_called(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert StatusCode.OK in rec.named("chat ")[0].statuses
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        mock_span.end.assert_called_once()
+class TestContentCapture:
+    """TELEMETRY-CONTRACT.md section 7."""
 
-    async def test_gen_ai_operation_name(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
-
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("gen_ai.operation.name") == "chat"
-
-    async def test_gen_ai_content_prompt_event(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
-
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-            h = create_claude_messages_handler()
-            await h(CONFIG, "user input", {}, {})
-        event_names = [c[0][0] for c in mock_span.add_event.call_args_list]
-        assert "gen_ai.content.prompt" in event_names
-
-    async def test_gen_ai_content_completion_event(
+    async def test_emits_no_content_at_all_by_default(
         self, mock_anthropic: MagicMock
     ) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        # Conversation content is PII. This is the assertion worth pinning hardest.
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+        with ctx:
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        for span in rec.spans:
+            content_keys = [
+                k
+                for k in span.attributes
+                if k.startswith(("gen_ai.prompt", "gen_ai.completion"))
+                or k
+                in (
+                    "gen_ai.input.messages",
+                    "gen_ai.output.messages",
+                    "gen_ai.system_instructions",
+                    "gen_ai.tool.definitions",
+                )
+            ]
+            assert content_keys == []
+            assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        event_names = [c[0][0] for c in mock_span.add_event.call_args_list]
-        assert "gen_ai.content.completion" in event_names
-
-    async def test_total_tokens_attribute(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
-
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert "gen_ai.usage.total_tokens" in attrs
-        assert attrs["gen_ai.usage.total_tokens"] == attrs.get(
-            "gen_ai.usage.input_tokens", 0
-        ) + attrs.get("gen_ai.usage.output_tokens", 0)
-
-    async def test_gen_ai_response_model(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
-
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, {})
-        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert "gen_ai.response.model" in attrs
-        assert attrs["gen_ai.response.model"] == CONFIG["model"]["name"]
-
-    async def test_ld_span_attributes(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
-
-        variables = {
-            "__ld": {
-                "configKey": "my-config",
-                "variationKey": "v1",
-                "runId": "run-abc",
-            }
-        }
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, variables)
-        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert attrs.get("launchdarkly.operation.type") == "gen_ai"
-        assert attrs.get("launchdarkly.config.key") == "my-config"
-        assert attrs.get("launchdarkly.variation.key") == "v1"
-        assert attrs.get("launchdarkly.run.id") == "run-abc"
-        assert "launchdarkly.graph.key" not in attrs
-
-    async def test_ld_graph_key_set_when_present(
+    async def test_puts_prompt_and_completion_on_spans_when_enabled(
         self, mock_anthropic: MagicMock
     ) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-        variables = {
-            "__ld": {
-                "configKey": "my-config",
-                "variationKey": "v1",
-                "runId": "run-abc",
-                "graphKey": "my-graph",
-            }
+        with ctx:
+            await create_claude_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+        chat = rec.named("chat ")[0]
+        assert chat.attributes["gen_ai.prompt.0.role"] == "system"
+        assert chat.attributes["gen_ai.prompt.0.content"] == "Be helpful."
+        assert "gen_ai.input.messages" in chat.attributes
+        assert chat.attributes["gen_ai.completion.0.content"] == "Hello World"
+        assert "gen_ai.output.messages" in chat.attributes
+
+    async def test_records_the_tool_catalog_on_the_chat_span_when_enabled(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import json
+
+        cfg = {
+            **CONFIG,
+            "tools": {"myTool": {"description": "d", "parameters": {"type": "object"}}},
         }
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-            h = create_claude_messages_handler()
-            await h(CONFIG, "q", {}, variables)
-        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert attrs.get("launchdarkly.graph.key") == "my-graph"
+        with ctx:
+            await create_claude_messages_handler(capture_content=True)(
+                cfg, "q", {"myTool": lambda _: "r"}, {}
+            )
+        definitions = json.loads(
+            rec.named("chat ")[0].attributes["gen_ai.tool.definitions"]
+        )
+        assert definitions[0]["name"] == "myTool"
+        assert definitions[0]["type"] == "function"
+
+    async def test_records_tool_arguments_and_results_when_enabled(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1", {"city": "NYC"})],
+                    stop_reason="tool_use",
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler(capture_content=True)(
+                CONFIG, "q", {"myTool": lambda _: "72F"}, {}
+            )
+        tool = rec.named("execute_tool ")[0]
+        assert tool.attributes["gen_ai.tool.call.arguments"] == '{"city": "NYC"}'
+        assert tool.attributes["gen_ai.tool.call.result"] == "72F"
+
+    async def test_still_writes_the_legacy_content_events_when_enabled(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Redundant and deprecated, but every published version emitted them.
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+        names = [n for n, _ in rec.named("chat ")[0].events]
+        assert "gen_ai.content.prompt" in names
+        assert "gen_ai.content.completion" in names
 
 
 # ---------------------------------------------------------------------------
@@ -653,56 +1011,104 @@ class TestTelemetry:
 
 
 class TestErrorHandling:
-    async def test_records_exception_on_span(self, mock_anthropic: MagicMock) -> None:
-        mock_anthropic.messages.create = AsyncMock(
-            side_effect=RuntimeError("api error")
-        )
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+    """TELEMETRY-CONTRACT.md section 6."""
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-            h = create_claude_messages_handler()
-            with pytest.raises(RuntimeError):
-                await h(CONFIG, "q", {}, {})
-        mock_span.record_exception.assert_called_once()
-
-    async def test_sets_span_status_error(self, mock_anthropic: MagicMock) -> None:
-        mock_anthropic.messages.create = AsyncMock(
-            side_effect=RuntimeError("api error")
-        )
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
-
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-            h = create_claude_messages_handler()
-            with pytest.raises(RuntimeError):
-                await h(CONFIG, "q", {}, {})
+    async def test_fails_the_chat_span_when_the_provider_call_raises(
+        self, mock_anthropic: MagicMock
+    ) -> None:
         from opentelemetry.trace import StatusCode
 
-        status_calls = [c[0][0] for c in mock_span.set_status.call_args_list]
-        assert StatusCode.ERROR in status_calls
-
-    async def test_ends_span_on_error(self, mock_anthropic: MagicMock) -> None:
         mock_anthropic.messages.create = AsyncMock(
             side_effect=RuntimeError("api error")
         )
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+        with ctx, pytest.raises(RuntimeError):
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        chat = rec.named("chat ")[0]
+        assert len(chat.exceptions) == 1
+        assert StatusCode.ERROR in chat.statuses
+        assert chat.ended == 1
 
-            h = create_claude_messages_handler()
-            with pytest.raises(RuntimeError):
-                await h(CONFIG, "q", {}, {})
-        mock_span.end.assert_called_once()
+    async def test_fails_the_root_span_too(self, mock_anthropic: MagicMock) -> None:
+        from opentelemetry.trace import StatusCode
+
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=RuntimeError("api error")
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx, pytest.raises(RuntimeError):
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert len(rec.root.exceptions) == 1
+        assert StatusCode.ERROR in rec.root.statuses
+        assert rec.root.ended == 1
+
+    async def test_fails_the_execute_tool_span_when_a_tool_raises(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_anthropic_response(
+                [_tool_use_block("myTool", "tu1")], stop_reason="tool_use"
+            )
+        )
+
+        def _boom(_: Any) -> Any:
+            raise RuntimeError("tool exploded")
+
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx, pytest.raises(RuntimeError, match="tool exploded"):
+            await create_claude_messages_handler()(CONFIG, "q", {"myTool": _boom}, {})
+        tool = rec.named("execute_tool ")[0]
+        assert len(tool.exceptions) == 1
+        assert StatusCode.ERROR in tool.statuses
+        assert tool.ended == 1
+
+    async def test_reports_the_spend_of_completed_turns_on_a_failed_run(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # The first turn was billed. The root is the only span a config-scoped cost query finds it on.
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1")],
+                    stop_reason="tool_use",
+                    input_tokens=40,
+                    output_tokens=7,
+                ),
+                RuntimeError("second turn died"),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx, pytest.raises(RuntimeError):
+            await create_claude_messages_handler()(
+                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 40
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 7
+
+    async def test_writes_no_usage_when_no_turn_ever_reported_any(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # All-zero attributes would assert the run cost nothing, which a run whose first call died
+        # mid-flight cannot claim. An absent attribute correctly says "unknown".
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=RuntimeError("died on the first call")
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx, pytest.raises(RuntimeError):
+            await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert "gen_ai.usage.input_tokens" not in rec.root.attributes
 
     async def test_rethrows_error(self, mock_anthropic: MagicMock) -> None:
         mock_anthropic.messages.create = AsyncMock(side_effect=RuntimeError("rethrown"))
@@ -836,7 +1242,7 @@ def _make_stream_context(
     events = [_make_stream_event(c) for c in chunks]
     final_msg = MagicMock()
     final_msg.stop_reason = "end_turn"
-    final_msg.usage = MagicMock(input_tokens=input_tok, output_tokens=output_tok)
+    final_msg.usage = _Usage(input_tok, output_tok)
     final_msg.content = []
 
     class _FakeStream:
@@ -1101,6 +1507,8 @@ class TestMaxStepsCap:
 
 
 class TestStreamingTelemetry:
+    """TELEMETRY-CONTRACT.md sections 1 and 6. The streaming path emits the same tree."""
+
     def _patch_stream(
         self,
         mock_anthropic: MagicMock,
@@ -1111,53 +1519,134 @@ class TestStreamingTelemetry:
         ctx, _ = _make_stream_context(chunks, input_tok, output_tok)
         mock_anthropic.messages.stream = MagicMock(return_value=ctx)
 
-    async def test_span_started_during_stream(self, mock_anthropic: MagicMock) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, mock_tracer = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
-        from launchdarkly_ai_claude_messages import create_claude_messages_handler
-
-        self._patch_stream(mock_anthropic, ["hi"])
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            h = create_claude_messages_handler()
-            async for _ in await h.stream(CONFIG, "q"):
-                pass
-        mock_tracer.start_span.assert_called_with("claude.messages.stream")
-
-    async def test_ld_span_attributes_set_during_stream(
+    async def test_opens_the_same_root_span_name_as_the_blocking_path(
         self, mock_anthropic: MagicMock
     ) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        # A consumer must not be able to tell from the trace which path ran.
+        self._patch_stream(mock_anthropic, ["hi"])
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            async for _ in await create_claude_messages_handler().stream(CONFIG, "q"):
+                pass
+        assert rec.root.name == "invoke_agent"
+        assert "chat claude-3-sonnet-20240229" in rec.names
+
+    async def test_carries_the_launchdarkly_attributes_on_the_root(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        self._patch_stream(mock_anthropic, ["hi"])
+        ctx, rec = _recording()
         from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
         variables = {"__ld": {"configKey": "k", "variationKey": "v", "runId": "r"}}
-        self._patch_stream(mock_anthropic, ["hi"])
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            h = create_claude_messages_handler()
-            async for _ in await h.stream(CONFIG, "q", None, variables):
+        with ctx:
+            async for _ in await create_claude_messages_handler().stream(
+                CONFIG, "q", None, variables
+            ):
                 pass
-        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert attrs.get("launchdarkly.operation.type") == "gen_ai"
-        assert attrs.get("launchdarkly.config.key") == "k"
-        assert attrs.get("launchdarkly.variation.key") == "v"
-        assert attrs.get("launchdarkly.run.id") == "r"
+        attrs = rec.root.attributes
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "k"
+        assert attrs["launchdarkly.variation.key"] == "v"
+        assert attrs["launchdarkly.run.id"] == "r"
 
-    async def test_span_ended_after_stream_completes(
+    async def test_ends_every_span_once_when_the_stream_completes(
         self, mock_anthropic: MagicMock
     ) -> None:
-        mock_span = MagicMock()
-        mock_trace_mod, _ = _make_tracer_patch(mock_span)
-        import launchdarkly_ai_claude_messages.handler as handler_mod
+        self._patch_stream(mock_anthropic, ["hi"])
+        ctx, rec = _recording()
         from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-        self._patch_stream(mock_anthropic, ["hi"])
-        with patch.object(handler_mod, "trace", mock_trace_mod):
-            h = create_claude_messages_handler()
-            async for _ in await h.stream(CONFIG, "q"):
+        with ctx:
+            async for _ in await create_claude_messages_handler().stream(CONFIG, "q"):
                 pass
-        mock_span.end.assert_called()
+        assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
+        assert "launchdarkly.stream.abandoned" not in rec.root.attributes
+
+    async def test_writes_the_run_total_to_the_root(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        self._patch_stream(mock_anthropic, ["hi"], input_tok=11, output_tok=4)
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            async for _ in await create_claude_messages_handler().stream(CONFIG, "q"):
+                pass
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 11
+        assert rec.root.attributes["gen_ai.usage.total_tokens"] == 15
+
+    async def test_an_abandoned_stream_still_ends_and_exports_every_span(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # A consumer that breaks out mid-stream makes the generator run `finally` without ever
+        # entering `except`: GeneratorExit is a BaseException. Without the cleanup there the root is
+        # never ended, so it is never exported, and the whole run vanishes from AI Config Monitoring
+        # along with the feature_flag event it carries.
+        self._patch_stream(mock_anthropic, ["one", "two", "three"])
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            gen = await create_claude_messages_handler().stream(CONFIG, "q")
+            async for _ in gen:
+                break
+            await gen.aclose()
+        assert rec.root.ended == 1
+        assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
+
+    async def test_an_abandoned_stream_is_marked_but_not_failed(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Stopping early is normal, and LaunchDarkly's own metrics record neither a success nor an
+        # error for it, so ERROR here would put two dashboards in disagreement about one run.
+        from opentelemetry.trace import StatusCode
+
+        self._patch_stream(mock_anthropic, ["one", "two", "three"])
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            gen = await create_claude_messages_handler().stream(CONFIG, "q")
+            async for _ in gen:
+                break
+            await gen.aclose()
+        assert rec.root.attributes["launchdarkly.stream.abandoned"] is True
+        assert StatusCode.ERROR not in rec.root.statuses
+        assert rec.root.exceptions == []
+
+    async def test_fails_the_spans_when_the_stream_raises(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        mock_anthropic.messages.stream = MagicMock(
+            side_effect=RuntimeError("stream died")
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx, pytest.raises(RuntimeError, match="stream died"):
+            async for _ in await create_claude_messages_handler().stream(CONFIG, "q"):
+                pass
+        assert StatusCode.ERROR in rec.root.statuses
+        assert rec.root.ended == 1
+
+    async def test_emits_no_content_by_default_on_the_streaming_path(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        self._patch_stream(mock_anthropic, ["hi"])
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            async for _ in await create_claude_messages_handler().stream(CONFIG, "q"):
+                pass
+        for span in rec.spans:
+            assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
+            assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
 
 # ---------------------------------------------------------------------------

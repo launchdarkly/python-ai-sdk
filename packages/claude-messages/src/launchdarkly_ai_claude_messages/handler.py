@@ -9,17 +9,38 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    SpanMessage,
+    SpanMessagePart,
     config,
     create_handler,
+    end_span_once,
     parse_template,
-    set_ld_span_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    set_tool_call_content_attributes,
+    to_semconv_finish_reason,
+)
+
+from .spans import (
+    RawRunUsage,
+    fail_span,
+    finish_model_span,
+    finish_root_span,
+    mark_ok,
+    parent_context_of,
+    raw_usage_of,
+    start_model_span,
+    start_root_span,
+    start_tool_span,
+    succeed_span,
+    to_span_messages,
+    to_span_parts,
+    to_tool_definitions,
 )
 
 try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode as SpanStatusCode
+    from opentelemetry import trace  # noqa: F401
+    from opentelemetry.trace import StatusCode as SpanStatusCode  # noqa: F401
 
     _HAS_OTEL = True
 except ImportError:
@@ -95,19 +116,46 @@ async def _run_tool_loop(
     messages: list[dict[str, Any]],
     system: str | None,
     tool_handlers: dict[str, Any],
-) -> tuple[str, int, int]:
-    """Runs the Anthropic messages loop, handling tool calls.  Returns (output, input_tokens, output_tokens)."""
+    *,
+    capture_content: bool = False,
+    parent: Any = None,
+    run_usage: RawRunUsage,
+) -> tuple[str, dict[str, Any]]:
+    """Runs the model, then its tools, until the model stops asking for tools.
+
+    Emits one ``chat`` span per model turn and one ``execute_tool`` span per tool call. Both are
+    parented to *parent*, which is the root's context, so tool spans are siblings of the ``chat``
+    span rather than children of it.
+
+    *run_usage* is owned by the caller rather than created here, so a turn that raises does not take
+    the run's spend with it.
+    """
+    # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
+    # difference predates this span work and changes what the model is offered, not what the span
+    # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
     max_tokens = (config.get("model", {}).get("parameters") or {}).get(
         "max_tokens", 1024
     )
     conversation = list(messages)
-    total_input = 0
-    total_output = 0
     output = ""
     steps = 0
 
+    tool_definitions = to_tool_definitions(tools)
+
     while True:
+        model_span = start_model_span(config, parent)
+        # Written before the call, so an in-flight or failed turn still shows what it was asked.
+        # `conversation` grows with each turn, which is what makes a `chat` span self-contained.
+        if capture_content:
+            set_input_content_attributes(
+                model_span,
+                capture_content,
+                system_instructions=system,
+                messages=to_span_messages(conversation),
+                tool_definitions=tool_definitions,
+            )
+
         kwargs: dict[str, Any] = {
             "model": config["model"]["name"],
             "max_tokens": max_tokens,
@@ -118,9 +166,31 @@ async def _run_tool_loop(
         if tools:
             kwargs["tools"] = tools
 
-        resp = await client.messages.create(**kwargs)
-        total_input += resp.usage.input_tokens
-        total_output += resp.usage.output_tokens
+        try:
+            resp = await client.messages.create(**kwargs)
+        except Exception as exc:
+            fail_span(model_span, exc)
+            raise
+
+        raw_usage = raw_usage_of(getattr(resp, "usage", None))
+        # Mapped once, into a local, so the span attribute and the output message cannot disagree:
+        # Anthropic's `end_turn` is semconv's `stop`, and this handler is not the only one whose
+        # spans a consumer groups by that value.
+        finish_reason = to_semconv_finish_reason(getattr(resp, "stop_reason", None))
+        if capture_content:
+            set_output_content_attributes(
+                model_span,
+                capture_content,
+                [
+                    SpanMessage(
+                        role="assistant",
+                        parts=to_span_parts(resp.content),
+                        finish_reason=finish_reason,
+                    )
+                ],
+            )
+        finish_model_span(model_span, config, raw_usage, finish_reason)
+        run_usage.add_turn(raw_usage)
 
         if resp.stop_reason != "tool_use":
             output = "".join(
@@ -139,20 +209,30 @@ async def _run_tool_loop(
         for block in resp.content:
             if block.type != "tool_use":
                 continue
-            handler_fn = tool_handlers.get(block.name)
-            if not handler_fn or not callable(handler_fn):
-                raise ValueError(f'No handler registered for tool "{block.name}"')
-            result = (
-                await handler_fn(block.input)
-                if _is_coroutine(handler_fn)
-                else handler_fn(block.input)
+            tool_span = start_tool_span(block.name, block.id, parent)
+            set_tool_call_content_attributes(
+                tool_span, capture_content, arguments=block.input
             )
+            try:
+                handler_fn = tool_handlers.get(block.name)
+                if not handler_fn or not callable(handler_fn):
+                    raise ValueError(f'No handler registered for tool "{block.name}"')
+                result = (
+                    await handler_fn(block.input)
+                    if _is_coroutine(handler_fn)
+                    else handler_fn(block.input)
+                )
+            except Exception as exc:
+                fail_span(tool_span, exc)
+                raise
+            set_tool_call_content_attributes(tool_span, capture_content, result=result)
+            succeed_span(tool_span)
             tool_results.append(
                 {"type": "tool_result", "tool_use_id": block.id, "content": str(result)}
             )
         conversation.append({"role": "user", "content": tool_results})
 
-    return output, total_input, total_output
+    return output, run_usage.total
 
 
 def _is_coroutine(fn: Any) -> bool:
@@ -162,17 +242,20 @@ def _is_coroutine(fn: Any) -> bool:
 _MAX_STEPS = 10
 
 
-def create_claude_messages_handler() -> ProviderHandler:
-    """
-    Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
+def create_claude_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+    """Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
+
     Requires ``anthropic`` to be installed as a peer dependency.
+
+    Set *capture_content* to put prompts, model output, tool arguments and tool results on the
+    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
+    meaning models, token counts, timings and tool names, until a caller asks for more. Turning this
+    on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
     import importlib
 
     anthropic_mod = importlib.import_module("anthropic")
     client = anthropic_mod.AsyncAnthropic()
-
-    tracer_name = "@launchdarkly/ai-claude-messages"
 
     async def _call_impl(
         config: AiConfigRep,
@@ -184,64 +267,52 @@ def create_claude_messages_handler() -> ProviderHandler:
         th = tool_handlers or {}
         vs = variables or {}
 
-        if _HAS_OTEL:
-            tracer = trace.get_tracer(tracer_name)
-            span = tracer.start_span("claude.messages")
-            span.set_attribute("gen_ai.operation.name", "chat")
-            span.set_attribute("gen_ai.system", "anthropic")
-            span.set_attribute(
-                "gen_ai.request.model", config.get("model", {}).get("name", "")
-            )
-            set_ld_span_attributes(span, vs)
-        else:
-            span = None
+        span = start_root_span(config, vs)
+        parent = parent_context_of(span)
 
         messages, system = _build_messages(config, user_input, vs, history=history)
-        if span:
-            prompt_text = (f"system: {system}\n" if system else "") + "\n".join(
-                f"{m['role']}: {m['content']}" for m in messages
-            )
-            span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-            prompt_msgs = (
-                [{"role": "system", "content": system}] if system else []
-            ) + [{"role": m["role"], "content": m["content"]} for m in messages]
-            set_openllmetry_prompt(span, prompt_msgs)
+        set_input_content_attributes(
+            span,
+            capture_content,
+            system_instructions=system,
+            messages=to_span_messages(messages),
+        )
 
+        # Outside the try, so the failure path can still report the spend of the turns that
+        # completed before it.
+        run_usage = RawRunUsage()
         try:
-            output, inp, out = await _run_tool_loop(
-                client, config, messages, system, th
+            output, usage = await _run_tool_loop(
+                client,
+                config,
+                messages,
+                system,
+                th,
+                capture_content=capture_content,
+                parent=parent,
+                run_usage=run_usage,
             )
-            if span:
-                span.set_attribute(
-                    "gen_ai.response.model", config.get("model", {}).get("name", "")
-                )
-                span.set_attribute("gen_ai.usage.input_tokens", inp)
-                span.set_attribute("gen_ai.usage.output_tokens", out)
-                span.set_attribute("gen_ai.usage.total_tokens", inp + out)
-                span.add_event(
-                    "gen_ai.content.completion",
-                    {
-                        "gen_ai.completion": output
-                        if isinstance(output, str)
-                        else json.dumps(output)
-                    },
-                )
-                set_openllmetry_completion(
-                    span,
-                    output if isinstance(output, str) else json.dumps(output),
-                    {"input_tokens": inp, "output_tokens": out},
-                )
-                span.set_status(SpanStatusCode.OK)
-                span.end()
-            return {
-                "output": output,
-                "usage": {"input_tokens": inp, "output_tokens": out},
-            }
+            set_output_content_attributes(
+                span,
+                capture_content,
+                [
+                    SpanMessage(
+                        role="assistant",
+                        parts=[SpanMessagePart(type="text", content=output)],
+                    )
+                ],
+            )
+            finish_root_span(span, config, usage)
+            succeed_span(span)
+            # Raw usage, cache fields intact. `parse_usage` folds them exactly once; handing back a
+            # pre-folded figure alongside the fields would count the cache twice.
+            return {"output": output, "usage": usage}
         except Exception as exc:
-            if span:
-                span.record_exception(exc)
-                span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            # The turns that completed were billed, and the root is the only span a config-scoped
+            # cost query can find them on.
+            if run_usage.reported:
+                finish_root_span(span, config, run_usage.total)
+            fail_span(span, exc)
             raise
 
     def _stream_impl(
@@ -252,7 +323,13 @@ def create_claude_messages_handler() -> ProviderHandler:
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         return _stream_gen(
-            client, config, user_input, tool_handlers or {}, variables or {}, history
+            client,
+            config,
+            user_input,
+            tool_handlers or {},
+            variables or {},
+            history,
+            capture_content=capture_content,
         )
 
     return create_handler(("Anthropic", "messages"), _call_impl, _stream_impl)  # type: ignore[arg-type]
@@ -265,44 +342,59 @@ async def _stream_gen(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
+    *,
+    capture_content: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    tracer_name = "@launchdarkly/ai-claude-messages"
-    if _HAS_OTEL:
-        span = trace.get_tracer(tracer_name).start_span("claude.messages.stream")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute("gen_ai.system", "anthropic")
-        span.set_attribute(
-            "gen_ai.request.model", config.get("model", {}).get("name", "")
-        )
-        set_ld_span_attributes(span, variables)
-    else:
-        span = None
+    """Streams the run, emitting the same span tree as the blocking path.
+
+    A consumer that breaks out of ``async for``, or raises inside the loop body, makes this
+    generator run its ``finally`` without ever entering ``except``: ``GeneratorExit`` inherits from
+    ``BaseException``, so ``except Exception`` does not see it. Without the cleanup in ``finally``
+    the root span is never ended, so it is never exported, and the whole run disappears from AI
+    Config Monitoring along with the ``feature_flag`` event it carries.
+
+    ``ended`` stops the success, failure and abandonment paths from ending the same span twice.
+    """
+    span = start_root_span(config, variables)
+    parent = parent_context_of(span)
 
     messages, system = _build_messages(
         config, user_input, variables, include_output_format=False, history=history
     )
-    if span:
-        prompt_text = (f"system: {system}\n" if system else "") + "\n".join(
-            f"{m['role']}: {m['content']}" for m in messages
-        )
-        span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-        prompt_msgs = ([{"role": "system", "content": system}] if system else []) + [
-            {"role": m["role"], "content": m["content"]} for m in messages
-        ]
-        set_openllmetry_prompt(span, prompt_msgs)
+    set_input_content_attributes(
+        span,
+        capture_content,
+        system_instructions=system,
+        messages=to_span_messages(messages),
+    )
 
     tools = _build_tools(config.get("tools") or {})
+    tool_definitions = to_tool_definitions(tools)
     max_tokens = (config.get("model", {}).get("parameters") or {}).get(
         "max_tokens", 1024
     )
     conversation = list(messages)
-    total_input = 0
-    total_output = 0
     full_output = ""
     steps = 0
 
+    ended: set[int] = set()
+    open_model_span: Any = None
+    # Outside the try, so the failure and abandonment paths can still report the spend.
+    run_usage = RawRunUsage()
+
     try:
         while True:
+            model_span = start_model_span(config, parent)
+            open_model_span = model_span
+            if capture_content:
+                set_input_content_attributes(
+                    model_span,
+                    capture_content,
+                    system_instructions=system,
+                    messages=to_span_messages(conversation),
+                    tool_definitions=tool_definitions,
+                )
+
             kwargs: dict[str, Any] = {
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
@@ -313,23 +405,47 @@ async def _stream_gen(
             if tools:
                 kwargs["tools"] = tools
 
-            stream = client.messages.stream(**kwargs)
-            async with stream as s:
-                async for event in s:
-                    if (
-                        hasattr(event, "type")
-                        and event.type == "content_block_delta"
-                        and hasattr(event, "delta")
-                        and getattr(event.delta, "type", None) == "text_delta"
-                    ):
-                        text = event.delta.text
-                        full_output += text
-                        yield {"type": "chunk", "text": text}
+            try:
+                stream = client.messages.stream(**kwargs)
+                async with stream as s:
+                    async for event in s:
+                        if (
+                            hasattr(event, "type")
+                            and event.type == "content_block_delta"
+                            and hasattr(event, "delta")
+                            and getattr(event.delta, "type", None) == "text_delta"
+                        ):
+                            text = event.delta.text
+                            full_output += text
+                            yield {"type": "chunk", "text": text}
 
-                final_msg = await s.get_final_message()
+                    final_msg = await s.get_final_message()
+            except Exception as exc:
+                fail_span(model_span, exc, ended)
+                open_model_span = None
+                raise
 
-            total_input += final_msg.usage.input_tokens
-            total_output += final_msg.usage.output_tokens
+            raw_usage = raw_usage_of(getattr(final_msg, "usage", None))
+            finish_reason = to_semconv_finish_reason(
+                getattr(final_msg, "stop_reason", None)
+            )
+            if capture_content:
+                set_output_content_attributes(
+                    model_span,
+                    capture_content,
+                    [
+                        SpanMessage(
+                            role="assistant",
+                            parts=to_span_parts(final_msg.content),
+                            finish_reason=finish_reason,
+                        )
+                    ],
+                )
+            # finish_model_span ends the span. Clearing open_model_span is what stops the
+            # `finally` from ending it a second time.
+            finish_model_span(model_span, config, raw_usage, finish_reason)
+            open_model_span = None
+            run_usage.add_turn(raw_usage)
 
             if final_msg.stop_reason != "tool_use":
                 break
@@ -345,14 +461,28 @@ async def _stream_gen(
             for block in final_msg.content:
                 if block.type != "tool_use":
                     continue
-                handler_fn = tool_handlers.get(block.name)
-                if not handler_fn or not callable(handler_fn):
-                    raise ValueError(f'No handler registered for tool "{block.name}"')
-                result = (
-                    await handler_fn(block.input)
-                    if _is_coroutine(handler_fn)
-                    else handler_fn(block.input)
+                tool_span = start_tool_span(block.name, block.id, parent)
+                set_tool_call_content_attributes(
+                    tool_span, capture_content, arguments=block.input
                 )
+                try:
+                    handler_fn = tool_handlers.get(block.name)
+                    if not handler_fn or not callable(handler_fn):
+                        raise ValueError(
+                            f'No handler registered for tool "{block.name}"'
+                        )
+                    result = (
+                        await handler_fn(block.input)
+                        if _is_coroutine(handler_fn)
+                        else handler_fn(block.input)
+                    )
+                except Exception as exc:
+                    fail_span(tool_span, exc, ended)
+                    raise
+                set_tool_call_content_attributes(
+                    tool_span, capture_content, result=result
+                )
+                succeed_span(tool_span)
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -362,43 +492,42 @@ async def _stream_gen(
                 )
             conversation.append({"role": "user", "content": tool_results})
 
-        if span:
-            span.set_attribute(
-                "gen_ai.response.model", config.get("model", {}).get("name", "")
-            )
-            span.set_attribute("gen_ai.usage.input_tokens", total_input)
-            span.set_attribute("gen_ai.usage.output_tokens", total_output)
-            span.set_attribute("gen_ai.usage.total_tokens", total_input + total_output)
-            span.add_event(
-                "gen_ai.content.completion",
-                {
-                    "gen_ai.completion": full_output
-                    if isinstance(full_output, str)
-                    else json.dumps(full_output)
-                },
-            )
-            set_openllmetry_completion(
-                span,
-                full_output
-                if isinstance(full_output, str)
-                else json.dumps(full_output),
-                {"input_tokens": total_input, "output_tokens": total_output},
-            )
-            span.set_status(SpanStatusCode.OK)
-            span.end()
+        set_output_content_attributes(
+            span,
+            capture_content,
+            [
+                SpanMessage(
+                    role="assistant",
+                    parts=[SpanMessagePart(type="text", content=full_output)],
+                )
+            ],
+        )
+        finish_root_span(span, config, run_usage.total)
+        mark_ok(span)
+        end_span_once(span, ended)
 
         yield {
             "type": "done",
             "output": full_output,
-            "usage": {"input_tokens": total_input, "output_tokens": total_output},
+            "usage": run_usage.total,
         }
 
     except Exception as exc:
-        if span:
-            span.record_exception(exc)
-            span.set_status(SpanStatusCode.ERROR, str(exc))
-            span.end()
+        if run_usage.reported:
+            finish_root_span(span, config, run_usage.total)
+        fail_span(span, exc, ended)
         raise
+    finally:
+        # A no-op on the success and failure paths, because both already ended their spans through
+        # `ended`. On abandonment it is the only chance to close the tree, and to report what the
+        # completed turns already cost. An abandoned span is left UNSET rather than ERROR: stopping
+        # early is a normal thing for a consumer to do, and LaunchDarkly's own metrics record neither
+        # a success nor an error for it, so ERROR would put two dashboards in disagreement.
+        if open_model_span is not None:
+            end_span_once(open_model_span, ended, abandoned=True)
+        if span is not None and id(span) not in ended and run_usage.reported:
+            finish_root_span(span, config, run_usage.total)
+        end_span_once(span, ended, abandoned=True)
 
 
 def claude_messages(
