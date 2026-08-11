@@ -784,7 +784,15 @@ def langchain_messages(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
+    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
+    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
+    # asking for content on spans got a TypeError instead of content.
     variables = kwargs.pop("variables", None)
+    capture_content = kwargs.pop("capture_content", False)
     return config(
-        key=config_key, handler=create_langchain_messages_handler(llm=llm), **kwargs
+        key=config_key,
+        handler=create_langchain_messages_handler(
+            llm=llm, capture_content=capture_content
+        ),
+        **kwargs,
     ).invoke(user_input, context, variables=variables)
