@@ -423,9 +423,7 @@ async def _stream_gen(
         # a normal thing for a consumer to do, and LaunchDarkly's own metrics record neither a
         # success nor an error for it.
         if span is not None and id(span) not in ended:
-            span_callbacks.close_open_spans(
-                RuntimeError("stream abandoned before completion")
-            )
+            span_callbacks.abandon_open_spans(ended)
             if span_callbacks.run_usage.reported:
                 finish_root_span(span, config, span_callbacks.run_usage.total)
         end_span_once(span, ended, abandoned=True)

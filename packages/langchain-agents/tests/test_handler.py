@@ -1497,3 +1497,63 @@ class TestHistory:
         assert system is not None
         assert "Conversation History:" in system
         assert "user: What is feature flagging?" in system
+
+
+class TestAbandonOpenSpans:
+    """An early consumer stop must not look like a provider failure.
+
+    The abandonment path used to reuse `close_open_spans`, which records a synthetic exception and
+    sets ERROR on every span still open. TELEMETRY-CONTRACT.md section 6 says an abandoned span stays
+    UNSET and carries `launchdarkly.stream.abandoned`, and `openai-agents` already did that.
+
+    Tested directly on the callback handler rather than through the streaming path. Reaching the
+    state that matters, a chat or tool span still open at the break, needs a fake model that yields
+    mid-turn, and with the fixtures here LangGraph has already run every callback by the time the
+    first chunk reaches the consumer. A test driven through `stream` therefore passes whether or not
+    the fix is present, which is worse than no test.
+    """
+
+    def _handler_with_open_spans(self) -> tuple[Any, Any, Any]:
+        import launchdarkly_ai_langchain_agents.spans as spans_mod
+        from launchdarkly_ai_langchain_agents.spans import build_span_callbacks
+
+        recorder = SpanRecorder()
+        with patch.object(spans_mod, "trace", recorder):
+            bundle = build_span_callbacks(BASE_CONFIG, None, capture_content=False)
+            handler = bundle._handler
+            chat = recorder.start_span("chat gpt-4o")
+            tool = recorder.start_span("execute_tool search")
+        handler.model_spans["run-1"] = chat
+        handler.tool_spans["run-2"] = tool
+        return bundle, chat, tool
+
+    def test_marks_open_spans_abandoned_and_leaves_them_unset(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        bundle, chat, tool = self._handler_with_open_spans()
+        bundle.abandon_open_spans(set())
+        for span in (chat, tool):
+            assert span.ended == 1
+            assert span.attributes["launchdarkly.stream.abandoned"] is True
+            assert StatusCode.ERROR not in span.statuses
+            assert span.exceptions == []
+
+    def test_close_open_spans_still_fails_them_for_a_real_error(self) -> None:
+        # The failure path keeps its behaviour; only abandonment changed.
+        from opentelemetry.trace import StatusCode
+
+        bundle, chat, tool = self._handler_with_open_spans()
+        bundle.close_open_spans(RuntimeError("provider died"))
+        for span in (chat, tool):
+            assert span.ended == 1
+            assert StatusCode.ERROR in span.statuses
+            assert len(span.exceptions) == 1
+            assert "launchdarkly.stream.abandoned" not in span.attributes
+
+    def test_abandoning_twice_ends_each_span_once(self) -> None:
+        bundle, chat, tool = self._handler_with_open_spans()
+        ended: set[int] = set()
+        bundle.abandon_open_spans(ended)
+        bundle.abandon_open_spans(ended)
+        assert chat.ended == 1
+        assert tool.ended == 1

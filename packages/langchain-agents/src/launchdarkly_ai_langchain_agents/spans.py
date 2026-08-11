@@ -411,6 +411,21 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         self.model_spans.clear()
         self.tool_spans.clear()
 
+    def abandon_open_spans(self, ended: set[int]) -> None:
+        """Ends every span this run has open, for stream abandonment.
+
+        Unlike :meth:`close_open_spans`, nothing failed: a consumer stopping early is normal.
+        ``end_span_once`` leaves each span at ``UNSET`` and marks ``launchdarkly.stream.abandoned``,
+        rather than recording a synthetic exception and setting ``ERROR``, which would make an early
+        consumer stop indistinguishable from a provider failure in a trace.
+        """
+        for span in self.model_spans.values():
+            end_span_once(span, ended, abandoned=True)
+        for span in self.tool_spans.values():
+            end_span_once(span, ended, abandoned=True)
+        self.model_spans.clear()
+        self.tool_spans.clear()
+
 
 def _tool_result_text(output: Any) -> Any:
     """A ``ToolMessage`` carries the result in ``content``; anything else passes through."""
@@ -437,6 +452,10 @@ class SpanCallbacks:
     def close_open_spans(self, error: BaseException) -> None:
         if self._handler is not None:
             self._handler.close_open_spans(error)
+
+    def abandon_open_spans(self, ended: set[int]) -> None:
+        if self._handler is not None:
+            self._handler.abandon_open_spans(ended)
 
 
 def build_span_callbacks(
