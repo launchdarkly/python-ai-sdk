@@ -40,14 +40,6 @@ from .spans import (
     to_tool_definitions,
 )
 
-try:
-    from opentelemetry import trace  # noqa: F401
-    from opentelemetry.trace import StatusCode as SpanStatusCode  # noqa: F401
-
-    _HAS_OTEL = True
-except ImportError:
-    _HAS_OTEL = False
-
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK's
