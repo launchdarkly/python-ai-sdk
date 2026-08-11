@@ -248,13 +248,16 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                             if _is_coroutine(handler_fn)
                             else handler_fn(args)
                         )
+                        # Inside the try on purpose. Serialising a tool result can raise, most easily
+                        # when capture_content is on and the result is not JSON-serialisable, and a
+                        # raise out here would leave this span open: nothing else knows it exists.
+                        set_tool_call_content_attributes(
+                            tool_span, capture_content, result=result
+                        )
+                        succeed_span(tool_span)
                     except Exception as exc:
                         fail_span(tool_span, exc)
                         raise
-                    set_tool_call_content_attributes(
-                        tool_span, capture_content, result=result
-                    )
-                    succeed_span(tool_span)
                     tool_outputs.append(
                         {
                             "type": "function_call_output",
@@ -457,13 +460,16 @@ async def _stream_gen(
                         if _is_coroutine(handler_fn)
                         else handler_fn(args)
                     )
+                    # Inside the try on purpose. Serialising a tool result can raise, most easily
+                    # when capture_content is on and the result is not JSON-serialisable, and a
+                    # raise out here would leave this span open: nothing else knows it exists.
+                    set_tool_call_content_attributes(
+                        tool_span, capture_content, result=result
+                    )
+                    succeed_span(tool_span)
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     raise
-                set_tool_call_content_attributes(
-                    tool_span, capture_content, result=result
-                )
-                succeed_span(tool_span)
                 tool_outputs.append(
                     {
                         "type": "function_call_output",
