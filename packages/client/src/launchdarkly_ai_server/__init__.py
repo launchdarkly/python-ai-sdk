@@ -3,6 +3,19 @@
 __version__ = "0.1.3"  # x-release-please-version
 
 from .client import ConfigInstance, config
+from .content import (
+    SpanMessage,
+    SpanMessagePart,
+    ToolDefinitionInput,
+    lang_chain_finish_reasons,
+    lang_chain_span_messages,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    set_tool_call_content_attributes,
+    set_tool_definition_attributes,
+    text_message,
+    to_semconv_finish_reason,
+)
 from .graph import GraphInstance, graph, resolve_graph
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
@@ -114,17 +127,28 @@ __all__ = [  # noqa: RUF022
     "TrackData",
     "InputTokenDetails",
     "RunUsage",
+    "SpanMessage",
+    "SpanMessagePart",
     "SpanUsage",
+    "ToolDefinitionInput",
     "UsageDict",
     "add_cached_tokens_to_input",
     "create_run_usage",
     "end_span_once",
     "end_unfinished_spans",
+    "lang_chain_finish_reasons",
+    "lang_chain_span_messages",
     "lang_chain_span_usage",
     "number_or_zero",
+    "set_input_content_attributes",
     "set_model_identity_attributes",
+    "set_output_content_attributes",
+    "set_tool_call_content_attributes",
+    "set_tool_definition_attributes",
     "set_usage_span_attributes",
     "to_usage_dict",
+    "text_message",
+    "to_semconv_finish_reason",
     "VariationMeta",
     # utils
     "create_handler",
