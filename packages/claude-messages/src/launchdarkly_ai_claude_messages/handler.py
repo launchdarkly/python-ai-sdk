@@ -222,11 +222,16 @@ async def _run_tool_loop(
                     if _is_coroutine(handler_fn)
                     else handler_fn(block.input)
                 )
+                # Inside the try on purpose. Serialising a tool result can raise, most easily when
+                # capture_content is on and the result is not JSON-serialisable, and a raise out
+                # here would leave this span open forever: nothing else knows it exists.
+                set_tool_call_content_attributes(
+                    tool_span, capture_content, result=result
+                )
+                succeed_span(tool_span)
             except Exception as exc:
                 fail_span(tool_span, exc)
                 raise
-            set_tool_call_content_attributes(tool_span, capture_content, result=result)
-            succeed_span(tool_span)
             tool_results.append(
                 {"type": "tool_result", "tool_use_id": block.id, "content": str(result)}
             )
@@ -476,13 +481,14 @@ async def _stream_gen(
                         if _is_coroutine(handler_fn)
                         else handler_fn(block.input)
                     )
+                    # Inside the try, for the same reason as the blocking path above.
+                    set_tool_call_content_attributes(
+                        tool_span, capture_content, result=result
+                    )
+                    succeed_span(tool_span)
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     raise
-                set_tool_call_content_attributes(
-                    tool_span, capture_content, result=result
-                )
-                succeed_span(tool_span)
                 tool_results.append(
                     {
                         "type": "tool_result",

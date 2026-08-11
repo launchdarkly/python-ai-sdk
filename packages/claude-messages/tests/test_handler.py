@@ -1763,3 +1763,43 @@ class TestConvenienceWrapperForwardsCaptureContent:
 
     def test_defaults_to_off(self) -> None:
         assert self._run()["capture_content"] is False
+
+
+class TestToolSpanNeverLeaks:
+    """A raise while recording a tool result must not leave its span open.
+
+    Serialising a tool result can raise, most easily when capture_content is on and the result is
+    not JSON-serialisable. The success-side content write used to sit outside the try, so that raise
+    skipped both the finish and the failure path: only the root was marked ERROR, and the tool span
+    was never ended, so the exporter never saw it.
+    """
+
+    async def test_an_unserialisable_tool_result_still_ends_the_tool_span(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _anthropic_response(
+                    [_tool_use_block("myTool", "tu1")], stop_reason="tool_use"
+                ),
+                _anthropic_response([_text_block("done")]),
+            ]
+        )
+
+        class _Unserialisable:
+            __slots__ = ()
+
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx, pytest.raises(TypeError):
+            await create_claude_messages_handler(capture_content=True)(
+                CONFIG, "q", {"myTool": lambda _: _Unserialisable()}, {}
+            )
+
+        tool_spans = rec.named("execute_tool ")
+        assert len(tool_spans) == 1
+        assert tool_spans[0].ended == 1, "the tool span leaked"
+        assert StatusCode.ERROR in tool_spans[0].statuses
