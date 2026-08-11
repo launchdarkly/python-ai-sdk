@@ -247,13 +247,27 @@ def extract_llm_usage(output: Any) -> dict[str, Any]:
     llm_output = _get(output, "llm_output") or {}
     token_usage = llm_output.get("token_usage") or llm_output.get("usage")
     if token_usage:
+        # `or` would read a real 0 as missing, and with both counts at zero the bag came back all
+        # None, which lang_chain_span_usage reports as "the provider said nothing". A turn that
+        # completed and reported zero is not the same as a turn that reported nothing: only the
+        # second may leave the root without usage attributes.
         return {
-            "input_tokens": token_usage.get("prompt_tokens")
-            or token_usage.get("input_tokens"),
-            "output_tokens": token_usage.get("completion_tokens")
-            or token_usage.get("output_tokens"),
+            "input_tokens": _first_present(
+                token_usage, "prompt_tokens", "input_tokens"
+            ),
+            "output_tokens": _first_present(
+                token_usage, "completion_tokens", "output_tokens"
+            ),
         }
     return {}
+
+
+def _first_present(bag: dict[str, Any], *keys: str) -> Any:
+    """The first key actually present, so a reported 0 is kept rather than skipped."""
+    for key in keys:
+        if key in bag:
+            return bag[key]
+    return None
 
 
 def to_tool_definitions(config_tools: dict[str, Any]) -> list[ToolDefinitionInput]:

@@ -7,6 +7,7 @@ Reference: TESTING.md §1, §2.x (LangChain)
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1679,3 +1680,41 @@ class TestModelSpanTrackedBeforeContent:
             bundle.abandon_open_spans(set())
 
         assert recorder.named("chat ")[0].ended == 1
+
+
+class TestZeroTokensAreStillReported:
+    """A reported 0 is not a missing count.
+
+    `extract_llm_usage` read the llm_output fallback with `or`, so a genuine 0 was skipped. With both
+    counts at zero the bag came back all None, `lang_chain_span_usage` read that as "the provider
+    said nothing", and the run went unreported: a turn that completed and cost nothing became
+    indistinguishable from one that never reported.
+    """
+
+    def test_a_zero_prompt_count_survives(self) -> None:
+        from launchdarkly_ai_langchain_agents.spans import extract_llm_usage
+
+        result = SimpleNamespace(
+            generations=[],
+            llm_output={"token_usage": {"prompt_tokens": 0, "completion_tokens": 7}},
+        )
+        assert extract_llm_usage(result) == {"input_tokens": 0, "output_tokens": 7}
+
+    def test_both_zero_still_counts_as_reported(self) -> None:
+        from launchdarkly_ai_langchain_agents.spans import extract_llm_usage
+        from launchdarkly_ai_server import lang_chain_span_usage
+
+        result = SimpleNamespace(
+            generations=[],
+            llm_output={"token_usage": {"prompt_tokens": 0, "completion_tokens": 0}},
+        )
+        raw = extract_llm_usage(result)
+        assert raw == {"input_tokens": 0, "output_tokens": 0}
+        # The distinction that matters downstream: this is a reported turn, not an absent one.
+        assert lang_chain_span_usage(raw) is not None
+
+    def test_an_absent_count_is_still_none(self) -> None:
+        from launchdarkly_ai_langchain_agents.spans import extract_llm_usage
+
+        result = SimpleNamespace(generations=[], llm_output={"token_usage": {}})
+        assert extract_llm_usage(result) == {}
