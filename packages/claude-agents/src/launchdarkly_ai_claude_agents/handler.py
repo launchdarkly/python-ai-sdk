@@ -1,14 +1,31 @@
 """
-Claude Agents handler — uses the claude-agent-sdk `query()` + MCP tools.
-Mirrors the TypeScript @launchdarkly/ai-claude-agents handler.
+Claude Agents handler: uses the claude-agent-sdk ``query()`` plus MCP tools.
+
+Span shape: ``invoke_agent`` root, one ``chat`` child per model response, ``execute_tool`` children
+per tool call, the same three-span vocabulary the other five handlers emit.
+
+``query()`` reports no request boundaries, so this handler derives them from the message stream: an
+``AssistantMessage`` *is* one model response, carrying its own ``message_id`` (the Anthropic response
+id), ``usage`` and ``model``. See :mod:`spans` for how those are folded into ``chat`` spans.
+
+Deliberately NOT done here: enabling the CLI's own OTel exporter. Its spans are named outside the
+semantic conventions and duplicate what this handler already emits.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from typing import Any
+
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    HookMatcher,
+    ResultMessage,
+    StreamEvent,
+    query,
+)
 
 from launchdarkly_ai_server import (
     NATIVE_TOOL_KEY,
@@ -16,28 +33,37 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeTool,
     ProviderHandler,
+    SpanMessage,
+    SpanMessagePart,
     config,
     create_handler,
+    end_span_once,
     parse_template,
-    set_ld_span_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    set_tool_call_content_attributes,
 )
 
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode as SpanStatusCode
-
-    _HAS_OTEL = True
-except ImportError:
-    _HAS_OTEL = False
-
-TOOL_MCP_NAME = "tool-mcp"
-MCP_TOOL_PREFIX = f"mcp__{TOOL_MCP_NAME}__"
-
+from .spans import (
+    MCP_TOOL_PREFIX,
+    TOOL_MCP_NAME,
+    InferenceSpans,
+    Opening,
+    ToolCatalog,
+    fail_span,
+    finish_root_span,
+    mark_ok,
+    parent_context_of,
+    record_conversation_id,
+    record_native_tools,
+    start_root_span,
+    start_tool_span,
+    succeed_span,
+    tool_display_name,
+)
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Tool wiring
 # ---------------------------------------------------------------------------
 
 
@@ -45,7 +71,13 @@ async def build_tool_mcp(
     config_tools: dict[str, Any],
     handlers: dict[str, Any],
 ) -> Any:
-    """Build an in-process SDK MCP server from LD config tools + handler functions."""
+    """Build an in-process SDK MCP server from LD config tools + handler functions.
+
+    Imports the SDK lazily rather than off the module-level ``claude_agent_sdk`` import that
+    ``query``/``ClaudeAgentOptions``/etc. use: ``native_graph.py`` (out of scope for this telemetry
+    pass) calls this function too, and its own tests mock the SDK by patching
+    ``importlib.import_module`` rather than this module's names.
+    """
     import importlib
 
     sdk = importlib.import_module("claude_agent_sdk")
@@ -79,9 +111,13 @@ def partition_tools(
     """
     Returns (native_tool_map, user_config_tools, native_tool_names).
 
-    native_tool_map  : provider tool name → tracking stub (for PreToolUse hook)
+    native_tool_map  : provider tool name → tracking stub (for PreToolUse/PostToolUse hooks)
     user_config_tools: LD tool definitions for user-defined tools (sent via MCP)
     native_tool_names: provider-facing names for query(options.tools=[...])
+
+    Kept at a 3-tuple return for backward compatibility: ``native_graph.py`` (out of scope for this
+    telemetry pass) unpacks this directly. See :func:`_native_tool_aliases` for the fourth mapping
+    the span work needs.
     """
     native_tool_map: dict[str, Any] = {}
     user_config_tools: dict[str, Any] = {}
@@ -94,6 +130,144 @@ def partition_tools(
             user_config_tools[ld_name] = config_tools[ld_name]
 
     return native_tool_map, user_config_tools, list(native_tool_map.keys())
+
+
+def _native_tool_aliases(tool_handlers: dict[str, Any]) -> dict[str, str]:
+    """AI Config key → provider tool name, for the config's native tools only.
+
+    ``partition_tools``'s ``native_tool_map`` is keyed the other way round, by provider name, which
+    loses the AI Config key, and the key is what a config's declared schema is filed under.
+    :class:`~.spans.ToolCatalog` needs both ends to report one tool once, under the name the model
+    saw, with the schema the config gave it.
+    """
+    aliases: dict[str, str] = {}
+    for ld_name, stub in tool_handlers.items():
+        native = getattr(stub, NATIVE_TOOL_KEY, None)
+        if isinstance(native, NativeTool):
+            aliases[ld_name] = native.tool_name
+    return aliases
+
+
+def _is_coroutine(fn: Any) -> bool:
+    return asyncio.iscoroutinefunction(fn)
+
+
+def _build_hooks(native_tool_map: dict[str, Any]) -> dict[str, Any] | None:
+    """The pre-span-work hook set: tracks a native tool call for telemetry purposes only.
+
+    Kept for ``native_graph.py`` (out of scope for this telemetry pass), which imports this name
+    directly and does not build ``execute_tool`` spans of its own. See :func:`build_tool_hooks` for
+    the span-aware hook set this handler's own ``_call_impl``/``_stream_gen`` use.
+    """
+    if not native_tool_map:
+        return None
+
+    async def _pre_tool_hook(
+        input_data: Any, tool_use_id: str | None, hook_context: Any
+    ) -> dict[str, Any]:
+        tool_name = (
+            input_data.get("tool_name") if isinstance(input_data, dict) else None
+        )
+        stub = native_tool_map.get(tool_name) if tool_name is not None else None
+        if stub and callable(stub):
+            stub()
+        return {}
+
+    return {"PreToolUse": [HookMatcher(hooks=[_pre_tool_hook])]}  # type: ignore[list-item]
+
+
+ToolTelemetry = Callable[[BaseException], None]
+
+
+def build_tool_hooks(
+    native_tool_map: dict[str, Any],
+    parent_context: Any,
+    capture_content: bool,
+) -> tuple[dict[str, list[HookMatcher]], ToolTelemetry]:
+    """Builds the PreToolUse/PostToolUse/PostToolUseFailure hooks that open and close
+    ``execute_tool`` spans around the Agent SDK's own tool dispatch.
+
+    Returns ``(hooks, close_open_spans)``. ``close_open_spans`` fails every span this run still has
+    open, for the path where the SDK throws mid-tool-call and no ``PostToolUse*`` hook ever fires.
+    """
+    tool_spans: dict[str, Any] = {}
+
+    def _finish(
+        tool_use_id: str | None, *, error: BaseException | None, result: Any = None
+    ) -> None:
+        if tool_use_id is None:
+            return
+        span = tool_spans.pop(tool_use_id, None)
+        if span is None:
+            return
+        if result is not None:
+            set_tool_call_content_attributes(span, capture_content, result=result)
+        if error is None:
+            succeed_span(span)
+        else:
+            fail_span(span, error)
+
+    async def _pre_tool_use(
+        input_data: Any, tool_use_id: str | None, hook_context: Any
+    ) -> dict[str, Any]:
+        if input_data.get("hook_event_name") != "PreToolUse":
+            return {}
+        provider_name = input_data.get("tool_name", "")
+        stub = native_tool_map.get(provider_name)
+        if stub and callable(stub):
+            stub()
+
+        display_name = tool_display_name(provider_name)
+        use_id = input_data.get("tool_use_id") or tool_use_id or ""
+        span = start_tool_span(display_name, use_id, parent_context)
+        session_id = input_data.get("session_id")
+        # Same grouping key as the root and as the CLI's own spans; the hook input is where this
+        # side sees it without waiting for a message. See TELEMETRY-CONTRACT.md section 4.
+        if span is not None and session_id:
+            span.set_attribute("gen_ai.conversation.id", session_id)
+        set_tool_call_content_attributes(
+            span, capture_content, arguments=input_data.get("tool_input")
+        )
+        tool_spans[use_id] = span
+        return {}
+
+    async def _post_tool_use(
+        input_data: Any, tool_use_id: str | None, hook_context: Any
+    ) -> dict[str, Any]:
+        if input_data.get("hook_event_name") != "PostToolUse":
+            return {}
+        use_id = input_data.get("tool_use_id") or tool_use_id
+        _finish(use_id, error=None, result=input_data.get("tool_response"))
+        return {}
+
+    async def _post_tool_use_failure(
+        input_data: Any, tool_use_id: str | None, hook_context: Any
+    ) -> dict[str, Any]:
+        if input_data.get("hook_event_name") != "PostToolUseFailure":
+            return {}
+        use_id = input_data.get("tool_use_id") or tool_use_id
+        _finish(
+            use_id,
+            error=RuntimeError(str(input_data.get("error") or "tool call failed")),
+        )
+        return {}
+
+    def close_open_spans(error: BaseException) -> None:
+        for span in list(tool_spans.values()):
+            fail_span(span, error)
+        tool_spans.clear()
+
+    hooks: dict[str, list[HookMatcher]] = {
+        "PreToolUse": [HookMatcher(hooks=[_pre_tool_use])],  # type: ignore[list-item]
+        "PostToolUse": [HookMatcher(hooks=[_post_tool_use])],  # type: ignore[list-item]
+        "PostToolUseFailure": [HookMatcher(hooks=[_post_tool_use_failure])],  # type: ignore[list-item]
+    }
+    return hooks, close_open_spans
+
+
+# ---------------------------------------------------------------------------
+# Prompt construction
+# ---------------------------------------------------------------------------
 
 
 def _format_history(history: list[dict[str, Any]] | None) -> str | None:
@@ -113,7 +287,11 @@ def build_prompt(
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str | None]:
-    """Returns (prompt, system_prompt)."""
+    """Returns (prompt, system_prompt).
+
+    One user message, not one per configured role: ``query()`` takes a single prompt string, so this
+    really does flatten a configured history into one turn before the model sees it.
+    """
     safe_input = user_input or ""
     system_prompt: str | None = None
 
@@ -143,33 +321,49 @@ def build_prompt(
     return safe_input, system_prompt
 
 
-def _is_coroutine(fn: Any) -> bool:
-    return asyncio.iscoroutinefunction(fn)
+def _opening_of(prompt: str, system_prompt: str | None) -> Opening:
+    return Opening(
+        system_instructions=system_prompt,
+        messages=[
+            SpanMessage(
+                role="user", parts=[SpanMessagePart(type="text", content=prompt)]
+            )
+        ],
+    )
 
 
-def _build_hooks(native_tool_map: dict[str, Any]) -> dict[str, Any] | None:
-    if not native_tool_map:
-        return None
+def _result_error(subtype: str, errors: list[str] | None) -> str:
+    """Builds the error for a non-success result message.
 
-    import importlib
+    ``SDKResultError`` carries no ``result`` field, so a run that hit ``error_max_turns`` or
+    ``error_max_budget_usd`` genuinely failed and has to surface as a failure rather than being
+    reported OK with zeroed usage.
+    """
+    detail = f": {'; '.join(errors)}" if errors else ""
+    return f"Claude agent run ended with {subtype}{detail}"
 
-    sdk = importlib.import_module("claude_agent_sdk")
-    HookMatcher = sdk.HookMatcher
 
-    async def _pre_tool_hook(
-        input_data: Any, tool_use_id: str | None, context: Any
-    ) -> dict[str, Any]:
-        tool_name = getattr(input_data, "tool_name", None) or (
-            input_data.get("tool_name") if isinstance(input_data, dict) else None
-        )
-        stub = native_tool_map.get(tool_name) if tool_name is not None else None
-        if stub and callable(stub):
-            stub()
-        return {}
-
-    return {
-        "PreToolUse": [HookMatcher(hooks=[_pre_tool_hook])],
+def _build_query_options(
+    config: AiConfigRep,
+    system_prompt: str | None,
+    native_tool_names: list[str],
+    mcp_allowed_tools: list[str],
+    tool_mcp: Any,
+    hooks: dict[str, list[HookMatcher]] | None,
+    **extra: Any,
+) -> ClaudeAgentOptions:
+    all_allowed = [*mcp_allowed_tools, *native_tool_names]
+    kwargs: dict[str, Any] = {
+        "model": config["model"]["name"],
+        "tools": native_tool_names if native_tool_names else [],
+        "allowed_tools": all_allowed if all_allowed else [],
+        "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
+        "hooks": hooks or {},
+        **extra,
     }
+    if system_prompt:
+        kwargs["system_prompt"] = system_prompt
+    return ClaudeAgentOptions(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +371,12 @@ def _build_hooks(native_tool_map: dict[str, Any]) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def create_claude_agents_handler() -> ProviderHandler:
-    """Creates a ``ProviderHandler`` for Anthropic's Claude via the claude-agent-sdk."""
-    tracer_name = "@launchdarkly/ai-claude-agents"
+def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHandler:
+    """Creates a ``ProviderHandler`` for Anthropic's Claude via the claude-agent-sdk.
+
+    Set *capture_content* to put prompts, model output, tool arguments and tool results on the
+    emitted spans. It defaults to off. See TELEMETRY-CONTRACT.md section 7.
+    """
 
     async def _call_impl(
         config: AiConfigRep,
@@ -188,134 +385,129 @@ def create_claude_agents_handler() -> ProviderHandler:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        import importlib
-
-        sdk = importlib.import_module("claude_agent_sdk")
-        ClaudeAgentOptions = sdk.ClaudeAgentOptions
-        ResultMessage = sdk.ResultMessage
-        query_fn = sdk.query
-
         th = tool_handlers or {}
         vs = variables or {}
 
-        if _HAS_OTEL:
-            span = trace.get_tracer(tracer_name).start_span("claude.query")
-            span.set_attribute("gen_ai.operation.name", "chat")
-            span.set_attribute("gen_ai.system", "anthropic")
-            span.set_attribute(
-                "gen_ai.request.model", config.get("model", {}).get("name", "")
-            )
-            set_ld_span_attributes(span, vs)
-        else:
-            span = None
+        span = start_root_span(config, vs)
+        parent = parent_context_of(span)
 
         prompt, system_prompt = build_prompt(config, user_input, vs, history)
-
-        # Append outputFormat instruction to system prompt
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
             system_prompt = (
                 f"{system_prompt}\n\n{schema_instr}" if system_prompt else schema_instr
             )
+        opening = _opening_of(prompt, system_prompt)
 
-        if span:
-            span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt})
-            prompt_msgs: list[dict[str, str]] = []
-            if system_prompt:
-                prompt_msgs.append({"role": "system", "content": system_prompt})
-            prompt_msgs.append({"role": "user", "content": prompt})
-            set_openllmetry_prompt(span, prompt_msgs)
+        native_tool_map, user_config_tools, native_tool_names = partition_tools(
+            config.get("tools"), th
+        )
+        catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(th))
+        set_input_content_attributes(
+            span,
+            capture_content,
+            system_instructions=opening.system_instructions,
+            messages=opening.messages,
+            tool_definitions=catalog.current,
+        )
 
+        # Declared out here so the except clause can end a chat span the throw left open.
+        inference = InferenceSpans(config, parent, capture_content, catalog, opening)
+        tool_telemetry: ToolTelemetry | None = None
+        # Set wherever the root's usage is written, so the failure path can tell whether the CLI
+        # already reported an authoritative run-level total and must not overwrite it.
+        root_usage_written = False
+        gen: AsyncIterator[Any] | None = None
         try:
-            native_tool_map, user_config_tools, native_tool_names = partition_tools(
-                config.get("tools"), th
-            )
-
             tool_mcp = (
                 await build_tool_mcp(user_config_tools, th)
                 if user_config_tools
                 else None
             )
-            mcp_allowed = [MCP_TOOL_PREFIX + n for n in user_config_tools]
-            all_allowed = mcp_allowed + native_tool_names
+            mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
+            hooks = None
+            if native_tool_names or mcp_allowed_tools:
+                hooks, tool_telemetry = build_tool_hooks(
+                    native_tool_map, parent, capture_content
+                )
 
-            hooks = _build_hooks(native_tool_map)
-
-            options = ClaudeAgentOptions(
-                allowed_tools=all_allowed if all_allowed else [],
-                mcp_servers={TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
-                hooks=hooks or {},
-                **({"system_prompt": system_prompt} if system_prompt else {}),
-                **({"tools": native_tool_names} if native_tool_names else {}),
+            options = _build_query_options(
+                config,
+                system_prompt,
+                native_tool_names,
+                mcp_allowed_tools,
+                tool_mcp,
+                hooks,
             )
 
             output = ""
-            raw_usage: dict[str, Any] = {}
-            span_ended = False
 
-            # Hold an explicit reference so we can call aclose() in the finally
-            # block below.  A bare `return` inside `async for` abandons the
-            # generator — Python's asyncio finalizer later tries to aclose() it
-            # and raises RuntimeError if the generator is suspended inside a real
-            # await in the SDK (AIC-2950).  See Appendix A.4 in TESTING.md.
-            gen = query_fn(prompt=prompt, options=options)
+            # Held in a variable so the finally below can aclose() it. A bare `return` inside
+            # `async for` abandons the generator, and asyncio's finalizer then raises RuntimeError
+            # when the generator is suspended inside a real await in the SDK.
+            gen = query(prompt=prompt, options=options)
             try:
                 async for message in gen:
-                    if isinstance(message, ResultMessage):
-                        output = message.result or ""
-                        raw_usage = message.usage or {}
-                        input_tokens = int(raw_usage.get("input_tokens", 0))
-                        output_tokens = int(raw_usage.get("output_tokens", 0))
-                        if span:
-                            span.set_attribute(
-                                "gen_ai.response.model",
-                                config.get("model", {}).get("name", ""),
-                            )
-                            span.set_attribute(
-                                "gen_ai.usage.input_tokens", input_tokens
-                            )
-                            span.set_attribute(
-                                "gen_ai.usage.output_tokens", output_tokens
-                            )
-                            span.set_attribute(
-                                "gen_ai.usage.total_tokens",
-                                input_tokens + output_tokens,
-                            )
-                            span.add_event(
-                                "gen_ai.content.completion",
-                                {
-                                    "gen_ai.completion": output
-                                    if isinstance(output, str)
-                                    else json.dumps(output)
-                                },
-                            )
-                            set_openllmetry_completion(
-                                span,
-                                output
-                                if isinstance(output, str)
-                                else json.dumps(output),
-                                {
-                                    "input_tokens": input_tokens,
-                                    "output_tokens": output_tokens,
-                                },
-                            )
-                            span.set_status(SpanStatusCode.OK)
-                            span.end()
-                            span_ended = True
-                        break
-            finally:
-                await gen.aclose()
+                    record_conversation_id(span, message)
+                    record_native_tools(span, message, capture_content, catalog)
+                    inference.record(message)
 
-            if span and not span_ended:
-                span.set_status(SpanStatusCode.OK)
-                span.end()
-            return {"output": output, "usage": raw_usage}
+                    if isinstance(message, ResultMessage):
+                        # Before the root, so the children it parents are already closed.
+                        inference.finish()
+                        raw_usage: dict[str, Any] = dict(message.usage or {})
+                        finish_root_span(span, config, raw_usage)
+                        # The CLI's own run-level total is authoritative, so the except clause below
+                        # must not overwrite it with the summed-per-response figure.
+                        root_usage_written = True
+                        if message.subtype != "success":
+                            raise RuntimeError(
+                                _result_error(message.subtype, message.errors)
+                            )
+                        result_text = (
+                            message.result
+                            if isinstance(message.result, str)
+                            else json.dumps(message.result)
+                        )
+                        set_output_content_attributes(
+                            span,
+                            capture_content,
+                            [
+                                SpanMessage(
+                                    role="assistant",
+                                    parts=[
+                                        SpanMessagePart(
+                                            type="text", content=result_text
+                                        )
+                                    ],
+                                )
+                            ],
+                        )
+                        succeed_span(span)
+                        return {"output": message.result, "usage": raw_usage}
+
+                # The stream ended without a result message, so no message closed the last
+                # response, and no message carried a run-level total either. The per-response sum
+                # is the only record of what the run spent.
+                inference.finish()
+                streamed_usage = inference.run_usage
+                finish_root_span(span, config, streamed_usage["total"])
+                root_usage_written = True
+                succeed_span(span)
+                return {"output": output, "usage": streamed_usage["total"]}
+            finally:
+                if gen is not None:
+                    await gen.aclose()  # type: ignore[attr-defined]
 
         except Exception as exc:
-            if span:
-                span.record_exception(exc)
-                span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            # Before the root: the exporter only receives ended spans, so a chat span left open by
+            # the throw would never reach the trace.
+            inference.finish()
+            if tool_telemetry is not None:
+                tool_telemetry(exc)
+            if not root_usage_written and inference.run_usage["reported"]:
+                finish_root_span(span, config, inference.run_usage["total"])
+            fail_span(span, exc)
             raise
 
     def _stream_impl(
@@ -326,7 +518,12 @@ def create_claude_agents_handler() -> ProviderHandler:
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         return _stream_gen(
-            config, user_input, tool_handlers or {}, variables or {}, history
+            config,
+            user_input,
+            tool_handlers or {},
+            variables or {},
+            history,
+            capture_content=capture_content,
         )
 
     return create_handler(("Anthropic", "agent"), _call_impl, _stream_impl)  # type: ignore[arg-type]
@@ -338,61 +535,72 @@ async def _stream_gen(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
+    *,
+    capture_content: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    import importlib
+    """Streams the run, emitting the same span tree as the blocking path.
 
-    sdk = importlib.import_module("claude_agent_sdk")
-    ClaudeAgentOptions = sdk.ClaudeAgentOptions
-    ResultMessage = sdk.ResultMessage
-    StreamEvent = sdk.StreamEvent
-    query_fn = sdk.query
-
-    tracer_name = "@launchdarkly/ai-claude-agents"
-    if _HAS_OTEL:
-        span = trace.get_tracer(tracer_name).start_span("claude.query.stream")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute("gen_ai.system", "anthropic")
-        span.set_attribute(
-            "gen_ai.request.model", config.get("model", {}).get("name", "")
-        )
-        set_ld_span_attributes(span, variables)
-    else:
-        span = None
+    A consumer that breaks out of ``async for``, or raises inside the loop body, makes this
+    generator run its ``finally`` without ever entering ``except``: ``GeneratorExit`` inherits from
+    ``BaseException``, so ``except Exception`` does not see it. The same ``finally`` also closes the
+    vendor's own generator, for the same reason the blocking path holds one in a variable: a bare
+    exit abandons it, and asyncio's finalizer later raises ``RuntimeError`` when it is suspended
+    inside a real await in the SDK.
+    """
+    span = start_root_span(config, variables)
+    parent = parent_context_of(span)
 
     prompt, system_prompt = build_prompt(config, user_input, variables, history)
-    if span:
-        span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt})
-        prompt_msgs: list[dict[str, str]] = []
-        if system_prompt:
-            prompt_msgs.append({"role": "system", "content": system_prompt})
-        prompt_msgs.append({"role": "user", "content": prompt})
-        set_openllmetry_prompt(span, prompt_msgs)
+    opening = _opening_of(prompt, system_prompt)
+
+    native_tool_map, user_config_tools, native_tool_names = partition_tools(
+        config.get("tools"), tool_handlers
+    )
+    catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(tool_handlers))
+    set_input_content_attributes(
+        span,
+        capture_content,
+        system_instructions=opening.system_instructions,
+        messages=opening.messages,
+        tool_definitions=catalog.current,
+    )
+
+    inference = InferenceSpans(config, parent, capture_content, catalog, opening)
+    tool_telemetry: ToolTelemetry | None = None
+    root_usage_written = False
+    ended: set[int] = set()
+    gen: AsyncIterator[Any] | None = None
 
     try:
-        native_tool_map, user_config_tools, native_tool_names = partition_tools(
-            config.get("tools"), tool_handlers
-        )
         tool_mcp = (
             await build_tool_mcp(user_config_tools, tool_handlers)
             if user_config_tools
             else None
         )
-        mcp_allowed = [MCP_TOOL_PREFIX + n for n in user_config_tools]
-        all_allowed = mcp_allowed + native_tool_names
-        hooks = _build_hooks(native_tool_map)
+        mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
+        hooks = None
+        if native_tool_names or mcp_allowed_tools:
+            hooks, tool_telemetry = build_tool_hooks(
+                native_tool_map, parent, capture_content
+            )
 
-        options = ClaudeAgentOptions(
-            allowed_tools=all_allowed if all_allowed else [],
-            mcp_servers={TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
-            hooks=hooks or {},
+        options = _build_query_options(
+            config,
+            system_prompt,
+            native_tool_names,
+            mcp_allowed_tools,
+            tool_mcp,
+            hooks,
             include_partial_messages=True,
-            **({"system_prompt": system_prompt} if system_prompt else {}),
-            **({"tools": native_tool_names} if native_tool_names else {}),
         )
 
         full_output = ""
+        gen = query(prompt=prompt, options=options)
+        async for message in gen:
+            record_conversation_id(span, message)
+            record_native_tools(span, message, capture_content, catalog)
+            inference.record(message)
 
-        async for message in query_fn(prompt=prompt, options=options):
             if isinstance(message, StreamEvent):
                 event = message.event
                 if (
@@ -404,50 +612,82 @@ async def _stream_gen(
                         yield {"type": "chunk", "text": text}
                         full_output += text
             elif isinstance(message, ResultMessage):
-                raw_usage = message.usage or {}
-                input_tokens = int(raw_usage.get("input_tokens", 0))
-                output_tokens = int(raw_usage.get("output_tokens", 0))
-                final_output = message.result or full_output
-                if span:
-                    span.set_attribute(
-                        "gen_ai.response.model", config.get("model", {}).get("name", "")
-                    )
-                    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-                    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-                    span.set_attribute(
-                        "gen_ai.usage.total_tokens", input_tokens + output_tokens
-                    )
-                    span.add_event(
-                        "gen_ai.content.completion",
-                        {
-                            "gen_ai.completion": final_output
-                            if isinstance(final_output, str)
-                            else json.dumps(final_output)
-                        },
-                    )
-                    set_openllmetry_completion(
-                        span,
-                        final_output
-                        if isinstance(final_output, str)
-                        else json.dumps(final_output),
-                        {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                    )
-                    span.set_status(SpanStatusCode.OK)
-                    span.end()
+                # Before the root, so the children it parents are already closed.
+                inference.finish()
+                raw_usage: dict[str, Any] = dict(message.usage or {})
+                finish_root_span(span, config, raw_usage)
+                root_usage_written = True
+                if message.subtype != "success":
+                    raise RuntimeError(_result_error(message.subtype, message.errors))
+                final_output = (
+                    message.result if message.result is not None else full_output
+                )
+                result_text = (
+                    final_output
+                    if isinstance(final_output, str)
+                    else json.dumps(final_output)
+                )
+                set_output_content_attributes(
+                    span,
+                    capture_content,
+                    [
+                        SpanMessage(
+                            role="assistant",
+                            parts=[SpanMessagePart(type="text", content=result_text)],
+                        )
+                    ],
+                )
+                mark_ok(span)
+                end_span_once(span, ended)
                 yield {"type": "done", "output": final_output, "usage": raw_usage}
                 return
 
-        if span:
-            span.set_status(SpanStatusCode.OK)
-            span.end()
-        yield {"type": "done", "output": full_output, "usage": {}}
+        # The stream ended without a result message, so nothing carried a run-level total. The
+        # per-response sum is the only record of the spend.
+        inference.finish()
+        streamed_usage = inference.run_usage
+        finish_root_span(span, config, streamed_usage["total"])
+        root_usage_written = True
+        set_output_content_attributes(
+            span,
+            capture_content,
+            [
+                SpanMessage(
+                    role="assistant",
+                    parts=[SpanMessagePart(type="text", content=full_output)],
+                )
+            ],
+        )
+        mark_ok(span)
+        end_span_once(span, ended)
+        yield {"type": "done", "output": full_output, "usage": streamed_usage["total"]}
 
     except Exception as exc:
-        if span:
-            span.record_exception(exc)
-            span.set_status(SpanStatusCode.ERROR, str(exc))
-            span.end()
+        if tool_telemetry is not None:
+            tool_telemetry(exc)
+        if not root_usage_written and inference.run_usage["reported"]:
+            finish_root_span(span, config, inference.run_usage["total"])
+            root_usage_written = True
+        fail_span(span, exc, ended)
         raise
+    finally:
+        # A no-op on the success path, where the result message already closed the last response.
+        # On the error and abandonment paths this is the only thing that ends a chat span still
+        # open, and the exporter only receives ended spans.
+        inference.finish()
+        # A no-op on the success and failure paths; on abandonment it is the only chance to close
+        # the tree, including any tool span whose PostToolUse hook never fired, and the only chance
+        # to report what the responses that did arrive cost.
+        if id(span) not in ended:
+            if tool_telemetry is not None:
+                tool_telemetry(RuntimeError("stream abandoned before completion"))
+            if not root_usage_written and inference.run_usage["reported"]:
+                finish_root_span(span, config, inference.run_usage["total"])
+        end_span_once(span, ended, abandoned=True)
+        # Same reasoning as the blocking path: a bare exit through this generator's boundary
+        # abandons the vendor's own generator if it is not closed explicitly.
+        if gen is not None:
+            await gen.aclose()  # type: ignore[attr-defined]
 
 
 def claude_agents(
@@ -458,6 +698,9 @@ def claude_agents(
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
     variables = kwargs.pop("variables", None)
+    capture_content = kwargs.pop("capture_content", False)
     return config(
-        key=config_key, handler=create_claude_agents_handler(), **kwargs
+        key=config_key,
+        handler=create_claude_agents_handler(capture_content=capture_content),
+        **kwargs,
     ).invoke(user_input, context, variables=variables)
