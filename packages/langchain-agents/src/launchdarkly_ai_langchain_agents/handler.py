@@ -13,17 +13,33 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    SpanMessage,
+    SpanMessagePart,
     config,
     create_handler,
+    create_run_usage,
+    end_span_once,
+    lang_chain_span_messages,
+    lang_chain_span_usage,
     parse_template,
-    set_ld_span_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
+    set_input_content_attributes,
+    set_output_content_attributes,
+)
+
+from .spans import (
+    build_span_callbacks,
+    fail_span,
+    finish_root_span,
+    mark_ok,
+    parent_context_of,
+    start_root_span,
+    succeed_span,
+    to_tool_definitions,
 )
 
 try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode as SpanStatusCode
+    from opentelemetry import trace  # noqa: F401
+    from opentelemetry.trace import StatusCode as SpanStatusCode  # noqa: F401
 
     _HAS_OTEL = True
 except ImportError:
@@ -142,9 +158,32 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
     return lc_openai.ChatOpenAI(model=model_name or "gpt-4o")
 
 
-def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
-    """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``."""
-    tracer_name = "@launchdarkly/ai-langchain-agents"
+def _run_usage_from_messages(messages: list[Any]) -> Any:
+    """Sums ``usage_metadata`` over a run's messages, the same set of numbers the callbacks see
+    from the other side.
+
+    Only ``AIMessage`` carries usage. Summing here rather than trusting the callbacks' own total
+    matters when there is a real ``result``/stepped state to read: it is the same path the
+    TypeScript handler takes, and it keeps the two run-usage totals (this one, and the callbacks'
+    fallback used only on the failure path) computed the same way.
+    """
+    run_usage = create_run_usage()
+    for msg in messages:
+        usage = getattr(msg, "usage_metadata", None)
+        if usage:
+            run_usage.add(lang_chain_span_usage(usage))
+    return run_usage
+
+
+def create_langchain_agents_handler(
+    llm: Any = None, *, capture_content: bool = False
+) -> ProviderHandler:
+    """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
+
+    Set *capture_content* to put prompts, model output, tool arguments and tool results on the
+    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
+    meaning models, token counts, timings and tool names, until a caller asks for more.
+    """
 
     async def _call_impl(
         config: AiConfigRep,
@@ -158,19 +197,8 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
         th = tool_handlers or {}
         vs = variables or {}
 
-        if _HAS_OTEL:
-            span = trace.get_tracer(tracer_name).start_span("langchain.agent")
-            span.set_attribute("gen_ai.operation.name", "chat")
-            span.set_attribute(
-                "gen_ai.system",
-                config.get("provider", {}).get("name", "langchain").lower(),
-            )
-            span.set_attribute(
-                "gen_ai.request.model", config.get("model", {}).get("name", "")
-            )
-            set_ld_span_attributes(span, vs)
-        else:
-            span = None
+        span = start_root_span(config, vs)
+        parent = parent_context_of(span)
 
         system_prompt = _extract_system_prompt(config, vs, history)
         if config.get("outputFormat"):
@@ -180,33 +208,20 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
             )
 
         initial_messages = _build_initial_messages(config, user_input, vs)
+        if capture_content:
+            set_input_content_attributes(
+                span,
+                capture_content,
+                system_instructions=system_prompt,
+                messages=lang_chain_span_messages(initial_messages)[1],
+            )
 
-        if span:
-            prompt_text = "\n".join(
-                [
-                    *(["system: " + system_prompt] if system_prompt else []),
-                    *[
-                        f"{getattr(m, 'type', type(m).__name__)}: {m.content}"
-                        for m in initial_messages
-                    ],
-                ]
-            )
-            span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-            prompt_msgs: list[dict[str, str]] = []
-            if system_prompt:
-                prompt_msgs.append({"role": "system", "content": system_prompt})
-            prompt_msgs.extend(
-                [
-                    {
-                        "role": getattr(m, "type", type(m).__name__),
-                        "content": m.content
-                        if isinstance(m.content, str)
-                        else str(m.content),
-                    }
-                    for m in initial_messages
-                ]
-            )
-            set_openllmetry_prompt(span, prompt_msgs)
+        span_callbacks = build_span_callbacks(
+            config,
+            parent,
+            capture_content,
+            to_tool_definitions(config.get("tools") or {}),
+        )
 
         try:
             base_model = llm
@@ -221,13 +236,18 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
                 tools,
                 **({"prompt": system_prompt} if system_prompt else {}),
             )
-            result = await agent.ainvoke({"messages": initial_messages})
+            result = await agent.ainvoke(
+                {"messages": initial_messages},
+                config={"callbacks": span_callbacks.callbacks},
+            )
 
             msgs = (
                 result.get("messages", [])
                 if isinstance(result, dict)
                 else getattr(result, "messages", [])
             )
+            run_usage = _run_usage_from_messages(msgs)
+
             last_msg = msgs[-1] if msgs else None
             output = (
                 (last_msg.content if isinstance(last_msg.content, str) else "")
@@ -235,50 +255,35 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
                 else ""
             )
 
-            total_input = sum(
-                (getattr(m, "usage_metadata", None) or {}).get("input_tokens", 0)
-                for m in msgs
+            set_output_content_attributes(
+                span,
+                capture_content,
+                [
+                    SpanMessage(
+                        role="assistant",
+                        parts=[SpanMessagePart(type="text", content=output)],
+                    )
+                ],
             )
-            total_output = sum(
-                (getattr(m, "usage_metadata", None) or {}).get("output_tokens", 0)
-                for m in msgs
-            )
-
-            if span:
-                span.set_attribute(
-                    "gen_ai.response.model", config.get("model", {}).get("name", "")
-                )
-                span.set_attribute("gen_ai.usage.input_tokens", total_input)
-                span.set_attribute("gen_ai.usage.output_tokens", total_output)
-                span.set_attribute(
-                    "gen_ai.usage.total_tokens", total_input + total_output
-                )
-                span.add_event(
-                    "gen_ai.content.completion",
-                    {
-                        "gen_ai.completion": output
-                        if isinstance(output, str)
-                        else json.dumps(output)
-                    },
-                )
-                set_openllmetry_completion(
-                    span,
-                    output if isinstance(output, str) else json.dumps(output),
-                    {"input_tokens": total_input, "output_tokens": total_output},
-                )
-                span.set_status(SpanStatusCode.OK)
-                span.end()
+            finish_root_span(span, config, run_usage.total)
+            succeed_span(span)
 
             return {
                 "output": output,
-                "usage": {"input_tokens": total_input, "output_tokens": total_output},
+                "usage": {
+                    "input_tokens": run_usage.total.input,
+                    "output_tokens": run_usage.total.output,
+                },
             }
 
         except Exception as exc:
-            if span:
-                span.record_exception(exc)
-                span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            span_callbacks.close_open_spans(exc)
+            # There is no `result` to sum, so the run total comes from the callbacks, which saw
+            # every turn that did complete. Those tokens were billed and the root is the only span
+            # a config-scoped cost query can find them on.
+            if span_callbacks.run_usage.reported:
+                finish_root_span(span, config, span_callbacks.run_usage.total)
+            fail_span(span, exc)
             raise
 
     def _stream_impl(
@@ -289,7 +294,13 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         return _stream_gen(
-            llm, config, user_input, tool_handlers or {}, variables or {}, history
+            llm,
+            config,
+            user_input,
+            tool_handlers or {},
+            variables or {},
+            history,
+            capture_content=capture_content,
         )
 
     return create_handler(("*", "agent"), _call_impl, _stream_impl)  # type: ignore[arg-type]
@@ -302,52 +313,38 @@ async def _stream_gen(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
+    *,
+    capture_content: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
+    """Streams the run, emitting the same span tree as the blocking path.
+
+    A consumer that breaks out of ``async for``, or raises inside the loop body, makes this
+    generator run its ``finally`` without ever entering ``except``: ``GeneratorExit`` inherits from
+    ``BaseException``, so ``except Exception`` does not see it. Without the cleanup in ``finally``
+    the root span, and any ``chat``/``execute_tool`` span LangChain's end callback never fired for,
+    is never ended, so it is never exported.
+
+    ``ended`` stops the success, failure and abandonment paths from ending the same span twice.
+    """
     import importlib
 
-    tracer_name = "@launchdarkly/ai-langchain-agents"
-    if _HAS_OTEL:
-        span = trace.get_tracer(tracer_name).start_span("langchain.agent.stream")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute(
-            "gen_ai.system", config.get("provider", {}).get("name", "langchain").lower()
-        )
-        span.set_attribute(
-            "gen_ai.request.model", config.get("model", {}).get("name", "")
-        )
-        set_ld_span_attributes(span, variables)
-    else:
-        span = None
+    span = start_root_span(config, variables)
+    parent = parent_context_of(span)
 
     system_prompt = _extract_system_prompt(config, variables, history)
     initial_messages = _build_initial_messages(config, user_input, variables)
+    if capture_content:
+        set_input_content_attributes(
+            span,
+            capture_content,
+            system_instructions=system_prompt,
+            messages=lang_chain_span_messages(initial_messages)[1],
+        )
 
-    if span:
-        prompt_text = "\n".join(
-            [
-                *(["system: " + system_prompt] if system_prompt else []),
-                *[
-                    f"{getattr(m, 'type', type(m).__name__)}: {m.content}"
-                    for m in initial_messages
-                ],
-            ]
-        )
-        span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-        prompt_msgs: list[dict[str, str]] = []
-        if system_prompt:
-            prompt_msgs.append({"role": "system", "content": system_prompt})
-        prompt_msgs.extend(
-            [
-                {
-                    "role": getattr(m, "type", type(m).__name__),
-                    "content": m.content
-                    if isinstance(m.content, str)
-                    else str(m.content),
-                }
-                for m in initial_messages
-            ]
-        )
-        set_openllmetry_prompt(span, prompt_msgs)
+    span_callbacks = build_span_callbacks(
+        config, parent, capture_content, to_tool_definitions(config.get("tools") or {})
+    )
+    ended: set[int] = set()
 
     try:
         base_model = llm
@@ -363,11 +360,14 @@ async def _stream_gen(
             **({"prompt": system_prompt} if system_prompt else {}),
         )
 
-        total_input = 0
-        total_output = 0
+        run_usage = create_run_usage()
         full_output = ""
 
-        async for step_state in agent.astream({"messages": initial_messages}):
+        # agent.astream() yields state updates per graph step: { [node_name]: { messages: [...] } }
+        async for step_state in agent.astream(
+            {"messages": initial_messages},
+            config={"callbacks": span_callbacks.callbacks},
+        ):
             for step_messages in (
                 step_state.values() if isinstance(step_state, dict) else []
             ):
@@ -377,52 +377,58 @@ async def _stream_gen(
                     else []
                 )
                 for msg in msgs:
-                    usage = getattr(msg, "usage_metadata", None) or {}
-                    total_input += usage.get("input_tokens", 0)
-                    total_output += usage.get("output_tokens", 0)
+                    usage = getattr(msg, "usage_metadata", None)
+                    if usage:
+                        run_usage.add(lang_chain_span_usage(usage))
                     if getattr(msg, "type", None) == "ai":
                         text = msg.content if isinstance(msg.content, str) else ""
                         if text:
                             yield {"type": "chunk", "text": text}
                             full_output = text
 
-        if span:
-            span.set_attribute(
-                "gen_ai.response.model", config.get("model", {}).get("name", "")
-            )
-            span.set_attribute("gen_ai.usage.input_tokens", total_input)
-            span.set_attribute("gen_ai.usage.output_tokens", total_output)
-            span.set_attribute("gen_ai.usage.total_tokens", total_input + total_output)
-            span.add_event(
-                "gen_ai.content.completion",
-                {
-                    "gen_ai.completion": full_output
-                    if isinstance(full_output, str)
-                    else json.dumps(full_output)
-                },
-            )
-            set_openllmetry_completion(
-                span,
-                full_output
-                if isinstance(full_output, str)
-                else json.dumps(full_output),
-                {"input_tokens": total_input, "output_tokens": total_output},
-            )
-            span.set_status(SpanStatusCode.OK)
-            span.end()
+        set_output_content_attributes(
+            span,
+            capture_content,
+            [
+                SpanMessage(
+                    role="assistant",
+                    parts=[SpanMessagePart(type="text", content=full_output)],
+                )
+            ],
+        )
+        finish_root_span(span, config, run_usage.total)
+        mark_ok(span)
+        end_span_once(span, ended)
 
         yield {
             "type": "done",
             "output": full_output,
-            "usage": {"input_tokens": total_input, "output_tokens": total_output},
+            "usage": {
+                "input_tokens": run_usage.total.input,
+                "output_tokens": run_usage.total.output,
+            },
         }
 
     except Exception as exc:
-        if span:
-            span.record_exception(exc)
-            span.set_status(SpanStatusCode.ERROR, str(exc))
-            span.end()
+        span_callbacks.close_open_spans(exc)
+        if span_callbacks.run_usage.reported:
+            finish_root_span(span, config, span_callbacks.run_usage.total)
+        fail_span(span, exc, ended)
         raise
+    finally:
+        # A no-op on the success and failure paths, because both already ended their spans through
+        # `ended`. On abandonment it is the only chance to close the tree, including any chat or
+        # tool span whose LangChain end callback never fired, and to report what the completed
+        # turns already cost. An abandoned span is left UNSET rather than ERROR: stopping early is
+        # a normal thing for a consumer to do, and LaunchDarkly's own metrics record neither a
+        # success nor an error for it.
+        if span is not None and id(span) not in ended:
+            span_callbacks.close_open_spans(
+                RuntimeError("stream abandoned before completion")
+            )
+            if span_callbacks.run_usage.reported:
+                finish_root_span(span, config, span_callbacks.run_usage.total)
+        end_span_once(span, ended, abandoned=True)
 
 
 def langchain_agents(

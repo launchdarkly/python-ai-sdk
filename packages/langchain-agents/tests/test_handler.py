@@ -10,7 +10,9 @@ from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pydantic
 import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
 
 import launchdarkly_ai_langchain_agents.handler as handler_mod
 from launchdarkly_ai_langchain_agents.handler import (
@@ -450,328 +452,654 @@ class TestToolExecutionLoop:
 # ---------------------------------------------------------------------------
 
 
-class TestTelemetry:
+class _FakeToolModel(BaseChatModel):
+    """A real ``BaseChatModel`` (so ``create_react_agent`` accepts it) that returns canned replies
+    in sequence and never touches the network. ``bind_tools`` is required by the agent graph and
+    the base class raises ``NotImplementedError`` for it.
+    """
+
+    replies: list[Any] = pydantic.Field(default_factory=list)
+    fail_after: int | None = None
+    fail_with: Exception | None = None
+    calls: int = 0
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+        return self
+
+    def _generate(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> Any:
+        raise NotImplementedError
+
+    async def _agenerate(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> Any:
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        if self.fail_after is not None and self.calls >= self.fail_after:
+            raise self.fail_with or RuntimeError("model down")
+        reply = self.replies[min(self.calls, len(self.replies) - 1)]
+        self.calls += 1
+        return ChatResult(generations=[ChatGeneration(message=reply)])
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-tool-model"
+
+
+def _ai_message(
+    content: str = "",
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+    tool_calls: list[dict[str, Any]] | None = None,
+    response_metadata: dict[str, Any] | None = None,
+) -> Any:
+    from langchain_core.messages import AIMessage
+
+    return AIMessage(
+        content=content,
+        usage_metadata={
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+        tool_calls=tool_calls or [],
+        response_metadata=response_metadata or {},
+    )
+
+
+class RecordedSpan:
+    """A span that remembers what a handler did to it, so a test can assert on the whole thing."""
+
+    def __init__(self, name: str, context: Any = None) -> None:
+        self.name = name
+        self.context = context
+        self.attributes: dict[str, Any] = {}
+        self.events: list[tuple[str, dict[str, Any]]] = []
+        self.statuses: list[Any] = []
+        self.exceptions: list[BaseException] = []
+        self.ended = 0
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+    def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
+        self.events.append((name, attributes or {}))
+
+    def set_status(self, code: Any, description: str | None = None) -> None:
+        self.statuses.append(code)
+
+    def record_exception(self, exc: BaseException) -> None:
+        self.exceptions.append(exc)
+
+    def end(self) -> None:
+        self.ended += 1
+
+
+class SpanRecorder:
+    """Stands in for the ``trace`` module inside ``spans.py`` and records every span opened.
+
+    A single MagicMock cannot see a span tree at all: every span would be the same object, so a
+    parent and its children would be indistinguishable.
+    """
+
+    def __init__(self) -> None:
+        self.spans: list[RecordedSpan] = []
+
+    def get_tracer(self, name: str) -> SpanRecorder:
+        return self
+
+    def start_span(self, name: str, context: Any = None) -> RecordedSpan:
+        span = RecordedSpan(name, context)
+        self.spans.append(span)
+        return span
+
+    def set_span_in_context(self, span: RecordedSpan) -> Any:
+        return ("context-of", span)
+
+    @property
+    def root(self) -> RecordedSpan:
+        return self.spans[0]
+
+    def named(self, prefix: str) -> list[RecordedSpan]:
+        return [s for s in self.spans if s.name.startswith(prefix)]
+
+    @property
+    def names(self) -> list[str]:
+        return [s.name for s in self.spans]
+
+
+def _recording() -> Any:
+    """Patches the tracer that ``spans.py`` holds, and yields the recorder.
+
+    ``AsyncCallbackHandler`` (the base class of ``SpanCallbackHandler``) stays real: LangChain's own
+    callback machinery decides when ``on_chat_model_start`` / ``on_llm_end`` / ``on_tool_start`` /
+    ``on_tool_end`` fire, and that dispatch is exactly what these tests need to prove, not something
+    to mock away.
+    """
+    import launchdarkly_ai_langchain_agents.spans as spans_mod
+
+    recorder = SpanRecorder()
+    return patch.object(spans_mod, "trace", recorder), recorder
+
+
+BASE_CONFIG: dict[str, Any] = {
+    "model": {"name": "gpt-4o"},
+    "provider": {"name": "OpenAI"},
+    "instructions": "You are helpful.",
+}
+
+TOOL_CONFIG: dict[str, Any] = {
+    **BASE_CONFIG,
+    "tools": {
+        "search": {
+            "description": "search the web",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    },
+}
+
+
+class TestSpanTree:
+    """TELEMETRY-CONTRACT.md section 1. A real langgraph agent and a real LangChain callback
+    dispatch, against a tracer this file controls."""
+
     @pytest.mark.asyncio
-    async def test_span_name(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_opens_a_root_span_named_invoke_agent(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("Hello!")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert rec.root.name == "invoke_agent"
+        assert rec.root.attributes["gen_ai.operation.name"] == "invoke_agent"
 
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi")
+    @pytest.mark.asyncio
+    async def test_emits_one_chat_child_per_model_turn(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("Hello!")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        chats = rec.named("chat ")
+        assert len(chats) == 1
+        assert chats[0].name == "chat gpt-4o"
+        assert chats[0].attributes["gen_ai.operation.name"] == "chat"
+        assert chats[0].context == ("context-of", rec.root)
 
-        mock_trace.get_tracer.return_value.start_span.assert_called_with(
-            "langchain.agent"
+    @pytest.mark.asyncio
+    async def test_names_the_chat_span_after_the_model(self) -> None:
+        ctx, rec = _recording()
+        cfg = {**BASE_CONFIG, "model": {"name": "claude-sonnet-4-5"}}
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(cfg, "q")
+        assert "chat claude-sonnet-4-5" in rec.names
+
+    @pytest.mark.asyncio
+    async def test_emits_a_chat_span_per_turn_of_a_tool_loop(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}]
+                ),
+                _ai_message("done"),
+            ]
         )
+        with ctx:
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}
+            )
+        assert len(rec.named("chat ")) == 2
 
     @pytest.mark.asyncio
-    async def test_gen_ai_system(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi")
-
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("gen_ai.system") == "langchain"
-
-    @pytest.mark.asyncio
-    async def test_gen_ai_operation_name(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi")
-
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("gen_ai.operation.name") == "chat"
-
-    @pytest.mark.asyncio
-    async def test_span_status_ok(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi")
-
-        mock_span.set_status.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_span_end_always_called(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi")
-
-        mock_span.end.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_gen_ai_request_model(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(model={"name": "gpt-4o"}), "hi")
-
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("gen_ai.request.model") == "gpt-4o"
-
-    @pytest.mark.asyncio
-    async def test_gen_ai_content_prompt_event(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "my question")
-
-        event_calls = [
-            c
-            for c in mock_span.add_event.call_args_list
-            if c[0][0] == "gen_ai.content.prompt"
-        ]
-        assert event_calls
-        # The gen_ai.prompt attribute must include the user input text
-        prompt_attr = event_calls[0][0][1].get("gen_ai.prompt", "")
-        assert "my question" in prompt_attr, (
-            f"gen_ai.prompt must include user input 'my question', got: {prompt_attr!r}"
+    async def test_emits_an_execute_tool_span_per_tool_call(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}]
+                ),
+                _ai_message("done"),
+            ]
         )
+        with ctx:
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}
+            )
+        tools = rec.named("execute_tool ")
+        assert len(tools) == 1
+        assert tools[0].name == "execute_tool search"
+        assert tools[0].attributes["gen_ai.operation.name"] == "execute_tool"
+        assert tools[0].attributes["gen_ai.tool.name"] == "search"
+        assert tools[0].attributes["gen_ai.tool.call.id"] == "call_1"
 
     @pytest.mark.asyncio
-    async def test_token_attributes_set(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        ai_msg = _make_ai_msg("answer", input_tokens=30, output_tokens=12)
-        mocks = _make_langchain_mock()
-
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=ai_msg))
-                    )
-                    await h(_make_config(), "hi")
-
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert (
-            "gen_ai.usage.input_tokens" in calls
-            or "gen_ai.usage.output_tokens" in calls
+    async def test_tool_spans_are_siblings_of_chat_not_children(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}]
+                ),
+                _ai_message("done"),
+            ]
         )
+        with ctx:
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}
+            )
+        assert rec.named("execute_tool ")[0].context == ("context-of", rec.root)
 
     @pytest.mark.asyncio
-    async def test_gen_ai_content_completion_event(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi")
-
-        event_calls = [
-            c
-            for c in mock_span.add_event.call_args_list
-            if c[0][0] == "gen_ai.content.completion"
-        ]
-        assert event_calls
+    async def test_every_span_is_ended(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}]
+                ),
+                _ai_message("done"),
+            ]
+        )
+        with ctx:
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}
+            )
+        assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
 
     @pytest.mark.asyncio
-    async def test_gen_ai_response_model(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_nests_the_chat_span_under_the_root_in_the_streaming_path(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("Hello!")])
+        with ctx:
+            async for _ in await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            ):
+                pass
+        chats = rec.named("chat ")
+        assert chats
+        assert chats[0].context == ("context-of", rec.root)
 
-        mocks = _make_langchain_mock()
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(model={"name": "gpt-4o"}), "hi")
 
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert "gen_ai.response.model" in calls
-        assert calls["gen_ai.response.model"] == "gpt-4o"
+class TestRootSpanAttributes:
+    """TELEMETRY-CONTRACT.md sections 2, 2a and 9."""
 
     @pytest.mark.asyncio
-    async def test_ld_span_attributes(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_gen_ai_provider_name_is_openai_for_a_non_anthropic_config(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        attrs = rec.root.attributes
+        # gen_ai.provider.name names who really served the model: ChatOpenAI here. gen_ai.system
+        # keeps the framework name so existing dashboards do not break.
+        assert attrs["gen_ai.provider.name"] == "openai"
+        assert attrs["gen_ai.system"] == "langchain"
 
-        mocks = _make_langchain_mock()
+    @pytest.mark.asyncio
+    async def test_gen_ai_provider_name_is_anthropic_when_config_names_it(self) -> None:
+        ctx, rec = _recording()
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Anthropic"},
+            "model": {"name": "claude-sonnet-4-5"},
+        }
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(cfg, "q")
+        assert rec.root.attributes["gen_ai.provider.name"] == "anthropic"
+        assert rec.root.attributes["gen_ai.system"] == "langchain"
+
+    @pytest.mark.asyncio
+    async def test_gen_ai_provider_name_falls_back_to_openai_for_anything_else(
+        self,
+    ) -> None:
+        # A binary choice, not a passthrough: Bedrock, Azure, Cohere, a typo, or nothing at all all
+        # report `openai`, because that mirrors which chat model class is really instantiated.
+        ctx, rec = _recording()
+        cfg = {**BASE_CONFIG, "provider": {"name": "Bedrock"}}
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(cfg, "q")
+        assert rec.root.attributes["gen_ai.provider.name"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_response_model_is_the_requested_name(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert rec.root.attributes["gen_ai.response.model"] == "gpt-4o"
+        assert rec.root.attributes["gen_ai.request.model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_carries_the_launchdarkly_attributes_and_feature_flag_event(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
         variables = {
             "__ld": {
-                "configKey": "my-config",
-                "variationKey": "v1",
-                "runId": "run-abc",
+                "configKey": "k",
+                "variationKey": "v",
+                "runId": "r",
+                "graphKey": "g",
             }
         }
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi", variables=variables)
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q", {}, variables)
+        attrs = rec.root.attributes
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "k"
+        assert attrs["launchdarkly.variation.key"] == "v"
+        assert attrs["launchdarkly.run.id"] == "r"
+        assert attrs["launchdarkly.graph.key"] == "g"
+        assert [n for n, _ in rec.root.events] == ["feature_flag"]
 
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("launchdarkly.operation.type") == "gen_ai"
-        assert calls.get("launchdarkly.config.key") == "my-config"
-        assert calls.get("launchdarkly.variation.key") == "v1"
-        assert calls.get("launchdarkly.run.id") == "run-abc"
-        assert "launchdarkly.graph.key" not in calls
+    @pytest.mark.asyncio
+    async def test_child_spans_carry_no_launchdarkly_identity(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}]
+                ),
+                _ai_message("done"),
+            ]
+        )
+        variables = {"__ld": {"configKey": "k", "variationKey": "v", "runId": "r"}}
+        with ctx:
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}, variables
+            )
+        for child in rec.spans[1:]:
+            assert not [k for k in child.attributes if k.startswith("launchdarkly.")]
+            assert "feature_flag" not in [n for n, _ in child.events]
 
-    async def test_ld_graph_key_set_when_present(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-        variables = {
-            "__ld": {
-                "configKey": "my-config",
-                "variationKey": "v1",
-                "runId": "run-abc",
-                "graphKey": "my-graph",
-            }
-        }
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=mocks["_ai_msg"]))
-                    )
-                    await h(_make_config(), "hi", variables=variables)
-
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("launchdarkly.graph.key") == "my-graph"
+    @pytest.mark.asyncio
+    async def test_carries_the_run_total_not_one_turn(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    input_tokens=10,
+                    output_tokens=1,
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}],
+                ),
+                _ai_message("done", input_tokens=20, output_tokens=2),
+            ]
+        )
+        with ctx:
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 30
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 3
+        assert rec.root.attributes["gen_ai.usage.total_tokens"] == 33
 
 
-# ---------------------------------------------------------------------------
-# §1.6 Error handling
-# ---------------------------------------------------------------------------
+class TestChatSpanAttributes:
+    """TELEMETRY-CONTRACT.md sections 3, 5 and 8."""
+
+    @pytest.mark.asyncio
+    async def test_writes_all_seven_usage_attributes_including_zeros(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[_ai_message("hi", input_tokens=10, output_tokens=5)]
+        )
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        attrs = rec.named("chat ")[0].attributes
+        assert attrs["gen_ai.usage.input_tokens"] == 10
+        assert attrs["gen_ai.usage.output_tokens"] == 5
+        assert attrs["gen_ai.usage.total_tokens"] == 15
+        assert attrs["gen_ai.usage.cache_read.input_tokens"] == 0
+        assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 0
+        assert attrs["gen_ai.usage.prompt_tokens"] == 10
+        assert attrs["gen_ai.usage.completion_tokens"] == 5
+
+    @pytest.mark.asyncio
+    async def test_input_tokens_pass_through_untouched_cache_included(self) -> None:
+        # LangChain already includes cached tokens inside input_tokens, unlike Anthropic: the input
+        # figure must pass through as reported, and the cache figures are for parity only. This is
+        # the assertion that catches a fold applied in the wrong direction.
+        from langchain_core.messages import AIMessage
+
+        reply = AIMessage(
+            content="hi",
+            usage_metadata={
+                "input_tokens": 23554,
+                "output_tokens": 10,
+                "total_tokens": 23564,
+                "input_token_details": {"cache_read": 19971, "cache_creation": 3580},
+            },
+        )
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[reply])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        attrs = rec.named("chat ")[0].attributes
+        assert attrs["gen_ai.usage.input_tokens"] == 23554
+        assert attrs["gen_ai.usage.cache_read.input_tokens"] == 19971
+        assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 3580
+        assert attrs["gen_ai.usage.total_tokens"] == 23564 + 10 - 10  # input + output
+
+    @pytest.mark.asyncio
+    async def test_reports_the_mapped_finish_reason(self) -> None:
+        # LangChain does not normalise the field; the handler reads response_metadata.stop_reason
+        # and maps Anthropic's `end_turn` onto semconv's `stop`.
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[_ai_message("hi", response_metadata={"stop_reason": "end_turn"})]
+        )
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert rec.named("chat ")[0].attributes["gen_ai.response.finish_reasons"] == [
+            "stop"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_maps_openai_finish_reason_too(self) -> None:
+        # This handler can serve either vendor; both spellings must map onto one vocabulary.
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[_ai_message("hi", response_metadata={"finish_reason": "stop"})]
+        )
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert rec.named("chat ")[0].attributes["gen_ai.response.finish_reasons"] == [
+            "stop"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_omits_the_finish_reason_when_the_provider_gives_none(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert "gen_ai.response.finish_reasons" not in rec.named("chat ")[0].attributes
+
+    @pytest.mark.asyncio
+    async def test_sets_status_ok_on_a_successful_turn(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert StatusCode.OK in rec.named("chat ")[0].statuses
+
+
+class TestContentCapture:
+    """TELEMETRY-CONTRACT.md section 7."""
+
+    @pytest.mark.asyncio
+    async def test_emits_no_content_at_all_by_default(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        for span in rec.spans:
+            content_keys = [
+                k
+                for k in span.attributes
+                if k.startswith(("gen_ai.prompt", "gen_ai.completion"))
+                or k
+                in (
+                    "gen_ai.input.messages",
+                    "gen_ai.output.messages",
+                    "gen_ai.system_instructions",
+                    "gen_ai.tool.definitions",
+                )
+            ]
+            assert content_keys == []
+            assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
+
+    @pytest.mark.asyncio
+    async def test_puts_prompt_and_completion_on_the_root_when_enabled(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("Hello World")])
+        with ctx:
+            await create_langchain_agents_handler(llm, capture_content=True)(
+                BASE_CONFIG, "q"
+            )
+        root = rec.root
+        assert root.attributes["gen_ai.system_instructions"]
+        assert "gen_ai.input.messages" in root.attributes
+        assert root.attributes["gen_ai.completion.0.content"] == "Hello World"
+        assert "gen_ai.output.messages" in root.attributes
+
+    @pytest.mark.asyncio
+    async def test_records_the_tool_catalog_on_the_chat_span_when_enabled(self) -> None:
+        import json
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm, capture_content=True)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}
+            )
+        definitions = json.loads(
+            rec.named("chat ")[0].attributes["gen_ai.tool.definitions"]
+        )
+        assert definitions[0]["name"] == "search"
+        assert definitions[0]["type"] == "function"
+
+    @pytest.mark.asyncio
+    async def test_records_tool_arguments_and_results_when_enabled(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    tool_calls=[
+                        {"name": "search", "args": {"q": "weather"}, "id": "call_1"}
+                    ]
+                ),
+                _ai_message("done"),
+            ]
+        )
+        with ctx:
+            await create_langchain_agents_handler(llm, capture_content=True)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="72F")}
+            )
+        tool = rec.named("execute_tool ")[0]
+        assert "weather" in tool.attributes["gen_ai.tool.call.arguments"]
+        assert tool.attributes["gen_ai.tool.call.result"] == "72F"
 
 
 class TestErrorHandling:
-    @pytest.mark.asyncio
-    async def test_records_exception_on_span(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    """TELEMETRY-CONTRACT.md section 6."""
 
-        mocks = _make_langchain_mock()
-        mocks["_agent"].ainvoke = AsyncMock(side_effect=RuntimeError("lc error"))
-        mocks["langgraph.prebuilt"].create_react_agent = MagicMock(
-            return_value=mocks["_agent"]
+    @pytest.mark.asyncio
+    async def test_fails_the_chat_span_when_the_provider_call_raises(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[], fail_after=0, fail_with=RuntimeError("model down")
         )
-
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock(return_value=None))
-                    )
-                    with pytest.raises(RuntimeError):
-                        await h(_make_config(), "hi")
-
-        mock_span.record_exception.assert_called()
+        with ctx, pytest.raises(RuntimeError, match="model down"):
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        chat = rec.named("chat ")[0]
+        assert len(chat.exceptions) == 1
+        assert StatusCode.ERROR in chat.statuses
+        assert chat.ended == 1
 
     @pytest.mark.asyncio
-    async def test_sets_span_status_error(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_fails_the_root_span_too(self) -> None:
+        from opentelemetry.trace import StatusCode
 
-        mocks = _make_langchain_mock()
-        mocks["_agent"].ainvoke = AsyncMock(side_effect=RuntimeError("lc error"))
-
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock())
-                    )
-                    with pytest.raises(RuntimeError):
-                        await h(_make_config(), "hi")
-
-        mock_span.set_status.assert_called()
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[], fail_after=0, fail_with=RuntimeError("model down")
+        )
+        with ctx, pytest.raises(RuntimeError):
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert len(rec.root.exceptions) == 1
+        assert StatusCode.ERROR in rec.root.statuses
+        assert rec.root.ended == 1
 
     @pytest.mark.asyncio
-    async def test_ends_span_on_error(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_fails_the_execute_tool_span_when_a_tool_raises(self) -> None:
+        from opentelemetry.trace import StatusCode
 
-        mocks = _make_langchain_mock()
-        mocks["_agent"].ainvoke = AsyncMock(side_effect=RuntimeError("lc error"))
+        async def _boom(_args: Any) -> str:
+            raise RuntimeError("tool exploded")
 
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(
-                        llm=MagicMock(ainvoke=AsyncMock())
-                    )
-                    with pytest.raises(RuntimeError):
-                        await h(_make_config(), "hi")
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}]
+                )
+            ]
+        )
+        with ctx, pytest.raises(Exception, match="tool exploded"):
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": _boom}
+            )
+        tool = rec.named("execute_tool ")[0]
+        assert len(tool.exceptions) == 1
+        assert StatusCode.ERROR in tool.statuses
+        assert tool.ended == 1
 
-        mock_span.end.assert_called()
+    @pytest.mark.asyncio
+    async def test_reports_the_spend_of_completed_turns_on_a_failed_run(self) -> None:
+        # The first turn was billed. The root is the only span a config-scoped cost query finds it
+        # on. There is no `result` to sum on this path, so the total comes from the callbacks.
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[
+                _ai_message(
+                    input_tokens=40,
+                    output_tokens=7,
+                    tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call_1"}],
+                )
+            ],
+            fail_after=1,
+            fail_with=RuntimeError("second turn died"),
+        )
+        with ctx, pytest.raises(RuntimeError):
+            await create_langchain_agents_handler(llm)(
+                TOOL_CONFIG, "q", {"search": AsyncMock(return_value="r")}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 40
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 7
+
+    @pytest.mark.asyncio
+    async def test_writes_no_usage_when_no_turn_ever_reported_any(self) -> None:
+        # All-zero attributes would assert the run cost nothing; an absent attribute says "unknown".
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[], fail_after=0, fail_with=RuntimeError("died first")
+        )
+        with ctx, pytest.raises(RuntimeError):
+            await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert "gen_ai.usage.input_tokens" not in rec.root.attributes
 
     @pytest.mark.asyncio
     async def test_rethrows_error(self) -> None:
@@ -918,83 +1246,124 @@ class TestStreaming:
 
 
 class TestStreamingTelemetry:
-    @pytest.mark.asyncio
-    async def test_span_started_during_stream(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
-
-        mocks = _make_langchain_mock()
-
-        async def _empty_astream(*a: Any, **kw: Any) -> AsyncIterator[Any]:
-            return
-            yield
-
-        mocks["_agent"].astream = _empty_astream
-
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(llm=MagicMock())
-                    async for _ in await h.stream(_make_config(), "hi"):
-                        pass
-
-        mock_trace.get_tracer.return_value.start_span.assert_called_with(
-            "langchain.agent.stream"
-        )
+    """TELEMETRY-CONTRACT.md sections 1 and 6. The streaming path emits the same tree."""
 
     @pytest.mark.asyncio
-    async def test_ld_span_attributes_set_during_stream(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_opens_the_same_root_span_name_as_the_blocking_path(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            async for _ in await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            ):
+                pass
+        assert rec.root.name == "invoke_agent"
+        assert "chat gpt-4o" in rec.names
 
-        mocks = _make_langchain_mock()
-
-        async def _empty_astream(*a: Any, **kw: Any) -> AsyncIterator[Any]:
-            return
-            yield
-
-        mocks["_agent"].astream = _empty_astream
+    @pytest.mark.asyncio
+    async def test_carries_the_launchdarkly_attributes_on_the_root(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
         variables = {"__ld": {"configKey": "k", "variationKey": "v", "runId": "r"}}
-
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(llm=MagicMock())
-                    async for _ in await h.stream(
-                        _make_config(), "hi", None, variables
-                    ):
-                        pass
-
-        calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert calls.get("launchdarkly.operation.type") == "gen_ai"
-        assert calls.get("launchdarkly.config.key") == "k"
-        assert calls.get("launchdarkly.variation.key") == "v"
-        assert calls.get("launchdarkly.run.id") == "r"
+        with ctx:
+            async for _ in await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, variables
+            ):
+                pass
+        attrs = rec.root.attributes
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "k"
+        assert attrs["launchdarkly.variation.key"] == "v"
+        assert attrs["launchdarkly.run.id"] == "r"
 
     @pytest.mark.asyncio
-    async def test_span_ended_after_stream_completes(self) -> None:
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_ends_every_span_once_when_the_stream_completes(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            async for _ in await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            ):
+                pass
+        assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
+        assert "launchdarkly.stream.abandoned" not in rec.root.attributes
 
-        mocks = _make_langchain_mock()
+    @pytest.mark.asyncio
+    async def test_writes_the_run_total_to_the_root(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[_ai_message("hi", input_tokens=11, output_tokens=4)]
+        )
+        with ctx:
+            async for _ in await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            ):
+                pass
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 11
+        assert rec.root.attributes["gen_ai.usage.total_tokens"] == 15
 
-        async def _empty_astream(*a: Any, **kw: Any) -> AsyncIterator[Any]:
-            return
-            yield
+    @pytest.mark.asyncio
+    async def test_an_abandoned_stream_still_ends_and_exports_every_span(self) -> None:
+        # A consumer that breaks out of `async for` makes this generator run `finally` without ever
+        # entering `except`: GeneratorExit is a BaseException. Without the cleanup there the root is
+        # never ended, so it is never exported.
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            gen = await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            )
+            async for _ in gen:
+                break
+            await gen.aclose()
+        assert rec.root.ended == 1
+        assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
 
-        mocks["_agent"].astream = _empty_astream
+    @pytest.mark.asyncio
+    async def test_an_abandoned_stream_is_marked_but_not_failed(self) -> None:
+        from opentelemetry.trace import StatusCode
 
-        with _patch_lc(mocks):
-            with patch.object(handler_mod, "trace", mock_trace):
-                with patch.object(handler_mod, "_HAS_OTEL", True):
-                    h = create_langchain_agents_handler(llm=MagicMock())
-                    async for _ in await h.stream(_make_config(), "hi"):
-                        pass
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            gen = await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            )
+            async for _ in gen:
+                break
+            await gen.aclose()
+        assert rec.root.attributes["launchdarkly.stream.abandoned"] is True
+        assert StatusCode.ERROR not in rec.root.statuses
+        assert rec.root.exceptions == []
 
-        mock_span.end.assert_called()
+    @pytest.mark.asyncio
+    async def test_fails_the_spans_when_the_stream_raises(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[], fail_after=0, fail_with=RuntimeError("stream died")
+        )
+        with ctx, pytest.raises(RuntimeError, match="stream died"):
+            async for _ in await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            ):
+                pass
+        assert StatusCode.ERROR in rec.root.statuses
+        assert rec.root.ended == 1
+
+    @pytest.mark.asyncio
+    async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            async for _ in await create_langchain_agents_handler(llm).stream(
+                BASE_CONFIG, "q", {}, {}
+            ):
+                pass
+        for span in rec.spans:
+            assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
+            assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
 
 # ---------------------------------------------------------------------------
