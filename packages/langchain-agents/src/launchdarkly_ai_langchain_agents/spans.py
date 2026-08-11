@@ -343,17 +343,24 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         span = self.model_spans.pop(key, None)
         if span is None:
             return
-        if self._capture_content:
-            set_output_content_attributes(
-                span,
-                self._capture_content,
-                lang_chain_span_messages(generated_messages(response))[1],
+        # Popped, so close_open_spans can no longer reach this span: whatever happens next, this
+        # method has to end it. Serialising conversation content raises on anything that is not
+        # JSON-serialisable, and a raise here would otherwise leak the span with nothing tracking it.
+        try:
+            if self._capture_content:
+                set_output_content_attributes(
+                    span,
+                    self._capture_content,
+                    lang_chain_span_messages(generated_messages(response))[1],
+                )
+            turn_usage_raw = extract_llm_usage(response)
+            self.run_usage.add(lang_chain_span_usage(turn_usage_raw))
+            finish_model_span(
+                span, self._config, turn_usage_raw, lang_chain_finish_reasons(response)
             )
-        turn_usage_raw = extract_llm_usage(response)
-        self.run_usage.add(lang_chain_span_usage(turn_usage_raw))
-        finish_model_span(
-            span, self._config, turn_usage_raw, lang_chain_finish_reasons(response)
-        )
+        except Exception as exc:
+            fail_span(span, exc)
+            raise
 
     async def on_llm_error(
         self, error: BaseException, *, run_id: Any, **kwargs: Any
@@ -378,20 +385,27 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         span = start_tool_span(
             tool_name, tool_call_id or str(run_id), self._parent_context
         )
+        # Tracked before the content write, not after. Serialising the arguments can raise, and a
+        # span created but never inserted is unreachable by every cleanup path there is.
+        self.tool_spans[str(run_id)] = span
         set_tool_call_content_attributes(
             span, self._capture_content, arguments=kwargs.get("inputs") or input_str
         )
-        self.tool_spans[str(run_id)] = span
 
     async def on_tool_end(self, output: Any, *, run_id: Any, **kwargs: Any) -> None:
         key = str(run_id)
         span = self.tool_spans.pop(key, None)
         if span is None:
             return
-        set_tool_call_content_attributes(
-            span, self._capture_content, result=_tool_result_text(output)
-        )
-        succeed_span(span)
+        # Same reason as on_llm_end: once popped, ending it is this method's job alone.
+        try:
+            set_tool_call_content_attributes(
+                span, self._capture_content, result=_tool_result_text(output)
+            )
+            succeed_span(span)
+        except Exception as exc:
+            fail_span(span, exc)
+            raise
 
     async def on_tool_error(
         self, error: BaseException, *, run_id: Any, **kwargs: Any

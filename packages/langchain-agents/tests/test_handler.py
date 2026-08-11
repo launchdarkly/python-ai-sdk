@@ -1593,3 +1593,61 @@ class TestConvenienceWrapperForwardsCaptureContent:
 
     def test_defaults_to_off(self) -> None:
         assert self._run()["capture_content"] is False
+
+
+class TestCallbackSpansNeverLeak:
+    """A raise inside a callback must not leave a span both untracked and unended.
+
+    The end callbacks pop the span before doing work that can raise, so after the pop nothing else
+    can reach it and ending it is that callback's job alone. `on_tool_start` had the mirror problem:
+    it created the span before inserting it, so a raise in between left a span no cleanup path knew
+    about.
+    """
+
+    class _Unserialisable:
+        __slots__ = ()
+
+    def _recording_handler(self) -> Any:
+        """The patch must stay active while the callbacks run, not only while they are built."""
+        import launchdarkly_ai_langchain_agents.spans as spans_mod
+
+        recorder = SpanRecorder()
+        return patch.object(spans_mod, "trace", recorder), recorder
+
+    @pytest.mark.asyncio
+    async def test_a_raise_in_on_tool_end_still_ends_the_span(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_langchain_agents.spans import build_span_callbacks
+
+        ctx, recorder = self._recording_handler()
+        with ctx:
+            handler = build_span_callbacks(
+                BASE_CONFIG, None, capture_content=True
+            )._handler
+            await handler.on_tool_start({"name": "search"}, "{}", run_id="r1")
+            assert "r1" in handler.tool_spans
+            with pytest.raises(TypeError):
+                await handler.on_tool_end(self._Unserialisable(), run_id="r1")
+
+        span = recorder.named("execute_tool ")[0]
+        assert span.ended == 1, "the tool span leaked"
+        assert StatusCode.ERROR in span.statuses
+
+    @pytest.mark.asyncio
+    async def test_on_tool_start_tracks_the_span_before_it_can_raise(self) -> None:
+        from launchdarkly_ai_langchain_agents.spans import build_span_callbacks
+
+        ctx, recorder = self._recording_handler()
+        with ctx:
+            bundle = build_span_callbacks(BASE_CONFIG, None, capture_content=True)
+            handler = bundle._handler
+            with pytest.raises(TypeError):
+                await handler.on_tool_start(
+                    {"name": "search"}, "{}", run_id="r1", inputs=self._Unserialisable()
+                )
+            # Tracked despite the raise, so the caller's cleanup can still close it.
+            assert "r1" in handler.tool_spans
+            bundle.abandon_open_spans(set())
+
+        assert recorder.named("execute_tool ")[0].ended == 1
