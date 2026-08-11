@@ -1557,3 +1557,39 @@ class TestAbandonOpenSpans:
         bundle.abandon_open_spans(ended)
         assert chat.ended == 1
         assert tool.ended == 1
+
+
+class TestConvenienceWrapperForwardsCaptureContent:
+    """`capture_content` must reach the handler, not fall through into `config()`.
+
+    `config()` takes no such argument, so leaving it in kwargs raised TypeError: a caller asking for
+    content on spans got an exception instead. Five of the six wrappers had this.
+    """
+
+    def _run(self, **kwargs: Any) -> dict[str, Any]:
+        import launchdarkly_ai_langchain_agents.handler as handler_mod
+
+        seen: dict[str, Any] = {}
+
+        def _factory(*args: Any, capture_content: bool = False, **kw: Any) -> Any:
+            seen["capture_content"] = capture_content
+            return MagicMock()
+
+        fake_config = MagicMock()
+        fake_config.return_value.invoke = MagicMock(return_value="ok")
+        with (
+            patch.object(handler_mod, "create_langchain_agents_handler", _factory),
+            patch.object(handler_mod, "config", fake_config),
+        ):
+            handler_mod.langchain_agents("k", "q", {}, **kwargs)
+        seen["config_kwargs"] = fake_config.call_args.kwargs
+        return seen
+
+    def test_capture_content_reaches_the_factory(self) -> None:
+        seen = self._run(capture_content=True)
+        assert seen["capture_content"] is True
+        # And it must not have been forwarded to config(), which does not accept it.
+        assert "capture_content" not in seen["config_kwargs"]
+
+    def test_defaults_to_off(self) -> None:
+        assert self._run()["capture_content"] is False
