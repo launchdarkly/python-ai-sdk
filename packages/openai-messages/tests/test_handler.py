@@ -1182,22 +1182,22 @@ class TestStreaming:
     async def test_stream_defined_and_async_generator(
         self, mock_openai: MagicMock
     ) -> None:
-        import launchdarkly_ai_openai_messages.handler as handler_mod
+        import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         self._patch_stream(mock_openai, ["hi"])
-        with patch.object(handler_mod, "_HAS_OTEL", False):
+        with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
         assert h.has_stream
         gen = await h.stream(CONFIG, "q")
         assert hasattr(gen, "__aiter__")
 
     async def test_yields_chunk_events(self, mock_openai: MagicMock) -> None:
-        import launchdarkly_ai_openai_messages.handler as handler_mod
+        import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         self._patch_stream(mock_openai, ["hello ", "world"])
-        with patch.object(handler_mod, "_HAS_OTEL", False):
+        with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             events = [e async for e in await h.stream(CONFIG, "q")]
         chunks = [e for e in events if e.get("type") == "chunk"]
@@ -1206,22 +1206,22 @@ class TestStreaming:
         assert chunks[1]["text"] == "world"
 
     async def test_yields_exactly_one_done_event(self, mock_openai: MagicMock) -> None:
-        import launchdarkly_ai_openai_messages.handler as handler_mod
+        import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         self._patch_stream(mock_openai, ["x"])
-        with patch.object(handler_mod, "_HAS_OTEL", False):
+        with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             events = [e async for e in await h.stream(CONFIG, "q")]
         done_events = [e for e in events if e.get("type") == "done"]
         assert len(done_events) == 1
 
     async def test_done_event_carries_usage(self, mock_openai: MagicMock) -> None:
-        import launchdarkly_ai_openai_messages.handler as handler_mod
+        import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         self._patch_stream(mock_openai, ["text"], input_tok=7, output_tok=3)
-        with patch.object(handler_mod, "_HAS_OTEL", False):
+        with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             events = [e async for e in await h.stream(CONFIG, "q")]
         done = next(e for e in events if e.get("type") == "done")
@@ -1231,11 +1231,11 @@ class TestStreaming:
     async def test_done_event_carries_accumulated_output(
         self, mock_openai: MagicMock
     ) -> None:
-        import launchdarkly_ai_openai_messages.handler as handler_mod
+        import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         self._patch_stream(mock_openai, ["hello ", "world"])
-        with patch.object(handler_mod, "_HAS_OTEL", False):
+        with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             events = [e async for e in await h.stream(CONFIG, "q")]
         done = next(e for e in events if e.get("type") == "done")
@@ -1244,7 +1244,7 @@ class TestStreaming:
     async def test_generator_throws_on_provider_error(
         self, mock_openai: MagicMock
     ) -> None:
-        import launchdarkly_ai_openai_messages.handler as handler_mod
+        import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         @asynccontextmanager
@@ -1253,7 +1253,7 @@ class TestStreaming:
             yield
 
         mock_openai.responses.stream = MagicMock(return_value=_bad_ctx())
-        with patch.object(handler_mod, "_HAS_OTEL", False):
+        with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             with pytest.raises(RuntimeError, match="stream error"):
                 async for _ in await h.stream(CONFIG, "q"):
@@ -1268,7 +1268,7 @@ class TestStreaming:
         does not resend tools after the first turn). It changes what the model is offered, not what
         the span reports, so this test only pins that the behaviour is unchanged by the span work.
         """
-        import launchdarkly_ai_openai_messages.handler as handler_mod
+        import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         tool_call_item = _function_call_item("my-tool", "call-1", {"q": "x"})
@@ -1335,7 +1335,7 @@ class TestStreaming:
             "tools": {"my-tool": {"description": "does stuff", "parameters": {}}},
         }
 
-        with patch.object(handler_mod, "_HAS_OTEL", False):
+        with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             _events = [
                 e
