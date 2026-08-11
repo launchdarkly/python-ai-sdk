@@ -1735,3 +1735,38 @@ class TestConvenienceWrapperForwardsCaptureContent:
 
     def test_defaults_to_off(self) -> None:
         assert self._run()["capture_content"] is False
+
+
+class TestChatSpanNeverLeaks:
+    """A raise while recording conversation content must not leave the chat span open.
+
+    The content writes on both sides of the provider call used to sit outside the try that fails the
+    span. A raise there failed only the root, and the chat span was never ended, so the exporter
+    never saw the turn.
+    """
+
+    async def test_an_unserialisable_output_still_ends_the_chat_span(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        class _Exploding:
+            model = "gpt-4o"
+            usage = None
+
+            @property
+            def output(self) -> Any:
+                raise TypeError("cannot serialise this response")
+
+        mock_openai.responses.create = AsyncMock(return_value=_Exploding())
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx, pytest.raises(TypeError):
+            await create_openai_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+        chat = rec.named("chat ")
+        assert len(chat) == 1
+        assert chat[0].ended == 1, "the chat span leaked"
+        assert StatusCode.ERROR in chat[0].statuses

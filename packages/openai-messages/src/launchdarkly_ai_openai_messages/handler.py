@@ -124,27 +124,31 @@ async def _run_model_turn(
     the raw provider response so the caller can inspect its output items.
     """
     model_span = start_model_span(config, parent)
-    if capture_content:
-        system_instructions, messages = split_input_messages(params["input"])
-        set_input_content_attributes(
-            model_span,
-            capture_content,
-            system_instructions=system_instructions,
-            messages=messages,
-            tool_definitions=tool_definitions,
-        )
-
+    # Everything that touches this span sits inside the try, including the content writes on both
+    # sides of the call. Serialising conversation content raises on anything that is not
+    # JSON-serialisable, and a raise outside the guard would leave this span open forever: only the
+    # root gets failed, and nothing else knows the chat span exists.
     try:
+        if capture_content:
+            system_instructions, messages = split_input_messages(params["input"])
+            set_input_content_attributes(
+                model_span,
+                capture_content,
+                system_instructions=system_instructions,
+                messages=messages,
+                tool_definitions=tool_definitions,
+            )
+
         response = await client.responses.create(**params)
+
+        set_response_output_content(model_span, capture_content, response)
+        finish_reason = finish_reason_of(response)
+        response_model = getattr(response, "model", None) or model_name(config)
+        usage = to_span_usage(getattr(response, "usage", None))
+        finish_model_span(model_span, response_model, usage, finish_reason)
     except Exception as exc:
         fail_span(model_span, exc)
         raise
-
-    set_response_output_content(model_span, capture_content, response)
-    finish_reason = finish_reason_of(response)
-    response_model = getattr(response, "model", None) or model_name(config)
-    usage = to_span_usage(getattr(response, "usage", None))
-    finish_model_span(model_span, response_model, usage, finish_reason)
     # `to_span_usage` of an absent bag is still a real object, so a turn that completed without
     # reported usage counts as reported: the call happened, whatever the provider said.
     run_usage.add(usage)
