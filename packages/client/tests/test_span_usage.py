@@ -371,6 +371,12 @@ class TestEndSpanOnce:
         end_span_once(second, tracker)
         assert (first.ended, second.ended) == (1, 1)
 
+    def test_a_none_span_is_a_no_op(self) -> None:
+        # Handlers hold None whenever the OTel SDK is absent, and a cleanup path in a `finally` is
+        # the last place that should have to remember it. Every sibling helper already no-ops.
+        end_span_once(None, set())
+        end_span_once(None, set(), abandoned=True)
+
     def test_an_unhashable_span_is_still_tracked(self) -> None:
         # The tracker holds id(span), because an OTel span is not guaranteed hashable.
         class Unhashable(FakeSpan):

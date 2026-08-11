@@ -369,7 +369,13 @@ def end_span_once(span: Any, tracker: set[int], abandoned: bool = False) -> None
 
     Ending the span is not always enough. Two handlers also hold a vendor generator or run that must
     be closed or cancelled in the same ``finally``. See TELEMETRY-CONTRACT.md section 6.
+
+    A ``None`` span is a no-op, matching every other helper in this family. Handlers hold ``None``
+    whenever the OpenTelemetry SDK is absent, and a cleanup path in a ``finally`` is the last place
+    that should have to remember it.
     """
+    if span is None:
+        return
     key = id(span)
     if key in tracker:
         return
