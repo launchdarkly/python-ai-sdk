@@ -319,11 +319,11 @@ EXPECTED_VOCABULARY = {
     "gen_ai.input.messages",
     "gen_ai.output.messages",
     "gen_ai.tool.definitions",
-    # Content, OpenLLMetry
+    # Content, OpenLLMetry. These two are the prefixes handed to the indexed writer; the keys it
+    # actually emits are `gen_ai.prompt.{i}.role` and friends, built by f-string and therefore
+    # invisible to any static scan. TestOpenLLMetryCarrier below covers those at runtime.
     "gen_ai.prompt",
     "gen_ai.completion",
-    "gen_ai.completion.0.role",
-    "gen_ai.completion.0.content",
     # Tool calls
     "gen_ai.tool.name",
     "gen_ai.tool.call.id",
@@ -347,6 +347,17 @@ EXPECTED_VOCABULARY = {
     "ld.ai.graph",
     "ld.ai.graph.key",
     "ld.ai.graph.path",
+}
+
+#: Keys that appear only inside superseded code, kept exported for one release.
+#:
+#: Held apart from the live vocabulary on purpose. `set_openllmetry_completion` has no call sites,
+#: so these two literals describe nothing the SDK emits. Folding them into the set above would mean
+#: deleting that dead helper fails the lock, and would also let a genuine drop of the live indexed
+#: carrier hide behind them. Delete this set and its two names together when the helper goes.
+SUPERSEDED_VOCABULARY = {
+    "gen_ai.completion.0.role",
+    "gen_ai.completion.0.content",
 }
 
 _KEY_PATTERN = re.compile(
@@ -379,7 +390,7 @@ def _emitted_vocabulary() -> set[str]:
 
 class TestVocabularyLock:
     def test_the_sdk_emits_no_key_this_list_does_not_know_about(self) -> None:
-        unexpected = _emitted_vocabulary() - EXPECTED_VOCABULARY
+        unexpected = _emitted_vocabulary() - EXPECTED_VOCABULARY - SUPERSEDED_VOCABULARY
         assert unexpected == set(), (
             "New span attribute keys found. If this is deliberate, add them to "
             "EXPECTED_VOCABULARY and say why in the commit message. If the two SDKs should agree, "
@@ -390,7 +401,45 @@ class TestVocabularyLock:
         # Catches a key silently disappearing, which is how a dashboard goes blank without anything
         # failing.
         emitted = _emitted_vocabulary()
-        # `gen_ai.prompt.{i}` and `gen_ai.completion.{i}` are written by template, so the base names
-        # appear rather than the indexed forms.
         missing = EXPECTED_VOCABULARY - emitted
         assert missing == set(), f"keys no longer emitted anywhere: {sorted(missing)}"
+
+
+class TestOpenLLMetryCarrier:
+    """The indexed carrier is written by f-string, so only a runtime check can see it.
+
+    This is the one LaunchDarkly's LLM trace view reads today, so dropping it renders an empty
+    transcript while every canonical attribute is still present and every static check still passes.
+    The vocabulary lock above cannot cover it: `f"{prefix}.{index}.role"` has no literal key to scan
+    for.
+    """
+
+    def test_the_input_side_writes_indexed_role_and_content(self) -> None:
+        from launchdarkly_ai_server import set_input_content_attributes, text_message
+
+        span = RecordedSpan("chat test-model-1")
+        set_input_content_attributes(
+            span,
+            True,
+            system_instructions="Be brief.",
+            messages=[text_message("user", "hi")],
+        )
+        assert span.attributes["gen_ai.prompt.0.role"] == "system"
+        assert span.attributes["gen_ai.prompt.0.content"] == "Be brief."
+        assert span.attributes["gen_ai.prompt.1.role"] == "user"
+        assert span.attributes["gen_ai.prompt.1.content"] == "hi"
+
+    def test_the_output_side_writes_indexed_role_and_content(self) -> None:
+        from launchdarkly_ai_server import set_output_content_attributes, text_message
+
+        span = RecordedSpan("chat test-model-1")
+        set_output_content_attributes(span, True, [text_message("assistant", "hello")])
+        assert span.attributes["gen_ai.completion.0.role"] == "assistant"
+        assert span.attributes["gen_ai.completion.0.content"] == "hello"
+
+    def test_the_carrier_stays_behind_the_capture_gate(self) -> None:
+        from launchdarkly_ai_server import set_input_content_attributes, text_message
+
+        span = RecordedSpan("chat test-model-1")
+        set_input_content_attributes(span, False, messages=[text_message("user", "hi")])
+        assert span.attributes == {}
