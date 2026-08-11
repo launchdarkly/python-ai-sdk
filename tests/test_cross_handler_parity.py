@@ -349,16 +349,31 @@ EXPECTED_VOCABULARY = {
     "ld.ai.graph.path",
 }
 
-#: Keys that appear only inside superseded code, kept exported for one release.
+#: Functions kept exported for one release that nothing calls any more.
 #:
-#: Held apart from the live vocabulary on purpose. `set_openllmetry_completion` has no call sites,
-#: so these two literals describe nothing the SDK emits. Folding them into the set above would mean
-#: deleting that dead helper fails the lock, and would also let a genuine drop of the live indexed
-#: carrier hide behind them. Delete this set and its two names together when the helper goes.
-SUPERSEDED_VOCABULARY = {
-    "gen_ai.completion.0.role",
-    "gen_ai.completion.0.content",
-}
+#: Their bodies are cut out before the scan below, rather than their keys being listed as expected.
+#: Listing the keys does not work: `gen_ai.prompt` is written by the live content writer *and* by
+#: dead `set_openllmetry_prompt`, so naming it as expected lets the dead copy satisfy the lock after
+#: the live one is removed. Cutting the dead code out means only live writes can satisfy anything.
+#:
+#: Delete these names when the functions go. The lock will tell you if you miss one.
+SUPERSEDED_FUNCTIONS = (
+    "set_openllmetry_prompt",
+    "set_openllmetry_completion",
+)
+
+
+def _without_superseded(source: str) -> str:
+    """Drops the body of every superseded function, so a dead write cannot satisfy the lock."""
+    for name in SUPERSEDED_FUNCTIONS:
+        start = source.find(f"def {name}(")
+        if start == -1:
+            continue
+        nxt = source.find("\ndef ", start + 1)
+        end = len(source) if nxt == -1 else nxt
+        source = source[:start] + source[end:]
+    return source
+
 
 _KEY_PATTERN = re.compile(
     r'set_attribute\(\s*f?"([^"{]+)"'
@@ -376,7 +391,7 @@ def _emitted_vocabulary() -> set[str]:
     """Every attribute key, event name and template found in the package sources."""
     found: set[str] = set()
     for path in (REPO_ROOT / "packages").glob("*/src/*/*.py"):
-        for match in _KEY_PATTERN.finditer(path.read_text()):
+        for match in _KEY_PATTERN.finditer(_without_superseded(path.read_text())):
             key = next((g for g in match.groups() if g), None)
             if key and key.split(".")[0] in (
                 "gen_ai",
@@ -390,7 +405,7 @@ def _emitted_vocabulary() -> set[str]:
 
 class TestVocabularyLock:
     def test_the_sdk_emits_no_key_this_list_does_not_know_about(self) -> None:
-        unexpected = _emitted_vocabulary() - EXPECTED_VOCABULARY - SUPERSEDED_VOCABULARY
+        unexpected = _emitted_vocabulary() - EXPECTED_VOCABULARY
         assert unexpected == set(), (
             "New span attribute keys found. If this is deliberate, add them to "
             "EXPECTED_VOCABULARY and say why in the commit message. If the two SDKs should agree, "
