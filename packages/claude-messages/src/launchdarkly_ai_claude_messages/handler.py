@@ -137,16 +137,6 @@ async def _run_tool_loop(
 
     while True:
         model_span = start_model_span(config, parent)
-        # Written before the call, so an in-flight or failed turn still shows what it was asked.
-        # `conversation` grows with each turn, which is what makes a `chat` span self-contained.
-        if capture_content:
-            set_input_content_attributes(
-                model_span,
-                capture_content,
-                system_instructions=system,
-                messages=to_span_messages(conversation),
-                tool_definitions=tool_definitions,
-            )
 
         kwargs: dict[str, Any] = {
             "model": config["model"]["name"],
@@ -163,6 +153,18 @@ async def _run_tool_loop(
         # span open: the blocking path has no `finally` that could recover it, so the turn would never
         # be exported and the run would show a model call that left no trace.
         try:
+            # Written before the call, so an in-flight or failed turn still shows what it was asked.
+            # `conversation` grows with each turn, which is what makes a `chat` span self-contained.
+            # Inside the guard, because serialising it raises on anything that is not
+            # JSON-serialisable and a raise out here would leave this span open.
+            if capture_content:
+                set_input_content_attributes(
+                    model_span,
+                    capture_content,
+                    system_instructions=system,
+                    messages=to_span_messages(conversation),
+                    tool_definitions=tool_definitions,
+                )
             resp = await client.messages.create(**kwargs)
 
             raw_usage = raw_usage_of(getattr(resp, "usage", None))
@@ -274,17 +276,20 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
         parent = parent_context_of(span)
 
         messages, system = _build_messages(config, user_input, vs, history=history)
-        set_input_content_attributes(
-            span,
-            capture_content,
-            system_instructions=system,
-            messages=to_span_messages(messages),
-        )
 
         # Outside the try, so the failure path can still report the spend of the turns that
         # completed before it.
         run_usage = RawRunUsage()
         try:
+            # Inside the guard, because serialising the prompt raises on anything that is not
+            # JSON-serialisable and a raise out here would leave the root open: never ended, never
+            # exported, and the run gone from AI Config Monitoring with the feature_flag event on it.
+            set_input_content_attributes(
+                span,
+                capture_content,
+                system_instructions=system,
+                messages=to_span_messages(messages),
+            )
             output, usage = await _run_tool_loop(
                 client,
                 config,
@@ -364,12 +369,6 @@ async def _stream_gen(
     messages, system = _build_messages(
         config, user_input, variables, include_output_format=False, history=history
     )
-    set_input_content_attributes(
-        span,
-        capture_content,
-        system_instructions=system,
-        messages=to_span_messages(messages),
-    )
 
     tools = _build_tools(config.get("tools") or {})
     tool_definitions = to_tool_definitions(tools)
@@ -389,6 +388,15 @@ async def _stream_gen(
     run_usage = RawRunUsage()
 
     try:
+        # Inside the guard, because serialising the prompt raises on anything that is not
+        # JSON-serialisable. A raise out here would leave the root open with the `finally` never
+        # entered, so the run would vanish from AI Config Monitoring with its feature_flag event.
+        set_input_content_attributes(
+            span,
+            capture_content,
+            system_instructions=system,
+            messages=to_span_messages(messages),
+        )
         while True:
             model_span = start_model_span(config, parent)
             open_model_span = model_span

@@ -1968,3 +1968,56 @@ class TestStreamingKeepsBilledTokens:
 
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 37
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 11
+
+
+class TestInputWritesNeverLeakASpan:
+    """Serialising the prompt must not be able to strand a span.
+
+    The input content write ran before the guard that fails the span it writes to, so a raise there
+    left the root open on both paths: never ended, never exported, so the run disappeared from AI
+    Config Monitoring along with the feature_flag event it carries.
+    """
+
+    async def test_the_blocking_root_still_ends(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, rec = _recording()
+        with (
+            ctx,
+            patch(
+                "launchdarkly_ai_claude_messages.handler.set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            await create_claude_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+
+        assert rec.root.ended == 1, "the root span leaked"
+        assert StatusCode.ERROR in rec.root.statuses
+
+    async def test_the_streaming_root_still_ends(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, rec = _recording()
+        with (
+            ctx,
+            patch(
+                "launchdarkly_ai_claude_messages.handler.set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            async for _ in await create_claude_messages_handler(
+                capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+
+        assert rec.root.ended == 1, "the root span leaked"
