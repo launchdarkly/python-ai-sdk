@@ -23,6 +23,7 @@ See TELEMETRY-CONTRACT.md.
 from __future__ import annotations
 
 import importlib
+import inspect
 import re
 from pathlib import Path
 from typing import Any
@@ -458,3 +459,96 @@ class TestOpenLLMetryCarrier:
         span = RecordedSpan("chat test-model-1")
         set_input_content_attributes(span, False, messages=[text_message("user", "hi")])
         assert span.attributes == {}
+
+
+# ---------------------------------------------------------------------------
+# Every span a streaming run opens must be closed by its `finally`
+# ---------------------------------------------------------------------------
+
+#: The handlers whose streaming path dispatches tools inline, in the generator itself. Each holds the
+#: open `execute_tool` span in a local, so each needs that local in its `finally`.
+INLINE_TOOL_LOOP_HANDLERS: dict[str, str] = {
+    "claude-messages": "launchdarkly_ai_claude_messages.handler",
+    "openai-messages": "launchdarkly_ai_openai_messages.handler",
+    "langchain-messages": "launchdarkly_ai_langchain_messages.handler",
+}
+
+#: The handlers that dispatch tools through the vendor's own hook or callback object. The open spans
+#: live in that object, so the same duty is discharged by an `abandon_open_spans`-style method.
+HOOK_BASED_TOOL_HANDLERS: dict[str, str] = {
+    "claude-agents": "launchdarkly_ai_claude_agents.handler",
+    "openai-agents": "launchdarkly_ai_openai_agents.handler",
+    "langchain-agents": "launchdarkly_ai_langchain_agents.handler",
+}
+
+
+def _handler_source(module_path: str) -> str:
+    return inspect.getsource(importlib.import_module(module_path))
+
+
+def _package_source(module_path: str) -> str:
+    """The handler and its spans module together.
+
+    Where the abandonment helper lives is a free choice: claude-agents and openai-agents keep it
+    beside the hooks in handler.py, langchain-agents keeps it on the callback object in spans.py.
+    The duty is the same, so the check looks in both rather than dictating the file.
+    """
+    spans_path = module_path.rsplit(".", 1)[0] + ".spans"
+    return _handler_source(module_path) + _handler_source(spans_path)
+
+
+class TestStreamingTeardownClosesToolSpans:
+    """A tool cancelled mid-flight must not leave its span open.
+
+    `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so the tool loop's own
+    handler never runs for those, and the streaming `finally` is the only code left that can end the
+    span. Four of the six handlers once held the open tool span in a local that `finally` never read,
+    which exported a closed parent above a child that never arrived.
+
+    Structural rather than behavioural on purpose: the leak is a property of which variables the
+    teardown reads, and a behavioural test would need a cancellable tool per handler to say the same
+    thing six times.
+    """
+
+    @pytest.mark.parametrize("name", sorted(INLINE_TOOL_LOOP_HANDLERS))
+    def test_an_inline_tool_loop_tracks_its_open_span_for_the_teardown(
+        self, name: str
+    ) -> None:
+        source = _handler_source(INLINE_TOOL_LOOP_HANDLERS[name])
+        assert "start_tool_span" in source, f"{name} no longer opens tool spans"
+        assert "open_tool_span" in source, (
+            f"{name} opens execute_tool spans in its streaming generator but keeps no tracker for "
+            "the teardown to close. A tool cancelled mid-flight will leak its span."
+        )
+        # The tracker has to be read where abandonment is handled, not merely assigned.
+        teardown = source[source.rindex("finally:") :]
+        assert "open_tool_span" in teardown, (
+            f"{name} tracks open_tool_span but its `finally` never closes it."
+        )
+
+    @pytest.mark.parametrize("name", sorted(HOOK_BASED_TOOL_HANDLERS))
+    def test_a_hook_based_handler_can_abandon_its_open_spans(self, name: str) -> None:
+        source = _package_source(HOOK_BASED_TOOL_HANDLERS[name])
+        # The definition, not the name: a mention in a docstring must not satisfy this.
+        assert re.search(r"def abandon_open_spans\(", source), (
+            f"{name} dispatches tools through a hook object, so it needs an abandon_open_spans to "
+            "end the spans still open when a consumer walks away."
+        )
+        # And the handler has to call it. A helper nothing reaches closes no spans. The call is
+        # matched by prefix rather than by exact name because claude-agents binds it to a local when
+        # it unpacks the hook factory's result.
+        handler = _handler_source(HOOK_BASED_TOOL_HANDLERS[name])
+        assert re.search(r"abandon\w*\(", handler), (
+            f"{name} defines an abandonment helper that the handler never calls, so a consumer who "
+            "walks away still leaves tool spans open."
+        )
+
+    @pytest.mark.parametrize("name", sorted(HOOK_BASED_TOOL_HANDLERS))
+    def test_abandonment_is_distinct_from_failure(self, name: str) -> None:
+        # Both exist for a reason: abandonment leaves UNSET, failure records the exception. Collapsing
+        # them makes one handler report an error for a run another reports as a clean stop.
+        source = _package_source(HOOK_BASED_TOOL_HANDLERS[name])
+        assert "close_open_spans" in source, (
+            f"{name} lost its failure path for open spans"
+        )
+        assert source.index("abandon_open_spans") != source.index("close_open_spans")
