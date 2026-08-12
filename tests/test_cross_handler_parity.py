@@ -621,9 +621,16 @@ class TestStreamingTeardownClosesToolSpans:
                 f"{name} has an abandon_open_spans that neither marks the spans abandoned nor hands "
                 "off to one that does, so it closes nothing."
             )
-        assert any(
-            "fail_span" in body or "close_open_spans(" in body
-            for body in _function_bodies(source, "close_open_spans")
-        ), (
-            f"{name}'s close_open_spans no longer records the failure it exists to record."
+        # At least one body has to do the recording itself. Accepting delegation alone let the
+        # wrapper's hand-off keep this green while the handler it delegates to stopped failing
+        # anything, which is the failure path disappearing without the lock noticing.
+        close_bodies = _function_bodies(source, "close_open_spans")
+        assert any("fail_span" in body for body in close_bodies), (
+            f"{name} has no close_open_spans that records a failure, so a run that died mid-tool "
+            "leaves its spans ended without the error that killed them."
         )
+        for body in close_bodies:
+            assert "fail_span" in body or "close_open_spans(" in body, (
+                f"{name} has a close_open_spans that neither records the failure nor hands off to "
+                "one that does, so it closes nothing."
+            )
