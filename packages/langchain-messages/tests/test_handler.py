@@ -1953,3 +1953,66 @@ class TestStreamingChatSpanAndTokens:
             ).stream(CONFIG, "q"):
                 pass
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 53
+
+
+class TestInputWritesNeverLeakASpan:
+    """Serialising the prompt must not be able to strand a span.
+
+    The input content write ran before the guard that fails the span it writes to. A raise there left
+    the chat span open on the structured path, and on both root paths left the root open: never
+    ended, never exported, so the run disappeared from AI Config Monitoring along with the
+    feature_flag event it carries.
+    """
+
+    def _unserialisable_prompt_config(self) -> dict[str, Any]:
+        class _Unserialisable:
+            pass
+
+        # A variable that reaches the prompt and refuses to serialise.
+        return {**CONFIG, "messages": [{"role": "user", "content": _Unserialisable()}]}
+
+    @pytest.mark.asyncio
+    async def test_the_blocking_root_still_ends(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        with (
+            ctx,
+            patch(
+                "launchdarkly_ai_langchain_messages.handler.set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            await create_langchain_messages_handler(
+                llm=_make_llm(), capture_content=True
+            )(CONFIG, "q", {}, {})
+
+        assert rec.root.ended == 1, "the root span leaked"
+        assert StatusCode.ERROR in rec.root.statuses
+
+    @pytest.mark.asyncio
+    async def test_the_streaming_root_still_ends(self) -> None:
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        with (
+            ctx,
+            patch(
+                "launchdarkly_ai_langchain_messages.handler.set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            async for _ in await create_langchain_messages_handler(
+                llm=_make_llm(), capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+
+        assert rec.root.ended == 1, "the root span leaked"

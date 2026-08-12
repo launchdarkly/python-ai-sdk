@@ -202,18 +202,18 @@ async def _run_structured_turn(
     outputFormat, mirroring the TypeScript handler's ``runStructuredTurn``.
     """
     model_span = start_model_span(config, parent)
-    if capture_content:
-        system_instructions, span_messages = _span_messages(messages)
-        set_input_content_attributes(
-            model_span,
-            capture_content,
-            system_instructions=system_instructions,
-            messages=span_messages,
-        )
-    # Everything that touches this span stays inside one guard. Serialising conversation content
-    # raises on anything that is not JSON-serialisable, and a raise out here would leave the chat span
-    # open: this path has no `finally` that could recover it.
+    # Everything that touches this span stays inside one guard, the input write included. Serialising
+    # conversation content raises on anything that is not JSON-serialisable, and a raise out here
+    # would leave the chat span open: this path has no `finally` that could recover it.
     try:
+        if capture_content:
+            system_instructions, span_messages = _span_messages(messages)
+            set_input_content_attributes(
+                model_span,
+                capture_content,
+                system_instructions=system_instructions,
+                messages=span_messages,
+            )
         structured_model = base_model.with_structured_output(
             output_format, include_raw=True
         )
@@ -294,19 +294,22 @@ def create_langchain_messages_handler(
         parent = parent_context_of(span)
 
         initial_messages = _build_messages(config, user_input, vs, history)
-        if capture_content:
-            system_instructions, span_messages = _span_messages(initial_messages)
-            set_input_content_attributes(
-                span,
-                capture_content,
-                system_instructions=system_instructions,
-                messages=span_messages,
-            )
 
         # Outside the try, so the failure path can still report the spend of the turns that
         # completed before it.
         run_usage = create_run_usage()
         try:
+            # Inside the guard, because serialising the prompt raises on anything that is not
+            # JSON-serialisable and a raise out here would leave the root open: never ended, never
+            # exported, and the run gone from AI Config Monitoring with the feature_flag event on it.
+            if capture_content:
+                system_instructions, span_messages = _span_messages(initial_messages)
+                set_input_content_attributes(
+                    span,
+                    capture_content,
+                    system_instructions=system_instructions,
+                    messages=span_messages,
+                )
             base_model = (
                 llm if llm is not None else _make_default_chat_model(config, importlib)
             )
@@ -591,14 +594,6 @@ async def _stream_gen(
     parent = parent_context_of(span)
 
     initial_messages = _build_messages(config, user_input, variables, history)
-    if capture_content:
-        system_instructions, span_messages = _span_messages(initial_messages)
-        set_input_content_attributes(
-            span,
-            capture_content,
-            system_instructions=system_instructions,
-            messages=span_messages,
-        )
 
     tool_defs = _build_tools(config.get("tools") or {})
     tool_model = base_model.bind_tools(tool_defs) if tool_defs else base_model
@@ -621,6 +616,18 @@ async def _stream_gen(
     ToolMessage = msgs_mod.ToolMessage
 
     try:
+        # Inside the guard, because serialising the prompt raises on anything that is not
+        # JSON-serialisable. A raise out here would leave the root open with the `finally` never
+        # entered, so the run would vanish from AI Config Monitoring along with its feature_flag
+        # event.
+        if capture_content:
+            system_instructions, span_messages = _span_messages(initial_messages)
+            set_input_content_attributes(
+                span,
+                capture_content,
+                system_instructions=system_instructions,
+                messages=span_messages,
+            )
         while True:
             model_span = start_model_span(config, parent)
             open_model_span = model_span
