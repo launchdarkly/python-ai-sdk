@@ -1698,3 +1698,77 @@ class TestOpenToolSpanIsNeverLeaked:
         assert tools[0].ended == 1, "the execute_tool span leaked"
         assert tools[0].attributes["launchdarkly.stream.abandoned"] is True
         assert rec.root.ended == 1
+
+
+class TestStructuredTurnChatSpanNeverLeaks:
+    """The structured-output turn has no `finally`, so a raise outside its guard is unrecoverable.
+
+    The output content write and the span finish sat outside the try that fails the chat span. A raise
+    while serialising the parsed object left the span open and unexported, and dropped the turn from
+    the run total even though the provider had already billed it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unserialisable_parsed_object_still_ends_the_chat_span(
+        self,
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        class _Unserialisable:
+            """json.dumps refuses this, which is how a real caller trips the same wire."""
+
+        config = {**CONFIG, "outputFormat": {"type": "object"}}
+        llm = _make_llm()
+        structured_llm = MagicMock()
+        structured_llm.ainvoke = AsyncMock(
+            return_value={
+                "parsed": _Unserialisable(),
+                "raw": FakeAIMessage("", input_tokens=17, output_tokens=4),
+            }
+        )
+        llm.with_structured_output = MagicMock(return_value=structured_llm)
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            await create_langchain_messages_handler(llm=llm, capture_content=True)(
+                config, "q", {}, {}
+            )
+
+        chat = rec.named("chat ")
+        assert len(chat) == 1
+        assert chat[0].ended == 1, "the chat span leaked"
+        assert StatusCode.ERROR in chat[0].statuses
+
+    @pytest.mark.asyncio
+    async def test_a_content_failure_does_not_lose_the_tokens_already_billed(
+        self,
+    ) -> None:
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        class _Unserialisable:
+            pass
+
+        config = {**CONFIG, "outputFormat": {"type": "object"}}
+        llm = _make_llm()
+        structured_llm = MagicMock()
+        structured_llm.ainvoke = AsyncMock(
+            return_value={
+                "parsed": _Unserialisable(),
+                "raw": FakeAIMessage("", input_tokens=17, output_tokens=4),
+            }
+        )
+        llm.with_structured_output = MagicMock(return_value=structured_llm)
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            await create_langchain_messages_handler(llm=llm, capture_content=True)(
+                config, "q", {}, {}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 17
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 4

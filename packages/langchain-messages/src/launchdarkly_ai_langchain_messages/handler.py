@@ -210,49 +210,57 @@ async def _run_structured_turn(
             system_instructions=system_instructions,
             messages=span_messages,
         )
+    # Everything that touches this span stays inside one guard. Serialising conversation content
+    # raises on anything that is not JSON-serialisable, and a raise out here would leave the chat span
+    # open: this path has no `finally` that could recover it.
     try:
         structured_model = base_model.with_structured_output(
             output_format, include_raw=True
         )
         result = await structured_model.ainvoke(messages)
+
+        raw: Any = (
+            result.get("raw")
+            if isinstance(result, dict)
+            else getattr(result, "raw", None)
+        )
+        raw_usage = getattr(raw, "usage_metadata", None) or {}
+        # Accumulated before anything that can raise. The provider has already billed this turn, so a
+        # later content failure must not report the run as having spent less than it did.
+        run_usage.add(lang_chain_span_usage(raw_usage))
+
+        parsed: Any = (
+            result.get("parsed")
+            if isinstance(result, dict)
+            else getattr(result, "parsed", None)
+        )
+        if capture_content:
+            set_output_content_attributes(
+                model_span,
+                capture_content,
+                [
+                    SpanMessage(
+                        role="assistant",
+                        parts=[
+                            SpanMessagePart(
+                                type="text",
+                                content=parsed
+                                if isinstance(parsed, str)
+                                else json.dumps(parsed),
+                            )
+                        ],
+                    )
+                ],
+            )
+        finish_model_span(
+            model_span,
+            config,
+            lang_chain_span_usage(raw_usage) or SpanUsage(),
+            lang_chain_finish_reasons(raw),
+        )
     except Exception as exc:
         fail_span(model_span, exc)
         raise
-
-    raw: Any = (
-        result.get("raw") if isinstance(result, dict) else getattr(result, "raw", None)
-    )
-    raw_usage = getattr(raw, "usage_metadata", None) or {}
-    parsed: Any = (
-        result.get("parsed")
-        if isinstance(result, dict)
-        else getattr(result, "parsed", None)
-    )
-    if capture_content:
-        set_output_content_attributes(
-            model_span,
-            capture_content,
-            [
-                SpanMessage(
-                    role="assistant",
-                    parts=[
-                        SpanMessagePart(
-                            type="text",
-                            content=parsed
-                            if isinstance(parsed, str)
-                            else json.dumps(parsed),
-                        )
-                    ],
-                )
-            ],
-        )
-    finish_model_span(
-        model_span,
-        config,
-        lang_chain_span_usage(raw_usage) or SpanUsage(),
-        lang_chain_finish_reasons(raw),
-    )
-    run_usage.add(lang_chain_span_usage(raw_usage))
     return parsed
 
 
