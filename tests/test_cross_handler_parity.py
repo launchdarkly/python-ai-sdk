@@ -509,6 +509,21 @@ def _call_sites_only(source: str) -> str:
     )
 
 
+def _function_bodies(source: str, name: str) -> list[str]:
+    """Every definition of ``name`` in the source, not just the first.
+
+    langchain-agents defines ``abandon_open_spans`` twice: once on the callback handler that holds the
+    spans, and once on the wrapper the handler actually calls. Checking only the first left the
+    wrapper unchecked, so a wrapper that closed nothing kept this green.
+    """
+    bodies = [
+        _function_body(source[m.start() :], name)
+        for m in re.finditer(rf"^[ \t]*def {re.escape(name)}\(", source, re.M)
+    ]
+    assert bodies, f"{name} is not defined"
+    return bodies
+
+
 def _function_body(source: str, name: str) -> str:
     """The body of one function: every line indented deeper than its ``def``.
 
@@ -595,15 +610,20 @@ class TestStreamingTeardownClosesToolSpans:
         )
         # The bodies, not the names. Two helpers that both call fail_span are one helper with two
         # names, and the whole point is that abandonment does not record an exception.
-        abandon = _function_body(source, "abandon_open_spans")
-        assert "fail_span" not in abandon, (
-            f"{name}'s abandon_open_spans records an exception, so an abandoned run reports an "
-            "error nobody had. Abandonment leaves the span UNSET."
-        )
-        assert "abandoned=True" in abandon, (
-            f"{name}'s abandon_open_spans does not mark the spans abandoned, so a reader cannot "
-            "tell an abandoned run from one that simply ended."
-        )
-        assert "fail_span" in _function_body(source, "close_open_spans"), (
+        # Every definition, because a handler may wrap the one that holds the spans.
+        for abandon in _function_bodies(source, "abandon_open_spans"):
+            assert "fail_span" not in abandon, (
+                f"{name} has an abandon_open_spans that records an exception, so an abandoned run "
+                "reports an error nobody had. Abandonment leaves the span UNSET."
+            )
+            # A wrapper delegates rather than marking the span itself, and that is still correct.
+            assert "abandoned=True" in abandon or "abandon_open_spans(" in abandon, (
+                f"{name} has an abandon_open_spans that neither marks the spans abandoned nor hands "
+                "off to one that does, so it closes nothing."
+            )
+        assert any(
+            "fail_span" in body or "close_open_spans(" in body
+            for body in _function_bodies(source, "close_open_spans")
+        ), (
             f"{name}'s close_open_spans no longer records the failure it exists to record."
         )
