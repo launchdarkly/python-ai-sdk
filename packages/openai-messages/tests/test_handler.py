@@ -1860,3 +1860,82 @@ class TestOpenToolSpanIsNeverLeaked:
         assert tools[0].ended == 1, "the execute_tool span leaked"
         assert tools[0].attributes["launchdarkly.stream.abandoned"] is True
         assert rec.root.ended == 1
+
+
+class TestStreamingChatSpanAndTokens:
+    """The streaming path must fail its span and keep its tokens when content serialisation raises.
+
+    The content write and the span finish sat after the try that fails the chat span, and the usage
+    was accumulated last. A raise while serialising the response therefore left the span for `finally`
+    to end as abandoned, which reads as a consumer who walked away rather than as the failure it was,
+    and dropped a turn the provider had already billed.
+    """
+
+    def _exploding_stream(self, mock_openai: MagicMock) -> None:
+        class _Exploding:
+            model = "gpt-4o"
+            status = "completed"
+            incomplete_details = None
+            id = "resp-1"
+
+            def __init__(self) -> None:
+                self.usage = MagicMock(input_tokens=44, output_tokens=12)
+                self.usage.input_tokens_details = MagicMock(cached_tokens=0)
+
+            @property
+            def output(self) -> Any:
+                raise TypeError("cannot serialise this response")
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                e = MagicMock()
+                e.type = "response.output_text.delta"
+                e.delta = "thinking..."
+                yield e
+
+            async def get_final_response(self) -> Any:
+                return _Exploding()
+
+        @asynccontextmanager
+        async def _ctx() -> Any:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_ctx())
+
+    async def test_the_chat_span_is_failed_not_abandoned(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        self._exploding_stream(mock_openai)
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            async for _ in await create_openai_messages_handler(
+                capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+
+        chat = rec.named("chat ")[0]
+        assert chat.ended == 1
+        assert StatusCode.ERROR in chat.statuses
+        assert "launchdarkly.stream.abandoned" not in chat.attributes
+
+    async def test_the_tokens_already_billed_survive(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        self._exploding_stream(mock_openai)
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            async for _ in await create_openai_messages_handler(
+                capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 44
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 12

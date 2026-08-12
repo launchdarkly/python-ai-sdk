@@ -417,20 +417,26 @@ async def _stream_gen(
                             yield {"type": "chunk", "text": text}
 
                     final_resp = await s.get_final_response()
+
+                last_response_model = getattr(final_resp, "model", None) or model_name(
+                    config
+                )
+                # Accumulated before anything that can raise. The provider has already billed this
+                # turn, so a later content failure must not report the run as having spent less than
+                # it did.
+                usage = to_span_usage(getattr(final_resp, "usage", None))
+                run_usage.add(usage)
+                # Inside the guard for the same reason as the blocking path: a raise out here would
+                # leave this span for `finally` to end as abandoned, which reads as a consumer who
+                # walked away rather than as the failure it is.
+                set_response_output_content(model_span, capture_content, final_resp)
+                finish_reason = finish_reason_of(final_resp)
+                finish_model_span(model_span, last_response_model, usage, finish_reason)
+                open_model_span = None
             except Exception as exc:
                 fail_span(model_span, exc, ended)
                 open_model_span = None
                 raise
-
-            last_response_model = getattr(final_resp, "model", None) or model_name(
-                config
-            )
-            set_response_output_content(model_span, capture_content, final_resp)
-            finish_reason = finish_reason_of(final_resp)
-            usage = to_span_usage(getattr(final_resp, "usage", None))
-            finish_model_span(model_span, last_response_model, usage, finish_reason)
-            open_model_span = None
-            run_usage.add(usage)
 
             tool_calls = [
                 item
