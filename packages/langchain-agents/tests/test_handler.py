@@ -1817,3 +1817,58 @@ class TestCallbackKeepsBilledTokens:
         # The turn was billed before the write that failed, so its tokens are still counted.
         assert callbacks.run_usage.total.input == 61
         assert callbacks.run_usage.total.output == 14
+
+
+class TestInputWritesNeverLeakASpan:
+    """Serialising the prompt must not be able to strand the root span.
+
+    The input content write ran before the guard that fails the root, so a raise there left it open:
+    never ended, never exported, so the run disappeared from AI Config Monitoring along with the
+    feature_flag event it carries.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_blocking_root_still_ends(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        import launchdarkly_ai_langchain_agents.handler as handler_mod
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with (
+            ctx,
+            patch.object(
+                handler_mod,
+                "set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            await create_langchain_agents_handler(llm, capture_content=True)(
+                BASE_CONFIG, "q"
+            )
+
+        assert rec.root.ended == 1, "the root span leaked"
+        assert StatusCode.ERROR in rec.root.statuses
+
+    @pytest.mark.asyncio
+    async def test_the_streaming_root_still_ends(self) -> None:
+        import launchdarkly_ai_langchain_agents.handler as handler_mod
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with (
+            ctx,
+            patch.object(
+                handler_mod,
+                "set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            async for _ in await create_langchain_agents_handler(
+                llm, capture_content=True
+            ).stream(BASE_CONFIG, "q"):
+                pass
+
+        assert rec.root.ended == 1, "the root span leaked"

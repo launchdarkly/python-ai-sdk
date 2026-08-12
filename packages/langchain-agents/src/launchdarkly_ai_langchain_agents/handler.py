@@ -204,13 +204,6 @@ def create_langchain_agents_handler(
             )
 
         initial_messages = _build_initial_messages(config, user_input, vs)
-        if capture_content:
-            set_input_content_attributes(
-                span,
-                capture_content,
-                system_instructions=system_prompt,
-                messages=lang_chain_span_messages(initial_messages)[1],
-            )
 
         span_callbacks = build_span_callbacks(
             config,
@@ -220,6 +213,16 @@ def create_langchain_agents_handler(
         )
 
         try:
+            # Inside the guard, because serialising the prompt raises on anything that is not
+            # JSON-serialisable and a raise out here would leave the root open: never ended, never
+            # exported, and the run gone from AI Config Monitoring with the feature_flag event on it.
+            if capture_content:
+                set_input_content_attributes(
+                    span,
+                    capture_content,
+                    system_instructions=system_prompt,
+                    messages=lang_chain_span_messages(initial_messages)[1],
+                )
             base_model = llm
             if base_model is None:
                 base_model = _make_default_chat_model(config)
@@ -336,13 +339,6 @@ async def _stream_gen(
 
     system_prompt = _extract_system_prompt(config, variables, history)
     initial_messages = _build_initial_messages(config, user_input, variables)
-    if capture_content:
-        set_input_content_attributes(
-            span,
-            capture_content,
-            system_instructions=system_prompt,
-            messages=lang_chain_span_messages(initial_messages)[1],
-        )
 
     span_callbacks = build_span_callbacks(
         config, parent, capture_content, to_tool_definitions(config.get("tools") or {})
@@ -350,6 +346,16 @@ async def _stream_gen(
     ended: set[int] = set()
 
     try:
+        # Inside the guard, because serialising the prompt raises on anything that is not
+        # JSON-serialisable. A raise out here would leave the root open with the `finally` never
+        # entered, so the run would vanish from AI Config Monitoring with its feature_flag event.
+        if capture_content:
+            set_input_content_attributes(
+                span,
+                capture_content,
+                system_instructions=system_prompt,
+                messages=lang_chain_span_messages(initial_messages)[1],
+            )
         base_model = llm
         if base_model is None:
             base_model = _make_default_chat_model(config)
