@@ -22,6 +22,7 @@ See TELEMETRY-CONTRACT.md.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import re
@@ -497,6 +498,22 @@ def _package_source(module_path: str) -> str:
     return _handler_source(module_path) + _handler_source(spans_path)
 
 
+def _finally_blocks(source: str) -> list[str]:
+    """The body of every ``finally:`` in the source.
+
+    Any of them will do, not only the last. langchain-agents cleans up in an inner ``finally`` and
+    keeps an outer one for the vendor generator, so pinning this to the last block would have failed
+    a handler that does the right thing in the right place.
+    """
+    tree = ast.parse(source)
+    blocks: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and node.finalbody:
+            segments = [ast.get_source_segment(source, stmt) for stmt in node.finalbody]
+            blocks.append("\n".join(seg for seg in segments if seg))
+    return blocks
+
+
 def _call_sites_only(source: str) -> str:
     """The source with every ``def`` line removed, so a definition cannot pass for a call.
 
@@ -589,15 +606,18 @@ class TestStreamingTeardownClosesToolSpans:
             f"{name} dispatches tools through a hook object, so it needs an abandon_open_spans to "
             "end the spans still open when a consumer walks away."
         )
-        # And the handler has to call it. A helper nothing reaches closes no spans. Definition lines
-        # are stripped first, because three of these handlers define the helper in the module that
-        # has to call it, and the `def` line would otherwise answer for the call. The call is matched
-        # by prefix rather than exact name because claude-agents binds it to a local when it unpacks
-        # the hook factory's result.
-        handler = _call_sites_only(_handler_source(HOOK_BASED_TOOL_HANDLERS[name]))
-        assert re.search(r"abandon\w*\(", handler), (
-            f"{name} defines an abandonment helper that the handler never calls, so a consumer who "
-            "walks away still leaves tool spans open."
+        # And the call has to sit in a `finally`. Anywhere else is not teardown: GeneratorExit and
+        # CancelledError never enter `except Exception`, and a success path does not run at all when
+        # a consumer walks away, so an abandon call in either place closes nothing on the one path it
+        # exists for. Definition lines are stripped first, because three of these handlers define the
+        # helper in the module that has to call it and the `def` line would otherwise answer for the
+        # call. Matched by prefix rather than exact name, because claude-agents binds it to a local
+        # when it unpacks the hook factory's result.
+        handler = _handler_source(HOOK_BASED_TOOL_HANDLERS[name])
+        teardowns = [_call_sites_only(block) for block in _finally_blocks(handler)]
+        assert any(re.search(r"abandon\w*\(", block) for block in teardowns), (
+            f"{name} never calls its abandonment helper from a `finally`, so a consumer who walks "
+            "away still leaves tool spans open."
         )
 
     @pytest.mark.parametrize("name", sorted(HOOK_BASED_TOOL_HANDLERS))
