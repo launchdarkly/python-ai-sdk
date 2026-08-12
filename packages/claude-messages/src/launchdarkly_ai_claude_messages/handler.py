@@ -435,6 +435,10 @@ async def _stream_gen(
             finish_reason = to_semconv_finish_reason(
                 getattr(final_msg, "stop_reason", None)
             )
+            # Accumulated before anything that can raise, the same way the blocking path does it.
+            # Anthropic has already billed this turn, so a later content failure must not report the
+            # run as having spent less than it did.
+            run_usage.add_turn(raw_usage)
             if capture_content:
                 set_output_content_attributes(
                     model_span,
@@ -451,7 +455,6 @@ async def _stream_gen(
             # `finally` from ending it a second time.
             finish_model_span(model_span, config, raw_usage, finish_reason)
             open_model_span = None
-            run_usage.add_turn(raw_usage)
 
             if final_msg.stop_reason != "tool_use":
                 break

@@ -1919,3 +1919,52 @@ class TestBlockingChatSpanNeverLeaks:
             )
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 23
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 7
+
+
+class TestStreamingKeepsBilledTokens:
+    """The streaming path must report the tokens it spent even when serialising content fails.
+
+    The blocking path already accumulated before any content work. The streaming path did it last, so
+    a raise while serialising the completion dropped a turn Anthropic had already billed, and left
+    the root reporting less than the run cost.
+    """
+
+    async def test_a_content_failure_does_not_lose_the_tokens_already_billed(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        class _ExplodingContent(list):
+            def __iter__(self) -> Any:
+                raise TypeError("cannot serialise this content")
+
+        final_msg = MagicMock()
+        final_msg.stop_reason = "end_turn"
+        final_msg.usage = _Usage(37, 11)
+        final_msg.content = _ExplodingContent()
+
+        class _FakeStream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield _make_stream_event("thinking...")
+
+            async def get_final_message(self) -> Any:
+                return final_msg
+
+        @asynccontextmanager
+        async def _ctx_mgr() -> AsyncGenerator[Any, None]:
+            yield _FakeStream()
+
+        mock_anthropic.messages.stream = MagicMock(return_value=_ctx_mgr())
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            async for _ in await create_claude_messages_handler(
+                capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 37
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 11
