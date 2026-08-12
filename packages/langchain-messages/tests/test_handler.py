@@ -1649,3 +1649,52 @@ class TestChatSpanAndTeardownNeverLeak:
             "the root span was lost to a vendor teardown failure"
         )
         assert rec.root.attributes["launchdarkly.stream.abandoned"] is True
+
+
+class TestOpenToolSpanIsNeverLeaked:
+    """A BaseException while a tool runs must still close the execute_tool span.
+
+    The streaming `finally` closed the model span and the root, but the in-flight tool span was held
+    only by a local. `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so a
+    tool cancelled mid-flight left its span open and unexported: the trace showed a closed parent
+    above a child that never arrived.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_tool_cancelled_mid_flight_still_ends_its_span(self) -> None:
+        import asyncio
+
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage("done"))
+
+        async def _astream(msgs: Any) -> AsyncGenerator[Any, None]:
+            yield FakeAIMessage(
+                "",
+                tool_calls=[{"name": "myTool", "id": "tu1", "args": {"a": 1}}],
+                input_tokens=5,
+                output_tokens=3,
+            )
+
+        llm.astream = _astream
+
+        async def _cancelled_tool(_: Any) -> Any:
+            # A BaseException, so `except Exception` in the tool loop does not see it.
+            raise asyncio.CancelledError()
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(asyncio.CancelledError):
+            async for _ in await create_langchain_messages_handler(llm=llm).stream(
+                CONFIG, "q", {"myTool": _cancelled_tool}
+            ):
+                pass
+
+        tools = rec.named("execute_tool ")
+        assert len(tools) == 1
+        assert tools[0].ended == 1, "the execute_tool span leaked"
+        assert tools[0].attributes["launchdarkly.stream.abandoned"] is True
+        assert rec.root.ended == 1
