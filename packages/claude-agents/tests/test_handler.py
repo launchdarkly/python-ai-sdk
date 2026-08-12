@@ -1787,3 +1787,56 @@ class TestAbandonedToolSpansAreNotErrors:
         tools = [s for s in spans() if s.name.startswith("execute_tool ")]
         assert len(tools) == 1
         assert tools[0].status.status_code == StatusCode.ERROR
+
+
+class TestAnEmptyRunDoesNotClaimItCostNothing:
+    """A stream that ended with nothing reported must leave the root's usage attributes absent.
+
+    Both paths wrote the all-zero per-response sum when the stream ended without a ResultMessage and
+    without absorbing a single assistant turn. Zeros say the run cost nothing, which is a different
+    claim from not knowing what it cost, and a config-scoped cost query cannot tell the two apart
+    once the zeros are on the span. The error and abandonment paths already guarded on `reported`.
+    """
+
+    async def test_the_blocking_path_writes_no_usage_when_nothing_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _no_result(**_kwargs: Any) -> AsyncIterator[Any]:
+            # A stream that yields text and then stops: no ResultMessage, no assistant turn.
+            yield stream_event("partial")
+
+        monkeypatch.setattr(handler_mod, "query", _no_result)
+        await create_claude_agents_handler()(BASE_CONFIG, "q", {}, {})
+
+        attrs = root().attributes or {}
+        assert "gen_ai.usage.input_tokens" not in attrs
+        assert "gen_ai.usage.output_tokens" not in attrs
+        assert "gen_ai.usage.total_tokens" not in attrs
+
+    async def test_a_reported_turn_is_still_written(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The other side of the branch: a run that did report must still report.
+        async def _one_turn_no_result(**_kwargs: Any) -> AsyncIterator[Any]:
+            yield stream_event("partial")
+            yield assistant_message(input_tokens=13, output_tokens=6)
+
+        monkeypatch.setattr(handler_mod, "query", _one_turn_no_result)
+        await create_claude_agents_handler()(BASE_CONFIG, "q", {}, {})
+        assert (root().attributes or {})["gen_ai.usage.input_tokens"] == 13
+
+    async def test_the_streaming_path_writes_no_usage_when_nothing_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _no_result(**_kwargs: Any) -> AsyncIterator[Any]:
+            yield stream_event("partial")
+
+        monkeypatch.setattr(handler_mod, "query", _no_result)
+        async for _ in await create_claude_agents_handler().stream(
+            BASE_CONFIG, "q", {}, {}
+        ):
+            pass
+
+        attrs = root().attributes or {}
+        assert "gen_ai.usage.input_tokens" not in attrs
+        assert "gen_ai.usage.total_tokens" not in attrs

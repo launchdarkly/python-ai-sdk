@@ -511,8 +511,13 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
                 # is the only record of what the run spent.
                 inference.finish()
                 streamed_usage = inference.run_usage
-                finish_root_span(span, config, streamed_usage["total"])
-                root_usage_written = True
+                # Only when something reported. All-zero attributes claim the run cost nothing, and a
+                # stream that ended without a result message and without absorbing a single turn
+                # cannot make that claim: absent usage means unknown, which is the honest answer. The
+                # error and abandonment paths already guard the same way.
+                if streamed_usage["reported"]:
+                    finish_root_span(span, config, streamed_usage["total"])
+                    root_usage_written = True
                 succeed_span(span)
                 return {"output": output, "usage": streamed_usage["total"]}
             finally:
@@ -667,8 +672,10 @@ async def _stream_gen(
         # per-response sum is the only record of the spend.
         inference.finish()
         streamed_usage = inference.run_usage
-        finish_root_span(span, config, streamed_usage["total"])
-        root_usage_written = True
+        # Same guard as the blocking path: zeros would assert the run cost nothing.
+        if streamed_usage["reported"]:
+            finish_root_span(span, config, streamed_usage["total"])
+            root_usage_written = True
         set_output_content_attributes(
             span,
             capture_content,
