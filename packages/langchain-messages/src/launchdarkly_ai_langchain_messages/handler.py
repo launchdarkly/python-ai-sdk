@@ -500,17 +500,23 @@ def create_langchain_messages_handler(
                     )
                 conversation_messages.extend(tool_results)
 
-            output_str = output if isinstance(output, str) else json.dumps(output)
-            set_output_content_attributes(
-                span,
-                capture_content,
-                [
-                    SpanMessage(
-                        role="assistant",
-                        parts=[SpanMessagePart(type="text", content=output_str)],
-                    )
-                ],
-            )
+            # Behind the flag, because set_output_content_attributes is a no-op without it and
+            # json.dumps is not. With tools and an outputFormat on a non-OpenAI provider the output
+            # here is the parsed object, so serialising one json.dumps refuses turned a successful
+            # run into a raised TypeError for a caller who had asked for no content at all. The
+            # outputFormat-only path above already guards the same work the same way.
+            if capture_content:
+                output_str = output if isinstance(output, str) else json.dumps(output)
+                set_output_content_attributes(
+                    span,
+                    capture_content,
+                    [
+                        SpanMessage(
+                            role="assistant",
+                            parts=[SpanMessagePart(type="text", content=output_str)],
+                        )
+                    ],
+                )
             finish_root_span(span, config, run_usage.total)
             succeed_span(span)
             return {

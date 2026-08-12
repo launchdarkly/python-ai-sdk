@@ -1821,6 +1821,43 @@ class TestNoContentWorkWhenCaptureIsOff:
     """
 
     @pytest.mark.asyncio
+    async def test_the_tool_path_also_returns_normally(self) -> None:
+        # The same guard on the other exit. With tools and an outputFormat on a non-OpenAI provider
+        # the run leaves through the tool loop's own return, which serialised the parsed object too.
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        class _Unserialisable:
+            pass
+
+        parsed = _Unserialisable()
+        config = {
+            **CONFIG,
+            "provider": {"name": "Anthropic"},
+            "outputFormat": {"type": "object"},
+            "tools": {"myTool": {"name": "myTool", "description": "d"}},
+        }
+        llm = _make_llm()
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage("", tool_calls=[]))
+        structured_llm = MagicMock()
+        structured_llm.ainvoke = AsyncMock(
+            return_value={
+                "parsed": parsed,
+                "raw": FakeAIMessage("", input_tokens=6, output_tokens=1),
+            }
+        )
+        llm.with_structured_output = MagicMock(return_value=structured_llm)
+
+        ctx, rec = _recording()
+        with ctx:
+            result = await create_langchain_messages_handler(llm=llm)(
+                config, "q", {"myTool": AsyncMock(return_value="r")}, {}
+            )
+        assert result["output"] is parsed
+        assert "gen_ai.output.messages" not in rec.root.attributes
+
+    @pytest.mark.asyncio
     async def test_an_unserialisable_parsed_object_still_returns_normally(self) -> None:
         from launchdarkly_ai_langchain_messages import (
             create_langchain_messages_handler,
