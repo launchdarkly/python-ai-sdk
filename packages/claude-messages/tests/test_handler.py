@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2021,3 +2022,50 @@ class TestInputWritesNeverLeakASpan:
                 pass
 
         assert rec.root.ended == 1, "the root span leaked"
+
+
+class TestCacheFiguresAreNotInvented:
+    """A run total may not claim a cache figure Anthropic never sent.
+
+    RawRunUsage seeded both cache fields at zero, which undid raw_usage_of: that function omits the
+    fields Anthropic did not send precisely so absent stays absent. The returned bag therefore always
+    looked cache-aware, and parse_usage emitted an input_details breakdown of zeros for a model with
+    no prompt caching at all. A zero cache read is a claim, not the absence of one.
+    """
+
+    async def test_a_model_without_caching_returns_no_cache_fields(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        resp = MagicMock()
+        resp.stop_reason = "end_turn"
+        resp.content = []
+        # Anthropic sends only the two base counts when the model has no prompt caching.
+        resp.usage = SimpleNamespace(input_tokens=12, output_tokens=3)
+        mock_anthropic.messages.create = AsyncMock(return_value=resp)
+
+        result = await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert result["usage"] == {"input_tokens": 12, "output_tokens": 3}
+
+    async def test_a_reported_cache_figure_is_still_carried(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        resp = MagicMock()
+        resp.stop_reason = "end_turn"
+        resp.content = []
+        resp.usage = SimpleNamespace(
+            input_tokens=3,
+            output_tokens=40,
+            cache_read_input_tokens=19971,
+            cache_creation_input_tokens=3580,
+        )
+        mock_anthropic.messages.create = AsyncMock(return_value=resp)
+
+        result = await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert result["usage"]["cache_read_input_tokens"] == 19971
+        assert result["usage"]["cache_creation_input_tokens"] == 3580
+        # Still unfolded, so parse_usage folds exactly once.
+        assert result["usage"]["input_tokens"] == 3

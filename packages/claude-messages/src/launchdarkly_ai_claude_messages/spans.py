@@ -278,13 +278,13 @@ class RawRunUsage:
     raises still leaves the run's spend somewhere the root can read it.
     """
 
+    #: Present on every total, because a completed turn always has a base count to report.
+    _BASE_FIELDS = ("input_tokens", "output_tokens")
+    #: Carried only once a turn actually reports one. See :meth:`add_turn`.
+    _CACHE_FIELDS = ("cache_read_input_tokens", "cache_creation_input_tokens")
+
     def __init__(self) -> None:
-        self.total: dict[str, Any] = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-        }
+        self.total: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
         self._turns = 0
 
     @property
@@ -299,8 +299,18 @@ class RawRunUsage:
 
     def add_turn(self, raw_usage: dict[str, Any]) -> None:
         self._turns += 1
-        for key in self.total:
+        for key in self._BASE_FIELDS:
             self.total[key] += number_or_zero(raw_usage.get(key))
+        # A cache field appears in the total only once some turn reported one. Seeding them at zero
+        # undid `raw_usage_of`, which omits the fields Anthropic did not send: the returned bag then
+        # always looked cache-aware, so `parse_usage` emitted an input_details breakdown of zeros for
+        # a model with no prompt caching at all. Reporting a zero cache read is a claim, and this
+        # accumulator has no grounds to make it.
+        for key in self._CACHE_FIELDS:
+            if key in raw_usage:
+                self.total[key] = number_or_zero(self.total.get(key)) + number_or_zero(
+                    raw_usage.get(key)
+                )
 
 
 def raw_usage_of(usage: Any) -> dict[str, Any]:
