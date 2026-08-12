@@ -155,9 +155,13 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
     from the other side.
 
     Only ``AIMessage`` carries usage. Summing here rather than trusting the callbacks' own total
-    matters when there is a real ``result``/stepped state to read: it is the same path the
-    TypeScript handler takes, and it keeps the two run-usage totals (this one, and the callbacks'
-    fallback used only on the failure path) computed the same way.
+    matters when there is a real ``result``/stepped state to read: it is the same path the TypeScript
+    handler takes.
+
+    The two sides do not read the same fields, though. This one sees ``usage_metadata`` only, and the
+    callbacks also fall back to ``llm_output.token_usage``. The caller reconciles them, because a
+    provider that reports only in ``llm_output`` would otherwise give a successful run a root that
+    says zero and chat spans that say otherwise.
     """
     run_usage = create_run_usage()
     for msg in messages:
@@ -239,6 +243,13 @@ def create_langchain_agents_handler(
                 else getattr(result, "messages", [])
             )
             run_usage = _run_usage_from_messages(msgs)
+            # The two sides do not see the same fields. A message carries usage_metadata and nothing
+            # else, while the callbacks read the LLMResult and fall back to llm_output.token_usage,
+            # which some providers use instead. When only the callbacks saw anything, they are the
+            # only record of what the run cost, and a successful root reporting zero while its own
+            # chat spans report real tokens is the one outcome neither figure can be right about.
+            if not run_usage.reported and span_callbacks.run_usage.reported:
+                run_usage = span_callbacks.run_usage
 
             last_msg = msgs[-1] if msgs else None
             output = (

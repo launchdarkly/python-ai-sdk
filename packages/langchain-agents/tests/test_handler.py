@@ -1718,3 +1718,60 @@ class TestZeroTokensAreStillReported:
 
         result = SimpleNamespace(generations=[], llm_output={"token_usage": {}})
         assert extract_llm_usage(result) == {}
+
+
+class TestSuccessAndFailureUsageAgree:
+    """A successful root must not report zero while its own chat spans report real tokens.
+
+    The two sides read different fields. The success path sums `usage_metadata` off each message; the
+    callbacks read the whole `LLMResult` and fall back to `llm_output.token_usage`, which some
+    providers use instead. For those providers the chat spans carried the tokens and the successful
+    run's root, and the bag handed back to the caller, both stayed at zero.
+    """
+
+    @pytest.mark.asyncio
+    async def test_llm_output_only_usage_still_reaches_the_root(self) -> None:
+        # A provider that reports in llm_output and leaves usage_metadata empty.
+        class _LlmOutputOnlyModel(_FakeToolModel):
+            async def _agenerate(
+                self,
+                messages: Any,
+                stop: Any = None,
+                run_manager: Any = None,
+                **kwargs: Any,
+            ) -> Any:
+                from langchain_core.messages import AIMessage
+                from langchain_core.outputs import ChatGeneration, ChatResult
+
+                self.calls += 1
+                return ChatResult(
+                    generations=[ChatGeneration(message=AIMessage(content="hi"))],
+                    llm_output={
+                        "token_usage": {"prompt_tokens": 41, "completion_tokens": 9}
+                    },
+                )
+
+        ctx, rec = _recording()
+        result = None
+        with ctx:
+            result = await create_langchain_agents_handler(_LlmOutputOnlyModel())(
+                BASE_CONFIG, "q"
+            )
+        chat = rec.named("chat ")[0].attributes
+        assert chat["gen_ai.usage.input_tokens"] == 41
+        # The point of the test: the root and the returned bag must agree with the chat span.
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 41
+        assert result["usage"] == {"input_tokens": 41, "output_tokens": 9}
+
+    @pytest.mark.asyncio
+    async def test_usage_metadata_still_wins_when_both_are_present(self) -> None:
+        # The message-level sum stays authoritative where it has anything to say, so this change
+        # cannot double-count a provider that reports in both places.
+        ctx, rec = _recording()
+        llm = _FakeToolModel(
+            replies=[_ai_message("hi", input_tokens=10, output_tokens=5)]
+        )
+        with ctx:
+            result = await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 10
+        assert result["usage"] == {"input_tokens": 10, "output_tokens": 5}
