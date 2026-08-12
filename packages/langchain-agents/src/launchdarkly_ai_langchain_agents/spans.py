@@ -363,6 +363,10 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         # Popped, so close_open_spans can no longer reach this span: whatever happens next, this
         # method has to end it. Serialising conversation content raises on anything that is not
         # JSON-serialisable, and a raise here would otherwise leak the span with nothing tracking it.
+        # Before the content write, because the provider has already billed these tokens: a content
+        # failure is our problem and must not report the run as having spent less than it did.
+        turn_usage_raw = extract_llm_usage(response)
+        self.run_usage.add(lang_chain_span_usage(turn_usage_raw))
         try:
             if self._capture_content:
                 set_output_content_attributes(
@@ -370,8 +374,6 @@ class SpanCallbackHandler(AsyncCallbackHandler):
                     self._capture_content,
                     lang_chain_span_messages(generated_messages(response))[1],
                 )
-            turn_usage_raw = extract_llm_usage(response)
-            self.run_usage.add(lang_chain_span_usage(turn_usage_raw))
             finish_model_span(
                 span, self._config, turn_usage_raw, lang_chain_finish_reasons(response)
             )

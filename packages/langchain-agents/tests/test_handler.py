@@ -1775,3 +1775,45 @@ class TestSuccessAndFailureUsageAgree:
             result = await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 10
         assert result["usage"] == {"input_tokens": 10, "output_tokens": 5}
+
+
+class TestCallbackKeepsBilledTokens:
+    """The callback must report the tokens a turn spent even when writing its content fails.
+
+    `on_llm_end` accumulated after the content write. A raise while serialising completion content
+    dropped a turn the provider had already billed, and that accumulator is what a failed run's root
+    reports and what a successful run falls back to when the messages carry no usage of their own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_content_failure_does_not_lose_the_tokens_already_billed(
+        self,
+    ) -> None:
+        from langchain_core.outputs import ChatGeneration, LLMResult
+
+        import launchdarkly_ai_langchain_agents.spans as spans_mod
+
+        callbacks = spans_mod.build_span_callbacks(BASE_CONFIG, None, True, [])
+        handler = callbacks._handler
+
+        result = LLMResult(
+            generations=[
+                [
+                    ChatGeneration(
+                        message=_ai_message("hi", input_tokens=61, output_tokens=14)
+                    )
+                ]
+            ],
+        )
+
+        def _explode(*_a: Any, **_k: Any) -> None:
+            raise TypeError("cannot serialise this content")
+
+        await handler.on_llm_start({}, ["q"], run_id="r1")
+        with patch.object(spans_mod, "set_output_content_attributes", _explode):
+            with pytest.raises(TypeError):
+                await handler.on_llm_end(result, run_id="r1")
+
+        # The turn was billed before the write that failed, so its tokens are still counted.
+        assert callbacks.run_usage.total.input == 61
+        assert callbacks.run_usage.total.output == 14
