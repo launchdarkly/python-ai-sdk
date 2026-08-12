@@ -422,13 +422,6 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             config.get("tools"), th
         )
         catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(th))
-        set_input_content_attributes(
-            span,
-            capture_content,
-            system_instructions=opening.system_instructions,
-            messages=opening.messages,
-            tool_definitions=catalog.current,
-        )
 
         # Declared out here so the except clause can end a chat span the throw left open.
         inference = InferenceSpans(config, parent, capture_content, catalog, opening)
@@ -438,6 +431,16 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
         root_usage_written = False
         gen: AsyncIterator[Any] | None = None
         try:
+            # Inside the guard, because serialising the prompt raises on anything that is not
+            # JSON-serialisable and a raise out here would leave the root open: never ended, never
+            # exported, and the run gone from AI Config Monitoring with the feature_flag event on it.
+            set_input_content_attributes(
+                span,
+                capture_content,
+                system_instructions=opening.system_instructions,
+                messages=opening.messages,
+                tool_definitions=catalog.current,
+            )
             tool_mcp = (
                 await build_tool_mcp(user_config_tools, th)
                 if user_config_tools
@@ -582,13 +585,6 @@ async def _stream_gen(
         config.get("tools"), tool_handlers
     )
     catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(tool_handlers))
-    set_input_content_attributes(
-        span,
-        capture_content,
-        system_instructions=opening.system_instructions,
-        messages=opening.messages,
-        tool_definitions=catalog.current,
-    )
 
     inference = InferenceSpans(config, parent, capture_content, catalog, opening)
     tool_telemetry: ToolTelemetry | None = None
@@ -598,6 +594,16 @@ async def _stream_gen(
     gen: AsyncIterator[Any] | None = None
 
     try:
+        # Inside the guard, because serialising the prompt raises on anything that is not
+        # JSON-serialisable. A raise out here would leave the root open with the `finally` never
+        # entered, so the run would vanish from AI Config Monitoring with its feature_flag event.
+        set_input_content_attributes(
+            span,
+            capture_content,
+            system_instructions=opening.system_instructions,
+            messages=opening.messages,
+            tool_definitions=catalog.current,
+        )
         tool_mcp = (
             await build_tool_mcp(user_config_tools, tool_handlers)
             if user_config_tools

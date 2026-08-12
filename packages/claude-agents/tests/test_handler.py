@@ -1840,3 +1840,53 @@ class TestAnEmptyRunDoesNotClaimItCostNothing:
         attrs = root().attributes or {}
         assert "gen_ai.usage.input_tokens" not in attrs
         assert "gen_ai.usage.total_tokens" not in attrs
+
+
+class TestInputWritesNeverLeakASpan:
+    """Serialising the prompt must not be able to strand the root span.
+
+    The input content write ran before the guard that fails the root, so a raise there left it open:
+    never ended, never exported, so the run disappeared from AI Config Monitoring along with the
+    feature_flag event it carries.
+    """
+
+    async def test_the_blocking_root_still_ends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _q(**_kwargs: Any) -> AsyncIterator[Any]:
+            yield result_message("done")
+
+        monkeypatch.setattr(handler_mod, "query", _q)
+        monkeypatch.setattr(
+            handler_mod,
+            "set_input_content_attributes",
+            MagicMock(side_effect=TypeError("cannot serialise this prompt")),
+        )
+        with pytest.raises(TypeError):
+            await create_claude_agents_handler(capture_content=True)(
+                BASE_CONFIG, "q", {}, {}
+            )
+
+        assert root().end_time is not None, "the root span leaked"
+        assert root().status.status_code == StatusCode.ERROR
+
+    async def test_the_streaming_root_still_ends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _q(**_kwargs: Any) -> AsyncIterator[Any]:
+            yield stream_event("chunk")
+            yield result_message("done")
+
+        monkeypatch.setattr(handler_mod, "query", _q)
+        monkeypatch.setattr(
+            handler_mod,
+            "set_input_content_attributes",
+            MagicMock(side_effect=TypeError("cannot serialise this prompt")),
+        )
+        with pytest.raises(TypeError):
+            async for _ in await create_claude_agents_handler(
+                capture_content=True
+            ).stream(BASE_CONFIG, "q", {}, {}):
+                pass
+
+        assert root().end_time is not None, "the root span leaked"
