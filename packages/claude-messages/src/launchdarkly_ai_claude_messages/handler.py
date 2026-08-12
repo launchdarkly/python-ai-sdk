@@ -158,31 +158,37 @@ async def _run_tool_loop(
         if tools:
             kwargs["tools"] = tools
 
+        # Everything that touches this span stays inside one guard. Serialising conversation content
+        # raises on anything that is not JSON-serialisable, and a raise out here would leave the chat
+        # span open: the blocking path has no `finally` that could recover it, so the turn would never
+        # be exported and the run would show a model call that left no trace.
         try:
             resp = await client.messages.create(**kwargs)
+
+            raw_usage = raw_usage_of(getattr(resp, "usage", None))
+            # Accumulated before anything that can raise. Anthropic has already billed this turn, so
+            # a later content failure must not report the run as having spent less than it did.
+            run_usage.add_turn(raw_usage)
+            # Mapped once, into a local, so the span attribute and the output message cannot disagree:
+            # Anthropic's `end_turn` is semconv's `stop`, and this handler is not the only one whose
+            # spans a consumer groups by that value.
+            finish_reason = to_semconv_finish_reason(getattr(resp, "stop_reason", None))
+            if capture_content:
+                set_output_content_attributes(
+                    model_span,
+                    capture_content,
+                    [
+                        SpanMessage(
+                            role="assistant",
+                            parts=to_span_parts(resp.content),
+                            finish_reason=finish_reason,
+                        )
+                    ],
+                )
+            finish_model_span(model_span, config, raw_usage, finish_reason)
         except Exception as exc:
             fail_span(model_span, exc)
             raise
-
-        raw_usage = raw_usage_of(getattr(resp, "usage", None))
-        # Mapped once, into a local, so the span attribute and the output message cannot disagree:
-        # Anthropic's `end_turn` is semconv's `stop`, and this handler is not the only one whose
-        # spans a consumer groups by that value.
-        finish_reason = to_semconv_finish_reason(getattr(resp, "stop_reason", None))
-        if capture_content:
-            set_output_content_attributes(
-                model_span,
-                capture_content,
-                [
-                    SpanMessage(
-                        role="assistant",
-                        parts=to_span_parts(resp.content),
-                        finish_reason=finish_reason,
-                    )
-                ],
-            )
-        finish_model_span(model_span, config, raw_usage, finish_reason)
-        run_usage.add_turn(raw_usage)
 
         if resp.stop_reason != "tool_use":
             output = "".join(

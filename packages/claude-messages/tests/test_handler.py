@@ -1858,3 +1858,64 @@ class TestOpenToolSpanIsNeverLeaked:
         assert tools[0].ended == 1, "the execute_tool span leaked"
         assert tools[0].attributes["launchdarkly.stream.abandoned"] is True
         assert rec.root.ended == 1
+
+
+class TestBlockingChatSpanNeverLeaks:
+    """The blocking path has no `finally`, so anything that raises outside the guard is unrecoverable.
+
+    The output content write and the span finish sat outside the try that fails the chat span. A raise
+    while serialising the completion left the span open and unexported, and dropped the turn from the
+    run total, so the trace showed an errored root with no model call and a cost lower than the one
+    Anthropic had already billed.
+    """
+
+    async def test_an_unserialisable_completion_still_ends_the_chat_span(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        class _ExplodingContent(list):
+            def __iter__(self) -> Any:
+                raise TypeError("cannot serialise this content")
+
+        resp = MagicMock()
+        resp.stop_reason = "end_turn"
+        resp.usage = _Usage(23, 7)
+        resp.content = _ExplodingContent()
+        mock_anthropic.messages.create = AsyncMock(return_value=resp)
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            await create_claude_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+
+        chat = rec.named("chat ")
+        assert len(chat) == 1
+        assert chat[0].ended == 1, "the chat span leaked"
+        assert StatusCode.ERROR in chat[0].statuses
+
+    async def test_a_content_failure_does_not_lose_the_tokens_already_billed(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        class _ExplodingContent(list):
+            def __iter__(self) -> Any:
+                raise TypeError("cannot serialise this content")
+
+        resp = MagicMock()
+        resp.stop_reason = "end_turn"
+        resp.usage = _Usage(23, 7)
+        resp.content = _ExplodingContent()
+        mock_anthropic.messages.create = AsyncMock(return_value=resp)
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            await create_claude_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 23
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 7
