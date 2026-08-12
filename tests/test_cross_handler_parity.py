@@ -497,6 +497,46 @@ def _package_source(module_path: str) -> str:
     return _handler_source(module_path) + _handler_source(spans_path)
 
 
+def _call_sites_only(source: str) -> str:
+    """The source with every ``def`` line removed, so a definition cannot pass for a call.
+
+    ``abandon_open_spans(`` appears in its own ``def`` line, and three of the handlers define the
+    helper in the same module that has to call it. Searching the raw source therefore said yes to a
+    helper nothing reached, which is the exact thing this is here to catch.
+    """
+    return "\n".join(
+        line for line in source.split("\n") if not line.lstrip().startswith("def ")
+    )
+
+
+def _function_body(source: str, name: str) -> str:
+    """The body of one function: every line indented deeper than its ``def``.
+
+    By indentation rather than by finding the next ``def``, because these helpers are nested inside a
+    factory and the last one in a factory has no sibling after it. Scanning to the next ``def`` there
+    swallowed the rest of the module and read its calls as the helper's own.
+    """
+    match = re.search(rf"^([ \t]*)def {re.escape(name)}\(", source, re.M)
+    assert match, f"{name} is not defined"
+    depth = len(match.group(1))
+    body: list[str] = []
+    started = False
+    # Skipping from the `def` line rather than from the end of the name, so a signature that wraps
+    # over several lines does not end the body before it starts.
+    for line in source[match.start() :].split("\n")[1:]:
+        if not line.strip():
+            if started:
+                body.append(line)
+            continue
+        if len(line) - len(line.lstrip()) <= depth:
+            if started:
+                break
+            continue
+        started = True
+        body.append(line)
+    return "\n".join(body)
+
+
 class TestStreamingTeardownClosesToolSpans:
     """A tool cancelled mid-flight must not leave its span open.
 
@@ -534,10 +574,12 @@ class TestStreamingTeardownClosesToolSpans:
             f"{name} dispatches tools through a hook object, so it needs an abandon_open_spans to "
             "end the spans still open when a consumer walks away."
         )
-        # And the handler has to call it. A helper nothing reaches closes no spans. The call is
-        # matched by prefix rather than by exact name because claude-agents binds it to a local when
-        # it unpacks the hook factory's result.
-        handler = _handler_source(HOOK_BASED_TOOL_HANDLERS[name])
+        # And the handler has to call it. A helper nothing reaches closes no spans. Definition lines
+        # are stripped first, because three of these handlers define the helper in the module that
+        # has to call it, and the `def` line would otherwise answer for the call. The call is matched
+        # by prefix rather than exact name because claude-agents binds it to a local when it unpacks
+        # the hook factory's result.
+        handler = _call_sites_only(_handler_source(HOOK_BASED_TOOL_HANDLERS[name]))
         assert re.search(r"abandon\w*\(", handler), (
             f"{name} defines an abandonment helper that the handler never calls, so a consumer who "
             "walks away still leaves tool spans open."
@@ -548,7 +590,20 @@ class TestStreamingTeardownClosesToolSpans:
         # Both exist for a reason: abandonment leaves UNSET, failure records the exception. Collapsing
         # them makes one handler report an error for a run another reports as a clean stop.
         source = _package_source(HOOK_BASED_TOOL_HANDLERS[name])
-        assert "close_open_spans" in source, (
+        assert re.search(r"def close_open_spans\(", source), (
             f"{name} lost its failure path for open spans"
         )
-        assert source.index("abandon_open_spans") != source.index("close_open_spans")
+        # The bodies, not the names. Two helpers that both call fail_span are one helper with two
+        # names, and the whole point is that abandonment does not record an exception.
+        abandon = _function_body(source, "abandon_open_spans")
+        assert "fail_span" not in abandon, (
+            f"{name}'s abandon_open_spans records an exception, so an abandoned run reports an "
+            "error nobody had. Abandonment leaves the span UNSET."
+        )
+        assert "abandoned=True" in abandon, (
+            f"{name}'s abandon_open_spans does not mark the spans abandoned, so a reader cannot "
+            "tell an abandoned run from one that simply ended."
+        )
+        assert "fail_span" in _function_body(source, "close_open_spans"), (
+            f"{name}'s close_open_spans no longer records the failure it exists to record."
+        )
