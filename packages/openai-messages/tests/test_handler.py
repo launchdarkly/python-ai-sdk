@@ -1770,3 +1770,66 @@ class TestChatSpanNeverLeaks:
         assert len(chat) == 1
         assert chat[0].ended == 1, "the chat span leaked"
         assert StatusCode.ERROR in chat[0].statuses
+
+
+class TestOpenToolSpanIsNeverLeaked:
+    """A BaseException while a tool runs must still close the execute_tool span.
+
+    The streaming `finally` closed the model span and the root, but the in-flight tool span was held
+    only by a local. `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so a
+    tool cancelled mid-flight left its span open and unexported: the trace showed a closed parent
+    above a child that never arrived.
+    """
+
+    async def test_a_tool_cancelled_mid_flight_still_ends_its_span(
+        self, mock_openai: MagicMock
+    ) -> None:
+        import asyncio
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        tool_call_item = _function_call_item("my-tool", "call-1", {"q": "x"})
+        final = MagicMock()
+        final.output = [tool_call_item]
+        final.status = "completed"
+        final.incomplete_details = None
+        final.usage = MagicMock(input_tokens=3, output_tokens=1)
+        final.usage.input_tokens_details = MagicMock(cached_tokens=0)
+        final.id = "resp-1"
+        final.model = "gpt-4o"
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                e = MagicMock()
+                e.type = "response.output_text.delta"
+                e.delta = "thinking..."
+                yield e
+
+            async def get_final_response(self) -> Any:
+                return final
+
+        @asynccontextmanager
+        async def _ctx() -> Any:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_ctx())
+
+        async def _cancelled_tool(_: Any) -> Any:
+            # A BaseException, so `except Exception` in the tool loop does not see it.
+            raise asyncio.CancelledError()
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(asyncio.CancelledError):
+            async for _ in await create_openai_messages_handler().stream(
+                CONFIG, "q", {"my-tool": _cancelled_tool}
+            ):
+                pass
+
+        tools = rec.named("execute_tool ")
+        assert len(tools) == 1
+        assert tools[0].ended == 1, "the execute_tool span leaked"
+        assert tools[0].attributes["launchdarkly.stream.abandoned"] is True
+        assert rec.root.ended == 1
