@@ -376,6 +376,9 @@ async def _stream_gen(
 
     ended: set[int] = set()
     open_model_span: Any = None
+    # Tracked for the same reason as the model span: a BaseException raised while a tool runs skips
+    # `except Exception` entirely, and `finally` is then the only code that can close this span.
+    open_tool_span: Any = None
     # Outside the try, so the failure and abandonment paths can still report the spend.
     run_usage = RawRunUsage()
 
@@ -459,6 +462,7 @@ async def _stream_gen(
                 if block.type != "tool_use":
                     continue
                 tool_span = start_tool_span(block.name, block.id, parent)
+                open_tool_span = tool_span
                 set_tool_call_content_attributes(
                     tool_span, capture_content, arguments=block.input
                 )
@@ -478,9 +482,14 @@ async def _stream_gen(
                         tool_span, capture_content, result=result
                     )
                     succeed_span(tool_span)
+                    open_tool_span = None
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
+                    open_tool_span = None
                     raise
+                # Cleared on both paths that end the span, and deliberately not in a `finally`:
+                # a `finally` would also clear it for a BaseException, which is the one case where
+                # the span is still open and the outer `finally` is the only thing left to close it.
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -521,6 +530,10 @@ async def _stream_gen(
         # completed turns already cost. An abandoned span is left UNSET rather than ERROR: stopping
         # early is a normal thing for a consumer to do, and LaunchDarkly's own metrics record neither
         # a success nor an error for it, so ERROR would put two dashboards in disagreement.
+        # Tool span first: it is a child, and a reader following the tree should not meet a closed
+        # parent above an open child.
+        if open_tool_span is not None:
+            end_span_once(open_tool_span, ended, abandoned=True)
         if open_model_span is not None:
             end_span_once(open_model_span, ended, abandoned=True)
         if span is not None and id(span) not in ended and run_usage.reported:

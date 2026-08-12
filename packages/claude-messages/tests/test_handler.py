@@ -1803,3 +1803,58 @@ class TestToolSpanNeverLeaks:
         assert len(tool_spans) == 1
         assert tool_spans[0].ended == 1, "the tool span leaked"
         assert StatusCode.ERROR in tool_spans[0].statuses
+
+
+class TestOpenToolSpanIsNeverLeaked:
+    """A BaseException while a tool runs must still close the execute_tool span.
+
+    The streaming `finally` closed the model span and the root, but the in-flight tool span was held
+    only by a local. `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so a
+    tool cancelled mid-flight left its span open and unexported: the trace showed a closed parent
+    above a child that never arrived, which reads as a tool still running long after the run ended.
+    """
+
+    async def test_a_tool_cancelled_mid_flight_still_ends_its_span(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import asyncio
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        final_msg = MagicMock()
+        final_msg.stop_reason = "tool_use"
+        final_msg.usage = _Usage(5, 3)
+        final_msg.content = [_tool_use_block("myTool", "tu1", {"a": 1})]
+
+        class _FakeStream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield _make_stream_event("thinking...")
+
+            async def get_final_message(self) -> Any:
+                return final_msg
+
+        @asynccontextmanager
+        async def _ctx_mgr() -> AsyncGenerator[Any, None]:
+            yield _FakeStream()
+
+        mock_anthropic.messages.stream = MagicMock(return_value=_ctx_mgr())
+
+        async def _cancelled_tool(_: Any) -> Any:
+            # A BaseException, so `except Exception` in the tool loop does not see it.
+            raise asyncio.CancelledError()
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(asyncio.CancelledError):
+            async for _ in await create_claude_messages_handler().stream(
+                CONFIG, "q", {"myTool": _cancelled_tool}
+            ):
+                pass
+
+        tools = rec.named("execute_tool ")
+        assert len(tools) == 1
+        assert tools[0].ended == 1, "the execute_tool span leaked"
+        assert tools[0].attributes["launchdarkly.stream.abandoned"] is True
+        assert rec.root.ended == 1
