@@ -326,17 +326,25 @@ def create_langchain_messages_handler(
                     capture_content=capture_content,
                     run_usage=run_usage,
                 )
-                output_str = parsed if isinstance(parsed, str) else json.dumps(parsed)
-                set_output_content_attributes(
-                    span,
-                    capture_content,
-                    [
-                        SpanMessage(
-                            role="assistant",
-                            parts=[SpanMessagePart(type="text", content=output_str)],
-                        )
-                    ],
-                )
+                # Behind the flag, because set_output_content_attributes is a no-op without it and
+                # json.dumps is not: serialising an object it refuses turned a successful run into a
+                # raised TypeError for a caller who had asked for no content at all.
+                if capture_content:
+                    output_str = (
+                        parsed if isinstance(parsed, str) else json.dumps(parsed)
+                    )
+                    set_output_content_attributes(
+                        span,
+                        capture_content,
+                        [
+                            SpanMessage(
+                                role="assistant",
+                                parts=[
+                                    SpanMessagePart(type="text", content=output_str)
+                                ],
+                            )
+                        ],
+                    )
                 finish_root_span(span, config, run_usage.total)
                 succeed_span(span)
                 return {
@@ -404,6 +412,10 @@ def create_langchain_messages_handler(
                     response = await tool_model.ainvoke(conversation_messages)
 
                     usage = getattr(response, "usage_metadata", None) or {}
+                    # Accumulated before anything that can raise, the same way the structured turn
+                    # does it. The provider has already billed this turn, so a later content failure
+                    # must not report the run as having spent less than it did.
+                    run_usage.add(lang_chain_span_usage(usage))
                     tool_calls = getattr(response, "tool_calls", None) or []
                     if capture_content:
                         set_output_content_attributes(
@@ -420,7 +432,6 @@ def create_langchain_messages_handler(
                 except Exception as exc:
                     fail_span(model_span, exc)
                     raise
-                run_usage.add(lang_chain_span_usage(usage))
 
                 if not tool_calls:
                     # Only when response_format was not already bound above. Anthropic and any other

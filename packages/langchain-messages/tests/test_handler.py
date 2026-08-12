@@ -1772,3 +1772,80 @@ class TestStructuredTurnChatSpanNeverLeaks:
             )
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 17
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 4
+
+
+class TestToolTurnKeepsBilledTokens:
+    """The tool loop must report the tokens it spent even when serialising its content fails."""
+
+    @pytest.mark.asyncio
+    async def test_a_content_failure_does_not_lose_the_tokens_already_billed(
+        self,
+    ) -> None:
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        class _Exploding:
+            """Shaped like an AIMessage, with usage readable and content not."""
+
+            usage_metadata: ClassVar[dict[str, Any]] = {
+                "input_tokens": 29,
+                "output_tokens": 6,
+            }
+            tool_calls: ClassVar[list[Any]] = []
+            response_metadata: ClassVar[dict[str, Any]] = {}
+
+            @property
+            def content(self) -> Any:
+                raise TypeError("cannot serialise this content")
+
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        llm.ainvoke = AsyncMock(return_value=_Exploding())
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            await create_langchain_messages_handler(llm=llm, capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 29
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 6
+
+
+class TestNoContentWorkWhenCaptureIsOff:
+    """With capture off, nothing should serialise the output, because nothing will read it.
+
+    set_output_content_attributes is a no-op without the flag, but json.dumps is not. Serialising a
+    parsed object json.dumps refuses turned a successful run into a raised TypeError for a caller who
+    had asked for no content at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unserialisable_parsed_object_still_returns_normally(self) -> None:
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        class _Unserialisable:
+            pass
+
+        parsed = _Unserialisable()
+        config = {**CONFIG, "outputFormat": {"type": "object"}}
+        llm = _make_llm()
+        structured_llm = MagicMock()
+        structured_llm.ainvoke = AsyncMock(
+            return_value={
+                "parsed": parsed,
+                "raw": FakeAIMessage("", input_tokens=8, output_tokens=2),
+            }
+        )
+        llm.with_structured_output = MagicMock(return_value=structured_llm)
+
+        ctx, rec = _recording()
+        with ctx:
+            result = await create_langchain_messages_handler(llm=llm)(
+                config, "q", {}, {}
+            )
+        assert result["output"] is parsed
+        assert result["usage"] == {"input_tokens": 8, "output_tokens": 2}
+        assert "gen_ai.output.messages" not in rec.root.attributes
