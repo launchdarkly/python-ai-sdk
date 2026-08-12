@@ -1849,3 +1849,70 @@ class TestNoContentWorkWhenCaptureIsOff:
         assert result["output"] is parsed
         assert result["usage"] == {"input_tokens": 8, "output_tokens": 2}
         assert "gen_ai.output.messages" not in rec.root.attributes
+
+
+class TestStreamingChatSpanAndTokens:
+    """The streaming path must fail its span and keep its tokens when content serialisation raises.
+
+    The content write and the span finish sat outside the try that fails the chat span, and the usage
+    was accumulated after both. A raise while serialising completion content left the span for the
+    `finally` to end as abandoned, which reads as a consumer who walked away rather than as the
+    failure it was, and dropped a turn the provider had already billed.
+    """
+
+    def _exploding_llm(self) -> Any:
+        class _Unserialisable:
+            """json.dumps refuses this, so building the output messages raises at the write."""
+
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage("done"))
+
+        async def _astream(msgs: Any) -> AsyncGenerator[Any, None]:
+            # Usage reads fine, so the turn is billed. The tool-call arguments then refuse to
+            # serialise, so the failure happens on the way to the span rather than in the loop.
+            yield FakeAIMessage(
+                "partial",
+                tool_calls=[
+                    {"name": "myTool", "id": "tu1", "args": {"bad": _Unserialisable()}}
+                ],
+                input_tokens=53,
+                output_tokens=8,
+            )
+
+        llm.astream = _astream
+        return llm
+
+    @pytest.mark.asyncio
+    async def test_the_chat_span_is_failed_not_abandoned(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            async for _ in await create_langchain_messages_handler(
+                llm=self._exploding_llm(), capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+
+        chat = rec.named("chat ")[0]
+        assert chat.ended == 1
+        assert StatusCode.ERROR in chat.statuses
+        assert "launchdarkly.stream.abandoned" not in chat.attributes
+
+    @pytest.mark.asyncio
+    async def test_the_tokens_already_billed_survive(self) -> None:
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            async for _ in await create_langchain_messages_handler(
+                llm=self._exploding_llm(), capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 53

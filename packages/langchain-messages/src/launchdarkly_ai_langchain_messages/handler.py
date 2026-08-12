@@ -677,18 +677,6 @@ async def _stream_gen(
                 open_model_span = None
                 raise
 
-            if capture_content:
-                set_output_content_attributes(
-                    model_span,
-                    capture_content,
-                    _assistant_output_messages(
-                        accumulated_content, accumulated_tool_calls
-                    ),
-                )
-            # finish_model_span ends the span. Clearing open_model_span is what stops the
-            # `finally` from ending it a second time.
-            finish_model_span(model_span, config, turn_usage, finish_reasons)
-            open_model_span = None
             # The already-mapped figures, not a bag rebuilt from them: this path summed the chunks
             # into a SpanUsage to begin with, so re-parsing its own output would be a round trip
             # whose only effect is another chance to disagree with itself.
@@ -698,7 +686,32 @@ async def _stream_gen(
             # and claims the run cost nothing, which is the one thing `reported` exists to prevent.
             # The blocking path gets this for free, because lang_chain_span_usage returns None for a
             # bag the provider never filled.
+            #
+            # Before the content write, and before the span finish, because the provider has already
+            # billed these tokens: a content failure is our problem and must not report the run as
+            # having spent less than it did.
             run_usage.add(turn_usage if usage_reported else None)
+
+            # Inside a guard for the same reason as the blocking path: a raise while serialising
+            # completion content would otherwise leave this span for `finally` to end as abandoned,
+            # which reads as a consumer who walked away rather than as the failure it is.
+            try:
+                if capture_content:
+                    set_output_content_attributes(
+                        model_span,
+                        capture_content,
+                        _assistant_output_messages(
+                            accumulated_content, accumulated_tool_calls
+                        ),
+                    )
+                # finish_model_span ends the span. Clearing open_model_span is what stops the
+                # `finally` from ending it a second time.
+                finish_model_span(model_span, config, turn_usage, finish_reasons)
+                open_model_span = None
+            except Exception as exc:
+                fail_span(model_span, exc, ended)
+                open_model_span = None
+                raise
 
             if not accumulated_tool_calls:
                 full_output = (full_output or "") + accumulated_content
