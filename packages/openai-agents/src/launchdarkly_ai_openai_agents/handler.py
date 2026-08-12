@@ -478,6 +478,9 @@ async def _stream_gen(
     run_usage = create_run_usage()
     hooks = _SpanningHooks(config, parent, capture_content, run_usage)
     streamed: Any = None
+    # Whether the vendor's stream ran to the end. Tracked separately from the span, because the
+    # teardown below has to cancel the Runner on an install with no spans at all.
+    stream_completed = False
 
     try:
         streamed = Runner.run_streamed(agent, prompt, hooks=hooks)
@@ -495,6 +498,7 @@ async def _stream_gen(
                         yield {"type": "chunk", "text": delta}
                         full_output += delta
 
+        stream_completed = True
         final_output = streamed.final_output
         output = (
             _stringify_output(final_output) if final_output is not None else full_output
@@ -527,13 +531,17 @@ async def _stream_gen(
         # stop the vendor's run — breaking out of `async for` above only stops us reading; the
         # Runner's own background task keeps calling the model and spending tokens until told to
         # stop.
+        # Cancelling the Runner is not telemetry, so it does not sit behind a span. Without the otel
+        # extra there is no root span at all, and the guard below would have skipped the cancel
+        # entirely: an early break would leave the vendor's background task calling the model and
+        # spending money, which is the failure this teardown exists to prevent.
+        if streamed is not None and not stream_completed:
+            try:
+                streamed.cancel()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
         if span is not None and id(span) not in ended:
             hooks.abandon_open_spans(ended)
-            if streamed is not None:
-                try:
-                    streamed.cancel()
-                except Exception:  # pragma: no cover - best-effort teardown
-                    pass
             if run_usage.reported:
                 finish_root_span(span, config, run_usage.total)
         end_span_once(span, ended, abandoned=True)

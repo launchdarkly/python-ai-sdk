@@ -1620,3 +1620,56 @@ class TestAFailedRunDoesNotClaimItCostNothing:
         with ctx, _patched_agents(agents_mod), pytest.raises(_Boom):
             await create_openai_agent_handler()(CONFIG, "q", {}, {})
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 12
+
+
+class TestCancellationDoesNotDependOnTelemetry:
+    """Stopping the vendor's run is not telemetry, so no span may gate it.
+
+    The cancel sat inside a `span is not None` guard. Without the `otel` extra there is no root span
+    at all, so an early consumer break never cancelled the Runner and its background task kept calling
+    the model and spending money: the exact failure this teardown exists to prevent, reintroduced by
+    an install choice that has nothing to do with tracing.
+    """
+
+    async def test_an_abandoned_stream_cancels_the_runner_with_telemetry_off(
+        self,
+    ) -> None:
+        import launchdarkly_ai_openai_agents.spans as spans_mod
+
+        streamed_holder: dict[str, Any] = {}
+        # Deltas, so there is something to break out of: a stream with no chunks runs to the end and
+        # is not abandoned at all.
+        turns = [{"deltas": ["one", "two", "three"], "output": _text_output("done")}]
+
+        def run_streamed(agent: Any, prompt: Any, hooks: Any = None, **_k: Any) -> Any:
+            streamed = FakeStreamedResult(agent, prompt, hooks, turns, "done")
+            streamed_holder["streamed"] = streamed
+            return streamed
+
+        agents_mod = _fake_agents_module(run_streamed=run_streamed)
+        with patch.object(spans_mod, "_HAS_OTEL", False), _patched_agents(agents_mod):
+            gen = await create_openai_agent_handler().stream(CONFIG, "q", {}, {})
+            async for _ in gen:
+                break
+            await gen.aclose()
+
+        assert streamed_holder["streamed"].cancelled is True
+
+    async def test_a_stream_read_to_the_end_is_not_cancelled(self) -> None:
+        # The other side of the branch: a completed run must not be cancelled after the fact.
+        streamed_holder: dict[str, Any] = {}
+        turns = [{"deltas": ["one", "two"], "output": _text_output("done")}]
+
+        def run_streamed(agent: Any, prompt: Any, hooks: Any = None, **_k: Any) -> Any:
+            streamed = FakeStreamedResult(agent, prompt, hooks, turns, "done")
+            streamed_holder["streamed"] = streamed
+            return streamed
+
+        agents_mod = _fake_agents_module(run_streamed=run_streamed)
+        with _patched_agents(agents_mod):
+            async for _ in await create_openai_agent_handler().stream(
+                CONFIG, "q", {}, {}
+            ):
+                pass
+
+        assert streamed_holder["streamed"].cancelled is False
