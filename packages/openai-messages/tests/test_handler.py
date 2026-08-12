@@ -1771,6 +1771,33 @@ class TestChatSpanNeverLeaks:
         assert chat[0].ended == 1, "the chat span leaked"
         assert StatusCode.ERROR in chat[0].statuses
 
+    async def test_a_content_failure_does_not_lose_the_tokens_already_billed(
+        self, mock_openai: MagicMock
+    ) -> None:
+        # The provider has already charged for this turn. Failing to serialise its content is our
+        # problem, not a reason to report the run as having spent less than it did.
+        class _Exploding:
+            model = "gpt-4o"
+            usage = MagicMock(input_tokens=31, output_tokens=9)
+
+            def __init__(self) -> None:
+                self.usage.input_tokens_details = MagicMock(cached_tokens=0)
+
+            @property
+            def output(self) -> Any:
+                raise TypeError("cannot serialise this response")
+
+        mock_openai.responses.create = AsyncMock(return_value=_Exploding())
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx, pytest.raises(TypeError):
+            await create_openai_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 31
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 9
+
 
 class TestOpenToolSpanIsNeverLeaked:
     """A BaseException while a tool runs must still close the execute_tool span.

@@ -133,17 +133,21 @@ async def _run_model_turn(
 
         response = await client.responses.create(**params)
 
+        # Accounting before anything that can raise. The provider has already billed this turn, so a
+        # later failure while serialising content must not lose the tokens: the root is the only span
+        # a config-scoped cost query can read them from. `to_span_usage` of an absent bag is still a
+        # real object, so a turn that completed without reported usage counts as reported: the call
+        # happened, whatever the provider said.
+        usage = to_span_usage(getattr(response, "usage", None))
+        run_usage.add(usage)
+
         set_response_output_content(model_span, capture_content, response)
         finish_reason = finish_reason_of(response)
         response_model = getattr(response, "model", None) or model_name(config)
-        usage = to_span_usage(getattr(response, "usage", None))
         finish_model_span(model_span, response_model, usage, finish_reason)
     except Exception as exc:
         fail_span(model_span, exc)
         raise
-    # `to_span_usage` of an absent bag is still a real object, so a turn that completed without
-    # reported usage counts as reported: the call happened, whatever the provider said.
-    run_usage.add(usage)
     return response
 
 
