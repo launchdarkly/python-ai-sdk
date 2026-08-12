@@ -211,19 +211,23 @@ class _SpanningHooks(_RunHooksBase):
     async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
         span = self.open_model_span
         self.open_model_span = None
-        if span is None:
-            return
         output = getattr(response, "output", None) or []
         finish_reason = derive_finish_reason(output)
+        usage = to_span_usage(getattr(response, "usage", None))
+        # Accounting before the span, and not conditional on it. run_usage is what the caller gets
+        # back as its usage bag and what LaunchDarkly's own metrics bill from, and neither depends on
+        # a span existing. Returning early here dropped the tokens of every turn on an install
+        # without the otel extra, which is a billing figure rather than a telemetry one.
+        self.run_usage.add(usage)
+        if span is None:
+            return
         if self.capture_content:
             set_output_content_attributes(
                 span,
                 self.capture_content,
                 to_response_span_messages(output, finish_reason),
             )
-        usage = to_span_usage(getattr(response, "usage", None))
         finish_model_span(span, self.config, usage, finish_reason)
-        self.run_usage.add(usage)
 
     async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
         call_id = getattr(context, "tool_call_id", None) or getattr(
@@ -304,7 +308,11 @@ def _write_failed_run_usage(
     cannot claim.
     """
     spent = _usage_from_error(error)
-    if spent is not None:
+    # An aggregate that reports no tokens is not an aggregate. RunContextWrapper.usage defaults to an
+    # empty Usage, so the attribute is present from the moment the run starts, and an exception before
+    # the first paid call carries a full set of zeros. Writing those would assert the run cost
+    # nothing, which is the one claim this function's docstring says it must not make.
+    if spent is not None and (spent.input or spent.output):
         finish_root_span(span, config, spent)
     elif run_usage.reported:
         finish_root_span(span, config, run_usage.total)

@@ -1524,3 +1524,99 @@ class TestConvenienceWrapperForwardsCaptureContent:
             handler_mod.openai_agents("k", "q", {})
 
         assert seen["capture_content"] is False
+
+
+class TestUsageIsNotCoupledToSpans:
+    """Token accounting must not depend on a span existing.
+
+    `on_llm_end` returned early when there was no open chat span, before accumulating the turn's
+    usage. On an install without the `otel` extra no span is ever created, so every turn's tokens were
+    dropped and the handler returned zeros. That is a billing figure, not a telemetry one: it is what
+    the caller reads back and what LaunchDarkly's own metrics record for the AI Config.
+    """
+
+    async def test_the_usage_bag_is_right_with_telemetry_switched_off(self) -> None:
+        import launchdarkly_ai_openai_agents.spans as spans_mod
+
+        turns = [
+            {"output": _text_output("a"), "usage": _usage(10, 5)},
+            {"output": _text_output("b"), "usage": _usage(7, 2)},
+        ]
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with patch.object(spans_mod, "_HAS_OTEL", False), _patched_agents(agents_mod):
+            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+        assert result["usage"] == {"input_tokens": 17, "output_tokens": 7}
+
+    async def test_the_usage_bag_agrees_with_the_root_span_when_telemetry_is_on(
+        self,
+    ) -> None:
+        # The same two turns, with spans. The bag and the span must not be able to disagree.
+        turns = [
+            {"output": _text_output("a"), "usage": _usage(10, 5)},
+            {"output": _text_output("b"), "usage": _usage(7, 2)},
+        ]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with ctx, _patched_agents(agents_mod):
+            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+        assert result["usage"]["input_tokens"] == 17
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 17
+
+
+class TestAFailedRunDoesNotClaimItCostNothing:
+    """A run that died before its first paid call must leave the root's usage attributes absent.
+
+    RunContextWrapper.usage defaults to an empty Usage, so the aggregate the exception carries is
+    present from the start and reads as a full set of zeros. Writing those says the run cost nothing,
+    which is different from not knowing what it cost, and a config-scoped cost query cannot tell the
+    two apart once the zeros are on the span.
+    """
+
+    async def test_an_error_before_any_turn_writes_no_usage_attributes(self) -> None:
+        class _EmptyUsage:
+            input_tokens = 0
+            output_tokens = 0
+            input_tokens_details = None
+
+        class _Boom(Exception):
+            def __init__(self) -> None:
+                super().__init__("died on the first call")
+                self.run_data = SimpleNamespace(
+                    context_wrapper=SimpleNamespace(usage=_EmptyUsage())
+                )
+
+        async def _raising_run(*_a: Any, **_k: Any) -> Any:
+            raise _Boom()
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_raising_run)
+        with ctx, _patched_agents(agents_mod), pytest.raises(_Boom):
+            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+
+        attrs = rec.root.attributes
+        assert "gen_ai.usage.input_tokens" not in attrs
+        assert "gen_ai.usage.output_tokens" not in attrs
+        assert "gen_ai.usage.total_tokens" not in attrs
+
+    async def test_an_error_after_a_paid_turn_still_reports_that_spend(self) -> None:
+        # The other side of the same branch: real tokens must survive the failure.
+        class _RealUsage:
+            input_tokens = 12
+            output_tokens = 4
+            input_tokens_details = None
+
+        class _Boom(Exception):
+            def __init__(self) -> None:
+                super().__init__("died after a paid turn")
+                self.run_data = SimpleNamespace(
+                    context_wrapper=SimpleNamespace(usage=_RealUsage())
+                )
+
+        async def _raising_run(*_a: Any, **_k: Any) -> Any:
+            raise _Boom()
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_raising_run)
+        with ctx, _patched_agents(agents_mod), pytest.raises(_Boom):
+            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 12
