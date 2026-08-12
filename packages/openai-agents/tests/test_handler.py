@@ -1673,3 +1673,59 @@ class TestCancellationDoesNotDependOnTelemetry:
                 pass
 
         assert streamed_holder["streamed"].cancelled is False
+
+
+class TestInputWritesNeverLeakASpan:
+    """Serialising the prompt must not be able to strand the root span.
+
+    The input content write ran before the guard that fails the root, so a raise there left it open:
+    never ended, never exported, so the run disappeared from AI Config Monitoring along with the
+    feature_flag event it carries.
+    """
+
+    async def test_the_blocking_root_still_ends(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        import launchdarkly_ai_openai_agents.handler as handler_mod
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(
+            run=_make_run([{"output": _text_output("a"), "usage": _usage(1, 1)}])
+        )
+        with (
+            ctx,
+            _patched_agents(agents_mod),
+            patch.object(
+                handler_mod,
+                "set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            await create_openai_agent_handler(capture_content=True)(CONFIG, "q", {}, {})
+
+        assert rec.root.ended == 1, "the root span leaked"
+        assert StatusCode.ERROR in rec.root.statuses
+
+    async def test_the_streaming_root_still_ends(self) -> None:
+        import launchdarkly_ai_openai_agents.handler as handler_mod
+
+        ctx, rec = _recording()
+        turns = [{"deltas": ["one"], "output": _text_output("done")}]
+        agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "done"))
+        with (
+            ctx,
+            _patched_agents(agents_mod),
+            patch.object(
+                handler_mod,
+                "set_input_content_attributes",
+                side_effect=TypeError("cannot serialise this prompt"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            async for _ in await create_openai_agent_handler(
+                capture_content=True
+            ).stream(CONFIG, "q", {}, {}):
+                pass
+
+        assert rec.root.ended == 1, "the root span leaked"

@@ -369,16 +369,18 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
         agent, prompt, instructions = _build_agent_and_prompt(
             config, user_input, th, vs, history
         )
-        set_input_content_attributes(
-            span,
-            capture_content,
-            system_instructions=instructions,
-            messages=[text_message("user", prompt)],
-        )
-
         run_usage = create_run_usage()
         hooks = _SpanningHooks(config, parent, capture_content, run_usage)
         try:
+            # Inside the guard, because serialising the prompt raises on anything that is not
+            # JSON-serialisable and a raise out here would leave the root open: never ended, never
+            # exported, and the run gone from AI Config Monitoring with the feature_flag event on it.
+            set_input_content_attributes(
+                span,
+                capture_content,
+                system_instructions=instructions,
+                messages=[text_message("user", prompt)],
+            )
             result = await Runner.run(agent, prompt, hooks=hooks)
             final_output = result.final_output
             set_output_content_attributes(
@@ -467,13 +469,6 @@ async def _stream_gen(
     agent, prompt, instructions = _build_agent_and_prompt(
         config, user_input, tool_handlers, variables, history
     )
-    set_input_content_attributes(
-        span,
-        capture_content,
-        system_instructions=instructions,
-        messages=[text_message("user", prompt)],
-    )
-
     ended: set[int] = set()
     run_usage = create_run_usage()
     hooks = _SpanningHooks(config, parent, capture_content, run_usage)
@@ -483,6 +478,15 @@ async def _stream_gen(
     stream_completed = False
 
     try:
+        # Inside the guard, because serialising the prompt raises on anything that is not
+        # JSON-serialisable. A raise out here would leave the root open with the `finally` never
+        # entered, so the run would vanish from AI Config Monitoring with its feature_flag event.
+        set_input_content_attributes(
+            span,
+            capture_content,
+            system_instructions=instructions,
+            messages=[text_message("user", prompt)],
+        )
         streamed = Runner.run_streamed(agent, prompt, hooks=hooks)
         full_output = ""
 
