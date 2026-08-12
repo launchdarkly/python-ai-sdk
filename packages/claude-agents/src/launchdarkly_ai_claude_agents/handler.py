@@ -177,17 +177,19 @@ def _build_hooks(native_tool_map: dict[str, Any]) -> dict[str, Any] | None:
 
 
 ToolTelemetry = Callable[[BaseException], None]
+#: Ends every open tool span without failing it, for the abandonment path.
+AbandonTelemetry = Callable[[set[int]], None]
 
 
 def build_tool_hooks(
     native_tool_map: dict[str, Any],
     parent_context: Any,
     capture_content: bool,
-) -> tuple[dict[str, list[HookMatcher]], ToolTelemetry]:
+) -> tuple[dict[str, list[HookMatcher]], ToolTelemetry, AbandonTelemetry]:
     """Builds the PreToolUse/PostToolUse/PostToolUseFailure hooks that open and close
     ``execute_tool`` spans around the Agent SDK's own tool dispatch.
 
-    Returns ``(hooks, close_open_spans)``. ``close_open_spans`` fails every span this run still has
+    Returns ``(hooks, close_open_spans, abandon_open_spans)``. ``close_open_spans`` fails every span this run still has
     open, for the path where the SDK throws mid-tool-call and no ``PostToolUse*`` hook ever fires.
     """
     tool_spans: dict[str, Any] = {}
@@ -257,12 +259,24 @@ def build_tool_hooks(
             fail_span(span, error)
         tool_spans.clear()
 
+    def abandon_open_spans(ended: set[int]) -> None:
+        """Ends every tool span still open, for stream abandonment.
+
+        Unlike :func:`close_open_spans`, nothing failed: a consumer stopping early is normal, so
+        each span is left UNSET and marked ``launchdarkly.stream.abandoned``. Matches what the
+        openai-agents and langchain-agents handlers do on the same path, so one abandoned run does
+        not read as an error in one SDK and a clean stop in another.
+        """
+        for span in list(tool_spans.values()):
+            end_span_once(span, ended, abandoned=True)
+        tool_spans.clear()
+
     hooks: dict[str, list[HookMatcher]] = {
         "PreToolUse": [HookMatcher(hooks=[_pre_tool_use])],  # type: ignore[list-item]
         "PostToolUse": [HookMatcher(hooks=[_post_tool_use])],  # type: ignore[list-item]
         "PostToolUseFailure": [HookMatcher(hooks=[_post_tool_use_failure])],  # type: ignore[list-item]
     }
-    return hooks, close_open_spans
+    return hooks, close_open_spans, abandon_open_spans
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +446,8 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
             hooks = None
             if native_tool_names or mcp_allowed_tools:
-                hooks, tool_telemetry = build_tool_hooks(
+                # The blocking path cannot be abandoned, so it takes no abandon hook.
+                hooks, tool_telemetry, _ = build_tool_hooks(
                     native_tool_map, parent, capture_content
                 )
 
@@ -572,6 +587,7 @@ async def _stream_gen(
 
     inference = InferenceSpans(config, parent, capture_content, catalog, opening)
     tool_telemetry: ToolTelemetry | None = None
+    abandon_tool_spans: AbandonTelemetry | None = None
     root_usage_written = False
     ended: set[int] = set()
     gen: AsyncIterator[Any] | None = None
@@ -585,7 +601,7 @@ async def _stream_gen(
         mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
         hooks = None
         if native_tool_names or mcp_allowed_tools:
-            hooks, tool_telemetry = build_tool_hooks(
+            hooks, tool_telemetry, abandon_tool_spans = build_tool_hooks(
                 native_tool_map, parent, capture_content
             )
 
@@ -684,8 +700,10 @@ async def _stream_gen(
         # the tree, including any tool span whose PostToolUse hook never fired, and the only chance
         # to report what the responses that did arrive cost.
         if id(span) not in ended:
-            if tool_telemetry is not None:
-                tool_telemetry(RuntimeError("stream abandoned before completion"))
+            # Abandonment, not failure: UNSET plus the abandoned marker, the same as the model
+            # span and the root get just below.
+            if abandon_tool_spans is not None:
+                abandon_tool_spans(ended)
             if not root_usage_written and inference.run_usage["reported"]:
                 finish_root_span(span, config, inference.run_usage["total"])
         end_span_once(span, ended, abandoned=True)

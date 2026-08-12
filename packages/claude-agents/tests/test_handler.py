@@ -1710,3 +1710,80 @@ class TestBuiltinsSurviveAnEmptyToolList:
 
         opts = _build_query_options(BASE_CONFIG, None, ["Read"], [], None, None)
         assert opts.tools == ["Read"]
+
+
+class TestAbandonedToolSpansAreNotErrors:
+    """An abandoned stream leaves an open tool span UNSET, not ERROR.
+
+    The streaming teardown reached close_open_spans, which records an exception and sets ERROR. That
+    is right for a failure and wrong for abandonment: a consumer stopping early is normal, and the
+    root and chat spans on the same path are left UNSET with launchdarkly.stream.abandoned. A tool
+    span whose PostToolUse hook never fired therefore reported an error nobody had.
+
+    The openai-agents and langchain-agents handlers already used the UNSET path here, so this also
+    closes a three-way disagreement about what one abandoned run looks like.
+    """
+
+    async def test_a_tool_span_open_at_abandonment_is_unset_and_marked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _query_that_opens_a_tool(**kwargs: Any) -> AsyncIterator[Any]:
+            # Fire PreToolUse the way the CLI does, then stall: PostToolUse never arrives, so the
+            # tool span is still open when the consumer walks away.
+            hooks = kwargs.get("options").hooks
+            pre = hooks["PreToolUse"][0].hooks[0]
+            await pre(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "WebSearch",
+                    "tool_use_id": "t1",
+                    "tool_input": {"query": "a"},
+                },
+                None,
+                None,
+            )
+            yield stream_event("chunk-1")
+            yield stream_event("chunk-2")
+            yield result_message("done")
+
+        from launchdarkly_ai_claude_agents.builtins import ClaudeWebSearch
+        from launchdarkly_ai_server import NATIVE_TOOL_KEY
+
+        # A native tool in the config is what makes the handler install the hooks at all.
+        stub = lambda: None  # noqa: E731
+        setattr(stub, NATIVE_TOOL_KEY, ClaudeWebSearch)
+        config = {**BASE_CONFIG, "tools": {"webSearch": {"name": "webSearch"}}}
+
+        monkeypatch.setattr(handler_mod, "query", _query_that_opens_a_tool)
+        h = create_claude_agents_handler()
+        gen = await h.stream(config, "q", {"webSearch": stub}, {})
+        assert (await gen.__anext__())["type"] == "chunk"
+        await gen.aclose()
+
+        tools = [s for s in spans() if s.name.startswith("execute_tool ")]
+        assert len(tools) == 1, [s.name for s in spans()]
+        assert tools[0].end_time is not None, "the tool span leaked"
+        assert tools[0].status.status_code == StatusCode.UNSET
+        assert tools[0].events == ()
+        assert tools[0].attributes.get("launchdarkly.stream.abandoned") is True
+
+    async def test_a_failed_run_still_marks_open_tool_spans_as_errors(self) -> None:
+        # The distinction the fix rests on: failure keeps ERROR, abandonment does not.
+        from launchdarkly_ai_claude_agents.handler import build_tool_hooks
+
+        hooks, close_open_spans, _ = build_tool_hooks({}, None, False)
+        pre = hooks["PreToolUse"][0].hooks[0]
+        await pre(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_use_id": "t1",
+                "tool_input": {},
+            },
+            None,
+            None,
+        )
+        close_open_spans(RuntimeError("boom"))
+        tools = [s for s in spans() if s.name.startswith("execute_tool ")]
+        assert len(tools) == 1
+        assert tools[0].status.status_code == StatusCode.ERROR
