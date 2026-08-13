@@ -397,21 +397,22 @@ def create_langchain_messages_handler(
 
             while True:
                 model_span = start_model_span(config, parent)
-                if capture_content:
-                    system_instructions, span_messages = _span_messages(
-                        conversation_messages
-                    )
-                    set_input_content_attributes(
-                        model_span,
-                        capture_content,
-                        system_instructions=system_instructions,
-                        messages=span_messages,
-                        tool_definitions=tool_definitions,
-                    )
-                # The output write and the finish live inside the guard too. Serialising completion
-                # content raises on anything that is not JSON-serialisable, and a raise out here
-                # would leave this chat span open: the blocking path has no `finally` to recover it.
+                # Every write to this span lives inside the guard, the input one included.
+                # Serialising conversation content raises on anything that is not JSON-serialisable,
+                # and a raise out here would leave the chat span open: the blocking path has no
+                # `finally` to recover it.
                 try:
+                    if capture_content:
+                        system_instructions, span_messages = _span_messages(
+                            conversation_messages
+                        )
+                        set_input_content_attributes(
+                            model_span,
+                            capture_content,
+                            system_instructions=system_instructions,
+                            messages=span_messages,
+                            tool_definitions=tool_definitions,
+                        )
                     response = await tool_model.ainvoke(conversation_messages)
 
                     usage = getattr(response, "usage_metadata", None) or {}
@@ -631,17 +632,6 @@ async def _stream_gen(
         while True:
             model_span = start_model_span(config, parent)
             open_model_span = model_span
-            if capture_content:
-                system_instructions, span_messages = _span_messages(
-                    conversation_messages
-                )
-                set_input_content_attributes(
-                    model_span,
-                    capture_content,
-                    system_instructions=system_instructions,
-                    messages=span_messages,
-                    tool_definitions=tool_definitions,
-                )
 
             accumulated_content = ""
             accumulated_tool_calls: list[Any] = []
@@ -658,6 +648,20 @@ async def _stream_gen(
             usage_reported = False
 
             try:
+                # Inside the guard, so a serialisation failure fails this chat span. Outside it, the
+                # raise reached the outer `finally` with `open_model_span` still set and the span was
+                # ended as abandoned, which reads as a consumer walking away rather than a failure.
+                if capture_content:
+                    system_instructions, span_messages = _span_messages(
+                        conversation_messages
+                    )
+                    set_input_content_attributes(
+                        model_span,
+                        capture_content,
+                        system_instructions=system_instructions,
+                        messages=span_messages,
+                        tool_definitions=tool_definitions,
+                    )
                 chunk_stream = tool_model.astream(conversation_messages)
                 open_chunk_stream = chunk_stream
                 async for chunk in chunk_stream:

@@ -2016,3 +2016,93 @@ class TestInputWritesNeverLeakASpan:
                 pass
 
         assert rec.root.ended == 1, "the root span leaked"
+
+
+class TestChatSpanInputWritesAreGuarded:
+    """The per-turn chat span needs the same guard the root got.
+
+    The input write for each `chat` span ran before the try that fails it. On the blocking path a
+    raise left the child open and unexported while the root was failed, and there is no `finally`
+    there to recover it. On the streaming path the raise reached the outer `finally` with
+    open_model_span still set, so the span was ended as abandoned: a content failure that reads as a
+    consumer walking away.
+    """
+
+    def _exploding_input(self) -> Any:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        return patch.object(
+            handler_mod,
+            "set_input_content_attributes",
+            side_effect=TypeError("cannot serialise this prompt"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_blocking_chat_span_is_failed_not_left_open(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        # The root's own write happens first, so let that one through and fail the turn's.
+        calls = {"n": 0}
+
+        def _fail_second(*a: Any, **k: Any) -> None:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise TypeError("cannot serialise this prompt")
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        with (
+            ctx,
+            patch.object(
+                handler_mod, "set_input_content_attributes", side_effect=_fail_second
+            ),
+            pytest.raises(TypeError),
+        ):
+            await create_langchain_messages_handler(
+                llm=_make_llm(), capture_content=True
+            )(CONFIG, "q", {}, {})
+
+        chat = rec.named("chat ")
+        assert len(chat) == 1
+        assert chat[0].ended == 1, "the chat span leaked"
+        assert StatusCode.ERROR in chat[0].statuses
+
+    @pytest.mark.asyncio
+    async def test_the_streaming_chat_span_is_failed_not_abandoned(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        ctx, rec = _recording()
+        calls = {"n": 0}
+
+        def _fail_second(*a: Any, **k: Any) -> None:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise TypeError("cannot serialise this prompt")
+
+        with (
+            ctx,
+            patch.object(
+                handler_mod, "set_input_content_attributes", side_effect=_fail_second
+            ),
+            pytest.raises(TypeError),
+        ):
+            async for _ in await create_langchain_messages_handler(
+                llm=_make_llm(), capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+
+        chat = rec.named("chat ")
+        assert len(chat) == 1
+        assert chat[0].ended == 1, "the chat span leaked"
+        assert StatusCode.ERROR in chat[0].statuses
+        assert "launchdarkly.stream.abandoned" not in chat[0].attributes
