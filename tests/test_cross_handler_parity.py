@@ -592,10 +592,13 @@ class TestStreamingTeardownClosesToolSpans:
             f"{name} opens execute_tool spans in its streaming generator but keeps no tracker for "
             "the teardown to close. A tool cancelled mid-flight will leak its span."
         )
-        # The tracker has to be read where abandonment is handled, not merely assigned.
-        teardown = source[source.rindex("finally:") :]
-        assert "open_tool_span" in teardown, (
-            f"{name} tracks open_tool_span but its `finally` never closes it."
+        # The tracker has to be closed inside a `finally`, not merely mentioned somewhere after the
+        # last one. Slicing from the last `finally:` to the end of the file took in every helper
+        # defined below it, so a function that happened to name the tracker satisfied this while the
+        # teardown closed nothing. Uses the same block reader as the hook-based checks below.
+        teardowns = _finally_blocks(source)
+        assert any("open_tool_span" in block for block in teardowns), (
+            f"{name} tracks open_tool_span but no `finally` closes it."
         )
 
     @pytest.mark.parametrize("name", sorted(HOOK_BASED_TOOL_HANDLERS))
