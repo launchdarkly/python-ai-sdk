@@ -1729,3 +1729,38 @@ class TestInputWritesNeverLeakASpan:
                 pass
 
         assert rec.root.ended == 1, "the root span leaked"
+
+
+class TestChatSpanIsNeverStranded:
+    """on_llm_end pops the span, so nothing else can end it if the write raises.
+
+    close_open_spans reaches only spans the hook object still holds. on_llm_end clears
+    open_model_span first, so a serialisation failure after that point left the chat span open with
+    nothing tracking it: never ended, never exported. The langchain-agents callback guards the
+    identical shape for the identical reason.
+    """
+
+    async def test_an_unserialisable_completion_still_ends_the_chat_span(self) -> None:
+        from opentelemetry.trace import StatusCode
+
+        import launchdarkly_ai_openai_agents.handler as handler_mod
+
+        ctx, rec = _recording()
+        turns = [{"output": _text_output("a"), "usage": _usage(10, 5)}]
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with (
+            ctx,
+            _patched_agents(agents_mod),
+            patch.object(
+                handler_mod,
+                "set_output_content_attributes",
+                side_effect=TypeError("cannot serialise this completion"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            await create_openai_agent_handler(capture_content=True)(CONFIG, "q", {}, {})
+
+        chat = rec.named("chat ")
+        assert len(chat) == 1
+        assert chat[0].ended == 1, "the chat span leaked"
+        assert StatusCode.ERROR in chat[0].statuses

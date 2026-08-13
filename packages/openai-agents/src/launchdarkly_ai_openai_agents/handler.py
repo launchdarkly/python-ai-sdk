@@ -221,13 +221,21 @@ class _SpanningHooks(_RunHooksBase):
         self.run_usage.add(usage)
         if span is None:
             return
-        if self.capture_content:
-            set_output_content_attributes(
-                span,
-                self.capture_content,
-                to_response_span_messages(output, finish_reason),
-            )
-        finish_model_span(span, self.config, usage, finish_reason)
+        # Popped above, so close_open_spans can no longer reach this span: whatever happens next,
+        # this method has to end it. Serialising conversation content raises on anything that is not
+        # JSON-serialisable, and a raise here would otherwise leak the span with nothing tracking it.
+        # The langchain-agents callback guards the identical shape for the identical reason.
+        try:
+            if self.capture_content:
+                set_output_content_attributes(
+                    span,
+                    self.capture_content,
+                    to_response_span_messages(output, finish_reason),
+                )
+            finish_model_span(span, self.config, usage, finish_reason)
+        except Exception as exc:
+            fail_span(span, exc)
+            raise
 
     async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
         call_id = getattr(context, "tool_call_id", None) or getattr(
