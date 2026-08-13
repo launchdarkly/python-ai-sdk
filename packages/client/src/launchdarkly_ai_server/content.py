@@ -88,11 +88,23 @@ class SpanMessagePart:
 
         Text and reasoning contribute their text. Tool traffic becomes JSON, because OpenLLMetry
         has no place to put structure.
+
+        An absent tool result contributes nothing, so :meth:`SpanMessage.to_text` drops it and every
+        carrier agrees with :meth:`to_canonical`, which omits the key. ``json.dumps(None)`` would
+        render it as the literal text ``null``, which reads in the trace view as a tool that returned
+        a null value rather than one that returned nothing.
+
+        ``None`` is the only spelling of absent here, because :meth:`to_canonical` already treats it
+        that way. The TypeScript SDK can tell an absent result from one explicitly returned as null
+        and reports the second as ``null``; Python's dataclass cannot hold that distinction, so there
+        is nothing to disagree about.
         """
         if self.type in ("text", "reasoning"):
             return self.content or ""
         if self.type == "tool_call":
             return json.dumps({"name": self.name or "", "arguments": self.arguments})
+        if self.result is None:
+            return ""
         if isinstance(self.result, str):
             return self.result
         return json.dumps(self.result)

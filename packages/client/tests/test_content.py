@@ -397,6 +397,36 @@ class TestPartFlattening:
         set_output_content_attributes(span, True, [message])
         assert span.attributes["gen_ai.completion.0.content"] == "only this"
 
+    def test_a_tool_result_the_provider_never_sent_leaves_the_transcript_empty(
+        self,
+    ) -> None:
+        # Every carrier is written from the same messages so they cannot disagree, and the canonical
+        # one omits an absent result. Serialising it would render the literal text `null`, so the
+        # trace view showed a tool that returned nothing as one that returned a null value.
+        span = FakeSpan()
+        message = SpanMessage(
+            role="tool",
+            parts=[SpanMessagePart(type="tool_call_response", id="c1")],
+        )
+        set_output_content_attributes(span, True, [message])
+
+        assert span.attributes["gen_ai.completion.0.content"] == ""
+        # The carrier the LaunchDarkly reader parses, and the canonical one, agree there is no result.
+        assert json.loads(span.attributes["gen_ai.output.messages"]) == [
+            {"role": "tool", "parts": [{"type": "tool_call_response", "id": "c1"}]}
+        ]
+
+    def test_a_falsy_tool_result_that_is_not_absent_survives(self) -> None:
+        # 0, False and "" are results. Only None means the provider sent nothing, which is also how
+        # to_canonical reads it.
+        span = FakeSpan()
+        message = SpanMessage(
+            role="tool",
+            parts=[SpanMessagePart(type="tool_call_response", id="c1", result=0)],
+        )
+        set_output_content_attributes(span, True, [message])
+        assert span.attributes["gen_ai.completion.0.content"] == "0"
+
 
 # ─── Tool call arguments and results ─────────────────────────────────────────
 
