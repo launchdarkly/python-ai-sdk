@@ -77,7 +77,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | Package | Description |
 | --- | --- |
 | [`launchdarkly-ai-server`](packages/client/README.md) | Core client — LaunchDarkly lifecycle, telemetry, shared types, `config()`, `graph()` |
-| [`launchdarkly-ai`](packages/ai/README.md) | Convenience barrel — re-exports all of `launchdarkly-ai-server`. Install this for the simplest setup. |
+| [`launchdarkly-ai-python`](packages/ai/README.md) | Convenience barrel — re-exports all of `launchdarkly-ai-server`. Install this for the simplest setup. |
 
 ### Handler Packages
 
@@ -98,12 +98,12 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 pip install launchdarkly-ai-python launchdarkly-ai-openai-messages
 ```
 
-`launchdarkly-ai` is a thin barrel that re-exports all of `launchdarkly-ai-server`. `init_client()` auto-discovers `launchdarkly-server-sdk` at runtime — no extra setup required.
+`launchdarkly-ai-python` is a thin barrel that re-exports all of `launchdarkly-ai-server`. `init_client()` auto-discovers `launchdarkly-server-sdk` at runtime — no extra setup required.
 
 **With telemetry** (recommended for production) — traces export to the LaunchDarkly Observability dashboard:
 
 ```bash
-pip install "launchdarkly-ai[otel]" launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-python[otel]" launchdarkly-ai-openai-messages
 ```
 
 No code changes are needed — `init_client()` detects whether the OTel packages are present at runtime and configures the tracer provider automatically. If they are absent, the SDK logs a one-time warning and continues normally.
@@ -492,7 +492,7 @@ When running inside `graph()`, every node's events carry the graph key, tool inv
 
 The OpenTelemetry SDK packages are **optional** — detected at runtime via `importlib`. The LaunchDarkly server SDK (`launchdarkly-server-sdk`) is also an optional dependency; pass a pre-initialized client to `init_client(client=...)` if you bring your own.
 
-**OTel packages** (installed via `pip install "launchdarkly-ai[otel]"` or `pip install "launchdarkly-ai-server[otel]"`):
+**OTel packages** (installed via `pip install "launchdarkly-ai-python[otel]"` or `pip install "launchdarkly-ai-server[otel]"`):
 - **If installed:** `init_client()` sets up a `TracerProvider` with a GZIP-compressed OTLP HTTP exporter and W3C trace-context/baggage propagators — no code changes needed.
 - **If not installed:** `init_client()` logs a warning and continues. Feature flags and AI calls work normally; spans become no-ops.
 
