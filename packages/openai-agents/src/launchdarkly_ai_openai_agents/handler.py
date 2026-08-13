@@ -326,6 +326,29 @@ def _write_failed_run_usage(
         finish_root_span(span, config, run_usage.total)
 
 
+def _run_aggregate_usage(run_result: Any) -> SpanUsage | None:
+    """The SDK's own total for a completed run, when it reported one.
+
+    ``RunResult.context_wrapper.usage`` is the aggregate the Runner maintains itself, and it is the
+    same object :func:`_usage_from_error` reads off a failure. The TypeScript handler uses it for the
+    root total and the returned bag, so this does too.
+
+    Preferred over the accumulator the run hooks fill, because the hooks are not guaranteed to fire:
+    ``openai-agents`` only added the LLM lifecycle hooks in 0.2.11, and this package's floor is far
+    below that. Accumulating from hooks alone handed a caller zeros for a run that really did spend,
+    which is a billing figure rather than a telemetry one.
+
+    Returns ``None`` when the aggregate is absent or reports nothing, so the caller falls back to the
+    accumulator rather than asserting the run cost nothing.
+    """
+    context_wrapper = getattr(run_result, "context_wrapper", None)
+    usage = getattr(context_wrapper, "usage", None) if context_wrapper else None
+    if usage is None:
+        return None
+    spent = to_span_usage(usage)
+    return spent if (spent.input or spent.output) else None
+
+
 def _usage_from_error(error: BaseException) -> SpanUsage | None:
     """The run's spend at the point it raised, when the SDK attached one.
 
@@ -396,7 +419,8 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
                 capture_content,
                 [text_message("assistant", _stringify_output(final_output))],
             )
-            finish_root_span(span, config, run_usage.total)
+            spent = _run_aggregate_usage(result) or run_usage.total
+            finish_root_span(span, config, spent)
             succeed_span(span)
             output = (
                 final_output
@@ -406,8 +430,8 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
             return {
                 "output": output,
                 "usage": {
-                    "input_tokens": run_usage.total.input,
-                    "output_tokens": run_usage.total.output,
+                    "input_tokens": spent.input,
+                    "output_tokens": spent.output,
                 },
             }
         except Exception as exc:
@@ -519,7 +543,10 @@ async def _stream_gen(
         set_output_content_attributes(
             span, capture_content, [text_message("assistant", output)]
         )
-        finish_root_span(span, config, run_usage.total)
+        # Same preference as the blocking path: the Runner's own aggregate, and the hook accumulator
+        # only when it reported nothing.
+        spent = _run_aggregate_usage(streamed) or run_usage.total
+        finish_root_span(span, config, spent)
         mark_ok(span)
         end_span_once(span, ended)
 
@@ -527,8 +554,8 @@ async def _stream_gen(
             "type": "done",
             "output": output,
             "usage": {
-                "input_tokens": run_usage.total.input,
-                "output_tokens": run_usage.total.output,
+                "input_tokens": spent.input,
+                "output_tokens": spent.output,
             },
         }
 

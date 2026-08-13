@@ -1764,3 +1764,69 @@ class TestChatSpanIsNeverStranded:
         assert len(chat) == 1
         assert chat[0].ended == 1, "the chat span leaked"
         assert StatusCode.ERROR in chat[0].statuses
+
+
+class TestUsageComesFromTheRunnersOwnAggregate:
+    """The Runner's aggregate is the source of truth, not the accumulator the hooks fill.
+
+    The LLM lifecycle hooks only arrived in openai-agents 0.2.11, and this package's floor is far
+    below that. Accumulating from hooks alone meant a caller on an older SDK got zeros for a run that
+    really did spend, and LaunchDarkly's metrics recorded the same. The TypeScript handler reads
+    `result.state.usage` for exactly this reason; `context_wrapper.usage` is its Python equivalent.
+    """
+
+    async def test_a_run_whose_hooks_never_fired_still_reports_its_spend(self) -> None:
+        # An SDK old enough not to call on_llm_start/on_llm_end at all.
+        async def _run_without_hooks(agent: Any, prompt: str, **_kw: Any) -> Any:
+            result = FakeRunResult("done")
+            result.context_wrapper = SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=88, output_tokens=21, input_tokens_details=None
+                )
+            )
+            return result
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_run_without_hooks)
+        with ctx, _patched_agents(agents_mod):
+            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+
+        assert result["usage"] == {"input_tokens": 88, "output_tokens": 21}
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 88
+        assert rec.root.attributes["gen_ai.usage.output_tokens"] == 21
+
+    async def test_the_aggregate_wins_over_the_hook_accumulator(self) -> None:
+        # Both present. They describe the same turns, so counting the accumulator on top would
+        # double-report; the aggregate is the authoritative one.
+        turns = [{"output": _text_output("a"), "usage": _usage(10, 5)}]
+
+        async def _run(agent: Any, prompt: str, hooks: Any = None, **_kw: Any) -> Any:
+            await _drive_turns(hooks, agent, prompt, turns)
+            result = FakeRunResult("done")
+            result.context_wrapper = SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=10, output_tokens=5, input_tokens_details=None
+                )
+            )
+            return result
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_run)
+        with ctx, _patched_agents(agents_mod):
+            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+
+        assert result["usage"] == {"input_tokens": 10, "output_tokens": 5}
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 10
+
+    async def test_the_hook_accumulator_still_stands_in_when_there_is_no_aggregate(
+        self,
+    ) -> None:
+        # The reverse case, so the fallback is not dead code.
+        turns = [{"output": _text_output("a"), "usage": _usage(7, 3)}]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with ctx, _patched_agents(agents_mod):
+            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+
+        assert result["usage"] == {"input_tokens": 7, "output_tokens": 3}
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 7
