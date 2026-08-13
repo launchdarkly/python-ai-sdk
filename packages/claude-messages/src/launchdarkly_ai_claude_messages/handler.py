@@ -434,35 +434,40 @@ async def _stream_gen(
                             yield {"type": "chunk", "text": text}
 
                     final_msg = await s.get_final_message()
+
+                raw_usage = raw_usage_of(getattr(final_msg, "usage", None))
+                finish_reason = to_semconv_finish_reason(
+                    getattr(final_msg, "stop_reason", None)
+                )
+                # Accumulated before anything that can raise, the same way the blocking path does
+                # it. Anthropic has already billed this turn, so a later content failure must not
+                # report the run as having spent less than it did.
+                run_usage.add_turn(raw_usage)
+                # The content write and the finish stay inside this guard, so a serialisation failure
+                # fails the chat span the way the blocking path does. Outside it, the raise reached
+                # the outer `finally` with `open_model_span` still set, and the chat span was ended as
+                # abandoned and left UNSET while the root was marked ERROR: one turn described as a
+                # consumer walking away and a failure at the same time.
+                if capture_content:
+                    set_output_content_attributes(
+                        model_span,
+                        capture_content,
+                        [
+                            SpanMessage(
+                                role="assistant",
+                                parts=to_span_parts(final_msg.content),
+                                finish_reason=finish_reason,
+                            )
+                        ],
+                    )
+                # finish_model_span ends the span. Clearing open_model_span is what stops the
+                # `finally` from ending it a second time.
+                finish_model_span(model_span, config, raw_usage, finish_reason)
+                open_model_span = None
             except Exception as exc:
                 fail_span(model_span, exc, ended)
                 open_model_span = None
                 raise
-
-            raw_usage = raw_usage_of(getattr(final_msg, "usage", None))
-            finish_reason = to_semconv_finish_reason(
-                getattr(final_msg, "stop_reason", None)
-            )
-            # Accumulated before anything that can raise, the same way the blocking path does it.
-            # Anthropic has already billed this turn, so a later content failure must not report the
-            # run as having spent less than it did.
-            run_usage.add_turn(raw_usage)
-            if capture_content:
-                set_output_content_attributes(
-                    model_span,
-                    capture_content,
-                    [
-                        SpanMessage(
-                            role="assistant",
-                            parts=to_span_parts(final_msg.content),
-                            finish_reason=finish_reason,
-                        )
-                    ],
-                )
-            # finish_model_span ends the span. Clearing open_model_span is what stops the
-            # `finally` from ending it a second time.
-            finish_model_span(model_span, config, raw_usage, finish_reason)
-            open_model_span = None
 
             if final_msg.stop_reason != "tool_use":
                 break

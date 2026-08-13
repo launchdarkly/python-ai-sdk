@@ -1970,6 +1970,54 @@ class TestStreamingKeepsBilledTokens:
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 37
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 11
 
+    async def test_a_streaming_content_failure_fails_the_chat_span(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # The same failure the blocking path records as ERROR on the chat span. Outside the guard the
+        # raise reached the outer `finally` with open_model_span still set, so the chat span was ended
+        # as abandoned and left UNSET while the root was marked ERROR: one turn described as a
+        # consumer walking away and as a failure at the same time.
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        class _ExplodingContent(list):
+            def __iter__(self) -> Any:
+                raise TypeError("cannot serialise this content")
+
+        final_msg = MagicMock()
+        final_msg.stop_reason = "end_turn"
+        final_msg.usage = _Usage(37, 11)
+        final_msg.content = _ExplodingContent()
+
+        class _FakeStream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield _make_stream_event("thinking...")
+
+            async def get_final_message(self) -> Any:
+                return final_msg
+
+        @asynccontextmanager
+        async def _ctx_mgr() -> AsyncGenerator[Any, None]:
+            yield _FakeStream()
+
+        mock_anthropic.messages.stream = MagicMock(return_value=_ctx_mgr())
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            async for _ in await create_claude_messages_handler(
+                capture_content=True
+            ).stream(CONFIG, "q"):
+                pass
+
+        chat = rec.named("chat ")[0]
+        assert chat.ended == 1
+        assert StatusCode.ERROR in chat.statuses
+        assert "launchdarkly.stream.abandoned" not in chat.attributes
+
 
 class TestInputWritesNeverLeakASpan:
     """Serialising the prompt must not be able to strand a span.
