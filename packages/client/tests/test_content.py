@@ -147,6 +147,47 @@ class TestLangChainSpanMessages:
         assert system == "Be helpful."
         assert [m.role for m in messages] == ["user"]
 
+    def test_keeps_a_bare_string_a_list_holds_beside_typed_blocks(self) -> None:
+        # LangChain types content as `str | list[str | dict]`, so a bare string in the list is what
+        # the library documents. Keeping only `type: "text"` blocks dropped it, and the span then
+        # showed less of the conversation than the model was given.
+        _, messages = lang_chain_span_messages(
+            [
+                _LCMessage(
+                    "human",
+                    ["a bare string", {"type": "text", "text": "a typed block"}],
+                )
+            ]
+        )
+        assert [p.to_canonical() for p in messages[0].parts] == [
+            {"type": "text", "content": "a bare stringa typed block"}
+        ]
+
+    def test_still_ignores_a_block_that_is_not_text(self) -> None:
+        _, messages = lang_chain_span_messages(
+            [
+                _LCMessage(
+                    "human",
+                    [
+                        {
+                            "type": "image_url",
+                            "image_url": "https://example.test/x.png",
+                        },
+                        {"type": "text", "text": "caption"},
+                    ],
+                )
+            ]
+        )
+        assert [p.to_canonical() for p in messages[0].parts] == [
+            {"type": "text", "content": "caption"}
+        ]
+
+    def test_still_reads_a_plain_string_content_unchanged(self) -> None:
+        _, messages = lang_chain_span_messages([_LCMessage("human", "just a string")])
+        assert [p.to_canonical() for p in messages[0].parts] == [
+            {"type": "text", "content": "just a string"}
+        ]
+
     def test_treats_developer_as_system(self) -> None:
         system, messages = lang_chain_span_messages([_LCMessage("developer", "rules")])
         assert system == "rules"

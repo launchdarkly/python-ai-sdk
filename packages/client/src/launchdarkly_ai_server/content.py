@@ -337,16 +337,27 @@ def lang_chain_span_messages(
 
 
 def _lang_chain_content_text(content: Any) -> str:
-    """LangChain message content is a string or a list of typed blocks."""
+    """LangChain message content is a string, or a list holding typed blocks and bare strings.
+
+    LangChain types it as ``str | list[str | dict]``, so a bare string inside the list is what the
+    library documents rather than a malformed input. Keeping only the blocks whose ``type`` is
+    ``text`` dropped those strings, and the span then showed less of the conversation than the model
+    was given.
+
+    Reachable from a caller: history content is passed straight into ``HumanMessage`` and
+    ``AIMessage`` with no conversion, so whatever shape the caller supplies is the shape this reads.
+    """
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
-    return "".join(
-        str(_get(block, "text") or "")
-        for block in content
-        if _get(block, "type") == "text"
-    )
+    texts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            texts.append(block)
+        elif _get(block, "type") == "text":
+            texts.append(str(_get(block, "text") or ""))
+    return "".join(texts)
 
 
 # ─── Writers ─────────────────────────────────────────────────────────────────
