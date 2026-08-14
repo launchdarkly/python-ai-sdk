@@ -5,6 +5,7 @@ Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -365,6 +366,10 @@ async def _stream_gen(
     )
     ended: set[int] = set()
 
+    # Distinguishes the two teardown reasons. A consumer that stops reading abandoned the
+    # stream; a CancelledError means something cancelled the run, usually a timeout, and the
+    # consumer chose nothing. The blocking path already tells these apart.
+    cancelled = False
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -438,6 +443,9 @@ async def _stream_gen(
             },
         }
 
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as exc:
         span_callbacks.close_open_spans(exc)
         if span_callbacks.run_usage.reported:
@@ -452,10 +460,10 @@ async def _stream_gen(
         # a normal thing for a consumer to do, and LaunchDarkly's own metrics record neither a
         # success nor an error for it.
         if span is not None and id(span) not in ended:
-            span_callbacks.abandon_open_spans(ended)
+            span_callbacks.abandon_open_spans(ended, cancelled=cancelled)
             if span_callbacks.run_usage.reported:
                 finish_root_span(span, config, span_callbacks.run_usage.total)
-        end_span_once(span, ended, abandoned=True)
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
 
 
 def langchain_agents(

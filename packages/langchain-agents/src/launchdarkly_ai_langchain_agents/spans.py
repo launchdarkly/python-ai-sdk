@@ -445,7 +445,7 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         self.model_spans.clear()
         self.tool_spans.clear()
 
-    def abandon_open_spans(self, ended: set[int]) -> None:
+    def abandon_open_spans(self, ended: set[int], cancelled: bool = False) -> None:
         """Ends every span this run has open, for stream abandonment.
 
         Unlike :meth:`close_open_spans`, nothing failed: a consumer stopping early is normal.
@@ -454,9 +454,9 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         consumer stop indistinguishable from a provider failure in a trace.
         """
         for span in self.model_spans.values():
-            end_span_once(span, ended, abandoned=True)
+            end_span_once(span, ended, abandoned=True, cancelled=cancelled)
         for span in self.tool_spans.values():
-            end_span_once(span, ended, abandoned=True)
+            end_span_once(span, ended, abandoned=True, cancelled=cancelled)
         self.model_spans.clear()
         self.tool_spans.clear()
 
@@ -500,9 +500,11 @@ class SpanCallbacks:
         if self._handler is not None:
             self._handler.close_open_spans(error)
 
-    def abandon_open_spans(self, ended: set[int]) -> None:
+    def abandon_open_spans(self, ended: set[int], cancelled: bool = False) -> None:
         if self._handler is not None:
-            self._handler.abandon_open_spans(ended)
+            # Forwarded, not dropped. The wrapper taking the flag and discarding it would leave the
+            # tool spans of a cancelled run saying abandoned while their root said cancelled.
+            self._handler.abandon_open_spans(ended, cancelled=cancelled)
 
     def cancel_open_spans(self) -> None:
         if self._handler is not None:

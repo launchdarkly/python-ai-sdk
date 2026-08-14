@@ -1931,3 +1931,64 @@ class TestCancellationEndsEverySpan:
         for span in rec.spans:
             assert span.statuses == []
             assert span.attributes["launchdarkly.run.cancelled"] is True
+
+
+class TestCancelledStreamSaysCancelled:
+    """TELEMETRY-CONTRACT.md section 6."""
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_stream_says_cancelled_not_abandoned(self) -> None:
+        # A consumer that stops reading abandoned the stream, and keeps that word. A CancelledError
+        # is not a choice: something cancelled the run, usually a timeout. The blocking path already
+        # reports launchdarkly.run.cancelled, so reporting this one as abandoned made a timed-out run
+        # and a timed-out stream disagree about why they stopped.
+        import asyncio
+
+        ctx, rec = _recording()
+
+        class _SlowModel(_FakeToolModel):
+            async def _agenerate(self, *a: Any, **k: Any) -> Any:
+                # Suspends inside the run, so a consumer awaiting the next chunk is cancelled while
+                # the generator itself is mid-await. That raises CancelledError in the handler, which
+                # is the real timeout shape. Sleeping in the consumer's loop body unwinds as a
+                # GeneratorExit instead, which is abandonment and a different thing.
+                await asyncio.sleep(3600)
+                return await super()._agenerate(*a, **k)
+
+        async def _drain() -> None:
+            with ctx:
+                gen = await create_langchain_agents_handler(
+                    _SlowModel(replies=[_ai_message("hi")])
+                ).stream(BASE_CONFIG, "q", {}, {})
+                async for _ in gen:
+                    pass
+
+        task = asyncio.create_task(_drain())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert rec.root.attributes.get("launchdarkly.run.cancelled") is True
+        assert "launchdarkly.stream.abandoned" not in rec.root.attributes
+
+    def test_the_wrapper_forwards_the_cancelled_flag_to_the_handler(self) -> None:
+        # The root-level test above cannot see this line: it opens no tool span, and the wrapper only
+        # matters for the spans the callback handler owns. A wrapper that accepted the flag and
+        # dropped it would leave a cancelled run's tool spans saying abandoned under a root saying
+        # cancelled.
+        from launchdarkly_ai_langchain_agents.spans import SpanCallbacks
+
+        seen: dict[str, Any] = {}
+
+        class _Handler:
+            def abandon_open_spans(
+                self, ended: set[int], cancelled: bool = False
+            ) -> None:
+                seen["cancelled"] = cancelled
+
+        callbacks = SpanCallbacks.__new__(SpanCallbacks)
+        callbacks._handler = _Handler()  # type: ignore[attr-defined]
+        callbacks.abandon_open_spans(set(), cancelled=True)
+
+        assert seen["cancelled"] is True
