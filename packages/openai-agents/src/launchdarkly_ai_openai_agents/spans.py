@@ -18,6 +18,7 @@ reachable through the ``openai-agents`` Python SDK's public ``ModelResponse``.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -44,6 +45,27 @@ except ImportError:  # pragma: no cover - exercised by the no-OTel install path
 TRACER_NAME = "@launchdarkly/ai-openai-agents"
 
 PROVIDER = "openai"
+
+
+def tool_arguments(raw: Any) -> Any:
+    """The object an Agents tool call denotes, given the JSON string the SDK carries.
+
+    ``function_call.arguments`` and ``context.tool_arguments`` arrive as an opaque JSON string, while
+    every other handler puts a parsed object on a ``tool_call`` part. Passing the string through left
+    the content carriers encoding it a second time, so an OpenAI span described the same call
+    differently from an Anthropic one. See TELEMETRY-CONTRACT.md section 12: arguments hold the
+    object the provider means, not the encoding it chose.
+
+    A string that does not parse comes back verbatim rather than raising: a truncated stream is worth
+    reporting as it arrived, and raising inside the telemetry path would end a run the provider has
+    already billed.
+    """
+    if not isinstance(raw, str):
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
 
 
 def model_name(config: AiConfigRep) -> str:
@@ -284,7 +306,7 @@ def item_parts(item: Any) -> list[SpanMessagePart]:
                 type="tool_call",
                 id=call_id if isinstance(call_id, str) else None,
                 name=str(_attr(item, "name") or ""),
-                arguments=_attr(item, "arguments"),
+                arguments=tool_arguments(_attr(item, "arguments")),
             )
         ]
     if item_type == "function_call_output":

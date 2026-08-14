@@ -54,6 +54,7 @@ from .spans import (
     to_response_span_messages,
     to_span_usage,
     to_tool_definitions,
+    tool_arguments,
 )
 
 try:
@@ -244,13 +245,16 @@ class _SpanningHooks(_RunHooksBase):
         name = getattr(context, "tool_name", None) or getattr(tool, "name", "tool")
         span = start_tool_span(str(name), str(call_id), self.parent)
         if self.capture_content:
-            # `tool_arguments` is the raw JSON args string the model produced. Passed through as a
-            # string rather than parsed and re-serialised, per TELEMETRY-CONTRACT.md section 7: a
-            # string passes through unchanged.
+            # `tool_arguments` is the raw JSON args string the model produced. Parsed here rather
+            # than passed through, per TELEMETRY-CONTRACT.md section 12: arguments hold the object
+            # the provider means, not the encoding it chose. The line this replaced cited section 7,
+            # which describes what the writer does with a value it is given, not what a call site
+            # should hand it. Reading it as a mandate to pass the string made this span describe the
+            # same call differently from an Anthropic one.
             args = getattr(context, "tool_arguments", None)
             if args is not None:
                 set_tool_call_content_attributes(
-                    span, self.capture_content, arguments=args
+                    span, self.capture_content, arguments=tool_arguments(args)
                 )
         self.open_tool_spans[str(call_id)] = span
 

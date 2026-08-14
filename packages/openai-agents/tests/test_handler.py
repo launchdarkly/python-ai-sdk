@@ -986,6 +986,63 @@ class TestContentCapture:
         assert tool_span.attributes["gen_ai.tool.call.arguments"] == '{"q": "x"}'
         assert tool_span.attributes["gen_ai.tool.call.result"] == "found"
 
+    async def test_reports_tool_arguments_as_the_object_they_denote(self) -> None:
+        # TELEMETRY-CONTRACT.md section 12: arguments hold the object the provider means, not the
+        # encoding it chose. The Agents SDK carries a JSON string, so passing it through left the
+        # content carriers encoding it a second time and an OpenAI span described the same call
+        # differently from an Anthropic one.
+        turns = [
+            {
+                "output": [_tool_call_output("search", "call_1", '{"q": "x"}')],
+                "usage": _usage(),
+            },
+            {"output": _text_output("done")},
+        ]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with ctx, _patched_agents(agents_mod):
+            await create_openai_agent_handler(capture_content=True)(
+                CONFIG, "q", {"search": AsyncMock()}, {}
+            )
+        chat = next(
+            c
+            for c in rec.named("chat")
+            if "search" in str(c.attributes.get("gen_ai.output.messages", ""))
+        )
+        parts = json.loads(chat.attributes["gen_ai.output.messages"])[0]["parts"]
+        assert parts == [
+            {
+                "type": "tool_call",
+                "id": "call_1",
+                "name": "search",
+                "arguments": {"q": "x"},
+            }
+        ]
+
+    async def test_keeps_malformed_tool_arguments_verbatim(self) -> None:
+        # A truncated argument string is worth reporting as it arrived. Raising inside the telemetry
+        # path would end a run the provider has already billed.
+        turns = [
+            {
+                "output": [_tool_call_output("search", "call_1", '{"q":')],
+                "usage": _usage(),
+            },
+            {"output": _text_output("done")},
+        ]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with ctx, _patched_agents(agents_mod):
+            await create_openai_agent_handler(capture_content=True)(
+                CONFIG, "q", {"search": AsyncMock()}, {}
+            )
+        chat = next(
+            c
+            for c in rec.named("chat")
+            if "search" in str(c.attributes.get("gen_ai.output.messages", ""))
+        )
+        parts = json.loads(chat.attributes["gen_ai.output.messages"])[0]["parts"]
+        assert parts[0]["arguments"] == '{"q":'
+
 
 # ---------------------------------------------------------------------------
 # §1.6 Error handling (top-level, no partial usage)
