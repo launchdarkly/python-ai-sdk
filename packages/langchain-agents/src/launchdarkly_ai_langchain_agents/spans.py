@@ -27,6 +27,7 @@ from launchdarkly_ai_server import (
     ToolDefinitionInput,
     create_run_usage,
     end_span_once,
+    end_unfinished_spans,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     lang_chain_span_usage,
@@ -459,6 +460,19 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         self.model_spans.clear()
         self.tool_spans.clear()
 
+    def cancel_open_spans(self) -> None:
+        """Ends every span this run has open, for a cancelled blocking call.
+
+        ``asyncio.CancelledError`` is a ``BaseException``, so the blocking handler's
+        ``except Exception`` never sees it and its ``finally`` calls this instead of
+        :meth:`close_open_spans`. Uses :func:`end_unfinished_spans` so a chat or tool span left open
+        by cancellation agrees with the root: marked ``launchdarkly.run.cancelled`` and left at
+        ``UNSET``, rather than the ``launchdarkly.stream.abandoned`` a stopped stream gets.
+        """
+        end_unfinished_spans(*self.model_spans.values(), *self.tool_spans.values())
+        self.model_spans.clear()
+        self.tool_spans.clear()
+
 
 def _tool_result_text(output: Any) -> Any:
     """A ``ToolMessage`` carries the result in ``content``; anything else passes through."""
@@ -489,6 +503,10 @@ class SpanCallbacks:
     def abandon_open_spans(self, ended: set[int]) -> None:
         if self._handler is not None:
             self._handler.abandon_open_spans(ended)
+
+    def cancel_open_spans(self) -> None:
+        if self._handler is not None:
+            self._handler.cancel_open_spans()
 
 
 def build_span_callbacks(

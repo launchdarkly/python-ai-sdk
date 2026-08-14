@@ -19,6 +19,7 @@ from launchdarkly_ai_server import (
     create_handler,
     create_run_usage,
     end_span_once,
+    end_unfinished_spans,
     lang_chain_span_messages,
     lang_chain_span_usage,
     parse_template,
@@ -195,6 +196,10 @@ def create_langchain_agents_handler(
 
         span = start_root_span(config, vs)
         parent = parent_context_of(span)
+        # Cleared by whichever path ends the root, so the `finally` below can tell an open root
+        # from a closed one without asking the span. A mock span answers `is_recording()`
+        # truthily, and the test suite is built on mock spans.
+        open_root_span: Any = span
 
         system_prompt = _extract_system_prompt(config, vs, history)
         if config.get("outputFormat"):
@@ -273,6 +278,7 @@ def create_langchain_agents_handler(
             )
             finish_root_span(span, config, run_usage.total)
             succeed_span(span)
+            open_root_span = None
 
             return {
                 "output": output,
@@ -290,7 +296,21 @@ def create_langchain_agents_handler(
             if span_callbacks.run_usage.reported:
                 finish_root_span(span, config, span_callbacks.run_usage.total)
             fail_span(span, exc)
+            open_root_span = None
             raise
+        finally:
+            # Not an `except`: asyncio.CancelledError is a BaseException, so a timeout or a
+            # task.cancel() never reaches the clause above. Without this the root, and any chat or
+            # execute_tool span the callback handler opened but never closed, would be stranded.
+            # The root is the only span carrying the feature_flag event and the launchdarkly.*
+            # attributes, so the whole run would vanish from AI Config Monitoring rather than show
+            # as incomplete.
+            span_callbacks.cancel_open_spans()
+            if open_root_span is not None and span_callbacks.run_usage.reported:
+                # The turns that completed were billed, the same reason the failure path reports
+                # them.
+                finish_root_span(open_root_span, config, span_callbacks.run_usage.total)
+            end_unfinished_spans(open_root_span)
 
     def _stream_impl(
         config: AiConfigRep,

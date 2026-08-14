@@ -463,6 +463,7 @@ class _FakeToolModel(BaseChatModel):
     replies: list[Any] = pydantic.Field(default_factory=list)
     fail_after: int | None = None
     fail_with: Exception | None = None
+    hang: bool = False
     calls: int = 0
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
@@ -476,8 +477,12 @@ class _FakeToolModel(BaseChatModel):
     async def _agenerate(
         self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
     ) -> Any:
+        import asyncio
+
         from langchain_core.outputs import ChatGeneration, ChatResult
 
+        if self.hang:
+            await asyncio.sleep(3600)
         if self.fail_after is not None and self.calls >= self.fail_after:
             raise self.fail_with or RuntimeError("model down")
         reply = self.replies[min(self.calls, len(self.replies) - 1)]
@@ -521,6 +526,10 @@ class RecordedSpan:
         self.statuses: list[Any] = []
         self.exceptions: list[BaseException] = []
         self.ended = 0
+
+    def is_recording(self) -> bool:
+        """False once ended, like a real span. The teardown helpers ask before writing."""
+        return self.ended == 0
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
@@ -1872,3 +1881,53 @@ class TestInputWritesNeverLeakASpan:
                 pass
 
         assert rec.root.ended == 1, "the root span leaked"
+
+
+class TestCancellationEndsEverySpan:
+    """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end."""
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_run_still_exports_its_spans(self) -> None:
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before
+        # this, a cancelled run exported nothing at all: the root carries the feature_flag event
+        # and every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather
+        # than showing as incomplete.
+        import asyncio
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(hang=True)
+
+        with ctx:
+            task = asyncio.create_task(
+                create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert rec.names[0] == "invoke_agent"
+        assert rec.names[1].startswith("chat ")
+        assert all(s.ended == 1 for s in rec.spans)
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_run_reports_unset_not_error(self) -> None:
+        # Nothing failed. The caller went away. ERROR would disagree with LaunchDarkly's own
+        # metrics, which record neither a success nor an error for a run that never finished.
+        import asyncio
+
+        ctx, rec = _recording()
+        llm = _FakeToolModel(hang=True)
+
+        with ctx:
+            task = asyncio.create_task(
+                create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        for span in rec.spans:
+            assert span.statuses == []
+            assert span.attributes["launchdarkly.run.cancelled"] is True
