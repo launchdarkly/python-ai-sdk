@@ -346,6 +346,11 @@ def lang_chain_span_messages(
             role = "user"
         elif msg_type == "ai":
             role = "assistant"
+        elif msg_type == "chat":
+            # A LangChain `ChatMessage` names its speaker in `role` and reports a type of `chat`.
+            # Reading the type recorded every such turn as the literal role `chat`, which is the name
+            # of the container rather than of anybody in the conversation.
+            role = str(_get(raw, "role") or "user")
         else:
             role = msg_type or "user"
         converted.append(SpanMessage(role=role, parts=parts))

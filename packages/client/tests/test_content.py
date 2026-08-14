@@ -209,6 +209,26 @@ class TestContentWritersToleratePeopleWithoutOpenTelemetry:
             assert guarded, f"{node.name} writes to a span it never checks for None"
 
 
+class TestLangChainChatMessageRole:
+    def test_a_chat_message_reports_its_own_speaker(self) -> None:
+        # ChatMessage names its speaker in `role` and reports a type of `chat`. Reading the type
+        # recorded the turn as role `chat`, which names the container rather than anybody speaking.
+        from types import SimpleNamespace
+
+        _, converted = lang_chain_span_messages(
+            [SimpleNamespace(type="chat", role="moderator", content="hi")]
+        )
+        assert [m.role for m in converted] == ["moderator"]
+
+    def test_a_chat_message_with_no_role_falls_back_to_user(self) -> None:
+        from types import SimpleNamespace
+
+        _, converted = lang_chain_span_messages(
+            [SimpleNamespace(type="chat", content="hi")]
+        )
+        assert [m.role for m in converted] == ["user"]
+
+
 class TestLangChainRoleAccessor:
     def test_reads_the_type_field_when_the_method_is_gone(self) -> None:
         # langchain-core replaced `_get_type()` with a plain `type` field and dropped the method.
