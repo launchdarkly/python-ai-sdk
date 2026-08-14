@@ -2179,3 +2179,44 @@ class TestCancellationEndsEverySpan:
         for span in rec.spans:
             assert span.statuses == []
             assert span.attributes["launchdarkly.run.cancelled"] is True
+
+
+class TestStreamingRootOutputRespectsTheCaptureFlag:
+    """Every equivalent site on the blocking path is guarded; this one was not."""
+
+    @staticmethod
+    def _streaming_llm(chunks: list[str]) -> Any:
+        llm = MagicMock()
+
+        async def _astream(*args: Any, **kwargs: Any) -> Any:
+            for c in chunks:
+                yield FakeAIMessage(c, input_tokens=3, output_tokens=1)
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        return llm
+
+    async def test_no_span_message_is_built_when_capture_is_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The helper is a no-op without capture, but building the SpanMessage is not. This asserts
+        # the call is not made at all, which is what the blocking path's own comment asks for.
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+        from launchdarkly_ai_langchain_messages import (
+            create_langchain_messages_handler,
+        )
+
+        calls = {"n": 0}
+        real = handler_mod.set_output_content_attributes
+
+        def _counting(span: Any, capture: bool, *a: Any, **k: Any) -> None:
+            calls["n"] += 1
+            real(span, capture, *a, **k)
+
+        monkeypatch.setattr(handler_mod, "set_output_content_attributes", _counting)
+
+        h = create_langchain_messages_handler(llm=self._streaming_llm(["hi"]))
+        async for _ in await h.stream(CONFIG, "q"):
+            pass
+
+        assert calls["n"] == 0

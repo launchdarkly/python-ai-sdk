@@ -844,16 +844,21 @@ async def _stream_gen(
         full_output_str = (
             full_output if isinstance(full_output, str) else json.dumps(full_output)
         )
-        set_output_content_attributes(
-            span,
-            capture_content,
-            [
-                SpanMessage(
-                    role="assistant",
-                    parts=[SpanMessagePart(type="text", content=full_output_str)],
-                )
-            ],
-        )
+        # Guarded like every equivalent site on the blocking path. The helper is a no-op without
+        # capture, but building the SpanMessage is not, and a caller who turned content capture off
+        # should not pay for a transcript nobody will read. `full_output_str` itself stays outside
+        # the guard: the done event below returns it whatever the capture setting is.
+        if capture_content:
+            set_output_content_attributes(
+                span,
+                capture_content,
+                [
+                    SpanMessage(
+                        role="assistant",
+                        parts=[SpanMessagePart(type="text", content=full_output_str)],
+                    )
+                ],
+            )
         finish_root_span(span, config, run_usage.total)
         mark_ok(span)
         end_span_once(span, ended)
