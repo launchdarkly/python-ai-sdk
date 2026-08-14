@@ -281,7 +281,7 @@ def lang_chain_span_messages(
 
     Shared here rather than copied into the two LangChain packages: both need the exact same
     conversion, and a copy in each package is how the span code in this SDK drifted apart the last
-    time. The narrowing is structural, on ``_get_type()``, ``content`` and ``tool_calls``, so the
+    time. The narrowing is structural, on the role accessor, ``content`` and ``tool_calls``, so the
     client takes no dependency on LangChain.
 
     LangChain names its roles ``human`` and ``ai``; the semconv vocabulary is ``user`` and
@@ -291,8 +291,17 @@ def lang_chain_span_messages(
     converted: list[SpanMessage] = []
 
     for raw in messages:
+        # `_get_type()` first, then the `type` field. Older LangChain exposed the method as the
+        # canonical accessor; the langchain-core these packages depend on replaced it with a plain
+        # field and dropped the method. Reading only the method meant every real SystemMessage,
+        # HumanMessage and AIMessage fell through to role `user`, silently: getattr returns None for
+        # a missing attribute rather than raising, so nothing failed and the transcript was simply
+        # wrong. langchain-messages carried a local adapter for this; langchain-agents did not, and
+        # had no way to know it needed one.
         get_type = getattr(raw, "_get_type", None)
-        msg_type = str(get_type()) if callable(get_type) else ""
+        msg_type = (
+            str(get_type()) if callable(get_type) else str(_get(raw, "type") or "")
+        )
         text = _lang_chain_content_text(_get(raw, "content"))
 
         if msg_type in ("system", "developer"):

@@ -175,6 +175,36 @@ class TestContentWritersToleratePeopleWithoutOpenTelemetry:
         set_tool_call_content_attributes(None, True, arguments={"a": 1}, result="r")
 
 
+class TestLangChainRoleAccessor:
+    def test_reads_the_type_field_when_the_method_is_gone(self) -> None:
+        # langchain-core replaced `_get_type()` with a plain `type` field and dropped the method.
+        # Reading only the method sent every message to role `user`, silently, because getattr
+        # returns None for a missing attribute rather than raising.
+        from types import SimpleNamespace
+
+        messages = [
+            SimpleNamespace(type="system", content="Be helpful."),
+            SimpleNamespace(type="human", content="hi"),
+            SimpleNamespace(type="ai", content="hello"),
+        ]
+        system, converted = lang_chain_span_messages(messages)
+
+        assert system == "Be helpful."
+        assert [m.role for m in converted] == ["user", "assistant"]
+
+    def test_the_method_still_wins_where_it_exists(self) -> None:
+        # Older releases expose both, and the method was the canonical accessor.
+        class _Old:
+            type = "human"
+            content = "hi"
+
+            def _get_type(self) -> str:
+                return "ai"
+
+        _, converted = lang_chain_span_messages([_Old()])
+        assert [m.role for m in converted] == ["assistant"]
+
+
 class TestLangChainSpanMessages:
     def test_lifts_the_system_prompt_out(self) -> None:
         system, messages = lang_chain_span_messages(
