@@ -104,8 +104,15 @@ The root also carries one span event, `feature_flag`, with these event attribute
 | `feature_flag.provider.name` | `LaunchDarkly` |
 | `feature_flag.set.id` | environment id, only when present |
 
-The root is the only span that carries `launchdarkly.*` and the `feature_flag` event. Child spans
-carry neither. A test asserts this, so do not add them to children out of tidiness.
+The root is the only span that carries the config-association attributes and the `feature_flag`
+event. Child spans carry neither. A test asserts this, so do not add them to children out of
+tidiness.
+
+The two lifecycle markers are the exception, and they are deliberate. `launchdarkly.stream.abandoned`
+and `launchdarkly.run.cancelled` say why a span stopped, so they belong on whichever span was still
+open when the teardown ran, root or child. A `chat` span that ends without a status and without a
+marker is indistinguishable from a bug. Neither marker identifies a config, which is what the rule
+above is protecting: a config-scoped query still finds exactly one span per run.
 
 That is also why the root carries run-level token totals. It is the span a config-scoped query
 finds. Without totals on it, that query returns nothing, because summing the children requires
