@@ -17,6 +17,7 @@ from launchdarkly_ai_server import (
     create_handler,
     create_run_usage,
     end_span_once,
+    end_unfinished_spans,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     lang_chain_span_usage,
@@ -202,6 +203,9 @@ async def _run_structured_turn(
     outputFormat, mirroring the TypeScript handler's ``runStructuredTurn``.
     """
     model_span = start_model_span(config, parent)
+    # Held so the `finally` below can end it. `except Exception` never sees an asyncio.CancelledError,
+    # which is a BaseException, so a timeout or a task.cancel() would otherwise strand this span.
+    open_model_span: Any = model_span
     # Everything that touches this span stays inside one guard, the input write included. Serialising
     # conversation content raises on anything that is not JSON-serialisable, and a raise out here
     # would leave the chat span open: this path has no `finally` that could recover it.
@@ -258,9 +262,16 @@ async def _run_structured_turn(
             lang_chain_span_usage(raw_usage) or SpanUsage(),
             lang_chain_finish_reasons(raw),
         )
+        open_model_span = None
     except Exception as exc:
         fail_span(model_span, exc)
+        open_model_span = None
         raise
+    finally:
+        # Not an `except`: the whole point is the unwind an `except Exception` cannot see. A
+        # cancelled turn still leaves its span exportable, marked and left at UNSET, because
+        # nothing failed. The caller went away.
+        end_unfinished_spans(open_model_span)
     return parsed
 
 
@@ -292,6 +303,10 @@ def create_langchain_messages_handler(
 
         span = start_root_span(config, vs)
         parent = parent_context_of(span)
+        # Cleared by whichever path ends the root, so the `finally` can tell an open root from a
+        # closed one without asking the span. A mock span answers `is_recording()` truthily, and the
+        # test suites are built on mock spans.
+        open_root_span: Any = span
 
         initial_messages = _build_messages(config, user_input, vs, history)
 
@@ -350,6 +365,7 @@ def create_langchain_messages_handler(
                     )
                 finish_root_span(span, config, run_usage.total)
                 succeed_span(span)
+                open_root_span = None
                 return {
                     "output": parsed,
                     "usage": {
@@ -395,114 +411,134 @@ def create_langchain_messages_handler(
             msgs_mod = importlib.import_module("langchain_core.messages")
             ToolMessage = msgs_mod.ToolMessage
 
-            while True:
-                model_span = start_model_span(config, parent)
-                # Every write to this span lives inside the guard, the input one included.
-                # Serialising conversation content raises on anything that is not JSON-serialisable,
-                # and a raise out here would leave the chat span open: the blocking path has no
-                # `finally` to recover it.
-                try:
-                    if capture_content:
-                        system_instructions, span_messages = _span_messages(
-                            conversation_messages
-                        )
-                        set_input_content_attributes(
-                            model_span,
-                            capture_content,
-                            system_instructions=system_instructions,
-                            messages=span_messages,
-                            tool_definitions=tool_definitions,
-                        )
-                    response = await tool_model.ainvoke(conversation_messages)
-
-                    usage = getattr(response, "usage_metadata", None) or {}
-                    # Accumulated before anything that can raise, the same way the structured turn
-                    # does it. The provider has already billed this turn, so a later content failure
-                    # must not report the run as having spent less than it did.
-                    run_usage.add(lang_chain_span_usage(usage))
-                    tool_calls = getattr(response, "tool_calls", None) or []
-                    if capture_content:
-                        set_output_content_attributes(
-                            model_span,
-                            capture_content,
-                            _assistant_output_messages(response.content, tool_calls),
-                        )
-                    finish_model_span(
-                        model_span,
-                        config,
-                        lang_chain_span_usage(usage) or SpanUsage(),
-                        lang_chain_finish_reasons(response),
-                    )
-                except Exception as exc:
-                    fail_span(model_span, exc)
-                    raise
-
-                if not tool_calls:
-                    # Only when response_format was not already bound above. Anthropic and any other
-                    # non-OpenAI provider reach the model through this second turn, because binding
-                    # response_format is an OpenAI-only mechanism.
-                    if output_format and not format_is_bound:
-                        output = await _run_structured_turn(
-                            base_model,
-                            config,
-                            conversation_messages,
-                            output_format,
-                            parent,
-                            capture_content=capture_content,
-                            run_usage=run_usage,
-                        )
-                    else:
-                        output = (
-                            response.content
-                            if isinstance(response.content, str)
-                            else ""
-                        )
-                    break
-
-                if steps >= _MAX_STEPS:
-                    raise RuntimeError(
-                        f"Tool loop exceeded the maximum number of steps ({_MAX_STEPS})"
-                    )
-                steps += 1
-
-                conversation_messages.append(response)
-
-                tool_results: list[Any] = []
-                for tc in tool_calls:
-                    tool_span = start_tool_span(
-                        tc["name"], tc.get("id") or tc["name"], parent
-                    )
-                    set_tool_call_content_attributes(
-                        tool_span, capture_content, arguments=tc.get("args")
-                    )
+            # Held so the `finally` below can end whatever is still open. `except Exception` never
+            # sees an asyncio.CancelledError, which is a BaseException, so a timeout or a
+            # task.cancel() would otherwise strand every span this loop opened.
+            open_model_span: Any = None
+            open_tool_span: Any = None
+            try:
+                while True:
+                    model_span = start_model_span(config, parent)
+                    open_model_span = model_span
+                    # Every write to this span lives inside the guard, the input one included.
+                    # Serialising conversation content raises on anything that is not
+                    # JSON-serialisable, and a raise out here would leave the chat span open: the
+                    # blocking path has no `finally` that could recover it.
                     try:
-                        handler_fn = th.get(tc["name"])
-                        if not handler_fn or not callable(handler_fn):
-                            raise ValueError(
-                                f'No handler registered for tool "{tc["name"]}"'
+                        if capture_content:
+                            system_instructions, span_messages = _span_messages(
+                                conversation_messages
                             )
-                        result_val = (
-                            await handler_fn(tc["args"])
-                            if _is_coroutine(handler_fn)
-                            else handler_fn(tc["args"])
+                            set_input_content_attributes(
+                                model_span,
+                                capture_content,
+                                system_instructions=system_instructions,
+                                messages=span_messages,
+                                tool_definitions=tool_definitions,
+                            )
+                        response = await tool_model.ainvoke(conversation_messages)
+
+                        usage = getattr(response, "usage_metadata", None) or {}
+                        # Accumulated before anything that can raise, the same way the structured
+                        # turn does it. The provider has already billed this turn, so a later
+                        # content failure must not report the run as having spent less than it did.
+                        run_usage.add(lang_chain_span_usage(usage))
+                        tool_calls = getattr(response, "tool_calls", None) or []
+                        if capture_content:
+                            set_output_content_attributes(
+                                model_span,
+                                capture_content,
+                                _assistant_output_messages(
+                                    response.content, tool_calls
+                                ),
+                            )
+                        finish_model_span(
+                            model_span,
+                            config,
+                            lang_chain_span_usage(usage) or SpanUsage(),
+                            lang_chain_finish_reasons(response),
                         )
-                        # Inside the try on purpose. Serialising a tool result can raise, most easily
-                        # when capture_content is on and the result is not JSON-serialisable, and a
-                        # raise out here would leave this span open: nothing else knows it exists.
-                        set_tool_call_content_attributes(
-                            tool_span, capture_content, result=result_val
-                        )
-                        succeed_span(tool_span)
+                        open_model_span = None
                     except Exception as exc:
-                        fail_span(tool_span, exc)
+                        fail_span(model_span, exc)
+                        open_model_span = None
                         raise
-                    tool_results.append(
-                        ToolMessage(
-                            tool_call_id=tc.get("id") or tc["name"],
-                            content=str(result_val),
+
+                    if not tool_calls:
+                        # Only when response_format was not already bound above. Anthropic and any
+                        # other non-OpenAI provider reach the model through this second turn, because
+                        # binding response_format is an OpenAI-only mechanism.
+                        if output_format and not format_is_bound:
+                            output = await _run_structured_turn(
+                                base_model,
+                                config,
+                                conversation_messages,
+                                output_format,
+                                parent,
+                                capture_content=capture_content,
+                                run_usage=run_usage,
+                            )
+                        else:
+                            output = (
+                                response.content
+                                if isinstance(response.content, str)
+                                else ""
+                            )
+                        break
+
+                    if steps >= _MAX_STEPS:
+                        raise RuntimeError(
+                            f"Tool loop exceeded the maximum number of steps ({_MAX_STEPS})"
                         )
-                    )
-                conversation_messages.extend(tool_results)
+                    steps += 1
+
+                    conversation_messages.append(response)
+
+                    tool_results: list[Any] = []
+                    for tc in tool_calls:
+                        tool_span = start_tool_span(
+                            tc["name"], tc.get("id") or tc["name"], parent
+                        )
+                        open_tool_span = tool_span
+                        set_tool_call_content_attributes(
+                            tool_span, capture_content, arguments=tc.get("args")
+                        )
+                        try:
+                            handler_fn = th.get(tc["name"])
+                            if not handler_fn or not callable(handler_fn):
+                                raise ValueError(
+                                    f'No handler registered for tool "{tc["name"]}"'
+                                )
+                            result_val = (
+                                await handler_fn(tc["args"])
+                                if _is_coroutine(handler_fn)
+                                else handler_fn(tc["args"])
+                            )
+                            # Inside the try on purpose. Serialising a tool result can raise, most
+                            # easily when capture_content is on and the result is not
+                            # JSON-serialisable, and a raise out here would leave this span open:
+                            # nothing else knows it exists.
+                            set_tool_call_content_attributes(
+                                tool_span, capture_content, result=result_val
+                            )
+                            succeed_span(tool_span)
+                            open_tool_span = None
+                        except Exception as exc:
+                            fail_span(tool_span, exc)
+                            open_tool_span = None
+                            raise
+                        tool_results.append(
+                            ToolMessage(
+                                tool_call_id=tc.get("id") or tc["name"],
+                                content=str(result_val),
+                            )
+                        )
+                    conversation_messages.extend(tool_results)
+            finally:
+                # Not an `except`: the whole point is the unwind an `except Exception` cannot see. A
+                # cancelled turn still leaves its spans exportable, marked and left at UNSET,
+                # because nothing failed. The caller went away.
+                end_unfinished_spans(open_tool_span, open_model_span)
 
             # Behind the flag, because set_output_content_attributes is a no-op without it and
             # json.dumps is not. With tools and an outputFormat on a non-OpenAI provider the output
@@ -523,6 +559,7 @@ def create_langchain_messages_handler(
                 )
             finish_root_span(span, config, run_usage.total)
             succeed_span(span)
+            open_root_span = None
             return {
                 "output": output,
                 "usage": {
@@ -536,7 +573,19 @@ def create_langchain_messages_handler(
             if run_usage.reported:
                 finish_root_span(span, config, run_usage.total)
             fail_span(span, exc)
+            open_root_span = None
             raise
+        finally:
+            # Not an `except`: asyncio.CancelledError is a BaseException, so a timeout or a
+            # task.cancel() never reaches the clause above. Without this the root is stranded, and
+            # the root is the only span carrying the feature_flag event and the launchdarkly.*
+            # attributes, so the whole run would vanish from AI Config Monitoring rather than show as
+            # incomplete.
+            if open_root_span is not None and run_usage.reported:
+                # The turns that completed were billed, the same reason the failure path reports
+                # them.
+                finish_root_span(open_root_span, config, run_usage.total)
+            end_unfinished_spans(open_root_span)
 
     def _stream_impl(
         config: AiConfigRep,

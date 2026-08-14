@@ -95,6 +95,10 @@ class RecordedSpan:
         self.exceptions: list[BaseException] = []
         self.ended = 0
 
+    def is_recording(self) -> bool:
+        """False once ended, like a real span. The teardown helpers ask before writing."""
+        return self.ended == 0
+
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
@@ -2106,3 +2110,68 @@ class TestChatSpanInputWritesAreGuarded:
         assert chat[0].ended == 1, "the chat span leaked"
         assert StatusCode.ERROR in chat[0].statuses
         assert "launchdarkly.stream.abandoned" not in chat[0].attributes
+
+
+class TestCancellationEndsEverySpan:
+    """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end."""
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_run_still_exports_its_spans(self) -> None:
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before
+        # this, a cancelled run exported nothing at all: the root carries the feature_flag event and
+        # every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather than
+        # showing as incomplete.
+        import asyncio
+
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+
+        async def never_returns(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(3600)
+
+        llm.ainvoke = AsyncMock(side_effect=never_returns)
+        ctx, rec = _recording()
+
+        with ctx:
+            task = asyncio.create_task(
+                create_langchain_messages_handler(llm=llm)(CONFIG, "q", {}, {})
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        names = [s.name for s in rec.spans]
+        assert names[0] == "invoke_agent"
+        assert names[1].startswith("chat ")
+        assert all(s.ended == 1 for s in rec.spans)
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_run_reports_unset_not_error(self) -> None:
+        # Nothing failed. The caller went away. ERROR would disagree with LaunchDarkly's own
+        # metrics, which record neither a success nor an error for a run that never finished.
+        import asyncio
+
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+
+        async def never_returns(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(3600)
+
+        llm.ainvoke = AsyncMock(side_effect=never_returns)
+        ctx, rec = _recording()
+
+        with ctx:
+            task = asyncio.create_task(
+                create_langchain_messages_handler(llm=llm)(CONFIG, "q", {}, {})
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        for span in rec.spans:
+            assert span.statuses == []
+            assert span.attributes["launchdarkly.run.cancelled"] is True
