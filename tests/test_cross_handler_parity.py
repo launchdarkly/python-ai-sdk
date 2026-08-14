@@ -341,6 +341,12 @@ EXPECTED_VOCABULARY = {
     "launchdarkly.run.id",
     "launchdarkly.graph.key",
     "launchdarkly.stream.abandoned",
+    # A blocking run that was cancelled. asyncio.CancelledError is a BaseException, so it walks past
+    # every `except Exception` a handler writes, and without a `finally` the run exported no span at
+    # all. UNSET plus this marker, never ERROR, for the same reason as the abandoned stream above:
+    # nothing failed, the caller went away. Python only. TypeScript has no cancellation that skips a
+    # `catch`, so this key has no counterpart there and its absence is not drift.
+    "launchdarkly.run.cancelled",
     "feature_flag",
     "feature_flag.key",
     "feature_flag.provider.name",
