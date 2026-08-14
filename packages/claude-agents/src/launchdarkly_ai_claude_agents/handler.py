@@ -38,6 +38,7 @@ from launchdarkly_ai_server import (
     config,
     create_handler,
     end_span_once,
+    end_unfinished_spans,
     parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
@@ -179,18 +180,27 @@ def _build_hooks(native_tool_map: dict[str, Any]) -> dict[str, Any] | None:
 ToolTelemetry = Callable[[BaseException], None]
 #: Ends every open tool span without failing it, for the abandonment path.
 AbandonTelemetry = Callable[[set[int]], None]
+#: Ends every open tool span without failing it, for a task.cancel() the blocking path cannot
+#: see coming. Distinct from AbandonTelemetry: that one marks a span abandoned mid-stream, this
+#: one marks it launchdarkly.run.cancelled, via the same shared helper the root's own finally uses.
+CancelTelemetry = Callable[[], None]
 
 
 def build_tool_hooks(
     native_tool_map: dict[str, Any],
     parent_context: Any,
     capture_content: bool,
-) -> tuple[dict[str, list[HookMatcher]], ToolTelemetry, AbandonTelemetry]:
+) -> tuple[
+    dict[str, list[HookMatcher]], ToolTelemetry, AbandonTelemetry, CancelTelemetry
+]:
     """Builds the PreToolUse/PostToolUse/PostToolUseFailure hooks that open and close
     ``execute_tool`` spans around the Agent SDK's own tool dispatch.
 
-    Returns ``(hooks, close_open_spans, abandon_open_spans)``. ``close_open_spans`` fails every span this run still has
-    open, for the path where the SDK throws mid-tool-call and no ``PostToolUse*`` hook ever fires.
+    Returns ``(hooks, close_open_spans, abandon_open_spans, cancel_open_spans)``.
+    ``close_open_spans`` fails every span this run still has open, for the path where the SDK
+    throws mid-tool-call and no ``PostToolUse*`` hook ever fires. ``cancel_open_spans`` is the same
+    idea for a ``task.cancel()``: nothing failed, so it ends each span still open through
+    :func:`~launchdarkly_ai_server.end_unfinished_spans` instead of failing it.
     """
     tool_spans: dict[str, Any] = {}
 
@@ -271,12 +281,23 @@ def build_tool_hooks(
             end_span_once(span, ended, abandoned=True)
         tool_spans.clear()
 
+    def cancel_open_spans() -> None:
+        """Ends every tool span still open, for the blocking path's unwind on a task.cancel().
+
+        ``asyncio.CancelledError`` is a ``BaseException``, so it walks past ``close_open_spans``'s
+        caller too. Nothing failed here either: the caller went away, the same reasoning
+        :func:`abandon_open_spans` applies, using the shared helper so a cancelled run's tool spans
+        agree with its root about ``launchdarkly.run.cancelled``.
+        """
+        end_unfinished_spans(*tool_spans.values())
+        tool_spans.clear()
+
     hooks: dict[str, list[HookMatcher]] = {
         "PreToolUse": [HookMatcher(hooks=[_pre_tool_use])],  # type: ignore[list-item]
         "PostToolUse": [HookMatcher(hooks=[_post_tool_use])],  # type: ignore[list-item]
         "PostToolUseFailure": [HookMatcher(hooks=[_post_tool_use_failure])],  # type: ignore[list-item]
     }
-    return hooks, close_open_spans, abandon_open_spans
+    return hooks, close_open_spans, abandon_open_spans, cancel_open_spans
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +430,10 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
 
         span = start_root_span(config, vs)
         parent = parent_context_of(span)
+        # Cleared by whichever path ends the root, so the finally below can tell an open root
+        # from a closed one without asking the span. A mock span answers `is_recording()`
+        # truthily, and this handler's own suite is built on mock spans in places.
+        open_root_span: Any = span
 
         prompt, system_prompt = build_prompt(config, user_input, vs, history)
         if config.get("outputFormat"):
@@ -426,6 +451,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
         # Declared out here so the except clause can end a chat span the throw left open.
         inference = InferenceSpans(config, parent, capture_content, catalog, opening)
         tool_telemetry: ToolTelemetry | None = None
+        cancel_tool_spans: CancelTelemetry | None = None
         # Set wherever the root's usage is written, so the failure path can tell whether the CLI
         # already reported an authoritative run-level total and must not overwrite it.
         root_usage_written = False
@@ -449,8 +475,9 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
             hooks = None
             if native_tool_names or mcp_allowed_tools:
-                # The blocking path cannot be abandoned, so it takes no abandon hook.
-                hooks, tool_telemetry, _ = build_tool_hooks(
+                # The blocking path cannot be abandoned, so it takes no abandon hook, but it can
+                # still be cancelled, so it keeps cancel_open_spans.
+                hooks, tool_telemetry, _, cancel_tool_spans = build_tool_hooks(
                     native_tool_map, parent, capture_content
                 )
 
@@ -507,6 +534,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
                             ],
                         )
                         succeed_span(span)
+                        open_root_span = None
                         return {"output": message.result, "usage": raw_usage}
 
                 # The stream ended without a result message, so no message closed the last
@@ -522,6 +550,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
                     finish_root_span(span, config, streamed_usage["total"])
                     root_usage_written = True
                 succeed_span(span)
+                open_root_span = None
                 return {"output": output, "usage": streamed_usage["total"]}
             finally:
                 if gen is not None:
@@ -536,7 +565,26 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             if not root_usage_written and inference.run_usage["reported"]:
                 finish_root_span(span, config, inference.run_usage["total"])
             fail_span(span, exc)
+            open_root_span = None
             raise
+        finally:
+            # Not an except: asyncio.CancelledError is a BaseException, so a timeout or a
+            # task.cancel() never reaches the clause above. Without this the root is stranded, and
+            # the root is the only span carrying the feature_flag event and the launchdarkly.*
+            # attributes, so the whole run would vanish from AI Config Monitoring rather than show
+            # as incomplete.
+            inference.finish()
+            if cancel_tool_spans is not None:
+                cancel_tool_spans()
+            if (
+                open_root_span is not None
+                and not root_usage_written
+                and inference.run_usage["reported"]
+            ):
+                # The turns that completed were billed, the same reason the failure path reports
+                # them.
+                finish_root_span(open_root_span, config, inference.run_usage["total"])
+            end_unfinished_spans(open_root_span)
 
     def _stream_impl(
         config: AiConfigRep,
@@ -612,7 +660,7 @@ async def _stream_gen(
         mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
         hooks = None
         if native_tool_names or mcp_allowed_tools:
-            hooks, tool_telemetry, abandon_tool_spans = build_tool_hooks(
+            hooks, tool_telemetry, abandon_tool_spans, _ = build_tool_hooks(
                 native_tool_map, parent, capture_content
             )
 

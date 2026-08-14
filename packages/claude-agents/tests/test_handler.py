@@ -1771,7 +1771,7 @@ class TestAbandonedToolSpansAreNotErrors:
         # The distinction the fix rests on: failure keeps ERROR, abandonment does not.
         from launchdarkly_ai_claude_agents.handler import build_tool_hooks
 
-        hooks, close_open_spans, _ = build_tool_hooks({}, None, False)
+        hooks, close_open_spans, _, _ = build_tool_hooks({}, None, False)
         pre = hooks["PreToolUse"][0].hooks[0]
         await pre(
             {
@@ -1890,3 +1890,60 @@ class TestInputWritesNeverLeakASpan:
                 pass
 
         assert root().end_time is not None, "the root span leaked"
+
+
+class TestCancellationEndsEverySpan:
+    """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end.
+
+    ``asyncio.CancelledError`` is a ``BaseException``, so `except Exception` never sees it. Before
+    this, a cancelled run exported nothing at all: the root carries the feature_flag event and
+    every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather than
+    showing as incomplete.
+    """
+
+    async def test_a_cancelled_run_still_exports_its_spans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        async def _never_returns(**_kwargs: Any) -> AsyncIterator[Any]:
+            await asyncio.sleep(3600)
+            yield result_message("done")  # pragma: no cover - unreachable
+
+        monkeypatch.setattr(handler_mod, "query", _never_returns)
+
+        task = asyncio.create_task(
+            create_claude_agents_handler()(BASE_CONFIG, "q", {}, {})
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert [s.name for s in spans()] == ["invoke_agent"]
+        assert all(s.end_time is not None for s in spans())
+
+    async def test_a_cancelled_run_reports_unset_not_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Nothing failed. The caller went away. ERROR would disagree with LaunchDarkly's own
+        # metrics, which record neither a success nor an error for a run that never finished.
+        import asyncio
+
+        async def _never_returns(**_kwargs: Any) -> AsyncIterator[Any]:
+            await asyncio.sleep(3600)
+            yield result_message("done")  # pragma: no cover - unreachable
+
+        monkeypatch.setattr(handler_mod, "query", _never_returns)
+
+        task = asyncio.create_task(
+            create_claude_agents_handler()(BASE_CONFIG, "q", {}, {})
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        for span in spans():
+            assert span.status.status_code == StatusCode.UNSET
+            assert span.attributes.get("launchdarkly.run.cancelled") is True
