@@ -432,6 +432,15 @@ A part is one of:
 
 Keys are snake_case in the JSON. Omit absent members rather than writing null.
 
+`arguments` on a `tool_call` part holds the object the provider means, not the encoding it chose.
+Anthropic and LangChain hand over an object. OpenAI's Responses API and Agents SDK send a JSON
+string, so the call site parses it before building the part. A string that does not parse goes on the
+part verbatim rather than raising, because a truncated stream is worth reporting as it arrived and a
+raise inside the telemetry path would end a run the provider has already billed.
+
+This rule lives at the call site, never in the shared writer, for the same reason as the cache
+folding in section 4. The writer cannot know whether a string is an encoding or a value.
+
 Flattening a part for the OpenLLMetry carrier: text and reasoning contribute their text. A
 `tool_call` becomes `{"name": ..., "arguments": ...}` as JSON. A `tool_call_response` contributes its
 result, as a string if it is one and as JSON otherwise. Join the parts with a newline and drop
