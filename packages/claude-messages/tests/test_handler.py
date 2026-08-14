@@ -1861,7 +1861,12 @@ class TestOpenToolSpanIsNeverLeaked:
         tools = rec.named("execute_tool ")
         assert len(tools) == 1
         assert tools[0].ended == 1, "the execute_tool span leaked"
-        assert tools[0].attributes["launchdarkly.stream.abandoned"] is True
+        # `cancelled`, not `abandoned`. This test used to assert the latter, which is what the defect
+        # looked like: nothing here chose to stop reading, a CancelledError ended the run underneath
+        # the consumer. The consumer-break test above still asserts `abandoned`, which is the case
+        # that word is for.
+        assert tools[0].attributes["launchdarkly.run.cancelled"] is True
+        assert "launchdarkly.stream.abandoned" not in tools[0].attributes
         assert rec.root.ended == 1
 
 
