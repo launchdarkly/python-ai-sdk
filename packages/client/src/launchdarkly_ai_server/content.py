@@ -494,6 +494,11 @@ def set_tool_definition_attributes(
     The catalog is content because tool descriptions and parameter schemas routinely embed
     customer-specific detail, so it sits behind the same gate as the messages.
     """
+    # A ``None`` span is a no-op, matching every other helper in this family. Handlers hold ``None``
+    # for every span when the OpenTelemetry extra is absent, and a caller who asked for content
+    # should not get an AttributeError after the provider has already billed the turn.
+    if span is None:
+        return
     if not capture or not tools:
         return
     definitions: list[dict[str, Any]] = []

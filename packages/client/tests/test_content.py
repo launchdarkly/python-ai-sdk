@@ -173,6 +173,40 @@ class TestContentWritersToleratePeopleWithoutOpenTelemetry:
         set_input_content_attributes(None, True, messages=messages)
         set_output_content_attributes(None, True, messages)
         set_tool_call_content_attributes(None, True, arguments={"a": 1}, result="r")
+        set_tool_definition_attributes(
+            None, True, [{"name": "t", "description": "d", "parameters": {}}]
+        )
+
+    def test_the_guard_covers_every_public_writer_in_this_module(self) -> None:
+        # The first version of this guard covered three of the four writers while its own comment
+        # claimed the whole family. This asserts the claim rather than the three cases someone
+        # remembered, so a writer added later cannot quietly opt out.
+        import ast
+        import inspect
+
+        import launchdarkly_ai_server.content as content_mod
+
+        source = inspect.getsource(content_mod)
+        for node in ast.parse(source).body:
+            if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+                continue
+            writes = any(
+                isinstance(c, ast.Attribute)
+                and isinstance(c.value, ast.Name)
+                and c.value.id == "span"
+                and c.attr in ("set_attribute", "add_event")
+                for c in ast.walk(node)
+            )
+            if not writes:
+                continue
+            guarded = any(
+                isinstance(c, ast.Compare)
+                and isinstance(c.left, ast.Name)
+                and c.left.id == "span"
+                and any(isinstance(o, ast.Is) for o in c.ops)
+                for c in ast.walk(node)
+            )
+            assert guarded, f"{node.name} writes to a span it never checks for None"
 
 
 class TestLangChainRoleAccessor:
