@@ -2187,3 +2187,45 @@ class TestCancellationEndsEverySpan:
         for span in rec.spans:
             assert span.statuses == []
             assert span.attributes["launchdarkly.run.cancelled"] is True
+
+
+class TestStreamingInputWriteIsGuarded:
+    """The streaming chat span must fail, not merely stop, when its input write raises."""
+
+    async def test_an_unserialisable_prompt_fails_the_chat_span(
+        self, mock_anthropic: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The write sat before the try that calls fail_span on this span. A raise reached the outer
+        # handler, which marked the root ERROR and left this span for the `finally`, so it ended as
+        # abandoned: the trace showed a failed run whose model call merely stopped.
+        from opentelemetry.trace import StatusCode
+
+        import launchdarkly_ai_claude_messages.handler as handler_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        calls = {"n": 0}
+        real = handler_mod.set_input_content_attributes
+
+        def _explode_on_the_chat_span(span: Any, capture: bool, **kw: Any) -> None:
+            # The root's own input write happens first and must still succeed, so only the second
+            # call, which is the chat span's, raises.
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise TypeError("cannot serialise this prompt")
+            real(span, capture, **kw)
+
+        monkeypatch.setattr(
+            handler_mod, "set_input_content_attributes", _explode_on_the_chat_span
+        )
+
+        ctx, rec = _recording()
+        with ctx, pytest.raises(TypeError):
+            async for _ in await create_claude_messages_handler(
+                capture_content=True
+            ).stream(CONFIG, "q", {}, {}):
+                pass
+
+        chat = rec.named("chat ")[0]
+        assert chat.ended == 1
+        assert StatusCode.ERROR in chat.statuses
+        assert "launchdarkly.stream.abandoned" not in chat.attributes

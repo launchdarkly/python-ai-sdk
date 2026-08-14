@@ -447,14 +447,6 @@ async def _stream_gen(
         while True:
             model_span = start_model_span(config, parent)
             open_model_span = model_span
-            if capture_content:
-                set_input_content_attributes(
-                    model_span,
-                    capture_content,
-                    system_instructions=system,
-                    messages=to_span_messages(conversation),
-                    tool_definitions=tool_definitions,
-                )
 
             kwargs: dict[str, Any] = {
                 "model": config["model"]["name"],
@@ -467,6 +459,20 @@ async def _stream_gen(
                 kwargs["tools"] = tools
 
             try:
+                # Inside the guard that calls fail_span on this span, the same as the blocking path
+                # and the same as the output write below. Serialising the conversation raises on
+                # anything that is not JSON-serialisable, and a raise out here reached the outer
+                # handler: the root was marked ERROR while this chat span was left open, so the
+                # `finally` ended it as abandoned and the trace showed a failed run whose model call
+                # merely stopped.
+                if capture_content:
+                    set_input_content_attributes(
+                        model_span,
+                        capture_content,
+                        system_instructions=system,
+                        messages=to_span_messages(conversation),
+                        tool_definitions=tool_definitions,
+                    )
                 stream = client.messages.stream(**kwargs)
                 async with stream as s:
                     async for event in s:
