@@ -260,6 +260,11 @@ class _SpanningHooks(_RunHooksBase):
         call_id = self._tool_span_key(context, tool)
         name = getattr(context, "tool_name", None) or getattr(tool, "name", "tool")
         span = start_tool_span(str(name), str(call_id), self.parent)
+        # Filed before the content write, not after. Serialising the arguments can raise, and a raise
+        # out of an unfiled span leaves it open with nothing tracking it: close_open_spans and
+        # abandon_open_spans both walk this dict, so a span missing from it never ends and never
+        # exports.
+        self.open_tool_spans[str(call_id)] = span
         if self.capture_content:
             # `tool_arguments` is the raw JSON args string the model produced. Parsed here rather
             # than passed through, per TELEMETRY-CONTRACT.md section 12: arguments hold the object
@@ -272,7 +277,6 @@ class _SpanningHooks(_RunHooksBase):
                 set_tool_call_content_attributes(
                     span, self.capture_content, arguments=tool_arguments(args)
                 )
-        self.open_tool_spans[str(call_id)] = span
 
     async def on_tool_end(
         self, context: Any, agent: Any, tool: Any, result: Any
@@ -280,9 +284,18 @@ class _SpanningHooks(_RunHooksBase):
         span = self.open_tool_spans.pop(self._tool_span_key(context, tool), None)
         if span is None:
             return
-        if self.capture_content:
-            set_tool_call_content_attributes(span, self.capture_content, result=result)
-        succeed_span(span)
+        # Once popped, ending it is this method's job alone: nothing else knows the span exists. A
+        # tool result comes from the caller's own function, so it can be anything, including
+        # something json.dumps refuses.
+        try:
+            if self.capture_content:
+                set_tool_call_content_attributes(
+                    span, self.capture_content, result=result
+                )
+            succeed_span(span)
+        except Exception as exc:
+            fail_span(span, exc)
+            raise
 
     def close_open_spans(self, error: BaseException) -> None:
         """Fails every span this run has open, for the crash path.

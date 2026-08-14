@@ -1966,3 +1966,41 @@ class TestUsageComesFromTheRunnersOwnAggregate:
 
         assert result["usage"] == {"input_tokens": 7, "output_tokens": 3}
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 7
+
+
+class TestToolSpanSurvivesAContentFailure:
+    """TELEMETRY-CONTRACT.md section 6: nothing may leave a span open."""
+
+    async def test_a_tool_result_that_will_not_serialise_still_ends_the_span(
+        self,
+    ) -> None:
+        # A tool result comes from the caller's own function, so it can be anything, including
+        # something json.dumps refuses. Before this the write ran after the pop and outside any guard,
+        # so the span was untracked and unended: never exported, and a reader saw a tool that started
+        # and never returned.
+        class Unserialisable:
+            pass
+
+        turns = [
+            {
+                "output": [_tool_call_output("search", "call_1", '{"q": "x"}')],
+                "usage": _usage(),
+                "tool_calls": [
+                    {
+                        "name": "search",
+                        "id": "call_1",
+                        "args": {"q": "x"},
+                        "result": Unserialisable(),
+                    }
+                ],
+            },
+        ]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with ctx, _patched_agents(agents_mod), pytest.raises(TypeError):
+            await create_openai_agent_handler(capture_content=True)(
+                CONFIG, "q", {"search": AsyncMock()}, {}
+            )
+
+        tool = rec.named("execute_tool ")[0]
+        assert tool.ended == 1
