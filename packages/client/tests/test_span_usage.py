@@ -468,6 +468,38 @@ def tracer_and_exporter():
     provider.shutdown()
 
 
+class TestEndSpanOnceDistinguishesWhyItStopped:
+    """TELEMETRY-CONTRACT.md section 6."""
+
+    def test_a_cancelled_stream_is_not_reported_as_abandoned(
+        self, tracer_and_exporter
+    ) -> None:
+        # Both can be true of the same unwind, and only one is the reason. A consumer that stops
+        # reading abandoned the stream. A CancelledError means something cancelled the run, usually a
+        # timeout, and the consumer never chose anything. Reporting the second as the first made a
+        # timed-out stream and a timed-out blocking call disagree about why they stopped.
+        from launchdarkly_ai_server import end_span_once
+
+        tracer, exporter = tracer_and_exporter
+        end_span_once(tracer.start_span("chat"), set(), abandoned=True, cancelled=True)
+
+        [finished] = exporter.get_finished_spans()
+        assert finished.attributes["launchdarkly.run.cancelled"] is True
+        assert "launchdarkly.stream.abandoned" not in finished.attributes
+
+    def test_a_consumer_that_stops_reading_is_still_abandoned(
+        self, tracer_and_exporter
+    ) -> None:
+        from launchdarkly_ai_server import end_span_once
+
+        tracer, exporter = tracer_and_exporter
+        end_span_once(tracer.start_span("chat"), set(), abandoned=True)
+
+        [finished] = exporter.get_finished_spans()
+        assert finished.attributes["launchdarkly.stream.abandoned"] is True
+        assert "launchdarkly.run.cancelled" not in finished.attributes
+
+
 class TestEndUnfinishedSpans:
     """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end."""
 

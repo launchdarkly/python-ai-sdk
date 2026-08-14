@@ -348,7 +348,9 @@ def set_model_identity_attributes(
     span.set_attribute("gen_ai.request.model", request_model)
 
 
-def end_span_once(span: Any, tracker: set[int], abandoned: bool = False) -> None:
+def end_span_once(
+    span: Any, tracker: set[int], abandoned: bool = False, cancelled: bool = False
+) -> None:
     """Ends a span exactly once, even when the caller cannot know whether an earlier path ended it.
 
     The streaming handlers need this: a consumer that breaks out of ``async for``, or throws inside
@@ -359,6 +361,12 @@ def end_span_once(span: Any, tracker: set[int], abandoned: bool = False) -> None
 
     *tracker* holds ``id(span)`` rather than the span itself, because an OTel span is not guaranteed
     hashable across implementations.
+
+    *cancelled* wins over *abandoned*, because both can be true of the same unwind and only one of
+    them is the reason. A consumer that stops reading abandoned the stream. A ``CancelledError``
+    means something cancelled the run, usually a timeout, and the consumer never chose anything. The
+    blocking paths report that second case as ``launchdarkly.run.cancelled``, so the streaming paths
+    say the same thing rather than calling a timed-out run an abandoned one.
 
     An abandoned span is marked with ``launchdarkly.stream.abandoned`` and deliberately left at
     ``UNSET`` rather than ``ERROR``. Stopping early is a normal thing for a consumer to do, such as
@@ -380,7 +388,9 @@ def end_span_once(span: Any, tracker: set[int], abandoned: bool = False) -> None
     if key in tracker:
         return
     tracker.add(key)
-    if abandoned:
+    if cancelled:
+        span.set_attribute("launchdarkly.run.cancelled", True)
+    elif abandoned:
         span.set_attribute("launchdarkly.stream.abandoned", True)
     span.end()
 
