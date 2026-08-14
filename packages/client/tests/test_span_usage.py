@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from launchdarkly_ai_server.utils import (
     SpanUsage,
     add_cached_tokens_to_input,
@@ -444,3 +446,80 @@ class TestToUsageDict:
         usage = to_usage_dict({})
         assert (usage.input, usage.output, usage.total) == (0, 0, 0)
         assert usage.input_details is None
+
+
+@pytest.fixture
+def tracer_and_exporter():
+    """A real tracer and exporter, not a mock.
+
+    A mock span cannot tell a span that was ended from one that was not, which is the only thing these
+    tests are about.
+    """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    yield provider.get_tracer("test"), exporter
+    provider.shutdown()
+
+
+class TestEndUnfinishedSpans:
+    """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end."""
+
+    def test_ends_a_span_a_cancelled_run_left_open(self, tracer_and_exporter) -> None:
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Without this
+        # helper a cancelled run exported no span at all, and the root carries the feature_flag event.
+        from launchdarkly_ai_server import end_unfinished_spans
+
+        tracer, exporter = tracer_and_exporter
+        span = tracer.start_span("invoke_agent")
+
+        end_unfinished_spans(span)
+
+        [finished] = exporter.get_finished_spans()
+        assert finished.name == "invoke_agent"
+        assert finished.attributes["launchdarkly.run.cancelled"] is True
+
+    def test_leaves_the_span_unset_rather_than_error(self, tracer_and_exporter) -> None:
+        # Nothing failed. The caller went away. Marking ERROR would disagree with LaunchDarkly's own
+        # metrics, which record neither a success nor an error for a run that never finished.
+        from opentelemetry.trace import StatusCode
+
+        from launchdarkly_ai_server import end_unfinished_spans
+
+        tracer, exporter = tracer_and_exporter
+        end_unfinished_spans(tracer.start_span("chat"))
+
+        [finished] = exporter.get_finished_spans()
+        assert finished.status.status_code is StatusCode.UNSET
+
+    def test_skips_a_span_another_path_already_ended(
+        self, tracer_and_exporter, caplog
+    ) -> None:
+        # This runs on the success path too, where every span is already closed. The OTel SDK makes a
+        # second end idempotent but logs it, and that log is the only observable difference: it is how
+        # a real double-end shows up in production, and it would bury a genuine leak in noise.
+        import logging
+
+        from launchdarkly_ai_server import end_unfinished_spans
+
+        tracer, exporter = tracer_and_exporter
+        span = tracer.start_span("chat")
+        span.end()
+
+        with caplog.at_level(logging.WARNING, logger="opentelemetry.sdk.trace"):
+            end_unfinished_spans(span)
+
+        assert caplog.records == []
+        [finished] = exporter.get_finished_spans()
+        assert "launchdarkly.run.cancelled" not in (finished.attributes or {})
+
+    def test_ignores_none_so_a_finally_need_not_check(self) -> None:
+        from launchdarkly_ai_server import end_unfinished_spans
+
+        end_unfinished_spans(None, None)

@@ -385,6 +385,38 @@ def end_span_once(span: Any, tracker: set[int], abandoned: bool = False) -> None
     span.end()
 
 
+def end_unfinished_spans(*spans: Any) -> None:
+    """Ends every span still open, for an exception no ``except Exception`` can catch.
+
+    ``asyncio.CancelledError`` inherits from ``BaseException``, deliberately, so a timeout or a
+    ``task.cancel()`` walks straight past every ``except Exception`` a handler writes. The blocking
+    paths ended their spans only from those clauses, so a cancelled run exported nothing at all: not a
+    wrong attribute, no span. The root carries the ``feature_flag`` event and every ``launchdarkly.*``
+    attribute, so a stranded root means the whole run never reaches AI Config Monitoring.
+
+    Call this from a ``finally``, not from an ``except``. The point is the paths an ``except`` cannot
+    see.
+
+    Spans are left at ``UNSET`` and marked ``launchdarkly.run.cancelled``. Nothing failed: the caller
+    went away. That is the same reasoning :func:`end_span_once` applies to an abandoned stream, and it
+    keeps the trace agreeing with LaunchDarkly's own metrics, which record neither a success nor an
+    error for a run that never finished.
+
+    A span another path already ended is skipped. ``is_recording()`` is ``False`` once ``end()`` has
+    run, so this is a no-op on the success path and cannot end a span twice. Setting an attribute after
+    ``end()`` logs a warning, which is why the check comes first. A ``None`` span is a no-op, matching
+    every other helper in this family.
+
+    This has no TypeScript counterpart, and needs none. An aborted request there rejects its promise
+    and the ``catch`` catches it. Only Python routes cancellation around a handler's guards.
+    """
+    for span in spans:
+        if span is None or not span.is_recording():
+            continue
+        span.set_attribute("launchdarkly.run.cancelled", True)
+        span.end()
+
+
 def parse_template(template: str, variables: dict[str, Any]) -> str:
     """
     Replaces ``{{variable}}`` placeholders in *template* with values from
