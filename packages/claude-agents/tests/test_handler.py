@@ -1767,6 +1767,37 @@ class TestAbandonedToolSpansAreNotErrors:
         assert tools[0].events == ()
         assert tools[0].attributes.get("launchdarkly.stream.abandoned") is True
 
+    async def test_a_cancelled_stream_says_cancelled_not_abandoned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The test above uses aclose(), which is a consumer choosing to stop: that is abandonment and
+        # keeps its word. A CancelledError is not a choice, so it gets the same marker the blocking
+        # path already uses. Reporting both as abandoned made a timed-out run and a timed-out stream
+        # disagree about why they stopped.
+        import asyncio
+
+        async def _slow_stream(**_kwargs: Any) -> AsyncIterator[Any]:
+            yield stream_event("chunk-1")
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(handler_mod, "query", _slow_stream)
+        h = create_claude_agents_handler()
+        gen = await h.stream(BASE_CONFIG, "q", {}, {})
+
+        async def _drain() -> None:
+            async for _ in gen:
+                pass
+
+        task = asyncio.create_task(_drain())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        root_span = next(s for s in spans() if s.name == "invoke_agent")
+        assert root_span.attributes.get("launchdarkly.run.cancelled") is True
+        assert "launchdarkly.stream.abandoned" not in root_span.attributes
+
     async def test_a_failed_run_still_marks_open_tool_spans_as_errors(self) -> None:
         # The distinction the fix rests on: failure keeps ERROR, abandonment does not.
         from launchdarkly_ai_claude_agents.handler import build_tool_hooks

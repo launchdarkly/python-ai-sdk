@@ -179,7 +179,9 @@ def _build_hooks(native_tool_map: dict[str, Any]) -> dict[str, Any] | None:
 
 ToolTelemetry = Callable[[BaseException], None]
 #: Ends every open tool span without failing it, for the abandonment path.
-AbandonTelemetry = Callable[[set[int]], None]
+#: Takes the ended-tracker and whether the unwind was a cancellation rather than a consumer
+#: stopping early, so a cancelled run marks launchdarkly.run.cancelled on its tool spans too.
+AbandonTelemetry = Callable[..., None]
 #: Ends every open tool span without failing it, for a task.cancel() the blocking path cannot
 #: see coming. Distinct from AbandonTelemetry: that one marks a span abandoned mid-stream, this
 #: one marks it launchdarkly.run.cancelled, via the same shared helper the root's own finally uses.
@@ -281,7 +283,7 @@ def build_tool_hooks(
             fail_span(span, error)
         tool_spans.clear()
 
-    def abandon_open_spans(ended: set[int]) -> None:
+    def abandon_open_spans(ended: set[int], cancelled: bool = False) -> None:
         """Ends every tool span still open, for stream abandonment.
 
         Unlike :func:`close_open_spans`, nothing failed: a consumer stopping early is normal, so
@@ -290,7 +292,7 @@ def build_tool_hooks(
         not read as an error in one SDK and a clean stop in another.
         """
         for span in list(tool_spans.values()):
-            end_span_once(span, ended, abandoned=True)
+            end_span_once(span, ended, abandoned=True, cancelled=cancelled)
         tool_spans.clear()
 
     def cancel_open_spans() -> None:
@@ -653,6 +655,10 @@ async def _stream_gen(
     ended: set[int] = set()
     gen: AsyncIterator[Any] | None = None
 
+    # Distinguishes the two teardown reasons. A consumer that stops reading abandoned the
+    # stream; a CancelledError means something cancelled the run, usually a timeout, and the
+    # consumer chose nothing. The blocking path already tells these apart.
+    cancelled = False
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -756,6 +762,9 @@ async def _stream_gen(
         end_span_once(span, ended)
         yield {"type": "done", "output": full_output, "usage": streamed_usage["total"]}
 
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as exc:
         if tool_telemetry is not None:
             tool_telemetry(exc)
@@ -776,10 +785,10 @@ async def _stream_gen(
             # Abandonment, not failure: UNSET plus the abandoned marker, the same as the model
             # span and the root get just below.
             if abandon_tool_spans is not None:
-                abandon_tool_spans(ended)
+                abandon_tool_spans(ended, cancelled=cancelled)
             if not root_usage_written and inference.run_usage["reported"]:
                 finish_root_span(span, config, inference.run_usage["total"])
-        end_span_once(span, ended, abandoned=True)
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
         # Same reasoning as the blocking path: a bare exit through this generator's boundary
         # abandons the vendor's own generator if it is not closed explicitly.
         if gen is not None:
