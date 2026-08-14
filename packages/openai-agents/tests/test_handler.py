@@ -986,6 +986,23 @@ class TestContentCapture:
         assert tool_span.attributes["gen_ai.tool.call.arguments"] == '{"q": "x"}'
         assert tool_span.attributes["gen_ai.tool.call.result"] == "found"
 
+    async def test_closes_the_tool_span_when_the_sdk_reports_no_call_id(self) -> None:
+        # `on_tool_start` filed the span under the tool name when `tool_call_id` was absent, while
+        # `on_tool_end` looked for the string "None". The span then never closed on success and stayed
+        # open until process teardown, so the run showed a tool that never returned.
+        turns = [{"tool_calls": [{"name": "search", "id": None}], "usage": _usage()}]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=_make_run(turns))
+        with ctx, _patched_agents(agents_mod):
+            await create_openai_agent_handler()(
+                CONFIG, "q", {"search": AsyncMock()}, {}
+            )
+        from opentelemetry.trace import StatusCode
+
+        tool = rec.named("execute_tool ")[0]
+        assert tool.ended == 1
+        assert StatusCode.OK in tool.statuses
+
     async def test_reports_tool_arguments_as_the_object_they_denote(self) -> None:
         # TELEMETRY-CONTRACT.md section 12: arguments hold the object the provider means, not the
         # encoding it chose. The Agents SDK carries a JSON string, so passing it through left the

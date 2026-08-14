@@ -238,10 +238,25 @@ class _SpanningHooks(_RunHooksBase):
             fail_span(span, exc)
             raise
 
-    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
-        call_id = getattr(context, "tool_call_id", None) or getattr(
-            tool, "name", "tool"
+    @staticmethod
+    def _tool_span_key(context: Any, tool: Any) -> str:
+        """The key an open tool span is filed under, computed the same way by both hooks.
+
+        ``on_tool_start`` used to fall back to the tool name when ``tool_call_id`` was absent, while
+        ``on_tool_end`` read ``str(context.tool_call_id)`` with no fallback. An absent id therefore
+        filed the span under the tool name and looked for it under the string ``"None"``, so the span
+        never closed on success and lived until process teardown.
+
+        Mirrors the single ``callId`` helper the TypeScript handler shares between its two hooks.
+        """
+        return str(
+            getattr(context, "tool_call_id", None)
+            or getattr(tool, "name", None)
+            or "tool"
         )
+
+    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+        call_id = self._tool_span_key(context, tool)
         name = getattr(context, "tool_name", None) or getattr(tool, "name", "tool")
         span = start_tool_span(str(name), str(call_id), self.parent)
         if self.capture_content:
@@ -261,8 +276,7 @@ class _SpanningHooks(_RunHooksBase):
     async def on_tool_end(
         self, context: Any, agent: Any, tool: Any, result: Any
     ) -> None:
-        call_id = str(getattr(context, "tool_call_id", None))
-        span = self.open_tool_spans.pop(call_id, None)
+        span = self.open_tool_spans.pop(self._tool_span_key(context, tool), None)
         if span is None:
             return
         if self.capture_content:
