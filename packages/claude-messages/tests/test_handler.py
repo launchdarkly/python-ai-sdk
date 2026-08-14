@@ -477,6 +477,10 @@ class RecordedSpan:
         self.exceptions: list[BaseException] = []
         self.ended = 0
 
+    def is_recording(self) -> bool:
+        """False once ended, like a real span. The teardown helpers ask before writing."""
+        return self.ended == 0
+
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
@@ -2117,3 +2121,64 @@ class TestCacheFiguresAreNotInvented:
         assert result["usage"]["cache_creation_input_tokens"] == 3580
         # Still unfolded, so parse_usage folds exactly once.
         assert result["usage"]["input_tokens"] == 3
+
+
+class TestCancellationEndsEverySpan:
+    """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end."""
+
+    async def test_a_cancelled_run_still_exports_its_spans(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before this,
+        # a cancelled run exported nothing at all: the root carries the feature_flag event and every
+        # launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather than showing
+        # as incomplete.
+        import asyncio
+
+        async def never_returns(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(3600)
+
+        mock_anthropic.messages.create = never_returns
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            task = asyncio.create_task(
+                create_claude_messages_handler()(CONFIG, "q", {}, {})
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        names = [s.name for s in rec.spans]
+        assert names[0] == "invoke_agent"
+        assert names[1].startswith("chat ")
+        assert all(s.ended == 1 for s in rec.spans)
+
+    async def test_a_cancelled_run_reports_unset_not_error(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # Nothing failed. The caller went away. ERROR would disagree with LaunchDarkly's own metrics,
+        # which record neither a success nor an error for a run that never finished.
+        import asyncio
+
+        async def never_returns(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(3600)
+
+        mock_anthropic.messages.create = never_returns
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            task = asyncio.create_task(
+                create_claude_messages_handler()(CONFIG, "q", {}, {})
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        for span in rec.spans:
+            assert span.statuses == []
+            assert span.attributes["launchdarkly.run.cancelled"] is True
