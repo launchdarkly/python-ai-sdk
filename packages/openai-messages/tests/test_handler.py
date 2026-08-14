@@ -2085,3 +2085,33 @@ class TestCancellationEndsEverySpan:
         for span in rec.spans:
             assert span.statuses == []
             assert span.attributes["launchdarkly.run.cancelled"] is True
+
+
+class TestEmptyOutputItemsDoNotHideTheAnswer:
+    """`gen_ai.completion.0` is the slot the trace view renders."""
+
+    async def test_a_reasoning_item_with_no_summary_is_dropped(
+        self, mock_openai: MagicMock
+    ) -> None:
+        # An encrypted reasoning item carries no summary text, so it produces no parts. Recorded as
+        # an empty message it took completion.0 and pushed the real answer to completion.1, so the
+        # trace view showed a blank reply.
+        reasoning = MagicMock()
+        reasoning.type = "reasoning"
+        reasoning.summary = []
+
+        resp = _make_response(output_text="the real answer")
+        resp.output = [reasoning, *resp.output]
+        mock_openai.responses.create = AsyncMock(return_value=resp)
+
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx:
+            await create_openai_messages_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
+
+        chat = rec.named("chat ")[0]
+        assert chat.attributes["gen_ai.completion.0.content"] == "the real answer"
+        assert "gen_ai.completion.1.content" not in chat.attributes

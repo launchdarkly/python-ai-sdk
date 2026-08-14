@@ -357,12 +357,21 @@ def set_response_output_content(span: Any, capture: bool, response: Any) -> None
     finish_reason = finish_reason_of(response)
     output = _attr(response, "output") or []
     messages = [
-        SpanMessage(
-            role=str(_attr(item, "role") or "assistant"),
-            parts=output_item_parts(item),
-            finish_reason=finish_reason,
+        message
+        for message in (
+            SpanMessage(
+                role=str(_attr(item, "role") or "assistant"),
+                parts=output_item_parts(item),
+                finish_reason=finish_reason,
+            )
+            for item in output
         )
-        for item in output
+        # An item that produced no parts is dropped rather than recorded empty. `output_item_parts`
+        # returns nothing for a reasoning item with no summary text, which is what an encrypted
+        # reasoning item looks like from here. Keeping it would put a blank message at
+        # `gen_ai.completion.0`, and that index is what the trace view renders: the reader would see
+        # an empty answer with the real one further down the list.
+        if message.parts
     ]
     set_output_content_attributes(span, capture, messages)
 
