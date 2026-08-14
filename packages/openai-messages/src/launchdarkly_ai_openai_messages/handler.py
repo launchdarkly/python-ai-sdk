@@ -38,6 +38,7 @@ from .spans import (
     succeed_span,
     to_span_usage,
     to_tool_definitions,
+    tool_arguments,
 )
 
 
@@ -234,7 +235,9 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                 for tc in tool_calls:
                     tool_span = start_tool_span(tc.name, tc.call_id, parent)
                     set_tool_call_content_attributes(
-                        tool_span, capture_content, arguments=tc.arguments
+                        tool_span,
+                        capture_content,
+                        arguments=tool_arguments(tc.arguments),
                     )
                     try:
                         args = json.loads(tc.arguments)
@@ -458,7 +461,7 @@ async def _stream_gen(
                 tool_span = start_tool_span(tc.name, tc.call_id, parent)
                 open_tool_span = tool_span
                 set_tool_call_content_attributes(
-                    tool_span, capture_content, arguments=tc.arguments
+                    tool_span, capture_content, arguments=tool_arguments(tc.arguments)
                 )
                 try:
                     args = json.loads(tc.arguments)

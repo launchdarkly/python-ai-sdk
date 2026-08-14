@@ -881,6 +881,83 @@ class TestContentCapture:
         assert chat.attributes["gen_ai.completion.0.content"] == "Hello World"
         assert "gen_ai.output.messages" in chat.attributes
 
+    async def test_reports_tool_arguments_as_the_object_they_denote(
+        self, mock_openai: MagicMock
+    ) -> None:
+        # TELEMETRY-CONTRACT.md section 12: arguments hold the object the provider means, not the
+        # encoding it chose. The Responses API sends a JSON string, so passing it through left the
+        # content carriers encoding it a second time and an OpenAI span described the same call
+        # differently from an Anthropic one. The handler parses this same string to call the tool.
+        cfg = {
+            **CONFIG,
+            "tools": {
+                "my-tool": {"description": "d", "parameters": {"type": "object"}}
+            },
+        }
+        mock_openai.responses.create = AsyncMock(
+            side_effect=[
+                _make_response(
+                    output_text="",
+                    tool_calls=[
+                        {"name": "my-tool", "call_id": "call-1", "args": {"q": "x"}}
+                    ],
+                ),
+                _make_response(output_text="done"),
+            ]
+        )
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx:
+            await create_openai_messages_handler(capture_content=True)(
+                cfg, "q", {"my-tool": lambda _: "r"}, {}
+            )
+
+        chat = next(
+            c
+            for c in rec.named("chat ")
+            if "my-tool" in str(c.attributes.get("gen_ai.output.messages", ""))
+        )
+        parts = json.loads(chat.attributes["gen_ai.output.messages"])[0]["parts"]
+        assert parts == [
+            {
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "my-tool",
+                "arguments": {"q": "x"},
+            }
+        ]
+        assert chat.attributes["gen_ai.completion.0.content"] == json.dumps(
+            {"name": "my-tool", "arguments": {"q": "x"}}
+        )
+
+    async def test_keeps_malformed_tool_arguments_verbatim(
+        self, mock_openai: MagicMock
+    ) -> None:
+        # A truncated argument string is worth reporting as it arrived. Raising inside the telemetry
+        # path would end a run the provider has already billed.
+        cfg = {
+            **CONFIG,
+            "tools": {
+                "my-tool": {"description": "d", "parameters": {"type": "object"}}
+            },
+        }
+        broken = _make_response(
+            output_text="", tool_calls=[{"name": "my-tool", "call_id": "call-1"}]
+        )
+        broken.output[0].arguments = '{"q":'
+        mock_openai.responses.create = AsyncMock(return_value=broken)
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx, pytest.raises(json.JSONDecodeError):
+            await create_openai_messages_handler(capture_content=True)(
+                cfg, "q", {"my-tool": lambda _: "r"}, {}
+            )
+
+        tool = rec.named("execute_tool ")[0]
+        assert tool.attributes["gen_ai.tool.call.arguments"] == '{"q":'
+
     async def test_records_the_tool_catalog_on_the_chat_span_when_enabled(
         self, mock_openai: MagicMock
     ) -> None:
