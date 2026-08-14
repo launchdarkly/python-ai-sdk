@@ -665,6 +665,10 @@ async def _stream_gen(
     AIMessage = msgs_mod.AIMessage
     ToolMessage = msgs_mod.ToolMessage
 
+    # Distinguishes the two teardown reasons. A consumer that stops reading abandoned the
+    # stream; a CancelledError means something cancelled the run, usually a timeout, and the
+    # consumer chose nothing. The blocking path already tells these apart.
+    cancelled = False
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -863,6 +867,9 @@ async def _stream_gen(
             },
         }
 
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as exc:
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
@@ -882,12 +889,12 @@ async def _stream_gen(
         # Tool span first: it is a child, and a reader following the tree should not meet a closed
         # parent above an open child.
         if open_tool_span is not None:
-            end_span_once(open_tool_span, ended, abandoned=True)
+            end_span_once(open_tool_span, ended, abandoned=True, cancelled=cancelled)
         if open_model_span is not None:
-            end_span_once(open_model_span, ended, abandoned=True)
+            end_span_once(open_model_span, ended, abandoned=True, cancelled=cancelled)
         if span is not None and id(span) not in ended and run_usage.reported:
             finish_root_span(span, config, run_usage.total)
-        end_span_once(span, ended, abandoned=True)
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
         if open_chunk_stream is not None:
             try:
                 await open_chunk_stream.aclose()
