@@ -420,6 +420,15 @@ async def _stream_gen(
                             yield {"type": "chunk", "text": text}
                             full_output = text
 
+        # The same reconciliation the blocking path does, for the same reason. This walk reads
+        # usage_metadata off the astream payloads, and sees nothing at all unless the graph is
+        # streaming updates rather than value snapshots. The callbacks read the LLMResult and also
+        # fall back to llm_output.token_usage. When only they saw anything, they are the only record
+        # of what the run cost, and a successful root reporting zero while its own chat spans report
+        # real tokens is the one outcome neither figure can be right about.
+        if not run_usage.reported and span_callbacks.run_usage.reported:
+            run_usage = span_callbacks.run_usage
+
         set_output_content_attributes(
             span,
             capture_content,

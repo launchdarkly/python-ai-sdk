@@ -1992,3 +1992,44 @@ class TestCancelledStreamSaysCancelled:
         callbacks.abandon_open_spans(set(), cancelled=True)
 
         assert seen["cancelled"] is True
+
+
+class TestStreamingRootUsageFallsBackToTheCallbacks:
+    """The blocking path reconciles the two usage sources; streaming did not."""
+
+    @pytest.mark.asyncio
+    async def test_a_provider_that_reports_only_in_llm_output_still_totals_the_root(
+        self,
+    ) -> None:
+        # The streaming walk reads usage_metadata off the astream payloads and sees nothing when a
+        # provider reports in llm_output.token_usage instead. Without the fallback the root wrote
+        # zero while its own chat spans held the billed tokens, which is the mismatch the blocking
+        # path already guards against.
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        class _LlmOutputOnlyModel(_FakeToolModel):
+            async def _agenerate(
+                self,
+                messages: Any,
+                stop: Any = None,
+                run_manager: Any = None,
+                **kwargs: Any,
+            ) -> Any:
+                reply = _ai_message("hi")
+                reply.usage_metadata = None
+                return ChatResult(
+                    generations=[ChatGeneration(message=reply)],
+                    llm_output={
+                        "token_usage": {"prompt_tokens": 11, "completion_tokens": 4}
+                    },
+                )
+
+        ctx, rec = _recording()
+        with ctx:
+            async for _ in await create_langchain_agents_handler(
+                _LlmOutputOnlyModel()
+            ).stream(BASE_CONFIG, "q", {}, {}):
+                pass
+
+        assert rec.root.attributes["gen_ai.usage.input_tokens"] == 11
+        assert rec.root.attributes["gen_ai.usage.total_tokens"] == 15
