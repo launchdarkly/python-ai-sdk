@@ -16,6 +16,7 @@ from launchdarkly_ai_server import (
     create_handler,
     create_run_usage,
     end_span_once,
+    end_unfinished_spans,
     parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
@@ -117,6 +118,10 @@ async def _run_model_turn(
     the raw provider response so the caller can inspect its output items.
     """
     model_span = start_model_span(config, parent)
+    # Held so the `finally` below can end whatever is still open. `except Exception` never sees an
+    # asyncio.CancelledError, which is a BaseException, so a timeout or a task.cancel() would
+    # otherwise strand this span.
+    open_model_span: Any = model_span
     # Everything that touches this span sits inside the try, including the content writes on both
     # sides of the call. Serialising conversation content raises on anything that is not
     # JSON-serialisable, and a raise outside the guard would leave this span open forever: only the
@@ -146,9 +151,16 @@ async def _run_model_turn(
         finish_reason = finish_reason_of(response)
         response_model = getattr(response, "model", None) or model_name(config)
         finish_model_span(model_span, response_model, usage, finish_reason)
+        open_model_span = None
     except Exception as exc:
         fail_span(model_span, exc)
+        open_model_span = None
         raise
+    finally:
+        # Not an `except`: the whole point is the unwind an `except Exception` cannot see. A
+        # cancelled turn still leaves its span exportable, marked and left at UNSET, because nothing
+        # failed. The caller went away.
+        end_unfinished_spans(open_model_span)
     return response
 
 
@@ -178,6 +190,13 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
 
         span = start_root_span(config, vs)
         parent = parent_context_of(span)
+        # Cleared by whichever path ends the root, so the `finally` can tell an open root from a
+        # closed one without asking the span. A mock span answers `is_recording()` truthily, and
+        # the test suites are built on mock spans.
+        open_root_span: Any = span
+        # Held for the same reason: a BaseException raised while a tool runs skips
+        # `except Exception` entirely, and `finally` is then the only code that can close this span.
+        open_tool_span: Any = None
 
         # Declared out here, not inside the `try`, so the failure path can still report the tokens
         # the run had already spent.
@@ -234,6 +253,7 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                 tool_outputs = []
                 for tc in tool_calls:
                     tool_span = start_tool_span(tc.name, tc.call_id, parent)
+                    open_tool_span = tool_span
                     set_tool_call_content_attributes(
                         tool_span,
                         capture_content,
@@ -258,8 +278,10 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                             tool_span, capture_content, result=result
                         )
                         succeed_span(tool_span)
+                        open_tool_span = None
                     except Exception as exc:
                         fail_span(tool_span, exc)
+                        open_tool_span = None
                         raise
                     tool_outputs.append(
                         {
@@ -290,6 +312,7 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
             response_model = getattr(response, "model", None) or model_name(config)
             finish_root_span(span, response_model, run_usage.total)
             succeed_span(span)
+            open_root_span = None
             # Cache keys are deliberately omitted: OpenAI's input already includes them, and
             # `parse_usage` would otherwise fold them in a second time.
             return {
@@ -306,7 +329,20 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
             if run_usage.reported:
                 finish_root_span(span, model_name(config), run_usage.total)
             fail_span(span, exc)
+            open_root_span = None
             raise
+        finally:
+            # Not an `except`: asyncio.CancelledError is a BaseException, so a timeout or a
+            # task.cancel() never reaches the clause above. Without this the root is stranded, and
+            # the root is the only span carrying the feature_flag event and the launchdarkly.*
+            # attributes, so the whole run would vanish from AI Config Monitoring rather than show
+            # as incomplete. Tool span first: it is a child, and a reader following the tree should
+            # not meet a closed parent above an open child.
+            if open_root_span is not None and run_usage.reported:
+                # The turns that completed were billed, the same reason the failure path reports
+                # them.
+                finish_root_span(open_root_span, model_name(config), run_usage.total)
+            end_unfinished_spans(open_tool_span, open_root_span)
 
     def _stream_impl(
         config: AiConfigRep,
