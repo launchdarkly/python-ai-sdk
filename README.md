@@ -103,7 +103,7 @@ pip install launchdarkly-ai-python launchdarkly-ai-openai-messages
 **With telemetry** (recommended for production) — traces export to the LaunchDarkly Observability dashboard:
 
 ```bash
-pip install "launchdarkly-ai[otel]" launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-python[otel]" launchdarkly-ai-openai-messages
 ```
 
 No code changes are needed — `init_client()` detects whether the OTel packages are present at runtime and configures the tracer provider automatically. If they are absent, the SDK logs a one-time warning and continues normally.
@@ -484,7 +484,64 @@ result2 = await config(
 
 ## Telemetry
 
-Every handler wraps its provider call in an OpenTelemetry span following [Gen AI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/). The core client also emits LaunchDarkly AI telemetry events (duration, token counts, generation success/failure) automatically on every `config().invoke()` call. No extra instrumentation code is required.
+Every handler emits OpenTelemetry spans following the [Gen AI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/). The core client also emits LaunchDarkly AI telemetry events (duration, token counts, generation success and failure) on every `config().invoke()` call. No extra instrumentation code is required.
+
+### The span tree
+
+One run produces three levels of span, the same shape from every handler:
+
+```
+invoke_agent                     one per call. Carries the LaunchDarkly identity,
+│                                the feature_flag event, and the run's token total.
+├── chat {model}                 one per model turn, with that turn's own tokens
+│                                and finish reason.
+└── execute_tool {tool_name}     one per tool call.
+```
+
+Tool spans are siblings of `chat`, not children of it. Both hang off the root.
+
+The root is the only span carrying `launchdarkly.config.key`, `launchdarkly.variation.key`,
+`launchdarkly.run.id` and the `feature_flag` event. That is what a config-scoped query in AI Config
+Monitoring finds, which is also why the root carries a run total: summing the children requires
+having already found them.
+
+A multi-turn run therefore reports each turn's cost separately, and a run that failed partway still
+reports what its completed turns cost.
+
+### Token counts and prompt caching
+
+Cached tokens are reported per turn, in `gen_ai.usage.cache_read.input_tokens` and
+`gen_ai.usage.cache_creation.input_tokens`, and folded into `gen_ai.usage.input_tokens` so that the
+input figure is always the total the model actually processed.
+
+This matters most on Anthropic, which reports cache reads and writes beside the input count rather
+than inside it. A turn that reads 19,971 tokens from cache and writes 3,580 more reports an input of
+3 from the provider; the span reports 23,554.
+
+### Conversation content is off by default
+
+Prompts, model output, tool arguments and tool results are personal data, so a span carries only
+metadata unless you ask for more: models, token counts, timings, tool names.
+
+Pass `capture_content=True` to a handler factory to include the conversation:
+
+```python
+from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+handler = create_claude_messages_handler(capture_content=True)
+```
+
+Turning this on sends the text of every request and response to whatever collector the SDK points
+at.
+
+### Streaming
+
+The streaming path emits the same spans as the blocking path. A consumer that stops reading early is
+a normal thing, not a failure: the run's spans still close and export, marked with
+`launchdarkly.stream.abandoned` and left at an unset status rather than an error, which matches what
+LaunchDarkly's own metrics record for an abandoned stream.
+
+### Graph runs
 
 When running inside `graph()`, every node's events carry the graph key, tool invocations emit `$ld:ai:tool_call`, and the graph run itself emits graph-level events (`$ld:ai:graph:invocation_success`/`invocation_failure`, `duration:total`, `total_tokens`, `path`, `handoff_success`/`handoff_failure`).
 
@@ -492,7 +549,7 @@ When running inside `graph()`, every node's events carry the graph key, tool inv
 
 The OpenTelemetry SDK packages are **optional** — detected at runtime via `importlib`. The LaunchDarkly server SDK (`launchdarkly-server-sdk`) is also an optional dependency; pass a pre-initialized client to `init_client(client=...)` if you bring your own.
 
-**OTel packages** (installed via `pip install "launchdarkly-ai[otel]"` or `pip install "launchdarkly-ai-server[otel]"`):
+**OTel packages** (installed via `pip install "launchdarkly-ai-python[otel]"` or `pip install "launchdarkly-ai-server[otel]"`):
 - **If installed:** `init_client()` sets up a `TracerProvider` with a GZIP-compressed OTLP HTTP exporter and W3C trace-context/baggage propagators — no code changes needed.
 - **If not installed:** `init_client()` logs a warning and continues. Feature flags and AI calls work normally; spans become no-ops.
 

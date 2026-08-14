@@ -61,7 +61,9 @@ jobs:
           python-version: "3.12"
       - run: uv lock
       - run: uv sync --all-packages
-      - run: uv run pytest packages/*/tests
+      # Not `packages/*/tests`: that glob silently skips the repo-root `tests/` directory, which
+      # holds the invariants no single package can own. `make test` runs this same bare command.
+      - run: uv run pytest
 
   # ─── Build ────────────────────────────────────────────────────────────────
   build:

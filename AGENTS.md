@@ -484,21 +484,76 @@ If `config["tools"]` is absent or empty, tool handling should be skipped entirel
 
 ### Telemetry
 
-Handlers must wrap the provider call in an OTel span, following [Gen AI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/):
+`TELEMETRY-CONTRACT.md` at the repo root is the authority for everything in this section. Read it
+before changing any span code. What follows is the summary, not the specification.
 
-**Span attributes:**
-- `gen_ai.system` — provider identifier (e.g. `"anthropic"`, `"openai"`)
-- `gen_ai.operation.name` — operation type (e.g. `"chat"`)
-- `gen_ai.request.model` — the model name from `config["model"]["name"]`
-- `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.total_tokens`
+Every handler emits three levels of span, and all six must agree:
 
-**Span events:**
-- `gen_ai.content.prompt` — emitted before the call with the final prompt text
-- `gen_ai.content.completion` — emitted after the call with the model's output text
+```
+invoke_agent                     one per call
+├── chat {model}                 one per model turn
+└── execute_tool {tool_name}     one per tool call, a sibling of chat
+```
 
-**Span status:**
-- Set to OK on success.
-- Set to ERROR and record the exception on failure. Re-raise the error after recording.
+Each package keeps its span construction in a `spans.py` beside its handler, so the tool loop reads
+as a tool loop rather than as span bookkeeping with a provider call in the middle.
+
+Do not hand-write a `span.set_attribute` for anything a shared helper covers. The helpers live in
+`launchdarkly_ai_server` and exist because six hand-rolled copies is how these spans drifted apart:
+
+| Helper | Writes |
+|---|---|
+| `set_model_identity_attributes` | `gen_ai.system`, `gen_ai.provider.name`, `gen_ai.request.model` |
+| `set_usage_span_attributes` | all seven `gen_ai.usage.*` keys, always, including zeros |
+| `set_ld_span_attributes` | the `launchdarkly.*` identity and the `feature_flag` event |
+| `set_input_content_attributes` | prompts, system instructions, tool catalog, gated |
+| `set_output_content_attributes` | model output, gated |
+| `set_tool_call_content_attributes` | tool arguments and results, gated |
+| `end_span_once` | an idempotent end, marking abandonment |
+
+#### Where things go
+
+The root is the only span carrying `launchdarkly.*` and the `feature_flag`
+event, because it is the span a config-scoped query finds. It also carries the run's token total,
+since summing the children requires having already found them. Children carry neither, and a test
+asserts it.
+
+#### Parent context is explicit
+
+These handlers open a plain span rather than an active one, so there
+is no ambient span for a child to inherit. Pass the parent through.
+
+#### Cache folding belongs at the call site, never in the shared writer
+
+Anthropic reports cache
+beside the input count, so its handlers add it in. OpenAI and LangChain already count it inside the
+input, so theirs pass the figure through. Centralising that rule would double-count for two
+providers out of three. `SpanUsage` is the type that means the folding is already done.
+
+#### Content is off by default
+
+Every factory takes `capture_content: bool = False`. Guard at the
+call site as well as inside the helper: the helper's guard makes a forgotten call site harmless, and
+the call site's guard avoids serialising JSON that would then be discarded, once per turn, in a loop.
+
+#### Finish reasons have three mechanisms, not one
+
+The Anthropic and LangChain handlers map the
+provider's word through the shared table. The two OpenAI handlers use the Responses API, which has no
+such field, and derive the value instead. Check the contract before writing one.
+
+#### Span status
+
+OK on success. ERROR with the exception recorded on failure, then re-raise. An
+abandoned stream is neither: it is marked and left unset.
+
+#### Streaming needs a `finally`
+
+`except Exception` does not catch `GeneratorExit`, which is a
+`BaseException`, so a consumer that breaks out of the loop skips the error path entirely. Without the
+cleanup the root span never ends, never exports, and the run disappears from AI Config Monitoring
+along with the `feature_flag` event it carries. Two handlers additionally have a vendor generator or
+run to close there; the contract names them.
 
 ### Return Shape
 

@@ -15,12 +15,12 @@ from .types import (
     ProviderHandler,
     ProviderResponse,
     StreamEvent,
-    UsageDict,
     VariationMeta,
 )
 from .utils import (
     parse_json_with_possible_fences,
     select_handler,
+    to_usage_dict,
 )
 
 
@@ -112,11 +112,7 @@ class ConfigInstance:
             else json.dumps(parsed_response)
         )
 
-        usage_obj = UsageDict(
-            input=usage.get("input", 0),
-            output=usage.get("output", 0),
-            total=usage.get("total", 0),
-        )
+        usage_obj = to_usage_dict(usage)
 
         if self._skip_judges:
             judge_tasks = await build_judge_tasks(

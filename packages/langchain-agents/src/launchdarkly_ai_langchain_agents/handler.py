@@ -5,6 +5,7 @@ Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -13,21 +14,30 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
+    SpanMessage,
+    SpanMessagePart,
     config,
     create_handler,
+    create_run_usage,
+    end_span_once,
+    end_unfinished_spans,
+    lang_chain_span_messages,
+    lang_chain_span_usage,
     parse_template,
-    set_ld_span_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
+    set_input_content_attributes,
+    set_output_content_attributes,
 )
 
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode as SpanStatusCode
-
-    _HAS_OTEL = True
-except ImportError:
-    _HAS_OTEL = False
+from .spans import (
+    build_span_callbacks,
+    fail_span,
+    finish_root_span,
+    mark_ok,
+    parent_context_of,
+    start_root_span,
+    succeed_span,
+    to_tool_definitions,
+)
 
 
 def _build_agent_tools(
@@ -142,9 +152,36 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
     return lc_openai.ChatOpenAI(model=model_name or "gpt-4o")
 
 
-def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
-    """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``."""
-    tracer_name = "@launchdarkly/ai-langchain-agents"
+def _run_usage_from_messages(messages: list[Any]) -> Any:
+    """Sums ``usage_metadata`` over a run's messages, the same set of numbers the callbacks see
+    from the other side.
+
+    Only ``AIMessage`` carries usage. Summing here rather than trusting the callbacks' own total
+    matters when there is a real ``result``/stepped state to read: it is the same path the TypeScript
+    handler takes.
+
+    The two sides do not read the same fields, though. This one sees ``usage_metadata`` only, and the
+    callbacks also fall back to ``llm_output.token_usage``. The caller reconciles them, because a
+    provider that reports only in ``llm_output`` would otherwise give a successful run a root that
+    says zero and chat spans that say otherwise.
+    """
+    run_usage = create_run_usage()
+    for msg in messages:
+        usage = getattr(msg, "usage_metadata", None)
+        if usage:
+            run_usage.add(lang_chain_span_usage(usage))
+    return run_usage
+
+
+def create_langchain_agents_handler(
+    llm: Any = None, *, capture_content: bool = False
+) -> ProviderHandler:
+    """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
+
+    Set *capture_content* to put prompts, model output, tool arguments and tool results on the
+    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
+    meaning models, token counts, timings and tool names, until a caller asks for more.
+    """
 
     async def _call_impl(
         config: AiConfigRep,
@@ -158,19 +195,12 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
         th = tool_handlers or {}
         vs = variables or {}
 
-        if _HAS_OTEL:
-            span = trace.get_tracer(tracer_name).start_span("langchain.agent")
-            span.set_attribute("gen_ai.operation.name", "chat")
-            span.set_attribute(
-                "gen_ai.system",
-                config.get("provider", {}).get("name", "langchain").lower(),
-            )
-            span.set_attribute(
-                "gen_ai.request.model", config.get("model", {}).get("name", "")
-            )
-            set_ld_span_attributes(span, vs)
-        else:
-            span = None
+        span = start_root_span(config, vs)
+        parent = parent_context_of(span)
+        # Cleared by whichever path ends the root, so the `finally` below can tell an open root
+        # from a closed one without asking the span. A mock span answers `is_recording()`
+        # truthily, and the test suite is built on mock spans.
+        open_root_span: Any = span
 
         system_prompt = _extract_system_prompt(config, vs, history)
         if config.get("outputFormat"):
@@ -181,34 +211,24 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
 
         initial_messages = _build_initial_messages(config, user_input, vs)
 
-        if span:
-            prompt_text = "\n".join(
-                [
-                    *(["system: " + system_prompt] if system_prompt else []),
-                    *[
-                        f"{getattr(m, 'type', type(m).__name__)}: {m.content}"
-                        for m in initial_messages
-                    ],
-                ]
-            )
-            span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-            prompt_msgs: list[dict[str, str]] = []
-            if system_prompt:
-                prompt_msgs.append({"role": "system", "content": system_prompt})
-            prompt_msgs.extend(
-                [
-                    {
-                        "role": getattr(m, "type", type(m).__name__),
-                        "content": m.content
-                        if isinstance(m.content, str)
-                        else str(m.content),
-                    }
-                    for m in initial_messages
-                ]
-            )
-            set_openllmetry_prompt(span, prompt_msgs)
+        span_callbacks = build_span_callbacks(
+            config,
+            parent,
+            capture_content,
+            to_tool_definitions(config.get("tools") or {}),
+        )
 
         try:
+            # Inside the guard, because serialising the prompt raises on anything that is not
+            # JSON-serialisable and a raise out here would leave the root open: never ended, never
+            # exported, and the run gone from AI Config Monitoring with the feature_flag event on it.
+            if capture_content:
+                set_input_content_attributes(
+                    span,
+                    capture_content,
+                    system_instructions=system_prompt,
+                    messages=lang_chain_span_messages(initial_messages)[1],
+                )
             base_model = llm
             if base_model is None:
                 base_model = _make_default_chat_model(config)
@@ -221,13 +241,25 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
                 tools,
                 **({"prompt": system_prompt} if system_prompt else {}),
             )
-            result = await agent.ainvoke({"messages": initial_messages})
+            result = await agent.ainvoke(
+                {"messages": initial_messages},
+                config={"callbacks": span_callbacks.callbacks},
+            )
 
             msgs = (
                 result.get("messages", [])
                 if isinstance(result, dict)
                 else getattr(result, "messages", [])
             )
+            run_usage = _run_usage_from_messages(msgs)
+            # The two sides do not see the same fields. A message carries usage_metadata and nothing
+            # else, while the callbacks read the LLMResult and fall back to llm_output.token_usage,
+            # which some providers use instead. When only the callbacks saw anything, they are the
+            # only record of what the run cost, and a successful root reporting zero while its own
+            # chat spans report real tokens is the one outcome neither figure can be right about.
+            if not run_usage.reported and span_callbacks.run_usage.reported:
+                run_usage = span_callbacks.run_usage
+
             last_msg = msgs[-1] if msgs else None
             output = (
                 (last_msg.content if isinstance(last_msg.content, str) else "")
@@ -235,51 +267,61 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
                 else ""
             )
 
-            total_input = sum(
-                (getattr(m, "usage_metadata", None) or {}).get("input_tokens", 0)
-                for m in msgs
+            # Built through the same conversion the chat span uses, not from `output`. A chat model
+            # may return content as a list of blocks, and `output` is deliberately blank for that
+            # case because it is also what this function returns to the caller. Reading it here made
+            # the root record an empty completion while its own chat child held the real text, so the
+            # two spans described the same reply differently.
+            #
+            # The blank return value is a separate question. It predates this work and is not
+            # telemetry, so it stays as it is.
+            set_output_content_attributes(
+                span,
+                capture_content,
+                lang_chain_span_messages([last_msg])[1]
+                if last_msg is not None
+                else [
+                    SpanMessage(
+                        role="assistant",
+                        parts=[SpanMessagePart(type="text", content=output)],
+                    )
+                ],
             )
-            total_output = sum(
-                (getattr(m, "usage_metadata", None) or {}).get("output_tokens", 0)
-                for m in msgs
-            )
-
-            if span:
-                span.set_attribute(
-                    "gen_ai.response.model", config.get("model", {}).get("name", "")
-                )
-                span.set_attribute("gen_ai.usage.input_tokens", total_input)
-                span.set_attribute("gen_ai.usage.output_tokens", total_output)
-                span.set_attribute(
-                    "gen_ai.usage.total_tokens", total_input + total_output
-                )
-                span.add_event(
-                    "gen_ai.content.completion",
-                    {
-                        "gen_ai.completion": output
-                        if isinstance(output, str)
-                        else json.dumps(output)
-                    },
-                )
-                set_openllmetry_completion(
-                    span,
-                    output if isinstance(output, str) else json.dumps(output),
-                    {"input_tokens": total_input, "output_tokens": total_output},
-                )
-                span.set_status(SpanStatusCode.OK)
-                span.end()
+            finish_root_span(span, config, run_usage.total)
+            succeed_span(span)
+            open_root_span = None
 
             return {
                 "output": output,
-                "usage": {"input_tokens": total_input, "output_tokens": total_output},
+                "usage": {
+                    "input_tokens": run_usage.total.input,
+                    "output_tokens": run_usage.total.output,
+                },
             }
 
         except Exception as exc:
-            if span:
-                span.record_exception(exc)
-                span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            span_callbacks.close_open_spans(exc)
+            # There is no `result` to sum, so the run total comes from the callbacks, which saw
+            # every turn that did complete. Those tokens were billed and the root is the only span
+            # a config-scoped cost query can find them on.
+            if span_callbacks.run_usage.reported:
+                finish_root_span(span, config, span_callbacks.run_usage.total)
+            fail_span(span, exc)
+            open_root_span = None
             raise
+        finally:
+            # Not an `except`: asyncio.CancelledError is a BaseException, so a timeout or a
+            # task.cancel() never reaches the clause above. Without this the root, and any chat or
+            # execute_tool span the callback handler opened but never closed, would be stranded.
+            # The root is the only span carrying the feature_flag event and the launchdarkly.*
+            # attributes, so the whole run would vanish from AI Config Monitoring rather than show
+            # as incomplete.
+            span_callbacks.cancel_open_spans()
+            if open_root_span is not None and span_callbacks.run_usage.reported:
+                # The turns that completed were billed, the same reason the failure path reports
+                # them.
+                finish_root_span(open_root_span, config, span_callbacks.run_usage.total)
+            end_unfinished_spans(open_root_span)
 
     def _stream_impl(
         config: AiConfigRep,
@@ -289,7 +331,13 @@ def create_langchain_agents_handler(llm: Any = None) -> ProviderHandler:
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         return _stream_gen(
-            llm, config, user_input, tool_handlers or {}, variables or {}, history
+            llm,
+            config,
+            user_input,
+            tool_handlers or {},
+            variables or {},
+            history,
+            capture_content=capture_content,
         )
 
     return create_handler(("*", "agent"), _call_impl, _stream_impl)  # type: ignore[arg-type]
@@ -302,54 +350,47 @@ async def _stream_gen(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
+    *,
+    capture_content: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
+    """Streams the run, emitting the same span tree as the blocking path.
+
+    A consumer that breaks out of ``async for``, or raises inside the loop body, makes this
+    generator run its ``finally`` without ever entering ``except``: ``GeneratorExit`` inherits from
+    ``BaseException``, so ``except Exception`` does not see it. Without the cleanup in ``finally``
+    the root span, and any ``chat``/``execute_tool`` span LangChain's end callback never fired for,
+    is never ended, so it is never exported.
+
+    ``ended`` stops the success, failure and abandonment paths from ending the same span twice.
+    """
     import importlib
 
-    tracer_name = "@launchdarkly/ai-langchain-agents"
-    if _HAS_OTEL:
-        span = trace.get_tracer(tracer_name).start_span("langchain.agent.stream")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute(
-            "gen_ai.system", config.get("provider", {}).get("name", "langchain").lower()
-        )
-        span.set_attribute(
-            "gen_ai.request.model", config.get("model", {}).get("name", "")
-        )
-        set_ld_span_attributes(span, variables)
-    else:
-        span = None
+    span = start_root_span(config, variables)
+    parent = parent_context_of(span)
 
     system_prompt = _extract_system_prompt(config, variables, history)
     initial_messages = _build_initial_messages(config, user_input, variables)
 
-    if span:
-        prompt_text = "\n".join(
-            [
-                *(["system: " + system_prompt] if system_prompt else []),
-                *[
-                    f"{getattr(m, 'type', type(m).__name__)}: {m.content}"
-                    for m in initial_messages
-                ],
-            ]
-        )
-        span.add_event("gen_ai.content.prompt", {"gen_ai.prompt": prompt_text})
-        prompt_msgs: list[dict[str, str]] = []
-        if system_prompt:
-            prompt_msgs.append({"role": "system", "content": system_prompt})
-        prompt_msgs.extend(
-            [
-                {
-                    "role": getattr(m, "type", type(m).__name__),
-                    "content": m.content
-                    if isinstance(m.content, str)
-                    else str(m.content),
-                }
-                for m in initial_messages
-            ]
-        )
-        set_openllmetry_prompt(span, prompt_msgs)
+    span_callbacks = build_span_callbacks(
+        config, parent, capture_content, to_tool_definitions(config.get("tools") or {})
+    )
+    ended: set[int] = set()
 
+    # Distinguishes the two teardown reasons. A consumer that stops reading abandoned the
+    # stream; a CancelledError means something cancelled the run, usually a timeout, and the
+    # consumer chose nothing. The blocking path already tells these apart.
+    cancelled = False
     try:
+        # Inside the guard, because serialising the prompt raises on anything that is not
+        # JSON-serialisable. A raise out here would leave the root open with the `finally` never
+        # entered, so the run would vanish from AI Config Monitoring with its feature_flag event.
+        if capture_content:
+            set_input_content_attributes(
+                span,
+                capture_content,
+                system_instructions=system_prompt,
+                messages=lang_chain_span_messages(initial_messages)[1],
+            )
         base_model = llm
         if base_model is None:
             base_model = _make_default_chat_model(config)
@@ -363,11 +404,14 @@ async def _stream_gen(
             **({"prompt": system_prompt} if system_prompt else {}),
         )
 
-        total_input = 0
-        total_output = 0
+        run_usage = create_run_usage()
         full_output = ""
 
-        async for step_state in agent.astream({"messages": initial_messages}):
+        # agent.astream() yields state updates per graph step: { [node_name]: { messages: [...] } }
+        async for step_state in agent.astream(
+            {"messages": initial_messages},
+            config={"callbacks": span_callbacks.callbacks},
+        ):
             for step_messages in (
                 step_state.values() if isinstance(step_state, dict) else []
             ):
@@ -377,52 +421,68 @@ async def _stream_gen(
                     else []
                 )
                 for msg in msgs:
-                    usage = getattr(msg, "usage_metadata", None) or {}
-                    total_input += usage.get("input_tokens", 0)
-                    total_output += usage.get("output_tokens", 0)
+                    usage = getattr(msg, "usage_metadata", None)
+                    if usage:
+                        run_usage.add(lang_chain_span_usage(usage))
                     if getattr(msg, "type", None) == "ai":
                         text = msg.content if isinstance(msg.content, str) else ""
                         if text:
                             yield {"type": "chunk", "text": text}
                             full_output = text
 
-        if span:
-            span.set_attribute(
-                "gen_ai.response.model", config.get("model", {}).get("name", "")
-            )
-            span.set_attribute("gen_ai.usage.input_tokens", total_input)
-            span.set_attribute("gen_ai.usage.output_tokens", total_output)
-            span.set_attribute("gen_ai.usage.total_tokens", total_input + total_output)
-            span.add_event(
-                "gen_ai.content.completion",
-                {
-                    "gen_ai.completion": full_output
-                    if isinstance(full_output, str)
-                    else json.dumps(full_output)
-                },
-            )
-            set_openllmetry_completion(
-                span,
-                full_output
-                if isinstance(full_output, str)
-                else json.dumps(full_output),
-                {"input_tokens": total_input, "output_tokens": total_output},
-            )
-            span.set_status(SpanStatusCode.OK)
-            span.end()
+        # The same reconciliation the blocking path does, for the same reason. This walk reads
+        # usage_metadata off the astream payloads, and sees nothing at all unless the graph is
+        # streaming updates rather than value snapshots. The callbacks read the LLMResult and also
+        # fall back to llm_output.token_usage. When only they saw anything, they are the only record
+        # of what the run cost, and a successful root reporting zero while its own chat spans report
+        # real tokens is the one outcome neither figure can be right about.
+        if not run_usage.reported and span_callbacks.run_usage.reported:
+            run_usage = span_callbacks.run_usage
+
+        set_output_content_attributes(
+            span,
+            capture_content,
+            [
+                SpanMessage(
+                    role="assistant",
+                    parts=[SpanMessagePart(type="text", content=full_output)],
+                )
+            ],
+        )
+        finish_root_span(span, config, run_usage.total)
+        mark_ok(span)
+        end_span_once(span, ended)
 
         yield {
             "type": "done",
             "output": full_output,
-            "usage": {"input_tokens": total_input, "output_tokens": total_output},
+            "usage": {
+                "input_tokens": run_usage.total.input,
+                "output_tokens": run_usage.total.output,
+            },
         }
 
-    except Exception as exc:
-        if span:
-            span.record_exception(exc)
-            span.set_status(SpanStatusCode.ERROR, str(exc))
-            span.end()
+    except asyncio.CancelledError:
+        cancelled = True
         raise
+    except Exception as exc:
+        span_callbacks.close_open_spans(exc)
+        if span_callbacks.run_usage.reported:
+            finish_root_span(span, config, span_callbacks.run_usage.total)
+        fail_span(span, exc, ended)
+        raise
+    finally:
+        # A no-op on the success and failure paths, because both already ended their spans through
+        # `ended`. On abandonment it is the only chance to close the tree, including any chat or
+        # tool span whose LangChain end callback never fired, and to report what the completed
+        # turns already cost. An abandoned span is left UNSET rather than ERROR: stopping early is
+        # a normal thing for a consumer to do, and LaunchDarkly's own metrics record neither a
+        # success nor an error for it.
+        if span is not None and id(span) not in ended:
+            span_callbacks.abandon_open_spans(ended, cancelled=cancelled)
+            if span_callbacks.run_usage.reported:
+                finish_root_span(span, config, span_callbacks.run_usage.total)
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
 
 
 def langchain_agents(
@@ -432,7 +492,13 @@ def langchain_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
+    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
+    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
+    # asking for content on spans got a TypeError instead of content.
     variables = kwargs.pop("variables", None)
+    capture_content = kwargs.pop("capture_content", False)
     return config(
-        key=config_key, handler=create_langchain_agents_handler(), **kwargs
+        key=config_key,
+        handler=create_langchain_agents_handler(capture_content=capture_content),
+        **kwargs,
     ).invoke(user_input, context, variables=variables)
