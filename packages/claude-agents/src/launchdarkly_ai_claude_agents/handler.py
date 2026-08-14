@@ -212,8 +212,17 @@ def build_tool_hooks(
         span = tool_spans.pop(tool_use_id, None)
         if span is None:
             return
-        if result is not None:
-            set_tool_call_content_attributes(span, capture_content, result=result)
+        # Once popped, ending it is this function's job alone: nothing else knows the span exists. A
+        # tool result comes from the caller's own function, so it can be anything, including something
+        # json.dumps refuses.
+        try:
+            if result is not None:
+                set_tool_call_content_attributes(span, capture_content, result=result)
+        except Exception as exc:
+            # `error or exc`, so a tool that already failed keeps the reason it failed. The
+            # serialisation problem is this span's second-worst fact, not its first.
+            fail_span(span, error or exc)
+            raise
         if error is None:
             succeed_span(span)
         else:
@@ -237,10 +246,13 @@ def build_tool_hooks(
         # side sees it without waiting for a message. See TELEMETRY-CONTRACT.md section 4.
         if span is not None and session_id:
             span.set_attribute("gen_ai.conversation.id", session_id)
+        # Filed before the content write, not after. Serialising the arguments can raise, and a raise
+        # out of an unfiled span leaves it open with nothing tracking it: close_open_spans and the
+        # teardown both walk this dict, so a span missing from it is a span that never exports.
+        tool_spans[use_id] = span
         set_tool_call_content_attributes(
             span, capture_content, arguments=input_data.get("tool_input")
         )
-        tool_spans[use_id] = span
         return {}
 
     async def _post_tool_use(

@@ -1947,3 +1947,83 @@ class TestCancellationEndsEverySpan:
         for span in spans():
             assert span.status.status_code == StatusCode.UNSET
             assert span.attributes.get("launchdarkly.run.cancelled") is True
+
+
+class TestToolSpanSurvivesAContentFailure:
+    """TELEMETRY-CONTRACT.md section 6: nothing may leave a span open."""
+
+    async def test_a_tool_result_that_will_not_serialise_still_ends_the_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A tool result comes from the caller's own function, so it can be anything, including
+        # something json.dumps refuses. Before this the write ran after the pop and outside any guard,
+        # so the span was untracked and unended: never exported, and a reader saw a tool that started
+        # and never returned.
+        class Unserialisable:
+            pass
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield init_message("s1")
+            hooks = kwargs["options"].hooks
+            await hooks["PreToolUse"][0].hooks[0](
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__tool-mcp__search",
+                    "tool_use_id": "tu-1",
+                    "tool_input": {},
+                },
+                "tu-1",
+                None,
+            )
+            with pytest.raises(TypeError):
+                await hooks["PostToolUse"][0].hooks[0](
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "tool_name": "mcp__tool-mcp__search",
+                        "tool_use_id": "tu-1",
+                        "tool_response": Unserialisable(),
+                    },
+                    "tu-1",
+                    None,
+                )
+            yield result_message("done")
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        await create_claude_agents_handler(capture_content=True)(
+            TOOL_CONFIG, "q", {"search": lambda _: "r"}
+        )
+
+        tool = named("execute_tool ")[0]
+        assert tool.end_time is not None
+
+    async def test_an_argument_that_will_not_serialise_leaves_the_span_trackable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The start hook wrote content before filing the span. A raise there left a span nothing knew
+        # about, so neither close_open_spans nor the teardown could ever end it.
+        class Unserialisable:
+            pass
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield init_message("s1")
+            hooks = kwargs["options"].hooks
+            with pytest.raises(TypeError):
+                await hooks["PreToolUse"][0].hooks[0](
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "mcp__tool-mcp__search",
+                        "tool_use_id": "tu-1",
+                        "tool_input": {"bad": Unserialisable()},
+                    },
+                    "tu-1",
+                    None,
+                )
+            yield result_message("done")
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        await create_claude_agents_handler(capture_content=True)(
+            TOOL_CONFIG, "q", {"search": lambda _: "r"}
+        )
+
+        tool = named("execute_tool ")[0]
+        assert tool.end_time is not None
