@@ -271,6 +271,10 @@ class RecordedSpan:
         self.exceptions: list[BaseException] = []
         self.ended = 0
 
+    def is_recording(self) -> bool:
+        """False once ended, like a real span. The teardown helpers ask before writing."""
+        return self.ended == 0
+
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
@@ -1104,6 +1108,64 @@ class TestErrorHandling:
             await create_openai_agent_handler()(CONFIG, "hi", {}, {})
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 100
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 20
+
+
+class TestCancellationEndsEverySpan:
+    """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end."""
+
+    async def test_a_cancelled_run_still_exports_its_spans(self) -> None:
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before
+        # this, a cancelled run exported nothing at all: the root carries the feature_flag event
+        # and every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather
+        # than showing as incomplete.
+        import asyncio
+
+        async def never_returns(
+            agent: Any, prompt: str, hooks: Any = None, **kw: Any
+        ) -> Any:
+            await hooks.on_llm_start(MagicMock(), agent, agent.instructions, prompt)
+            await asyncio.sleep(3600)
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=never_returns)
+        with ctx, _patched_agents(agents_mod):
+            task = asyncio.create_task(
+                create_openai_agent_handler()(CONFIG, "q", {}, {})
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert rec.names[0] == "invoke_agent"
+        assert rec.names[1].startswith("chat ")
+        assert all(s.ended == 1 for s in rec.spans)
+
+    async def test_a_cancelled_run_reports_unset_not_error(self) -> None:
+        # Nothing failed. The caller went away. ERROR would disagree with LaunchDarkly's own
+        # metrics, which record neither a success nor an error for a run that never finished.
+        import asyncio
+
+        async def never_returns(
+            agent: Any, prompt: str, hooks: Any = None, **kw: Any
+        ) -> Any:
+            await hooks.on_llm_start(MagicMock(), agent, agent.instructions, prompt)
+            await asyncio.sleep(3600)
+
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run=never_returns)
+        with ctx, _patched_agents(agents_mod):
+            task = asyncio.create_task(
+                create_openai_agent_handler()(CONFIG, "q", {}, {})
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        for span in rec.spans:
+            assert span.statuses == []
+            assert span.attributes["launchdarkly.run.cancelled"] is True
 
 
 # ---------------------------------------------------------------------------

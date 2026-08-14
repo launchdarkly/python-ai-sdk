@@ -32,6 +32,7 @@ from launchdarkly_ai_server import (
     create_handler,
     create_run_usage,
     end_span_once,
+    end_unfinished_spans,
     parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
@@ -414,6 +415,10 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
 
         span = start_root_span(config, vs)
         parent = parent_context_of(span)
+        # Cleared once this path (success or failure) has ended the root, so the `finally` below can
+        # tell an open root from a closed one without asking the span. A mock span answers
+        # `is_recording()` truthily, and the test suites are built on mock spans.
+        open_root_span: Any = span
 
         agent, prompt, instructions = _build_agent_and_prompt(
             config, user_input, th, vs, history
@@ -440,6 +445,7 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
             spent = _run_aggregate_usage(result) or run_usage.total
             finish_root_span(span, config, spent)
             succeed_span(span)
+            open_root_span = None
             output = (
                 final_output
                 if config.get("outputFormat")
@@ -456,7 +462,20 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
             hooks.close_open_spans(exc)
             _write_failed_run_usage(span, config, exc, run_usage)
             fail_span(span, exc)
+            open_root_span = None
             raise
+        finally:
+            # Not an `except`: asyncio.CancelledError is a BaseException, so a timeout or a
+            # task.cancel() never reaches the clause above. Without this the chat/execute_tool spans
+            # the hooks still had open, and the root itself, would be stranded, and the root is the
+            # only span carrying the feature_flag event and the launchdarkly.* attributes, so the
+            # whole run would vanish from AI Config Monitoring rather than show as incomplete.
+            end_unfinished_spans(hooks.open_model_span, *hooks.open_tool_spans.values())
+            if open_root_span is not None and run_usage.reported:
+                # The turns that completed were billed, the same reason the failure path reports
+                # them.
+                finish_root_span(open_root_span, config, run_usage.total)
+            end_unfinished_spans(open_root_span)
 
     def _stream_impl(
         config: AiConfigRep,
