@@ -139,6 +139,42 @@ class _LCMessage:
         return self._type
 
 
+class TestToolCallArgumentsAgreeAcrossCarriers:
+    def test_absent_arguments_are_omitted_not_written_as_null(self) -> None:
+        # to_canonical omits absent arguments. to_text used to write them as null, so the OpenLLMetry
+        # carrier said the model passed a null argument bag where the canonical one said it passed
+        # none. The module docstring promises the three carriers cannot disagree.
+        part = SpanMessagePart(type="tool_call", name="f")
+        assert part.to_canonical() == {"type": "tool_call", "name": "f"}
+        assert part.to_text() == json.dumps({"name": "f"})
+
+    def test_arguments_that_are_present_still_appear(self) -> None:
+        part = SpanMessagePart(type="tool_call", name="f", arguments={"q": 1})
+        assert part.to_text() == json.dumps({"name": "f", "arguments": {"q": 1}})
+
+    def test_an_empty_argument_bag_is_not_treated_as_absent(self) -> None:
+        # {} is a real thing a model can send: a tool called with no arguments. Only None is absent.
+        part = SpanMessagePart(type="tool_call", name="f", arguments={})
+        assert part.to_text() == json.dumps({"name": "f", "arguments": {}})
+
+
+class TestContentWritersToleratePeopleWithoutOpenTelemetry:
+    """Handlers hold None for every span when the `otel` extra is absent."""
+
+    def test_no_writer_raises_on_a_none_span(self) -> None:
+        # capture_content=True without the extra installed used to raise AttributeError from inside
+        # the telemetry path, after the provider had already billed the turn. Telemetry may report
+        # nothing; it may not break the call it is reporting on.
+        messages = [
+            SpanMessage(
+                role="assistant", parts=[SpanMessagePart(type="text", content="hi")]
+            )
+        ]
+        set_input_content_attributes(None, True, messages=messages)
+        set_output_content_attributes(None, True, messages)
+        set_tool_call_content_attributes(None, True, arguments={"a": 1}, result="r")
+
+
 class TestLangChainSpanMessages:
     def test_lifts_the_system_prompt_out(self) -> None:
         system, messages = lang_chain_span_messages(

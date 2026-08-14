@@ -102,7 +102,15 @@ class SpanMessagePart:
         if self.type in ("text", "reasoning"):
             return self.content or ""
         if self.type == "tool_call":
-            return json.dumps({"name": self.name or "", "arguments": self.arguments})
+            # `arguments` is omitted when absent, the same as :meth:`to_canonical` omits it. Writing
+            # it as null made this carrier say the model passed a null argument bag where the
+            # canonical one said it passed none, and the docstring above promises the three carriers
+            # cannot disagree. The absent tool result below has always been handled this way; the
+            # tool call was the half that was missed.
+            call: dict[str, Any] = {"name": self.name or ""}
+            if self.arguments is not None:
+                call["arguments"] = self.arguments
+            return json.dumps(call)
         if self.result is None:
             return ""
         if isinstance(self.result, str):
@@ -401,6 +409,11 @@ def set_input_content_attributes(
     say, which is asymmetric with the output side below. That asymmetry matches the TypeScript SDK
     and is deliberate rather than tidy.
     """
+    # A ``None`` span is a no-op, matching every other helper in this family. Handlers hold
+    # ``None`` for every span when the OpenTelemetry extra is absent, and a caller who asked for
+    # content should not get an AttributeError after the provider has already billed the turn.
+    if span is None:
+        return
     if not capture:
         return
 
@@ -446,6 +459,11 @@ def set_output_content_attributes(
 
     Unlike the input side, this writes nothing at all when there are no messages, event included.
     """
+    # A ``None`` span is a no-op, matching every other helper in this family. Handlers hold
+    # ``None`` for every span when the OpenTelemetry extra is absent, and a caller who asked for
+    # content should not get an AttributeError after the provider has already billed the turn.
+    if span is None:
+        return
     if not capture or not messages:
         return
     span.set_attribute(
@@ -492,6 +510,11 @@ def set_tool_call_content_attributes(
     Both are stringified rather than written as native attribute values: an argument bag is an
     object, and OTel attributes hold only primitives and sequences of primitives.
     """
+    # A ``None`` span is a no-op, matching every other helper in this family. Handlers hold
+    # ``None`` for every span when the OpenTelemetry extra is absent, and a caller who asked for
+    # content should not get an AttributeError after the provider has already billed the turn.
+    if span is None:
+        return
     if not capture:
         return
     if arguments is not None:
