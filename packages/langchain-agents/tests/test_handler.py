@@ -2033,3 +2033,25 @@ class TestStreamingRootUsageFallsBackToTheCallbacks:
 
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 11
         assert rec.root.attributes["gen_ai.usage.total_tokens"] == 15
+
+
+class TestRootCompletionWithBlockContent:
+    """The root and its chat child must describe the same reply the same way."""
+
+    @pytest.mark.asyncio
+    async def test_a_reply_in_content_blocks_still_reaches_the_root(self) -> None:
+        # `output` is blank whenever the last message content is a list, because it is also what the
+        # handler returns to the caller. Reading it for the span made the root record an empty
+        # completion while the chat child held the real text.
+        reply = _ai_message("")
+        reply.content = [{"type": "text", "text": "a typed block"}]
+        llm = _FakeToolModel(replies=[reply])
+
+        ctx, rec = _recording()
+        with ctx:
+            await create_langchain_agents_handler(llm, capture_content=True)(
+                BASE_CONFIG, "q"
+            )
+
+        assert rec.root.attributes["gen_ai.completion.0.content"] == "a typed block"
+        assert "a typed block" in str(rec.root.attributes["gen_ai.output.messages"])

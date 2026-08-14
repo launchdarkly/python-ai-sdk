@@ -267,10 +267,20 @@ def create_langchain_agents_handler(
                 else ""
             )
 
+            # Built through the same conversion the chat span uses, not from `output`. A chat model
+            # may return content as a list of blocks, and `output` is deliberately blank for that
+            # case because it is also what this function returns to the caller. Reading it here made
+            # the root record an empty completion while its own chat child held the real text, so the
+            # two spans described the same reply differently.
+            #
+            # The blank return value is a separate question. It predates this work and is not
+            # telemetry, so it stays as it is.
             set_output_content_attributes(
                 span,
                 capture_content,
-                [
+                lang_chain_span_messages([last_msg])[1]
+                if last_msg is not None
+                else [
                     SpanMessage(
                         role="assistant",
                         parts=[SpanMessagePart(type="text", content=output)],
