@@ -403,6 +403,10 @@ async def _stream_gen(
     run_usage = create_run_usage()
     last_response_model = model_name(config)
 
+    # Distinguishes the two teardown reasons. A consumer that stops reading abandoned the
+    # stream; a CancelledError means something cancelled the run, usually a timeout, and the
+    # consumer chose nothing. The blocking path already tells these apart.
+    cancelled = False
     try:
         tools = _build_tools(config.get("tools") or {})
         input_messages = _build_input_messages(config, user_input, variables, history)
@@ -549,6 +553,9 @@ async def _stream_gen(
             },
         }
 
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as exc:
         if open_model_span is not None:
             fail_span(open_model_span, exc, ended)
@@ -565,12 +572,12 @@ async def _stream_gen(
         # Tool span first: it is a child, and a reader following the tree should not meet a closed
         # parent above an open child.
         if open_tool_span is not None:
-            end_span_once(open_tool_span, ended, abandoned=True)
+            end_span_once(open_tool_span, ended, abandoned=True, cancelled=cancelled)
         if open_model_span is not None:
-            end_span_once(open_model_span, ended, abandoned=True)
+            end_span_once(open_model_span, ended, abandoned=True, cancelled=cancelled)
         if span is not None and id(span) not in ended and run_usage.reported:
             finish_root_span(span, last_response_model, run_usage.total)
-        end_span_once(span, ended, abandoned=True)
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
 
 
 def openai_messages(
