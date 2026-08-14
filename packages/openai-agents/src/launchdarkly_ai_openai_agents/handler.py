@@ -18,6 +18,7 @@ interface intercepts it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -311,7 +312,7 @@ class _SpanningHooks(_RunHooksBase):
             fail_span(self.open_model_span, error)
             self.open_model_span = None
 
-    def abandon_open_spans(self, ended: set[int]) -> None:
+    def abandon_open_spans(self, ended: set[int], cancelled: bool = False) -> None:
         """Ends every span this run has open, for stream abandonment.
 
         Unlike :meth:`close_open_spans`, nothing failed: a consumer stopping early is normal.
@@ -319,10 +320,12 @@ class _SpanningHooks(_RunHooksBase):
         rather than recording an exception and setting ``ERROR``.
         """
         for span in self.open_tool_spans.values():
-            end_span_once(span, ended, abandoned=True)
+            end_span_once(span, ended, abandoned=True, cancelled=cancelled)
         self.open_tool_spans.clear()
         if self.open_model_span is not None:
-            end_span_once(self.open_model_span, ended, abandoned=True)
+            end_span_once(
+                self.open_model_span, ended, abandoned=True, cancelled=cancelled
+            )
             self.open_model_span = None
 
 
@@ -559,6 +562,10 @@ async def _stream_gen(
     # teardown below has to cancel the Runner on an install with no spans at all.
     stream_completed = False
 
+    # Distinguishes the two teardown reasons. A consumer that stops reading abandoned the
+    # stream; a CancelledError means something cancelled the run, usually a timeout, and the
+    # consumer chose nothing. The blocking path already tells these apart.
+    cancelled = False
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -609,6 +616,9 @@ async def _stream_gen(
             },
         }
 
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as exc:
         hooks.close_open_spans(exc)
         _write_failed_run_usage(span, config, exc, run_usage)
@@ -630,10 +640,10 @@ async def _stream_gen(
             except Exception:  # pragma: no cover - best-effort teardown
                 pass
         if span is not None and id(span) not in ended:
-            hooks.abandon_open_spans(ended)
+            hooks.abandon_open_spans(ended, cancelled=cancelled)
             if run_usage.reported:
                 finish_root_span(span, config, run_usage.total)
-        end_span_once(span, ended, abandoned=True)
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
 
 
 def openai_agents(

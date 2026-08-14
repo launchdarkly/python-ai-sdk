@@ -2004,3 +2004,47 @@ class TestToolSpanSurvivesAContentFailure:
 
         tool = rec.named("execute_tool ")[0]
         assert tool.ended == 1
+
+
+class TestCancelledStreamSaysCancelled:
+    """TELEMETRY-CONTRACT.md section 6."""
+
+    async def test_a_cancelled_stream_says_cancelled_not_abandoned(self) -> None:
+        # A consumer that stops reading abandoned the stream, and keeps that word. A CancelledError
+        # is not a choice: something cancelled the run, usually a timeout. The blocking path already
+        # reports launchdarkly.run.cancelled, so reporting this one as abandoned made a timed-out run
+        # and a timed-out stream disagree about why they stopped.
+        import asyncio
+
+        ctx, rec = _recording()
+        turns = [{"deltas": ["one", "two", "three"], "output": _text_output("done")}]
+
+        class _SlowStreamedResult(FakeStreamedResult):
+            async def stream_events(self) -> Any:
+                # Suspends inside the generator, not in the consumer's loop body. Cancelling a
+                # consumer that is awaiting the next chunk raises CancelledError in here, which is
+                # the real timeout shape. Sleeping in the loop body instead would unwind as a
+                # GeneratorExit, which is abandonment and a different thing.
+                async for event in super().stream_events():
+                    yield event
+                await asyncio.sleep(3600)
+
+        def run_streamed(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            return _SlowStreamedResult(agent, prompt, hooks, turns, "done")
+
+        agents_mod = _fake_agents_module(run_streamed=run_streamed)
+
+        async def _drain() -> None:
+            with ctx, _patched_agents(agents_mod):
+                gen = await create_openai_agent_handler().stream(CONFIG, "q", {}, {})
+                async for _ in gen:
+                    pass
+
+        task = asyncio.create_task(_drain())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert rec.root.attributes.get("launchdarkly.run.cancelled") is True
+        assert "launchdarkly.stream.abandoned" not in rec.root.attributes
