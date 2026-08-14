@@ -17,7 +17,6 @@ from launchdarkly_ai_server import (
     AiConfigRep,
     SpanMessage,
     SpanMessagePart,
-    SpanUsage,
     ToolDefinitionInput,
     add_cached_tokens_to_input,
     number_or_zero,
@@ -335,8 +334,3 @@ def raw_usage_of(usage: Any) -> dict[str, Any]:
         if value is not None:
             out[field] = value
     return out
-
-
-def span_usage_of(raw_usage: dict[str, Any]) -> SpanUsage:
-    """This turn's usage as a ``SpanUsage``, with Anthropic's cache rule applied."""
-    return add_cached_tokens_to_input(raw_usage)
