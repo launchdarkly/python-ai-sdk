@@ -21,6 +21,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 
 | File | Responsibility |
 |---|---|
+| `src/launchdarkly_ai_server/conversation.py` | `conversation_id`, `ConversationIdSpanProcessor` — stamps `gen_ai.conversation.id` |
 | `src/launchdarkly_ai_server/lifecycle.py` | `init_client`, `get_client`, `shutdown`, `extract_variation` |
 | `src/launchdarkly_ai_server/client.py` | `config()`, `ConfigInstance` |
 | `src/launchdarkly_ai_server/tracking.py` | `execute_and_track`, `execute_and_stream`, `wrap_tool_handlers`, `parse_usage` |
@@ -41,6 +42,7 @@ Key symbols exported from `launchdarkly_ai_server`:
 ```python
 # Lifecycle
 from launchdarkly_ai_server import init_client, get_client, shutdown, extract_variation
+from launchdarkly_ai_server import conversation_id, set_conversation_id_if_absent, ConversationIdSpanProcessor
 
 # Types
 from launchdarkly_ai_server import (
@@ -118,14 +120,31 @@ Handlers may return any of these — the client normalizes them before emitting 
       - Calls `handler(config, user_input, tool_handlers, variables)`
       - On success: emits `$ld:ai:generation:success` + token tracks
       - On error: emits `$ld:ai:generation:error` then re-raises
-3. If `judge_configuration.judges` is present, runs each judge handler (sampled by `sampling_rate`) against the primary response and tracks `evaluation_metric_key`.
+3. If `judge_configuration.judges` is present, runs each judge handler (sampled by `sampling_rate`) against the primary response, tracks `evaluation_metric_key`, and emits a `gen_ai.evaluation.result` span event on the judge's `invoke_agent` span (`gen_ai.evaluation.name` / `.score.value` / `.explanation`).
 4. Returns `ProviderResponse`: `{ response: str, usage: UsageDict, track_data: TrackData, judge_results?: dict[str, JudgeResult], judge_tasks?: list[JudgeTask] }`. `judge_results` is populated when `skip_judges=False` (default) and judges ran; `judge_tasks` is populated when `skip_judges=True`.
+
+---
+
+## Conversation grouping
+
+LaunchDarkly's conversation view groups spans on `gen_ai.conversation.id`. Bind a caller-supplied id around any `invoke()` / `stream()` / `graph().invoke()` call:
+
+```python
+from launchdarkly_ai_server import conversation_id, config
+
+with conversation_id("thread-123"):
+    await config(key=key, handler=handler).invoke(user_input, ctx)
+```
+
+`init_client()` registers a span processor that stamps the id write-if-absent on every SDK span (root, chat, execute_tool, graph). No id is invented when the caller supplies none — a UUID, a trace id, or a content hash would violate the semantic conventions.
+
+This is an OTel context value, not W3C baggage, so the id does not leak onto outbound provider HTTP calls. A multi-tenant process must bind a different id per request; do not put it on the tracer resource.
 
 ---
 
 ## OTel Setup
 
-The core client owns all OTel initialization. `init_client()` configures a `TracerProvider` with a `BatchSpanProcessor` and an OTLP HTTP exporter when the optional OTel packages are installed.
+The core client owns all OTel initialization. `init_client()` configures a `TracerProvider` with `ConversationIdSpanProcessor` and a `BatchSpanProcessor` plus an OTLP HTTP exporter when the optional OTel packages are installed.
 
 **Required packages:**
 

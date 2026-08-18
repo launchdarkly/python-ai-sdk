@@ -18,7 +18,7 @@ import sys
 
 import examples.register  # noqa: F401 – side-effect: populate global_registry
 from examples.utils import new_context, write_output
-from launchdarkly_ai_server import config, global_registry
+from launchdarkly_ai_server import config, conversation_id, global_registry
 
 HISTORY = [
     {
@@ -48,10 +48,11 @@ HISTORY_PROMPT = (
 
 async def run(key: str, user_input: str) -> None:
     prompt = user_input or HISTORY_PROMPT
-    response = await config(
-        key=key,
-        registry=global_registry,
-    ).invoke(prompt, new_context(), variables=None, history=HISTORY)
+    with conversation_id("history-example"):
+        response = await config(
+            key=key,
+            registry=global_registry,
+        ).invoke(prompt, new_context(), variables=None, history=HISTORY)
 
     text = str(
         response.get("response", "")
