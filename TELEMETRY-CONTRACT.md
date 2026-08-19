@@ -212,22 +212,6 @@ when `conversation_id(...)` is bound.
 
 ---
 
-## 4a. Judge evaluation events
-
-A judge run is itself a tracked AI call (`invoke_agent` + `chat`). After the score is parsed, the
-SDK writes a `gen_ai.evaluation.result` span event on that `invoke_agent` span:
-
-| Event attribute | Value |
-|---|---|
-| `gen_ai.evaluation.name` | judge config key |
-| `gen_ai.evaluation.score.value` | numeric score |
-| `gen_ai.evaluation.explanation` | judge reasoning, when present |
-
-The same keys are mirrored as span attributes. `gen_ai.evaluation.score.label` is not invented.
-The existing `track(evaluationMetricKey)` call is unchanged and still feeds AI Config Monitoring.
-
----
-
 ## 5. Finish reasons
 
 One vocabulary across all six handlers: `stop`, `length`, `content_filter`, `tool_calls`, `error`.
