@@ -684,7 +684,9 @@ class TestNativeGraphConversationId:
         # A real tracer behind the module's `trace` lookup: the span and the processor are real,
         # only the global-provider registration is bypassed (it is process-wide and set once).
         real_trace = MagicMock()
-        real_trace.get_tracer.return_value = provider.get_tracer("native-graph-test")
+        real_trace.get_tracer.return_value = provider.get_tracer(
+            "@launchdarkly/ai-claude-agents"
+        )
 
         mock_sdk = _make_sdk_mock("done")
         graph_def = _make_graph_def()
