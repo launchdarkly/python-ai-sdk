@@ -308,6 +308,11 @@ EXPECTED_VOCABULARY = {
     "gen_ai.response.finish_reasons",
     "gen_ai.agent.name",
     "gen_ai.conversation.id",
+    # Judge evaluation event + mirrored span attributes on the judge invoke_agent span
+    "gen_ai.evaluation.result",
+    "gen_ai.evaluation.name",
+    "gen_ai.evaluation.score.value",
+    "gen_ai.evaluation.explanation",
     # Usage
     "gen_ai.usage.input_tokens",
     "gen_ai.usage.output_tokens",

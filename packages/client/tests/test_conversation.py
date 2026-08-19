@@ -13,6 +13,7 @@ from launchdarkly_ai_server.conversation import (
     ConversationIdSpanProcessor,
     conversation_id,
     set_conversation_id_if_absent,
+    with_judge_evaluation,
 )
 
 _exporter = InMemorySpanExporter()
@@ -79,3 +80,20 @@ class TestSetConversationIdIfAbsent:
         set_conversation_id_if_absent(span, "sess-abc")
         span.end()
         assert finished()[0].attributes[GEN_AI_CONVERSATION_ID] == "sess-abc"
+
+
+class TestJudgeEvaluation:
+    async def test_puts_evaluation_event_on_invoke_agent(self) -> None:
+        async with with_judge_evaluation("relevance-judge") as record:
+            with _tracer.start_as_current_span("invoke_agent") as span:
+                span.set_attribute("gen_ai.operation.name", "invoke_agent")
+            record(0.91, "on topic")
+        span = next(s for s in finished() if s.name == "invoke_agent")
+        assert span.attributes["gen_ai.evaluation.name"] == "relevance-judge"
+        assert span.attributes["gen_ai.evaluation.score.value"] == 0.91
+        assert span.attributes["gen_ai.evaluation.explanation"] == "on topic"
+        event = next(e for e in span.events if e.name == "gen_ai.evaluation.result")
+        assert event.attributes["gen_ai.evaluation.name"] == "relevance-judge"
+        assert event.attributes["gen_ai.evaluation.score.value"] == 0.91
+        assert event.attributes["gen_ai.evaluation.explanation"] == "on topic"
+        assert "gen_ai.evaluation.score.label" not in event.attributes

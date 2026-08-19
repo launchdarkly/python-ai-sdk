@@ -1,4 +1,4 @@
-"""Caller-supplied ``gen_ai.conversation.id``.
+"""Caller-supplied ``gen_ai.conversation.id`` and judge evaluation span events.
 
 A dedicated OTel context key, not W3C baggage: the id must not leak onto outbound
 provider HTTP calls. A multi-tenant process binds a different id per request.
@@ -6,8 +6,9 @@ provider HTTP calls. A multi-tenant process binds a different id per request.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator
-from contextlib import aclosing, contextmanager
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from contextlib import aclosing, asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import context as otel_context
@@ -25,6 +26,15 @@ else:
 GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
 
 _CONV_KEY = otel_context.create_key("launchdarkly.gen_ai.conversation.id")
+_EVAL_KEY = otel_context.create_key("launchdarkly.judge.evaluation")
+
+
+@dataclass
+class _JudgeEvalCapture:
+    name: str
+    released: bool = False
+    span: Any = None
+    pending_end: Callable[[], None] | None = None
 
 
 def _read_attribute(span: Any, key: str) -> Any:
@@ -51,6 +61,50 @@ def _conversation_id_from(ctx: otel_context.Context | None) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _record_evaluation(
+    span: Any, name: str, score: float, explanation: str | None
+) -> None:
+    if span is None or not span.is_recording():
+        return
+    attrs: dict[str, Any] = {
+        "gen_ai.evaluation.name": name,
+        "gen_ai.evaluation.score.value": score,
+    }
+    if explanation:
+        attrs["gen_ai.evaluation.explanation"] = explanation
+    span.add_event("gen_ai.evaluation.result", attrs)
+    span.set_attribute("gen_ai.evaluation.name", name)
+    span.set_attribute("gen_ai.evaluation.score.value", score)
+    if explanation:
+        span.set_attribute("gen_ai.evaluation.explanation", explanation)
+
+
+def _delay_invoke_agent_end(span: Any, capture: _JudgeEvalCapture) -> None:
+    original_end = span.end
+    ended = False
+
+    def wrapped_end(*args: Any, **kwargs: Any) -> None:
+        nonlocal ended
+        if ended:
+            return
+        if capture.released:
+            ended = True
+            original_end(*args, **kwargs)
+            return
+        capture.span = span
+
+        def pending() -> None:
+            nonlocal ended
+            if ended:
+                return
+            ended = True
+            original_end(*args, **kwargs)
+
+        capture.pending_end = pending
+
+    span.end = wrapped_end
+
+
 @contextmanager
 def conversation_id(conversation: str) -> Iterator[None]:
     """Bind a caller-supplied conversation id for the duration of the ``with`` block.
@@ -68,6 +122,9 @@ def conversation_id(conversation: str) -> Iterator[None]:
         yield
     finally:
         otel_context.detach(token)
+
+
+RecordEvaluation = Callable[[float, str | None], None]
 
 
 async def _stream_with_bound_id(
@@ -107,8 +164,31 @@ def bind_conversation_id(
     return _stream_with_bound_id(generator, conversation)
 
 
+@asynccontextmanager
+async def with_judge_evaluation(name: str) -> AsyncIterator[RecordEvaluation]:
+    """Hold the judge ``invoke_agent`` span open until ``record`` runs.
+
+    ``execute_and_track`` returns after the handler has already called ``span.end()``,
+    so without this delay the evaluation event would be dropped.
+    """
+    capture = _JudgeEvalCapture(name=name)
+
+    def record(score: float, explanation: str | None = None) -> None:
+        if capture.span is not None:
+            _record_evaluation(capture.span, capture.name, score, explanation)
+
+    token = otel_context.attach(otel_context.set_value(_EVAL_KEY, capture))
+    try:
+        yield record
+    finally:
+        capture.released = True
+        if capture.pending_end is not None:
+            capture.pending_end()
+        otel_context.detach(token)
+
+
 class ConversationIdSpanProcessor(_SpanProcessorBase):
-    """Stamps ``gen_ai.conversation.id`` write-if-absent on every span.
+    """Stamps ``gen_ai.conversation.id`` write-if-absent; delays judge ``invoke_agent`` end.
 
     Structurally a ``SpanProcessor``; the base is only real to a type checker so that an
     api-only install (no ``[otel]`` extra) still imports this module.
@@ -126,6 +206,15 @@ class ConversationIdSpanProcessor(_SpanProcessorBase):
         )
         if conv:
             set_conversation_id_if_absent(span, conv)
+
+        capture = otel_context.get_value(_EVAL_KEY, ctx)
+        if capture is None:
+            capture = otel_context.get_value(_EVAL_KEY)
+        if (
+            isinstance(capture, _JudgeEvalCapture)
+            and getattr(span, "name", None) == "invoke_agent"
+        ):
+            _delay_invoke_agent_end(span, capture)
 
     def on_end(self, span: Any) -> None:
         return None
