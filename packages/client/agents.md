@@ -136,6 +136,19 @@ with conversation_id("thread-123"):
     await config(key=key, handler=handler).invoke(user_input, ctx)
 ```
 
+`stream()` binds at call time rather than on first `__anext__`, so building the generator inside
+the block and iterating it later — the normal shape for a chat app — keeps the id:
+
+```python
+with conversation_id("thread-123"):
+    gen = config(key=key, handler=handler).stream(user_input, ctx)
+async for event in gen:  # spans opened here still carry thread-123
+    ...
+```
+
+Only the id is re-applied per step; the ambient context at iteration time is otherwise untouched,
+so streaming span parenting is the same as it is with no id bound.
+
 `init_client()` registers a span processor that stamps the id write-if-absent on every SDK span (root, chat, execute_tool, graph). No id is invented when the caller supplies none — a UUID, a trace id, or a content hash would violate the semantic conventions.
 
 This is an OTel context value, not W3C baggage, so the id does not leak onto outbound provider HTTP calls. A multi-tenant process must bind a different id per request; do not put it on the tracer resource.
