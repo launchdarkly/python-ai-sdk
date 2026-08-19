@@ -24,6 +24,7 @@ from launchdarkly_ai_server import ProviderHandler, config
 from launchdarkly_ai_server.conversation import (
     GEN_AI_CONVERSATION_ID,
     ConversationIdSpanProcessor,
+    bind_conversation_id,
     conversation_id,
 )
 
@@ -33,7 +34,7 @@ _exporter = InMemorySpanExporter()
 _provider = TracerProvider()
 _provider.add_span_processor(ConversationIdSpanProcessor())
 _provider.add_span_processor(SimpleSpanProcessor(_exporter))
-_tracer = _provider.get_tracer("stream-conversation-test")
+_tracer = _provider.get_tracer("@launchdarkly/ai-server")
 
 
 @pytest.fixture(autouse=True)
@@ -194,3 +195,72 @@ class TestConcurrentConversationIsolation:
         }
         assert by_name["tenant-a:invoke_agent"] == "tenant-a"
         assert by_name["tenant-b:invoke_agent"] == "tenant-b"
+
+
+class TestStreamParentingWithIdBound:
+    """The unbound parenting test cannot catch a regression in the wrapper — it never builds one.
+
+    A real streaming handler holds a span current across a ``yield``. The wrapper must not disturb
+    that: a span the handler opens after resuming belongs to its own ``chat`` span, exactly as it
+    would with no id bound.
+    """
+
+    async def _run(self, bind: bool) -> tuple[Any, Any, Any]:
+        _exporter.clear()
+
+        async def handler() -> AsyncGenerator:
+            with trace.use_span(_tracer.start_span("chat"), end_on_exit=True):
+                yield "c1"
+                child = _tracer.start_span("child-after-resume")
+                child.end()
+                yield "c2"
+
+        caller = _tracer.start_span("caller")
+        with trace.use_span(caller, end_on_exit=False):
+            if bind:
+                with conversation_id("thread-x"):
+                    gen = bind_conversation_id(handler())
+            else:
+                gen = handler()
+            async for _ in gen:
+                pass
+        caller.end()
+
+        spans = {s.name: s for s in finished()}
+        return caller, spans.get("chat"), spans.get("child-after-resume")
+
+    async def test_child_after_resume_keeps_its_parent_when_id_is_bound(self) -> None:
+        _, chat, child = await self._run(bind=True)
+        assert chat is not None and child is not None
+        assert child.parent is not None
+        assert child.parent.span_id == chat.context.span_id
+
+    async def test_parenting_matches_the_unbound_control(self) -> None:
+        caller_u, chat_u, child_u = await self._run(bind=False)
+        unbound = (
+            chat_u.parent.span_id == caller_u.context.span_id,
+            child_u.parent.span_id == chat_u.context.span_id,
+        )
+        caller_b, chat_b, child_b = await self._run(bind=True)
+        bound = (
+            chat_b.parent.span_id == caller_b.context.span_id,
+            child_b.parent.span_id == chat_b.context.span_id,
+        )
+        assert bound == unbound
+
+    async def test_binding_does_not_leak_into_the_caller_context(self) -> None:
+        from opentelemetry import context as otel_context
+
+        from launchdarkly_ai_server.conversation import _CONV_KEY
+
+        await self._run(bind=True)
+        assert otel_context.get_value(_CONV_KEY) is None
+
+
+class TestNullishConversationId:
+    async def test_none_id_is_treated_as_unbound_rather_than_raising(self) -> None:
+        # The natural call site is an optional header: conversation_id(request.thread_id)
+        with conversation_id(None):  # type: ignore[arg-type]
+            span = _tracer.start_span("invoke_agent")
+            span.end()
+        assert (finished()[0].attributes or {}).get(GEN_AI_CONVERSATION_ID) is None

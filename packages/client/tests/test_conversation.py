@@ -19,7 +19,7 @@ _exporter = InMemorySpanExporter()
 _provider = TracerProvider()
 _provider.add_span_processor(ConversationIdSpanProcessor())
 _provider.add_span_processor(SimpleSpanProcessor(_exporter))
-_tracer = _provider.get_tracer("conversation-test")
+_tracer = _provider.get_tracer("@launchdarkly/ai-server")
 
 
 @pytest.fixture(autouse=True)
@@ -79,3 +79,31 @@ class TestSetConversationIdIfAbsent:
         set_conversation_id_if_absent(span, "sess-abc")
         span.end()
         assert finished()[0].attributes[GEN_AI_CONVERSATION_ID] == "sess-abc"
+
+
+class TestProcessorScope:
+    """The processor is registered on the *global* provider, so it sees every span in the process.
+
+    Stamping a caller-supplied conversation id onto unrelated telemetry — Postgres queries, inbound
+    HTTP server spans, and the outbound provider call itself — is both semantically wrong and the
+    leak the module docstring says this design avoids.
+    """
+
+    def test_stamps_spans_from_launchdarkly_tracers(self) -> None:
+        tracer = _provider.get_tracer("@launchdarkly/ai-claude-messages")
+        with conversation_id("thread-123"):
+            span = tracer.start_span("invoke_agent")
+            span.end()
+        assert finished()[0].attributes[GEN_AI_CONVERSATION_ID] == "thread-123"
+
+    def test_does_not_stamp_third_party_instrumentation_spans(self) -> None:
+        http = _provider.get_tracer("opentelemetry.instrumentation.httpx")
+        db = _provider.get_tracer("opentelemetry.instrumentation.psycopg")
+        with conversation_id("thread-123"):
+            for tracer, name in ((http, "POST /v1/messages"), (db, "SELECT users")):
+                span = tracer.start_span(name)
+                span.end()
+        for span in finished():
+            assert (span.attributes or {}).get(GEN_AI_CONVERSATION_ID) is None, (
+                span.name
+            )
