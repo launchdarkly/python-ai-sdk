@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
+from time import time_ns
 
 import pytest
 from opentelemetry import trace
@@ -87,16 +89,45 @@ class TestJudgeEvaluation:
         async with with_judge_evaluation("relevance-judge") as record:
             with _tracer.start_as_current_span("invoke_agent") as span:
                 span.set_attribute("gen_ai.operation.name", "invoke_agent")
-            record(0.91, "on topic")
+            record(0.91)
         span = next(s for s in finished() if s.name == "invoke_agent")
         assert span.attributes["gen_ai.evaluation.name"] == "relevance-judge"
         assert span.attributes["gen_ai.evaluation.score.value"] == 0.91
-        assert span.attributes["gen_ai.evaluation.explanation"] == "on topic"
         event = next(e for e in span.events if e.name == "gen_ai.evaluation.result")
         assert event.attributes["gen_ai.evaluation.name"] == "relevance-judge"
         assert event.attributes["gen_ai.evaluation.score.value"] == 0.91
-        assert event.attributes["gen_ai.evaluation.explanation"] == "on topic"
         assert "gen_ai.evaluation.score.label" not in event.attributes
+
+    async def test_does_not_export_the_judge_explanation(self) -> None:
+        """Judge reasoning is model prose about the user's conversation, i.e. content.
+
+        AGENTS.md gates content attributes behind ``capture_content=True``, which this layer
+        cannot see, so the reasoning must not reach telemetry at all.
+        """
+        async with with_judge_evaluation("relevance-judge") as record:
+            with _tracer.start_as_current_span("invoke_agent"):
+                pass
+            record(0.2)
+        span = next(s for s in finished() if s.name == "invoke_agent")
+        event = next(e for e in span.events if e.name == "gen_ai.evaluation.result")
+        assert not any("explanation" in k for k in span.attributes)
+        assert not any("explanation" in k for k in (event.attributes or {}))
+
+    async def test_end_time_is_the_handler_call_not_the_release(self) -> None:
+        """The deferred end must not stamp flush time, or the judge span absorbs tracking work."""
+        async with with_judge_evaluation("slow-judge") as record:
+            with _tracer.start_as_current_span("invoke_agent"):
+                pass
+            ended_at = time_ns()
+            await asyncio.sleep(
+                0.05
+            )  # stands in for tracking + parsing after the handler ends
+            record(0.5)
+        span = next(s for s in finished() if s.name == "invoke_agent")
+        assert span.end_time is not None
+        # Allow scheduling slack, but nothing close to the 50ms of post-end work.
+        assert span.end_time - ended_at < 20_000_000
+
 
 class TestProcessorScope:
     """The processor is registered on the *global* provider, so it sees every span in the process.

@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
 from contextlib import aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from time import time_ns
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import context as otel_context
@@ -35,6 +36,7 @@ class _JudgeEvalCapture:
     released: bool = False
     span: Any = None
     pending_end: Callable[[], None] | None = None
+
 
 # Every tracer this SDK creates is named "@launchdarkly/ai-<package>". The processor is registered
 # on the *global* provider, so without this gate it stamps a caller-supplied id onto every span in
@@ -77,22 +79,24 @@ def _conversation_id_from(ctx: otel_context.Context | None) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _record_evaluation(
-    span: Any, name: str, score: float, explanation: str | None
-) -> None:
+def _record_evaluation(span: Any, name: str, score: float) -> None:
+    """Write the judge score as a ``gen_ai.evaluation.result`` event plus mirrored attributes.
+
+    The judge's free-text reasoning is deliberately NOT exported. It is model prose about the
+    user's conversation, i.e. content, and AGENTS.md restricts content attributes to callers who
+    pass ``capture_content=True`` — a handler-factory option this layer has no access to. The
+    reasoning is still returned to the caller in ``judge_results[key].response``; only the
+    telemetry copy is dropped. Exporting it needs its own opt-in.
+    """
     if span is None or not span.is_recording():
         return
     attrs: dict[str, Any] = {
         "gen_ai.evaluation.name": name,
         "gen_ai.evaluation.score.value": score,
     }
-    if explanation:
-        attrs["gen_ai.evaluation.explanation"] = explanation
     span.add_event("gen_ai.evaluation.result", attrs)
-    span.set_attribute("gen_ai.evaluation.name", name)
-    span.set_attribute("gen_ai.evaluation.score.value", score)
-    if explanation:
-        span.set_attribute("gen_ai.evaluation.explanation", explanation)
+    for key, value in attrs.items():
+        span.set_attribute(key, value)
 
 
 def _delay_invoke_agent_end(span: Any, capture: _JudgeEvalCapture) -> None:
@@ -108,6 +112,11 @@ def _delay_invoke_agent_end(span: Any, capture: _JudgeEvalCapture) -> None:
             original_end(*args, **kwargs)
             return
         capture.span = span
+        # Freeze the end time at the handler's call. Replaying a no-arg end() later would let the
+        # SDK stamp time_ns() at release, inflating the judge span by the tracking and parsing
+        # work that runs between the handler ending the span and the score being recorded.
+        if not args and "end_time" not in kwargs:
+            kwargs = {**kwargs, "end_time": time_ns()}
 
         def pending() -> None:
             nonlocal ended
@@ -142,7 +151,7 @@ def conversation_id(conversation: str | None) -> Iterator[None]:
         otel_context.detach(token)
 
 
-RecordEvaluation = Callable[[float, str | None], None]
+RecordEvaluation = Callable[[float], None]
 
 
 async def _stream_with_bound_id(
@@ -196,18 +205,22 @@ async def with_judge_evaluation(name: str) -> AsyncIterator[RecordEvaluation]:
     """
     capture = _JudgeEvalCapture(name=name)
 
-    def record(score: float, explanation: str | None = None) -> None:
+    def record(score: float) -> None:
         if capture.span is not None:
-            _record_evaluation(capture.span, capture.name, score, explanation)
+            _record_evaluation(capture.span, capture.name, score)
 
     token = otel_context.attach(otel_context.set_value(_EVAL_KEY, capture))
     try:
         yield record
     finally:
         capture.released = True
-        if capture.pending_end is not None:
-            capture.pending_end()
-        otel_context.detach(token)
+        try:
+            if capture.pending_end is not None:
+                capture.pending_end()
+        finally:
+            # Detach even if ending the span raises (a user span processor's on_end can throw);
+            # otherwise the judge capture stays bound in this task's context for good.
+            otel_context.detach(token)
 
 
 class ConversationIdSpanProcessor(_SpanProcessorBase):

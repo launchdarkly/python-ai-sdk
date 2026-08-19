@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import random
 from collections.abc import Callable
+from math import isfinite
 from typing import Any
 
 from .conversation import with_judge_evaluation
@@ -46,6 +47,18 @@ _FORMATTING_INSTRUCTIONS = "\n".join(
         "function. Do not include ```json tags.",
     ]
 )
+
+
+def _numeric_score(score: Any) -> float | None:
+    """Return ``score`` as a float only when it already is a finite number.
+
+    Never raises. A judge that returns ``"0.9 (high)"`` or ``None`` must not take down the
+    evaluation metric track that follows, and must not put a string where semconv defines a double.
+    """
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    value = float(score)
+    return value if isfinite(value) else None
 
 
 async def run_judges(
@@ -185,8 +198,9 @@ async def run_judges(
                     "response": reasoning,
                     "score": score,
                 }
-                if score is not None:
-                    record_evaluation(float(score), reasoning or None)
+                numeric_score = _numeric_score(score)
+                if numeric_score is not None:
+                    record_evaluation(numeric_score)
 
                 evaluation_metric_key = (
                     judge_ai_config.get("evaluationMetricKey")
@@ -412,8 +426,9 @@ async def run_judge(
 
         score = parsed.get("score", 0.0)
         reasoning = parsed.get("reasoning", "")
-        if score is not None:
-            record_evaluation(float(score), reasoning or None)
+        numeric_score = _numeric_score(score)
+        if numeric_score is not None:
+            record_evaluation(numeric_score)
         raw_usage = result["usage"]
 
         usage = to_usage_dict(raw_usage)
