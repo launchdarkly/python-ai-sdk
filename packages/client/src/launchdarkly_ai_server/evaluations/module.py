@@ -74,12 +74,13 @@ class EvaluationsModule:
 
         # Tool verification is deliberately first: a typo must not create records.
         resolved_tools = self._runner._resolve_tools(project_key, run_tools)
+        dataset_ref = self._runner._fetch_dataset(project_key, dataset)
         rows = self._runner._get_dataset_rows(project_key, dataset)
         evaluation = self._runner._create_evaluation(
             project_key, key, generation, resolved_tools
         )
         evaluation_run = self._runner._create_evaluation_run(
-            project_key, key, len(rows)
+            project_key, evaluation.id, len(rows), dataset_ref.id
         )
         config = self._runner._build_handler_config(generation, resolved_tools)
         results = await self._runner._run_rows(

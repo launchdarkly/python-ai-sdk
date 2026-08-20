@@ -12,6 +12,7 @@ from ..types import NativeTool
 from ..utils import parse_template
 from .api import EvaluationsError, LDApiClient, LDApiError
 from .types import (
+    DatasetRef,
     DatasetRow,
     EvaluationRef,
     EvaluationRunRef,
@@ -123,37 +124,48 @@ class EvaluationsRunner:
             )
         return resolved
 
-    def _fetch_dataset(
-        self,
-        project_key: str,
-        dataset_key: str,
-        *,
-        offset: int = 0,
-    ) -> Mapping[str, Any]:
-        path = (
-            f"projects/{_segment(project_key)}/datasets/key/"
-            f"{_segment(dataset_key)}/preview"
-        )
+    def _fetch_dataset(self, project_key: str, dataset_key: str) -> DatasetRef:
+        path = f"projects/{_segment(project_key)}/datasets/{_segment(dataset_key)}"
         try:
-            return _mapping(
-                self._api.get(
-                    path, params={"limit": DATASET_PAGE_SIZE, "offset": offset}
-                ),
-                description=f"dataset {dataset_key!r}",
-            )
+            raw = _mapping(self._api.get(path), description=f"dataset {dataset_key!r}")
         except LDApiError as error:
             if error.status == 404:
                 raise EvaluationsError(
                     f"LaunchDarkly dataset {dataset_key!r} was not found in project {project_key!r}"
                 ) from error
             raise
+        dataset_id = _required_string(raw, "id", "dataset")
+        response_key = raw.get("key", raw.get("name", dataset_key))
+        return DatasetRef(id=dataset_id, key=str(response_key))
+
+    def _fetch_dataset_rows_page(
+        self,
+        project_key: str,
+        dataset_key: str,
+        *,
+        offset: int,
+    ) -> Mapping[str, Any]:
+        path = f"projects/{_segment(project_key)}/datasets/{_segment(dataset_key)}/rows"
+        return _mapping(
+            self._api.get(
+                path,
+                params={
+                    "mode": "all",
+                    "limit": DATASET_PAGE_SIZE,
+                    "offset": offset,
+                },
+            ),
+            description=f"rows for dataset {dataset_key!r}",
+        )
 
     def _get_dataset_rows(self, project_key: str, dataset_key: str) -> list[DatasetRow]:
         rows: list[DatasetRow] = []
         offset = 0
         total: int | None = None
         while total is None or len(rows) < total:
-            page = self._fetch_dataset(project_key, dataset_key, offset=offset)
+            page = self._fetch_dataset_rows_page(
+                project_key, dataset_key, offset=offset
+            )
             items = page.get("items")
             page_total = page.get("totalCount")
             if not isinstance(items, list) or not isinstance(page_total, int):
@@ -256,15 +268,23 @@ class EvaluationsRunner:
     def _create_evaluation_run(
         self,
         project_key: str,
-        evaluation_key: str,
+        evaluation_id: str,
         row_count: int,
+        dataset_id: str,
     ) -> EvaluationRunRef:
         path = (
             f"projects/{_segment(project_key)}/evaluations/"
-            f"{_segment(evaluation_key)}/runs"
+            f"{_segment(evaluation_id)}/runs"
         )
         raw = _mapping(
-            self._api.post(path, body={"source": "client", "rowCount": row_count}),
+            self._api.post(
+                path,
+                body={
+                    "source": "client",
+                    "rowCount": row_count,
+                    "datasetId": dataset_id,
+                },
+            ),
             description="evaluation run",
         )
         return self._run_ref(raw)
