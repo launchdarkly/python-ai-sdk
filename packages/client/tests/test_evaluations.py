@@ -109,16 +109,19 @@ def test_missing_sdk_key_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert evals.sdk_key is None
 
 
-def test_base_uri_override(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_base_uri_override_isolated_from_sdk_delivery_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
-    monkeypatch.setenv("LD_BASE_URI", "https://ld.internal.example.com/")
+    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com/")
+    monkeypatch.setenv("LD_BASE_URI", "https://relay.example.com/")
 
     from_env = init_evaluations(transport=RecordingTransport())
     explicit = init_evaluations(
         base_uri="https://other.example.com", transport=RecordingTransport()
     )
 
-    assert from_env.api.base_uri == "https://ld.internal.example.com"
+    assert from_env.api.base_uri == "https://api.staging.example.com"
     assert explicit.api.base_uri == "https://other.example.com"
 
 
@@ -151,6 +154,44 @@ def test_get_encodes_query_params_and_omits_none() -> None:
         == "https://ld.example.com/api/v2/projects/proj/datasets/golden?limit=50"
     )
     assert "Content-Type" not in request["headers"]
+
+
+def test_rate_limit_retries_and_honors_retry_after() -> None:
+    transport = RecordingTransport(
+        [
+            HttpResponse(
+                status=429,
+                body='{"message": "slow down"}',
+                headers={"retry-after": "2"},
+            ),
+            HttpResponse(status=200, body='{"items": []}'),
+        ]
+    )
+    sleeps: list[float] = []
+    client = LDApiClient(
+        api_token="api-token",
+        transport=transport,
+        max_retries=1,
+        sleep=sleeps.append,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.get("projects/proj/datasets") == {"items": []}
+    assert len(transport.requests) == 2
+    assert sleeps == [2.0]
+
+
+def test_forbidden_response_is_not_retried() -> None:
+    transport = RecordingTransport(
+        [HttpResponse(status=403, body='{"message": "forbidden"}')]
+    )
+    client = LDApiClient(api_token="api-token", transport=transport, max_retries=3)
+
+    with pytest.raises(LDApiError) as excinfo:
+        client.get("projects/proj/evaluations")
+
+    assert excinfo.value.status == 403
+    assert len(transport.requests) == 1
 
 
 def test_error_response_raises_ld_api_error() -> None:

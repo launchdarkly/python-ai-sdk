@@ -10,13 +10,14 @@ from .api import (
     urllib_transport,
 )
 from .module import EvaluationsModule, init_evaluations
-from .types import EvalRunResult, RunSummary, Usage
+from .types import EvalRunResult, GenerationConfig, RunSummary, Usage
 
 __all__ = [
     "DEFAULT_BASE_URI",
     "EvalRunResult",
     "EvaluationsError",
     "EvaluationsModule",
+    "GenerationConfig",
     "HttpResponse",
     "LDApiClient",
     "LDApiError",

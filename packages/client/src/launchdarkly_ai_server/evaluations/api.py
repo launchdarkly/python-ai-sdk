@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import random
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
 DEFAULT_BASE_URI = "https://app.launchdarkly.com"
@@ -71,11 +76,7 @@ def urllib_transport(
 
 
 class LDApiClient:
-    """
-    Minimal client for the LaunchDarkly public ``/api/v2`` surface used by the
-    evaluations harness. Every request carries the API access token; the base
-    URI is overridable for non-default instances.
-    """
+    """Minimal retrying client for the LaunchDarkly public management API."""
 
     def __init__(
         self,
@@ -83,11 +84,17 @@ class LDApiClient:
         base_uri: str = DEFAULT_BASE_URI,
         transport: Transport = urllib_transport,
         timeout: float = 30.0,
+        max_retries: int = 3,
+        sleep: Callable[[float], None] = time.sleep,
+        random_value: Callable[[], float] = random.random,
     ) -> None:
         self.api_token = api_token
         self.base_uri = base_uri.rstrip("/")
         self._transport = transport
         self._timeout = timeout
+        self._max_retries = max(0, max_retries)
+        self._sleep = sleep
+        self._random_value = random_value
 
     def url_for(self, path: str, params: dict[str, Any] | None = None) -> str:
         url = f"{self.base_uri}/api/v2/{path.lstrip('/')}"
@@ -96,6 +103,25 @@ class LDApiClient:
             if query:
                 url = f"{url}?{urllib.parse.urlencode(query)}"
         return url
+
+    def _retry_delay(self, attempt: int, response: HttpResponse | None = None) -> float:
+        if response is not None:
+            retry_after = response.headers.get("retry-after") or response.headers.get(
+                "Retry-After"
+            )
+            if retry_after:
+                try:
+                    return max(0.0, float(retry_after))
+                except ValueError:
+                    try:
+                        when: datetime = parsedate_to_datetime(retry_after)
+                        now = datetime.now(UTC)
+                        return max(0.0, (when - now).total_seconds())
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+        exponential = float(min(30.0, 0.5 * (2**attempt)))
+        jitter = float(self._random_value()) * min(1.0, exponential)
+        return exponential + jitter
 
     def request(
         self,
@@ -114,14 +140,40 @@ class LDApiClient:
             headers["Content-Type"] = "application/json"
             payload = json.dumps(body).encode("utf-8")
 
-        response = self._transport(
-            method, self.url_for(path, params), headers, payload, self._timeout
-        )
+        response: HttpResponse | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._transport(
+                    method, self.url_for(path, params), headers, payload, self._timeout
+                )
+            except (TimeoutError, urllib.error.URLError) as error:
+                if attempt >= self._max_retries:
+                    raise EvaluationsError(
+                        f"LaunchDarkly API {method} {path} failed after retries: {error}"
+                    ) from error
+                self._sleep(self._retry_delay(attempt))
+                continue
+
+            retryable = response.status == 429 or response.status >= 500
+            if retryable and attempt < self._max_retries:
+                self._sleep(self._retry_delay(attempt, response))
+                continue
+            break
+
+        if response is None:
+            raise EvaluationsError(
+                f"LaunchDarkly API {method} {path} returned no response"
+            )
         if response.status < 200 or response.status >= 300:
             raise LDApiError(response.status, method, path, response.body)
         if not response.body:
             return None
-        return json.loads(response.body)
+        try:
+            return json.loads(response.body)
+        except json.JSONDecodeError as error:
+            raise EvaluationsError(
+                f"LaunchDarkly API {method} {path} returned invalid JSON"
+            ) from error
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self.request("GET", path, params=params)
