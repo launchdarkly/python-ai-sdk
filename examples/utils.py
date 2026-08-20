@@ -9,12 +9,24 @@ import string
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 def new_context() -> dict[str, Any]:
     """Returns a random LaunchDarkly user context."""
     key = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     return {"kind": "user", "key": key}
+
+
+def new_conversation_id(label: str) -> str:
+    """A fresh conversation id per run.
+
+    A constant would collapse every run — by every developer, and every CI pass — into one
+    ever-growing conversation in LaunchDarkly's view: a misleading demo of the very feature it is
+    demonstrating. An id should be stable across the turns of one conversation and distinct across
+    conversations.
+    """
+    return f"{label}-{uuid4().hex[:8]}"
 
 
 def _default_encoder(obj: Any) -> Any:
