@@ -87,6 +87,9 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
 
         resource = Resource.create(resource_attrs)
         provider = TracerProvider(resource=resource)
+        from .conversation import ConversationIdSpanProcessor
+
+        provider.add_span_processor(ConversationIdSpanProcessor())
         if exporter:
             provider.add_span_processor(BatchSpanProcessor(exporter))
 

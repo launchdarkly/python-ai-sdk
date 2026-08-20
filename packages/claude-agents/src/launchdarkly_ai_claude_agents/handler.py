@@ -40,6 +40,7 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     parse_template,
+    set_conversation_id_if_absent,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
@@ -247,7 +248,7 @@ def build_tool_hooks(
         # Same grouping key as the root and as the CLI's own spans; the hook input is where this
         # side sees it without waiting for a message. See TELEMETRY-CONTRACT.md section 4.
         if span is not None and session_id:
-            span.set_attribute("gen_ai.conversation.id", session_id)
+            set_conversation_id_if_absent(span, session_id)
         # Filed before the content write, not after. Serialising the arguments can raise, and a raise
         # out of an unfiled span leaves it open with nothing tracking it: close_open_spans and the
         # teardown both walk this dict, so a span missing from it is a span that never exports.

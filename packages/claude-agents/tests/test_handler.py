@@ -42,6 +42,7 @@ from launchdarkly_ai_claude_agents.handler import (
     create_claude_agents_handler,
     partition_tools,
 )
+from launchdarkly_ai_server import ConversationIdSpanProcessor, conversation_id
 
 # ---------------------------------------------------------------------------
 # A real tracer provider, reset between tests
@@ -49,6 +50,7 @@ from launchdarkly_ai_claude_agents.handler import (
 
 _exporter = InMemorySpanExporter()
 _provider = TracerProvider()
+_provider.add_span_processor(ConversationIdSpanProcessor())
 _provider.add_span_processor(SimpleSpanProcessor(_exporter))
 trace.set_tracer_provider(_provider)
 
@@ -686,6 +688,48 @@ class TestRootAttributes:
         monkeypatch.setattr(handler_mod, "query", _fake_query([result_message()]))
         await create_claude_agents_handler()(BASE_CONFIG, "q")
         assert "gen_ai.conversation.id" not in root().attributes
+
+    async def test_caller_conversation_id_wins_over_session_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield init_message("sess-abc")
+            yield assistant_message(session_id="sess-abc")
+            hooks = kwargs["options"].hooks
+            await hooks["PreToolUse"][0].hooks[0](
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__tool-mcp__search",
+                    "tool_use_id": "tu-1",
+                    "tool_input": {},
+                    "session_id": "sess-abc",
+                },
+                "tu-1",
+                None,
+            )
+            await hooks["PostToolUse"][0].hooks[0](
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "mcp__tool-mcp__search",
+                    "tool_use_id": "tu-1",
+                    "tool_response": "r",
+                },
+                "tu-1",
+                None,
+            )
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        with conversation_id("thread-stable"):
+            await create_claude_agents_handler()(
+                TOOL_CONFIG, "q", {"search": lambda _: "r"}
+            )
+        assert root().attributes["gen_ai.conversation.id"] == "thread-stable"
+        assert named("chat ")[0].attributes["gen_ai.conversation.id"] == "thread-stable"
+        assert (
+            named("execute_tool ")[0].attributes["gen_ai.conversation.id"]
+            == "thread-stable"
+        )
 
 
 # ---------------------------------------------------------------------------
