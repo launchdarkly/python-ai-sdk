@@ -39,6 +39,14 @@ class GenerationConfig(TypedDict, total=False):
 
 
 @dataclass
+class DatasetRef:
+    """Identifiers returned when resolving a dataset by key."""
+
+    id: str
+    key: str
+
+
+@dataclass
 class DatasetRow:
     """A rendered dataset row ready for handler invocation and ingest."""
 

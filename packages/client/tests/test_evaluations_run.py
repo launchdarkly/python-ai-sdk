@@ -102,6 +102,13 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
             ),
             response(
                 200,
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "name": "golden",
+                },
+            ),
+            response(
+                200,
                 dataset_page(
                     [
                         {
@@ -206,6 +213,7 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
         "GET",
         "GET",
         "GET",
+        "GET",
         "POST",
         "POST",
         "POST",
@@ -215,8 +223,12 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
     assert transport.requests[0]["url"].endswith(
         "/api/v2/projects/proj/ai-tools/lookup_order"
     )
-    assert "/projects/proj/datasets/key/golden/preview" in transport.requests[1]["url"]
-    assert transport.requests[3]["body"] == {
+    assert transport.requests[1]["url"].endswith(
+        "/api/v2/projects/proj/datasets/golden"
+    )
+    assert "/projects/proj/datasets/golden/rows" in transport.requests[2]["url"]
+    assert "mode=all" in transport.requests[2]["url"]
+    assert transport.requests[4]["body"] == {
         "name": "support-qa-unique",
         "generationProvider": "OpenAI",
         "generationModel": "gpt-4o",
@@ -224,9 +236,16 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
         "messages": [{"role": "system", "content": "Help the user."}],
         "tools": [{"key": "lookup_order", "version": 7}],
     }
-    assert transport.requests[4]["body"] == {"source": "client", "rowCount": 2}
+    assert transport.requests[5]["url"].endswith(
+        "/api/v2/projects/proj/evaluations/11111111-1111-1111-1111-111111111111/runs"
+    )
+    assert transport.requests[5]["body"] == {
+        "source": "client",
+        "rowCount": 2,
+        "datasetId": "33333333-3333-3333-3333-333333333333",
+    }
 
-    ingested = transport.requests[5]["body"]["results"]
+    ingested = transport.requests[6]["body"]["results"]
     assert [row["row_index"] for row in ingested] == [4, 9]
     assert ingested[0]["input"] == "Order A19"
     assert ingested[0]["expected_output"] == "Found A19"
@@ -278,7 +297,18 @@ async def test_missing_tool_aborts_before_any_mutating_request() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
-    transport = SequencedTransport([response(200, dataset_page([], total=0))])
+    transport = SequencedTransport(
+        [
+            response(
+                200,
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "name": "golden",
+                },
+            ),
+            response(200, dataset_page([], total=0)),
+        ]
+    )
     evals = init_evaluations(api_token="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match="empty"):
@@ -290,7 +320,7 @@ async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
             generation={"provider": "OpenAI", "model": "gpt-4o"},
         )
 
-    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
 
 
 @pytest.mark.asyncio
@@ -310,6 +340,13 @@ async def test_handler_error_is_ingested_and_other_rows_continue() -> None:
 
     transport = SequencedTransport(
         [
+            response(
+                200,
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "name": "golden",
+                },
+            ),
             response(
                 200,
                 dataset_page(
@@ -383,7 +420,7 @@ async def test_handler_error_is_ingested_and_other_rows_continue() -> None:
     assert set(calls) == {"bad", "good"}
     assert len(calls) == 2
     assert result.passed is False
-    rows = transport.requests[3]["body"]["results"]
+    rows = transport.requests[4]["body"]["results"]
     assert {row["status"] for row in rows} == {"COMPLETE", "ERROR"}
     error_row = next(row for row in rows if row["status"] == "ERROR")
     assert error_row["row_index"] == 0
