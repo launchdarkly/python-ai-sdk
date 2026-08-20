@@ -39,6 +39,42 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint override (default: LaunchDarkly Observability backend) |
+| `LD_API_TOKEN` | For evaluations | API access token used by the evaluations management API |
+| `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
+
+### Run an evaluation from code
+
+The generation-only evaluations harness reads an LD-hosted dataset, creates a new evaluation and client-source run, invokes your handler once per row, uploads the generations, and returns LaunchDarkly's stored verdict. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
+
+```python
+import asyncio
+import sys
+
+from launchdarkly_ai_openai_messages import create_openai_messages_handler
+from launchdarkly_ai_server import init_evaluations
+
+
+async def main() -> int:
+    evals = init_evaluations()  # LD_API_TOKEN required; LD_SDK_KEY optional
+    result = await evals.run(
+        project_key="my-project",
+        key="support-qa-2026-08-20",
+        dataset="support-golden",
+        handler=create_openai_messages_handler(),
+        generation={
+            "provider": "OpenAI",
+            "model": "gpt-4o",
+            "instructions": "You are a support agent.",
+        },
+    )
+    print(result.url, result.summary)
+    return 0 if result.passed else 1
+
+
+sys.exit(asyncio.run(main()))
+```
+
+`project_key` is supplied per run rather than during initialization. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
 
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 

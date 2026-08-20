@@ -21,6 +21,14 @@ from .conversation import (
     conversation_id,
     set_conversation_id_if_absent,
 )
+from .evaluations import (
+    EvalRunResult,
+    EvaluationsError,
+    EvaluationsModule,
+    GenerationConfig,
+    RunSummary,
+    init_evaluations,
+)
 from .graph import GraphInstance, graph, resolve_graph
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
@@ -155,6 +163,13 @@ __all__ = [  # noqa: RUF022
     "text_message",
     "to_semconv_finish_reason",
     "VariationMeta",
+    # evaluations
+    "EvalRunResult",
+    "EvaluationsError",
+    "EvaluationsModule",
+    "GenerationConfig",
+    "RunSummary",
+    "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",

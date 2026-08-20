@@ -52,6 +52,25 @@ if result["enabled"]:
 
 Never raises. Returns `{"enabled": bool, "config": dict | None, "meta": dict | None}`.
 
+## Evaluations from code
+
+`init_evaluations` and the evaluations result types are also re-exported:
+
+```python
+from launchdarkly_ai_python import init_evaluations
+
+evals = init_evaluations()
+result = await evals.run(
+    project_key="my-project",
+    key="unique-evaluation-key",
+    dataset="golden-dataset",
+    handler=my_handler,
+    generation={"provider": "OpenAI", "model": "gpt-4o"},
+)
+```
+
+`LD_API_TOKEN` is required. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
+
 ---
 
 All exports, types, and behaviors are identical to `launchdarkly-ai-server`. See the [core client README](../client/README.md) for the full API reference.
