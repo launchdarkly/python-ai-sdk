@@ -200,7 +200,10 @@ async def run_judges(
                 }
                 numeric_score = _numeric_score(score)
                 if numeric_score is not None:
-                    record_evaluation(numeric_score)
+                    record_evaluation(
+                        numeric_score,
+                        reasoning if judge_handler.capture_content else None,
+                    )
 
                 evaluation_metric_key = (
                     judge_ai_config.get("evaluationMetricKey")
@@ -428,7 +431,10 @@ async def run_judge(
         reasoning = parsed.get("reasoning", "")
         numeric_score = _numeric_score(score)
         if numeric_score is not None:
-            record_evaluation(numeric_score)
+            record_evaluation(
+                numeric_score,
+                reasoning if judge_handler.capture_content else None,
+            )
         raw_usage = result["usage"]
 
         usage = to_usage_dict(raw_usage)

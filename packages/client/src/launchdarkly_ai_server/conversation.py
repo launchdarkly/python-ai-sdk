@@ -79,14 +79,14 @@ def _conversation_id_from(ctx: otel_context.Context | None) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _record_evaluation(span: Any, name: str, score: float) -> None:
+def _record_evaluation(
+    span: Any, name: str, score: float, explanation: str | None = None
+) -> None:
     """Write the judge score as a ``gen_ai.evaluation.result`` event plus mirrored attributes.
 
-    The judge's free-text reasoning is deliberately NOT exported. It is model prose about the
-    user's conversation, i.e. content, and AGENTS.md restricts content attributes to callers who
-    pass ``capture_content=True`` — a handler-factory option this layer has no access to. The
-    reasoning is still returned to the caller in ``judge_results[key].response``; only the
-    telemetry copy is dropped. Exporting it needs its own opt-in.
+    ``explanation`` is passed only when the judge's own handler captures content — it is model
+    prose about the user's conversation, so it follows the same gate as every other content
+    attribute. The reasoning always reaches the caller in ``judge_results``.
     """
     if span is None or not span.is_recording():
         return
@@ -94,6 +94,8 @@ def _record_evaluation(span: Any, name: str, score: float) -> None:
         "gen_ai.evaluation.name": name,
         "gen_ai.evaluation.score.value": score,
     }
+    if explanation:
+        attrs["gen_ai.evaluation.explanation"] = explanation
     span.add_event("gen_ai.evaluation.result", attrs)
     for key, value in attrs.items():
         span.set_attribute(key, value)
@@ -151,7 +153,7 @@ def conversation_id(conversation: str | None) -> Iterator[None]:
         otel_context.detach(token)
 
 
-RecordEvaluation = Callable[[float], None]
+RecordEvaluation = Callable[..., None]
 
 
 async def _stream_with_bound_id(
@@ -205,9 +207,9 @@ async def with_judge_evaluation(name: str) -> AsyncIterator[RecordEvaluation]:
     """
     capture = _JudgeEvalCapture(name=name)
 
-    def record(score: float) -> None:
+    def record(score: float, explanation: str | None = None) -> None:
         if capture.span is not None:
-            _record_evaluation(capture.span, capture.name, score)
+            _record_evaluation(capture.span, capture.name, score, explanation)
 
     token = otel_context.attach(otel_context.set_value(_EVAL_KEY, capture))
     try:

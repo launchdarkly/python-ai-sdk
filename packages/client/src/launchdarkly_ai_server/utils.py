@@ -21,12 +21,18 @@ def create_handler(
     provides_for: tuple[str, Literal["agent", "messages"]],
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
+    capture_content: bool = False,
 ) -> ProviderHandler:
     """
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
     ``provides_for`` metadata and optional streaming implementation.
     """
-    return ProviderHandler(fn=fn, provides_for=provides_for, stream_fn=stream_fn)
+    return ProviderHandler(
+        fn=fn,
+        provides_for=provides_for,
+        stream_fn=stream_fn,
+        capture_content=capture_content,
+    )
 
 
 def collapse_messages_to_instructions(config: AiConfigRep) -> AiConfigRep:

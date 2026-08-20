@@ -617,7 +617,12 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             capture_content=capture_content,
         )
 
-    return create_handler(("Anthropic", "agent"), _call_impl, _stream_impl)  # type: ignore[arg-type]
+    return create_handler(
+        ("Anthropic", "agent"),
+        _call_impl,  # type: ignore[arg-type]
+        _stream_impl,  # type: ignore[arg-type]
+        capture_content=capture_content,
+    )
 
 
 async def _stream_gen(

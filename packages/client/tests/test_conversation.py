@@ -155,3 +155,31 @@ class TestProcessorScope:
             assert (span.attributes or {}).get(GEN_AI_CONVERSATION_ID) is None, (
                 span.name
             )
+
+
+class TestJudgeExplanationGating:
+    """The judge's reasoning follows the same content gate as prompts and completions."""
+
+    async def test_writes_explanation_when_supplied(self) -> None:
+        async with with_judge_evaluation("relevance-judge") as record:
+            with _tracer.start_as_current_span("invoke_agent"):
+                pass
+            record(0.8, "on topic and complete")
+        span = next(s for s in finished() if s.name == "invoke_agent")
+        assert (
+            span.attributes["gen_ai.evaluation.explanation"] == "on topic and complete"
+        )
+        event = next(e for e in span.events if e.name == "gen_ai.evaluation.result")
+        assert (
+            event.attributes["gen_ai.evaluation.explanation"] == "on topic and complete"
+        )
+
+    async def test_omits_explanation_when_not_supplied(self) -> None:
+        async with with_judge_evaluation("relevance-judge") as record:
+            with _tracer.start_as_current_span("invoke_agent"):
+                pass
+            record(0.8)
+        span = next(s for s in finished() if s.name == "invoke_agent")
+        assert not any("explanation" in k for k in span.attributes)
+        event = next(e for e in span.events if e.name == "gen_ai.evaluation.result")
+        assert not any("explanation" in k for k in (event.attributes or {}))
