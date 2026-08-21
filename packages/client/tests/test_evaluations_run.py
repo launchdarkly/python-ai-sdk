@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -86,9 +87,14 @@ def lookup_order(order_id: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_run_calls_private_operations_in_order_and_returns_server_verdict() -> (
-    None
-):
+async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
+    init_client = AsyncMock()
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client", init_client
+    )
     transport = SequencedTransport(
         [
             response(
@@ -189,6 +195,7 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
         ]
     )
     evals = init_evaluations(api_token="token", transport=transport)
+    assert evals.sdk_key is None
 
     result = await evals.run(
         project_key="proj",
@@ -251,6 +258,96 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
     assert ingested[0]["expected_output"] == "Found A19"
     assert ingested[0]["variables"]["input"] == "Order A19"
     assert ingested[0]["variables"]["expected_output"] == "Found A19"
+    init_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flag_value", "expected_ingest"),
+    [
+        pytest.param(True, True, id="enabled"),
+        pytest.param(False, False, id="disabled-default"),
+        pytest.param("true", False, id="malformed"),
+        pytest.param(
+            RuntimeError("delivery unavailable"), False, id="evaluation-error"
+        ),
+    ],
+)
+async def test_batch_ingest_flag_controls_generation_result_publishing(
+    monkeypatch: pytest.MonkeyPatch,
+    flag_value: object,
+    expected_ingest: bool,
+) -> None:
+    responses = [
+        response(200, {"id": "dataset-id", "name": "golden"}),
+        response(
+            200,
+            dataset_page(
+                [{"rowIndex": 3, "input": "hello", "variables": {}}],
+                total=1,
+            ),
+        ),
+        response(201, {"id": "evaluation-id", "name": "eval-key"}),
+        response(
+            201,
+            {
+                "id": "run-id",
+                "evaluationId": "evaluation-id",
+                "state": "PENDING",
+            },
+        ),
+    ]
+    if expected_ingest:
+        responses.append(response(202, {}))
+    responses.extend(
+        [
+            response(
+                200,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "COMPLETE",
+                    "verdict": "passed",
+                },
+            ),
+            response(200, {"statusCounts": {"total": 1, "passed": 1}}),
+        ]
+    )
+    transport = SequencedTransport(responses)
+    client = MagicMock()
+    if isinstance(flag_value, Exception):
+        client.variation = AsyncMock(side_effect=flag_value)
+    else:
+        client.variation = AsyncMock(return_value=flag_value)
+
+    async def fake_init_client(options: dict[str, Any]) -> MagicMock:
+        assert options == {"sdkKey": "sdk-key"}
+        return client
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client", fake_init_client
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert result.passed is True
+    assert (
+        any(
+            request["url"].endswith("/generation-results")
+            for request in transport.requests
+        )
+        is expected_ingest
+    )
 
 
 @pytest.mark.asyncio
