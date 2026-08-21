@@ -119,7 +119,13 @@ finds. Without totals on it, that query returns nothing, because summing the chi
 having already found them.
 
 `claude-agents` also writes `gen_ai.conversation.id` on the root, from the session id on the
-CLI's `system` / `init` message. See section 4 for the third place it appears.
+CLI's `system` / `init` message, write-if-absent. A caller-supplied id from `conversation_id(...)`
+(TypeScript: `withConversationId`) wins. When the caller supplies none, the session id is used.
+An app that opens a fresh CLI session per turn and re-feeds history must pass its own id, or each
+turn becomes its own conversation. See section 4 for the third place it appears.
+
+When a conversation id is bound, every handler stamps it on root, `chat`, and `execute_tool` (and
+on `ld.ai.graph`) via the shared span processor. No id is invented when the caller supplies none.
 
 ---
 
@@ -182,7 +188,7 @@ requested name. See section 2a.
 | Key | Value |
 |---|---|
 | `gen_ai.response.id` | provider request id |
-| `gen_ai.conversation.id` | session id |
+| `gen_ai.conversation.id` | session id, write-if-absent against a caller-supplied id |
 | `gen_ai.agent.name` | subagent type |
 
 ---
@@ -200,8 +206,9 @@ requested name. See section 2a.
 No usage attributes. A tool call spends no tokens.
 
 `claude-agents` also writes `gen_ai.conversation.id` here, from the session id on the tool-use
-hook input, when present. That attribute therefore appears on all three span types for this one
-handler: root, `chat`, and `execute_tool`.
+hook input, when present, write-if-absent. That attribute therefore appears on all three span types
+for this one handler: root, `chat`, and `execute_tool`. A caller-supplied id is already on the span
+when `conversation_id(...)` is bound.
 
 ---
 

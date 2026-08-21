@@ -40,6 +40,7 @@ from launchdarkly_ai_server import (
     add_cached_tokens_to_input,
     end_span_once,
     number_or_zero,
+    set_conversation_id_if_absent,
     set_input_content_attributes,
     set_ld_span_attributes,
     set_model_identity_attributes,
@@ -181,7 +182,9 @@ def record_conversation_id(span: Any, message: Any) -> None:
     It is the only key LaunchDarkly's trace view groups a conversation on, and the ``init`` system
     message is where this side first learns it. The ``chat`` and ``execute_tool`` children read the
     same id off their own message and hook input, so one run does not split into several
-    conversations. Set once: the id does not change within a run.
+    conversations. Write-if-absent: a caller-supplied id from ``conversation_id`` is already on the
+    span and must not be overwritten. Apps that open a fresh CLI session per turn and re-feed history
+    must pass their own conversation id, or each turn becomes its own conversation.
     """
     if (
         span is None
@@ -191,7 +194,7 @@ def record_conversation_id(span: Any, message: Any) -> None:
         return
     session_id = message.data.get("session_id")
     if session_id:
-        span.set_attribute("gen_ai.conversation.id", session_id)
+        set_conversation_id_if_absent(span, session_id)
 
 
 def record_native_tools(
@@ -532,7 +535,7 @@ class InferenceSpans:
         if inference.request_id:
             span.set_attribute("gen_ai.response.id", inference.request_id)
         if inference.session_id:
-            span.set_attribute("gen_ai.conversation.id", inference.session_id)
+            set_conversation_id_if_absent(span, inference.session_id)
         # Absent in practice: measured against Agent SDK 0.3.220, stop_reason and stop_details are
         # both null on every assistant message. Written only when the SDK populates it — never
         # synthesised from the presence of a tool-use block.

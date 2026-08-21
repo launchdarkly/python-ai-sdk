@@ -21,6 +21,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 
 | File | Responsibility |
 |---|---|
+| `src/launchdarkly_ai_server/conversation.py` | `conversation_id`, `ConversationIdSpanProcessor` — stamps `gen_ai.conversation.id` |
 | `src/launchdarkly_ai_server/lifecycle.py` | `init_client`, `get_client`, `shutdown`, `extract_variation` |
 | `src/launchdarkly_ai_server/client.py` | `config()`, `ConfigInstance` |
 | `src/launchdarkly_ai_server/tracking.py` | `execute_and_track`, `execute_and_stream`, `wrap_tool_handlers`, `parse_usage` |
@@ -42,6 +43,7 @@ Key symbols exported from `launchdarkly_ai_server`:
 ```python
 # Lifecycle
 from launchdarkly_ai_server import init_client, get_client, shutdown, extract_variation
+from launchdarkly_ai_server import conversation_id, set_conversation_id_if_absent, ConversationIdSpanProcessor
 
 # Types
 from launchdarkly_ai_server import (
@@ -130,9 +132,41 @@ Handlers may return any of these — the client normalizes them before emitting 
 
 `await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST`, so its key must be unique. The harness directly invokes the supplied handler once per row, never retries it, batches generation ingest, and trusts only the server's stored verdict.
 
+---
+
+## Conversation grouping
+
+LaunchDarkly's conversation view groups spans on `gen_ai.conversation.id`. Bind a caller-supplied id around any `invoke()` / `stream()` / `graph().invoke()` call:
+
+```python
+from launchdarkly_ai_server import conversation_id, config
+
+with conversation_id("thread-123"):
+    await config(key=key, handler=handler).invoke(user_input, ctx)
+```
+
+`stream()` binds at call time rather than on first `__anext__`, so building the generator inside
+the block and iterating it later — the normal shape for a chat app — keeps the id:
+
+```python
+with conversation_id("thread-123"):
+    gen = config(key=key, handler=handler).stream(user_input, ctx)
+async for event in gen:  # spans opened here still carry thread-123
+    ...
+```
+
+Only the id is re-applied per step; the ambient context at iteration time is otherwise untouched,
+so streaming span parenting is the same as it is with no id bound.
+
+`init_client()` registers a span processor that stamps the id write-if-absent on every SDK span (root, chat, execute_tool, graph). The processor is registered on the *global* tracer provider, so it is scoped to spans from `@launchdarkly/ai-*` tracers only — a caller-supplied id must not land on third-party instrumentation spans (HTTP, Postgres, the outbound provider call). No id is invented when the caller supplies none — a UUID, a trace id, or a content hash would violate the semantic conventions.
+
+This is an OTel context value, not W3C baggage, so the id does not leak onto outbound provider HTTP calls. A multi-tenant process must bind a different id per request; do not put it on the tracer resource.
+
+---
+
 ## OTel Setup
 
-The core client owns all OTel initialization. `init_client()` configures a `TracerProvider` with a `BatchSpanProcessor` and an OTLP HTTP exporter when the optional OTel packages are installed.
+The core client owns all OTel initialization. `init_client()` configures a `TracerProvider` with `ConversationIdSpanProcessor` and a `BatchSpanProcessor` plus an OTLP HTTP exporter when the optional OTel packages are installed.
 
 **Required packages:**
 

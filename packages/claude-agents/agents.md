@@ -136,6 +136,11 @@ Span event after the call:
 
 On error: `span.record_exception(exc)`, status set to ERROR, span ended, error re-raised.
 
+`gen_ai.conversation.id` is a caller-supplied id from `conversation_id(...)`, or the CLI
+`session_id` from the `init` message when the caller supplied none. Write-if-absent: the caller
+id wins. An app that opens a fresh CLI session per turn and re-feeds history must pass its own
+conversation id, or each turn becomes its own conversation.
+
 ---
 
 ## OTel Setup

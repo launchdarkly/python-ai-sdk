@@ -16,6 +16,11 @@ from .content import (
     text_message,
     to_semconv_finish_reason,
 )
+from .conversation import (
+    ConversationIdSpanProcessor,
+    conversation_id,
+    set_conversation_id_if_absent,
+)
 from .evaluations import (
     EvalRunResult,
     EvaluationsError,
@@ -201,6 +206,10 @@ __all__ = [  # noqa: RUF022
     # client
     "config",
     "ConfigInstance",
+    # conversation
+    "ConversationIdSpanProcessor",
+    "conversation_id",
+    "set_conversation_id_if_absent",
     # graph
     "graph",
     "resolve_graph",
