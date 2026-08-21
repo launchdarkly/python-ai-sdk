@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import cast
 
 from ..lifecycle import init_client
+from ..types import ProviderHandler
 from .api import (
     DEFAULT_BASE_URI,
     EvaluationsError,
@@ -13,7 +15,19 @@ from .api import (
     urllib_transport,
 )
 from .flags import should_skip_generation_result_ingestion
-from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
+from .judges import (
+    JudgeReference,
+    LaunchDarklyJudgeEvaluation,
+    resolve_launchdarkly_judges,
+)
+from .runner import (
+    EvalHandler,
+    EvaluationsRunner,
+    OfflineEvaluation,
+    ToolImplementation,
+    _segment,
+)
+from .scorers import Scorer
 from .types import EvalRunResult, GenerationConfig
 
 logger = logging.getLogger(__name__)
@@ -51,13 +65,15 @@ class EvaluationsModule:
         handler: EvalHandler,
         generation: GenerationConfig,
         tools: Mapping[str, ToolImplementation] | None = None,
+        judges: Sequence[JudgeReference | Scorer] | None = None,
         concurrency: int = 10,
         timeout: float = 300.0,
     ) -> EvalRunResult:
         """
-        Create and run a generation-only evaluation in the caller's process.
+        Create and run an evaluation in the caller's process.
 
-        The returned verdict is computed by LaunchDarkly. A CI script can exit
+        Typed judges and scorers run after each successful generation. The
+        returned verdict is computed by LaunchDarkly. A CI script can exit
         with ``0 if result.passed else 1`` after awaiting this method.
         """
         self._validate_run_args(
@@ -70,12 +86,17 @@ class EvaluationsModule:
             timeout=timeout,
         )
         run_tools = dict(tools or {})
+        requested_evaluations = list(judges or [])
+        self._validate_evaluations(requested_evaluations)
         skip_generation_result_ingestion = False
         if self._sdk_key:
             client = await init_client({"sdkKey": self._sdk_key})
             skip_generation_result_ingestion = (
                 await should_skip_generation_result_ingestion(client, project_key)
             )
+        evaluation_methods = await self._resolve_evaluations(
+            requested_evaluations, handler
+        )
 
         # Tool verification is deliberately first: a typo must not create records.
         resolved_tools = self._runner._resolve_tools(project_key, run_tools)
@@ -88,12 +109,13 @@ class EvaluationsModule:
             project_key, evaluation.id, len(rows), dataset_ref.id
         )
         config = self._runner._build_handler_config(generation, resolved_tools)
-        results = await self._runner._run_rows(
+        results, evaluation_results = await self._runner._run_rows(
             rows,
             handler,
             config,
             run_tools,
             concurrency,
+            evaluation_methods,
         )
         self._runner._ingest_results(
             project_key,
@@ -117,7 +139,50 @@ class EvaluationsModule:
             url=url,
             run_id=evaluation_run.id,
             summary=summary,
+            evaluation_results=evaluation_results,
         )
+
+    def _validate_evaluations(
+        self, evaluations: Sequence[JudgeReference | Scorer]
+    ) -> None:
+        if any(
+            not isinstance(evaluation, (JudgeReference, Scorer))
+            for evaluation in evaluations
+        ):
+            raise EvaluationsError(
+                "judges must contain typed JudgeReference or Scorer objects"
+            )
+
+    async def _resolve_evaluations(
+        self,
+        evaluations: Sequence[JudgeReference | Scorer],
+        generation_handler: EvalHandler,
+    ) -> list[OfflineEvaluation]:
+        judge_references = [
+            evaluation
+            for evaluation in evaluations
+            if isinstance(evaluation, JudgeReference)
+        ]
+        resolved_judges: list[LaunchDarklyJudgeEvaluation] = []
+        if judge_references:
+            if not hasattr(generation_handler, "provides_for"):
+                raise EvaluationsError(
+                    "LaunchDarkly judges require a ProviderHandler created with "
+                    "create_handler()"
+                )
+            resolved_judges = await resolve_launchdarkly_judges(
+                judge_references,
+                [cast(ProviderHandler, generation_handler)],
+                sdk_key=self._sdk_key,
+            )
+
+        judge_iterator = iter(resolved_judges)
+        return [
+            next(judge_iterator)
+            if isinstance(evaluation, JudgeReference)
+            else evaluation
+            for evaluation in evaluations
+        ]
 
     @staticmethod
     def _validate_run_args(

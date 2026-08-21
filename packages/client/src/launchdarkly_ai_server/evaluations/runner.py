@@ -11,6 +11,8 @@ from typing import Any
 from ..types import NativeTool
 from ..utils import parse_template
 from .api import EvaluationsError, LDApiClient, LDApiError
+from .judges import JudgeEvaluationResult, LaunchDarklyJudgeEvaluation
+from .scorers import Scorer, ScorerResult, ScorerRow
 from .types import (
     DatasetRef,
     DatasetRow,
@@ -27,6 +29,8 @@ MAX_INGEST_ROW_BYTES = 256 * 1024
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
+OfflineEvaluation = LaunchDarklyJudgeEvaluation | Scorer
+OfflineEvaluationResult = JudgeEvaluationResult | ScorerResult
 
 
 def _segment(value: str) -> str:
@@ -345,10 +349,14 @@ class EvaluationsRunner:
         config: dict[str, Any],
         tool_handlers: dict[str, ToolImplementation],
         concurrency: int,
-    ) -> list[dict[str, Any]]:
+        evaluations: list[OfflineEvaluation] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[OfflineEvaluationResult]]:
         controller = ConcurrencyController(concurrency)
+        evaluation_methods = evaluations or []
 
-        async def invoke(row: DatasetRow) -> dict[str, Any]:
+        async def invoke(
+            row: DatasetRow,
+        ) -> tuple[dict[str, Any], list[OfflineEvaluationResult]]:
             await controller.acquire(config["provider"]["name"])
             started = datetime.now(UTC)
             started_clock = time.perf_counter()
@@ -374,26 +382,73 @@ class EvaluationsRunner:
                 usage = result.get("usage")
                 if isinstance(usage, Mapping):
                     payload["output"]["usage"] = dict(usage)
+                generation_output = result.get("output")
+                evaluation_results: list[OfflineEvaluationResult] = []
+                for evaluation in evaluation_methods:
+                    if isinstance(evaluation, Scorer):
+                        evaluation_results.append(
+                            await evaluation.execute(
+                                ScorerRow(
+                                    row_index=row.row_index,
+                                    input=row.input,
+                                    expected_output=row.expected_output,
+                                    variables=row.variables,
+                                    metadata=row.metadata,
+                                ),
+                                generation_output
+                                if isinstance(generation_output, str)
+                                else None,
+                            )
+                        )
+                    else:
+                        evaluation_results.append(
+                            await evaluation.evaluate(
+                                generation_output
+                                if isinstance(generation_output, str)
+                                else "",
+                                row_index=row.row_index,
+                                rendered_input=row.input,
+                                expected_output=row.expected_output,
+                                variables=row.variables,
+                                metadata=row.metadata,
+                            )
+                        )
                 controller.record_success(config["provider"]["name"])
-                return payload
+                return payload, evaluation_results
             except Exception as error:
                 completed = datetime.now(UTC)
-                return {
-                    "row_index": row.row_index,
-                    "input": row.input,
-                    "expected_output": row.expected_output,
-                    "variables": row.variables,
-                    "metadata": row.metadata,
-                    "started_at": started.isoformat().replace("+00:00", "Z"),
-                    "generated_at": completed.isoformat().replace("+00:00", "Z"),
-                    "latency_ms": round((time.perf_counter() - started_clock) * 1000),
-                    "status": "ERROR",
-                    "error": {"code": 5001, "message": f"handler raised: {error}"},
-                }
+                return (
+                    {
+                        "row_index": row.row_index,
+                        "input": row.input,
+                        "expected_output": row.expected_output,
+                        "variables": row.variables,
+                        "metadata": row.metadata,
+                        "started_at": started.isoformat().replace("+00:00", "Z"),
+                        "generated_at": completed.isoformat().replace("+00:00", "Z"),
+                        "latency_ms": round(
+                            (time.perf_counter() - started_clock) * 1000
+                        ),
+                        "status": "ERROR",
+                        "error": {
+                            "code": 5001,
+                            "message": f"handler raised: {error}",
+                        },
+                    },
+                    [],
+                )
             finally:
                 controller.release()
 
-        return list(await asyncio.gather(*(invoke(row) for row in rows)))
+        row_results = await asyncio.gather(*(invoke(row) for row in rows))
+        return (
+            [generation for generation, _ in row_results],
+            [
+                evaluation
+                for _, evaluations_for_row in row_results
+                for evaluation in evaluations_for_row
+            ],
+        )
 
     def _ingest_results(
         self,

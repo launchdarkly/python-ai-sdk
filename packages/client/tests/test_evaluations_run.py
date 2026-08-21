@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,8 +10,18 @@ import pytest
 from launchdarkly_ai_server.evaluations import (
     EvaluationsError,
     HttpResponse,
+    Judge,
+    JudgeEvaluationResult,
+    JudgeIdentity,
+    JudgeReference,
+    LaunchDarklyJudgeEvaluation,
+    Scorer,
+    ScorerResult,
+    ScorerRow,
     init_evaluations,
 )
+from launchdarkly_ai_server.types import ProviderHandler
+from launchdarkly_ai_server.utils import create_handler
 
 
 class SequencedTransport:
@@ -318,6 +328,242 @@ async def test_enabled_rollout_flag_skips_generation_result_ingestion(
     assert not any(
         request["url"].endswith("/generation-results") for request in transport.requests
     )
+
+
+@pytest.mark.asyncio
+async def test_run_executes_scorer_with_generation_and_complete_row_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {
+                            "rowIndex": 8,
+                            "input": "Order {{order_id}}",
+                            "expectedOutput": "Found {{order_id}}",
+                            "variables": {"order_id": "A19"},
+                            "metadata": {"suite": "orders"},
+                        }
+                    ],
+                    total=1,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "PENDING",
+                },
+            ),
+            response(202, {}),
+            response(
+                200,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "COMPLETE",
+                    "verdict": "passed",
+                },
+            ),
+            response(200, {"statusCounts": {"total": 1, "passed": 1}}),
+        ]
+    )
+    received: dict[str, Any] = {}
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "Found A19"}
+
+    def score(row: ScorerRow, output: str | None) -> bool:
+        received.update(
+            row_index=row.row_index,
+            input=row.input,
+            expected_output=row.expected_output,
+            variables=dict(row.variables),
+            metadata=dict(row.metadata or {}),
+            output=output,
+        )
+        return True
+
+    result = await init_evaluations(api_token="token", transport=transport).run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        judges=[Scorer(name="exact-match", fn=score)],
+    )
+
+    assert received == {
+        "row_index": 8,
+        "input": "Order A19",
+        "expected_output": "Found A19",
+        "variables": {
+            "order_id": "A19",
+            "input": "Order A19",
+            "expected_output": "Found A19",
+        },
+        "metadata": {"suite": "orders"},
+        "output": "Found A19",
+    }
+    assert len(result.evaluation_results) == 1
+    scorer_result = result.evaluation_results[0]
+    assert isinstance(scorer_result, ScorerResult)
+    assert scorer_result.score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_resolves_and_executes_launchdarkly_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {
+                            "rowIndex": 5,
+                            "input": "Question",
+                            "expectedOutput": "Expected",
+                            "variables": {"account": "enterprise"},
+                            "metadata": {"suite": "judge"},
+                        }
+                    ],
+                    total=1,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "PENDING",
+                },
+            ),
+            response(202, {}),
+            response(
+                200,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "COMPLETE",
+                    "verdict": "passed",
+                },
+            ),
+            response(200, {"statusCounts": {"total": 1, "passed": 1}}),
+        ]
+    )
+    received: dict[str, Any] = {}
+
+    async def generation_handler(*args: object) -> dict[str, Any]:
+        return {"output": "Generated answer"}
+
+    async def judge_handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]] | None,
+        variables: dict[str, Any] | None,
+        history: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        del config, tool_handlers, history
+        received.update(user_input=user_input, variables=variables)
+        return {"output": '{"score": 0.9, "reasoning": "good"}'}
+
+    reference = Judge(key="security-judge")
+    resolved = LaunchDarklyJudgeEvaluation(
+        reference=reference,
+        config={
+            "provider": {"name": "OpenAI"},
+            "model": {"name": "judge-model"},
+            "instructions": "Judge the response",
+        },
+        identity=JudgeIdentity(
+            key="security-judge",
+            variation_key="variation-key",
+            version=3,
+            provider="OpenAI",
+            model="judge-model",
+            mode="messages",
+        ),
+        handler=create_handler(("OpenAI", "messages"), judge_handler),
+        collapse_messages=False,
+    )
+    generation = create_handler(("OpenAI", "messages"), generation_handler)
+    flag_client = MagicMock()
+    flag_client.variation = AsyncMock(return_value=False)
+
+    async def fake_init_client(options: dict[str, Any]) -> MagicMock:
+        assert options == {"sdkKey": "sdk-key"}
+        return flag_client
+
+    async def fake_resolve(
+        references: Sequence[JudgeReference],
+        handlers: Sequence[ProviderHandler],
+        *,
+        sdk_key: str | None,
+    ) -> list[LaunchDarklyJudgeEvaluation]:
+        assert references == [reference]
+        assert handlers == [generation]
+        assert sdk_key == "sdk-key"
+        return [resolved]
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client", fake_init_client
+    )
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.resolve_launchdarkly_judges",
+        fake_resolve,
+    )
+
+    result = await init_evaluations(
+        api_token="token", sdk_key="sdk-key", transport=transport
+    ).run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=generation,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        judges=[reference],
+    )
+
+    judge_result = result.evaluation_results[0]
+    assert isinstance(judge_result, JudgeEvaluationResult)
+    assert judge_result.score == 0.9
+    assert received["user_input"] == "Generated answer"
+    judge_variables = cast(Mapping[str, Any], received["variables"])
+    assert judge_variables["row_index"] == 5
+    assert judge_variables["input"] == "Question"
+    assert judge_variables["expected_output"] == "Expected"
+    assert judge_variables["account"] == "enterprise"
+    assert judge_variables["metadata"] == {"suite": "judge"}
+    assert judge_variables["response_to_evaluate"] == "Generated answer"
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_untyped_judges_before_network_io() -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="typed JudgeReference or Scorer"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            judges=["accuracy"],  # type: ignore[list-item]
+        )
+
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio

@@ -126,9 +126,9 @@ Handlers may return any of these — the client normalizes them before emitting 
 
 ## SDK-run evaluations
 
-`init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK flag delivery and may point at a relay proxy. `LD_SDK_KEY` is optional for generation-only runs and enables the normal handler observability path.
+`init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK flag delivery and may point at a relay proxy. `LD_SDK_KEY` is optional for generation-only or deterministic-scorer runs, and required when `judges` contains a LaunchDarkly judge reference.
 
-`await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST`, so its key must be unique. The harness directly invokes the supplied handler once per row, never retries it, batches generation ingest, and trusts only the server's stored verdict.
+`await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST`, so its key must be unique. The harness directly invokes the supplied handler once per row, never retries it, then runs typed `JudgeReference` / `Scorer` values with the generated output and full rendered row context. Generation results are batch-ingested; local evaluation outcomes are returned in `EvalRunResult.evaluation_results`, while `passed` remains the server's stored generation-run verdict until evaluation-results ingest lands.
 
 ## OTel Setup
 
