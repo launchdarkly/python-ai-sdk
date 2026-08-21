@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -86,9 +87,10 @@ def lookup_order(order_id: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_run_calls_private_operations_in_order_and_returns_server_verdict() -> (
-    None
-):
+async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
     transport = SequencedTransport(
         [
             response(
@@ -189,6 +191,7 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
         ]
     )
     evals = init_evaluations(api_token="token", transport=transport)
+    assert evals.sdk_key is None
 
     result = await evals.run(
         project_key="proj",
@@ -251,6 +254,70 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
     assert ingested[0]["expected_output"] == "Found A19"
     assert ingested[0]["variables"]["input"] == "Order A19"
     assert ingested[0]["variables"]["expected_output"] == "Found A19"
+
+
+@pytest.mark.asyncio
+async def test_enabled_rollout_flag_skips_generation_result_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 3, "input": "hello", "variables": {}}],
+                    total=1,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "PENDING",
+                },
+            ),
+            response(
+                200,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "COMPLETE",
+                    "verdict": "passed",
+                },
+            ),
+            response(200, {"statusCounts": {"total": 1, "passed": 1}}),
+        ]
+    )
+    client = MagicMock()
+    client.variation = AsyncMock(return_value=True)
+
+    async def fake_init_client(options: dict[str, Any]) -> MagicMock:
+        assert options == {"sdkKey": "sdk-key"}
+        return client
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client", fake_init_client
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert result.passed is True
+    assert not any(
+        request["url"].endswith("/generation-results") for request in transport.requests
+    )
 
 
 @pytest.mark.asyncio

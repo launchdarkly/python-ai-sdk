@@ -401,7 +401,11 @@ class EvaluationsRunner:
         evaluation_id: str,
         run_id: str,
         results: list[dict[str, Any]],
+        *,
+        skip_generation_result_ingestion: bool = False,
     ) -> None:
+        if skip_generation_result_ingestion:
+            return
         path = (
             f"projects/{_segment(project_key)}/evaluations/{_segment(evaluation_id)}"
             f"/runs/{_segment(run_id)}/generation-results"

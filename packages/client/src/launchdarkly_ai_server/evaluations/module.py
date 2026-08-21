@@ -12,6 +12,7 @@ from .api import (
     Transport,
     urllib_transport,
 )
+from .flags import should_skip_generation_result_ingestion
 from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
 from .types import EvalRunResult, GenerationConfig
 
@@ -69,8 +70,12 @@ class EvaluationsModule:
             timeout=timeout,
         )
         run_tools = dict(tools or {})
+        skip_generation_result_ingestion = False
         if self._sdk_key:
-            await init_client({"sdkKey": self._sdk_key})
+            client = await init_client({"sdkKey": self._sdk_key})
+            skip_generation_result_ingestion = (
+                await should_skip_generation_result_ingestion(client, project_key)
+            )
 
         # Tool verification is deliberately first: a typo must not create records.
         resolved_tools = self._runner._resolve_tools(project_key, run_tools)
@@ -91,7 +96,11 @@ class EvaluationsModule:
             concurrency,
         )
         self._runner._ingest_results(
-            project_key, evaluation.id, evaluation_run.id, results
+            project_key,
+            evaluation.id,
+            evaluation_run.id,
+            results,
+            skip_generation_result_ingestion=skip_generation_result_ingestion,
         )
         completed = await self._runner._poll_run(
             project_key, evaluation.id, evaluation_run.id, timeout
