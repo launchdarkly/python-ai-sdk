@@ -12,6 +12,7 @@ from .api import (
     Transport,
     urllib_transport,
 )
+from .flags import is_generation_result_batch_ingest_enabled
 from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
 from .types import EvalRunResult, GenerationConfig
 
@@ -69,8 +70,12 @@ class EvaluationsModule:
             timeout=timeout,
         )
         run_tools = dict(tools or {})
+        batch_ingest_enabled = True
         if self._sdk_key:
-            await init_client({"sdkKey": self._sdk_key})
+            client = await init_client({"sdkKey": self._sdk_key})
+            batch_ingest_enabled = await is_generation_result_batch_ingest_enabled(
+                client, project_key
+            )
 
         # Tool verification is deliberately first: a typo must not create records.
         resolved_tools = self._runner._resolve_tools(project_key, run_tools)
@@ -91,7 +96,11 @@ class EvaluationsModule:
             concurrency,
         )
         self._runner._ingest_results(
-            project_key, evaluation.id, evaluation_run.id, results
+            project_key,
+            evaluation.id,
+            evaluation_run.id,
+            results,
+            batch_ingest_enabled=batch_ingest_enabled,
         )
         completed = await self._runner._poll_run(
             project_key, evaluation.id, evaluation_run.id, timeout
