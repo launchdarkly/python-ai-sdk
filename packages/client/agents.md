@@ -128,9 +128,9 @@ Handlers may return any of these — the client normalizes them before emitting 
 
 ## SDK-run evaluations
 
-`init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK flag delivery and may point at a relay proxy. `LD_SDK_KEY` is optional for generation-only runs and enables the normal handler observability path.
+`init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK flag delivery and may point at a relay proxy. `LD_SDK_KEY` is optional for generation-only runs; when set it enables the normal handler observability path and gates generation-result ingest on the `enable-batch-ingest-in-evals-from-code` flag (only a strictly `true` variation publishes; false, default, malformed, or evaluation-error results skip publish safely). Without an SDK key the gate cannot be evaluated and ingest runs unconditionally.
 
-`await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST`, so its key must be unique. The harness directly invokes the supplied handler once per row, never retries it, batches generation ingest, and trusts only the server's stored verdict.
+`await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST`, so its key must be unique. The harness directly invokes the supplied handler once per row, never retries it, batches generation ingest when the gate permits, and trusts only the server's stored verdict.
 
 ---
 
