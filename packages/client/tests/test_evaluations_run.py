@@ -267,7 +267,7 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
 
 
 @pytest.mark.asyncio
-async def test_enabled_rollout_flag_skips_generation_result_ingestion(
+async def test_disabled_batch_ingest_flag_skips_generation_result_ingestion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transport = SequencedTransport(
@@ -302,7 +302,7 @@ async def test_enabled_rollout_flag_skips_generation_result_ingestion(
         ]
     )
     client = MagicMock()
-    client.variation = AsyncMock(return_value=True)
+    client.variation = AsyncMock(return_value=False)
 
     async def fake_init_client(options: dict[str, Any]) -> MagicMock:
         assert options == {"sdkKey": "sdk-key"}
@@ -499,7 +499,7 @@ async def test_run_resolves_and_executes_launchdarkly_judge(
     )
     generation = create_handler(("OpenAI", "messages"), generation_handler)
     flag_client = MagicMock()
-    flag_client.variation = AsyncMock(return_value=False)
+    flag_client.variation = AsyncMock(return_value=True)
 
     async def fake_init_client(options: dict[str, Any]) -> MagicMock:
         assert options == {"sdkKey": "sdk-key"}

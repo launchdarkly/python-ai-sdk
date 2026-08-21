@@ -457,9 +457,9 @@ class EvaluationsRunner:
         run_id: str,
         results: list[dict[str, Any]],
         *,
-        skip_generation_result_ingestion: bool = False,
+        batch_ingest_enabled: bool = True,
     ) -> None:
-        if skip_generation_result_ingestion:
+        if not batch_ingest_enabled:
             return
         path = (
             f"projects/{_segment(project_key)}/evaluations/{_segment(evaluation_id)}"

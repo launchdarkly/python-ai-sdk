@@ -8,20 +8,20 @@ from ..utils import to_ld_context
 
 logger = logging.getLogger(__name__)
 
-ENABLE_TOOL_CALLS_IN_OFFLINE_EVALUATIONS_FLAG_KEY: Final[str] = (
-    "enable-tool-calls-in-offline-evaluations"
+ENABLE_BATCH_INGEST_IN_EVALS_FROM_CODE_FLAG_KEY: Final[str] = (
+    "enable-batch-ingest-in-evals-from-code"
 )
-"""Canonical rollout flag for tool calls in offline evaluations."""
+"""Canonical rollout flag for generation-result batch ingestion."""
 
 
-async def should_skip_generation_result_ingestion(
+async def is_generation_result_batch_ingest_enabled(
     client: Any,
     project_key: str,
 ) -> bool:
-    """Return whether the rollout flag selects the no-ingest path.
+    """Return whether the rollout flag enables generation-result batch ingest.
 
-    Flag evaluation is fail-safe: false, malformed, or failed evaluations retain
-    the existing generation-result ingestion behavior.
+    Flag evaluation is fail-safe: false, malformed, or failed evaluations disable
+    the gated batch-ingest path.
     """
     try:
         context = to_ld_context(
@@ -29,7 +29,7 @@ async def should_skip_generation_result_ingestion(
             {"kind": "project", "key": project_key},
         )
         result = client.variation(
-            ENABLE_TOOL_CALLS_IN_OFFLINE_EVALUATIONS_FLAG_KEY,
+            ENABLE_BATCH_INGEST_IN_EVALS_FROM_CODE_FLAG_KEY,
             context,
             False,
         )
@@ -37,8 +37,8 @@ async def should_skip_generation_result_ingestion(
         return value is True
     except Exception:
         logger.warning(
-            "Unable to evaluate %s; generation results will be ingested",
-            ENABLE_TOOL_CALLS_IN_OFFLINE_EVALUATIONS_FLAG_KEY,
+            "Unable to evaluate %s; generation results will not be batch ingested",
+            ENABLE_BATCH_INGEST_IN_EVALS_FROM_CODE_FLAG_KEY,
             exc_info=True,
         )
         return False

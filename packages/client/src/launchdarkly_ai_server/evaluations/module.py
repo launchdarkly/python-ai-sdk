@@ -14,7 +14,7 @@ from .api import (
     Transport,
     urllib_transport,
 )
-from .flags import should_skip_generation_result_ingestion
+from .flags import is_generation_result_batch_ingest_enabled
 from .judges import (
     JudgeReference,
     LaunchDarklyJudgeEvaluation,
@@ -88,11 +88,11 @@ class EvaluationsModule:
         run_tools = dict(tools or {})
         requested_evaluations = list(judges or [])
         self._validate_evaluations(requested_evaluations)
-        skip_generation_result_ingestion = False
+        batch_ingest_enabled = True
         if self._sdk_key:
             client = await init_client({"sdkKey": self._sdk_key})
-            skip_generation_result_ingestion = (
-                await should_skip_generation_result_ingestion(client, project_key)
+            batch_ingest_enabled = await is_generation_result_batch_ingest_enabled(
+                client, project_key
             )
         evaluation_methods = await self._resolve_evaluations(
             requested_evaluations, handler
@@ -122,7 +122,7 @@ class EvaluationsModule:
             evaluation.id,
             evaluation_run.id,
             results,
-            skip_generation_result_ingestion=skip_generation_result_ingestion,
+            batch_ingest_enabled=batch_ingest_enabled,
         )
         completed = await self._runner._poll_run(
             project_key, evaluation.id, evaluation_run.id, timeout
