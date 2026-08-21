@@ -30,7 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
-| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and generation-only `EvaluationsModule.run()` orchestration |
+| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, offline judge/scorer resolution, and `EvaluationsModule.run()` orchestration |
 | `src/launchdarkly_ai_server/__init__.py` | Public barrel — the only surface handler packages import from |
 
 ---
