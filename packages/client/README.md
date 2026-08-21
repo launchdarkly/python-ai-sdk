@@ -44,18 +44,18 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 ### Run an evaluation from code
 
-The generation-only evaluations harness reads an LD-hosted dataset, creates a new evaluation and client-source run, invokes your handler once per row, uploads the generations, and returns LaunchDarkly's stored verdict. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
+The evaluations harness reads an LD-hosted dataset, creates a new evaluation and client-source run, invokes your handler once per row, optionally runs typed LaunchDarkly judges and deterministic scorers in the same worker, uploads the generations, and returns LaunchDarkly's stored verdict. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
 ```python
 import asyncio
 import sys
 
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server import init_evaluations
+from launchdarkly_ai_server import Accuracy, Judge, Scorer, init_evaluations
 
 
 async def main() -> int:
-    evals = init_evaluations()  # LD_API_TOKEN required; LD_SDK_KEY optional
+    evals = init_evaluations()  # LD_API_TOKEN + LD_SDK_KEY for LD judges
     result = await evals.run(
         project_key="my-project",
         key="support-qa-2026-08-20",
@@ -66,8 +66,17 @@ async def main() -> int:
             "model": "gpt-4o",
             "instructions": "You are a support agent.",
         },
+        judges=[
+            Accuracy(),
+            Judge(key="security-judge", threshold=0.7),
+            Scorer(
+                name="exact-match",
+                fn=lambda row, output: output == row.expected_output,
+            ),
+        ],
     )
     print(result.url, result.summary)
+    print(result.evaluation_results)
     return 0 if result.passed else 1
 
 
@@ -75,6 +84,8 @@ sys.exit(asyncio.run(main()))
 ```
 
 `project_key` is supplied per run rather than during initialization. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
+
+`judges` accepts only typed `JudgeReference` values (`Accuracy`, `AnswerRelevancy`, `Likeness`, `Bias`, `Toxicity`, `Misinformation`, or `Judge`) and `Scorer` values. LaunchDarkly judges require `LD_SDK_KEY` and a generation handler built with `create_handler()` so the resolved judge model can be routed safely. Scorers may be synchronous or asynchronous and receive `(row, generation_output)`; `row` includes the rendered row index, input, expected output, variables, and metadata. Results are returned in `EvalRunResult.evaluation_results`. This judging foundation does not yet submit those local scores to LaunchDarkly's evaluation-results endpoint, so `result.passed` remains the stored generation-run verdict.
 
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 

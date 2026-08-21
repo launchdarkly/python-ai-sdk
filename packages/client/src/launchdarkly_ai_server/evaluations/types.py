@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
+
+if TYPE_CHECKING:
+    from .judges import JudgeEvaluationResult
+    from .scorers import ScorerResult
 
 
 @dataclass
@@ -111,9 +115,12 @@ class RunSummary:
 
 @dataclass
 class EvalRunResult:
-    """The verdict of an evaluation run, as computed and stored by LaunchDarkly."""
+    """The server verdict and local judge/scorer results for an evaluation run."""
 
     passed: bool
     url: str
     run_id: str
     summary: RunSummary
+    evaluation_results: list[JudgeEvaluationResult | ScorerResult] = field(
+        default_factory=list
+    )

@@ -57,7 +57,7 @@ Never raises. Returns `{"enabled": bool, "config": dict | None, "meta": dict | N
 `init_evaluations` and the evaluations result types are also re-exported:
 
 ```python
-from launchdarkly_ai_python import init_evaluations
+from launchdarkly_ai_python import Accuracy, Scorer, init_evaluations
 
 evals = init_evaluations()
 result = await evals.run(
@@ -66,10 +66,15 @@ result = await evals.run(
     dataset="golden-dataset",
     handler=my_handler,
     generation={"provider": "OpenAI", "model": "gpt-4o"},
+    judges=[
+        Accuracy(),
+        Scorer(name="exact-match", fn=lambda row, output: output == row.expected_output),
+    ],
 )
+print(result.evaluation_results)
 ```
 
-`LD_API_TOKEN` is required. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
+`LD_API_TOKEN` is required, and LaunchDarkly judges also require `LD_SDK_KEY`; deterministic `Scorer` values do not. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
 
 ---
 

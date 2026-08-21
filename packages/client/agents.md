@@ -30,7 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
-| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and generation-only `EvaluationsModule.run()` orchestration |
+| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, offline judge/scorer resolution, and `EvaluationsModule.run()` orchestration |
 | `src/launchdarkly_ai_server/__init__.py` | Public barrel — the only surface handler packages import from |
 
 ---
@@ -126,9 +126,9 @@ Handlers may return any of these — the client normalizes them before emitting 
 
 ## SDK-run evaluations
 
-`init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK flag delivery and may point at a relay proxy. `LD_SDK_KEY` is optional for generation-only runs and enables the normal handler observability path.
+`init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK flag delivery and may point at a relay proxy. `LD_SDK_KEY` is optional for generation-only or deterministic-scorer runs, and required when `judges` contains a LaunchDarkly judge reference.
 
-`await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST`, so its key must be unique. The harness directly invokes the supplied handler once per row, never retries it, batches generation ingest, and trusts only the server's stored verdict.
+`await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST`, so its key must be unique. The harness directly invokes the supplied handler once per row, never retries it, then runs typed `JudgeReference` / `Scorer` values with the generated output and full rendered row context. Generation results are batch-ingested; local evaluation outcomes are returned in `EvalRunResult.evaluation_results`, while `passed` remains the server's stored generation-run verdict until evaluation-results ingest lands.
 
 ## OTel Setup
 
