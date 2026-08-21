@@ -51,7 +51,7 @@ def _required_string(data: Mapping[str, Any], key: str, description: str) -> str
 
 
 class ConcurrencyController:
-    """Owns row-worker permits; adaptive signals arrive in Phase 3."""
+    """Owns row-worker permits."""
 
     def __init__(self, limit: int = 10) -> None:
         if limit < 1:
