@@ -193,7 +193,12 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(
+        api_token="token",
+        base_uri="https://api.example.com",
+        ui_base_uri="https://ui.example.com/",
+        transport=transport,
+    )
     assert evals.sdk_key is None
 
     result = await evals.run(
@@ -213,6 +218,11 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
 
     assert result.passed is True
     assert result.run_id == "22222222-2222-2222-2222-222222222222"
+    assert result.url == (
+        "https://ui.example.com/projects/proj/ai/evaluations/"
+        "11111111-1111-1111-1111-111111111111/runs/"
+        "22222222-2222-2222-2222-222222222222"
+    )
     assert result.summary.total_rows == 2
 
     assert [request["method"] for request in transport.requests] == [

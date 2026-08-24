@@ -65,6 +65,7 @@ def test_init_resolves_credentials_from_env(monkeypatch: pytest.MonkeyPatch) -> 
     assert evals.api.api_token == "api-token-from-env"
     assert evals.sdk_key == "sdk-key-from-env"
     assert evals.api.base_uri == DEFAULT_BASE_URI
+    assert evals.ui_base_uri == "https://app.launchdarkly.com"
 
 
 def test_init_prefers_explicit_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,6 +124,23 @@ def test_base_uri_override_isolated_from_sdk_delivery_uri(
 
     assert from_env.api.base_uri == "https://api.staging.example.com"
     assert explicit.api.base_uri == "https://other.example.com"
+
+
+def test_ui_base_uri_precedence_and_api_base_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+    monkeypatch.setenv("LD_UI_BASE_URI", "https://ld-stg.launchdarkly.com/")
+
+    from_env = init_evaluations(transport=RecordingTransport())
+    explicit = init_evaluations(
+        ui_base_uri="https://ui.example.com/", transport=RecordingTransport()
+    )
+
+    assert from_env.api.base_uri == "https://api.staging.example.com"
+    assert from_env.ui_base_uri == "https://ld-stg.launchdarkly.com"
+    assert explicit.ui_base_uri == "https://ui.example.com"
 
 
 def test_requests_carry_token_auth_and_json_body() -> None:

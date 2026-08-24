@@ -18,6 +18,8 @@ from .types import EvalRunResult, GenerationConfig
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
+
 
 def _env(name: str) -> str | None:
     """Read an env var, treating blank/whitespace-only values as unset."""
@@ -28,9 +30,15 @@ def _env(name: str) -> str | None:
 class EvaluationsModule:
     """Entry point for running LaunchDarkly evaluations from customer code."""
 
-    def __init__(self, api_client: LDApiClient, sdk_key: str | None = None) -> None:
+    def __init__(
+        self,
+        api_client: LDApiClient,
+        sdk_key: str | None = None,
+        ui_base_uri: str = DEFAULT_UI_BASE_URI,
+    ) -> None:
         self._api = api_client
         self._sdk_key = sdk_key
+        self._ui_base_uri = ui_base_uri.rstrip("/")
         self._runner = EvaluationsRunner(api_client)
 
     @property
@@ -41,6 +49,11 @@ class EvaluationsModule:
     def sdk_key(self) -> str | None:
         """SDK key used for observability traces; ``None`` disables tracing."""
         return self._sdk_key
+
+    @property
+    def ui_base_uri(self) -> str:
+        """LaunchDarkly application host used for evaluation-run links."""
+        return self._ui_base_uri
 
     async def run(
         self,
@@ -111,7 +124,7 @@ class EvaluationsModule:
             project_key, evaluation.id, evaluation_run.id
         )
         url = (
-            f"{self._api.base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
+            f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
@@ -165,6 +178,7 @@ def init_evaluations(
     api_token: str | None = None,
     sdk_key: str | None = None,
     base_uri: str | None = None,
+    ui_base_uri: str | None = None,
     transport: Transport = urllib_transport,
 ) -> EvaluationsModule:
     """Resolve credentials and construct the evaluations module."""
@@ -186,4 +200,8 @@ def init_evaluations(
         base_uri=base_uri or _env("LD_API_BASE_URI") or DEFAULT_BASE_URI,
         transport=transport,
     )
-    return EvaluationsModule(api_client=api_client, sdk_key=resolved_sdk_key)
+    return EvaluationsModule(
+        api_client=api_client,
+        sdk_key=resolved_sdk_key,
+        ui_base_uri=ui_base_uri or _env("LD_UI_BASE_URI") or DEFAULT_UI_BASE_URI,
+    )

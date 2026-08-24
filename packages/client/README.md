@@ -41,10 +41,11 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint override (default: LaunchDarkly Observability backend) |
 | `LD_API_TOKEN` | For evaluations | API access token used by the evaluations management API |
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
+| `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`; staging: `https://ld-stg.launchdarkly.com`) |
 
 ### Run an evaluation from code
 
-The generation-only evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, invokes your handler once per row, uploads the generations, and derives pass/fail from LaunchDarkly's run summary. A result passes only when the summary has no failed, error, or pending rows. When generation-result ingest is disabled by its feature gate, the harness skips polling and returns the current summary immediately, which will normally show pending rows. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
+The generation-only evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, invokes your handler once per row, uploads the generations, and derives pass/fail from LaunchDarkly's run summary. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. A result passes only when the summary has no failed, error, or pending rows. When generation-result ingest is disabled by its feature gate, the harness skips polling and returns the current summary immediately, which will normally show pending rows. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
 ```python
 import asyncio

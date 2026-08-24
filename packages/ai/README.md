@@ -69,7 +69,7 @@ result = await evals.run(
 )
 ```
 
-`LD_API_TOKEN` is required. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
+`LD_API_TOKEN` is required. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. Evaluation-run links use the explicit `ui_base_uri` option or `LD_UI_BASE_URI` (for example, `https://ld-stg.launchdarkly.com` in staging), defaulting to `https://app.launchdarkly.com`. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
 
 ---
 
