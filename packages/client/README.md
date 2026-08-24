@@ -44,7 +44,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 ### Run an evaluation from code
 
-The generation-only evaluations harness reads an LD-hosted dataset, creates a new evaluation and client-source run, invokes your handler once per row, uploads the generations, and returns LaunchDarkly's stored verdict. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
+The generation-only evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, invokes your handler once per row, uploads the generations, and returns LaunchDarkly's stored verdict. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
 ```python
 import asyncio

@@ -280,7 +280,7 @@ class EvaluationsRunner:
             self._api.post(
                 path,
                 body={
-                    "source": "client",
+                    "source": "api",
                     "rowCount": row_count,
                     "datasetId": dataset_id,
                 },
