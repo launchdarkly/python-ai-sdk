@@ -103,9 +103,10 @@ class EvaluationsModule:
             results,
             batch_ingest_enabled=batch_ingest_enabled,
         )
-        await self._runner._poll_run(
-            project_key, evaluation.id, evaluation_run.id, timeout
-        )
+        if batch_ingest_enabled:
+            await self._runner._poll_run(
+                project_key, evaluation.id, evaluation_run.id, timeout
+            )
         summary = self._runner._get_summary(
             project_key, evaluation.id, evaluation_run.id
         )
@@ -114,7 +115,11 @@ class EvaluationsModule:
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
-            passed=summary.failed_rows == 0 and summary.error_rows == 0,
+            passed=(
+                summary.failed_rows == 0
+                and summary.error_rows == 0
+                and summary.pending_rows == 0
+            ),
             url=url,
             run_id=evaluation_run.id,
             summary=summary,
