@@ -57,8 +57,9 @@ class EvaluationsModule:
         """
         Create and run a generation-only evaluation in the caller's process.
 
-        The returned verdict is computed by LaunchDarkly. A CI script can exit
-        with ``0 if result.passed else 1`` after awaiting this method.
+        The returned pass/fail result is derived from LaunchDarkly's run summary.
+        A CI script can exit with ``0 if result.passed else 1`` after awaiting
+        this method.
         """
         self._validate_run_args(
             project_key=project_key,
@@ -102,7 +103,7 @@ class EvaluationsModule:
             results,
             batch_ingest_enabled=batch_ingest_enabled,
         )
-        completed = await self._runner._poll_run(
+        await self._runner._poll_run(
             project_key, evaluation.id, evaluation_run.id, timeout
         )
         summary = self._runner._get_summary(
@@ -113,7 +114,7 @@ class EvaluationsModule:
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
-            passed=completed.verdict == "passed",
+            passed=summary.failed_rows == 0 and summary.error_rows == 0,
             url=url,
             run_id=evaluation_run.id,
             summary=summary,

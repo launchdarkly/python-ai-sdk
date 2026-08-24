@@ -87,7 +87,7 @@ def lookup_order(order_id: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
+async def test_complete_run_with_zero_failed_and_error_rows_passes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
@@ -172,7 +172,6 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
                     "evaluationVersion": 1,
                     "source": "api",
                     "state": "COMPLETE",
-                    "verdict": "passed",
                     "createdAt": 1,
                 },
             ),
@@ -307,7 +306,6 @@ async def test_batch_ingest_flag_controls_generation_result_publishing(
                     "id": "run-id",
                     "evaluationId": "evaluation-id",
                     "state": "COMPLETE",
-                    "verdict": "passed",
                 },
             ),
             response(200, {"statusCounts": {"total": 1, "passed": 1}}),
@@ -421,7 +419,16 @@ async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handler_error_is_ingested_and_other_rows_continue() -> None:
+@pytest.mark.parametrize(
+    ("failed_rows", "error_rows"),
+    [
+        pytest.param(1, 0, id="failed-row"),
+        pytest.param(0, 1, id="error-row"),
+    ],
+)
+async def test_complete_run_with_failed_or_error_rows_does_not_pass(
+    failed_rows: int, error_rows: int
+) -> None:
     calls: list[str | None] = []
 
     async def handler(
@@ -482,7 +489,6 @@ async def test_handler_error_is_ingested_and_other_rows_continue() -> None:
                     "evaluationVersion": 1,
                     "source": "api",
                     "state": "COMPLETE",
-                    "verdict": "failed",
                     "createdAt": 1,
                 },
             ),
@@ -494,9 +500,9 @@ async def test_handler_error_is_ingested_and_other_rows_continue() -> None:
                     "evaluationRunId": "22222222-2222-2222-2222-222222222222",
                     "statusCounts": {
                         "total": 2,
-                        "passed": 1,
-                        "failed": 0,
-                        "error": 1,
+                        "passed": 2 - failed_rows - error_rows,
+                        "failed": failed_rows,
+                        "error": error_rows,
                         "pending": 0,
                     },
                     "createdAt": 1,
