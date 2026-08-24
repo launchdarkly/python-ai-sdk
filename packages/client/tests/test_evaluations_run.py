@@ -158,7 +158,7 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
                     "id": "22222222-2222-2222-2222-222222222222",
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
-                    "source": "client",
+                    "source": "api",
                     "state": "PENDING",
                     "createdAt": 1,
                 },
@@ -170,7 +170,7 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
                     "id": "22222222-2222-2222-2222-222222222222",
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
-                    "source": "client",
+                    "source": "api",
                     "state": "COMPLETE",
                     "verdict": "passed",
                     "createdAt": 1,
@@ -247,7 +247,7 @@ async def test_run_calls_private_operations_in_order_and_returns_server_verdict(
         "/api/v2/projects/proj/evaluations/11111111-1111-1111-1111-111111111111/runs"
     )
     assert transport.requests[5]["body"] == {
-        "source": "client",
+        "source": "api",
         "rowCount": 2,
         "datasetId": "33333333-3333-3333-3333-333333333333",
     }
@@ -468,7 +468,7 @@ async def test_handler_error_is_ingested_and_other_rows_continue() -> None:
                     "id": "22222222-2222-2222-2222-222222222222",
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
-                    "source": "client",
+                    "source": "api",
                     "state": "PENDING",
                     "createdAt": 1,
                 },
@@ -480,7 +480,7 @@ async def test_handler_error_is_ingested_and_other_rows_continue() -> None:
                     "id": "22222222-2222-2222-2222-222222222222",
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
-                    "source": "client",
+                    "source": "api",
                     "state": "COMPLETE",
                     "verdict": "failed",
                     "createdAt": 1,
