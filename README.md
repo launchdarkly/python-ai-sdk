@@ -77,7 +77,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | Package | Description |
 | --- | --- |
 | [`launchdarkly-ai-server`](packages/client/README.md) | Core client — LaunchDarkly lifecycle, telemetry, shared types, `config()`, `graph()` |
-| [`launchdarkly-ai`](packages/ai/README.md) | Convenience barrel — re-exports all of `launchdarkly-ai-server`. Install this for the simplest setup. |
+| [`launchdarkly-ai-python`](packages/ai/README.md) | Convenience barrel — re-exports all of `launchdarkly-ai-server`. Install this for the simplest setup. |
 
 ### Handler Packages
 
@@ -98,7 +98,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 pip install launchdarkly-ai-python launchdarkly-ai-openai-messages
 ```
 
-`launchdarkly-ai` is a thin barrel that re-exports all of `launchdarkly-ai-server`. `init_client()` auto-discovers `launchdarkly-server-sdk` at runtime — no extra setup required.
+`launchdarkly-ai-python` is a thin barrel that re-exports all of `launchdarkly-ai-server`. `init_client()` auto-discovers `launchdarkly-server-sdk` at runtime — no extra setup required.
 
 **With telemetry** (recommended for production) — traces export to the LaunchDarkly Observability dashboard:
 

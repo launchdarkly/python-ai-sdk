@@ -165,7 +165,7 @@ The core client owns all OTel initialization. `init_client()` configures a `Trac
 pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
   opentelemetry-propagator-b3
 # or via the extras:
-pip install "launchdarkly-ai[otel]"
+pip install "launchdarkly-ai-python[otel]"
 ```
 
 **OTLP endpoint configuration** — the exporter uses the standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var. The default (when not set) points to LaunchDarkly's hosted OTel collector.

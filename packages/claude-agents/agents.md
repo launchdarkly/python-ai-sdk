@@ -145,11 +145,11 @@ conversation id, or each turn becomes its own conversation.
 
 ## OTel Setup
 
-This package emits one span per invocation using `opentelemetry-api`. **No OTel configuration is needed in this package** — the tracer provider is registered by `init_client()` in `launchdarkly-ai-server` (or `launchdarkly-ai`).
+This package emits one span per invocation using `opentelemetry-api`. **No OTel configuration is needed in this package** — the tracer provider is registered by `init_client()` in `launchdarkly-ai-server` (or `launchdarkly-ai-python`).
 
 To receive spans, install the OTel SDK in your application:
 ```sh
-pip install "launchdarkly-ai[otel]"
+pip install "launchdarkly-ai-python[otel]"
 # or:
 pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 ```
