@@ -94,6 +94,7 @@ class RunSummary:
     passed_rows: int = 0
     failed_rows: int = 0
     error_rows: int = 0
+    pending_rows: int = 0
 
     @classmethod
     def from_wire(cls, data: Mapping[str, Any] | None) -> RunSummary:
@@ -105,6 +106,7 @@ class RunSummary:
             passed_rows=int(counts.get("passed", counts.get("passed_rows", 0)) or 0),
             failed_rows=int(counts.get("failed", counts.get("failed_rows", 0)) or 0),
             error_rows=int(counts.get("error", counts.get("error_rows", 0)) or 0),
+            pending_rows=int(counts.get("pending", counts.get("pending_rows", 0)) or 0),
         )
 
 

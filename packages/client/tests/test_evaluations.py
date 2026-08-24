@@ -224,7 +224,13 @@ def test_usage_matches_ingest_wire_shape() -> None:
 
 def test_run_summary_and_result() -> None:
     summary = RunSummary.from_wire(
-        {"total_rows": 500, "passed_rows": 498, "failed_rows": 1, "error_rows": 1}
+        {
+            "total_rows": 500,
+            "passed_rows": 497,
+            "failed_rows": 1,
+            "error_rows": 1,
+            "pending_rows": 1,
+        }
     )
     result = EvalRunResult(
         passed=False,
@@ -235,6 +241,8 @@ def test_run_summary_and_result() -> None:
 
     assert summary.total_rows == 500
     assert summary.error_rows == 1
+    assert summary.pending_rows == 1
+    assert RunSummary.from_wire({"pending": 2}).pending_rows == 2
     assert RunSummary.from_wire(None) == RunSummary()
     assert result.passed is False
     assert result.run_id == "run-1"

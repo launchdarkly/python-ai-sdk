@@ -297,20 +297,42 @@ async def test_batch_ingest_flag_controls_generation_result_publishing(
         ),
     ]
     if expected_ingest:
-        responses.append(response(202, {}))
-    responses.extend(
-        [
+        responses.extend(
+            [
+                response(202, {}),
+                response(
+                    200,
+                    {
+                        "id": "run-id",
+                        "evaluationId": "evaluation-id",
+                        "state": "COMPLETE",
+                    },
+                ),
+                response(
+                    200,
+                    {
+                        "statusCounts": {
+                            "total": 1,
+                            "passed": 1,
+                            "pending": 0,
+                        }
+                    },
+                ),
+            ]
+        )
+    else:
+        responses.append(
             response(
                 200,
                 {
-                    "id": "run-id",
-                    "evaluationId": "evaluation-id",
-                    "state": "COMPLETE",
+                    "total": 1,
+                    "passed": 0,
+                    "failed": 0,
+                    "error": 0,
+                    "pending": 1,
                 },
-            ),
-            response(200, {"statusCounts": {"total": 1, "passed": 1}}),
-        ]
-    )
+            )
+        )
     transport = SequencedTransport(responses)
     client = MagicMock()
     if isinstance(flag_value, Exception):
@@ -338,14 +360,17 @@ async def test_batch_ingest_flag_controls_generation_result_publishing(
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
-    assert result.passed is True
+    assert result.passed is expected_ingest
+    assert result.summary.pending_rows == (0 if expected_ingest else 1)
+    request_urls = [request["url"] for request in transport.requests]
     assert (
-        any(
-            request["url"].endswith("/generation-results")
-            for request in transport.requests
-        )
+        any(url.endswith("/generation-results") for url in request_urls)
         is expected_ingest
     )
+    status_url = "/evaluations/evaluation-id/runs/run-id"
+    assert any(url.endswith(status_url) for url in request_urls) is expected_ingest
+    assert request_urls[-1].endswith(f"{status_url}/summary")
+    assert sum(url.endswith(f"{status_url}/summary") for url in request_urls) == 1
 
 
 @pytest.mark.asyncio
