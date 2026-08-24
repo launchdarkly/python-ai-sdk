@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, TypedDict
 
 
@@ -65,6 +66,19 @@ class ResolvedTool:
     version: int
     description: str = ""
     schema: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ExecutedRow:
+    """Typed result of invoking a local handler for one dataset row."""
+
+    row: DatasetRow
+    output: str | None
+    usage: dict[str, Any] | None
+    started_at: datetime
+    generated_at: datetime
+    latency_ms: int
+    error: str | None = None
 
 
 @dataclass
