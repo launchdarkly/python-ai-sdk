@@ -83,7 +83,6 @@ class EvaluationRunRef:
     id: str
     evaluation_id: str
     state: str
-    verdict: str | None = None
     status_reason: str | None = None
 
 
@@ -111,7 +110,7 @@ class RunSummary:
 
 @dataclass
 class EvalRunResult:
-    """The verdict of an evaluation run, as computed and stored by LaunchDarkly."""
+    """The result of an evaluation run, derived from its row summary."""
 
     passed: bool
     url: str

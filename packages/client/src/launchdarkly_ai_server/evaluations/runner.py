@@ -294,7 +294,6 @@ class EvaluationsRunner:
             id=_required_string(raw, "id", "evaluation run"),
             evaluation_id=_required_string(raw, "evaluationId", "evaluation run"),
             state=_required_string(raw, "state", "evaluation run"),
-            verdict=(str(raw["verdict"]) if raw.get("verdict") is not None else None),
             status_reason=(
                 str(raw["statusReason"])
                 if raw.get("statusReason") is not None
@@ -440,10 +439,6 @@ class EvaluationsRunner:
                 _mapping(self._api.get(path), description="evaluation run")
             )
             if run.state == "COMPLETE":
-                if run.verdict not in {"passed", "failed"}:
-                    raise EvaluationsError(
-                        f"Evaluation run {run_id!r} completed without a verdict"
-                    )
                 return run
             if run.state in {"CANCELLED", "TEMPORARY_ERROR", "PERMANENT_ERROR"}:
                 reason = f": {run.status_reason}" if run.status_reason else ""
