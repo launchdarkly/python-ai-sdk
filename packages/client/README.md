@@ -223,22 +223,46 @@ asyncio.run(main())
 ### Agent Skills
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
-variations by reference. This release adds the first layer: discovering which skills a
-resolved config references. Retrieving their content and materializing them onto disk follow.
+variations by reference. The SDK surfaces which skills a config references and retrieves
+their content. Materializing them onto disk, where agent runtimes discover them, follows.
 
 ```python
 import asyncio
+import hashlib
 
-from launchdarkly_ai_server import init_client, inspect_config, skill_refs
+from launchdarkly_ai_server import (
+    init_client, inspect_config, skill_refs, get_skill, get_skills,
+    InMemorySkillStore,
+)
+
+SKILL_MD = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
 
 async def main():
-    await init_client()
+    # A store supplies skill content. InMemorySkillStore is the dict-backed
+    # store for local development, testing, and bring-your-own-content use.
+    store = InMemorySkillStore()
+    store.put({
+        "key": "pdf-extraction",
+        "version": 2,
+        "content": SKILL_MD,
+        # sha256, lowercase hex, over the verbatim utf-8 bytes. Content whose hash
+        # does not match is withheld, so this is not optional.
+        "contentHash": hashlib.sha256(SKILL_MD.encode("utf-8")).hexdigest(),
+    })
+    await init_client(options={"skillStore": store})
 
+    # 1. Which skills does this config reference? Pure projection — no I/O.
     info = await inspect_config("doc-agent", {"kind": "user", "key": "user-123"})
-    refs = skill_refs(info["config"])   # [SkillReference(key='pdf-extraction', version=2)]
+    refs = skill_refs(info["config"])          # [SkillReference(key='pdf-extraction', version=2)]
 
-    for ref in refs:
-        print(ref.key, ref.version)
+    # 2. Fetch content. Returns None rather than raising when a skill is unavailable.
+    skill = await get_skill("pdf-extraction")
+    if skill is not None:
+        print(skill.content)
+
+    # 3. Or resolve the config's references in one call.
+    for s in await get_skills(refs):
+        print(s.key, s.version)
 
 asyncio.run(main())
 ```
@@ -249,9 +273,32 @@ integer ≥ 1): the whole variation is rejected, `inspect_config` returns `confi
 `extract_variation` raises. A variation that previously carried its own custom `skills`
 field of a different shape must rename it before upgrading.
 
+**Integrity is not optional.** Content is only returned after its sha256 (lowercase hex,
+over the verbatim UTF-8 bytes) matches the delivered `contentHash`, its key and version
+revalidate, and its size is within 64 KiB. Anything that fails is withheld and treated as
+missing — no unverified content ever reaches your code. A retrieval that withheld anything
+logs a count at WARN, so a run that resolved nothing is not silent.
+
+**Versions are selected, not filtered.** A store may hold several versions of one key at
+once, because a delivery payload does: the newest version of every skill, plus every
+version a variation currently pins. `get_skill("k", version=1)` asks the store for version
+1 and gets it even when a newer one is also held.
+
 | Export | Description |
 |---|---|
 | `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when absent. |
+| `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
+| `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
+| `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
+| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)`. |
+| `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
+
+Configure the store with `init_client(options={"skillStore": store})`. With none configured,
+the accessors raise `RuntimeError` explaining what to do. `shutdown()` clears it.
+
+`all_objects` returns one entry per `(key, version)` under keys that are **opaque** to the
+SDK — identity is read from each object's own `key` and `version` fields, so a store is free
+to key its own map however the transport underneath does.
 
 > `Skill.content` is `bytes` — the verified verbatim bytes LaunchDarkly delivered, exactly
 > what was hashed. The SDK never parses or interprets them; if you want the frontmatter,

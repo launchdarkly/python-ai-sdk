@@ -28,7 +28,8 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/graph.py` | `graph()`, `resolve_graph()`, `GraphInstance` |
 | `src/launchdarkly_ai_server/types.py` | All shared Python types — `AiConfigRep`, `ProviderHandler`, `LDContext`, `NativeTool`, etc. |
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
-| `src/launchdarkly_ai_server/skills.py` | Agent Skills — `skill_refs`, the projection of a config's `skills` array into typed references |
+| `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
+| `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
@@ -73,8 +74,21 @@ from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_t
 from launchdarkly_ai_server import config, graph, resolve_graph
 
 # Agent Skills
-from launchdarkly_ai_server import skill_refs
+from launchdarkly_ai_server import (
+    skill_refs, get_skill, get_skills, all_skills,
+    SkillStore, InMemorySkillStore,
+)
 ```
+
+`MAX_SKILL_CONTENT_BYTES` is deliberately *not* among them: it is a local enforcement
+bound on content the platform produces, not a value this SDK defines, so exporting it
+would semver-lock a number this side does not own. Keep it internal to `skills_core`.
+
+`SKILL_OBJECT_KIND` is not exported either, for a different reason: it is the string this
+SDK hands a store, and a store adapter maps whatever the transport underneath calls a skill
+onto it. Publishing it would advertise an SDK-side seam value as the wire contract — a claim
+this side cannot make, and hard to walk back once a caller depends on it. An adapter that
+needs to agree with it reaches it through `launchdarkly_ai_server.skills_core`.
 
 When adding a new export, add it to `__init__.py`'s imports and `__all__`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
 
@@ -170,19 +184,102 @@ Three layers, in increasing order of blast radius. Only the first is implemented
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
    Validation of the array itself lives in `parse_ai_config` and is **fail closed** — one
    malformed reference fails the whole config parse.
-2. **Content accessors** — reading skill content through a store seam.
+2. **Content accessors** — `get_skill`, `get_skills`, `all_skills` read through the
+   `SkillStore` seam. Configure a store with
+   `init_client(options={"skillStore": store})`; with none configured the accessors raise
+   an actionable `RuntimeError`. A delivery transport can be added behind the seam
+   without touching the public API.
 3. **Materialization** — writing skills onto disk under a manifest.
+
+### The store seam, and why version is part of the lookup
+
+`SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, and an optional
+`add_listener(kind, fn)`. Version is part of the **lookup identity**, not a filter applied
+to the answer, and that is load-bearing: a delivery payload carries the newest version of
+every skill *plus* every version any variation currently pins, so two versions of one key
+coexist routinely. A seam keyed by key alone would answer a pinned reference with the newest
+object, and the caller would then have to reject it — turning the primary use case, a
+version-pinned attachment, into a missing skill. `version=None` asks for the newest held.
+
+The equality check in `resolve_from_store` stays, now as a **defense** rather than as the
+selection mechanism: the store is untrusted, so an answer that is not the version asked for
+is withheld.
+
+`all_objects` returns one entry per `(key, version)` under keys that are **opaque** to this
+SDK. Do not parse them and do not assume one per skill key; identity is read off each
+object's own `key` and `version`, which are revalidated anyway. `newest_by_key` is the
+one place that collapses the result to one object per key, because both whole-store
+consumers need it — `all_skills`, since a list holding two versions of one key is not a set
+of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single path.
 
 ### Security posture — do not relax any of this
 
+Store data is **untrusted input**; the transport is not part of the trust boundary.
+
 - **Skill content is an opaque byte buffer.** `Skill.content` is `bytes` — the verified
-  verbatim bytes LaunchDarkly delivered, exactly what was hashed. This SDK never parses,
-  decodes, or interprets them anywhere: not in the integrity path, not in an accessor, not
-  during materialization. Consumers who want frontmatter parse it themselves.
+  verbatim bytes, exactly what was hashed. The wire object delivers content as a JSON
+  string; the UTF-8 encode happens once, during verification, and from then on the SDK
+  never parses, decodes, or interprets the bytes anywhere: not in the integrity path, not
+  in an accessor, not during materialization. Consumers who want frontmatter parse it
+  themselves.
+- **Integrity is mandatory and doubled, through one implementation.** Every raw object is
+  verified at the accessor boundary (key pattern and length, integer version >= 1, content
+  at most 64 KiB, sha256 lowercase hex over the verbatim bytes against `contentHash`)
+  and the hash is re-verified immediately before a write, both through
+  `skills_core.verified_bytes`, so the integrity signal's property set cannot depend on
+  which layer caught the defect. A `Skill` is only ever constructed from content that
+  passed. Nothing unverified reaches user code.
+- **`contentHash` is required.** An object without one is withheld, not accepted on trust.
+  A payload built before the field is populated therefore yields nothing, which is why a
+  withholding run logs a run-level count at WARN — an empty result would otherwise be
+  indistinguishable from "this project has no skills".
+- **No unencodable string ever reaches an encode.** `json.loads` turns a `\ud800` escape
+  into an unpaired surrogate with no UTF-8 representation; every `.encode("utf-8")` site
+  treats that as a verification failure. Never reach for `errors="surrogatepass"` —
+  fabricating bytes could satisfy the hash comparison.
+- **Attacker-controlled strings are never echoed into telemetry.** `contentHash` and `key`
+  come off the wire, so a store could put the skill body in either; both are shape-checked
+  and redacted before they reach a signal or a log line.
 - **A key is untrusted input everywhere it appears.** `skill_key_rejection_reason` is the
   single canonical explanation, so the config parser and the reference projection reject a
   key for the same stated reason — and so does every layer added later. A silently
   shortened projection is not acceptable: every dropped entry is logged.
+
+### Telemetry seam
+
+Skills telemetry goes through a private emitter with one method,
+`record(signal, properties)`, whose default implementation is a **no-op** — nothing leaves
+the process in this release. `client.track()` is deliberately *not* used: it needs an LD
+context, spends the customer's event volume, lands in their data export, and is silenced by
+offline mode. No LD context is involved anywhere in this feature.
+
+Exactly three signals exist, and the list is an **allowlist, not a floor**:
+
+| Signal | When | Properties |
+|---|---|---|
+| `AgentControl Skill Integrity Failure` | any hash/size/shape verification failure | `skill_key`, `version?`, `expected_hash?`, `observed_hash?`, `language` |
+| `AgentControl Skill Materialized` | each `written` / `updated` / `skipped_current` | `skill_key`, `content_bytes`, `content_hash`, `reconcile_action`, `language` |
+| `AgentControl Skill Revoked Received` | prune removes a formerly managed skill | `skill_key`, `version`, `removed_from_disk`, `language` |
+
+The last two belong to the materialization layer and have no caller yet; they live here
+with the first so the allowlist is one section of one file rather than three sites to audit.
+
+`AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved`
+were considered and **deliberately excluded from SDK emission** — both are observable
+server-side. Do not add them. The skill body never appears in a signal, a log line, or
+an error message, and no signal carries a filesystem path. An emitter that raises is caught
+and logged; it never fails the operation.
+
+Module state lives in `skills_core.py`, so there is exactly one store and one emitter
+however the feature is entered. All three signals are emitted from the `record_*` functions
+next to the seam there — nothing outside that module calls `emit`, so the allowlist is
+enforced in one place.
+
+The injection path is deliberately narrower than the state's location: `skills.py` owns
+`_set_store`, `_set_emitter_for_testing` and `_clear_state`, which delegate to
+`skills_core`. `init_client` and `shutdown` use those, tests inject through those
+(`skills._set_store(store)` is the same setter `init_client` uses), and neither should
+reach into `skills_core` directly.
 
 ---
 
@@ -332,3 +429,6 @@ on their side of the boundary.
 - Do not weaken the `parse_ai_config` validation — handler packages rely on `config` being valid when they receive it.
 - `parse_usage` must continue to accept `input_tokens/output_tokens`, `inputTokens/outputTokens`, and `input/output` as all existing handlers return one of these variants.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
+- Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
+- Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
+- Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.
