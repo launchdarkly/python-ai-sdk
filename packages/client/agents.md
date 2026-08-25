@@ -27,7 +27,8 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/tracking.py` | `execute_and_track`, `execute_and_stream`, `wrap_tool_handlers`, `parse_usage` |
 | `src/launchdarkly_ai_server/graph.py` | `graph()`, `resolve_graph()`, `GraphInstance` |
 | `src/launchdarkly_ai_server/types.py` | All shared Python types — `AiConfigRep`, `ProviderHandler`, `LDContext`, `NativeTool`, etc. |
-| `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape |
+| `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
+| `src/launchdarkly_ai_server/skills.py` | Agent Skills — `skill_refs`, the projection of a config's `skills` array into typed references |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
@@ -53,6 +54,7 @@ from launchdarkly_ai_server import (
     TrackData, UsageDict, HandlerResult, HandlerStreamEvent,
     StreamEvent, StreamChunkEvent, StreamDoneEvent, ExecuteStreamEvent, ExecuteStreamDoneEvent,
     VariationMeta, InitClientOptions, JudgeResult, ParseResult, ParseSuccess, ParseFailure,
+    Skill, SkillReference,
 )
 
 # Utilities
@@ -69,6 +71,9 @@ from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_t
 
 # Entry points
 from launchdarkly_ai_server import config, graph, resolve_graph
+
+# Agent Skills
+from launchdarkly_ai_server import skill_refs
 ```
 
 When adding a new export, add it to `__init__.py`'s imports and `__all__`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
@@ -155,6 +160,32 @@ This is an OTel context value, not W3C baggage, so the id does not leak onto out
 
 ---
 
+## Agent Skills
+
+Versioned `SKILL.md` documents attached to AI Config variations by reference, retrieved
+through an injectable store, and materialized onto disk for agent runtimes to discover.
+Three layers, in increasing order of blast radius. Only the first is implemented here:
+
+1. **Reference discovery** — `skill_refs(config)` projects the config's `skills` array into
+   typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
+   Validation of the array itself lives in `parse_ai_config` and is **fail closed** — one
+   malformed reference fails the whole config parse.
+2. **Content accessors** — reading skill content through a store seam.
+3. **Materialization** — writing skills onto disk under a manifest.
+
+### Security posture — do not relax any of this
+
+- **Skill content is an opaque byte buffer.** `Skill.content` is `bytes` — the verified
+  verbatim bytes LaunchDarkly delivered, exactly what was hashed. This SDK never parses,
+  decodes, or interprets them anywhere: not in the integrity path, not in an accessor, not
+  during materialization. Consumers who want frontmatter parse it themselves.
+- **A key is untrusted input everywhere it appears.** `skill_key_rejection_reason` is the
+  single canonical explanation, so the config parser and the reference projection reject a
+  key for the same stated reason — and so does every layer added later. A silently
+  shortened projection is not acceptable: every dropped entry is logged.
+
+---
+
 ## OTel Setup
 
 The core client owns all OTel initialization. `init_client()` configures a `TracerProvider` with `ConversationIdSpanProcessor` and a `BatchSpanProcessor` plus an OTLP HTTP exporter when the optional OTel packages are installed.
@@ -230,6 +261,43 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 
 ---
 
+## Dependencies
+
+Tier 0, so the runtime surface is deliberately tiny: **one** hard dependency, and everything else either an optional extra, resolved dynamically at runtime, or dev-only. Nothing here may grow without a reason recorded in this table.
+
+### Runtime (`[project] dependencies`)
+
+| Package | Why |
+|---|---|
+| `opentelemetry-api>=1.25` | The tracer/span API used on every instrumented path (`tracking.py`, `graph.py`, `content.py`, `conversation.py`, `utils.py`). API-only — the *SDK* half is an optional extra, so a consumer that never configures OTel gets no-op spans rather than an `ImportError`. `conversation.py` imports `opentelemetry.sdk.trace.SpanProcessor` under `TYPE_CHECKING` only, for exactly this reason. |
+
+There is deliberately **no** `python-dotenv` here: `lifecycle.py` reads `os.environ` directly, so loading a `.env` file is the application's job rather than the SDK's. `python-dotenv` is in the workspace dev group for the examples only.
+
+### Optional extra (`[project.optional-dependencies] otel`)
+
+| Package | Why |
+|---|---|
+| `opentelemetry-sdk>=1.25` | Tracer provider, resources, and the batch span processor, imported inside `_setup_telemetry()` in `lifecycle.py`. Optional so telemetry is opt-in; absent ⇒ a `logger.warning` and no spans, never a raise. |
+| `opentelemetry-exporter-otlp-proto-http>=1.25` | OTLP/HTTP span export and its compression enum. Same optionality, same loader. |
+
+Install with `pip install "launchdarkly-ai-server[otel]"`; see [OTel Setup](#otel-setup) for the endpoint variables.
+
+### Resolved dynamically, declared nowhere
+
+| Package | Why |
+|---|---|
+| `launchdarkly-server-sdk` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. Undeclared on purpose: the BYOC path (`init_client(client=...)`) targets environments that supply their own client, and a hard dependency would force an unused SDK into every such install. So it is imported late and raises actionably when missing — absent ⇒ a `RuntimeError` naming the `pip install`, and only on the path that needs it. |
+
+### Dev-only (workspace root `[dependency-groups] dev`) — the ones with a contract attached
+
+| Package | Why |
+|---|---|
+| `launchdarkly-server-sdk>=9.0`, and the `otel` extra mirrored (`opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`) | Each dynamically-resolved or optional package is repeated in the dev group so the test suite can import it. Something that is *only* optional would not be installed in this workspace and the tests covering its present-and-working path could not run. |
+| `pytest>=8`, `pytest-asyncio>=0.24` | Test runner and the async support the whole suite relies on. `asyncio_mode = "auto"` is set at the workspace root, which is why no test in this package carries an `@pytest.mark.asyncio`. |
+| `mypy>=1.10` (`strict`), `ruff>=0.15` | Type checker and linter/formatter. |
+
+---
+
 ## Common Pitfalls
 
 ### 1. Calling `get_client()` before `init_client()` resolves
@@ -239,6 +307,14 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 ### 2. Returning `dict` not a dataclass from handlers
 
 `execute_and_track` expects the handler to return a plain `dict` with at least `output` and `usage` keys. Do not return a custom class — `parse_usage` and the telemetry pipeline both access dict keys.
+
+### 3. Interpreting skill content anywhere
+
+`Skill.content` is opaque `bytes` by construction. Do not add a parser, a decoder, or a
+convenience accessor that reads meaning into it — no YAML/frontmatter parsing, no
+"decode as UTF-8 for display", nothing. The SDK's whole contract is that content is the
+verified verbatim byte buffer and nothing more; a consumer who wants structure parses it
+on their side of the boundary.
 
 ---
 
@@ -255,3 +331,4 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 - Handler packages must import `LDContext` from `launchdarkly-ai-server` — not directly from any LD SDK.
 - Do not weaken the `parse_ai_config` validation — handler packages rely on `config` being valid when they receive it.
 - `parse_usage` must continue to accept `input_tokens/output_tokens`, `inputTokens/outputTokens`, and `input/output` as all existing handlers return one of these variants.
+- `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.

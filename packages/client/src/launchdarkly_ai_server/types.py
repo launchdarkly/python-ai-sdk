@@ -92,7 +92,8 @@ class Message:
 AiConfigRep = dict[str, Any]
 """
 Raw AI config dict as returned by ``parse_ai_config``. Fields include
-``model``, ``provider``, and at least one of ``instructions`` / ``messages``.
+``model``, ``provider``, at least one of ``instructions`` / ``messages``, and an
+optional ``skills`` array of ``{key, version}`` references (see ``skill_refs``).
 """
 
 VariationMeta = dict[str, Any]
@@ -410,6 +411,45 @@ class ProviderGraphResponse:
     """Aggregate token counts across all nodes."""
     judge_results: dict[str, JudgeResult] | None = None
     """Results from a graph-level judge, if configured."""
+
+
+# ---------------------------------------------------------------------------
+# Agent Skills
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SkillReference:
+    """A version-pinned pointer to a skill, as attached to an AI Config variation."""
+
+    key: str
+    """Immutable skill key — ``^[a-z0-9][a-z0-9-]*$``, at most 256 characters."""
+    version: int
+    """Immutable skill version — an integer >= 1."""
+
+
+@dataclass(frozen=True)
+class Skill:
+    """
+    A single verbatim ``SKILL.md`` document.
+
+    Only ever constructed after integrity verification passes, so ``content``
+    holds the exact byte sequence LaunchDarkly delivered and ``content_hash``
+    is its sha256. Instances are immutable.
+    """
+
+    key: str
+    version: int
+    content: bytes
+    """The verified verbatim bytes, exactly as LaunchDarkly delivered and
+    hashed them. Opaque to this SDK: no encoding is claimed and nothing here
+    ever parses or interprets them."""
+    content_hash: str
+    """sha256, lowercase hex, over the verbatim bytes of ``content``."""
+    name: str | None = None
+    """Display name from LaunchDarkly metadata; never parsed from the content."""
+    description: str | None = None
+    """Description from LaunchDarkly metadata; never parsed from the content."""
 
 
 # ---------------------------------------------------------------------------

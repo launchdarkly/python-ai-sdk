@@ -220,6 +220,45 @@ asyncio.run(main())
 
 ---
 
+### Agent Skills
+
+Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
+variations by reference. This release adds the first layer: discovering which skills a
+resolved config references. Retrieving their content and materializing them onto disk follow.
+
+```python
+import asyncio
+
+from launchdarkly_ai_server import init_client, inspect_config, skill_refs
+
+async def main():
+    await init_client()
+
+    info = await inspect_config("doc-agent", {"kind": "user", "key": "user-123"})
+    refs = skill_refs(info["config"])   # [SkillReference(key='pdf-extraction', version=2)]
+
+    for ref in refs:
+        print(ref.key, ref.version)
+
+asyncio.run(main())
+```
+
+**`skills` is now a validated field.** Config parsing fails closed on a `skills` value that
+is not a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an
+integer ≥ 1): the whole variation is rejected, `inspect_config` returns `config: None`, and
+`extract_variation` raises. A variation that previously carried its own custom `skills`
+field of a different shape must rename it before upgrading.
+
+| Export | Description |
+|---|---|
+| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when absent. |
+
+> `Skill.content` is `bytes` — the verified verbatim bytes LaunchDarkly delivered, exactly
+> what was hashed. The SDK never parses or interprets them; if you want the frontmatter,
+> decode and parse the content on your side.
+
+---
+
 ### Utility Helpers
 
 ```python
@@ -250,3 +289,5 @@ All types are exported from this package. Handler packages import them from here
 | `GraphNode` / `GraphEdge` | A dataclass node (`.key`, `.config`, `.meta`, `.edges`, `.is_terminal`) and a dataclass directed edge (`.key`, `.source_key`, `.target_key`, `.handoff`) |
 | `ProviderGraphResponse` | A dataclass returned by `graph(...).invoke()`: `.response`, `.usage`, `.judge_results` |
 | `GraphTopology` | The parsed graph flag shape (`root` + `edges`) |
+| `Skill` | A frozen skill document: `.key`, `.version`, `.content` (verified verbatim `bytes`), `.content_hash`, `.name?`, `.description?` |
+| `SkillReference` | A frozen version-pinned pointer to a skill: `.key`, `.version` |

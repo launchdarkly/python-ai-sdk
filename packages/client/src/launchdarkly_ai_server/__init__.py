@@ -37,6 +37,9 @@ from .registry import (
     resolve_handlers,
     resolve_tools,
 )
+from .skills import (
+    skill_refs,
+)
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -66,6 +69,8 @@ from .types import (
     ProviderGraphResponse,
     ProviderHandler,
     ProviderResponse,
+    Skill,
+    SkillReference,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -126,6 +131,8 @@ __all__ = [  # noqa: RUF022
     "ProviderGraphResponse",
     "ProviderHandler",
     "ProviderResponse",
+    "Skill",
+    "SkillReference",
     "StreamChunkEvent",
     "StreamDoneEvent",
     "StreamEvent",
@@ -199,4 +206,6 @@ __all__ = [  # noqa: RUF022
     "graph",
     "resolve_graph",
     "GraphInstance",
+    # skills
+    "skill_refs",
 ]
