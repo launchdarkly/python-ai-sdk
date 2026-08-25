@@ -163,7 +163,6 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
                     "createdAt": 1,
                 },
             ),
-            response(202, {}),
             response(
                 200,
                 {
@@ -193,13 +192,18 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
             ),
         ]
     )
+    client = MagicMock()
+    client.variation = AsyncMock(return_value=True)
+    client.flush = AsyncMock()
+    init_client.return_value = client
     evals = init_evaluations(
         api_token="token",
+        sdk_key="sdk-key",
         base_uri="https://api.example.com",
         ui_base_uri="https://ui.example.com/",
         transport=transport,
     )
-    assert evals.sdk_key is None
+    assert evals.sdk_key == "sdk-key"
 
     result = await evals.run(
         project_key="proj",
@@ -232,7 +236,6 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "GET",
         "POST",
         "POST",
-        "POST",
         "GET",
         "GET",
     ]
@@ -261,18 +264,31 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "datasetId": "33333333-3333-3333-3333-333333333333",
     }
 
-    ingested = transport.requests[6]["body"]["results"]
-    assert [row["row_index"] for row in ingested] == [4, 9]
-    assert ingested[0]["input"] == "Order A19"
-    assert ingested[0]["expected_output"] == "Found A19"
-    assert ingested[0]["variables"]["input"] == "Order A19"
-    assert ingested[0]["variables"]["expected_output"] == "Found A19"
-    init_client.assert_not_awaited()
+    assert not any(
+        request["url"].endswith("/generation-results") for request in transport.requests
+    )
+    assert client.track.call_count == 2
+    event_name, context, event, metric_value = client.track.call_args_list[0].args
+    assert event_name == "$ld:ai:offline-evals:generation"
+    assert context["key"] == "22222222-2222-2222-2222-222222222222"
+    assert metric_value == 1
+    assert event["projectKey"] == "proj"
+    assert event["evaluationId"] == "11111111-1111-1111-1111-111111111111"
+    assert event["runId"] == "22222222-2222-2222-2222-222222222222"
+    assert event["datasetId"] == "33333333-3333-3333-3333-333333333333"
+    assert event["rowIndex"] == 4
+    assert event["status"] == "COMPLETE"
+    assert event["generationOutput"] == "generated: Order A19"
+    assert event["usage"] == {"input_tokens": 10, "output_tokens": 4}
+    assert len(event["eventId"]) == len(event["contentHash"]) == 64
+    assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(event)
+    client.flush.assert_awaited_once_with()
+    init_client.assert_awaited_once_with({"sdkKey": "sdk-key"})
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("flag_value", "expected_ingest"),
+    ("flag_value", "expected_poll"),
     [
         pytest.param(True, True, id="enabled"),
         pytest.param(False, False, id="disabled-default"),
@@ -282,10 +298,10 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         ),
     ],
 )
-async def test_batch_ingest_flag_controls_generation_result_publishing(
+async def test_batch_ingest_flag_controls_generation_result_polling(
     monkeypatch: pytest.MonkeyPatch,
     flag_value: object,
-    expected_ingest: bool,
+    expected_poll: bool,
 ) -> None:
     responses = [
         response(200, {"id": "dataset-id", "name": "golden"}),
@@ -306,10 +322,9 @@ async def test_batch_ingest_flag_controls_generation_result_publishing(
             },
         ),
     ]
-    if expected_ingest:
+    if expected_poll:
         responses.extend(
             [
-                response(202, {}),
                 response(
                     200,
                     {
@@ -350,6 +365,12 @@ async def test_batch_ingest_flag_controls_generation_result_publishing(
     else:
         client.variation = AsyncMock(return_value=flag_value)
 
+    def flush_before_poll_or_summary() -> None:
+        assert len(transport.requests) == 4
+        assert transport.requests[-1]["url"].endswith("/evaluations/evaluation-id/runs")
+
+    client.flush.side_effect = flush_before_poll_or_summary
+
     async def fake_init_client(options: dict[str, Any]) -> MagicMock:
         assert options == {"sdkKey": "sdk-key"}
         return client
@@ -370,15 +391,14 @@ async def test_batch_ingest_flag_controls_generation_result_publishing(
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
-    assert result.passed is expected_ingest
-    assert result.summary.pending_rows == (0 if expected_ingest else 1)
+    assert result.passed is expected_poll
+    assert result.summary.pending_rows == (0 if expected_poll else 1)
     request_urls = [request["url"] for request in transport.requests]
-    assert (
-        any(url.endswith("/generation-results") for url in request_urls)
-        is expected_ingest
-    )
+    assert not any(url.endswith("/generation-results") for url in request_urls)
+    client.track.assert_called_once()
+    client.flush.assert_called_once_with()
     status_url = "/evaluations/evaluation-id/runs/run-id"
-    assert any(url.endswith(status_url) for url in request_urls) is expected_ingest
+    assert any(url.endswith(status_url) for url in request_urls) is expected_poll
     assert request_urls[-1].endswith(f"{status_url}/summary")
     assert sum(url.endswith(f"{status_url}/summary") for url in request_urls) == 1
 
@@ -462,7 +482,7 @@ async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
     ],
 )
 async def test_complete_run_with_failed_or_error_rows_does_not_pass(
-    failed_rows: int, error_rows: int
+    monkeypatch: pytest.MonkeyPatch, failed_rows: int, error_rows: int
 ) -> None:
     calls: list[str | None] = []
 
@@ -515,7 +535,6 @@ async def test_complete_run_with_failed_or_error_rows_does_not_pass(
                     "createdAt": 1,
                 },
             ),
-            response(202, {}),
             response(
                 200,
                 {
@@ -545,7 +564,17 @@ async def test_complete_run_with_failed_or_error_rows_does_not_pass(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    client = MagicMock()
+    client.variation = AsyncMock(return_value=True)
+
+    async def fake_init_client(options: dict[str, Any]) -> MagicMock:
+        assert options == {"sdkKey": "sdk-key"}
+        return client
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client", fake_init_client
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
 
     result = await evals.run(
         project_key="proj",
@@ -558,8 +587,11 @@ async def test_complete_run_with_failed_or_error_rows_does_not_pass(
     assert set(calls) == {"bad", "good"}
     assert len(calls) == 2
     assert result.passed is False
-    rows = transport.requests[4]["body"]["results"]
-    assert {row["status"] for row in rows} == {"COMPLETE", "ERROR"}
-    error_row = next(row for row in rows if row["status"] == "ERROR")
-    assert error_row["row_index"] == 0
-    assert "provider failed" in error_row["error"]["message"]
+    assert client.track.call_count == 2
+    events = [call.args[2] for call in client.track.call_args_list]
+    assert {event["status"] for event in events} == {"COMPLETE", "ERROR"}
+    error_event = next(event for event in events if event["status"] == "ERROR")
+    assert error_event["rowIndex"] == 0
+    assert "provider failed" in error_event["error"]["message"]
+    assert "generationOutput" not in error_event
+    assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(error_event)

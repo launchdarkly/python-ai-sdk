@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from collections.abc import Mapping
@@ -84,7 +85,8 @@ class EvaluationsModule:
             timeout=timeout,
         )
         run_tools = dict(tools or {})
-        batch_ingest_enabled = True
+        client = None
+        batch_ingest_enabled = False
         if self._sdk_key:
             client = await init_client({"sdkKey": self._sdk_key})
             batch_ingest_enabled = await is_generation_result_batch_ingest_enabled(
@@ -109,13 +111,18 @@ class EvaluationsModule:
             run_tools,
             concurrency,
         )
-        self._runner._ingest_results(
-            project_key,
-            evaluation.id,
-            evaluation_run.id,
-            results,
-            batch_ingest_enabled=batch_ingest_enabled,
-        )
+        if client is not None:
+            self._runner._emit_generation_events(
+                client,
+                project_key=project_key,
+                evaluation=evaluation,
+                evaluation_run=evaluation_run,
+                dataset=dataset_ref,
+                results=results,
+            )
+            flush_result = client.flush()
+            if inspect.isawaitable(flush_result):
+                await flush_result
         if batch_ingest_enabled:
             await self._runner._poll_run(
                 project_key, evaluation.id, evaluation_run.id, timeout
