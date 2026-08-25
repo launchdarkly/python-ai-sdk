@@ -274,7 +274,8 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert metric_value == 1
     assert event["projectKey"] == "proj"
     assert event["evaluationId"] == "11111111-1111-1111-1111-111111111111"
-    assert event["runId"] == "22222222-2222-2222-2222-222222222222"
+    assert event["evaluationRunId"] == "22222222-2222-2222-2222-222222222222"
+    assert event["runId"] == event["evaluationRunId"]
     assert event["datasetId"] == "33333333-3333-3333-3333-333333333333"
     assert event["rowIndex"] == 4
     assert event["status"] == "COMPLETE"

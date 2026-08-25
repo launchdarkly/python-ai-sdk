@@ -418,6 +418,7 @@ class EvaluationsRunner:
             identity = {
                 "projectKey": project_key,
                 "evaluationId": evaluation.id,
+                "evaluationRunId": evaluation_run.id,
                 "runId": evaluation_run.id,
                 "datasetId": dataset.id,
                 "rowIndex": result["row_index"],
