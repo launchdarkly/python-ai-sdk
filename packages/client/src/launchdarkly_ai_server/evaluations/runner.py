@@ -437,10 +437,12 @@ class EvaluationsRunner:
                     generated, sort_keys=True, separators=(",", ":"), default=str
                 ).encode()
             ).hexdigest()
+            emitted_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             payload: dict[str, Any] = {
                 **identity,
                 "eventId": event_id,
                 "contentHash": content_hash,
+                "emittedAt": emitted_at,
                 "evaluationKey": evaluation.key,
                 "evaluationVersion": evaluation.version,
                 "datasetKey": dataset.key,
@@ -456,6 +458,10 @@ class EvaluationsRunner:
             if generated["usage"] is not None:
                 payload["usage"] = generated["usage"]
             client.track(GENERATION_EVENT_NAME, context, payload, 1)
+            print(
+                f"{GENERATION_EVENT_NAME} emittedAt={emitted_at} eventId={event_id}",
+                flush=True,
+            )
 
     async def _poll_run(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -89,6 +90,7 @@ def lookup_order(order_id: str) -> str:
 @pytest.mark.asyncio
 async def test_complete_run_with_zero_failed_and_error_rows_passes(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
     init_client = AsyncMock()
@@ -282,7 +284,15 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert event["generationOutput"] == "generated: Order A19"
     assert event["usage"] == {"input_tokens": 10, "output_tokens": 4}
     assert len(event["eventId"]) == len(event["contentHash"]) == 64
+    assert event["emittedAt"].endswith("Z")
+    assert datetime.fromisoformat(event["emittedAt"]).tzinfo is not None
     assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(event)
+    output_lines = capsys.readouterr().out.splitlines()
+    assert len(output_lines) == 2
+    assert output_lines[0] == (
+        "$ld:ai:offline-evals:generation "
+        f"emittedAt={event['emittedAt']} eventId={event['eventId']}"
+    )
     client.flush.assert_awaited_once_with()
     init_client.assert_awaited_once_with({"sdkKey": "sdk-key"})
 
