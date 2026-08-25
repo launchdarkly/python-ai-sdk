@@ -17,6 +17,8 @@ import launchdarkly_ai_server.lifecycle as lifecycle_module
 import launchdarkly_ai_server.skills as skills_module
 from launchdarkly_ai_server import (
     InMemorySkillStore,
+    ReconcileAction,
+    ReconcileReport,
     Skill,
     SkillReference,
     all_skills,
@@ -129,7 +131,7 @@ FABRICATED_HASH_CASES = _fabricated_hash_cases()
 
 
 class TestSkillTypes:
-    """Immutability and optional metadata."""
+    """Immutability, optional metadata, and ``ReconcileReport.ok``."""
 
     def test_skill_reference_is_immutable(self) -> None:
         ref = SkillReference(key="pdf-extraction", version=2)
@@ -163,6 +165,70 @@ class TestSkillTypes:
         skill = _skill()
         assert skill.name is None
         assert skill.description is None
+
+    def test_report_ok_true_when_no_error_action(self) -> None:
+        report = ReconcileReport(
+            actions=[
+                ReconcileAction(key="a", action="written", version=1),
+                ReconcileAction(key="b", action="skipped_current", version=2),
+                ReconcileAction(key="c", action="removed"),
+                ReconcileAction(key="d", action="updated", version=3),
+            ]
+        )
+        assert report.ok is True
+
+    def test_report_ok_false_with_error_action(self) -> None:
+        report = ReconcileReport(
+            actions=[
+                ReconcileAction(key="a", action="written", version=1),
+                ReconcileAction(key="b", action="error", error="nope"),
+            ]
+        )
+        assert report.ok is False
+
+    def test_empty_report_is_ok(self) -> None:
+        assert ReconcileReport(actions=[]).ok is True
+
+    def test_report_errors_lists_error_actions_in_order(self) -> None:
+        """The report exposes its error actions itself."""
+        first = ReconcileAction(key="b", action="error", error="first")
+        second = ReconcileAction(key="d", action="error", error="second")
+        report = ReconcileReport(
+            actions=[
+                ReconcileAction(key="a", action="written", version=1),
+                first,
+                ReconcileAction(key="c", action="skipped_current", version=2),
+                second,
+                ReconcileAction(key="e", action="removed"),
+            ]
+        )
+        assert report.errors == [first, second]
+
+    def test_report_errors_empty_when_no_error_action(self) -> None:
+        report = ReconcileReport(
+            actions=[
+                ReconcileAction(key="a", action="written", version=1),
+                ReconcileAction(key="b", action="removed"),
+            ]
+        )
+        assert report.errors == []
+
+    def test_empty_report_has_no_errors(self) -> None:
+        assert ReconcileReport(actions=[]).errors == []
+
+    def test_report_ok_and_errors_always_agree(self) -> None:
+        """``ok`` is true iff ``errors`` is empty, on the same objects."""
+        clean = ReconcileReport(
+            actions=[ReconcileAction(key="a", action="written", version=1)]
+        )
+        failed = ReconcileReport(
+            actions=[
+                ReconcileAction(key="a", action="written", version=1),
+                ReconcileAction(key="b", action="error", error="nope"),
+            ]
+        )
+        for report in (clean, failed, ReconcileReport(actions=[])):
+            assert report.ok is (report.errors == [])
 
 
 class TestSkillRefs:
@@ -266,6 +332,59 @@ class TestPackageExports:
         assert skills_core.SKILL_OBJECT_KIND == "skill"
         assert "SKILL_OBJECT_KIND" not in package.__all__
         assert not hasattr(package, "SKILL_OBJECT_KIND")
+
+    def test_constants_are_exported_from_the_package_root(self) -> None:
+        import launchdarkly_ai_server as package
+
+        assert package.SKILL_FILENAME == "SKILL.md"
+        assert package.MANIFEST_FILENAME == ".launchdarkly-skills.json"
+        assert package.MANIFEST_VERSION == 1
+
+    def test_constants_are_listed_in_dunder_all(self) -> None:
+        """A name absent from ``__all__`` is not part of the public surface."""
+        import launchdarkly_ai_server as package
+
+        expected = {
+            "SKILL_FILENAME",
+            "MANIFEST_FILENAME",
+            "MANIFEST_VERSION",
+        }
+        assert expected <= set(package.__all__)
+
+    def test_closed_set_types_are_exported_from_the_package_root(self) -> None:
+        """The two closed-set unions are public API, not implementation detail.
+
+        ``ReconcileActionKind`` types the ``ReconcileAction.action`` field every
+        consumer of a report reads and switches on, and ``OnUnavailable`` types
+        a public keyword argument of ``write_skills``. ``agents.md`` forbids
+        handler packages from importing sub-path modules, so a name exported
+        only from the implementation module has no supported import path.
+        """
+        import launchdarkly_ai_server as package
+
+        assert hasattr(package, "ReconcileActionKind")
+        assert hasattr(package, "OnUnavailable")
+        assert {"ReconcileActionKind", "OnUnavailable"} <= set(package.__all__)
+
+    def test_exported_action_union_admits_exactly_the_five_actions(self) -> None:
+        """The union must match the actions a report can actually carry.
+
+        Spelled out rather than imported from the implementation for the same
+        reason as the constants above: deriving the expectation from the thing
+        under test would make the assertion circular.
+        """
+        import typing
+
+        import launchdarkly_ai_server as package
+
+        assert set(typing.get_args(package.ReconcileActionKind)) == {
+            "written",
+            "updated",
+            "skipped_current",
+            "removed",
+            "error",
+        }
+        assert set(typing.get_args(package.OnUnavailable)) == {"keep", "raise"}
 
     def test_retrieval_surface_is_exported_from_the_package_root(self) -> None:
         """A name absent from ``__all__`` is not part of the public surface."""
@@ -811,7 +930,7 @@ class TestWithholdingSummary:
     """
 
     def _tampered(self, make_raw_skill: Any, key: str = "a") -> dict[str, Any]:
-        raw = make_raw_skill(key=key)
+        raw: dict[str, Any] = make_raw_skill(key=key)
         raw["contentHash"] = "0" * 64
         return raw
 
