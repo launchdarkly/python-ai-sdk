@@ -347,6 +347,12 @@ EXPECTED_VOCABULARY = {
     # nothing failed, the caller went away. Python only. TypeScript has no cancellation that skips a
     # `catch`, so this key has no counterpart there and its absence is not drift.
     "launchdarkly.run.cancelled",
+    # The judge span, section 4b. Python only, ahead of TypeScript: reasoning is the one judge field
+    # customers ask for next to the score, and it has no counterpart there yet.
+    "launchdarkly.judge.key",
+    "launchdarkly.judge.score",
+    "launchdarkly.judge.reasoning",
+    "launchdarkly.judge.metric.key",
     "feature_flag",
     "feature_flag.key",
     "feature_flag.provider.name",
