@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import urllib.parse
@@ -9,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..types import NativeTool
-from ..utils import parse_template
+from ..utils import parse_template, to_ld_context
 from .api import EvaluationsError, LDApiClient, LDApiError
 from .types import (
     DatasetRef,
@@ -22,8 +23,7 @@ from .types import (
 )
 
 DATASET_PAGE_SIZE = 200
-INGEST_BATCH_SIZE = 50
-MAX_INGEST_ROW_BYTES = 256 * 1024
+GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
@@ -394,32 +394,67 @@ class EvaluationsRunner:
 
         return list(await asyncio.gather(*(invoke(row) for row in rows)))
 
-    def _ingest_results(
+    def _emit_generation_events(
         self,
-        project_key: str,
-        evaluation_id: str,
-        run_id: str,
-        results: list[dict[str, Any]],
+        client: Any,
         *,
-        batch_ingest_enabled: bool = True,
+        project_key: str,
+        evaluation: EvaluationRef,
+        evaluation_run: EvaluationRunRef,
+        dataset: DatasetRef,
+        results: list[dict[str, Any]],
     ) -> None:
-        if not batch_ingest_enabled:
-            return
-        path = (
-            f"projects/{_segment(project_key)}/evaluations/{_segment(evaluation_id)}"
-            f"/runs/{_segment(run_id)}/generation-results"
+        """Queue one LD custom event for each executed dataset row."""
+        context = to_ld_context(
+            client,
+            {
+                "kind": "evaluation",
+                "key": evaluation_run.id,
+                "projectKey": project_key,
+                "evaluationId": evaluation.id,
+            },
         )
         for result in results:
-            size = len(json.dumps(result).encode("utf-8"))
-            if size > MAX_INGEST_ROW_BYTES:
-                raise EvaluationsError(
-                    f"Generation result row {result['row_index']} exceeds the "
-                    f"{MAX_INGEST_ROW_BYTES}-byte limit"
-                )
-        for start in range(0, len(results), INGEST_BATCH_SIZE):
-            self._api.post(
-                path, body={"results": results[start : start + INGEST_BATCH_SIZE]}
-            )
+            identity = {
+                "projectKey": project_key,
+                "evaluationId": evaluation.id,
+                "runId": evaluation_run.id,
+                "datasetId": dataset.id,
+                "rowIndex": result["row_index"],
+            }
+            event_id = hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            generated = {
+                "status": result["status"],
+                "generationOutput": result.get("output", {}).get("generation"),
+                "error": result.get("error"),
+                "usage": result.get("output", {}).get("usage"),
+            }
+            content_hash = hashlib.sha256(
+                json.dumps(
+                    generated, sort_keys=True, separators=(",", ":"), default=str
+                ).encode()
+            ).hexdigest()
+            payload: dict[str, Any] = {
+                **identity,
+                "eventId": event_id,
+                "contentHash": content_hash,
+                "evaluationKey": evaluation.key,
+                "evaluationVersion": evaluation.version,
+                "datasetKey": dataset.key,
+                "status": result["status"],
+                "startedAt": result["started_at"],
+                "generatedAt": result["generated_at"],
+                "latencyMs": result["latency_ms"],
+            }
+            if generated["generationOutput"] is not None:
+                payload["generationOutput"] = generated["generationOutput"]
+            if generated["error"] is not None:
+                payload["error"] = generated["error"]
+            if generated["usage"] is not None:
+                payload["usage"] = generated["usage"]
+            client.track(GENERATION_EVENT_NAME, context, payload, 1)
 
     async def _poll_run(
         self,
