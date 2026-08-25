@@ -37,6 +37,24 @@ from .registry import (
     resolve_handlers,
     resolve_tools,
 )
+from .skills import (
+    InMemorySkillStore,
+    all_skills,
+    get_skill,
+    get_skills,
+    skill_refs,
+)
+from .skills_core import (
+    SKILL_OBJECT_KIND,
+    SkillStore,
+)
+from .skills_fs import (
+    MANIFEST_FILENAME,
+    MANIFEST_VERSION,
+    SKILL_FILENAME,
+    OnUnavailable,
+    write_skills,
+)
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -66,6 +84,11 @@ from .types import (
     ProviderGraphResponse,
     ProviderHandler,
     ProviderResponse,
+    ReconcileAction,
+    ReconcileActionKind,
+    ReconcileReport,
+    Skill,
+    SkillReference,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -126,6 +149,11 @@ __all__ = [  # noqa: RUF022
     "ProviderGraphResponse",
     "ProviderHandler",
     "ProviderResponse",
+    "ReconcileAction",
+    "ReconcileActionKind",
+    "ReconcileReport",
+    "Skill",
+    "SkillReference",
     "StreamChunkEvent",
     "StreamDoneEvent",
     "StreamEvent",
@@ -199,4 +227,20 @@ __all__ = [  # noqa: RUF022
     "graph",
     "resolve_graph",
     "GraphInstance",
+    # skills
+    "skill_refs",
+    "get_skill",
+    "get_skills",
+    "all_skills",
+    "write_skills",
+    "SkillStore",
+    "InMemorySkillStore",
+    # skills — the two closed-set unions a typed consumer needs to name
+    "ReconcileActionKind",
+    "OnUnavailable",
+    # skills — on-the-wire and on-disk constants, identical across languages
+    "SKILL_OBJECT_KIND",
+    "SKILL_FILENAME",
+    "MANIFEST_FILENAME",
+    "MANIFEST_VERSION",
 ]

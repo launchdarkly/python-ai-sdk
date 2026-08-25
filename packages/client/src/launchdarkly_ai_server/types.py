@@ -92,7 +92,8 @@ class Message:
 AiConfigRep = dict[str, Any]
 """
 Raw AI config dict as returned by ``parse_ai_config``. Fields include
-``model``, ``provider``, and at least one of ``instructions`` / ``messages``.
+``model``, ``provider``, at least one of ``instructions`` / ``messages``, and an
+optional ``skills`` array of ``{key, version}`` references (see ``skill_refs``).
 """
 
 VariationMeta = dict[str, Any]
@@ -410,6 +411,116 @@ class ProviderGraphResponse:
     """Aggregate token counts across all nodes."""
     judge_results: dict[str, JudgeResult] | None = None
     """Results from a graph-level judge, if configured."""
+
+
+# ---------------------------------------------------------------------------
+# Agent Skills
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SkillReference:
+    """A version-pinned pointer to a skill, as attached to an AI Config variation."""
+
+    key: str
+    """Immutable skill key — ``^[a-z0-9][a-z0-9-]*$``, at most 256 characters."""
+    version: int
+    """Immutable skill version — an integer >= 1."""
+
+
+@dataclass(frozen=True)
+class Skill:
+    """
+    A single verbatim ``SKILL.md`` document.
+
+    Only ever constructed after integrity verification passes, so ``content``
+    is the exact byte sequence LaunchDarkly delivered and ``content_hash`` is
+    its sha256. Instances are immutable.
+    """
+
+    key: str
+    version: int
+    content: str
+    """Verbatim ``SKILL.md`` — YAML frontmatter plus markdown body."""
+    content_hash: str
+    """sha256, lowercase hex, over the verbatim UTF-8 bytes of ``content``."""
+    name: str | None = None
+    """Display name from LaunchDarkly metadata; never parsed from the markdown."""
+    description: str | None = None
+    """Description from LaunchDarkly metadata; never parsed from the markdown."""
+
+    def frontmatter(self) -> dict[str, Any] | None:
+        """
+        Parses the leading ``---`` frontmatter block, if any.
+
+        A lazy convenience, never part of the integrity path. The YAML library
+        is imported inside this method so it stays a development-only
+        dependency. Parsing is bounded on every axis a hostile document could
+        exploit: the block must be at most 8 KB, nesting at most 10 levels
+        deep, alias/anchor resolution is disabled outright, and only a safe
+        loader is used so no object can be constructed.
+
+        Returns ``None`` — never raises — when the block is absent,
+        unterminated, oversize, too deeply nested, not a mapping, unparseable,
+        or when no safe YAML parser is available.
+        """
+        # Imported here, not at module scope: this module is the package's
+        # shared declarative type surface, and the parser it delegates to is
+        # only ever reached through this one accessor.
+        from .frontmatter import extract_block, parse_block
+
+        block = extract_block(self.content)
+        if block is None:
+            return None
+        return parse_block(block)
+
+
+ReconcileActionKind = Literal[
+    "written", "updated", "skipped_current", "removed", "error"
+]
+"""The closed set of outcomes ``write_skills`` reports."""
+
+
+@dataclass(frozen=True)
+class ReconcileAction:
+    """What ``write_skills`` did — or refused to do — for one skill."""
+
+    key: str
+    """
+    The skill key, or the **empty string** for a failure that belongs to the run
+    rather than to one skill — a corrupt manifest, a manifest that could not be
+    rewritten, a retrieval that failed before any key was known. Callers grouping
+    a report by key need to expect that sentinel; a report may carry both kinds.
+    """
+    action: ReconcileActionKind
+    version: int | None = None
+    path: str | None = None
+    """Canonical resolved path, when one was determined."""
+    error: str | None = None
+    """Failure detail, set only when ``action == "error"``."""
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """The result of a ``write_skills`` run — every outcome is visible here."""
+
+    actions: list[ReconcileAction] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """``True`` iff no action is an ``error``."""
+        return not self.errors
+
+    @property
+    def errors(self) -> list[ReconcileAction]:
+        """
+        The ``error`` actions, in ``actions`` order.
+
+        Exposed so callers never re-derive it — filtering ``actions`` is
+        boilerplate that otherwise reappears in every consumer. ``ok`` is defined
+        in terms of this, so the two can never disagree.
+        """
+        return [a for a in self.actions if a.action == "error"]
 
 
 # ---------------------------------------------------------------------------
