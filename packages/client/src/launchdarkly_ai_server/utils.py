@@ -594,6 +594,48 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     span.add_event("feature_flag", feature_flag_attrs)
 
 
+JUDGE_SPAN_NAME = "launchdarkly.judge"
+
+JUDGE_REASONING_MAX_LENGTH = 4000
+
+
+def truncate_judge_reasoning(reasoning: str) -> str:
+    """Clips reasoning to :data:`JUDGE_REASONING_MAX_LENGTH`, marking that it was clipped."""
+    if len(reasoning) <= JUDGE_REASONING_MAX_LENGTH:
+        return reasoning
+    return reasoning[:JUDGE_REASONING_MAX_LENGTH] + "…"
+
+
+def set_judge_span_attributes(
+    span: Any,
+    *,
+    judge_config_key: str,
+    score: float | None,
+    reasoning: str | None,
+    evaluation_metric_key: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    """Writes judge evaluation attributes onto a :data:`JUDGE_SPAN_NAME` span.
+
+    Config association attributes stay on the handler root span; ``launchdarkly.run.id`` joins
+    this span back to the run it evaluates.
+    """
+    if span is None:
+        return
+    span.set_attribute("launchdarkly.operation.type", "judge")
+    span.set_attribute("launchdarkly.judge.key", judge_config_key)
+    if score is not None:
+        span.set_attribute("launchdarkly.judge.score", score)
+    if reasoning:
+        span.set_attribute(
+            "launchdarkly.judge.reasoning", truncate_judge_reasoning(reasoning)
+        )
+    if evaluation_metric_key:
+        span.set_attribute("launchdarkly.judge.metric.key", evaluation_metric_key)
+    if run_id:
+        span.set_attribute("launchdarkly.run.id", run_id)
+
+
 def set_openllmetry_prompt(span: Any, messages: list[dict[str, str]]) -> None:
     """Set OpenLLMetry-style indexed prompt attributes on a span.
 

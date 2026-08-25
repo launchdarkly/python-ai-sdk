@@ -212,6 +212,37 @@ when `conversation_id(...)` is bound.
 
 ---
 
+## 4a. Attributes on a judge span, `launchdarkly.judge`
+
+Python-only, ahead of `js-ai-sdk`. One span per sampled judge evaluation, opened as a plain span
+and ended by hand. It is not made current: the judge is itself a tracked AI call, so making it
+current would reparent that call's `invoke_agent` root underneath it.
+
+| Key | Value |
+|---|---|
+| `launchdarkly.operation.type` | `judge` |
+| `launchdarkly.judge.key` | judge config key |
+| `launchdarkly.judge.score` | parsed score, only when present |
+| `launchdarkly.judge.reasoning` | parsed reasoning, only when non-empty. Truncated at 4000 characters |
+| `launchdarkly.judge.metric.key` | `evaluationMetricKey`, only when present |
+| `launchdarkly.run.id` | `TrackData.runId` of the run being evaluated |
+
+`launchdarkly.judge.reasoning` is not gated behind `capture_content` (section 7). Reasoning is the
+judge's own explanation of a score LaunchDarkly already receives, not conversation content, and
+gating it there would force a caller who wants it to also ship every request and response.
+`LD_CAPTURE_JUDGE_REASONING=false` suppresses reasoning on the span and in the track payload while
+keeping the score.
+
+No config-association attributes and no `feature_flag` event: those stay on the root, so a
+config-scoped query keeps finding exactly one span per run. `launchdarkly.run.id` joins this span
+back to the run it evaluates.
+
+The same reasoning also rides the evaluation metric event as `TrackData.judgeReasoning`, on both
+the inline path and the deferred `run_judge` path, so it reaches LaunchDarkly through the
+evaluation pipeline rather than only through the collector.
+
+---
+
 ## 5. Finish reasons
 
 One vocabulary across all six handlers: `stop`, `length`, `content_filter`, `tool_calls`, `error`.

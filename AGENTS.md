@@ -237,6 +237,7 @@ Payload attached to every LaunchDarkly tracking event.
 | `graphKey` | `str?` | Present when the event was produced inside an agent graph. |
 | `toolName` | `str?` | Present when the event is for a tool call. |
 | `judgeConfigKey` | `str?` | Present when the event is from a judge execution. |
+| `judgeReasoning` | `str?` | The judge's explanation of its score. Present on judge evaluation metric events when the judge returned reasoning. Truncated at 4000 characters; suppressed by `LD_CAPTURE_JUDGE_REASONING=false`. |
 
 #### `NativeTool`
 
