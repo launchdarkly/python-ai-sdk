@@ -205,6 +205,8 @@ class EvaluationsRunner:
             body["messages"] = []
         if "prompt_snippets" in generation:
             body["promptSnippets"] = generation["prompt_snippets"]
+        if "output_format" in generation:
+            body["outputFormat"] = generation["output_format"]
         if tools:
             body["tools"] = [
                 {"key": tool.key, "version": tool.version} for tool in tools.values()

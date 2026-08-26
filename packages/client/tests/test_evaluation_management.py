@@ -23,6 +23,41 @@ class RecordingApi:
         return self.responses.pop(0)
 
 
+def test_evaluation_create_sends_structured_output_format() -> None:
+    api = RecordingApi()
+    api.responses = [{"id": "evaluation-id", "name": "evaluation-key"}]
+    runner = EvaluationsRunner(api)  # type: ignore[arg-type]
+    output_format = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+
+    runner._create_evaluation(
+        "project",
+        "evaluation-key",
+        {
+            "provider": "OpenAI",
+            "model": "gpt-4o",
+            "output_format": output_format,
+        },
+        {},
+    )
+
+    assert api.posts == [
+        (
+            "projects/project/evaluations",
+            {
+                "name": "evaluation-key",
+                "generationProvider": "OpenAI",
+                "generationModel": "gpt-4o",
+                "messages": [],
+                "outputFormat": output_format,
+            },
+        )
+    ]
+
+
 def test_run_create_uses_landed_api_source_contract() -> None:
     api = RecordingApi()
     api.responses = [
