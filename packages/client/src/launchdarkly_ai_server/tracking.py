@@ -67,7 +67,7 @@ def wrap_tool_handlers(
                     get_client().track(
                         "$ld:ai:tool_call",
                         user_context,
-                        {**track_data, "toolName": tool_name},
+                        {**track_data, "toolKey": tool_name},
                         1,
                     )
 
@@ -85,7 +85,7 @@ def wrap_tool_handlers(
                         get_client().track(
                             "$ld:ai:tool_call",
                             user_context,
-                            {**track_data, "toolName": tool_name},
+                            {**track_data, "toolKey": tool_name},
                             1,
                         )
                     result = original(*args, **kwargs)
