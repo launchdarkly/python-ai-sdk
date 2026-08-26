@@ -23,7 +23,9 @@
 
 ---
 
-A Python monorepo for integrating LaunchDarkly AgentControl with multiple AI providers. LaunchDarkly manages which model, provider, prompt, and tools are used at runtime via feature flags — your code just calls the right handler.
+LaunchDarkly AI SDK for Python. Manage prompts, models, tools, and agent graphs as AgentControl configs, target and roll them out per user, score quality with judges, and track cost, latency, and errors. Handlers for OpenAI, Anthropic, and LangChain.
+
+Change models, providers, prompts, or tools in LaunchDarkly at runtime — your code just calls the right handler, with no redeploy.
 
 ## Repository Layout
 
