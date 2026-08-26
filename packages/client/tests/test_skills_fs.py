@@ -932,8 +932,11 @@ class TestPathTraversal:
         # The bare-filename ``dst`` of a ``dir_fd``-relative rename carries no
         # directory, so "the path does not contain the hostile key" is no longer
         # a meaningful check. Assert the stronger thing instead: the only rename
-        # that happened was into the valid skill's own directory.
-        assert [call.dst_dir_id for call in spy.calls] == [_dir_id(root / "good")]
+        # that happened was into the valid skill's own directory. Through the
+        # shared helper, so the check holds on the path fallback too — reading
+        # ``dst_dir_id`` directly would compare ``None`` there and fail a run
+        # that had in fact renamed correctly.
+        _assert_atomic_rename_of(spy, root / "good")
         # The valid skill is fully reconciled: written AND recorded, not orphaned.
         assert (root / "good" / "SKILL.md").exists()
         assert "good/SKILL.md" in _read_manifest(root)["entries"]
