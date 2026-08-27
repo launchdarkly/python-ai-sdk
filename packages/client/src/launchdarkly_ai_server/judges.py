@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 from collections.abc import Callable
 from typing import Any
+
+from opentelemetry import trace
 
 from .types import (
     AiConfigRep,
@@ -15,14 +18,21 @@ from .types import (
     TrackData,
 )
 from .utils import (
-    collapse_messages_to_instructions as _collapse_messages_to_instructions,
-)
-from .utils import (
+    JUDGE_SPAN_NAME,
     normalize_mode,
     parse_json_with_possible_fences,
+    set_judge_span_attributes,
     to_ld_context,
     to_usage_dict,
+    truncate_judge_reasoning,
 )
+from .utils import (
+    collapse_messages_to_instructions as _collapse_messages_to_instructions,
+)
+
+_TRACER_NAME = "@launchdarkly/ai-server"
+
+_REASONING_DISABLED_VALUES = frozenset({"0", "false", "off", "no"})
 
 
 def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
@@ -34,6 +44,40 @@ def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
 
 
 logger = logging.getLogger(__name__)
+
+
+def judge_reasoning_enabled() -> bool:
+    """Whether judge reasoning leaves the process. Enabled unless ``LD_CAPTURE_JUDGE_REASONING``
+    is set to a falsy value.
+    """
+    value = os.environ.get("LD_CAPTURE_JUDGE_REASONING", "").strip().lower()
+    return value not in _REASONING_DISABLED_VALUES
+
+
+def build_judge_track_data(
+    base_track_data: TrackData,
+    judge_config_key: str,
+    reasoning: str | None,
+) -> TrackData:
+    """Builds the payload for a judge's evaluation metric event, carrying ``judgeReasoning``
+    alongside the score.
+    """
+    track_data: TrackData = {**base_track_data, "judgeConfigKey": judge_config_key}
+    if reasoning and judge_reasoning_enabled():
+        track_data["judgeReasoning"] = truncate_judge_reasoning(reasoning)
+    return track_data
+
+
+def _start_judge_span(judge_config_key: str) -> Any:
+    """Opens the judge span as a plain span; making it current would reparent the judge's own
+    ``invoke_agent`` root underneath it.
+    """
+    try:
+        return trace.get_tracer(_TRACER_NAME).start_span(JUDGE_SPAN_NAME)
+    except Exception as exc:  # pragma: no cover - tracing must never fail a run
+        logger.debug("Could not start judge span for '%s': %s", judge_config_key, exc)
+        return None
+
 
 _FORMATTING_INSTRUCTIONS = "\n".join(
     [
@@ -83,6 +127,7 @@ async def run_judges(
             continue
 
         judge_key = judge["key"]
+        judge_span = _start_judge_span(judge_key)
 
         try:
             variation = await extract_variation(judge_key, user_context)
@@ -189,6 +234,15 @@ async def run_judges(
                 if isinstance(judge_ai_config, dict)
                 else None
             )
+            set_judge_span_attributes(
+                judge_span,
+                judge_config_key=judge_key,
+                score=score,
+                reasoning=reasoning if judge_reasoning_enabled() else None,
+                evaluation_metric_key=evaluation_metric_key,
+                run_id=base_track_data.get("runId"),
+            )
+
             if evaluation_metric_key and score is not None:
                 from .lifecycle import get_client
 
@@ -196,12 +250,15 @@ async def run_judges(
                 client.track(
                     evaluation_metric_key,
                     to_ld_context(client, user_context),
-                    {**base_track_data, "judgeConfigKey": judge_key},
+                    build_judge_track_data(base_track_data, judge_key, reasoning),
                     score,
                 )
 
         except Exception as exc:
             logger.error("Judge '%s' failed: %s", judge_key, exc)
+        finally:
+            if judge_span is not None:
+                judge_span.end()
 
     return judge_results
 
@@ -411,11 +468,25 @@ async def run_judge(
 
     usage = to_usage_dict(raw_usage)
 
-    merged_track_data: TrackData = {
-        **task.parent_track_data,
-        **result["track_data"],
-        "judgeConfigKey": task.config_key,
-    }
+    merged_track_data: TrackData = build_judge_track_data(
+        {**task.parent_track_data, **result["track_data"]},
+        task.config_key,
+        reasoning,
+    )
+
+    judge_span = _start_judge_span(task.config_key)
+    if judge_span is not None:
+        try:
+            set_judge_span_attributes(
+                judge_span,
+                judge_config_key=task.config_key,
+                score=score,
+                reasoning=reasoning if judge_reasoning_enabled() else None,
+                evaluation_metric_key=task.evaluation_metric_key,
+                run_id=merged_track_data.get("runId"),
+            )
+        finally:
+            judge_span.end()
 
     return JudgeRunResult(
         score=score, response=reasoning, usage=usage, track_data=merged_track_data
