@@ -7,6 +7,7 @@ import pytest
 
 from launchdarkly_ai_server.evaluations.api import (
     DEFAULT_BASE_URI,
+    EvaluationsError,
     HttpResponse,
     LDApiClient,
     LDApiError,
@@ -106,6 +107,62 @@ def test_rate_limit_retries_and_honors_retry_after() -> None:
     assert client.get("projects/proj/datasets") == {"items": []}
     assert len(transport.requests) == 2
     assert sleeps == [2.0]
+
+
+def test_get_retries_network_error() -> None:
+    attempts = 0
+
+    def transport(*args: Any) -> HttpResponse:
+        nonlocal attempts
+        del args
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("timed out")
+        return HttpResponse(status=200, body='{"items": []}')
+
+    sleeps: list[float] = []
+    client = LDApiClient(
+        api_token="api-token",
+        transport=transport,
+        max_retries=1,
+        sleep=sleeps.append,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.get("projects/proj/datasets") == {"items": []}
+    assert attempts == 2
+    assert sleeps == [0.5]
+
+
+@pytest.mark.parametrize("status", [429, 500])
+def test_post_does_not_retry_transient_status(status: int) -> None:
+    transport = RecordingTransport(
+        [HttpResponse(status=status, body='{"message": "transient"}')]
+    )
+    client = LDApiClient(api_token="api-token", transport=transport, max_retries=3)
+
+    with pytest.raises(LDApiError) as excinfo:
+        client.post("projects/proj/evaluations", body={"name": "evaluation"})
+
+    assert excinfo.value.status == status
+    assert len(transport.requests) == 1
+
+
+def test_post_does_not_retry_network_error() -> None:
+    attempts = 0
+
+    def transport(*args: Any) -> HttpResponse:
+        nonlocal attempts
+        del args
+        attempts += 1
+        raise TimeoutError("timed out after creation")
+
+    client = LDApiClient(api_token="api-token", transport=transport, max_retries=3)
+
+    with pytest.raises(EvaluationsError, match="timed out after creation"):
+        client.post("projects/proj/evaluations", body={"name": "evaluation"})
+
+    assert attempts == 1
 
 
 def test_forbidden_response_is_not_retried() -> None:

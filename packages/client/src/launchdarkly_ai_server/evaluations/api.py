@@ -140,6 +140,7 @@ class LDApiClient:
             headers["Content-Type"] = "application/json"
             payload = json.dumps(body).encode("utf-8")
 
+        retryable_method = method.upper() in {"GET", "HEAD", "PUT", "DELETE", "OPTIONS"}
         response: HttpResponse | None = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -147,15 +148,16 @@ class LDApiClient:
                     method, self.url_for(path, params), headers, payload, self._timeout
                 )
             except (TimeoutError, urllib.error.URLError) as error:
-                if attempt >= self._max_retries:
+                if not retryable_method or attempt >= self._max_retries:
+                    suffix = " after retries" if retryable_method else ""
                     raise EvaluationsError(
-                        f"LaunchDarkly API {method} {path} failed after retries: {error}"
+                        f"LaunchDarkly API {method} {path} failed{suffix}: {error}"
                     ) from error
                 self._sleep(self._retry_delay(attempt))
                 continue
 
             retryable = response.status == 429 or response.status >= 500
-            if retryable and attempt < self._max_retries:
+            if retryable_method and retryable and attempt < self._max_retries:
                 self._sleep(self._retry_delay(attempt, response))
                 continue
             break
