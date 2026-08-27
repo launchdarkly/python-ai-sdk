@@ -112,9 +112,15 @@ def test_rate_limit_retries_and_honors_retry_after() -> None:
 def test_get_retries_network_error() -> None:
     attempts = 0
 
-    def transport(*args: Any) -> HttpResponse:
+    def transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
         nonlocal attempts
-        del args
+        del method, url, headers, body, timeout
         attempts += 1
         if attempts == 1:
             raise TimeoutError("timed out")
@@ -151,9 +157,15 @@ def test_post_does_not_retry_transient_status(status: int) -> None:
 def test_post_does_not_retry_network_error() -> None:
     attempts = 0
 
-    def transport(*args: Any) -> HttpResponse:
+    def transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
         nonlocal attempts
-        del args
+        del method, url, headers, body, timeout
         attempts += 1
         raise TimeoutError("timed out after creation")
 
