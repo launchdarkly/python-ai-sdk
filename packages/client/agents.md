@@ -120,7 +120,7 @@ Handlers may return any of these — the client normalizes them before emitting 
       - Calls `handler(config, user_input, tool_handlers, variables)`
       - On success: emits `$ld:ai:generation:success` + token tracks
       - On error: emits `$ld:ai:generation:error` then re-raises
-3. If `judge_configuration.judges` is present, runs each judge handler (sampled by `sampling_rate`) against the primary response and tracks `evaluation_metric_key`.
+3. If `judge_configuration.judges` is present, runs each judge handler (sampled by `sampling_rate`) against the primary response, tracks `evaluation_metric_key`, and emits a `gen_ai.evaluation.result` span event on the judge's `invoke_agent` span (`gen_ai.evaluation.name` / `.score.value` / `.explanation`).
 4. Returns `ProviderResponse`: `{ response: str, usage: UsageDict, track_data: TrackData, judge_results?: dict[str, JudgeResult], judge_tasks?: list[JudgeTask] }`. `judge_results` is populated when `skip_judges=False` (default) and judges ran; `judge_tasks` is populated when `skip_judges=True`.
 
 ---

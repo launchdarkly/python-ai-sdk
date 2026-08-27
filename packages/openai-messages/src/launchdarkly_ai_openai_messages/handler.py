@@ -361,7 +361,12 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
             capture_content=capture_content,
         )
 
-    return create_handler(("OpenAI", "messages"), _call_impl, _stream_impl)  # type: ignore[arg-type]
+    return create_handler(
+        ("OpenAI", "messages"),
+        _call_impl,  # type: ignore[arg-type]
+        _stream_impl,  # type: ignore[arg-type]
+        capture_content=capture_content,
+    )
 
 
 def _final_output_messages(output: str) -> list[SpanMessage]:

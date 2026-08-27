@@ -95,6 +95,8 @@ able to tell from the trace which path ran.
 | `launchdarkly.run.id` | `TrackData.runId` | `set_ld_span_attributes` |
 | `launchdarkly.graph.key` | `TrackData.graphKey`, only when present | `set_ld_span_attributes` |
 | `launchdarkly.stream.abandoned` | `True`, only when abandoned | `end_span_once` |
+| `gen_ai.evaluation.name` | judge config key, judge roots only | `with_judge_evaluation`, see section 4a |
+| `gen_ai.evaluation.score.value` | numeric score, judge roots only | `with_judge_evaluation`, see section 4a |
 
 The root also carries one span event, `feature_flag`, with these event attributes:
 
@@ -209,6 +211,29 @@ No usage attributes. A tool call spends no tokens.
 hook input, when present, write-if-absent. That attribute therefore appears on all three span types
 for this one handler: root, `chat`, and `execute_tool`. A caller-supplied id is already on the span
 when `conversation_id(...)` is bound.
+
+---
+
+## 4a. Judge evaluation events
+
+A judge run is itself a tracked AI call (`invoke_agent` + `chat`). After the score is parsed, the
+SDK writes a `gen_ai.evaluation.result` span event on that `invoke_agent` span:
+
+| Event attribute | Value |
+|---|---|
+| `gen_ai.evaluation.name` | judge config key |
+| `gen_ai.evaluation.score.value` | numeric score, only when the judge returned a finite number |
+
+The same keys are mirrored as span attributes, so section 2 lists them too.
+`gen_ai.evaluation.score.label` is not invented.
+The existing `track(evaluationMetricKey)` call is unchanged and still feeds AI Config Monitoring —
+a judge that returns a non-numeric score emits no evaluation event but still tracks the metric.
+
+`gen_ai.evaluation.explanation` is deliberately **not** emitted. The judge's reasoning is
+model-generated prose about the user's conversation — content, under section 7 — and content
+attributes require `captureContent` / `capture_content`, a handler-factory option this layer does
+not receive. The reasoning is still returned to the caller in `judgeResults` / `judge_results`;
+only the telemetry copy is withheld. Exporting it needs its own opt-in.
 
 ---
 

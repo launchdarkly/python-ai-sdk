@@ -43,6 +43,7 @@ EXAMPLES: dict[str, str] = {
     "agent": "examples.agent",
     "streaming": "examples.streaming",
     "graph": "examples.graph_example",
+    "conversation": "examples.conversation",
     "history": "examples.history",
     "judge": "examples.judge_example",
     "claude-agents": "examples.claude_agents_example",
