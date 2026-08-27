@@ -60,7 +60,7 @@ def _wrap_native_tools(
                     get_client().track(
                         "$ld:ai:tool_call",
                         ld_context,
-                        {**track_data, "toolName": _name},
+                        {**track_data, "toolKey": _name},
                         1,
                     )
 
