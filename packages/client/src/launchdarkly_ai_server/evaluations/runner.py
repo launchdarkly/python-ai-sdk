@@ -3,16 +3,19 @@ from __future__ import annotations
 import asyncio
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from ..types import NativeTool
+from ..utils import parse_template
 from .api import EvaluationsError, LDApiClient, LDApiError
 from .types import (
     DatasetRef,
     DatasetRow,
     EvaluationRef,
     EvaluationRunRef,
+    ExecutedRow,
     GenerationConfig,
     ResolvedTool,
     RunSummary,
@@ -20,6 +23,7 @@ from .types import (
 
 DATASET_PAGE_SIZE = 200
 
+EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
 
 
@@ -42,6 +46,22 @@ def _required_string(data: Mapping[str, Any], key: str, description: str) -> str
             f"LaunchDarkly {description} response is missing string field {key!r}"
         )
     return value
+
+
+class ConcurrencyController:
+    """Owns row-worker permits."""
+
+    def __init__(self, limit: int = 10) -> None:
+        if limit < 1:
+            raise EvaluationsError("concurrency must be at least 1")
+        self._semaphore = asyncio.Semaphore(limit)
+
+    async def acquire(self, provider: str | None = None) -> None:
+        del provider
+        await self._semaphore.acquire()
+
+    def release(self) -> None:
+        self._semaphore.release()
 
 
 class EvaluationsRunner:
@@ -256,6 +276,114 @@ class EvaluationsRunner:
                 else None
             ),
         )
+
+    def _build_handler_config(
+        self,
+        generation: GenerationConfig,
+        tools: Mapping[str, ResolvedTool],
+    ) -> dict[str, Any]:
+        parameters = generation.get("parameters")
+        config: dict[str, Any] = {
+            "provider": {"name": generation["provider"]},
+            "model": {"name": generation["model"], "parameters": parameters},
+            "tools": {
+                key: {
+                    "description": tool.description,
+                    "parameters": tool.schema,
+                }
+                for key, tool in tools.items()
+            },
+        }
+        snippet_variables = {"snippet": generation.get("prompt_snippets", {})}
+        if "instructions" in generation:
+            config["instructions"] = parse_template(
+                generation["instructions"], snippet_variables
+            )
+        elif "messages" in generation:
+            config["messages"] = [
+                {
+                    **message,
+                    "content": parse_template(message["content"], snippet_variables)
+                    if isinstance(message.get("content"), str)
+                    else message.get("content"),
+                }
+                for message in generation["messages"]
+            ]
+        if "output_format" in generation:
+            config["outputFormat"] = generation["output_format"]
+        return config
+
+    @staticmethod
+    def _prepare_row(row: DatasetRow) -> DatasetRow:
+        variables = dict(row.variables)
+        rendered_input = (
+            parse_template(row.input, variables) if row.input is not None else None
+        )
+        rendered_expected = (
+            parse_template(row.expected_output, variables)
+            if row.expected_output is not None
+            else None
+        )
+        variables["input"] = rendered_input
+        variables["expected_output"] = rendered_expected
+        return DatasetRow(
+            row_index=row.row_index,
+            input=rendered_input,
+            expected_output=rendered_expected,
+            variables=variables,
+            metadata=row.metadata,
+        )
+
+    async def _run_rows(
+        self,
+        rows: list[DatasetRow],
+        handler: EvalHandler,
+        config: dict[str, Any],
+        tool_handlers: dict[str, ToolImplementation],
+        concurrency: int,
+    ) -> list[ExecutedRow]:
+        controller = ConcurrencyController(concurrency)
+
+        async def invoke(source_row: DatasetRow) -> ExecutedRow:
+            row = self._prepare_row(source_row)
+            await controller.acquire(config["provider"]["name"])
+            started = datetime.now(UTC)
+            started_clock = time.perf_counter()
+            try:
+                result = await handler(
+                    config, row.input, tool_handlers, dict(row.variables)
+                )
+                if not isinstance(result, Mapping):
+                    raise TypeError("handler result must be a mapping")
+                completed = datetime.now(UTC)
+                usage = result.get("usage")
+                return ExecutedRow(
+                    row=row,
+                    output=(
+                        str(result["output"])
+                        if result.get("output") is not None
+                        else None
+                    ),
+                    usage=dict(usage) if isinstance(usage, Mapping) else None,
+                    started_at=started,
+                    generated_at=completed,
+                    latency_ms=round((time.perf_counter() - started_clock) * 1000),
+                )
+            except Exception as error:
+                completed = datetime.now(UTC)
+                return ExecutedRow(
+                    row=row,
+                    output=None,
+                    usage=None,
+                    started_at=started,
+                    generated_at=completed,
+                    latency_ms=round((time.perf_counter() - started_clock) * 1000),
+                    error=f"handler raised: {error}",
+                )
+            finally:
+                controller.release()
+
+        return list(await asyncio.gather(*(invoke(row) for row in rows)))
 
     async def _poll_run(
         self,
