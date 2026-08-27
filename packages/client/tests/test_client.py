@@ -12,6 +12,7 @@ import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server import (
+    JudgeResult,
     ProviderHandler,
     config,
 )
@@ -897,6 +898,11 @@ class TestSkipJudges:
         # Two variation calls: main config + judge config
         assert mock_ld_client.variation.call_count == 2
         assert result.judge_results is not None
+        judge = result.judge_results["judge-key"]
+        assert isinstance(judge, JudgeResult)
+        # Same attribute reads as examples/conversation.py — dicts would print None.
+        assert getattr(judge, "score", None) == 0.9
+        assert getattr(judge, "response", None) == "good"
 
 
 # ---------------------------------------------------------------------------

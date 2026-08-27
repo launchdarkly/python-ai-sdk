@@ -9,6 +9,7 @@ from typing import Any
 from .conversation import with_judge_evaluation
 from .types import (
     AiConfigRep,
+    JudgeResult,
     JudgeRunResult,
     JudgeTask,
     LDContext,
@@ -72,7 +73,7 @@ async def run_judges(
     base_track_data: TrackData,
     tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
     graph_key: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JudgeResult]:
     """
     Runs any judges configured on ``config['judgeConfiguration']`` against the
     produced output. Each judge is itself a tracked AI call.
@@ -80,7 +81,7 @@ async def run_judges(
     from .lifecycle import extract_variation
     from .tracking import execute_and_track
 
-    judge_results: dict[str, Any] = {}
+    judge_results: dict[str, JudgeResult] = {}
 
     judge_config = (
         config.get("judgeConfiguration") or {} if isinstance(config, dict) else {}
@@ -193,11 +194,11 @@ async def run_judges(
 
                 score = parsed.get("score")
                 reasoning = parsed.get("reasoning", "")
-                judge_results[judge_key] = {
-                    "usage": result["usage"],
-                    "response": reasoning,
-                    "score": score,
-                }
+                judge_results[judge_key] = JudgeResult(
+                    usage=to_usage_dict(result["usage"]),
+                    response=reasoning,
+                    score=score,
+                )
                 numeric_score = _numeric_score(score)
                 if numeric_score is not None:
                     record_evaluation(
