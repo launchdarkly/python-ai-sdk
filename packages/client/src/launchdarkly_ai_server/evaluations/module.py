@@ -13,7 +13,6 @@ from .api import (
     Transport,
     urllib_transport,
 )
-from .flags import is_generation_result_batch_ingest_enabled
 from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
 from .types import EvalRunResult, GenerationConfig
 
@@ -66,7 +65,6 @@ class EvaluationsModule:
         generation: GenerationConfig,
         tools: Mapping[str, ToolImplementation] | None = None,
         concurrency: int = 10,
-        timeout: float = 300.0,
     ) -> EvalRunResult:
         """
         Create and run a generation-only evaluation in the caller's process.
@@ -82,16 +80,11 @@ class EvaluationsModule:
             handler=handler,
             generation=generation,
             concurrency=concurrency,
-            timeout=timeout,
         )
         run_tools = dict(tools or {})
         client = None
-        batch_ingest_enabled = False
         if self._sdk_key:
             client = await init_client({"sdkKey": self._sdk_key})
-            batch_ingest_enabled = await is_generation_result_batch_ingest_enabled(
-                client, project_key
-            )
 
         # Tool verification is deliberately first: a typo must not create records.
         resolved_tools = self._runner._resolve_tools(project_key, run_tools)
@@ -123,10 +116,6 @@ class EvaluationsModule:
             flush_result = client.flush()
             if inspect.isawaitable(flush_result):
                 await flush_result
-        if batch_ingest_enabled:
-            await self._runner._poll_run(
-                project_key, evaluation.id, evaluation_run.id, timeout
-            )
         summary = self._runner._get_summary(
             project_key, evaluation.id, evaluation_run.id
         )
@@ -154,7 +143,6 @@ class EvaluationsModule:
         handler: EvalHandler,
         generation: GenerationConfig,
         concurrency: int,
-        timeout: float,
     ) -> None:
         for name, value in (
             ("project_key", project_key),
@@ -177,8 +165,6 @@ class EvaluationsModule:
             )
         if concurrency < 1:
             raise EvaluationsError("concurrency must be at least 1")
-        if timeout <= 0:
-            raise EvaluationsError("timeout must be greater than zero")
 
 
 def init_evaluations(

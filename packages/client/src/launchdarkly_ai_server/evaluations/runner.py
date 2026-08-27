@@ -463,37 +463,6 @@ class EvaluationsRunner:
                 flush=True,
             )
 
-    async def _poll_run(
-        self,
-        project_key: str,
-        evaluation_id: str,
-        run_id: str,
-        timeout: float,
-    ) -> EvaluationRunRef:
-        path = (
-            f"projects/{_segment(project_key)}/evaluations/{_segment(evaluation_id)}"
-            f"/runs/{_segment(run_id)}"
-        )
-        deadline = time.monotonic() + timeout
-        delay = 0.25
-        while True:
-            run = self._run_ref(
-                _mapping(self._api.get(path), description="evaluation run")
-            )
-            if run.state == "COMPLETE":
-                return run
-            if run.state in {"CANCELLED", "TEMPORARY_ERROR", "PERMANENT_ERROR"}:
-                reason = f": {run.status_reason}" if run.status_reason else ""
-                raise EvaluationsError(
-                    f"Evaluation run {run_id!r} failed in state {run.state}{reason}"
-                )
-            if time.monotonic() >= deadline:
-                raise EvaluationsError(
-                    f"Evaluation run {run_id!r} is still in progress after {timeout} seconds"
-                )
-            await asyncio.sleep(delay)
-            delay = min(5.0, delay * 2)
-
     def _get_summary(
         self, project_key: str, evaluation_id: str, run_id: str
     ) -> RunSummary:

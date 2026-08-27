@@ -168,17 +168,6 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
             response(
                 200,
                 {
-                    "id": "22222222-2222-2222-2222-222222222222",
-                    "evaluationId": "11111111-1111-1111-1111-111111111111",
-                    "evaluationVersion": 1,
-                    "source": "api",
-                    "state": "COMPLETE",
-                    "createdAt": 1,
-                },
-            ),
-            response(
-                200,
-                {
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
                     "evaluationRunId": "22222222-2222-2222-2222-222222222222",
@@ -239,7 +228,6 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "POST",
         "POST",
         "GET",
-        "GET",
     ]
     assert transport.requests[0]["url"].endswith(
         "/api/v2/projects/proj/ai-tools/lookup_order"
@@ -294,70 +282,33 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         f"emittedAt={event['emittedAt']} eventId={event['eventId']}"
     )
     client.flush.assert_awaited_once_with()
+    client.variation.assert_not_awaited()
     init_client.assert_awaited_once_with({"sdkKey": "sdk-key"})
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("flag_value", "expected_poll"),
-    [
-        pytest.param(True, True, id="enabled"),
-        pytest.param(False, False, id="disabled-default"),
-        pytest.param("true", False, id="malformed"),
-        pytest.param(
-            RuntimeError("delivery unavailable"), False, id="evaluation-error"
-        ),
-    ],
-)
-async def test_batch_ingest_flag_controls_generation_result_polling(
+async def test_generation_events_always_emit_without_flag_or_status_poll(
     monkeypatch: pytest.MonkeyPatch,
-    flag_value: object,
-    expected_poll: bool,
 ) -> None:
-    responses = [
-        response(200, {"id": "dataset-id", "name": "golden"}),
-        response(
-            200,
-            dataset_page(
-                [{"rowIndex": 3, "input": "hello", "variables": {}}],
-                total=1,
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 3, "input": "hello", "variables": {}}],
+                    total=1,
+                ),
             ),
-        ),
-        response(201, {"id": "evaluation-id", "name": "eval-key"}),
-        response(
-            201,
-            {
-                "id": "run-id",
-                "evaluationId": "evaluation-id",
-                "state": "PENDING",
-            },
-        ),
-    ]
-    if expected_poll:
-        responses.extend(
-            [
-                response(
-                    200,
-                    {
-                        "id": "run-id",
-                        "evaluationId": "evaluation-id",
-                        "state": "COMPLETE",
-                    },
-                ),
-                response(
-                    200,
-                    {
-                        "statusCounts": {
-                            "total": 1,
-                            "passed": 1,
-                            "pending": 0,
-                        }
-                    },
-                ),
-            ]
-        )
-    else:
-        responses.append(
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "PENDING",
+                },
+            ),
             response(
                 200,
                 {
@@ -367,20 +318,17 @@ async def test_batch_ingest_flag_controls_generation_result_polling(
                     "error": 0,
                     "pending": 1,
                 },
-            )
-        )
-    transport = SequencedTransport(responses)
+            ),
+        ]
+    )
     client = MagicMock()
-    if isinstance(flag_value, Exception):
-        client.variation = AsyncMock(side_effect=flag_value)
-    else:
-        client.variation = AsyncMock(return_value=flag_value)
+    client.variation = AsyncMock(side_effect=AssertionError("flag must not be read"))
 
-    def flush_before_poll_or_summary() -> None:
+    def flush_before_summary() -> None:
         assert len(transport.requests) == 4
         assert transport.requests[-1]["url"].endswith("/evaluations/evaluation-id/runs")
 
-    client.flush.side_effect = flush_before_poll_or_summary
+    client.flush.side_effect = flush_before_summary
 
     async def fake_init_client(options: dict[str, Any]) -> MagicMock:
         assert options == {"sdkKey": "sdk-key"}
@@ -402,16 +350,16 @@ async def test_batch_ingest_flag_controls_generation_result_polling(
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
-    assert result.passed is expected_poll
-    assert result.summary.pending_rows == (0 if expected_poll else 1)
+    assert result.passed is False
+    assert result.summary.pending_rows == 1
     request_urls = [request["url"] for request in transport.requests]
     assert not any(url.endswith("/generation-results") for url in request_urls)
+    client.variation.assert_not_awaited()
     client.track.assert_called_once()
     client.flush.assert_called_once_with()
     status_url = "/evaluations/evaluation-id/runs/run-id"
-    assert any(url.endswith(status_url) for url in request_urls) is expected_poll
+    assert not any(url.endswith(status_url) for url in request_urls)
     assert request_urls[-1].endswith(f"{status_url}/summary")
-    assert sum(url.endswith(f"{status_url}/summary") for url in request_urls) == 1
 
 
 @pytest.mark.asyncio
@@ -549,17 +497,6 @@ async def test_complete_run_with_failed_or_error_rows_does_not_pass(
             response(
                 200,
                 {
-                    "id": "22222222-2222-2222-2222-222222222222",
-                    "evaluationId": "11111111-1111-1111-1111-111111111111",
-                    "evaluationVersion": 1,
-                    "source": "api",
-                    "state": "COMPLETE",
-                    "createdAt": 1,
-                },
-            ),
-            response(
-                200,
-                {
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
                     "evaluationRunId": "22222222-2222-2222-2222-222222222222",
@@ -598,6 +535,7 @@ async def test_complete_run_with_failed_or_error_rows_does_not_pass(
     assert set(calls) == {"bad", "good"}
     assert len(calls) == 2
     assert result.passed is False
+    client.variation.assert_not_awaited()
     assert client.track.call_count == 2
     events = [call.args[2] for call in client.track.call_args_list]
     assert {event["status"] for event in events} == {"COMPLETE", "ERROR"}
