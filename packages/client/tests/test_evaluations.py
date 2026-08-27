@@ -199,6 +199,86 @@ def test_rate_limit_retries_and_honors_retry_after() -> None:
     assert sleeps == [2.0]
 
 
+def test_server_error_retries_get_but_not_post() -> None:
+    server_error = HttpResponse(status=503, body='{"message": "unavailable"}')
+    get_transport = RecordingTransport(
+        [server_error, HttpResponse(200, '{"ok": true}')]
+    )
+    client = LDApiClient(
+        api_token="api-token",
+        transport=get_transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.get("projects/proj/datasets") == {"ok": True}
+    assert len(get_transport.requests) == 2
+
+    post_transport = RecordingTransport([server_error])
+    client = LDApiClient(
+        api_token="api-token",
+        transport=post_transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    with pytest.raises(LDApiError) as excinfo:
+        client.post("projects/proj/evaluations", body={"name": "eval"})
+
+    assert excinfo.value.status == 503
+    assert len(post_transport.requests) == 1
+
+
+def test_transport_failure_is_not_replayed_for_post() -> None:
+    attempts: list[str] = []
+
+    def timing_out_transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        attempts.append(method)
+        raise TimeoutError("timed out")
+
+    client = LDApiClient(
+        api_token="api-token",
+        transport=timing_out_transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    with pytest.raises(EvaluationsError):
+        client.post("projects/proj/evaluations", body={"name": "eval"})
+
+    assert attempts == ["POST"]
+
+
+def test_rate_limited_post_is_retried() -> None:
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=429, body='{"message": "slow down"}'),
+            HttpResponse(status=201, body='{"id": "eval-id"}'),
+        ]
+    )
+    client = LDApiClient(
+        api_token="api-token",
+        transport=transport,
+        max_retries=1,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.post("projects/proj/evaluations", body={"name": "eval"}) == {
+        "id": "eval-id"
+    }
+    assert len(transport.requests) == 2
+
+
 def test_forbidden_response_is_not_retried() -> None:
     transport = RecordingTransport(
         [HttpResponse(status=403, body='{"message": "forbidden"}')]

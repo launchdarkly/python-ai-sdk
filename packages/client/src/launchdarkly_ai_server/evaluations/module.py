@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
 from collections.abc import Mapping
+from typing import Any
 
-from ..lifecycle import init_client
+from ..lifecycle import get_client, init_client
 from .api import (
     DEFAULT_BASE_URI,
     EvaluationsError,
@@ -84,17 +86,33 @@ class EvaluationsModule:
         run_tools = dict(tools or {})
         client = None
         if self._sdk_key:
-            client = await init_client({"sdkKey": self._sdk_key})
+            client = await self._resolve_client()
 
+        # The management API client is synchronous; running it in a worker thread
+        # keeps the caller's event loop free.
         # Tool verification is deliberately first: a typo must not create records.
-        resolved_tools = self._runner._resolve_tools(project_key, run_tools)
-        dataset_ref = self._runner._fetch_dataset(project_key, dataset)
-        rows = self._runner._get_dataset_rows(project_key, dataset)
-        evaluation = self._runner._create_evaluation(
-            project_key, key, generation, resolved_tools
+        resolved_tools = await asyncio.to_thread(
+            self._runner._resolve_tools, project_key, run_tools
         )
-        evaluation_run = self._runner._create_evaluation_run(
-            project_key, evaluation.id, len(rows), dataset_ref.id
+        dataset_ref = await asyncio.to_thread(
+            self._runner._fetch_dataset, project_key, dataset
+        )
+        rows = await asyncio.to_thread(
+            self._runner._get_dataset_rows, project_key, dataset
+        )
+        evaluation = await asyncio.to_thread(
+            self._runner._create_evaluation,
+            project_key,
+            key,
+            generation,
+            resolved_tools,
+        )
+        evaluation_run = await asyncio.to_thread(
+            self._runner._create_evaluation_run,
+            project_key,
+            evaluation.id,
+            len(rows),
+            dataset_ref.id,
         )
         config = self._runner._build_handler_config(generation, resolved_tools)
         results = await self._runner._run_rows(
@@ -116,8 +134,8 @@ class EvaluationsModule:
             flush_result = client.flush()
             if inspect.isawaitable(flush_result):
                 await flush_result
-        summary = self._runner._get_summary(
-            project_key, evaluation.id, evaluation_run.id
+        summary = await asyncio.to_thread(
+            self._runner._get_summary, project_key, evaluation.id, evaluation_run.id
         )
         url = (
             f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
@@ -133,6 +151,24 @@ class EvaluationsModule:
             run_id=evaluation_run.id,
             summary=summary,
         )
+
+    async def _resolve_client(self) -> Any:
+        """
+        Return the SDK client used for generation events.
+
+        ``init_client`` is idempotent, so an application that already holds a
+        client keeps it and the evaluations SDK key is not applied.
+        """
+        try:
+            existing = get_client()
+        except RuntimeError:
+            return await init_client({"sdkKey": self._sdk_key})
+        logger.warning(
+            "A LaunchDarkly client is already initialized; evaluation events are "
+            "sent with it and the evaluations SDK key is ignored. Both must point "
+            "at the project under evaluation."
+        )
+        return existing
 
     @staticmethod
     def _validate_run_args(

@@ -14,6 +14,10 @@ from typing import Any, Protocol
 
 DEFAULT_BASE_URI = "https://app.launchdarkly.com"
 
+# Only these methods are replayed after a 5xx or a transport failure: a POST that
+# timed out may still have created a record server-side.
+RETRY_SAFE_METHODS = frozenset({"GET", "HEAD"})
+
 
 class EvaluationsError(Exception):
     """Base error for the evaluations harness."""
@@ -147,14 +151,21 @@ class LDApiClient:
                     method, self.url_for(path, params), headers, payload, self._timeout
                 )
             except (TimeoutError, urllib.error.URLError) as error:
-                if attempt >= self._max_retries:
+                if (
+                    method.upper() not in RETRY_SAFE_METHODS
+                    or attempt >= self._max_retries
+                ):
                     raise EvaluationsError(
                         f"LaunchDarkly API {method} {path} failed after retries: {error}"
                     ) from error
                 self._sleep(self._retry_delay(attempt))
                 continue
 
-            retryable = response.status == 429 or response.status >= 500
+            # A 429 is rejected before the server acts on it, so it is safe to
+            # replay for any method.
+            retryable = response.status == 429 or (
+                response.status >= 500 and method.upper() in RETRY_SAFE_METHODS
+            )
             if retryable and attempt < self._max_retries:
                 self._sleep(self._retry_delay(attempt, response))
                 continue
