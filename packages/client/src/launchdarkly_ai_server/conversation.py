@@ -40,7 +40,8 @@ class _JudgeEvalCapture:
 
 # Every tracer this SDK creates is named "@launchdarkly/ai-<package>". The processor is registered
 # on the *global* provider, so without this gate it stamps a caller-supplied id onto every span in
-# the process — Postgres queries, inbound HTTP server spans, and the outbound provider call itself.
+# the process — Postgres queries, inbound HTTP server spans, and the outbound provider call itself
+# — and replaces ``end`` on any third-party ``invoke_agent`` span that starts during a judge run.
 _LD_TRACER_PREFIX = "@launchdarkly/"
 
 
@@ -65,8 +66,9 @@ def _is_launchdarkly_span(span: Any) -> bool:
     """True only when the span came from one of this SDK's own tracers.
 
     Deliberately conservative: an unrecognisable scope means "not ours", so an id is never sprayed
-    across unrelated telemetry. The companion test asserts LD spans *are* stamped, so a rename of
-    the scope attribute fails the suite loudly rather than silently disabling the feature.
+    across unrelated telemetry and a judge run never delays a third-party ``invoke_agent`` span.
+    The companion test asserts LD spans *are* stamped, so a rename of the scope attribute fails
+    the suite loudly rather than silently disabling the feature.
     """
     scope_name = getattr(getattr(span, "instrumentation_scope", None), "name", None)
     return isinstance(scope_name, str) and scope_name.startswith(_LD_TRACER_PREFIX)
@@ -248,9 +250,13 @@ class ConversationIdSpanProcessor(_SpanProcessorBase):
         capture = otel_context.get_value(_EVAL_KEY, ctx)
         if capture is None:
             capture = otel_context.get_value(_EVAL_KEY)
+        # Same LD-scope gate as conversation-id stamping: wrapping ``end`` on a foreign
+        # ``invoke_agent`` (OpenAI Agents, LangChain, …) would overwrite ``pending_end``,
+        # leak the judge root, and attach ``gen_ai.evaluation.result`` to the wrong span.
         if (
             isinstance(capture, _JudgeEvalCapture)
             and getattr(span, "name", None) == "invoke_agent"
+            and _is_launchdarkly_span(span)
         ):
             _delay_invoke_agent_end(span, capture)
 

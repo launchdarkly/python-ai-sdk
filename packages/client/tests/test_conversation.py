@@ -36,6 +36,11 @@ def finished() -> list[ReadableSpan]:
     return list(_exporter.get_finished_spans())
 
 
+def _scope_name(span: ReadableSpan) -> str | None:
+    scope = span.instrumentation_scope
+    return None if scope is None else scope.name
+
+
 class TestConversationId:
     def test_stamps_id_on_every_span_in_scope(self) -> None:
         with conversation_id("thread-123"):
@@ -134,7 +139,8 @@ class TestProcessorScope:
 
     Stamping a caller-supplied conversation id onto unrelated telemetry — Postgres queries, inbound
     HTTP server spans, and the outbound provider call itself — is both semantically wrong and the
-    leak the module docstring says this design avoids.
+    leak the module docstring says this design avoids. Delaying ``end`` on a foreign
+    ``invoke_agent`` is the same class of leak: it can overwrite the judge root's ``pending_end``.
     """
 
     def test_stamps_spans_from_launchdarkly_tracers(self) -> None:
@@ -155,6 +161,46 @@ class TestProcessorScope:
             assert (span.attributes or {}).get(GEN_AI_CONVERSATION_ID) is None, (
                 span.name
             )
+
+    async def test_does_not_delay_third_party_invoke_agent_end(self) -> None:
+        """GenAI instrumentation also names roots ``invoke_agent``; delay only ours."""
+        foreign = _provider.get_tracer("opentelemetry.instrumentation.openai")
+        async with with_judge_evaluation("relevance-judge") as record:
+            span = foreign.start_span("invoke_agent")
+            span.end()
+            exported = [s for s in finished() if s.name == "invoke_agent"]
+            assert len(exported) == 1
+            assert _scope_name(exported[0]) == "opentelemetry.instrumentation.openai"
+            assert "gen_ai.evaluation.name" not in (exported[0].attributes or {})
+            record(0.91)
+        assert all(
+            "gen_ai.evaluation.name" not in (s.attributes or {}) for s in finished()
+        )
+
+    async def test_third_party_invoke_agent_does_not_steal_judge_root(self) -> None:
+        """A foreign ``invoke_agent`` ending after the judge root must not replace pending_end."""
+        foreign = _provider.get_tracer("opentelemetry.instrumentation.openai")
+        async with with_judge_evaluation("relevance-judge") as record:
+            ld_span = _tracer.start_span("invoke_agent")
+            foreign_span = foreign.start_span("invoke_agent")
+            ld_span.end()
+            assert not any(
+                (_scope_name(s) or "").startswith("@launchdarkly/") for s in finished()
+            )
+            foreign_span.end()
+            foreign_done = [
+                s
+                for s in finished()
+                if _scope_name(s) == "opentelemetry.instrumentation.openai"
+            ]
+            assert len(foreign_done) == 1
+            assert "gen_ai.evaluation.name" not in (foreign_done[0].attributes or {})
+            record(0.91)
+        ld = next(
+            s for s in finished() if (_scope_name(s) or "").startswith("@launchdarkly/")
+        )
+        assert ld.name == "invoke_agent"
+        assert ld.attributes["gen_ai.evaluation.name"] == "relevance-judge"
 
 
 class TestJudgeExplanationGating:
