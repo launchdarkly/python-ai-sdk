@@ -364,7 +364,7 @@ class EvaluationsRunner:
                     "expected_output": row.expected_output,
                     "variables": row.variables,
                     "metadata": row.metadata,
-                    "output": {"generation": result.get("output")},
+                    "output": result.get("output"),
                     "started_at": started.isoformat().replace("+00:00", "Z"),
                     "generated_at": completed.isoformat().replace("+00:00", "Z"),
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
@@ -372,7 +372,7 @@ class EvaluationsRunner:
                 }
                 usage = result.get("usage")
                 if isinstance(usage, Mapping):
-                    payload["output"]["usage"] = dict(usage)
+                    payload["usage"] = dict(usage)
                 controller.record_success(config["provider"]["name"])
                 return payload
             except Exception as error:
@@ -428,10 +428,10 @@ class EvaluationsRunner:
             ).hexdigest()
             generated = {
                 "status": result["status"],
-                "output": result.get("output", {}).get("generation"),
+                "output": result.get("output"),
                 "error": result.get("error"),
             }
-            usage = result.get("output", {}).get("usage")
+            usage = result.get("usage")
             if isinstance(usage, Mapping):
                 normalized_usage = parse_usage(dict(usage))
                 generated["usage"] = {
