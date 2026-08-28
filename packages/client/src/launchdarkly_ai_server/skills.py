@@ -183,8 +183,8 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
 
     A config that came through ``parse_ai_config`` never contains an invalid
     entry — parsing fails closed on one. A hand-built dict can, and a silently
-    shortened projection would leave a caller materializing a skill set it
-    believes is complete, so every dropped entry is logged.
+    shortened projection would let ``write_skills`` prune the dropped skill's
+    on-disk copy, so every dropped entry is logged.
     """
     if not isinstance(config, dict):
         return []

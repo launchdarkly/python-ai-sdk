@@ -30,6 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
+| `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
@@ -56,7 +57,7 @@ from launchdarkly_ai_server import (
     TrackData, UsageDict, HandlerResult, HandlerStreamEvent,
     StreamEvent, StreamChunkEvent, StreamDoneEvent, ExecuteStreamEvent, ExecuteStreamDoneEvent,
     VariationMeta, InitClientOptions, JudgeResult, ParseResult, ParseSuccess, ParseFailure,
-    Skill, SkillReference,
+    Skill, SkillReference, ReconcileAction, ReconcileReport,
 )
 
 # Utilities
@@ -76,8 +77,10 @@ from launchdarkly_ai_server import config, graph, resolve_graph
 
 # Agent Skills
 from launchdarkly_ai_server import (
-    skill_refs, get_skill, get_skills, all_skills,
+    skill_refs, get_skill, get_skills, all_skills, write_skills,
     SkillStore, InMemorySkillStore,
+    SKILL_FILENAME, MANIFEST_FILENAME, MANIFEST_VERSION,
+    ReconcileActionKind, OnUnavailable,   # the two closed-set unions
 )
 ```
 
@@ -179,7 +182,7 @@ This is an OTel context value, not W3C baggage, so the id does not leak onto out
 
 Versioned `SKILL.md` documents attached to AI Config variations by reference, retrieved
 through an injectable store, and materialized onto disk for agent runtimes to discover.
-Three layers, in increasing order of blast radius. Only the first is implemented here:
+Three layers, in increasing order of blast radius:
 
 1. **Reference discovery** — `skill_refs(config)` projects the config's `skills` array into
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
@@ -190,7 +193,8 @@ Three layers, in increasing order of blast radius. Only the first is implemented
    `init_client(options={"skillStore": store})`; with none configured the accessors raise
    an actionable `RuntimeError`. A delivery transport can be added behind the seam
    without touching the public API.
-3. **Materialization** — writing skills onto disk under a manifest.
+3. **Materialization** — `write_skills(skills, root)` writes `<root>/<key>/SKILL.md` and
+   reconciles against a manifest at `<root>/.launchdarkly-skills.json`.
 
 ### The store seam, and why version is part of the lookup
 
@@ -241,6 +245,30 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
 - **Attacker-controlled strings are never echoed into telemetry.** `contentHash` and `key`
   come off the wire, so a store could put the skill body in either; both are shape-checked
   and redacted before they reach a signal or a log line.
+- **The key is re-validated inside `write_skills`**, regardless of upstream validation — a
+  key becomes a directory name. Rejection happens before any filesystem call.
+- **Never write through a symlink**, in either the skill directory or the target file, on
+  the write path *and* the prune path.
+- **Destructive operations only on manifest-listed paths whose `key` matches.** A file at a
+  managed path with no matching manifest entry is reported as `error` and left alone.
+- **A corrupt manifest fails closed**: unreadable, unparseable, not an object, malformed
+  `entries`, or a `manifestVersion` this release cannot read means no overwrites and no
+  prunes, brand-new paths may still be written, an `error` action names the manifest, and
+  the manifest file itself is not rewritten.
+- **An incomplete retrieval suppresses pruning.** Otherwise a transport outage would read
+  as "everything was revoked" and delete the customer's managed files.
+- **Writes are atomic**: temp file created exclusively in the target's *own* directory,
+  mode `0644` set explicitly (never inherited from the umask, never executable), write,
+  fsync, `os.replace`, fsync the directory. `os.replace` is the single rename call site
+  and must not be swapped for `os.rename`.
+- **Every operation under the root goes through a pinned descriptor, not a path.** See
+  "Descriptor-pinned filesystem access" below. Re-resolving `<root>/<key>` from its path at
+  write or unlink time reopens a swap window that the checks above cannot cover.
+- **A key valid to the data model may still be unrepresentable on disk.** The model allows
+  256 characters; `NAME_MAX` is 255 bytes. `write_skills` rejects an over-long key before
+  any filesystem call, and every per-skill filesystem failure is caught at the loop so it
+  becomes an `error` action — aborting the loop would skip the manifest rewrite and orphan
+  files already written in that run.
 - **A key is untrusted input everywhere it appears.** `skill_key_rejection_reason` is the
   single canonical explanation, so the config parser and the reference projection reject a
   key for the same stated reason — and so does every layer added later. A silently
@@ -261,9 +289,6 @@ Exactly three signals exist, and the list is an **allowlist, not a floor**:
 | `AgentControl Skill Integrity Failure` | any hash/size/shape verification failure | `skill_key`, `version?`, `expected_hash?`, `observed_hash?`, `language` |
 | `AgentControl Skill Materialized` | each `written` / `updated` / `skipped_current` | `skill_key`, `content_bytes`, `content_hash`, `reconcile_action`, `language` |
 | `AgentControl Skill Revoked Received` | prune removes a formerly managed skill | `skill_key`, `version`, `removed_from_disk`, `language` |
-
-The last two belong to the materialization layer and have no caller yet; they live here
-with the first so the allowlist is one section of one file rather than three sites to audit.
 
 ### The integrity-failure log record
 
@@ -321,11 +346,12 @@ where they cannot see it.
 `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved`
 were considered and **deliberately excluded from SDK emission** — both are observable
 server-side. Do not add them. The skill body never appears in a signal, a log line, or
-an error message, and no signal carries a filesystem path. An emitter that raises is caught
-and logged; it never fails the operation.
+an error message, and no signal carries a filesystem path (paths belong in the returned
+`ReconcileReport`, which is user-facing API). An emitter that raises is caught and logged;
+it never fails the operation.
 
-Module state lives in `skills_core.py`, so there is exactly one store and one emitter
-however the feature is entered. All three signals are emitted from the `record_*` functions
+Module state lives in `skills_core.py`, the module `skills.py` and `skills_fs.py` share,
+so there is exactly one store and one emitter however the feature is entered. All three signals are emitted from the `record_*` functions
 next to the seam there — nothing outside that module calls `emit`, so the allowlist is
 enforced in one place.
 
@@ -366,7 +392,14 @@ primitives live in `safe_fs.py`, which knows nothing about skills:
   *trailing* symlink, but it does resolve the directory above it, so the same swap turns a
   removal into a delete of an attacker-chosen file. A symlink found where this SDK expects
   its own file raises `SymlinkRefused` rather than being tidied away: the state on disk is
-  not what the caller believes, and that is the caller's to report.
+  not what the caller believes, and that is the caller's to report. `_prune_one` goes
+  through it; `rmdir` stays path-based and is safe that way, since it fails `ENOTDIR` on a
+  symlink and only ever succeeds on an empty directory.
+
+Every `lstat`, `realpath` and containment check on the skills side lives in one shared
+`_unsafe_path_reason`, so the write and prune paths cannot drift apart on what counts as
+unsafe. `skills_fs._prune_one` spells its symlink check `os.stat(..., follow_symlinks=False)`
+rather than `os.lstat`, matching the name the capability probe advertises.
 
 `safe_fs.SUPPORTS_DIR_FD` gates all of it, and the probe is not the obvious one.
 `os.supports_dir_fd` is populated per underlying syscall, and CPython registers `renameat`
@@ -379,7 +412,43 @@ and silently turns the defense off, so the probe names the advertised twins
 (Windows) `open_directory_nofollow` returns `None` after an `lstat` check instead of
 attempting the descriptor open — `os.open` cannot open a directory there — and every caller
 falls back to the identical full-path sequence, the per-component `lstat` floor. The
-residual window on those platforms is documented rather than closed.
+residual window on those platforms is documented rather than closed; the TOCTOU tests skip
+off this same flag, deliberately, so a probe that wrongly reports "unsupported" cannot also
+silently skip the tests that would have caught it.
+
+Both call shapes are admitted by the test seam. `os.replace` remains the single
+interceptable rename call site; under the descriptor-relative shape `dst` is the bare string
+`"SKILL.md"`, so an `endswith("SKILL.md")` spy filter still matches, and the
+same-directory requirement is proved by descriptor identity (`src_dir_fd == dst_dir_fd`,
+resolving to the skill directory's `(st_dev, st_ino)`) instead of by comparing path strings.
+A spy must `fstat` the descriptor **inside** the intercepted call — the implementation closes
+it as soon as the write returns.
+
+### Deferred: bounded retries
+
+`timeout` is implemented — a monotonic deadline, checked before each retrieval, before
+each write, and before each prune; only the final manifest rewrite runs past it, so files
+already written are never orphaned. Bounded retries inside that deadline are **not**
+implemented, and belong to the delivery transport, not to this layer. Three structural
+reasons, all of which the transport changes:
+
+1. **There is nothing transient to retry.** `SkillStore.get_object` is a synchronous
+   in-process read against already-delivered data, modelled on the LaunchDarkly
+   data-store API. `InMemorySkillStore` reads a dict. A retry re-invokes customer code and
+   returns the same answer.
+2. **The seam cannot classify a failure.** All it surfaces is "this raised". Retrying a
+   `PermissionError` or a malformed payload spends the caller's `timeout` on a certainty.
+   The transient/permanent taxonomy a retry policy needs is the transport's to define.
+3. **Backoff has nowhere to sleep.** The retrieval path (`_resolve_requests`,
+   `_resolve_reference`, `_resolve_all`) is synchronous, called from an async
+   `write_skills`. Backoff would mean either `time.sleep` — blocking the event loop of every
+   caller — or async-ifying the whole path for a store that cannot benefit.
+
+Picking a bound and a backoff now would fix numbers in a cross-language contract with no
+transport to calibrate them against, so there is **no** retry test and no assumable attempt
+count. When the transport lands it owns the policy; keep both languages retry-free until
+then, since the number of times a throwing store is invoked is observable and the two would
+otherwise diverge.
 
 ---
 
@@ -491,7 +560,7 @@ Install with `pip install "launchdarkly-ai-server[otel]"`; see [OTel Setup](#ote
 |---|---|
 | `launchdarkly-server-sdk>=9.0`, and the `otel` extra mirrored (`opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`) | Each dynamically-resolved or optional package is repeated in the dev group so the test suite can import it. Something that is *only* optional would not be installed in this workspace and the tests covering its present-and-working path could not run. |
 | `pytest>=8`, `pytest-asyncio>=0.24` | Test runner and the async support the whole suite relies on. `asyncio_mode = "auto"` is set at the workspace root, which is why no test in this package carries an `@pytest.mark.asyncio`. |
-| `mypy>=1.10` (`strict`), `ruff>=0.15` | Type checker and linter/formatter. |
+| `mypy>=1.10` (`strict`), `ruff>=0.15` | Type checker and linter/formatter. `mypy` strict mode is the only thing enforcing the `Literal[...]` closed set on `ReconcileAction.action` — unlike `write_skills`'s `on_unavailable`, which is also checked at runtime because the value can arrive from untyped code. |
 
 ---
 
@@ -513,6 +582,22 @@ convenience accessor that reads meaning into it — no YAML/frontmatter parsing,
 verified verbatim byte buffer and nothing more; a consumer who wants structure parses it
 on their side of the boundary.
 
+### 4. Assuming `write_skills` prunes on every run
+
+Pruning is suppressed when the manifest is corrupt or any retrieval was incomplete — both
+mean the SDK cannot tell what it owns or what is still current, and deleting under that
+uncertainty is data loss. A run whose report contains a manifest `error` will not have
+pruned anything, so do not read "no `removed` actions" as "nothing is stale".
+
+### 5. Treating "absent from the resolved set" as always meaning revoked
+
+Revocation is pruning, but only for a skill the store genuinely no longer serves. An object
+that is *present and unverifiable* is a different thing, and `_resolve_all` must emit a
+failed `_PendingWrite` for it rather than filtering it out: dropping it silently leaves its
+key out of the requested set, so prune deletes the last known-good copy on disk and reports
+a routine `removed` with `report.ok` still true. Tampered content must never be able to
+trigger deletion.
+
 ---
 
 ## Adding a New Export
@@ -532,4 +617,5 @@ on their side of the boundary.
 - Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
 - Do not rename `ld.skills.integrity_failure`, and do not add a ninth `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
+- Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.
