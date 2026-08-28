@@ -26,6 +26,10 @@ class Usage:
         )
 
 
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
 class GenerationConfig(TypedDict, total=False):
     """Generation settings stored on the evaluation and passed to its handler."""
 
@@ -88,13 +92,14 @@ class EvaluationRunRef:
 
 @dataclass
 class RunSummary:
-    """Row counts for a finished evaluation run."""
+    """State and row counts for an evaluation run."""
 
     total_rows: int = 0
     passed_rows: int = 0
     failed_rows: int = 0
     error_rows: int = 0
     pending_rows: int = 0
+    state: str | None = None
 
     @classmethod
     def from_wire(cls, data: Mapping[str, Any] | None) -> RunSummary:
@@ -107,6 +112,7 @@ class RunSummary:
             failed_rows=int(counts.get("failed", counts.get("failed_rows", 0)) or 0),
             error_rows=int(counts.get("error", counts.get("error_rows", 0)) or 0),
             pending_rows=int(counts.get("pending", counts.get("pending_rows", 0)) or 0),
+            state=_optional_string(data.get("state") or data.get("evaluationRunState")),
         )
 
 

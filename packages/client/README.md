@@ -47,7 +47,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 The generation-only evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. With `LD_SDK_KEY` configured, each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error, usage, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event prints a line to stdout with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
-Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. A result passes only when the summary has no failed, error, or pending rows. After flushing generation events, the harness does not poll or wait for backend processing; it fetches the current summary once and returns immediately, so newly created runs will normally show pending rows. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
+Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. After flushing generation events, the harness polls the run summary endpoint until the run reaches a terminal state, with a three-minute timeout. A generation result passes only when the terminal summary has no error or pending rows. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
 ```python
 import asyncio
@@ -79,7 +79,7 @@ sys.exit(asyncio.run(main()))
 
 `project_key` is supplied per run rather than during initialization. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
 
-`LD_SDK_KEY` is required to emit generation events through the standard LaunchDarkly SDK event transport. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then fetches the summary once without status polling. Without an SDK key, no generation event can be emitted, but the current summary is still fetched once and returned immediately.
+`LD_SDK_KEY` is required to emit generation events through the standard LaunchDarkly SDK event transport. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint for terminal run state. Without an SDK key, no generation event can be emitted, but the run summary is still polled.
 
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 

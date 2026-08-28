@@ -171,6 +171,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
                     "evaluationRunId": "22222222-2222-2222-2222-222222222222",
+                    "state": "COMPLETE",
                     "statusCounts": {
                         "total": 2,
                         "passed": 2,
@@ -287,7 +288,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
 
 
 @pytest.mark.asyncio
-async def test_generation_events_always_emit_without_flag_or_status_poll(
+async def test_generation_events_always_emit_without_flag_or_run_status_poll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transport = SequencedTransport(
@@ -312,6 +313,7 @@ async def test_generation_events_always_emit_without_flag_or_status_poll(
             response(
                 200,
                 {
+                    "state": "COMPLETE",
                     "total": 1,
                     "passed": 0,
                     "failed": 0,
@@ -360,6 +362,165 @@ async def test_generation_events_always_emit_without_flag_or_status_poll(
     status_url = "/evaluations/evaluation-id/runs/run-id"
     assert not any(url.endswith(status_url) for url in request_urls)
     assert request_urls[-1].endswith(f"{status_url}/summary")
+
+
+@pytest.mark.asyncio
+async def test_summary_is_polled_until_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "state": "PENDING",
+                    "statusCounts": {"total": 1, "passed": 0, "error": 0, "pending": 1},
+                },
+            ),
+            response(
+                200,
+                {
+                    "state": "COMPLETE",
+                    "statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0},
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    summary_requests = [
+        request for request in transport.requests if request["url"].endswith("/summary")
+    ]
+    assert len(summary_requests) == 2
+    assert result.passed is True
+    assert result.summary.state == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_summary_polling_times_out_waiting_for_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_TIMEOUT_SECONDS", 0
+    )
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "state": "PENDING",
+                    "statusCounts": {"total": 1, "passed": 0, "error": 0, "pending": 1},
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(
+        EvaluationsError,
+        match=r"Timed out after 0 seconds.*terminal state.*pending_rows=1",
+    ):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    summary_requests = [
+        request for request in transport.requests if request["url"].endswith("/summary")
+    ]
+    assert len(summary_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_generation_failed_rows_do_not_fail_the_result() -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "state": "COMPLETE",
+                    "statusCounts": {
+                        "total": 1,
+                        "passed": 0,
+                        "failed": 1,
+                        "error": 0,
+                        "pending": 0,
+                    },
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert result.summary.failed_rows == 1
+    assert result.passed is True
 
 
 @pytest.mark.asyncio
@@ -433,16 +594,10 @@ async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("failed_rows", "error_rows"),
-    [
-        pytest.param(1, 0, id="failed-row"),
-        pytest.param(0, 1, id="error-row"),
-    ],
-)
-async def test_complete_run_with_failed_or_error_rows_does_not_pass(
-    monkeypatch: pytest.MonkeyPatch, failed_rows: int, error_rows: int
+async def test_complete_run_with_error_rows_does_not_pass(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    error_rows = 1
     calls: list[str | None] = []
 
     async def handler(
@@ -500,10 +655,10 @@ async def test_complete_run_with_failed_or_error_rows_does_not_pass(
                     "evaluationId": "11111111-1111-1111-1111-111111111111",
                     "evaluationVersion": 1,
                     "evaluationRunId": "22222222-2222-2222-2222-222222222222",
+                    "state": "COMPLETE",
                     "statusCounts": {
                         "total": 2,
-                        "passed": 2 - failed_rows - error_rows,
-                        "failed": failed_rows,
+                        "passed": 2 - error_rows,
                         "error": error_rows,
                         "pending": 0,
                     },

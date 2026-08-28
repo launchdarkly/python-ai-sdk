@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 import os
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,17 +17,33 @@ from .api import (
     urllib_transport,
 )
 from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
-from .types import EvalRunResult, GenerationConfig
+from .types import EvalRunResult, GenerationConfig, RunSummary
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
+SUMMARY_POLL_INTERVAL_SECONDS = 2.0
+SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
+_TERMINAL_SUMMARY_STATES = {
+    "CANCELED",
+    "CANCELLED",
+    "COMPLETE",
+    "COMPLETED",
+    "ERROR",
+    "FAILED",
+}
 
 
 def _env(name: str) -> str | None:
     """Read an env var, treating blank/whitespace-only values as unset."""
     value = os.environ.get(name, "").strip()
     return value if value else None
+
+
+def _is_terminal_summary(summary: RunSummary) -> bool:
+    if summary.state is None:
+        return summary.pending_rows == 0
+    return summary.state.upper() in _TERMINAL_SUMMARY_STATES
 
 
 class EvaluationsModule:
@@ -134,23 +151,41 @@ class EvaluationsModule:
             flush_result = client.flush()
             if inspect.isawaitable(flush_result):
                 await flush_result
-        summary = await asyncio.to_thread(
-            self._runner._get_summary, project_key, evaluation.id, evaluation_run.id
+        summary = await self._poll_summary_until_terminal(
+            project_key, evaluation.id, evaluation_run.id
         )
         url = (
             f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
-            passed=(
-                summary.failed_rows == 0
-                and summary.error_rows == 0
-                and summary.pending_rows == 0
-            ),
+            passed=(summary.error_rows == 0 and summary.pending_rows == 0),
             url=url,
             run_id=evaluation_run.id,
             summary=summary,
         )
+
+    async def _poll_summary_until_terminal(
+        self, project_key: str, evaluation_id: str, run_id: str
+    ) -> RunSummary:
+        deadline = time.monotonic() + SUMMARY_POLL_TIMEOUT_SECONDS
+        last_summary = None
+        while True:
+            last_summary = await asyncio.to_thread(
+                self._runner._get_summary, project_key, evaluation_id, run_id
+            )
+            if _is_terminal_summary(last_summary):
+                return last_summary
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                state = last_summary.state or "unknown"
+                raise EvaluationsError(
+                    "Timed out after "
+                    f"{SUMMARY_POLL_TIMEOUT_SECONDS:g} seconds waiting for evaluation "
+                    f"run {run_id} summary to reach a terminal state "
+                    f"(last state={state}, pending_rows={last_summary.pending_rows})"
+                )
+            await asyncio.sleep(min(SUMMARY_POLL_INTERVAL_SECONDS, remaining))
 
     async def _resolve_client(self) -> Any:
         """
