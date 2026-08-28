@@ -270,8 +270,11 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert event["datasetId"] == "33333333-3333-3333-3333-333333333333"
     assert event["rowIndex"] == 4
     assert event["status"] == "COMPLETE"
-    assert event["generationOutput"] == "generated: Order A19"
-    assert event["usage"] == {"input_tokens": 10, "output_tokens": 4}
+    assert event["output"] == "generated: Order A19"
+    assert event["inputTokens"] == 10
+    assert event["outputTokens"] == 4
+    assert "generationOutput" not in event
+    assert "usage" not in event
     assert len(event["eventId"]) == len(event["contentHash"]) == 64
     assert event["emittedAt"].endswith("Z")
     assert datetime.fromisoformat(event["emittedAt"]).tzinfo is not None
@@ -698,4 +701,8 @@ async def test_complete_run_with_error_rows_does_not_pass(
     assert error_event["rowIndex"] == 0
     assert "provider failed" in error_event["error"]["message"]
     assert "generationOutput" not in error_event
+    assert "output" not in error_event
+    assert "usage" not in error_event
+    assert "inputTokens" not in error_event
+    assert "outputTokens" not in error_event
     assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(error_event)

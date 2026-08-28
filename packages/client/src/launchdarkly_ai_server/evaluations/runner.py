@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..types import NativeTool
-from ..utils import parse_template, to_ld_context
+from ..utils import parse_template, parse_usage, to_ld_context
 from .api import EvaluationsError, LDApiClient, LDApiError
 from .types import (
     DatasetRef,
@@ -428,10 +428,14 @@ class EvaluationsRunner:
             ).hexdigest()
             generated = {
                 "status": result["status"],
-                "generationOutput": result.get("output", {}).get("generation"),
+                "output": result.get("output", {}).get("generation"),
                 "error": result.get("error"),
-                "usage": result.get("output", {}).get("usage"),
             }
+            usage = result.get("output", {}).get("usage")
+            if isinstance(usage, Mapping):
+                normalized_usage = parse_usage(dict(usage))
+                generated["inputTokens"] = normalized_usage["input"]
+                generated["outputTokens"] = normalized_usage["output"]
             content_hash = hashlib.sha256(
                 json.dumps(
                     generated, sort_keys=True, separators=(",", ":"), default=str
@@ -451,12 +455,13 @@ class EvaluationsRunner:
                 "generatedAt": result["generated_at"],
                 "latencyMs": result["latency_ms"],
             }
-            if generated["generationOutput"] is not None:
-                payload["generationOutput"] = generated["generationOutput"]
+            if generated["output"] is not None:
+                payload["output"] = generated["output"]
             if generated["error"] is not None:
                 payload["error"] = generated["error"]
-            if generated["usage"] is not None:
-                payload["usage"] = generated["usage"]
+            if "inputTokens" in generated:
+                payload["inputTokens"] = generated["inputTokens"]
+                payload["outputTokens"] = generated["outputTokens"]
             client.track(GENERATION_EVENT_NAME, context, payload, 1)
             print(
                 f"{GENERATION_EVENT_NAME} emittedAt={emitted_at} eventId={event_id}",
