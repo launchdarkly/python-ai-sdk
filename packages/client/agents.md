@@ -264,6 +264,59 @@ Exactly three signals exist, and the list is an **allowlist, not a floor**:
 The last two belong to the materialization layer and have no caller yet; they live here
 with the first so the allowlist is one section of one file rather than three sites to audit.
 
+### The integrity-failure log record
+
+The signal above is product telemetry; the **log record** beside it is the customer-owned
+detection path, and the more load-bearing of the two. It is the only integrity surface that
+works when telemetry is off, and the only one that exists at all in an instance with no
+telemetry destination, so it is a documented contract in the README rather than a debugging
+aid. `record_integrity_failure` writes both, and is the only place either is constructed.
+
+One ERROR record per withheld skill, message text = `INTEGRITY_FAILURE_EVENT` + a space +
+`json.dumps(record, sort_keys=True, separators=(",", ":"))`, plus the same mapping under
+`extra={"ld_skills": record}`. Fields: `event`, `action` (always `withheld`), `skill_key`,
+`version?`, `expected_hash?`, `observed_hash?`, `reason_code`, `reason`, `language`.
+
+Each of those choices is load-bearing; do not undo one as a simplification.
+
+- **The event name is in the message text**, not only in `extra`. Severity cannot
+  discriminate — `resolve_from_store` and `list_raw_objects` in the same module also log
+  ERROR for a raising store — and the stdlib's default formatter drops `extra` entirely, so
+  an `extra`-only record is invisible under a plain `logging.basicConfig()`.
+- **`ld.skills.integrity_failure` is documented for customers to match on**, which makes it
+  a compatibility surface. It must never be renamed.
+- **`sort_keys=True` is not cosmetic.** The other language implementations build the object
+  in alphabetical key order, so sorting makes the serialized line byte-identical across
+  SDKs for the same input, modulo `language`.
+- **Optional fields are omitted, never nulled**, so a SIEM field-existence check means
+  something.
+- **The record spreads the signal's properties** rather than rebuilding them, so the two
+  cannot drift on the fields they share — in particular on which are redacted. Anything
+  added later that comes off the wire needs the same shape-check-then-redact treatment.
+- **`reason_code` is in the record only.** The signal's property set is the allowlist above
+  and does not grow; the local record is where the detection vocabulary lives.
+
+`reason_code` is a **closed vocabulary of exactly eight tokens** — `IntegrityReasonCode`, a
+`Literal`, so a typo at a call site is a type error — one per `record_integrity_failure`
+call site, and the same eight in every language implementation:
+
+| `reason_code` | Call site |
+|---|---|
+| `not_an_object` | `verify_raw_skill` — raw object is not a dict |
+| `invalid_key` | `verify_raw_skill` — fails `is_valid_skill_key` |
+| `invalid_version` | `verify_raw_skill` — fails `is_valid_skill_version` |
+| `missing_content` | `verify_raw_skill` — `content` absent or not a string |
+| `missing_content_hash` | `verify_raw_skill` — `contentHash` absent or not a string |
+| `not_utf8` | `verified_bytes` — `UnicodeEncodeError` on encode (wire-`str` path only; a `Skill` already holds bytes) |
+| `over_size_cap` | `verified_bytes` — over `MAX_SKILL_CONTENT_BYTES` |
+| `hash_mismatch` | `verified_bytes` — observed sha256 != `contentHash` |
+
+Adding a ninth failure mode means widening `IntegrityReasonCode`, adding a case to
+`REASON_CODE_CASES` in `test_skills.py` (whose exhaustiveness assertion fails otherwise),
+documenting it in the README table, **and** doing the same in the other language SDKs. A
+token added on one side only is a drift bug: a customer's detection rule stops matching
+where they cannot see it.
+
 `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved`
 were considered and **deliberately excluded from SDK emission** — both are observable
 server-side. Do not add them. The skill body never appears in a signal, a log line, or
@@ -431,4 +484,5 @@ on their side of the boundary.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
 - Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
+- Do not rename `ld.skills.integrity_failure`, and do not add a ninth `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.

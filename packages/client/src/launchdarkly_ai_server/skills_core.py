@@ -38,10 +38,11 @@ and they delegate here.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, get_args
 
 from .types import Skill, SkillReference
 from .types_validation import is_valid_skill_key, is_valid_skill_version
@@ -90,6 +91,46 @@ put the skill body there would otherwise leak it into a signal."""
 _SIGNAL_INTEGRITY_FAILURE = "AgentControl Skill Integrity Failure"
 _SIGNAL_MATERIALIZED = "AgentControl Skill Materialized"
 _SIGNAL_REVOKED = "AgentControl Skill Revoked Received"
+
+INTEGRITY_FAILURE_EVENT = "ld.skills.integrity_failure"
+"""
+Stable event identity for the local integrity-failure log record.
+
+A **compatibility surface**, not an implementation detail: the README documents
+it as the string a customer's SIEM matches on, so it must never be renamed.
+
+It appears verbatim **in the message text**, not only in ``extra``. Severity
+alone cannot discriminate — ``list_raw_objects`` and ``resolve_from_store`` in
+this module also log ERROR when a store raises — and the stdlib's default
+formatter drops ``extra`` entirely, so under a plain ``logging.basicConfig()``
+an ``extra``-only record would be invisible.
+"""
+
+_ACTION_WITHHELD = "withheld"
+"""The only action an integrity failure results in: content is never returned."""
+
+IntegrityReasonCode = Literal[
+    "not_an_object",
+    "invalid_key",
+    "invalid_version",
+    "missing_content",
+    "missing_content_hash",
+    "not_utf8",
+    "over_size_cap",
+    "hash_mismatch",
+]
+"""
+The closed ``reason_code`` vocabulary — one token per ``record_integrity_failure``
+call site, and the same eight tokens in every language implementation of this
+feature, so a detection rule written against one SDK reads the others.
+
+A ``Literal`` rather than a bare ``str`` so a typo at a call site is a type
+error, and so widening the vocabulary is a deliberate edit here rather than a
+new string invented at the site that needed it.
+"""
+
+INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode))
+"""``IntegrityReasonCode`` as a runtime set, derived rather than restated."""
 
 NO_STORE_MESSAGE = (
     "No skill store is configured, so skill content cannot be retrieved. Configure "
@@ -234,17 +275,39 @@ def record_integrity_failure(
     skill_key: str,
     reason: str,
     *,
+    reason_code: IntegrityReasonCode,
     version: Any = None,
     expected_hash: Any = None,
     observed_hash: str | None = None,
 ) -> None:
     """
-    Records an integrity failure. Carries hashes and byte counts only — the skill
-    body never appears in a signal, a log line, or an error message.
+    Records an integrity failure on both surfaces: one local log record, one
+    product signal.
+
+    Carries hashes and byte counts only — the skill body never appears in a
+    signal, a log line, or an error message.
+
+    The two surfaces are deliberately different sizes, and the log record is the
+    more important of the two. The signal is product telemetry: opt-out
+    respecting, no-op by default, and its property set is a documented allowlist
+    (``agents.md``) that does not grow. The **log record** is the customer-owned
+    detection path — the only one that works when telemetry is off, and the only
+    one that exists at all in an instance with no telemetry destination — so it
+    is designed to be ingested and alerted on, and additionally carries the
+    stable event name, the action taken, the human-readable reason, and the
+    machine-parseable ``reason_code``.
+
+    Emitted twice over, because neither form alone is sufficient: the message
+    text carries ``INTEGRITY_FAILURE_EVENT`` followed by compact JSON, so the
+    record survives ``logging.basicConfig()`` and is greppable and ``jq``-able
+    under any handler configuration; ``extra["ld_skills"]`` carries the same
+    mapping unflattened for a structured handler that would rather not reparse.
     """
     # Both of these come off the wire, so neither may be echoed verbatim: a store
     # that set contentHash (or key) to the skill body would otherwise publish the
-    # body itself. Shape-check, then redact.
+    # body itself. Shape-check, then redact. Every field the log record adds on
+    # top is either a literal or SDK-authored, so the record introduces no new
+    # untrusted value — anything added later needs this same treatment.
     safe_key = skill_key if is_valid_skill_key(skill_key) else "<invalid-key>"
     properties: dict[str, Any] = {"skill_key": safe_key, "language": _LANGUAGE}
     if is_valid_skill_version(version):
@@ -258,7 +321,28 @@ def record_integrity_failure(
     if observed_hash is not None:
         properties["observed_hash"] = observed_hash
 
-    logger.error("Skill '%s' failed integrity verification: %s", safe_key, reason)
+    # Spread the signal's properties rather than rebuilding them, so the record
+    # cannot drift from the signal on the fields they share — in particular on
+    # which of them are redacted and which are omitted. Absent optional fields
+    # stay absent; the record never carries a null.
+    record: dict[str, Any] = {
+        "event": INTEGRITY_FAILURE_EVENT,
+        "action": _ACTION_WITHHELD,
+        "reason_code": reason_code,
+        "reason": reason,
+        **properties,
+    }
+    # ``sort_keys`` is load-bearing rather than cosmetic: the other language
+    # implementations build this object in alphabetical key order, so sorting
+    # here makes the serialized line byte-identical across SDKs for the same
+    # input, modulo ``language``. Do not drop it, and do not reorder the keys
+    # above expecting the output to follow.
+    logger.error(
+        "%s %s",
+        INTEGRITY_FAILURE_EVENT,
+        json.dumps(record, sort_keys=True, separators=(",", ":")),
+        extra={"ld_skills": record},
+    )
     emit(_SIGNAL_INTEGRITY_FAILURE, properties)
 
 
@@ -375,7 +459,11 @@ def verified_bytes(
             # satisfy the hash comparison.
             reason = "content is not encodable as UTF-8"
             record_integrity_failure(
-                key, reason, version=version, expected_hash=expected_hash
+                key,
+                reason,
+                reason_code="not_utf8",
+                version=version,
+                expected_hash=expected_hash,
             )
             return VerificationFailure(reason)
 
@@ -385,7 +473,11 @@ def verified_bytes(
             f"{MAX_SKILL_CONTENT_BYTES} byte cap"
         )
         record_integrity_failure(
-            key, reason, version=version, expected_hash=expected_hash
+            key,
+            reason,
+            reason_code="over_size_cap",
+            version=version,
+            expected_hash=expected_hash,
         )
         return VerificationFailure(reason)
 
@@ -396,6 +488,7 @@ def verified_bytes(
         record_integrity_failure(
             key,
             "content hash mismatch",
+            reason_code="hash_mismatch",
             version=version,
             expected_hash=expected_hash,
             observed_hash=observed_hash,
@@ -414,7 +507,11 @@ def verify_raw_skill(raw: Any) -> Skill | None:
     user code.
     """
     if not isinstance(raw, dict):
-        record_integrity_failure("<unknown>", "raw skill object is not an object")
+        record_integrity_failure(
+            "<unknown>",
+            "raw skill object is not an object",
+            reason_code="not_an_object",
+        )
         return None
 
     key = raw.get("key")
@@ -422,25 +519,34 @@ def verify_raw_skill(raw: Any) -> Skill | None:
         record_integrity_failure(
             key if isinstance(key, str) else "<unknown>",
             "key is not a valid skill key",
+            reason_code="invalid_key",
         )
         return None
 
     version = raw.get("version")
     if not is_valid_skill_version(version):
-        record_integrity_failure(key, "version is not an integer >= 1")
+        record_integrity_failure(
+            key, "version is not an integer >= 1", reason_code="invalid_version"
+        )
         return None
 
     content = raw.get("content")
     if not isinstance(content, str):
         record_integrity_failure(
-            key, "content is missing or not a string", version=version
+            key,
+            "content is missing or not a string",
+            reason_code="missing_content",
+            version=version,
         )
         return None
 
     expected_hash = raw.get("contentHash")
     if not isinstance(expected_hash, str):
         record_integrity_failure(
-            key, "contentHash is missing or not a string", version=version
+            key,
+            "contentHash is missing or not a string",
+            reason_code="missing_content_hash",
+            version=version,
         )
         return None
 

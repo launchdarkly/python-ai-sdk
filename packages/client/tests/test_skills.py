@@ -1006,6 +1006,275 @@ class TestIntegrityVerification:
         assert await all_skills() == []
 
 
+# ---------------------------------------------------------------------------
+# Gap 1 — the local integrity-failure log record
+# ---------------------------------------------------------------------------
+
+INTEGRITY_EVENT = "ld.skills.integrity_failure"
+"""The stable event name, spelled out rather than imported.
+
+The name is a compatibility surface documented for customers to match on in a
+SIEM, so the test has to fail when it is renamed. Importing the constant would
+rename in lockstep and assert nothing.
+"""
+
+LOGGED_BODY = "UNIQUE-SECRET-BODY-THAT-MUST-NOT-BE-LOGGED"
+
+
+def _raw_object(**overrides: Any) -> dict[str, Any]:
+    """A wire-shaped raw object with a correct ``contentHash``.
+
+    The ``make_raw_skill`` fixture is the same factory, but a module-level
+    ``parametrize`` table cannot reach a fixture.
+    """
+    raw: dict[str, Any] = {
+        "key": "a",
+        "version": 1,
+        "content": SKILL_BODY,
+        "contentHash": _hash(SKILL_BODY),
+    }
+    raw.update(overrides)
+    return raw
+
+
+def _raw_without(field: str) -> dict[str, Any]:
+    raw = _raw_object()
+    del raw[field]
+    return raw
+
+
+_OVERSIZE = "x" * (64 * 1024 + 1)
+
+REASON_CODE_CASES = [
+    # Not a dict at all. Reachable through ``all_skills`` and not through
+    # ``get_skill``, which rejects a non-dict answer before verification.
+    pytest.param("not-an-object-at-all", "not_an_object", id="not_an_object"),
+    pytest.param(_raw_object(key="Evil/../x"), "invalid_key", id="invalid_key"),
+    pytest.param(_raw_object(version=0), "invalid_version", id="invalid_version"),
+    pytest.param(_raw_without("content"), "missing_content", id="missing_content"),
+    pytest.param(
+        _raw_without("contentHash"), "missing_content_hash", id="missing_content_hash"
+    ),
+    # A lone surrogate has no UTF-8 encoding. Only reachable on the wire-``str``
+    # path: a ``Skill`` already holds bytes and skips the encode.
+    pytest.param(
+        _raw_object(content=json.loads(r'"hi \ud800 there"')), "not_utf8", id="not_utf8"
+    ),
+    # Correct hash for the oversize body, so the cap is what withheld it.
+    pytest.param(
+        _raw_object(content=_OVERSIZE, contentHash=_hash(_OVERSIZE)),
+        "over_size_cap",
+        id="over_size_cap",
+    ),
+    pytest.param(
+        _raw_object(contentHash="0" * 64), "hash_mismatch", id="hash_mismatch"
+    ),
+]
+"""One case per ``reason_code`` token, driven end to end through ``all_skills``.
+
+``all_skills`` rather than ``get_skill`` for every case so the table is uniform:
+it verifies every object the store holds, including the ones too malformed to
+carry a usable key, which is the only accessor path a non-dict reaches.
+"""
+
+
+def _integrity_records(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """Every integrity-failure record in *caplog*, parsed out of the message text.
+
+    Read off the message rather than off ``record.ld_skills`` deliberately: the
+    message is what a customer sees under a plain ``logging.basicConfig()``, and
+    it is the surface the documented contract is about. The structured mirror is
+    asserted separately, against this.
+    """
+    parsed: list[dict[str, Any]] = []
+    for entry in caplog.records:
+        message = entry.getMessage()
+        if not message.startswith(f"{INTEGRITY_EVENT} "):
+            continue
+        parsed.append(json.loads(message[len(INTEGRITY_EVENT) + 1 :]))
+    return parsed
+
+
+class TestIntegrityFailureLogRecord:
+    """
+    The local log record is a documented detection surface, not a debugging aid.
+
+    It is the only integrity signal that survives telemetry being switched off,
+    and the only one that exists at all in an instance with no telemetry
+    destination, so its shape is a contract: a stable event name in the message
+    text, a closed ``reason_code`` vocabulary, and no field a hostile store can
+    dictate.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture_errors(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level("ERROR", logger="launchdarkly_ai_server.skills_core")
+
+    async def _withhold(self, objects: dict[str, Any]) -> None:
+        skills_module._set_store(InMemorySkillStore(objects))
+        assert await all_skills() == []
+
+    @pytest.mark.parametrize(("raw", "expected_code"), REASON_CODE_CASES)
+    async def test_one_record_per_reason_code(
+        self, caplog: pytest.LogCaptureFixture, raw: Any, expected_code: str
+    ) -> None:
+        await self._withhold({"a": raw})
+
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        record = records[0]
+        assert record["reason_code"] == expected_code
+        assert record["event"] == INTEGRITY_EVENT
+        assert record["action"] == "withheld"
+        assert record["language"] == "python"
+        assert record["reason"]  # the human-readable half, carrying byte counts
+        # Absent optional fields are omitted, never nulled: a SIEM field
+        # existence check has to mean something.
+        assert None not in record.values()
+        # The body never reaches a log line. Swept over every failure mode here;
+        # the two cases below are the ones that make the rule observable, since
+        # a well-formed key and digest never enter a redaction branch.
+        assert "Do the thing." not in json.dumps(record)
+
+    def test_the_case_table_exhausts_the_vocabulary(self) -> None:
+        """The vocabulary is closed, and every token in it is reachable.
+
+        Both directions matter. A ninth token added to the source without a call
+        site fails here, and so does a ninth call site that invented a token the
+        table does not cover — which is what keeps the Python and TypeScript
+        vocabularies from drifting apart one edit at a time.
+        """
+        from launchdarkly_ai_server import skills_core
+
+        covered = {case.values[1] for case in REASON_CODE_CASES}
+        assert covered == skills_core.INTEGRITY_REASON_CODES
+        assert len(covered) == 8
+
+    async def test_the_event_name_is_in_the_message_text(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Severity alone cannot discriminate, so the name has to be in the line.
+
+        ``resolve_from_store`` and ``list_raw_objects`` also log ERROR from this
+        logger when a store raises, and the stdlib's default formatter drops
+        ``extra`` entirely — an ``extra``-only record would be invisible to a
+        customer running ``logging.basicConfig()``.
+        """
+        await self._withhold({"a": _raw_object(contentHash="0" * 64)})
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert errors[0].getMessage().startswith(f"{INTEGRITY_EVENT} ")
+
+    async def test_structured_handlers_get_the_same_record(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``extra`` carries the record unflattened, and says the same thing."""
+        await self._withhold({"a": _raw_object(contentHash="0" * 64)})
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        # extra lands in the record's __dict__, which is where a
+        # structured handler reads it from.
+        assert errors[0].__dict__["ld_skills"] == _integrity_records(caplog)[0]
+
+    async def test_redaction_survives_into_the_record(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Both wire-sourced fields are still redacted in the JSON payload.
+
+        ``key`` and ``contentHash`` are attacker-controlled, so a store can put
+        the skill body in either. The record must not have reopened a leak the
+        signal already closed — same treatment, same placeholders.
+        """
+        await self._withhold(
+            {
+                "a": {
+                    "key": f"{LOGGED_BODY}/../x",
+                    "version": 1,
+                    "content": LOGGED_BODY,
+                    "contentHash": LOGGED_BODY,
+                }
+            }
+        )
+
+        record = _integrity_records(caplog)[0]
+        assert record["skill_key"] == "<invalid-key>"
+        assert LOGGED_BODY not in json.dumps(record)
+
+    async def test_a_non_sha256_expected_hash_is_redacted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The key is valid here, so ``expected_hash`` is the field under test."""
+        await self._withhold({"a": _raw_object(contentHash=LOGGED_BODY)})
+
+        record = _integrity_records(caplog)[0]
+        assert record["expected_hash"] == "<not-a-sha256-digest>"
+        assert LOGGED_BODY not in json.dumps(record)
+
+    async def test_observed_hash_is_absent_before_hashing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Nothing was hashed, so there is no observed value to report."""
+        await self._withhold({"a": _raw_without("contentHash")})
+
+        assert "observed_hash" not in _integrity_records(caplog)[0]
+
+    async def test_observed_hash_is_present_on_a_mismatch(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The one case that is a possible active-tampering signal.
+
+        Positive control for the test above: an implementation that never
+        populated ``observed_hash`` would satisfy it vacuously.
+        """
+        await self._withhold({"a": _raw_object(contentHash="0" * 64)})
+
+        record = _integrity_records(caplog)[0]
+        assert record["observed_hash"] == _hash(SKILL_BODY)
+        assert record["expected_hash"] == "0" * 64
+
+    async def test_the_serialized_payload_is_compact_and_key_sorted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Sorted keys are what make the line byte-identical across SDKs.
+
+        The other language implementations build this object in alphabetical
+        order, so a Python line following insertion order would differ byte for
+        byte on identical input. Compact separators are asserted alongside
+        because the two together are the serialization contract.
+        """
+        await self._withhold({"a": _raw_object(contentHash="0" * 64)})
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        payload = errors[0].getMessage()[len(INTEGRITY_EVENT) + 1 :]
+        # json.loads preserves the document's order, so this is what was written.
+        keys = list(json.loads(payload))
+        assert keys == sorted(keys)
+        assert ", " not in payload and ": " not in payload
+
+    async def test_reason_code_stays_out_of_the_telemetry_signal(
+        self, recording_emitter: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The signal's property set is an allowlist and does not grow.
+
+        The record is the customer-owned detection path and carries the new
+        vocabulary; the LD-side counter is product telemetry and was left
+        exactly as designed.
+        """
+        skills_module._set_emitter_for_testing(recording_emitter)
+        await self._withhold({"a": _raw_object(contentHash="0" * 64)})
+
+        props = recording_emitter.signals(INTEGRITY_SIGNAL)[0]
+        assert set(props) == {
+            "skill_key",
+            "version",
+            "expected_hash",
+            "observed_hash",
+            "language",
+        }
+        assert _integrity_records(caplog)[0]["reason_code"] == "hash_mismatch"
+
+
 class TestTelemetrySeam:
     """Internal emitter seam, no client.track, no context."""
 

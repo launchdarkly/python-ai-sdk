@@ -279,6 +279,57 @@ revalidate, and its size is within 64 KiB. Anything that fails is withheld and t
 missing — no unverified content ever reaches your code. A retrieval that withheld anything
 logs a count at WARN, so a run that resolved nothing is not silent.
 
+#### Detecting integrity failures
+
+Every withheld skill emits one structured **ERROR** log record on the SDK's own logger
+(`launchdarkly_ai_server.skills_core`), designed to be ingested by a SIEM and alerted on.
+It is emitted **regardless of how telemetry is configured** — it is not conditional on any
+opt-in, and it is the detection path that works when nothing leaves your process.
+
+The message text is the stable event name followed by compact JSON, so it is greppable and
+`jq`-able under any handler configuration, and the same mapping is attached as
+`extra["ld_skills"]` for a structured handler:
+
+```
+ERROR ld.skills.integrity_failure {"action":"withheld","event":"ld.skills.integrity_failure","expected_hash":"0000…0000","language":"python","observed_hash":"5fc8…6ec0","reason":"content hash mismatch","reason_code":"hash_mismatch","skill_key":"pdf-extraction","version":2}
+```
+
+**`ld.skills.integrity_failure` is a stability commitment.** It is the string to match on,
+it will not be renamed, and the JSON keys are sorted so the line is byte-identical across
+LaunchDarkly's AI SDKs for the same input.
+
+| Field | Description |
+|---|---|
+| `event` | Always `ld.skills.integrity_failure`. |
+| `action` | Always `withheld` — the content was not returned to your code. |
+| `skill_key` | The skill key, or `<invalid-key>` when the delivered key was itself malformed. |
+| `version` | The delivered version. Omitted when it was not a valid version. |
+| `expected_hash` | The delivered `contentHash`, or `<not-a-sha256-digest>` when it was not one. Omitted when none was delivered. |
+| `observed_hash` | The sha256 the SDK computed. Omitted when the failure happened before anything was hashed. |
+| `reason_code` | A stable token naming the failure mode — see below. |
+| `reason` | Human-readable detail, including byte counts where relevant. |
+| `language` | Always `python`. |
+
+Absent optional fields are **omitted entirely** rather than emitted as `null`, so a field
+existence check is meaningful. The skill body, and any attacker-controllable string that
+could carry it, never appears in the record; neither does any filesystem path.
+
+| `reason_code` | Meaning |
+|---|---|
+| `not_an_object` | The delivered object was not a JSON object. |
+| `invalid_key` | The key did not match `^[a-z0-9][a-z0-9-]*$` or exceeded 256 characters. |
+| `invalid_version` | The version was not an integer ≥ 1. |
+| `missing_content` | `content` was absent or not a string. |
+| `missing_content_hash` | `contentHash` was absent or not a string. |
+| `not_utf8` | The content string had no UTF-8 encoding, so there are no bytes that could have been hashed. |
+| `over_size_cap` | The content exceeded the SDK's local size cap. |
+| `hash_mismatch` | The computed sha256 did not match the delivered `contentHash`. |
+
+**`hash_mismatch` is the one worth paging on.** The other seven describe a malformed or
+truncated payload; a mismatch means content was delivered whose bytes are not the bytes
+LaunchDarkly hashed, which is a possible **active-tampering** signal. Alert on it, and
+treat `expected_hash` / `observed_hash` as the evidence pair.
+
 **Versions are selected, not filtered.** A store may hold several versions of one key at
 once, because a delivery payload does: the newest version of every skill, plus every
 version a variation currently pins. `get_skill("k", version=1)` asks the store for version
