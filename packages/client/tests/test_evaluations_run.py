@@ -271,10 +271,10 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert event["rowIndex"] == 4
     assert event["status"] == "COMPLETE"
     assert event["output"] == "generated: Order A19"
-    assert event["inputTokens"] == 10
-    assert event["outputTokens"] == 4
+    assert event["usage"] == {"inputTokens": 10, "outputTokens": 4}
     assert "generationOutput" not in event
-    assert "usage" not in event
+    assert "inputTokens" not in event
+    assert "outputTokens" not in event
     assert len(event["eventId"]) == len(event["contentHash"]) == 64
     assert event["emittedAt"].endswith("Z")
     assert datetime.fromisoformat(event["emittedAt"]).tzinfo is not None

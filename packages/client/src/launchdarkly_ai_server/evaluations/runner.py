@@ -434,8 +434,10 @@ class EvaluationsRunner:
             usage = result.get("output", {}).get("usage")
             if isinstance(usage, Mapping):
                 normalized_usage = parse_usage(dict(usage))
-                generated["inputTokens"] = normalized_usage["input"]
-                generated["outputTokens"] = normalized_usage["output"]
+                generated["usage"] = {
+                    "inputTokens": normalized_usage["input"],
+                    "outputTokens": normalized_usage["output"],
+                }
             content_hash = hashlib.sha256(
                 json.dumps(
                     generated, sort_keys=True, separators=(",", ":"), default=str
@@ -459,9 +461,8 @@ class EvaluationsRunner:
                 payload["output"] = generated["output"]
             if generated["error"] is not None:
                 payload["error"] = generated["error"]
-            if "inputTokens" in generated:
-                payload["inputTokens"] = generated["inputTokens"]
-                payload["outputTokens"] = generated["outputTokens"]
+            if "usage" in generated:
+                payload["usage"] = generated["usage"]
             client.track(GENERATION_EVENT_NAME, context, payload, 1)
             print(
                 f"{GENERATION_EVENT_NAME} emittedAt={emitted_at} eventId={event_id}",
