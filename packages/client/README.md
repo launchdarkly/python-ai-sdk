@@ -223,22 +223,46 @@ asyncio.run(main())
 ### Agent Skills
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
-variations by reference. This release adds the first layer: discovering which skills a
-resolved config references. Retrieving their content and materializing them onto disk follow.
+variations by reference. The SDK surfaces which skills a config references and retrieves
+their content. Materializing them onto disk, where agent runtimes discover them, follows.
 
 ```python
 import asyncio
+import hashlib
 
-from launchdarkly_ai_server import init_client, inspect_config, skill_refs
+from launchdarkly_ai_server import (
+    init_client, inspect_config, skill_refs, get_skill, get_skills,
+    InMemorySkillStore,
+)
+
+SKILL_MD = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
 
 async def main():
-    await init_client()
+    # A store supplies skill content. InMemorySkillStore is the dict-backed
+    # store for local development, testing, and bring-your-own-content use.
+    store = InMemorySkillStore()
+    store.put({
+        "key": "pdf-extraction",
+        "version": 2,
+        "content": SKILL_MD,
+        # sha256, lowercase hex, over the verbatim utf-8 bytes. Content whose hash
+        # does not match is withheld, so this is not optional.
+        "contentHash": hashlib.sha256(SKILL_MD.encode("utf-8")).hexdigest(),
+    })
+    await init_client(options={"skillStore": store})
 
+    # 1. Which skills does this config reference? Pure projection — no I/O.
     info = await inspect_config("doc-agent", {"kind": "user", "key": "user-123"})
-    refs = skill_refs(info["config"])   # [SkillReference(key='pdf-extraction', version=2)]
+    refs = skill_refs(info["config"])          # [SkillReference(key='pdf-extraction', version=2)]
 
-    for ref in refs:
-        print(ref.key, ref.version)
+    # 2. Fetch content. Returns None rather than raising when a skill is unavailable.
+    skill = await get_skill("pdf-extraction")
+    if skill is not None:
+        print(skill.content)
+
+    # 3. Or resolve the config's references in one call.
+    for s in await get_skills(refs):
+        print(s.key, s.version)
 
 asyncio.run(main())
 ```
@@ -249,9 +273,83 @@ integer ≥ 1): the whole variation is rejected, `inspect_config` returns `confi
 `extract_variation` raises. A variation that previously carried its own custom `skills`
 field of a different shape must rename it before upgrading.
 
+**Integrity is not optional.** Content is only returned after its sha256 (lowercase hex,
+over the verbatim UTF-8 bytes) matches the delivered `contentHash`, its key and version
+revalidate, and its size is within 64 KiB. Anything that fails is withheld and treated as
+missing — no unverified content ever reaches your code. A retrieval that withheld anything
+logs a count at WARN, so a run that resolved nothing is not silent.
+
+#### Detecting integrity failures
+
+Every withheld skill emits one structured **ERROR** log record on the SDK's own logger
+(`launchdarkly_ai_server.skills_core`), designed to be ingested by a SIEM and alerted on.
+It is emitted **regardless of how telemetry is configured** — it is not conditional on any
+opt-in, and it is the detection path that works when nothing leaves your process.
+
+The message text is the stable event name followed by compact JSON, so it is greppable and
+`jq`-able under any handler configuration, and the same mapping is attached as
+`extra["ld_skills"]` for a structured handler:
+
+```
+ERROR ld.skills.integrity_failure {"action":"withheld","event":"ld.skills.integrity_failure","expected_hash":"0000…0000","language":"python","observed_hash":"5fc8…6ec0","reason":"content hash mismatch","reason_code":"hash_mismatch","skill_key":"pdf-extraction","version":2}
+```
+
+**`ld.skills.integrity_failure` is a stability commitment.** It is the string to match on,
+it will not be renamed, and the JSON keys are sorted so the line is byte-identical across
+LaunchDarkly's AI SDKs for the same input.
+
+| Field | Description |
+|---|---|
+| `event` | Always `ld.skills.integrity_failure`. |
+| `action` | Always `withheld` — the content was not returned to your code. |
+| `skill_key` | The skill key, or `<invalid-key>` when the delivered key was itself malformed. |
+| `version` | The delivered version. Omitted when it was not a valid version. |
+| `expected_hash` | The delivered `contentHash`, or `<not-a-sha256-digest>` when it was not one. Omitted when none was delivered. |
+| `observed_hash` | The sha256 the SDK computed. Omitted when the failure happened before anything was hashed. |
+| `reason_code` | A stable token naming the failure mode — see below. |
+| `reason` | Human-readable detail, including byte counts where relevant. |
+| `language` | Always `python`. |
+
+Absent optional fields are **omitted entirely** rather than emitted as `null`, so a field
+existence check is meaningful. The skill body, and any attacker-controllable string that
+could carry it, never appears in the record; neither does any filesystem path.
+
+| `reason_code` | Meaning |
+|---|---|
+| `not_an_object` | The delivered object was not a JSON object. |
+| `invalid_key` | The key did not match `^[a-z0-9][a-z0-9-]*$` or exceeded 256 characters. |
+| `invalid_version` | The version was not an integer ≥ 1. |
+| `missing_content` | `content` was absent or not a string. |
+| `missing_content_hash` | `contentHash` was absent or not a string. |
+| `not_utf8` | The content string had no UTF-8 encoding, so there are no bytes that could have been hashed. |
+| `over_size_cap` | The content exceeded the SDK's local size cap. |
+| `hash_mismatch` | The computed sha256 did not match the delivered `contentHash`. |
+
+**`hash_mismatch` is the one worth paging on.** The other seven describe a malformed or
+truncated payload; a mismatch means content was delivered whose bytes are not the bytes
+LaunchDarkly hashed, which is a possible **active-tampering** signal. Alert on it, and
+treat `expected_hash` / `observed_hash` as the evidence pair.
+
+**Versions are selected, not filtered.** A store may hold several versions of one key at
+once, because a delivery payload does: the newest version of every skill, plus every
+version a variation currently pins. `get_skill("k", version=1)` asks the store for version
+1 and gets it even when a newer one is also held.
+
 | Export | Description |
 |---|---|
 | `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when absent. |
+| `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
+| `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
+| `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
+| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)`. |
+| `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
+
+Configure the store with `init_client(options={"skillStore": store})`. With none configured,
+the accessors raise `RuntimeError` explaining what to do. `shutdown()` clears it.
+
+`all_objects` returns one entry per `(key, version)` under keys that are **opaque** to the
+SDK — identity is read from each object's own `key` and `version` fields, so a store is free
+to key its own map however the transport underneath does.
 
 > `Skill.content` is `bytes` — the verified verbatim bytes LaunchDarkly delivered, exactly
 > what was hashed. The SDK never parses or interprets them; if you want the frontmatter,
