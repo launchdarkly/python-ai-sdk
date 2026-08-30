@@ -250,7 +250,26 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
 - **Never write through a symlink**, in either the skill directory or the target file, on
   the write path *and* the prune path.
 - **Destructive operations only on manifest-listed paths whose `key` matches.** A file at a
-  managed path with no matching manifest entry is reported as `error` and left alone.
+  managed path with no matching manifest entry is reported as `error` and left alone —
+  *unless its bytes already are the resolved content*, in which case it is adopted (manifest
+  entry recorded, reported `skipped_current`). That single exception is what makes a
+  reconcile killed between the content writes and the final manifest rewrite recoverable
+  instead of permanently wedged, and it cannot be widened: the comparison is over the
+  verbatim bytes against the resolved `contentHash`, a read that fails is a refusal and
+  never an overwrite, and the read is bounded at `len(content) + 1` bytes so a file that
+  merely *begins* with the resolved content is refused too. Do not relax it to a prefix, a
+  length, an mtime, or the manifest's own recorded `sha256` — that field is untrusted and is
+  never a decision input. `skipped_current` is reused deliberately rather than adding an
+  `adopted` action kind; `ReconcileActionKind` is a public closed set.
+- **Temp files are swept, within the same bounds as everything else.** `atomic_write` unlinks
+  its own temp file on any exception, but a `SIGKILL` leaves one behind that no manifest
+  entry records, and a non-empty directory defeats `_prune_one`'s `rmdir` — so one orphan
+  pins a skill directory forever. The sweep is the only place this SDK removes a file the
+  manifest does not list, and it is bounded on every axis: inside `<root>/<key>/` only, for a
+  key that passes `_key_rejection_reason`; only names `safe_fs.is_temp_name` recognizes,
+  anchored at both ends and asked of `safe_fs` rather than re-spelled (a copy would drift
+  from the writer); only regular files, with the type read off the descriptor; unlinked
+  through the pinned descriptor. It never raises and never aborts a run.
 - **A corrupt manifest fails closed**: unreadable, unparseable, not an object, malformed
   `entries`, or a `manifestVersion` this release cannot read means no overwrites and no
   prunes, brand-new paths may still be written, an `error` action names the manifest, and
@@ -265,10 +284,28 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   "Descriptor-pinned filesystem access" below. Re-resolving `<root>/<key>` from its path at
   write or unlink time reopens a swap window that the checks above cannot cover.
 - **A key valid to the data model may still be unrepresentable on disk.** The model allows
-  256 characters; `NAME_MAX` is 255 bytes. `write_skills` rejects an over-long key before
-  any filesystem call, and every per-skill filesystem failure is caught at the loop so it
-  becomes an `error` action — aborting the loop would skip the manifest rewrite and orphan
-  files already written in that run.
+  256 characters; `NAME_MAX` is 255 bytes. Windows additionally reserves 22 MS-DOS device
+  names, none of which can be a directory name there: `con`, `prn`, `aux`, `nul`,
+  `com1`–`com9`, `lpt1`–`lpt9` (`com0` and `lpt0` are *not* reserved; do not add them).
+  `write_skills` rejects both before any filesystem call, and every per-skill filesystem
+  failure is caught at the loop so it becomes an `error` action — aborting the loop would
+  skip the manifest rewrite and orphan files already written in that run.
+- **Those two bounds live in `_key_rejection_reason`, not in the key grammar, and must not
+  move.** `is_valid_skill_key` / `skill_key_rejection_reason` keep admitting an over-long or
+  reserved key on purpose. `parse_ai_config` fails closed on a bad `skills` entry, so a
+  grammar-level rejection would invalidate the *entire* AI Config — model, provider,
+  instructions, tools — for a Linux customer over a Windows-only constraint; and it would
+  silently shrink `skill_refs`, which is what authorizes a prune, converting "this skill
+  fails to write on Windows" into "this skill gets deleted on Linux". `_key_rejection_reason`
+  is shared by the write and prune paths, so one edit covers both destructive paths.
+  The reserved-name check is unconditional rather than `os.name == "nt"`-gated: a root
+  written from a Linux container is routinely read from a Windows host, and neither
+  repository has a Windows CI runner (every matrix job is `ubuntu-latest`), so a gated branch
+  would be untestable — the exact condition that produced the gap. No suffix stripping and no
+  case folding are needed, because the grammar admits no `.` and no `$` (so `con.txt` and
+  `CONIN$` are unreachable) and is lowercase-only. The residual the SDK cannot check is total
+  path length: the 255-byte bound is per *component*, and the root belongs to the customer,
+  so `MAX_PATH` overflow is a README note rather than a check.
 - **A key is untrusted input everywhere it appears.** `skill_key_rejection_reason` is the
   single canonical explanation, so the config parser and the reference projection reject a
   key for the same stated reason — and so does every layer added later. A silently
