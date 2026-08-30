@@ -33,6 +33,7 @@ from .safe_fs import (
     SymlinkRefused,
     atomic_write,
     atomic_write_in,
+    is_temp_name,
     pinned_directory,
     unlink_file,
 )
@@ -92,6 +93,27 @@ becomes a single directory name, and the data model permits keys up to 256
 characters — one byte longer than any of those filesystems can represent. Such a
 key is rejected before any filesystem call so the caller gets a reported action
 rather than an ENAMETOOLONG escaping from a stat deep inside the reconcile.
+"""
+
+
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{digit}" for digit in range(1, 10)}
+    | {f"lpt{digit}" for digit in range(1, 10)}
+)
+"""
+The 22 MS-DOS device names Windows still reserves, which cannot be directory
+names there. The key grammar admits every one of them, so a customer who names a
+skill ``con`` gets a working reconcile on Linux and a broken one on Windows —
+rejected here instead, on every platform, so the on-disk result never depends on
+which OS ran the write. Neither repository has a Windows CI runner, which is the
+condition that produced the gap in the first place.
+
+The bare names are the whole set: no suffix stripping is needed because the key
+grammar admits no ``.``, so ``con.txt`` is unreachable, and ``CONIN$`` /
+``CONOUT$`` are unreachable for want of a ``$``; no case folding is needed
+because the grammar is lowercase-only. ``com0`` and ``lpt0`` are deliberately
+absent — those are not reserved.
 """
 
 
@@ -644,6 +666,17 @@ def _key_rejection_reason(key: Any) -> str | None:
             f"skill key '{key[:32]}...' is {key_bytes} bytes, over the "
             f"{_MAX_PATH_COMPONENT_BYTES}-byte limit for a single directory name"
         )
+    # Same reasoning as the byte bound above, and it lives at the same layer for
+    # the same reason: the grammar itself must keep admitting these, because
+    # rejecting them there would fail the whole AI Config over one skill, and
+    # would shrink ``skill_refs`` — which is what authorizes a prune, so a
+    # Windows-only constraint would delete the skill's file on Linux.
+    if key in _WINDOWS_RESERVED_NAMES:
+        return (
+            f"skill key '{key}' is a name Windows reserves for a device and "
+            "cannot be a directory name there; it is rejected on every platform "
+            "so a managed root written on one OS is usable on the other"
+        )
     return None
 
 
@@ -683,24 +716,45 @@ def _write_one(root: Path, skill: Skill, entries: dict[str, Any]) -> ReconcileAc
         )
     encoded, content_hash = verified.encoded, verified.content_hash
 
+    # Sweep before writing rather than after, so a temp file this run is about
+    # to create can never be a candidate.
+    _sweep_orphan_temp_files(root, key)
+
     # Overwrite only what the manifest records as ours under this key.
     entry = entries.get(relative)
     managed = isinstance(entry, dict) and entry.get("key") == key
     exists = target.exists()
 
-    if exists and not managed:
-        return failed(
-            f"'{relative}' exists but the manifest does not record it as managed "
-            f"under key '{key}'; refusing to overwrite a file this SDK did not write"
-        )
-
     if exists:
+        # Hash first, and decide from the bytes. The manifest check below is what
+        # protects a customer's own file, but it also refuses the file this SDK
+        # itself wrote and was killed before recording — the reconcile writes
+        # every skill and only then rewrites the manifest, so a crash in that
+        # window leaves a managed path with no entry, and every later reconcile
+        # takes the refusal branch forever. Comparing the bytes distinguishes the
+        # two cases without weakening anything: only content byte-identical to
+        # what LaunchDarkly resolved is ever adopted.
         try:
-            on_disk = _read_regular_file(target)
+            on_disk = _read_regular_file(target, max_bytes=len(encoded))
         except OSError as exc:
+            if not managed:
+                # A read that failed proves nothing, and must never become an
+                # overwrite: it is the comparison below that would authorize one.
+                return failed(
+                    f"'{relative}' exists, the manifest does not record it as "
+                    f"managed under key '{key}', and it could not be read to "
+                    f"compare against the resolved content: {exc}; refusing to "
+                    "overwrite a file this SDK may not have written"
+                )
             return failed(f"'{relative}' could not be read: {exc}")
 
         if hashlib.sha256(on_disk).hexdigest() == content_hash:
+            # ``skipped_current`` covers this deliberately, rather than a new
+            # action kind: its documented meaning is that the bytes on disk
+            # already are the resolved content, which is exactly as true for an
+            # adopted file as for one this SDK wrote and recorded. Adoption does
+            # add a manifest entry, so the file becomes prunable later — correct,
+            # because a prune then removes content LaunchDarkly delivered anyway.
             _update_entry(entries, relative, skill, content_hash)
             record_materialized(key, len(encoded), content_hash, "skipped_current")
             return ReconcileAction(
@@ -708,6 +762,12 @@ def _write_one(root: Path, skill: Skill, entries: dict[str, Any]) -> ReconcileAc
                 action="skipped_current",
                 version=skill.version,
                 path=str(target),
+            )
+
+        if not managed:
+            return failed(
+                f"'{relative}' exists but the manifest does not record it as managed "
+                f"under key '{key}'; refusing to overwrite a file this SDK did not write"
             )
         # Stale version or local tampering — LD-resolved content wins.
         action: ReconcileActionKind = "updated"
@@ -725,7 +785,7 @@ def _write_one(root: Path, skill: Skill, entries: dict[str, Any]) -> ReconcileAc
     )
 
 
-def _read_regular_file(target: Path) -> bytes:
+def _read_regular_file(target: Path, *, max_bytes: int) -> bytes:
     """
     Reads *target*, refusing anything that is not a regular file.
 
@@ -739,6 +799,12 @@ def _read_regular_file(target: Path) -> bytes:
     bytes the *verbatim* bytes: it is 0 on POSIX, but on Windows a descriptor
     without it translates CRLF on read, which would fail the hash comparison
     against content that is actually current.
+
+    Reads at most ``max_bytes + 1`` bytes. The only consumer compares a hash, and
+    anything longer than the resolved content cannot match it, so the one extra
+    byte is enough to prove inequality — which is what keeps a foreign file of
+    arbitrary size from being pulled into memory now that adoption reads files
+    the manifest does not list.
     """
     flags = (
         os.O_RDONLY
@@ -751,13 +817,80 @@ def _read_regular_file(target: Path) -> bytes:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError("the target file is not a regular file")
         chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 65536)
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
             if not chunk:
-                return b"".join(chunks)
+                break
             chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def _sweep_orphan_temp_files(root: Path, key: str) -> None:
+    """
+    Removes temp files a killed reconcile left behind under ``<root>/<key>/``.
+
+    ``atomic_write`` unlinks its own temp file on any exception, but a ``SIGKILL``
+    between the create and the rename leaves one on disk, and nothing else
+    records that it exists: ``_prune`` walks manifest entries, and an orphan
+    never has one. The second-order effect is what makes this worth doing —
+    ``_prune_one``'s ``rmdir`` only succeeds on an empty directory, so a single
+    orphaned temp pins a skill's directory permanently.
+
+    Bounded on every axis, because this is the one place the SDK removes a file
+    the manifest does not list: only inside a directory named by a key that
+    passes ``_key_rejection_reason``; only names ``safe_fs`` itself recognizes as
+    its own temp naming for ``SKILL.md``, anchored at both ends, and asked of
+    ``safe_fs`` rather than re-spelled here so the recognizer cannot drift from
+    the writer; only regular files; and every removal relative to a descriptor
+    pinned with ``O_NOFOLLOW``. It never raises and never aborts the run: the
+    reconcile itself has succeeded either way, so a sweep that cannot happen is
+    a warning.
+    """
+    if _key_rejection_reason(key) is not None:
+        return
+    skill_dir = root / key
+    if not skill_dir.is_dir():
+        return
+
+    try:
+        with pinned_directory(skill_dir) as dir_fd:
+            # Listing by path is safe even though the removals are
+            # descriptor-relative: a name reaches the unlink only if it matches
+            # the anchored temp pattern, and the unlink resolves it inside the
+            # pinned directory, so a listing redirected between the pin and here
+            # can at worst name a file that is not in it.
+            for name in sorted(os.listdir(skill_dir)):
+                if is_temp_name(name, SKILL_FILENAME):
+                    _remove_orphan_temp_file(skill_dir, name, dir_fd)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "orphaned temp files under skill '%s' could not be swept: %s", key, exc
+        )
+
+
+def _remove_orphan_temp_file(skill_dir: Path, name: str, dir_fd: int | None) -> None:
+    """
+    Removes one recognized orphan. A per-file failure warns and moves on.
+
+    The type check is what keeps the temp naming from being a way to have this
+    SDK delete something it did not write: a symlink or a FIFO wearing that name
+    is not a file ``atomic_write`` left behind, so it is not this function's to
+    remove. It is read off the descriptor, not the path, wherever there is one.
+    """
+    try:
+        if dir_fd is not None:
+            mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+        else:
+            mode = os.lstat(skill_dir / name).st_mode
+        if not stat.S_ISREG(mode):
+            return
+        unlink_file(skill_dir, name, dir_fd=dir_fd)
+    except (OSError, ValueError) as exc:
+        logger.warning("an orphaned temp file could not be removed: %s", exc)
 
 
 def _write_through_descriptor(
@@ -928,6 +1061,10 @@ def _prune_one(
     unsafe = _unsafe_path_reason(root, skill_dir, target, key, require_directory=False)
     if unsafe is not None:
         return _prune_error(key, f"'{relative}' was not removed: {unsafe}", version)
+
+    # Before the removal, so the ``rmdir`` below is not defeated by an orphaned
+    # temp file that nothing else on disk records.
+    _sweep_orphan_temp_files(root, key)
 
     removed_from_disk = False
     if target.exists():

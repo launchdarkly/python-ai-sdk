@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import secrets
 import stat
 import tempfile
@@ -191,6 +192,53 @@ def unlink_file(directory: Path, name: str, *, dir_fd: int | None) -> None:
     os.unlink(name, dir_fd=dir_fd)
 
 
+_TEMP_SUFFIX = ".tmp"
+"""Suffix on every temp file this module creates."""
+
+_TEMP_TOKEN_BYTES = 8
+"""Bytes of randomness in a temp name, as ``secrets.token_hex`` takes them."""
+
+_TEMP_TOKEN_PATTERN = re.compile(
+    # Two producers, one recognizer. The descriptor path below names its temp
+    # file with ``secrets.token_hex(_TEMP_TOKEN_BYTES)`` — twice that many
+    # lowercase hex characters. The fallback path hands naming to
+    # ``tempfile.mkstemp``, whose sequence is eight characters drawn from
+    # ``[a-z0-9_]``. Matched with ``fullmatch``, which anchors both branches at
+    # both ends, so nothing longer or otherwise-shaped is ever recognized.
+    rf"[0-9a-f]{{{_TEMP_TOKEN_BYTES * 2}}}|[a-z0-9_]{{8}}"
+)
+
+
+def temp_name_prefix(name: str) -> str:
+    """
+    The prefix every temp file for *name* is created under.
+
+    Spelled once because two callers need to agree on it: ``atomic_write``
+    creates the name, and a caller sweeping orphaned temp files left by a crash
+    has to recognize it. A copy of the format string in the sweeper would be a
+    copy that can drift out of step with the writer.
+    """
+    return f".{name}."
+
+
+def is_temp_name(candidate: str, name: str) -> bool:
+    """
+    Whether *candidate* is a name this module could have created for *name*.
+
+    The recognizer for the orphan sweep: ``atomic_write`` unlinks its temp file
+    on any exception, but a ``SIGKILL`` between the create and the rename leaves
+    it behind, and nothing else on disk records that it exists. Deliberately
+    narrow — prefix, random token, and suffix must all match, with nothing
+    before or after — because the only thing a caller does with a ``True`` here
+    is delete the file.
+    """
+    prefix = temp_name_prefix(name)
+    if not candidate.startswith(prefix) or not candidate.endswith(_TEMP_SUFFIX):
+        return False
+    token = candidate[len(prefix) : -len(_TEMP_SUFFIX)]
+    return _TEMP_TOKEN_PATTERN.fullmatch(token) is not None
+
+
 def _mkstemp_at(dir_fd: int, prefix: str) -> tuple[int, str]:
     """
     ``tempfile.mkstemp`` for a directory descriptor.
@@ -202,7 +250,7 @@ def _mkstemp_at(dir_fd: int, prefix: str) -> tuple[int, str]:
     """
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     for _ in range(tempfile.TMP_MAX):
-        name = f"{prefix}{secrets.token_hex(8)}.tmp"
+        name = f"{prefix}{secrets.token_hex(_TEMP_TOKEN_BYTES)}{_TEMP_SUFFIX}"
         try:
             return os.open(name, flags, 0o600, dir_fd=dir_fd), name
         except FileExistsError:
@@ -234,7 +282,7 @@ def atomic_write(
     semantics on Windows).
     """
     at_fd = dir_fd if dir_fd is not None and SUPPORTS_DIR_FD else None
-    prefix = f".{name}."
+    prefix = temp_name_prefix(name)
     target: str | Path
 
     if at_fd is not None:
@@ -243,7 +291,7 @@ def atomic_write(
     else:
         # mkstemp opens with O_CREAT|O_EXCL, so an existing temp path is never
         # reused.
-        fd, temp = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+        fd, temp = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=_TEMP_SUFFIX)
         target = directory / name
 
     try:

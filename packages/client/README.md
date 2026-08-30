@@ -357,6 +357,32 @@ never writes through a symlink; writes are atomic (temp file, `fsync`, rename) a
 `0644`; and if the manifest is unreadable it performs no destructive action at all. Removing
 a skill from a variation is how revocation works — the next reconcile prunes it.
 
+**One exception, and it is what makes a crashed reconcile recoverable.** A file at a managed
+path whose bytes are *already byte-identical* to the content LaunchDarkly resolved is
+adopted — recorded in the manifest and reported `skipped_current` — rather than refused.
+Without that, a process killed after a skill file lands but before the manifest is rewritten
+leaves that file managed-but-unrecorded, which is indistinguishable from a file you wrote
+yourself, so every later reconcile would refuse it and the skill would stay wedged until
+someone intervened. Adoption cannot weaken the guarantee above, because bytes that differ in
+any way are still refused and left untouched. Note that an adopted file becomes prunable
+like any other managed file — which is the same outcome the crash pre-empted.
+
+**A few keys are legal to an AI Config but not to a filesystem.** A key becomes a single
+directory name, so `write_skills` applies bounds of its own on top of the key grammar: no
+mainstream filesystem allows a 256-byte path component, and Windows reserves 22 MS-DOS
+device names (`con`, `prn`, `aux`, `nul`, `com1`–`com9`, `lpt1`–`lpt9`) that cannot be
+directory names there. Either one is a reported `error` action for that skill, and the
+rejection is unconditional rather than platform-gated — a managed root written from a Linux
+container is routinely read from a Windows host, so the on-disk result must not depend on
+which OS ran the write. The keys stay valid everywhere else: an AI Config referencing a skill
+named `aux` parses, and its other fields are unaffected. If you have a skill named for a
+device, rename it.
+
+**Total path length is yours to bound, not the SDK's.** The 255-byte bound above is per
+*component*; the root is your path, so `<root>` + `<key>` + `/SKILL.md` can still exceed
+Windows' 260-character `MAX_PATH` with a perfectly legal key. Choose a short managed root on
+Windows.
+
 | Export | Description |
 |---|---|
 | `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when absent. |
