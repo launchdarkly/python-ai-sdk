@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -70,13 +71,16 @@ class RecordedSpan:
         self.name = name
         self.context = context
         self.attributes: dict[str, Any] = {}
-        self.events: list[str] = []
+        # Keyed by event name, holding the event's attributes. A list of names was
+        # enough while nothing asserted on an event's payload; the context identity
+        # rides on the feature_flag event, so the payload has to survive.
+        self.events: dict[str, dict[str, Any]] = {}
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
     def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
-        self.events.append(name)
+        self.events[name] = dict(attributes or {})
 
     def set_status(self, code: Any, description: str | None = None) -> None:
         pass
@@ -240,6 +244,44 @@ class TestLaunchDarklyIdentity:
         assert [k for k in span.attributes if k.startswith("launchdarkly.")] == []
         assert "feature_flag" not in span.events
 
+    def test_the_root_carries_the_context_identity(self, handler_spans: Any) -> None:
+        # AC 2: the composite canonical key cannot express "filter to this one
+        # user" for a multi-kind context, so every handler must also write the
+        # per-kind attributes. Interpolated keys, so the vocabulary lock cannot
+        # see them — this is the only check that can.
+        _, module, tracer = handler_spans
+        module.start_root_span(
+            CONFIG,
+            {
+                **LD_VARIABLES,
+                "ldContext": {
+                    "kind": "multi",
+                    "user": {"kind": "user", "key": "u1"},
+                    "org": {"kind": "org", "key": "o1"},
+                },
+            },
+        )
+        span = tracer.spans[0]
+        assert span.attributes["context.contextKeys.user"] == "u1"
+        assert span.attributes["context.contextKeys.org"] == "o1"
+        event = span.events["feature_flag"]
+        assert event["feature_flag.context.id"] == "org:o1:user:u1"
+        assert json.loads(event["feature_flag.contextKeys"]) == {
+            "org": "o1",
+            "user": "u1",
+        }
+
+    def test_a_tool_span_carries_no_context_identity(self, handler_spans: Any) -> None:
+        # Same rule as the LaunchDarkly identity above: one span per run must
+        # answer a context-scoped query, or one run looks like several.
+        _, module, tracer = handler_spans
+        module.start_tool_span("get_weather", "call-1", None)
+        assert [
+            k
+            for k in tracer.spans[0].attributes
+            if k.startswith("context.contextKeys.")
+        ] == []
+
 
 # ─── Model identity ──────────────────────────────────────────────────────────
 
@@ -358,6 +400,16 @@ EXPECTED_VOCABULARY = {
     "feature_flag.key",
     "feature_flag.provider.name",
     "feature_flag.set.id",
+    # Context identity, AIC-3230. `feature_flag.context.id` is the canonical key, matching the Go
+    # SDK's ldotel hook. `feature_flag.contextKeys` is a JSON object of per-kind keys, matching the
+    # observability browser SDK and filling the ContextKeys column the ClickHouse MV already lifts.
+    "feature_flag.context.id",
+    "feature_flag.contextKeys",
+    # `context.contextKeys` is a prefix, not a key: the emitted keys are
+    # `context.contextKeys.<kind>`, built by f-string and invisible to the scan. They are span
+    # attributes rather than event attributes because that is what makes a single kind an exact
+    # match in trace search — the canonical key above is a composite for a multi-kind context.
+    "context.contextKeys",
     # Graph spans, unchanged from before the span work
     "ld.ai.graph",
     "ld.ai.graph.key",
@@ -397,8 +449,14 @@ _KEY_PATTERN = re.compile(
     r'|"(gen_ai\.[a-z_.0-9]+)"'
     r'|f"(gen_ai\.[a-z_.]+)\.\{'
     # The feature_flag event's own attributes are built as a plain dict before being handed to
-    # add_event, so they never appear inside a set_attribute call.
-    r'|"(feature_flag\.[a-z_.]+)"'
+    # add_event, so they never appear inside a set_attribute call. `contextKeys` is camelCase
+    # because that is the spelling the observability browser SDK already emits and the
+    # ClickHouse materialized view already lifts, so the character class allows uppercase.
+    r'|"(feature_flag\.[a-zA-Z_.]+)"'
+    # Per-kind context keys are `f"context.contextKeys.{kind}"`, so only the prefix has a literal
+    # to scan for, exactly like the gen_ai indexed carrier above.
+    # TestLaunchDarklyIdentity covers the interpolated keys at runtime.
+    r'|f"(context\.contextKeys)\.\{'
 )
 
 
@@ -413,6 +471,7 @@ def _emitted_vocabulary() -> set[str]:
                 "launchdarkly",
                 "feature_flag",
                 "ld",
+                "context",
             ):
                 found.add(key)
     return found
