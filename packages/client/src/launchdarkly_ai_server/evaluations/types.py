@@ -88,7 +88,11 @@ class EvaluationRunRef:
 
 @dataclass
 class RunSummary:
-    """State and row counts for an evaluation run."""
+    """Row counts for an evaluation run.
+
+    The summary endpoint does not return run state, so terminal completion
+    is derived from row accounting instead.
+    """
 
     total_rows: int = 0
     passed_rows: int = 0
