@@ -41,6 +41,7 @@ from .skills import (
     InMemorySkillStore,
     all_skills,
     get_skill,
+    get_skill_result,
     get_skills,
     skill_refs,
 )
@@ -85,6 +86,8 @@ from .types import (
     ReconcileActionKind,
     ReconcileReport,
     Skill,
+    SkillOutcome,
+    SkillOutcomeReason,
     SkillReference,
     StreamChunkEvent,
     StreamDoneEvent,
@@ -150,6 +153,7 @@ __all__ = [  # noqa: RUF022
     "ReconcileActionKind",
     "ReconcileReport",
     "Skill",
+    "SkillOutcome",
     "SkillReference",
     "StreamChunkEvent",
     "StreamDoneEvent",
@@ -227,14 +231,16 @@ __all__ = [  # noqa: RUF022
     # skills
     "skill_refs",
     "get_skill",
+    "get_skill_result",
     "get_skills",
     "all_skills",
     "write_skills",
     "SkillStore",
     "InMemorySkillStore",
-    # skills — the two closed-set unions a typed consumer needs to name
+    # skills — the three closed-set unions a typed consumer needs to name
     "ReconcileActionKind",
     "OnUnavailable",
+    "SkillOutcomeReason",
     # skills — on-disk constants, identical across languages
     "SKILL_FILENAME",
     "MANIFEST_FILENAME",

@@ -404,11 +404,17 @@ def _resolve_reference(
     """
     store = _available_store(deadline, f"'{key}'")
     if isinstance(store, _RetrievalBlocked):
-        return Resolution(error=store.reason, unavailable=True)
+        return Resolution(
+            reason="store_unavailable", error=store.reason, unavailable=True
+        )
 
     resolved = resolve_from_store(store, key, wanted_version)
     if resolved.unavailable and resolved.error is not None:
-        return Resolution(error=_unavailable(resolved.error), unavailable=True)
+        return Resolution(
+            reason="store_unavailable",
+            error=_unavailable(resolved.error),
+            unavailable=True,
+        )
     return resolved
 
 

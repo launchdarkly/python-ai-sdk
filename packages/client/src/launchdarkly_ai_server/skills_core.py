@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, get_args
 
-from .types import Skill, SkillReference
+from .types import Skill, SkillOutcomeReason, SkillReference
 from .types_validation import is_valid_skill_key, is_valid_skill_version
 
 logger = logging.getLogger(__name__)
@@ -672,6 +672,26 @@ def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
 class Resolution:
     """One key resolved against a store: the skill, or why there is none."""
 
+    reason: SkillOutcomeReason
+    """
+    Which of the five public outcomes this resolution is.
+
+    Declared first and **without a default**, so every construction site has to
+    state it. A default would be the wrong shape twice over: a contributor
+    adding a sixth internal outcome would inherit whichever token happened to be
+    the default rather than deciding which public token it maps to, and if that
+    default were ``"ok"`` a failure would publish ``ok`` with no skill attached.
+
+    Carried as a token rather than derived from ``error`` on the way out:
+    ``get_skill_result`` publishes this value, and pattern-matching prose to
+    recover a decision a caller fails closed on is exactly the fragility the
+    typed outcome exists to remove. A reviewer can read the mapping here.
+
+    Distinct from ``unavailable`` on purpose — that flag answers one question
+    (may prune run?) and this token answers a different one (what does the
+    caller learn?) — but the two can only disagree by a bug: ``unavailable`` is
+    ``True`` in exactly the ``store_unavailable`` case.
+    """
     skill: Skill | None = None
     error: str | None = None
     unavailable: bool = False
@@ -702,26 +722,33 @@ def resolve_from_store(
         raw = store.get_object(SKILL_OBJECT_KIND, key, wanted_version)
     except Exception as exc:
         logger.error("Skill store raised while retrieving '%s'", key, exc_info=True)
-        return Resolution(error=store_raised(exc), unavailable=True)
+        return Resolution(
+            reason="store_unavailable",
+            error=store_raised(exc),
+            unavailable=True,
+        )
 
     if not isinstance(raw, dict):
         return Resolution(
-            error=f"skill '{key}' is not available from the configured skill store"
+            reason="absent",
+            error=f"skill '{key}' is not available from the configured skill store",
         )
 
     skill = verify_raw_skill(raw)
     if skill is None:
         return Resolution(
-            error=f"skill '{key}' failed integrity verification and was withheld"
+            reason="integrity_failure",
+            error=f"skill '{key}' failed integrity verification and was withheld",
         )
     if wanted_version is not None and skill.version != wanted_version:
         return Resolution(
+            reason="wrong_version",
             error=(
                 f"skill '{key}' version {wanted_version} is not available "
                 f"(the store holds version {skill.version})"
-            )
+            ),
         )
-    return Resolution(skill=skill)
+    return Resolution(reason="ok", skill=skill)
 
 
 def reference_target(item: SkillReference | str) -> tuple[str, int | None]:
