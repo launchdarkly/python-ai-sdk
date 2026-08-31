@@ -426,7 +426,7 @@ async def test_summary_is_polled_until_terminal_state(
 
 
 @pytest.mark.asyncio
-async def test_summary_polling_completes_without_state_when_all_rows_are_accounted(
+async def test_summary_polling_completes_for_real_backend_summary_without_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -444,18 +444,25 @@ async def test_summary_polling_completes_without_state_when_all_rows_are_account
             response(201, {"id": "evaluation-id", "name": "eval-key"}),
             response(
                 201,
-                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+                {
+                    "id": "run-id",
+                    "evaluationId": "evaluation-id",
+                    "state": "COMPLETE",
+                    "rowCount": 10,
+                    "selectedRowCount": 10,
+                },
             ),
             response(
                 200,
                 {
                     "statusCounts": {
                         "total": 10,
-                        "passed": 7,
-                        "failed": 2,
-                        "error": 1,
+                        "passed": 10,
+                        "failed": 0,
+                        "error": 0,
                         "pending": 0,
-                    }
+                    },
+                    "estimatedRemainingWindowMs": 0,
                 },
             ),
         ]
@@ -480,12 +487,9 @@ async def test_summary_polling_completes_without_state_when_all_rows_are_account
     assert result.summary.state is None
     assert result.summary.total_rows == 10
     assert result.summary.pending_rows == 0
-    assert (
-        result.summary.passed_rows
-        + result.summary.failed_rows
-        + result.summary.error_rows
-        == 10
-    )
+    assert result.summary.passed_rows == 10
+    assert result.summary.failed_rows == 0
+    assert result.summary.error_rows == 0
 
 
 @pytest.mark.asyncio
