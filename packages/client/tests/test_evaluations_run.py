@@ -294,6 +294,9 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
 async def test_generation_events_always_emit_without_flag_or_run_status_poll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
     transport = SequencedTransport(
         [
             response(200, {"id": "dataset-id", "name": "golden"}),
@@ -316,12 +319,21 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
             response(
                 200,
                 {
-                    "state": "COMPLETE",
                     "total": 1,
                     "passed": 0,
                     "failed": 0,
                     "error": 0,
                     "pending": 1,
+                },
+            ),
+            response(
+                200,
+                {
+                    "total": 1,
+                    "passed": 0,
+                    "failed": 0,
+                    "error": 1,
+                    "pending": 0,
                 },
             ),
         ]
@@ -356,7 +368,8 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
     )
 
     assert result.passed is False
-    assert result.summary.pending_rows == 1
+    assert result.summary.error_rows == 1
+    assert result.summary.pending_rows == 0
     request_urls = [request["url"] for request in transport.requests]
     assert not any(url.endswith("/generation-results") for url in request_urls)
     client.variation.assert_not_awaited()

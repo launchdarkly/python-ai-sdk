@@ -26,10 +26,6 @@ class Usage:
         )
 
 
-def _optional_string(value: object) -> str | None:
-    return value if isinstance(value, str) else None
-
-
 class GenerationConfig(TypedDict, total=False):
     """Generation settings stored on the evaluation and passed to its handler."""
 
