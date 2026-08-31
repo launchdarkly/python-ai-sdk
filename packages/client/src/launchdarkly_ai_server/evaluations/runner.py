@@ -435,7 +435,9 @@ class EvaluationsRunner:
             if result["status"] == "ERROR":
                 if isinstance(error, Mapping):
                     message = error.get("message")
-                    generated["errorMessage"] = str(message) if message else "Unknown error"
+                    generated["errorMessage"] = (
+                        str(message) if message else "Unknown error"
+                    )
                 else:
                     generated["errorMessage"] = str(error) if error else "Unknown error"
             usage = result.get("usage")
