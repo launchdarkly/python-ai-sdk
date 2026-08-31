@@ -41,9 +41,15 @@ def _env(name: str) -> str | None:
 
 
 def _is_terminal_summary(summary: RunSummary) -> bool:
-    if summary.state is None:
-        return False
-    return summary.state.upper() in _TERMINAL_SUMMARY_STATES
+    if summary.state is not None:
+        return summary.state.upper() in _TERMINAL_SUMMARY_STATES
+
+    accounted_rows = summary.passed_rows + summary.failed_rows + summary.error_rows
+    return (
+        summary.total_rows > 0
+        and summary.pending_rows == 0
+        and accounted_rows == summary.total_rows
+    )
 
 
 class EvaluationsModule:

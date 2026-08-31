@@ -426,6 +426,69 @@ async def test_summary_is_polled_until_terminal_state(
 
 
 @pytest.mark.asyncio
+async def test_summary_polling_completes_without_state_when_all_rows_are_accounted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "statusCounts": {
+                        "total": 10,
+                        "passed": 7,
+                        "failed": 2,
+                        "error": 1,
+                        "pending": 0,
+                    }
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    summary_requests = [
+        request for request in transport.requests if request["url"].endswith("/summary")
+    ]
+    assert len(summary_requests) == 1
+    assert result.summary.state is None
+    assert result.summary.total_rows == 10
+    assert result.summary.pending_rows == 0
+    assert (
+        result.summary.passed_rows
+        + result.summary.failed_rows
+        + result.summary.error_rows
+        == 10
+    )
+
+
+@pytest.mark.asyncio
 async def test_summary_polling_ignores_missing_state_even_when_pending_is_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
