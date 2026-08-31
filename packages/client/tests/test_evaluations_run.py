@@ -368,7 +368,7 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
 
 
 @pytest.mark.asyncio
-async def test_summary_is_polled_until_terminal_state(
+async def test_summary_is_polled_until_rows_are_accounted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -422,7 +422,6 @@ async def test_summary_is_polled_until_terminal_state(
     ]
     assert len(summary_requests) == 2
     assert result.passed is True
-    assert result.summary.state == "COMPLETE"
 
 
 @pytest.mark.asyncio
@@ -484,7 +483,6 @@ async def test_summary_polling_completes_for_real_backend_summary_without_state(
         request for request in transport.requests if request["url"].endswith("/summary")
     ]
     assert len(summary_requests) == 1
-    assert result.summary.state is None
     assert result.summary.total_rows == 10
     assert result.summary.pending_rows == 0
     assert result.summary.passed_rows == 10
@@ -544,12 +542,11 @@ async def test_summary_polling_ignores_missing_state_even_when_pending_is_zero(
         request for request in transport.requests if request["url"].endswith("/summary")
     ]
     assert len(summary_requests) == 3
-    assert result.summary.state == "COMPLETE"
     assert result.passed is True
 
 
 @pytest.mark.asyncio
-async def test_summary_polling_times_out_waiting_for_terminal_state(
+async def test_summary_polling_times_out_waiting_for_rows_to_be_accounted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -585,7 +582,7 @@ async def test_summary_polling_times_out_waiting_for_terminal_state(
 
     with pytest.raises(
         EvaluationsError,
-        match=r"Timed out after 0 seconds.*terminal state.*pending_rows=1",
+        match=r"Timed out after 0 seconds.*rows to be fully accounted.*pending_rows=1",
     ):
         await evals.run(
             project_key="proj",

@@ -24,14 +24,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
 SUMMARY_POLL_INTERVAL_SECONDS = 2.0
 SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
-_TERMINAL_SUMMARY_STATES = {
-    "CANCELED",
-    "CANCELLED",
-    "COMPLETE",
-    "COMPLETED",
-    "ERROR",
-    "FAILED",
-}
 
 
 def _env(name: str) -> str | None:
@@ -41,9 +33,6 @@ def _env(name: str) -> str | None:
 
 
 def _is_terminal_summary(summary: RunSummary) -> bool:
-    if summary.state is not None:
-        return summary.state.upper() in _TERMINAL_SUMMARY_STATES
-
     accounted_rows = summary.passed_rows + summary.failed_rows + summary.error_rows
     return (
         summary.total_rows > 0
@@ -184,12 +173,18 @@ class EvaluationsModule:
                 return last_summary
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                state = last_summary.state or "unknown"
+                accounted_rows = (
+                    last_summary.passed_rows
+                    + last_summary.failed_rows
+                    + last_summary.error_rows
+                )
                 raise EvaluationsError(
                     "Timed out after "
                     f"{SUMMARY_POLL_TIMEOUT_SECONDS:g} seconds waiting for evaluation "
-                    f"run {run_id} summary to reach a terminal state "
-                    f"(last state={state}, pending_rows={last_summary.pending_rows})"
+                    f"run {run_id} summary rows to be fully accounted "
+                    f"(total_rows={last_summary.total_rows}, "
+                    f"accounted_rows={accounted_rows}, "
+                    f"pending_rows={last_summary.pending_rows})"
                 )
             await asyncio.sleep(min(SUMMARY_POLL_INTERVAL_SECONDS, remaining))
 
