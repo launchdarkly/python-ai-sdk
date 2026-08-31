@@ -700,6 +700,7 @@ async def test_complete_run_with_error_rows_does_not_pass(
     error_event = next(event for event in events if event["status"] == "ERROR")
     assert error_event["rowIndex"] == 0
     assert "provider failed" in error_event["error"]["message"]
+    assert "provider failed" in error_event["errorMessage"]
     assert "generationOutput" not in error_event
     assert "output" not in error_event
     assert "usage" not in error_event

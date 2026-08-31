@@ -426,11 +426,18 @@ class EvaluationsRunner:
             event_id = hashlib.sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
+            error = result.get("error")
             generated = {
                 "status": result["status"],
                 "output": result.get("output"),
-                "error": result.get("error"),
+                "error": error,
             }
+            if result["status"] == "ERROR":
+                if isinstance(error, Mapping):
+                    message = error.get("message")
+                    generated["errorMessage"] = str(message) if message else "Unknown error"
+                else:
+                    generated["errorMessage"] = str(error) if error else "Unknown error"
             usage = result.get("usage")
             if isinstance(usage, Mapping):
                 normalized_usage = parse_usage(dict(usage))
@@ -461,6 +468,8 @@ class EvaluationsRunner:
                 payload["output"] = generated["output"]
             if generated["error"] is not None:
                 payload["error"] = generated["error"]
+            if generated.get("errorMessage") is not None:
+                payload["errorMessage"] = generated["errorMessage"]
             if "usage" in generated:
                 payload["usage"] = generated["usage"]
             client.track(GENERATION_EVENT_NAME, context, payload, 1)
