@@ -20,10 +20,12 @@ from launchdarkly_ai_server import (
     ReconcileAction,
     ReconcileReport,
     Skill,
+    SkillOutcome,
     SkillReference,
     all_skills,
     get_client,
     get_skill,
+    get_skill_result,
     get_skills,
     init_client,
     shutdown,
@@ -142,6 +144,16 @@ class TestSkillTypes:
         skill = _skill()
         with pytest.raises(dataclasses.FrozenInstanceError):
             skill.content = b"tampered"  # type: ignore[misc]
+
+    def test_skill_outcome_is_immutable(self) -> None:
+        """A reported outcome is a value, like every other public skills type.
+
+        Matters more here than for the others: a caller that fails closed on
+        ``reason`` must not be handed something a later layer can rewrite.
+        """
+        outcome = SkillOutcome(skill=None, reason="integrity_failure", detail="nope")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            outcome.reason = "ok"  # type: ignore[misc]
 
     def test_skill_content_is_bytes(self) -> None:
         """Content is the verified verbatim bytes — opaque, never text."""
@@ -385,6 +397,13 @@ class TestPackageExports:
             "error",
         }
         assert set(typing.get_args(package.OnUnavailable)) == {"keep", "raise"}
+        assert set(typing.get_args(package.SkillOutcomeReason)) == {
+            "absent",
+            "integrity_failure",
+            "ok",
+            "store_unavailable",
+            "wrong_version",
+        }
 
     def test_retrieval_surface_is_exported_from_the_package_root(self) -> None:
         """A name absent from ``__all__`` is not part of the public surface."""
@@ -393,11 +412,14 @@ class TestPackageExports:
         expected = {
             "skill_refs",
             "get_skill",
+            "get_skill_result",
             "get_skills",
             "all_skills",
             "SkillStore",
             "InMemorySkillStore",
             "Skill",
+            "SkillOutcome",
+            "SkillOutcomeReason",
             "SkillReference",
         }
         assert expected <= set(package.__all__)
@@ -741,6 +763,265 @@ class TestGetSkill:
         skill = await get_skill("a")
         assert skill is not None
         assert skill.content == content.encode("utf-8")
+
+
+class _RaisingStore:
+    """A store whose reads raise — the "the transport is down" case.
+
+    Declared with the full ``get_object`` signature on purpose. A double missing
+    the ``version`` parameter would also produce a raise here, but a
+    ``TypeError`` from the call itself rather than from the store, and the test
+    would then pass without the store ever having been consulted.
+    """
+
+    def get_object(
+        self, kind: str, key: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        raise RuntimeError("transport failure")
+
+    def all_objects(self, kind: str) -> dict[str, dict[str, Any]]:
+        raise RuntimeError("transport failure")
+
+
+class _WrongVersionAnsweringStore:
+    """A store that answers a pinned lookup with some other version."""
+
+    def __init__(self, make_raw_skill: Any, answered_version: int = 99) -> None:
+        self._make = make_raw_skill
+        self._answered_version = answered_version
+
+    def get_object(
+        self, kind: str, key: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        answer: dict[str, Any] = self._make(key=key, version=self._answered_version)
+        return answer
+
+    def all_objects(self, kind: str) -> dict[str, dict[str, Any]]:
+        return {}
+
+
+class TestGetSkillResult:
+    """
+    The reported accessor — one token per outcome a retrieval can have.
+
+    ``get_skill`` collapses four distinct failures to ``None``, which leaves a
+    caller unable to fail closed on suspected tampering while tolerating a skill
+    that is merely not configured. These tests pin that the five outcomes are
+    told apart, and that reporting them changed nothing about ``get_skill``.
+    """
+
+    def _tampered(self, make_raw_skill: Any, key: str = "a") -> dict[str, Any]:
+        raw: dict[str, Any] = make_raw_skill(key=key)
+        raw["contentHash"] = "0" * 64
+        return raw
+
+    async def test_ok_carries_the_skill_and_no_detail(
+        self, store: InMemorySkillStore, make_raw_skill: Any
+    ) -> None:
+        store.put(make_raw_skill(key="pdf-extraction", version=2))
+
+        outcome = await get_skill_result("pdf-extraction")
+
+        assert outcome.reason == "ok"
+        assert outcome.detail is None
+        assert outcome.skill is not None
+        assert outcome.skill.key == "pdf-extraction"
+        assert outcome.skill.version == 2
+        assert outcome.skill.content == SKILL_BODY.encode("utf-8")
+
+    async def test_absent_when_the_store_does_not_hold_the_key(
+        self, store: InMemorySkillStore
+    ) -> None:
+        outcome = await get_skill_result("nope")
+
+        assert outcome.reason == "absent"
+        assert outcome.skill is None
+        assert outcome.detail
+        assert "'nope'" in outcome.detail
+
+    async def test_integrity_failure_when_content_does_not_verify(
+        self, store: InMemorySkillStore, make_raw_skill: Any
+    ) -> None:
+        """The one outcome a caller is expected to fail closed on."""
+        store.put(self._tampered(make_raw_skill, key="a"))
+
+        outcome = await get_skill_result("a")
+
+        assert outcome.reason == "integrity_failure"
+        assert outcome.skill is None
+        assert outcome.detail
+        # The quoted form, so the assertion is about the key and not about a
+        # letter that appears in half the words in the message.
+        assert "'a'" in outcome.detail
+
+    async def test_wrong_version_when_the_store_answers_with_another(
+        self, make_raw_skill: Any
+    ) -> None:
+        skills_module._set_store(_WrongVersionAnsweringStore(make_raw_skill))
+
+        outcome = await get_skill_result("a", version=1)
+
+        assert outcome.reason == "wrong_version"
+        assert outcome.skill is None
+        assert outcome.detail
+        # The detail is what makes this actionable rather than merely negative:
+        # it names both the version asked for and the version held.
+        assert "version 1" in outcome.detail
+        assert "version 99" in outcome.detail
+
+    async def test_store_unavailable_when_the_store_raises(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        skills_module._set_store(_RaisingStore())
+
+        with caplog.at_level("ERROR", logger="launchdarkly_ai_server.skills_core"):
+            outcome = await get_skill_result("a")
+
+        assert outcome.reason == "store_unavailable"
+        assert outcome.skill is None
+        assert outcome.detail
+        assert "RuntimeError" in outcome.detail
+
+    async def test_store_unavailable_is_distinct_from_absent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An outage is not a deletion, and the two must not read alike.
+
+        This is the distinction ``write_skills`` already depends on to decide
+        whether pruning may run — only a raising store suppresses it — so
+        collapsing the two tokens here would put the public vocabulary at odds
+        with a policy the SDK already enforces internally.
+        """
+        skills_module._set_store(_RaisingStore())
+        with caplog.at_level("ERROR", logger="launchdarkly_ai_server.skills_core"):
+            raised = await get_skill_result("a")
+
+        skills_module._set_store(InMemorySkillStore())
+        empty = await get_skill_result("a")
+
+        # Asserted as two named tokens rather than as an inequality: the type
+        # checker can already see that these two literals differ, so an
+        # inequality here would be dead weight.
+        assert raised.reason == "store_unavailable"
+        assert empty.reason == "absent"
+
+    async def test_every_non_ok_outcome_carries_a_detail(
+        self, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A reason with no detail leaves an operator nothing to act on.
+
+        Swept over all four failures in one test rather than asserted per case
+        only, so a fifth failure path added later without a message is caught by
+        a test whose name says what it is about.
+        """
+        stores: list[tuple[str, Any]] = [
+            ("absent", InMemorySkillStore()),
+            (
+                "integrity_failure",
+                InMemorySkillStore({"a": self._tampered(make_raw_skill)}),
+            ),
+            ("wrong_version", _WrongVersionAnsweringStore(make_raw_skill)),
+            ("store_unavailable", _RaisingStore()),
+        ]
+
+        outcomes: list[SkillOutcome] = []
+        with caplog.at_level("ERROR", logger="launchdarkly_ai_server.skills_core"):
+            for _expected, store_double in stores:
+                skills_module._set_store(store_double)
+                outcomes.append(await get_skill_result("a", version=1))
+
+        assert [o.reason for o in outcomes] == [expected for expected, _ in stores]
+        assert all(o.skill is None for o in outcomes)
+        assert all(o.detail for o in outcomes)
+
+    async def test_detail_never_carries_the_skill_content(
+        self, store: InMemorySkillStore, make_raw_skill: Any
+    ) -> None:
+        """``detail`` is safe to log, so the body must not travel in it.
+
+        Same rule the integrity log record follows, asserted separately here
+        because this string reaches the caller through a different surface.
+        """
+        secret = "---\nname: Secret\n---\nSSN 000-00-0000 and an API key.\n"
+        store.put(make_raw_skill(key="a", content=secret, contentHash="0" * 64))
+
+        outcome = await get_skill_result("a")
+
+        assert outcome.reason == "integrity_failure"
+        assert outcome.detail is not None
+        assert secret not in outcome.detail
+        assert "SSN" not in outcome.detail
+        assert "API key" not in outcome.detail
+
+    async def test_raises_the_same_way_as_get_skill_with_no_store(self) -> None:
+        """Identical failure mode, down to the message.
+
+        The two accessors differ only in what they report about a retrieval; a
+        missing store is a configuration error in both, so a caller cannot need
+        to handle it twice.
+        """
+        with pytest.raises(RuntimeError, match="skill store") as reported:
+            await get_skill_result("a")
+        with pytest.raises(RuntimeError, match="skill store") as collapsed:
+            await get_skill("a")
+
+        assert str(reported.value) == str(collapsed.value)
+
+    async def test_records_no_second_integrity_signal(
+        self,
+        store: InMemorySkillStore,
+        make_raw_skill: Any,
+        recording_emitter: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One failed retrieval is one failure, on both surfaces.
+
+        Verification already recorded the log record and the signal before
+        ``resolve_from_store`` returned, so reporting the reason must add
+        nothing: a second record would double-count one event in a SIEM and
+        inflate the product counter. ``_integrity_records`` is the shared parser
+        used by the log-record tests further down this module.
+        """
+        skills_module._set_emitter_for_testing(recording_emitter)
+        store.put(self._tampered(make_raw_skill, key="a"))
+
+        with caplog.at_level("ERROR", logger="launchdarkly_ai_server.skills_core"):
+            outcome = await get_skill_result("a")
+
+        assert outcome.reason == "integrity_failure"
+        assert len(_integrity_records(caplog)) == 1
+        assert len(recording_emitter.signals(INTEGRITY_SIGNAL)) == 1
+
+    async def test_get_skill_still_returns_none_for_every_failure(
+        self, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The no-behaviour-change guarantee.
+
+        ``get_skill``'s contract — ``None`` for every failure, and it never
+        raises for one — is documented in its docstring and in the README, and
+        every existing caller treats ``None`` as "no skill". Adding a reported
+        accessor beside it must not move that line, so the four failures are
+        driven through both accessors in one test: the reason is distinguishable
+        *and* the collapsed form still collapses.
+        """
+        cases: list[tuple[str, Any]] = [
+            ("absent", InMemorySkillStore()),
+            (
+                "integrity_failure",
+                InMemorySkillStore({"a": self._tampered(make_raw_skill)}),
+            ),
+            ("wrong_version", _WrongVersionAnsweringStore(make_raw_skill)),
+            ("store_unavailable", _RaisingStore()),
+        ]
+
+        with caplog.at_level("ERROR", logger="launchdarkly_ai_server.skills_core"):
+            for expected_reason, store_double in cases:
+                skills_module._set_store(store_double)
+                reported = await get_skill_result("a", version=1)
+                assert reported.reason == expected_reason
+                # No pytest.raises wrapper: an escaping exception fails the test
+                # here, which is the "never raises" half of the contract.
+                assert await get_skill("a", version=1) is None
 
 
 class TestGetSkills:

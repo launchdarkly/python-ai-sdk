@@ -337,6 +337,55 @@ truncated payload; a mismatch means content was delivered whose bytes are not th
 LaunchDarkly hashed, which is a possible **active-tampering** signal. Alert on it, and
 treat `expected_hash` / `observed_hash` as the evidence pair.
 
+#### Failing closed on tampering
+
+The log record above is the operator's surface. `get_skill_result` is the application's:
+same retrieval, same verification, same telemetry as `get_skill`, and it reports which of
+five outcomes happened instead of collapsing all of them to `None`.
+
+```python
+from launchdarkly_ai_server import get_skill_result
+
+outcome = await get_skill_result("pdf-extraction")
+
+if outcome.reason == "integrity_failure":
+    # Content was delivered and did not verify. Do not degrade quietly.
+    raise SystemExit(f"refusing to start: {outcome.detail}")
+
+if outcome.reason == "store_unavailable":
+    # The store could not answer at all. Retry, alert, or carry on with what
+    # you already have — but this is an outage, not a revocation.
+    print(f"skill retrieval unavailable: {outcome.detail}")
+elif outcome.reason in ("absent", "wrong_version"):
+    # Nothing was tampered with — this skill is simply not available to you.
+    print(f"continuing without a skill: {outcome.detail}")
+elif outcome.skill is not None:
+    print(outcome.skill.content)
+```
+
+| `reason` | Meaning |
+|---|---|
+| `ok` | A verified skill was returned; `.skill` is set and `.detail` is `None`. |
+| `absent` | The store answered, and does not hold that key. |
+| `integrity_failure` | Content was delivered and failed verification, so it was withheld. **The one to fail closed on.** |
+| `store_unavailable` | The store itself could not answer — it raised. An outage, not a deletion. |
+| `wrong_version` | The store answered with a version other than the one asked for, so the answer was withheld. |
+
+`.detail` is human-readable and safe to log or show an operator — it names the key and the
+failure mode, and never carries skill content or a filesystem path. Branch on `.reason`,
+not on `.detail`. `.skill` is populated only when `.reason == "ok"`. `SkillOutcome` is
+frozen, like every other value type here.
+
+**`get_skill` is unchanged.** It still returns `None` for all four failures and still never
+raises for one, so no existing caller has to move. The two accessors run the same code path
+and differ only in what they report — `get_skill_result` adds no second log record and no
+second signal for a failure that already emitted one, so a caller can switch to it without
+double-counting anything.
+
+`get_skills` and `all_skills` have no reported form: they still omit entries that could not
+be resolved, and a run that omitted anything logs a count at WARN. Retrieve individually
+with `get_skill_result` when you need the reason per key.
+
 **Versions are selected, not filtered.** A store may hold several versions of one key at
 once, because a delivery payload does: the newest version of every skill, plus every
 version a variation currently pins. `get_skill("k", version=1)` asks the store for version
@@ -387,6 +436,7 @@ Windows.
 |---|---|
 | `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when absent. |
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
+| `get_skill_result(key, *, version=None)` | The same retrieval, reporting **why**: a frozen `SkillOutcome` with `.skill`, `.reason` (`ok` / `absent` / `integrity_failure` / `store_unavailable` / `wrong_version`), and `.detail`. Use it to fail closed on tampering — see *Failing closed on tampering* above. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative `timeout`, or an unrecognised `on_unavailable`. **Performs synchronous filesystem I/O — see the note below.** |
@@ -406,9 +456,10 @@ manifest, for instance — carries the empty string as its `key`.
 
 The fixed on-disk values are exported too, so you do not have to hardcode them:
 `MANIFEST_FILENAME` (`.launchdarkly-skills.json`, handy for a `.gitignore`),
-`SKILL_FILENAME`, and `MANIFEST_VERSION`. So are the two closed-set types, for annotating
+`SKILL_FILENAME`, and `MANIFEST_VERSION`. So are the three closed-set types, for annotating
 your own helpers: `ReconcileActionKind` (`written` / `updated` / `skipped_current` /
-`removed` / `error`) and `OnUnavailable` (`keep` / `raise`).
+`removed` / `error`), `OnUnavailable` (`keep` / `raise`), and `SkillOutcomeReason`
+(`absent` / `integrity_failure` / `ok` / `store_unavailable` / `wrong_version`).
 
 **`write_skills` blocks.** It is `async` for parity with the other accessors and with the
 TypeScript SDK, but it awaits nothing: every read, write, `fsync` and rename runs inline,
@@ -460,5 +511,6 @@ All types are exported from this package. Handler packages import them from here
 | `GraphTopology` | The parsed graph flag shape (`root` + `edges`) |
 | `Skill` | A frozen skill document: `.key`, `.version`, `.content` (verified verbatim `bytes`), `.content_hash`, `.name?`, `.description?` |
 | `SkillReference` | A frozen version-pinned pointer to a skill: `.key`, `.version` |
+| `SkillOutcome` | A frozen retrieval outcome: `.skill`, `.reason` (`SkillOutcomeReason`), `.detail` |
 | `ReconcileAction` | One `write_skills` outcome: `.key`, `.action`, `.version?`, `.path?`, `.error?` |
 | `ReconcileReport` | The `write_skills` result: `.actions`, `.ok`, and `.errors` |

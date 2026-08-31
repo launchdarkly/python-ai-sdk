@@ -37,7 +37,7 @@ from .skills_core import (
     resolve_from_store,
     verify_raw_skill,
 )
-from .types import AiConfigRep, Skill, SkillReference
+from .types import AiConfigRep, Skill, SkillOutcome, SkillReference
 from .types_validation import (
     is_valid_skill_key,
     is_valid_skill_version,
@@ -245,6 +245,40 @@ async def get_skill(key: str, *, version: int | None = None) -> Skill | None:
     explicitly with ``get_skills(skill_refs(config))``.
     """
     return resolve_from_store(require_store(), key, version).skill
+
+
+async def get_skill_result(key: str, *, version: int | None = None) -> SkillOutcome:
+    """
+    Retrieves one verified skill, reporting *why* when there is none.
+
+    Same retrieval, same verification, same telemetry as ``get_skill`` — the two
+    differ only in what they report. ``get_skill`` collapses "no such skill",
+    "the store raised", "that is not the version held", and "the content failed
+    integrity verification" to one ``None``; this returns a ``SkillOutcome``
+    whose ``reason`` names which of them happened, so a caller can fail closed on
+    suspected tampering while tolerating a merely-absent skill:
+
+    ```python
+    outcome = await get_skill_result("pdf-extraction")
+    if outcome.reason == "integrity_failure":
+        raise SystemExit(f"refusing to run: {outcome.detail}")
+    if outcome.skill is not None:
+        print(outcome.skill.content)
+    ```
+
+    ``detail`` is human-readable and safe to surface — it names the key and the
+    failure mode, never any skill content or filesystem path. Branch on
+    ``reason``, not on ``detail``.
+
+    Emits nothing of its own: an integrity failure has already recorded its log
+    record and its signal inside verification, and recording a second here would
+    double-count one failure. Raises ``RuntimeError`` only when no skill store is
+    configured, exactly as ``get_skill`` does.
+    """
+    resolved = resolve_from_store(require_store(), key, version)
+    return SkillOutcome(
+        skill=resolved.skill, reason=resolved.reason, detail=resolved.error
+    )
 
 
 async def get_skills(refs: Sequence[SkillReference | str]) -> list[Skill]:

@@ -77,10 +77,10 @@ from launchdarkly_ai_server import config, graph, resolve_graph
 
 # Agent Skills
 from launchdarkly_ai_server import (
-    skill_refs, get_skill, get_skills, all_skills, write_skills,
-    SkillStore, InMemorySkillStore,
+    skill_refs, get_skill, get_skill_result, get_skills, all_skills, write_skills,
+    SkillStore, InMemorySkillStore, SkillOutcome,
     SKILL_FILENAME, MANIFEST_FILENAME, MANIFEST_VERSION,
-    ReconcileActionKind, OnUnavailable,   # the two closed-set unions
+    ReconcileActionKind, OnUnavailable, SkillOutcomeReason,  # the three closed-set unions
 )
 ```
 
@@ -188,8 +188,8 @@ Three layers, in increasing order of blast radius:
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
    Validation of the array itself lives in `parse_ai_config` and is **fail closed** — one
    malformed reference fails the whole config parse.
-2. **Content accessors** — `get_skill`, `get_skills`, `all_skills` read through the
-   `SkillStore` seam. Configure a store with
+2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
+   through the `SkillStore` seam. Configure a store with
    `init_client(options={"skillStore": store})`; with none configured the accessors raise
    an actionable `RuntimeError`. A delivery transport can be added behind the seam
    without touching the public API.
@@ -216,6 +216,55 @@ object's own `key` and `version`, which are revalidated anyway. `newest_by_key` 
 one place that collapses the result to one object per key, because both whole-store
 consumers need it — `all_skills`, since a list holding two versions of one key is not a set
 of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single path.
+
+### The reported outcome vocabulary, and the `Resolution` mapping
+
+`get_skill` returns `Skill | None`; `get_skill_result` returns a frozen `SkillOutcome`
+(`skill`, `reason`, `detail`) naming *which* outcome happened. Both are
+`resolve_from_store` — one retrieval, one verification, one telemetry pass — and they differ
+only in what they report. `get_skill`'s contract is load-bearing and **frozen**: `None` for
+every failure, never raises for one, documented in its docstring and in the README. Change
+it and every caller that treats `None` as "no skill" breaks silently.
+
+`SkillOutcomeReason` is five tokens, listed alphabetically for the same reason
+`IntegrityReasonCode` is — so the vocabulary reads identically in the Python and TypeScript
+SDKs, where the type name, the accessor name, and the tokens are all deliberately the same.
+Do not rename one on one side.
+
+Internal `Resolution.reason` maps 1:1 onto it, set explicitly at every construction site:
+
+| `resolve_from_store` outcome | `reason` |
+|---|---|
+| the store raised (`unavailable=True`) | `store_unavailable` |
+| `raw` is not a dict | `absent` |
+| `verify_raw_skill` returned `None` | `integrity_failure` |
+| `skill.version != wanted_version` | `wrong_version` |
+| success | `ok` |
+
+**Adding a sixth internal outcome means choosing which public token it maps to.**
+`Resolution.reason` has no default, so the compiler asks the question; answer it rather than
+defaulting to `absent`, which claims the store does not hold the skill. If the new outcome
+is genuinely neither of the five, the token set grows — on both sides, in the same commit.
+
+Two things the reason is deliberately *not*:
+
+- **Not derived from `Resolution.error`.** That string is prose for a human; recovering a
+  decision a caller fails closed on by matching it is the fragility the typed token exists
+  to remove. `detail` *is* that string, passed straight through — safe to surface (key and
+  failure mode only, never content, never a path), and not for matching on.
+- **Not `Resolution.unavailable`.** The flag answers "may prune run?" and the token answers
+  "what does the caller learn?". They agree by construction — `unavailable` is `True` in
+  exactly the `store_unavailable` case — and both exist because `store_unavailable` must
+  stay distinct from `absent`: only a raising store suppresses pruning, since deleting
+  managed files after a failed lookup turns an outage into data loss.
+
+`get_skill_result` emits nothing of its own. The integrity log record and signal already
+fired inside verification before `resolve_from_store` returned; recording anything here
+would double-count one failure in a SIEM and in the product counter.
+
+There is no `get_skills_result` or `all_skills_result`. The batch accessors keep omitting
+unresolved entries and keep logging the run-level WARN count, and a second accessor per
+batch form would double the surface for a case nobody has asked for.
 
 ### Security posture — do not relax any of this
 
