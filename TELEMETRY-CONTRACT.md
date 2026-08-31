@@ -97,6 +97,7 @@ able to tell from the trace which path ran.
 | `launchdarkly.stream.abandoned` | `True`, only when abandoned | `end_span_once` |
 | `gen_ai.evaluation.name` | judge config key, judge roots only | `with_judge_evaluation`, see section 4a |
 | `gen_ai.evaluation.score.value` | numeric score, judge roots only | `with_judge_evaluation`, see section 4a |
+| `context.contextKeys.<kind>` | the context's key for that kind, one row per kind | `set_ld_span_attributes` |
 
 The root also carries one span event, `feature_flag`, with these event attributes:
 
@@ -105,6 +106,23 @@ The root also carries one span event, `feature_flag`, with these event attribute
 | `feature_flag.key` | config key |
 | `feature_flag.provider.name` | `LaunchDarkly` |
 | `feature_flag.set.id` | environment id, only when present |
+| `feature_flag.context.id` | canonical key of the evaluation context, only when present |
+| `feature_flag.contextKeys` | JSON object of the context's per-kind keys, only when present |
+
+The context identity appears in two shapes on purpose, and neither is new to LaunchDarkly.
+`feature_flag.context.id` is the canonical key, matching what the Go server SDK's `ldotel` hook
+emits, and it is a composite of every kind for a multi-kind context. That makes it useless for
+"filter this config's traces to one user", which is the question AI Config Monitoring's group-by
+asks. So the per-kind keys are also written as `context.contextKeys.<kind>` span attributes — the
+spelling the observability browser SDK and the product-analytics pipeline already use — where each
+kind is an exact match on its own. `feature_flag.contextKeys` carries the same map as JSON on the
+event, matching the browser SDK and filling the column observability's materialized view already
+lifts from that attribute.
+
+Only context *keys* are emitted. Context attribute values are not, and there is no option to turn
+them on: keys are identifiers already exposed by LaunchDarkly's other OTel integrations, whereas
+attribute values are where the personal data lives. See section 7 for the same reasoning applied to
+content.
 
 The root is the only span that carries the config-association attributes and the `feature_flag`
 event. Child spans carry neither. A test asserts this, so do not add them to children out of
