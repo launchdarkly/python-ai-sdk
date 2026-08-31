@@ -42,7 +42,7 @@ def _env(name: str) -> str | None:
 
 def _is_terminal_summary(summary: RunSummary) -> bool:
     if summary.state is None:
-        return summary.pending_rows == 0
+        return False
     return summary.state.upper() in _TERMINAL_SUMMARY_STATES
 
 

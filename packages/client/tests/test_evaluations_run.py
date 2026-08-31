@@ -426,6 +426,62 @@ async def test_summary_is_polled_until_terminal_state(
 
 
 @pytest.mark.asyncio
+async def test_summary_polling_ignores_missing_state_even_when_pending_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(200, {}),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 0, "error": 0, "pending": 0}},
+            ),
+            response(
+                200,
+                {
+                    "state": "COMPLETE",
+                    "statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0},
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    summary_requests = [
+        request for request in transport.requests if request["url"].endswith("/summary")
+    ]
+    assert len(summary_requests) == 3
+    assert result.summary.state == "COMPLETE"
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
 async def test_summary_polling_times_out_waiting_for_terminal_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
