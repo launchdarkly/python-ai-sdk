@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .ld_context import context_identity
 from .types import (
     AiConfigRep,
     GraphNode,
@@ -573,11 +574,18 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     * ``launchdarkly.variation.key``  = variationKey
     * ``launchdarkly.run.id``         = runId
     * ``launchdarkly.graph.key``      = graphKey  (only when present)
+    * ``context.contextKeys.<kind>``  = one attribute per context kind, only when
+      ``variables['ldContext']`` yields a usable identity (AIC-3230). Per-kind
+      span attributes are what make a single kind filterable; the composite
+      canonical key on the ``feature_flag`` event cannot be.
 
     Span event (required for AI Config Monitoring Traces tab correlation):
     ``name='feature_flag'`` with ``feature_flag.key``,
-    ``feature_flag.provider.name``, and ``feature_flag.set.id`` (when
-    ``LD_ENVIRONMENT_ID`` is set or the TS SDK auto-resolved it).
+    ``feature_flag.provider.name``, ``feature_flag.set.id`` (when
+    ``LD_ENVIRONMENT_ID`` is set or the TS SDK auto-resolved it),
+    ``feature_flag.context.id`` (canonical key of the evaluation context, only
+    when present) and ``feature_flag.contextKeys`` (JSON object of the
+    context's per-kind keys, only when present).
     """
     span.set_attribute("launchdarkly.operation.type", "gen_ai")
     if not variables:
@@ -597,6 +605,30 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     }
     if ld.get("environmentId"):
         feature_flag_attrs["feature_flag.set.id"] = ld["environmentId"]
+
+    # `execute_and_track` / `execute_and_stream` merge `ldContext` into
+    # variables after the caller's own variables, so it is always the
+    # evaluation context and cannot be clobbered by a same-named variable.
+    identity = context_identity(variables.get("ldContext"))
+    if identity is not None:
+        canonical_key, context_keys = identity
+        # Matches the Go SDK's ldotel hook (`feature_flag.context.id`) and the
+        # observability browser SDK (both, plus the per-kind span attributes).
+        feature_flag_attrs["feature_flag.context.id"] = canonical_key
+        # Compact separators on purpose. `json.dumps` defaults to `", "` and
+        # `": "`, which would make this string differ from what `JSON.stringify`
+        # produces in js-ai-sdk and in the observability browser SDK — and this
+        # value lands verbatim in the ClickHouse `ContextKeys` column, where a
+        # consumer may match on it as text.
+        feature_flag_attrs["feature_flag.contextKeys"] = json.dumps(
+            context_keys, separators=(",", ":")
+        )
+        # The canonical key is a composite for a multi-kind context, so it
+        # cannot answer "filter to this one user". These per-kind attributes
+        # can, and they use the spelling AI Config Monitoring already speaks.
+        for kind, key in context_keys.items():
+            span.set_attribute(f"context.contextKeys.{kind}", key)
+
     span.add_event("feature_flag", feature_flag_attrs)
 
 
