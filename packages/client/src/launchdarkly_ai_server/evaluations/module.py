@@ -79,14 +79,22 @@ class EvaluationsModule:
         generation: GenerationConfig,
         tools: Mapping[str, ToolImplementation] | None = None,
         concurrency: int = 10,
+        poll_interval_seconds: float | None = None,
+        poll_timeout_seconds: float | None = None,
     ) -> EvalRunResult:
         """
         Create and run a generation-only evaluation in the caller's process.
 
         The returned pass/fail result is derived from LaunchDarkly's run summary.
         A CI script can exit with ``0 if result.passed else 1`` after awaiting
-        this method.
+        this method. Large datasets may need a longer ``poll_timeout_seconds``
+        and a wider ``poll_interval_seconds``; both default to
+        ``SUMMARY_POLL_TIMEOUT_SECONDS`` / ``SUMMARY_POLL_INTERVAL_SECONDS``.
         """
+        if poll_interval_seconds is None:
+            poll_interval_seconds = SUMMARY_POLL_INTERVAL_SECONDS
+        if poll_timeout_seconds is None:
+            poll_timeout_seconds = SUMMARY_POLL_TIMEOUT_SECONDS
         self._validate_run_args(
             project_key=project_key,
             key=key,
@@ -94,6 +102,8 @@ class EvaluationsModule:
             handler=handler,
             generation=generation,
             concurrency=concurrency,
+            poll_interval_seconds=poll_interval_seconds,
+            poll_timeout_seconds=poll_timeout_seconds,
         )
         run_tools = dict(tools or {})
         client = None
@@ -147,7 +157,11 @@ class EvaluationsModule:
             if inspect.isawaitable(flush_result):
                 await flush_result
         summary = await self._poll_summary_until_terminal(
-            project_key, evaluation.id, evaluation_run.id
+            project_key,
+            evaluation.id,
+            evaluation_run.id,
+            poll_interval_seconds,
+            poll_timeout_seconds,
         )
         url = (
             f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
@@ -161,9 +175,14 @@ class EvaluationsModule:
         )
 
     async def _poll_summary_until_terminal(
-        self, project_key: str, evaluation_id: str, run_id: str
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+        poll_interval_seconds: float,
+        poll_timeout_seconds: float,
     ) -> RunSummary:
-        deadline = time.monotonic() + SUMMARY_POLL_TIMEOUT_SECONDS
+        deadline = time.monotonic() + poll_timeout_seconds
         last_summary = None
         while True:
             last_summary = await asyncio.to_thread(
@@ -180,13 +199,13 @@ class EvaluationsModule:
                 )
                 raise EvaluationsError(
                     "Timed out after "
-                    f"{SUMMARY_POLL_TIMEOUT_SECONDS:g} seconds waiting for evaluation "
+                    f"{poll_timeout_seconds:g} seconds waiting for evaluation "
                     f"run {run_id} summary rows to be fully accounted "
                     f"(total_rows={last_summary.total_rows}, "
                     f"accounted_rows={accounted_rows}, "
                     f"pending_rows={last_summary.pending_rows})"
                 )
-            await asyncio.sleep(min(SUMMARY_POLL_INTERVAL_SECONDS, remaining))
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
 
     async def _resolve_client(self) -> Any:
         """
@@ -215,6 +234,8 @@ class EvaluationsModule:
         handler: EvalHandler,
         generation: GenerationConfig,
         concurrency: int,
+        poll_interval_seconds: float,
+        poll_timeout_seconds: float,
     ) -> None:
         for name, value in (
             ("project_key", project_key),
@@ -237,6 +258,10 @@ class EvaluationsModule:
             )
         if concurrency < 1:
             raise EvaluationsError("concurrency must be at least 1")
+        if poll_interval_seconds < 0:
+            raise EvaluationsError("poll_interval_seconds must not be negative")
+        if poll_timeout_seconds < 0:
+            raise EvaluationsError("poll_timeout_seconds must not be negative")
 
 
 def init_evaluations(

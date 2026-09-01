@@ -612,6 +612,64 @@ async def test_summary_polling_times_out_waiting_for_rows_to_be_accounted(
 
 
 @pytest.mark.asyncio
+async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 0, "error": 0, "pending": 1}},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        poll_interval_seconds=0,
+        poll_timeout_seconds=600,
+    )
+
+    assert result.passed is True
+    summary_requests = [
+        request for request in transport.requests if request["url"].endswith("/summary")
+    ]
+    assert len(summary_requests) == 2
+
+    with pytest.raises(EvaluationsError, match="poll_timeout_seconds"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            poll_timeout_seconds=-1,
+        )
+
+
+@pytest.mark.asyncio
 async def test_generation_failed_rows_do_not_fail_the_result() -> None:
     transport = SequencedTransport(
         [
