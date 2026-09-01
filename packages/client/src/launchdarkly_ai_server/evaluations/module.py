@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -32,6 +33,20 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
+def _initialized_client() -> Any | None:
+    """Return the SDK singleton when one is initialized, otherwise ``None``."""
+    try:
+        return get_client()
+    except RuntimeError:
+        return None
+
+
+def _can_emit_events(client: Any) -> bool:
+    return callable(getattr(client, "track", None)) and callable(
+        getattr(client, "flush", None)
+    )
+
+
 def _is_terminal_summary(summary: RunSummary) -> bool:
     accounted_rows = summary.passed_rows + summary.failed_rows + summary.error_rows
     return (
@@ -47,7 +62,7 @@ class EvaluationsModule:
     def __init__(
         self,
         api_client: LDApiClient,
-        sdk_key: str,
+        sdk_key: str | None,
         ui_base_uri: str = DEFAULT_UI_BASE_URI,
     ) -> None:
         self._api = api_client
@@ -60,7 +75,7 @@ class EvaluationsModule:
         return self._api
 
     @property
-    def sdk_key(self) -> str:
+    def sdk_key(self) -> str | None:
         """SDK key whose event transport carries generation results to LaunchDarkly."""
         return self._sdk_key
 
@@ -211,16 +226,21 @@ class EvaluationsModule:
         ``init_client`` is idempotent, so an application that already holds a
         client keeps it and the evaluations SDK key is not applied.
         """
-        try:
-            existing = get_client()
-        except RuntimeError:
-            return await init_client({"sdkKey": self._sdk_key})
-        logger.warning(
-            "A LaunchDarkly client is already initialized; evaluation events are "
-            "sent with it and the evaluations SDK key is ignored. Both must point "
-            "at the project under evaluation."
-        )
-        return existing
+        existing = _initialized_client()
+        if existing is not None:
+            if self._sdk_key:
+                logger.warning(
+                    "A LaunchDarkly client is already initialized; evaluation "
+                    "events are sent with it and the evaluations SDK key is "
+                    "ignored. Both must point at the project under evaluation."
+                )
+            return existing
+        if not self._sdk_key:
+            raise EvaluationsError(
+                "No LaunchDarkly SDK key provided and no initialized "
+                "LaunchDarkly client is available to deliver generation events."
+            )
+        return await init_client({"sdkKey": self._sdk_key})
 
     @staticmethod
     def _validate_run_args(
@@ -255,10 +275,15 @@ class EvaluationsModule:
             )
         if concurrency < 1:
             raise EvaluationsError("concurrency must be at least 1")
-        if poll_interval_seconds < 0:
-            raise EvaluationsError("poll_interval_seconds must not be negative")
-        if poll_timeout_seconds < 0:
-            raise EvaluationsError("poll_timeout_seconds must not be negative")
+        for name, seconds in (
+            ("poll_interval_seconds", poll_interval_seconds),
+            ("poll_timeout_seconds", poll_timeout_seconds),
+        ):
+            # NaN comparisons are always false, so a NaN would poll forever.
+            if math.isnan(seconds):
+                raise EvaluationsError(f"{name} must be a number")
+            if seconds < 0:
+                raise EvaluationsError(f"{name} must not be negative")
 
 
 def init_evaluations(
@@ -278,12 +303,16 @@ def init_evaluations(
 
     resolved_sdk_key = sdk_key or _env("LD_SDK_KEY")
     if not resolved_sdk_key:
-        raise EvaluationsError(
-            "No LaunchDarkly SDK key provided. Generation results reach "
-            "LaunchDarkly through the SDK event transport, so a run cannot "
-            "complete without one: set the LD_SDK_KEY environment variable or "
-            "pass sdk_key to init_evaluations()."
-        )
+        byoc_client = _initialized_client()
+        if byoc_client is None or not _can_emit_events(byoc_client):
+            raise EvaluationsError(
+                "No LaunchDarkly SDK key provided and no initialized "
+                "LaunchDarkly client to emit events with. Generation results "
+                "reach LaunchDarkly through the SDK event transport, so a run "
+                "cannot complete without one: set the LD_SDK_KEY environment "
+                "variable, pass sdk_key to init_evaluations(), or initialize a "
+                "client first with init_client(client=...)."
+            )
 
     api_client = LDApiClient(
         api_token=token,

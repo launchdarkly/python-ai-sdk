@@ -68,6 +68,16 @@ def response(status: int, body: dict[str, Any] | None = None) -> HttpResponse:
     )
 
 
+def failing_transport(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: bytes | None,
+    timeout: float,
+) -> HttpResponse:
+    raise AssertionError("no network I/O expected")
+
+
 def dataset_page(
     items: list[dict[str, Any]], total: int, next_href: str | None = None
 ) -> dict[str, Any]:
@@ -683,6 +693,114 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
             handler=handler,
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             poll_timeout_seconds=-1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("poll_interval_seconds", "poll_timeout_seconds"),
+    [(float("nan"), 1.0), (1.0, float("nan"))],
+    ids=["interval", "timeout"],
+)
+@pytest.mark.asyncio
+async def test_nan_poll_values_are_rejected(
+    poll_interval_seconds: float, poll_timeout_seconds: float
+) -> None:
+    evals = init_evaluations(api_token="token", transport=failing_transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(EvaluationsError, match="must be a number"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            poll_interval_seconds=poll_interval_seconds,
+            poll_timeout_seconds=poll_timeout_seconds,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_uses_a_byoc_client_when_no_sdk_key_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
+    byoc_client = MagicMock()
+    byoc_client.flush = AsyncMock()
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.get_client",
+        MagicMock(return_value=byoc_client),
+    )
+    init_client = AsyncMock(side_effect=AssertionError("must reuse the BYOC client"))
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client", init_client
+    )
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+    assert evals.sdk_key is None
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert result.passed is True
+    init_client.assert_not_awaited()
+    byoc_client.track.assert_called_once()
+    byoc_client.flush.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_run_raises_when_no_sdk_key_and_no_initialized_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
+    byoc_client = MagicMock()
+    byoc_client.flush = AsyncMock()
+    get_client = MagicMock(return_value=byoc_client)
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.get_client", get_client
+    )
+    evals = init_evaluations(api_token="token", transport=failing_transport)
+    get_client.side_effect = RuntimeError("client not initialized")
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(EvaluationsError, match="no initialized LaunchDarkly client"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
         )
 
 

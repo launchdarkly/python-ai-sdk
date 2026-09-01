@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server.evaluations import (
     DEFAULT_BASE_URI,
     EvalRunResult,
@@ -16,6 +19,13 @@ from launchdarkly_ai_server.evaluations import (
     Usage,
     init_evaluations,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_sdk_singleton() -> Iterator[None]:
+    lifecycle_module._reset_for_testing()
+    yield
+    lifecycle_module._reset_for_testing()
 
 
 class RecordingTransport:
@@ -116,6 +126,32 @@ def test_blank_sdk_key_env_is_treated_as_unset(
 ) -> None:
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "   ")
+
+    with pytest.raises(EvaluationsError, match="LD_SDK_KEY"):
+        init_evaluations(transport=failing_transport)
+
+
+def test_missing_sdk_key_is_allowed_with_a_byoc_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
+    byoc_client = MagicMock()
+    byoc_client.track = MagicMock()
+    byoc_client.flush = AsyncMock()
+    lifecycle_module._set_client_for_testing(byoc_client)
+
+    evals = init_evaluations(transport=failing_transport)
+
+    assert evals.sdk_key is None
+
+
+def test_missing_sdk_key_raises_when_the_byoc_client_cannot_emit_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
+    lifecycle_module._set_client_for_testing(object())
 
     with pytest.raises(EvaluationsError, match="LD_SDK_KEY"):
         init_evaluations(transport=failing_transport)

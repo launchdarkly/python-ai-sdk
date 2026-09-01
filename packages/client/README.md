@@ -59,7 +59,7 @@ from launchdarkly_ai_server import init_evaluations
 
 
 async def main() -> int:
-    evals = init_evaluations()  # LD_API_TOKEN and LD_SDK_KEY both required
+    evals = init_evaluations()  # LD_API_TOKEN required; LD_SDK_KEY unless a client is already initialized
     result = await evals.run(
         project_key="my-project",
         key="support-qa-2026-08-20",
@@ -80,7 +80,7 @@ sys.exit(asyncio.run(main()))
 
 `project_key` is supplied per run rather than during initialization. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
 
-`LD_SDK_KEY` is required: generation events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises when no SDK key is resolved rather than creating a run that can never complete. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
+Generation events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises rather than creating a run that can never complete unless it can resolve an event transport: either an SDK key (`sdk_key` or `LD_SDK_KEY`) or a client already initialized through `init_client(client=...)`. Bringing your own client lets a process emit evaluation events without an SDK key in scope. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
 
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 
