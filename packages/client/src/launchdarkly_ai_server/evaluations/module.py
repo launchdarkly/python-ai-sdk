@@ -47,7 +47,7 @@ class EvaluationsModule:
     def __init__(
         self,
         api_client: LDApiClient,
-        sdk_key: str | None = None,
+        sdk_key: str,
         ui_base_uri: str = DEFAULT_UI_BASE_URI,
     ) -> None:
         self._api = api_client
@@ -60,8 +60,8 @@ class EvaluationsModule:
         return self._api
 
     @property
-    def sdk_key(self) -> str | None:
-        """SDK key used for observability traces; ``None`` disables tracing."""
+    def sdk_key(self) -> str:
+        """SDK key whose event transport carries generation results to LaunchDarkly."""
         return self._sdk_key
 
     @property
@@ -106,9 +106,7 @@ class EvaluationsModule:
             poll_timeout_seconds=poll_timeout_seconds,
         )
         run_tools = dict(tools or {})
-        client = None
-        if self._sdk_key:
-            client = await self._resolve_client()
+        client = await self._resolve_client()
 
         # The management API client is synchronous; running it in a worker thread
         # keeps the caller's event loop free.
@@ -144,18 +142,17 @@ class EvaluationsModule:
             run_tools,
             concurrency,
         )
-        if client is not None:
-            self._runner._emit_generation_events(
-                client,
-                project_key=project_key,
-                evaluation=evaluation,
-                evaluation_run=evaluation_run,
-                dataset=dataset_ref,
-                results=results,
-            )
-            flush_result = client.flush()
-            if inspect.isawaitable(flush_result):
-                await flush_result
+        self._runner._emit_generation_events(
+            client,
+            project_key=project_key,
+            evaluation=evaluation,
+            evaluation_run=evaluation_run,
+            dataset=dataset_ref,
+            results=results,
+        )
+        flush_result = client.flush()
+        if inspect.isawaitable(flush_result):
+            await flush_result
         summary = await self._poll_summary_until_terminal(
             project_key,
             evaluation.id,
@@ -281,8 +278,11 @@ def init_evaluations(
 
     resolved_sdk_key = sdk_key or _env("LD_SDK_KEY")
     if not resolved_sdk_key:
-        logger.info(
-            "No LaunchDarkly SDK key provided; evaluation runs will not emit traces."
+        raise EvaluationsError(
+            "No LaunchDarkly SDK key provided. Generation results reach "
+            "LaunchDarkly through the SDK event transport, so a run cannot "
+            "complete without one: set the LD_SDK_KEY environment variable or "
+            "pass sdk_key to init_evaluations()."
         )
 
     api_client = LDApiClient(

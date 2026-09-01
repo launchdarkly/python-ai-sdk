@@ -15,6 +15,23 @@ from launchdarkly_ai_server.evaluations import (
 )
 
 
+@pytest.fixture(autouse=True)
+def stub_sdk_client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Give every run a resolvable SDK client, since one is now required."""
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
+    client = MagicMock()
+    client.flush = AsyncMock()
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.get_client",
+        MagicMock(side_effect=RuntimeError("client not initialized")),
+    )
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client",
+        AsyncMock(return_value=client),
+    )
+    return client
+
+
 class SequencedTransport:
     """Records requests and returns one response for each expected request."""
 

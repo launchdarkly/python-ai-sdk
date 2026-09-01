@@ -101,19 +101,31 @@ def test_blank_api_token_env_is_treated_as_unset(
         init_evaluations(transport=failing_transport)
 
 
-def test_missing_sdk_key_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_sdk_key_raises_before_network_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
 
-    evals = init_evaluations(transport=RecordingTransport())
+    with pytest.raises(EvaluationsError, match="LD_SDK_KEY"):
+        init_evaluations(transport=failing_transport)
 
-    assert evals.sdk_key is None
+
+def test_blank_sdk_key_env_is_treated_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "   ")
+
+    with pytest.raises(EvaluationsError, match="LD_SDK_KEY"):
+        init_evaluations(transport=failing_transport)
 
 
 def test_base_uri_override_isolated_from_sdk_delivery_uri(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
     monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com/")
     monkeypatch.setenv("LD_BASE_URI", "https://relay.example.com/")
 
@@ -130,6 +142,7 @@ def test_ui_base_uri_precedence_and_api_base_isolation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
     monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
     monkeypatch.setenv("LD_UI_BASE_URI", "https://ld-stg.launchdarkly.com/")
 
