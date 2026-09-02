@@ -33,7 +33,7 @@
     },
     "python-ai-openai-messages": {
       "name": "OpenAI Messages AI SDK for Python",
-      "type": "ai",
+      "type": "ai-provider",
       "path": "packages/openai-messages",
       "languages": ["Python"],
       "aiSdkNames": ["launchdarkly-ai-openai-messages"],
@@ -44,7 +44,7 @@
     },
     "python-ai-openai-agents": {
       "name": "OpenAI Agents AI SDK for Python",
-      "type": "ai",
+      "type": "ai-provider",
       "path": "packages/openai-agents",
       "languages": ["Python"],
       "aiSdkNames": ["launchdarkly-ai-openai-agents"],
@@ -57,7 +57,7 @@
     },
     "python-ai-claude-messages": {
       "name": "Claude Messages AI SDK for Python",
-      "type": "ai",
+      "type": "ai-provider",
       "path": "packages/claude-messages",
       "languages": ["Python"],
       "aiSdkNames": ["launchdarkly-ai-claude-messages"],
@@ -68,7 +68,7 @@
     },
     "python-ai-claude-agents": {
       "name": "Claude Agents AI SDK for Python",
-      "type": "ai",
+      "type": "ai-provider",
       "path": "packages/claude-agents",
       "languages": ["Python"],
       "aiSdkNames": ["launchdarkly-ai-claude-agents"],
@@ -81,7 +81,7 @@
     },
     "python-ai-langchain-messages": {
       "name": "LangChain Messages AI SDK for Python",
-      "type": "ai",
+      "type": "ai-provider",
       "path": "packages/langchain-messages",
       "languages": ["Python"],
       "aiSdkNames": ["launchdarkly-ai-langchain-messages"],
@@ -92,7 +92,7 @@
     },
     "python-ai-langchain-agents": {
       "name": "LangChain Agents AI SDK for Python",
-      "type": "ai",
+      "type": "ai-provider",
       "path": "packages/langchain-agents",
       "languages": ["Python"],
       "aiSdkNames": ["launchdarkly-ai-langchain-agents"],
