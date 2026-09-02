@@ -9,6 +9,7 @@ from .api import (
     Transport,
     urllib_transport,
 )
+from .judges import Judge, Scorer
 from .module import EvaluationsModule, init_evaluations
 from .types import EvalRunResult, GenerationConfig, RunSummary, Usage
 
@@ -19,9 +20,11 @@ __all__ = [
     "EvaluationsModule",
     "GenerationConfig",
     "HttpResponse",
+    "Judge",
     "LDApiClient",
     "LDApiError",
     "RunSummary",
+    "Scorer",
     "Transport",
     "Usage",
     "init_evaluations",

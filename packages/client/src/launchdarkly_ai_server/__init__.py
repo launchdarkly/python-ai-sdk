@@ -26,7 +26,9 @@ from .evaluations import (
     EvaluationsError,
     EvaluationsModule,
     GenerationConfig,
+    Judge,
     RunSummary,
+    Scorer,
     init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
@@ -168,7 +170,9 @@ __all__ = [  # noqa: RUF022
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
+    "Judge",
     "RunSummary",
+    "Scorer",
     "init_evaluations",
     # utils
     "create_handler",
