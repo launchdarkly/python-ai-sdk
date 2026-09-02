@@ -31,6 +31,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
+| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and generation-only `EvaluationsModule.run()` orchestration |
 | `src/launchdarkly_ai_server/__init__.py` | Public barrel — the only surface handler packages import from |
 
 ---
@@ -68,7 +69,7 @@ from launchdarkly_ai_server import Registry, global_registry, compose, resolve_h
 from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_tool_handlers
 
 # Entry points
-from launchdarkly_ai_server import config, graph, resolve_graph
+from launchdarkly_ai_server import config, graph, resolve_graph, init_evaluations
 ```
 
 When adding a new export, add it to `__init__.py`'s imports and `__all__`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
@@ -122,6 +123,14 @@ Handlers may return any of these — the client normalizes them before emitting 
       - On error: emits `$ld:ai:generation:error` then re-raises
 3. If `judge_configuration.judges` is present, runs each judge handler (sampled by `sampling_rate`) against the primary response, tracks `evaluation_metric_key`, and emits a `gen_ai.evaluation.result` span event on the judge's `invoke_agent` span (`gen_ai.evaluation.name` / `.score.value` / `.explanation`).
 4. Returns `ProviderResponse`: `{ response: str, usage: UsageDict, track_data: TrackData, judge_results?: dict[str, JudgeResult], judge_tasks?: list[JudgeTask] }`. `judge_results` is populated when `skip_judges=False` (default) and judges ran; `judge_tasks` is populated when `skip_judges=True`.
+
+---
+
+## SDK-run evaluations
+
+`init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK delivery and may point at a relay proxy. Evaluation-run links use the separate `ui_base_uri` option, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; do not derive their host from `LD_API_BASE_URI`. An event transport is resolved in `init_evaluations()`, which raises before any network I/O when it finds neither an SDK key (`sdk_key` or `LD_SDK_KEY`) nor an already-initialized event-capable client: generation events are the only ingest path for row results, so a run without a transport could never complete. The lifecycle module's bring-your-own-client path (`init_client(client=...)`) therefore satisfies the check on its own, and `run()` reuses that singleton through `_resolve_client`; `run()` raises if the client disappears before it emits. Both polling arguments reject NaN, which would otherwise never compare past a deadline and hang the run. The harness always queues one `$ld:ai:offline-evals:generation` custom event per row through the standard SDK event transport and flushes before returning. No feature flag gates event emission. The harness polls the run summary endpoint until a nonzero `total_rows` has `pending_rows == 0` and `passed + failed + error` rows accounting for the total, polling every `poll_interval_seconds` (default 2s) until `poll_timeout_seconds` (default 180s); both are `run()` arguments so large datasets can widen them. The summary endpoint does not return run state, so `RunSummary` exposes row counts only.
+
+`await EvaluationsModule.run(...)` takes `project_key` per call. Dataset lookup/row pagination, evaluation creation, and run creation are private helpers; only `run()` is public. Each call creates a new evaluation with `POST` and a run with `source="api"`, so its key must be unique. The harness directly invokes the supplied handler once per row and never retries it — event delivery is never a reason to rerun a handler because that would repeat tool side effects; retries apply only to management API requests. A 429 is replayed for any method, but 5xx responses and transport failures are replayed only for `GET`/`HEAD`, so an evaluation or run `POST` that the server may already have applied is never duplicated. Management API calls run in a worker thread (`asyncio.to_thread`) because the client is synchronous; the caller's event loop stays free. Generation events go through the already-initialized SDK client when the application has one — `init_client` is idempotent, so an existing singleton wins and the evaluations SDK key is ignored with a warning. Dataset-owned `input`, `expected_output`, `metadata`, and `variables` are deliberately excluded from the event payload. The harness flushes events, polls the run summary endpoint until row accounting is complete (`total_rows > 0`, `pending_rows == 0`, and `passed + failed + error == total_rows`), and raises a timeout once `poll_timeout_seconds` elapses if the backend never reaches one. `RunSummary` includes row counts only, and `EvalRunResult.passed` is true only when error and pending row counts are both zero.
 
 ---
 
