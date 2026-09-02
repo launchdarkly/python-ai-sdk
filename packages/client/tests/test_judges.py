@@ -391,18 +391,18 @@ class TestScoreGuard:
     """`float(score)` used to sit ahead of the evaluation-metric track, so a junk score killed it."""
 
     def test_rejects_non_numeric_scores_without_raising(self) -> None:
-        from launchdarkly_ai_server.judges import _numeric_score
+        from launchdarkly_ai_server.judge_scoring import numeric_score
 
         for junk in ("0.9 (high)", "85%", None, {"v": 1}, [], True, False):
-            assert _numeric_score(junk) is None
+            assert numeric_score(junk) is None
 
     def test_accepts_finite_numbers(self) -> None:
         from math import inf, nan
 
-        from launchdarkly_ai_server.judges import _numeric_score
+        from launchdarkly_ai_server.judge_scoring import numeric_score
 
-        assert _numeric_score(0.9) == 0.9
-        assert _numeric_score(1) == 1.0
-        assert _numeric_score(0) == 0.0
-        assert _numeric_score(inf) is None
-        assert _numeric_score(nan) is None
+        assert numeric_score(0.9) == 0.9
+        assert numeric_score(1) == 1.0
+        assert numeric_score(0) == 0.0
+        assert numeric_score(inf) is None
+        assert numeric_score(nan) is None

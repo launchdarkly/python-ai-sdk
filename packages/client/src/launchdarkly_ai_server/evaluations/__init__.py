@@ -9,12 +9,14 @@ from .api import (
     Transport,
     urllib_transport,
 )
-from .judges import Judge, Scorer
+from .criteria import Criterion, Judge, Scorer
 from .module import EvaluationsModule, init_evaluations
-from .types import EvalRunResult, GenerationConfig, RunSummary, Usage
+from .types import DatasetRow, EvalRunResult, GenerationConfig, RunSummary, Usage
 
 __all__ = [
     "DEFAULT_BASE_URI",
+    "Criterion",
+    "DatasetRow",
     "EvalRunResult",
     "EvaluationsError",
     "EvaluationsModule",

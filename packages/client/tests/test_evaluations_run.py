@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from launchdarkly_ai_server.evaluations import (
+    DatasetRow,
     EvaluationsError,
     HttpResponse,
     Judge,
@@ -1116,7 +1117,7 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
         dataset="golden",
         handler=handler,
         generation={"provider": "OpenAI", "model": "gpt-4o"},
-        judges=[Judge(key="$ld:ai:judge:accuracy")],
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
     assert result.passed is True
@@ -1169,7 +1170,7 @@ async def test_missing_ld_judge_aborts_before_mutating_request(
             dataset="golden",
             handler=handler,
             generation={"provider": "OpenAI", "model": "gpt-4o"},
-            judges=[Judge(key="security-judge")],
+            criteria=[Judge(key="security-judge")],
         )
 
     assert transport.requests == []
@@ -1215,9 +1216,9 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
             "usage": {"input_tokens": 10, "output_tokens": 4},
         }
 
-    def check_refund(row: Mapping[str, Any], output: Any) -> bool:
-        assert row["row_index"] == 42
-        assert row["input"] == "Ticket A"
+    def check_refund(row: DatasetRow, output: Any) -> bool:
+        assert row.row_index == 42
+        assert row.input == "Ticket A"
         assert output == "refund exists"
         return "refund" in str(output)
 
@@ -1227,7 +1228,7 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
         dataset="support-golden-v3",
         handler=handler,
         generation={"provider": "OpenAI", "model": "gpt-4o"},
-        judges=[Scorer(name="refund-exists", fn=check_refund)],
+        criteria=[Scorer(name="refund-exists", fn=check_refund)],
     )
 
     assert result.passed is True

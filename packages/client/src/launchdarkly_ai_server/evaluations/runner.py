@@ -10,22 +10,25 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from ..judge_scoring import (
+    FORMATTING_INSTRUCTIONS,
+    parse_judge_response,
+)
 from ..lifecycle import extract_variation
 from ..types import NativeTool
 from ..utils import (
-    parse_json_with_possible_fences,
     parse_template,
     parse_usage,
     to_ld_context,
 )
 from .api import EvaluationsError, LDApiClient, LDApiError
+from .criteria import Criterion, Judge, Scorer
 from .events import (
     DeterministicScorerEvaluationEventPayload,
     EvaluationEventPayload,
     LDJudgeEvaluationEventPayload,
     TokenUsage,
 )
-from .judges import Judge, JudgeReference, Scorer
 from .types import (
     DatasetRef,
     DatasetRow,
@@ -40,14 +43,6 @@ from .types import (
 DATASET_PAGE_SIZE = 200
 GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
 EVALUATION_EVENT_NAME = "$ld:ai:offline-evals:evaluation"
-JUDGE_FORMATTING_INSTRUCTIONS = "\n".join(
-    [
-        "Your response MUST be in valid JSON format with the following structure:",
-        '{ "score": <number, 0-1>, "reasoning": <string> }',
-        "The output must be valid, parseable JSON. Do not include additional tags, comments, formatting, or newlines.",
-        "Do not include ```json tags.",
-    ]
-)
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
@@ -289,7 +284,7 @@ class EvaluationsRunner:
         key: str,
         generation: GenerationConfig,
         tools: Mapping[str, ResolvedTool],
-        judges: list[JudgeReference] | None = None,
+        criteria: list[Criterion] | None = None,
     ) -> EvaluationRef:
         body: dict[str, Any] = {
             "name": key,
@@ -312,8 +307,8 @@ class EvaluationsRunner:
             body["tools"] = [
                 {"key": tool.key, "version": tool.version} for tool in tools.values()
             ]
-        if judges:
-            body["criteria"] = [judge.to_criteria_wire() for judge in judges]
+        if criteria:
+            body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
 
         path = f"projects/{_segment(project_key)}/evaluations"
         raw = _mapping(self._api.post(path, body=body), description="evaluation")
@@ -611,7 +606,14 @@ class EvaluationsRunner:
                 base, started_clock, "scorer_error", "generation did not complete"
             )
         try:
-            score_value = scorer.fn(row, row.get("output"))
+            dataset_row = DatasetRow(
+                row_index=row["row_index"],
+                input=row.get("input"),
+                expected_output=row.get("expected_output"),
+                variables=dict(row.get("variables") or {}),
+                metadata=row.get("metadata"),
+            )
+            score_value = scorer.fn(dataset_row, row.get("output"))
             if inspect.isawaitable(score_value):
                 score_value = await score_value
             if isinstance(score_value, bool):
@@ -668,27 +670,20 @@ class EvaluationsRunner:
                 tool_handlers,
                 {
                     **variables,
-                    "formatting_instructions": JUDGE_FORMATTING_INSTRUCTIONS,
+                    "formatting_instructions": FORMATTING_INSTRUCTIONS,
                 },
             )
             if not isinstance(result, Mapping):
                 raise TypeError("judge handler result must be a mapping")
-            raw = result.get("output", result.get("response"))
-            parsed = (
-                parse_json_with_possible_fences(raw)
-                if isinstance(raw, str)
-                else raw
-                if isinstance(raw, Mapping)
-                else None
+            score, reason = parse_judge_response(
+                result.get("output", result.get("response"))
             )
-            if not isinstance(parsed, Mapping):
-                raise ValueError("Invalid JSON from judge")
             completed = datetime.now(UTC)
             event = {
                 **base,
                 "status": "COMPLETE",
-                "score": parsed.get("score"),
-                "reason": str(parsed.get("reasoning", parsed.get("reason", ""))),
+                "score": score,
+                "reason": reason,
                 "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
                 "latency_ms": round((time.perf_counter() - started_clock) * 1000),
             }
@@ -701,27 +696,27 @@ class EvaluationsRunner:
                 base, started_clock, "judge_error", str(error)
             )
 
-    async def _run_judges_for_results(
+    async def _run_criteria_for_results(
         self,
         rows: list[dict[str, Any]],
         handler: EvalHandler,
         tool_handlers: dict[str, ToolImplementation],
-        judge_refs: list[JudgeReference],
+        criteria: list[Criterion],
         resolved_judges: Mapping[str, ResolvedJudge],
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for row in rows:
-            for judge in judge_refs:
-                if isinstance(judge, Scorer):
-                    results.append(await self._run_scorer_for_result(row, judge))
+            for criterion in criteria:
+                if isinstance(criterion, Scorer):
+                    results.append(await self._run_scorer_for_result(row, criterion))
                 else:
                     results.append(
                         await self._run_ld_judge_for_result(
                             row,
                             handler,
                             tool_handlers,
-                            judge,
-                            resolved_judges[judge.key],
+                            criterion,
+                            resolved_judges[criterion.key],
                         )
                     )
         return results

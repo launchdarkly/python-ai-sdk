@@ -17,7 +17,7 @@ from .api import (
     Transport,
     urllib_transport,
 )
-from .judges import Judge, JudgeReference
+from .criteria import Criterion, Judge
 from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
 from .types import EvalRunResult, GenerationConfig, RunSummary
 
@@ -94,7 +94,7 @@ class EvaluationsModule:
         handler: EvalHandler,
         generation: GenerationConfig,
         tools: Mapping[str, ToolImplementation] | None = None,
-        judges: list[JudgeReference] | None = None,
+        criteria: list[Criterion] | None = None,
         concurrency: int = 10,
         poll_interval_seconds: float | None = None,
         poll_timeout_seconds: float | None = None,
@@ -123,8 +123,10 @@ class EvaluationsModule:
             poll_timeout_seconds=poll_timeout_seconds,
         )
         run_tools = dict(tools or {})
-        run_judges = list(judges or [])
-        ld_judges = [judge for judge in run_judges if isinstance(judge, Judge)]
+        run_criteria = list(criteria or [])
+        ld_judges = [
+            criterion for criterion in run_criteria if isinstance(criterion, Judge)
+        ]
         client = await self._resolve_client()
 
         # The management API client is synchronous; running it in a worker thread
@@ -146,7 +148,7 @@ class EvaluationsModule:
             key,
             generation,
             resolved_tools,
-            run_judges,
+            run_criteria,
         )
         evaluation_run = await asyncio.to_thread(
             self._runner._create_evaluation_run,
@@ -170,12 +172,12 @@ class EvaluationsModule:
             dataset=dataset_ref,
             results=results,
         )
-        if run_judges:
-            judge_results = await self._runner._run_judges_for_results(
+        if run_criteria:
+            criterion_results = await self._runner._run_criteria_for_results(
                 results,
                 handler,
                 run_tools,
-                run_judges,
+                run_criteria,
                 resolved_judges,
             )
             self._runner._emit_evaluation_events(
@@ -184,7 +186,7 @@ class EvaluationsModule:
                 evaluation=evaluation,
                 evaluation_run=evaluation_run,
                 dataset=dataset_ref,
-                results=judge_results,
+                results=criterion_results,
             )
         flush_result = client.flush()
         if inspect.isawaitable(flush_result):
