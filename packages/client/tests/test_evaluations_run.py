@@ -120,8 +120,9 @@ def lookup_order(order_id: str) -> str:
 @pytest.mark.asyncio
 async def test_complete_run_with_zero_failed_and_error_rows_passes(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger="launchdarkly_ai_server.evaluations.runner")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
     init_client = AsyncMock()
     monkeypatch.setattr(
@@ -308,9 +309,13 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert event["emittedAt"].endswith("Z")
     assert datetime.fromisoformat(event["emittedAt"]).tzinfo is not None
     assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(event)
-    output_lines = capsys.readouterr().out.splitlines()
-    assert len(output_lines) == 2
-    assert output_lines[0] == (
+    emit_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "launchdarkly_ai_server.evaluations.runner"
+    ]
+    assert len(emit_logs) == 2
+    assert emit_logs[0] == (
         "$ld:ai:offline-evals:generation "
         f"emittedAt={event['emittedAt']} eventId={event['eventId']}"
     )

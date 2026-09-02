@@ -536,9 +536,11 @@ class EvaluationsRunner:
             if "usage" in generated:
                 payload["usage"] = generated["usage"]
             client.track(GENERATION_EVENT_NAME, context, payload, 1)
-            print(
-                f"{GENERATION_EVENT_NAME} emittedAt={emitted_at} eventId={event_id}",
-                flush=True,
+            logger.info(
+                "%s emittedAt=%s eventId=%s",
+                GENERATION_EVENT_NAME,
+                emitted_at,
+                event_id,
             )
 
     def _judge_variables(
@@ -871,9 +873,11 @@ class EvaluationsRunner:
                     result.get("criterion_type"),
                 )
                 continue
-            print(
-                f"{EVALUATION_EVENT_NAME} emittedAt={emitted_at} eventId={event_id}",
-                flush=True,
+            logger.info(
+                "%s emittedAt=%s eventId=%s",
+                EVALUATION_EVENT_NAME,
+                emitted_at,
+                event_id,
             )
 
     def _get_summary(

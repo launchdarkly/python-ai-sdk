@@ -100,7 +100,13 @@ class EvaluationsModule:
         poll_timeout_seconds: float | None = None,
     ) -> EvalRunResult:
         """
-        Create and run a generation-only evaluation in the caller's process.
+        Create and run an evaluation in the caller's process.
+
+        Each dataset row is generated with ``handler``; every entry in
+        ``criteria`` — LaunchDarkly :class:`Judge` references and local
+        deterministic :class:`Scorer` functions — is then run against each
+        generated row, and one evaluation event is emitted per
+        ``(row, criterion)`` result.
 
         The returned pass/fail result is derived from LaunchDarkly's run summary.
         A CI script can exit with ``0 if result.passed else 1`` after awaiting
