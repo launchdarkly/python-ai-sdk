@@ -54,6 +54,8 @@ EXAMPLES: dict[str, str] = {
     "langchain": "examples.langchain_example",
     "langchain-agents": "examples.langchain_agents_example",
     "langchain-messages": "examples.langchain_messages_example",
+    "bedrock-agents": "examples.bedrock_agents_example",
+    "bedrock-messages": "examples.bedrock_messages_example",
     "native-graph": "examples.native_graph",
     "native-graph-langchain": "examples.native_graph_langchain",
 }

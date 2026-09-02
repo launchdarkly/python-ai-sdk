@@ -6,5 +6,7 @@
   "packages/openai-agents": "0.2.2",
   "packages/openai-messages": "0.2.2",
   "packages/langchain-agents": "0.2.2",
-  "packages/langchain-messages": "0.2.2"
+  "packages/langchain-messages": "0.2.2",
+  "packages/bedrock-agents": "0.0.1",
+  "packages/bedrock-messages": "0.0.1"
 }
