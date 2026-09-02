@@ -621,7 +621,7 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
         # value lands verbatim in the ClickHouse `ContextKeys` column, where a
         # consumer may match on it as text.
         feature_flag_attrs["feature_flag.contextKeys"] = json.dumps(
-            context_keys, separators=(",", ":")
+            context_keys, separators=(",", ":"), ensure_ascii=False
         )
         # The canonical key is a composite for a multi-kind context, so it
         # cannot answer "filter to this one user". These per-kind attributes

@@ -128,3 +128,16 @@ def test_only_keys_are_emitted_never_attribute_values() -> None:
     emitted = json.dumps([span.attributes, span.events])
     assert "bob@example.com" not in emitted
     assert "Bob" not in emitted
+
+
+def test_a_non_ascii_key_is_emitted_as_the_raw_character_not_a_unicode_escape() -> None:
+    # `json.dumps` defaults to ensure_ascii=True, which writes `José` as
+    # `Jos\u00e9`. JSON.stringify writes the character as-is, and this string
+    # lands verbatim in ClickHouse.
+    span = RecordingSpan()
+    set_ld_span_attributes(
+        span, {"__ld": LD, "ldContext": {"kind": "user", "key": "José"}}
+    )
+    encoded = span.feature_flag_event["feature_flag.contextKeys"]
+    assert encoded == '{"user":"José"}'
+    assert "\\u" not in encoded
