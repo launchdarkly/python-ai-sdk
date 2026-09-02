@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "sdks": {
+    "python-ai": {
+      "name": "AI SDK for Python",
+      "type": "ai",
+      "path": "packages/ai",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-python"],
+      "releases": { "tag-prefix": "launchdarkly-ai-python-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" },
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiJudgeConfig": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-server": {
+      "name": "Core AI SDK for Python",
+      "type": "ai",
+      "path": "packages/client",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-server"],
+      "releases": { "tag-prefix": "launchdarkly-ai-server-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" },
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiJudgeConfig": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-openai-messages": {
+      "name": "OpenAI Messages AI SDK for Python",
+      "type": "ai",
+      "path": "packages/openai-messages",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-openai-messages"],
+      "releases": { "tag-prefix": "launchdarkly-ai-openai-messages-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-openai-agents": {
+      "name": "OpenAI Agents AI SDK for Python",
+      "type": "ai",
+      "path": "packages/openai-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-openai-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-openai-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-claude-messages": {
+      "name": "Claude Messages AI SDK for Python",
+      "type": "ai",
+      "path": "packages/claude-messages",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-claude-messages"],
+      "releases": { "tag-prefix": "launchdarkly-ai-claude-messages-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-claude-agents": {
+      "name": "Claude Agents AI SDK for Python",
+      "type": "ai",
+      "path": "packages/claude-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-claude-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-claude-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-langchain-messages": {
+      "name": "LangChain Messages AI SDK for Python",
+      "type": "ai",
+      "path": "packages/langchain-messages",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-langchain-messages"],
+      "releases": { "tag-prefix": "launchdarkly-ai-langchain-messages-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-langchain-agents": {
+      "name": "LangChain Agents AI SDK for Python",
+      "type": "ai",
+      "path": "packages/langchain-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-langchain-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-langchain-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    }
+  }
+}
