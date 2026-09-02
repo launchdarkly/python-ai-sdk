@@ -181,6 +181,7 @@ class EvaluationsModule:
                     run_tools,
                     run_criteria,
                     resolved_judges,
+                    concurrency,
                 )
                 self._runner._emit_evaluation_events(
                     client,

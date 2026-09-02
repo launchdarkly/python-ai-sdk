@@ -28,6 +28,7 @@ from .criteria import Criterion, Judge, Scorer
 from .events import (
     DeterministicScorerEvaluationEventPayload,
     EvaluationEventPayload,
+    EvaluationStatus,
     LDJudgeEvaluationEventPayload,
     TokenUsage,
 )
@@ -745,23 +746,33 @@ class EvaluationsRunner:
         tool_handlers: dict[str, ToolImplementation],
         criteria: list[Criterion],
         resolved_judges: Mapping[str, ResolvedJudge],
+        concurrency: int,
     ) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            for criterion in criteria:
+        """Run every (row, criterion) pair, bounded by the run's concurrency."""
+        controller = ConcurrencyController(concurrency)
+
+        async def run_one(
+            row: Mapping[str, Any], criterion: Criterion
+        ) -> dict[str, Any]:
+            await controller.acquire()
+            try:
                 if isinstance(criterion, Scorer):
-                    results.append(await self._run_scorer_for_result(row, criterion))
-                else:
-                    results.append(
-                        await self._run_ld_judge_for_result(
-                            row,
-                            handler,
-                            tool_handlers,
-                            criterion,
-                            resolved_judges[criterion.key],
-                        )
-                    )
-        return results
+                    return await self._run_scorer_for_result(row, criterion)
+                return await self._run_ld_judge_for_result(
+                    row,
+                    handler,
+                    tool_handlers,
+                    criterion,
+                    resolved_judges[criterion.key],
+                )
+            finally:
+                controller.release()
+
+        return list(
+            await asyncio.gather(
+                *(run_one(row, criterion) for row in rows for criterion in criteria)
+            )
+        )
 
     def _emit_evaluation_events(
         self,
@@ -783,57 +794,83 @@ class EvaluationsRunner:
             },
         )
         for result in results:
-            identity = {
-                "projectKey": project_key,
-                "evaluationId": evaluation.id,
-                "evaluationRunId": evaluation_run.id,
-                "runId": evaluation_run.id,
-                "datasetId": dataset.id,
-                "rowIndex": result["row_index"],
-                "criterionType": result["criterion_type"],
-            }
-            event_id = hashlib.sha256(
-                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            emitted_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            usage: TokenUsage | None = None
-            if result["kind"] == "judge" and isinstance(result.get("usage"), Mapping):
-                normalized_usage = parse_usage(dict(result["usage"]))
-                usage = TokenUsage(
-                    inputTokens=normalized_usage["input"],
-                    outputTokens=normalized_usage["output"],
+            # One bad criterion result must not abort the run or drop the
+            # events queued for the results that preceded it.
+            try:
+                identity = {
+                    "projectKey": project_key,
+                    "evaluationId": evaluation.id,
+                    "evaluationRunId": evaluation_run.id,
+                    "runId": evaluation_run.id,
+                    "datasetId": dataset.id,
+                    "rowIndex": result["row_index"],
+                    "criterionType": result["criterion_type"],
+                }
+                event_id = hashlib.sha256(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                emitted_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                usage: TokenUsage | None = None
+                if result["kind"] == "judge" and isinstance(
+                    result.get("usage"), Mapping
+                ):
+                    normalized_usage = parse_usage(dict(result["usage"]))
+                    usage = TokenUsage(
+                        input_tokens=normalized_usage["input"],
+                        output_tokens=normalized_usage["output"],
+                    )
+                error = result.get("error")
+                error_message: str | None = None
+                if result["status"] == "ERROR":
+                    if isinstance(error, Mapping) and error.get("message"):
+                        error_message = str(error["message"])
+                    else:
+                        error_message = str(error) if error else "Unknown error"
+                common_payload: dict[str, Any] = {
+                    "project_key": project_key,
+                    "evaluation_id": evaluation.id,
+                    "evaluation_run_id": evaluation_run.id,
+                    "run_id": evaluation_run.id,
+                    "dataset_id": dataset.id,
+                    "row_index": result["row_index"],
+                    "criterion_type": result["criterion_type"],
+                    "event_id": event_id,
+                    "emitted_at": emitted_at,
+                    "evaluation_key": evaluation.key,
+                    "evaluation_version": evaluation.version,
+                    "dataset_key": dataset.key,
+                    "status": EvaluationStatus(result["status"]),
+                    "started_at": result["started_at"],
+                    "evaluated_at": result["evaluated_at"],
+                    "latency_ms": result["latency_ms"],
+                    "score": result.get("score"),
+                    "reason": result.get("reason"),
+                    "error": error,
+                    "error_message": error_message,
+                }
+                payload_model: EvaluationEventPayload
+                if result["kind"] == "judge":
+                    payload_model = LDJudgeEvaluationEventPayload(
+                        **common_payload,
+                        judge_key=result["judge_key"],
+                        variation_key=result["variation_key"],
+                        version=result.get("version"),
+                        usage=usage,
+                    )
+                else:
+                    payload_model = DeterministicScorerEvaluationEventPayload(
+                        **common_payload
+                    )
+                client.track(
+                    EVALUATION_EVENT_NAME, context, payload_model.to_track_payload(), 1
                 )
-            common_payload = {
-                **identity,
-                "eventId": event_id,
-                "emittedAt": emitted_at,
-                "evaluationKey": evaluation.key,
-                "evaluationVersion": evaluation.version,
-                "datasetKey": dataset.key,
-                "status": result["status"],
-                "startedAt": result["started_at"],
-                "evaluatedAt": result["evaluated_at"],
-                "latencyMs": result["latency_ms"],
-                "score": result.get("score"),
-                "reason": result.get("reason"),
-                "error": result.get("error"),
-            }
-            payload_model: EvaluationEventPayload
-            if result["kind"] == "judge":
-                payload_model = LDJudgeEvaluationEventPayload(
-                    **common_payload,
-                    judgeKey=result["judge_key"],
-                    variationKey=result["variation_key"],
-                    version=result.get("version"),
-                    usage=usage,
+            except Exception:
+                logger.exception(
+                    "Skipping evaluation event for row %s criterion %s",
+                    result.get("row_index"),
+                    result.get("criterion_type"),
                 )
-            else:
-                payload_model = DeterministicScorerEvaluationEventPayload(
-                    **common_payload
-                )
-            client.track(
-                EVALUATION_EVENT_NAME, context, payload_model.to_track_payload(), 1
-            )
+                continue
             print(
                 f"{EVALUATION_EVENT_NAME} emittedAt={emitted_at} eventId={event_id}",
                 flush=True,

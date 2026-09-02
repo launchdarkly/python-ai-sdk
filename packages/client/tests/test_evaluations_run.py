@@ -1368,6 +1368,7 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
     judge_event = next(event for event in events if event.get("kind") == "judge")
     assert judge_event["status"] == "ERROR"
     assert judge_event["error"]["code"] == expected_code
+    assert judge_event["errorMessage"] == judge_event["error"]["message"]
     assert "score" not in judge_event
     stub_sdk_client.flush.assert_awaited()
 
@@ -1521,3 +1522,107 @@ async def test_errored_generation_row_emits_generation_incomplete_criterion_even
     judge_event = next(event for event in events if event.get("kind") == "judge")
     assert judge_event["status"] == "ERROR"
     assert judge_event["error"]["code"] == "generation_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_failed_evaluation_event_tracking_skips_event_but_completes_run(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    accuracy_judge_variation(monkeypatch)
+
+    def track(event_name: str, *args: Any) -> None:
+        if event_name == "$ld:ai:offline-evals:evaluation":
+            raise RuntimeError("event pipeline unavailable")
+
+    stub_sdk_client.track = MagicMock(side_effect=track)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    stub_sdk_client.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_criteria_run_concurrently_within_the_concurrency_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    import asyncio
+
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {"rowIndex": index, "input": f"Question {index}"}
+                        for index in range(3)
+                    ],
+                    total=3,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 3, "passed": 3, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    in_flight = 0
+    max_in_flight = 0
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal in_flight, max_in_flight
+        if "Judge" in config.get("instructions", ""):
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        concurrency=2,
+    )
+
+    assert result.passed is True
+    assert max_in_flight == 2
