@@ -22,6 +22,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | File | Responsibility |
 |---|---|
 | `src/launchdarkly_ai_server/conversation.py` | `conversation_id`, `ConversationIdSpanProcessor` — stamps `gen_ai.conversation.id` |
+| `src/launchdarkly_ai_server/sdk_info.py` | `$ld:ai:sdk:info` package registry and flush |
 | `src/launchdarkly_ai_server/lifecycle.py` | `init_client`, `get_client`, `shutdown`, `extract_variation` |
 | `src/launchdarkly_ai_server/client.py` | `config()`, `ConfigInstance` |
 | `src/launchdarkly_ai_server/tracking.py` | `execute_and_track`, `execute_and_stream`, `wrap_tool_handlers`, `parse_usage` |
@@ -42,7 +43,7 @@ Key symbols exported from `launchdarkly_ai_server`:
 
 ```python
 # Lifecycle
-from launchdarkly_ai_server import init_client, get_client, shutdown, extract_variation
+from launchdarkly_ai_server import init_client, get_client, shutdown, extract_variation, register_ai_sdk_package
 from launchdarkly_ai_server import conversation_id, set_conversation_id_if_absent, ConversationIdSpanProcessor
 
 # Types

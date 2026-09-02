@@ -45,6 +45,7 @@ from .registry import (
     resolve_handlers,
     resolve_tools,
 )
+from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -199,6 +200,9 @@ __all__ = [  # noqa: RUF022
     "shutdown",
     "extract_variation",
     "inspect_config",
+    "SDK_INFO_CONTEXT",
+    "SDK_INFO_EVENT",
+    "register_ai_sdk_package",
     # judges
     "build_judge_tasks",
     "run_judge",
@@ -215,3 +219,5 @@ __all__ = [  # noqa: RUF022
     "resolve_graph",
     "GraphInstance",
 ]
+
+register_ai_sdk_package("launchdarkly-ai-server", __version__)
