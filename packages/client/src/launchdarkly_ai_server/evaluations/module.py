@@ -124,6 +124,7 @@ class EvaluationsModule:
         )
         run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
+        self._validate_criteria(run_criteria)
         ld_judges = [
             criterion for criterion in run_criteria if isinstance(criterion, Judge)
         ]
@@ -135,7 +136,7 @@ class EvaluationsModule:
         resolved_tools = await asyncio.to_thread(
             self._runner._resolve_tools, project_key, run_tools
         )
-        resolved_judges = await self._runner._resolve_judges(ld_judges)
+        resolved_judges = await self._runner._resolve_judges(project_key, ld_judges)
         dataset_ref = await asyncio.to_thread(
             self._runner._fetch_dataset, project_key, dataset
         )
@@ -164,33 +165,37 @@ class EvaluationsModule:
             run_tools,
             concurrency,
         )
-        self._runner._emit_generation_events(
-            client,
-            project_key=project_key,
-            evaluation=evaluation,
-            evaluation_run=evaluation_run,
-            dataset=dataset_ref,
-            results=results,
-        )
-        if run_criteria:
-            criterion_results = await self._runner._run_criteria_for_results(
-                results,
-                handler,
-                run_tools,
-                run_criteria,
-                resolved_judges,
-            )
-            self._runner._emit_evaluation_events(
+        try:
+            self._runner._emit_generation_events(
                 client,
                 project_key=project_key,
                 evaluation=evaluation,
                 evaluation_run=evaluation_run,
                 dataset=dataset_ref,
-                results=criterion_results,
+                results=results,
             )
-        flush_result = client.flush()
-        if inspect.isawaitable(flush_result):
-            await flush_result
+            if run_criteria:
+                criterion_results = await self._runner._run_criteria_for_results(
+                    results,
+                    handler,
+                    run_tools,
+                    run_criteria,
+                    resolved_judges,
+                )
+                self._runner._emit_evaluation_events(
+                    client,
+                    project_key=project_key,
+                    evaluation=evaluation,
+                    evaluation_run=evaluation_run,
+                    dataset=dataset_ref,
+                    results=criterion_results,
+                )
+        finally:
+            # Generation results already queued on the SDK event buffer must
+            # reach LaunchDarkly even when the criteria phase fails.
+            flush_result = client.flush()
+            if inspect.isawaitable(flush_result):
+                await flush_result
         summary = await self._poll_summary_until_terminal(
             project_key,
             evaluation.id,
@@ -264,6 +269,27 @@ class EvaluationsModule:
                 "LaunchDarkly client is available to deliver generation events."
             )
         return await init_client({"sdkKey": self._sdk_key})
+
+    @staticmethod
+    def _validate_criteria(criteria: list[Criterion]) -> None:
+        """Reject duplicate criterion identities before any records are created.
+
+        A judge key and a scorer name that collide would share a criterionType,
+        and with it the deterministic event identity of their results.
+        """
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for criterion in criteria:
+            criterion_type = criterion.criterion_type
+            if criterion_type in seen and criterion_type not in duplicates:
+                duplicates.append(criterion_type)
+            seen.add(criterion_type)
+        if duplicates:
+            raise EvaluationsError(
+                "Duplicate evaluation criteria: "
+                + ", ".join(repr(name) for name in duplicates)
+                + ". Judge keys and scorer names must be unique within a run."
+            )
 
     @staticmethod
     def _validate_run_args(

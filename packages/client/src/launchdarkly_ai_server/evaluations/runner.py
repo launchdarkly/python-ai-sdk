@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
@@ -12,6 +13,7 @@ from typing import Any
 
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
+    numeric_score,
     parse_judge_response,
 )
 from ..lifecycle import extract_variation
@@ -39,6 +41,8 @@ from .types import (
     ResolvedTool,
     RunSummary,
 )
+
+logger = logging.getLogger(__name__)
 
 DATASET_PAGE_SIZE = 200
 GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
@@ -145,18 +149,22 @@ class EvaluationsRunner:
 
     async def _resolve_judges(
         self,
+        project_key: str,
         judges: list[Judge],
     ) -> dict[str, ResolvedJudge]:
         """Resolve LD Judge configs before any evaluation records are created."""
         resolved: dict[str, ResolvedJudge] = {}
-        context: dict[str, Any] = {}
+        # variation() rejects a context without kind and key; use the same
+        # context shape the emitted evaluation events are attributed to.
+        context: dict[str, Any] = {"kind": "evaluation", "key": project_key}
         for judge in judges:
             try:
                 variation = await extract_variation(judge.key, context)
             except Exception as error:
                 raise EvaluationsError(
-                    f"LaunchDarkly judge {judge.key!r} was not found or could not be resolved "
-                    "for this project. Create the judge in the LaunchDarkly UI and try again."
+                    f"Failed to resolve LaunchDarkly judge {judge.key!r}: {error} "
+                    f"If the judge does not exist in project {project_key!r}, "
+                    "create it in the LaunchDarkly UI and try again."
                 ) from error
             config = variation.get("config")
             meta_value = variation.get("meta")
@@ -537,6 +545,12 @@ class EvaluationsRunner:
         row_result: Mapping[str, Any],
         judge: Judge,
     ) -> dict[str, Any]:
+        """Variables available to the judge config's ``{{...}}`` placeholders.
+
+        Absent values become empty strings: ``parse_template`` leaves a
+        placeholder with a ``None`` value as-is, and literal mustache text must
+        not reach the judge model.
+        """
         variables = dict(row_result.get("variables") or {})
         output = row_result.get("output")
         expected = row_result.get("expected_output")
@@ -547,30 +561,20 @@ class EvaluationsRunner:
             ground_truth = str(expected)
         variables.update(
             {
-                "input": row_result.get("input"),
-                "response_to_evaluate": output,
+                "input": row_result.get("input") or "",
+                "response_to_evaluate": output if output is not None else "",
                 "message_history": "\n\n".join(
                     str(value)
                     for value in (row_result.get("input"), output)
                     if value is not None
                 ),
-                "expected_output": expected,
-                "ground_truth_context": ground_truth,
+                "expected_output": expected if expected is not None else "",
+                "ground_truth_context": (
+                    ground_truth if ground_truth is not None else ""
+                ),
             }
         )
         return variables
-
-    def _render_config_value(self, value: Any, variables: Mapping[str, Any]) -> Any:
-        if isinstance(value, str):
-            return parse_template(value, dict(variables))
-        if isinstance(value, list):
-            return [self._render_config_value(item, variables) for item in value]
-        if isinstance(value, Mapping):
-            return {
-                str(key): self._render_config_value(item, variables)
-                for key, item in value.items()
-            }
-        return value
 
     def _criterion_error_result(
         self,
@@ -603,40 +607,55 @@ class EvaluationsRunner:
         }
         if row.get("status") != "COMPLETE":
             return self._criterion_error_result(
-                base, started_clock, "scorer_error", "generation did not complete"
+                base,
+                started_clock,
+                "generation_incomplete",
+                "generation did not complete",
             )
+        dataset_row = DatasetRow(
+            row_index=row["row_index"],
+            input=row.get("input"),
+            expected_output=row.get("expected_output"),
+            variables=dict(row.get("variables") or {}),
+            metadata=row.get("metadata"),
+        )
         try:
-            dataset_row = DatasetRow(
-                row_index=row["row_index"],
-                input=row.get("input"),
-                expected_output=row.get("expected_output"),
-                variables=dict(row.get("variables") or {}),
-                metadata=row.get("metadata"),
-            )
             score_value = scorer.fn(dataset_row, row.get("output"))
             if inspect.isawaitable(score_value):
                 score_value = await score_value
-            if isinstance(score_value, bool):
-                score: float = 1.0 if score_value else 0.0
-            elif isinstance(score_value, int | float):
-                score = float(score_value)
-            else:
-                raise TypeError("scorer fn must return a bool or numeric score")
-            if score < 0 or score > 1:
-                raise ValueError("scorer fn score must be between 0 and 1")
-            completed = datetime.now(UTC)
-            return {
-                **base,
-                "status": "COMPLETE",
-                "score": score,
-                "reason": None,
-                "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
-                "latency_ms": round((time.perf_counter() - started_clock) * 1000),
-            }
         except Exception as error:
             return self._criterion_error_result(
-                base, started_clock, "scorer_error", str(error)
+                base, started_clock, "scorer_raised", f"scorer fn raised: {error}"
             )
+        if isinstance(score_value, bool):
+            score: float = 1.0 if score_value else 0.0
+        else:
+            maybe_score = numeric_score(score_value)
+            if maybe_score is None:
+                return self._criterion_error_result(
+                    base,
+                    started_clock,
+                    "invalid_score",
+                    "scorer fn must return a bool or a finite number, "
+                    f"got {score_value!r}",
+                )
+            score = maybe_score
+        if score < 0 or score > 1:
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "invalid_score",
+                f"scorer fn score must be between 0 and 1, got {score_value!r}",
+            )
+        completed = datetime.now(UTC)
+        return {
+            **base,
+            "status": "COMPLETE",
+            "score": score,
+            "reason": None,
+            "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
+            "latency_ms": round((time.perf_counter() - started_clock) * 1000),
+        }
 
     async def _run_ld_judge_for_result(
         self,
@@ -659,13 +678,18 @@ class EvaluationsRunner:
         }
         if row.get("status") != "COMPLETE":
             return self._criterion_error_result(
-                base, started_clock, "judge_error", "generation did not complete"
+                base,
+                started_clock,
+                "generation_incomplete",
+                "generation did not complete",
             )
+        # The config is passed unrendered: the handler owns the single
+        # parse_template pass, so ``{{...}}`` sequences inside generated output
+        # or dataset values are never re-expanded into the judge prompt.
+        variables = self._judge_variables(row, judge)
         try:
-            variables = self._judge_variables(row, judge)
-            rendered_config = self._render_config_value(resolved.config, variables)
             result = await handler(
-                rendered_config,
+                dict(resolved.config),
                 row.get("output"),
                 tool_handlers,
                 {
@@ -673,28 +697,46 @@ class EvaluationsRunner:
                     "formatting_instructions": FORMATTING_INSTRUCTIONS,
                 },
             )
-            if not isinstance(result, Mapping):
-                raise TypeError("judge handler result must be a mapping")
-            score, reason = parse_judge_response(
-                result.get("output", result.get("response"))
-            )
-            completed = datetime.now(UTC)
-            event = {
-                **base,
-                "status": "COMPLETE",
-                "score": score,
-                "reason": reason,
-                "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
-                "latency_ms": round((time.perf_counter() - started_clock) * 1000),
-            }
-            usage = result.get("usage")
-            if isinstance(usage, Mapping):
-                event["usage"] = dict(usage)
-            return event
         except Exception as error:
             return self._criterion_error_result(
-                base, started_clock, "judge_error", str(error)
+                base, started_clock, "handler_raised", f"judge handler raised: {error}"
             )
+        if not isinstance(result, Mapping):
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "invalid_judge_output",
+                "judge handler result must be a mapping",
+            )
+        try:
+            raw_score, reason = parse_judge_response(
+                result.get("output", result.get("response"))
+            )
+        except ValueError as error:
+            return self._criterion_error_result(
+                base, started_clock, "invalid_judge_output", str(error)
+            )
+        score = numeric_score(raw_score)
+        if score is None or score < 0 or score > 1:
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "invalid_score",
+                f"judge score must be a number between 0 and 1, got {raw_score!r}",
+            )
+        completed = datetime.now(UTC)
+        event = {
+            **base,
+            "status": "COMPLETE",
+            "score": score,
+            "reason": reason,
+            "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
+            "latency_ms": round((time.perf_counter() - started_clock) * 1000),
+        }
+        usage = result.get("usage")
+        if isinstance(usage, Mapping):
+            event["usage"] = dict(usage)
+        return event
 
     async def _run_criteria_for_results(
         self,
