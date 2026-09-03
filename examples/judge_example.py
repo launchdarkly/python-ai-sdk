@@ -25,6 +25,7 @@ import sys
 import threading
 from typing import Any
 
+import examples.register  # noqa: F401 – side-effect: populate global_registry
 from examples.utils import new_multi_context, write_output
 from launchdarkly_ai_server import (
     JudgeRunResult,
@@ -66,10 +67,6 @@ def _judge_in_thread(
 
 
 async def run(key: str, user_input: str) -> None:
-    from examples.register import register_handlers
-
-    register_handlers()
-
     ctx = new_multi_context()
     print(
         f"[context] {json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}",
