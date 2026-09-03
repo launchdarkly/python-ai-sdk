@@ -23,11 +23,12 @@ Usage (via main.py):
 
 from __future__ import annotations
 
+import json
 import sys
 from typing import Any
 
 import examples.register  # noqa: F401 – side-effect: populate global_registry
-from examples.utils import new_context, new_conversation_id
+from examples.utils import new_conversation_id, new_multi_context
 from launchdarkly_ai_server import config, conversation_id, global_registry
 
 FOLLOW_UPS = [
@@ -38,7 +39,11 @@ FOLLOW_UPS = [
 
 async def run(key: str, user_input: str) -> None:
     conversation = new_conversation_id("conversation-example")
-    ctx = new_context()
+    ctx = new_multi_context()
+    print(
+        f"[context] {json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}",
+        file=sys.stderr,
+    )
     history: list[dict[str, Any]] = []
 
     print(f"[conversation] {conversation}", file=sys.stderr)

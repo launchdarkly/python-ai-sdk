@@ -20,10 +20,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 import threading
 from typing import Any
 
-from examples.utils import new_context, write_output
+from examples.utils import new_multi_context, write_output
 from launchdarkly_ai_server import (
     JudgeRunResult,
     JudgeTask,
@@ -68,7 +70,11 @@ async def run(key: str, user_input: str) -> None:
 
     register_handlers()
 
-    ctx = new_context()
+    ctx = new_multi_context()
+    print(
+        f"[context] {json.dumps(ctx, ensure_ascii=False, separators=(',', ':'))}",
+        file=sys.stderr,
+    )
 
     # Single config() call — the caller never touches a judge key.
     # skip_judges=True suppresses automatic inline evaluation so we control when
