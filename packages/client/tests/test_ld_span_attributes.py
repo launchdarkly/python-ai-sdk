@@ -66,6 +66,24 @@ class TestContextIdentity:
         assert event["feature_flag.contextKeys"] == '{"user":"u-1"}'
         assert span.attributes["context.contextKeys.user"] == "u-1"
 
+    @pytest.mark.parametrize(
+        "context",
+        [
+            {"key": "u%1:west"},
+            {"kind": "user", "key": "u%1:west"},
+        ],
+        ids=["legacy-user", "explicit-user"],
+    )
+    def test_user_percent_and_colon_stay_raw_in_all_identity_values(
+        self, context: dict[str, Any]
+    ) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(span, _vars(context))
+        event = _feature_flag(span)
+        assert event["feature_flag.context.id"] == "u%1:west"
+        assert event["feature_flag.contextKeys"] == '{"user":"u%1:west"}'
+        assert span.attributes["context.contextKeys.user"] == "u%1:west"
+
     def test_non_user_single_kind_is_prefixed(self) -> None:
         span = FakeSpan()
         set_ld_span_attributes(span, _vars({"kind": "org", "key": "o-1"}))
@@ -149,6 +167,9 @@ class TestContextIdentity:
         _vars({}),
         _vars({"kind": "user", "key": 123}),
         _vars({"kind": "user", "key": ""}),
+        _vars({"kind": "", "key": "u-1"}),
+        _vars({"kind": None, "key": "u-1"}),
+        _vars({"kind": 123, "key": "u-1"}),
         _vars({"kind": "multi"}),
         _vars({"kind": "multi", "user": {"name": "Ada"}}),
     ],
@@ -160,6 +181,9 @@ class TestContextIdentity:
         "empty-object",
         "non-string-key",
         "empty-key",
+        "empty-explicit-kind",
+        "none-explicit-kind",
+        "number-explicit-kind",
         "empty-multi",
         "multi-with-no-usable-key",
     ],

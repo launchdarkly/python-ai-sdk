@@ -605,11 +605,16 @@ def _context_identity_from_ld_context(
         key = _usable_context_key(ld_context.get("key"))
         if key is None:
             return None
-        kind_value = ld_context.get("kind")
-        kind = kind_value if isinstance(kind_value, str) and kind_value else "user"
+        if "kind" not in ld_context:
+            kind = "user"
+        else:
+            kind_value = ld_context["kind"]
+            if not isinstance(kind_value, str) or not kind_value:
+                return None
+            kind = kind_value
         keys = {kind: key}
         canonical = (
-            _escape_canonical_part(key)
+            key
             if kind == "user"
             else f"{_escape_canonical_part(kind)}:{_escape_canonical_part(key)}"
         )
