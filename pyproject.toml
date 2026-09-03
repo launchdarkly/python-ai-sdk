@@ -33,6 +33,7 @@ pythonpath = ["."]
 [tool.mypy]
 strict = true
 python_version = "3.12"
+explicit_package_bases = true
 
 [tool.ruff]
 target-version = "py312"
