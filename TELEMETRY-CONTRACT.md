@@ -94,6 +94,7 @@ able to tell from the trace which path ran.
 | `launchdarkly.variation.key` | `TrackData.variationKey` | `set_ld_span_attributes` |
 | `launchdarkly.run.id` | `TrackData.runId` | `set_ld_span_attributes` |
 | `launchdarkly.graph.key` | `TrackData.graphKey`, only when present | `set_ld_span_attributes` |
+| `context.contextKeys.<kind>` | raw per-kind context key, only when `variables.ldContext` has a usable identity | `set_ld_span_attributes` |
 | `launchdarkly.stream.abandoned` | `True`, only when abandoned | `end_span_once` |
 | `gen_ai.evaluation.name` | judge config key, judge roots only | `with_judge_evaluation`, see section 4a |
 | `gen_ai.evaluation.score.value` | numeric score, judge roots only | `with_judge_evaluation`, see section 4a |
@@ -105,6 +106,8 @@ The root also carries one span event, `feature_flag`, with these event attribute
 | `feature_flag.key` | config key |
 | `feature_flag.provider.name` | `LaunchDarkly` |
 | `feature_flag.set.id` | environment id, only when present |
+| `feature_flag.context.id` | canonical context key, only when `variables.ldContext` has a usable identity |
+| `feature_flag.contextKeys` | compact JSON of per-kind keys, only when identity is present |
 
 The root is the only span that carries the config-association attributes and the `feature_flag`
 event. Child spans carry neither. A test asserts this, so do not add them to children out of

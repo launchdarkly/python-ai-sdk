@@ -505,7 +505,7 @@ Do not hand-write a `span.set_attribute` for anything a shared helper covers. Th
 |---|---|
 | `set_model_identity_attributes` | `gen_ai.system`, `gen_ai.provider.name`, `gen_ai.request.model` |
 | `set_usage_span_attributes` | all seven `gen_ai.usage.*` keys, always, including zeros |
-| `set_ld_span_attributes` | the `launchdarkly.*` identity and the `feature_flag` event |
+| `set_ld_span_attributes` | the `launchdarkly.*` identity, per-kind `context.contextKeys.*`, and the `feature_flag` event |
 | `set_input_content_attributes` | prompts, system instructions, tool catalog, gated |
 | `set_output_content_attributes` | model output, gated |
 | `set_tool_call_content_attributes` | tool arguments and results, gated |

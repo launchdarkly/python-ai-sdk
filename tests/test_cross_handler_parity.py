@@ -61,7 +61,8 @@ LD_VARIABLES: dict[str, Any] = {
         "runId": "run-1",
         "graphKey": "graph-1",
         "environmentId": "env-1",
-    }
+    },
+    "ldContext": {"kind": "user", "key": "user-123"},
 }
 
 
@@ -71,12 +72,14 @@ class RecordedSpan:
         self.context = context
         self.attributes: dict[str, Any] = {}
         self.events: list[str] = []
+        self.event_attributes: dict[str, dict[str, Any]] = {}
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
     def add_event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
         self.events.append(name)
+        self.event_attributes[name] = attributes or {}
 
     def set_status(self, code: Any, description: str | None = None) -> None:
         pass
@@ -218,6 +221,15 @@ class TestLaunchDarklyIdentity:
         module.start_root_span(CONFIG, LD_VARIABLES)
         assert "feature_flag" in tracer.spans[0].events
 
+    def test_the_root_carries_context_identity(self, handler_spans: Any) -> None:
+        _, module, tracer = handler_spans
+        module.start_root_span(CONFIG, LD_VARIABLES)
+        span = tracer.spans[0]
+        event = span.event_attributes["feature_flag"]
+        assert event["feature_flag.context.id"] == "user-123"
+        assert event["feature_flag.contextKeys"] == '{"user":"user-123"}'
+        assert span.attributes["context.contextKeys.user"] == "user-123"
+
     def test_a_tool_span_carries_no_launchdarkly_identity(
         self, handler_spans: Any
     ) -> None:
@@ -227,6 +239,9 @@ class TestLaunchDarklyIdentity:
         module.start_tool_span("get_weather", "call-1", None)
         span = tracer.spans[0]
         assert [k for k in span.attributes if k.startswith("launchdarkly.")] == []
+        assert [
+            k for k in span.attributes if k.startswith("context.contextKeys.")
+        ] == []
         assert "feature_flag" not in span.events
 
     def test_a_model_span_carries_no_launchdarkly_identity(
@@ -238,6 +253,9 @@ class TestLaunchDarklyIdentity:
         module.start_model_span(CONFIG, None)
         span = tracer.spans[0]
         assert [k for k in span.attributes if k.startswith("launchdarkly.")] == []
+        assert [
+            k for k in span.attributes if k.startswith("context.contextKeys.")
+        ] == []
         assert "feature_flag" not in span.events
 
 
@@ -358,6 +376,12 @@ EXPECTED_VOCABULARY = {
     "feature_flag.key",
     "feature_flag.provider.name",
     "feature_flag.set.id",
+    # AIC-3230: evaluation-context identity on the root feature_flag event / span.
+    # `context.contextKeys` is the f-string prefix; the keys actually emitted are
+    # `context.contextKeys.<kind>`.
+    "feature_flag.context.id",
+    "feature_flag.contextKeys",
+    "context.contextKeys",
     # Graph spans, unchanged from before the span work
     "ld.ai.graph",
     "ld.ai.graph.key",
@@ -397,8 +421,11 @@ _KEY_PATTERN = re.compile(
     r'|"(gen_ai\.[a-z_.0-9]+)"'
     r'|f"(gen_ai\.[a-z_.]+)\.\{'
     # The feature_flag event's own attributes are built as a plain dict before being handed to
-    # add_event, so they never appear inside a set_attribute call.
-    r'|"(feature_flag\.[a-z_.]+)"'
+    # add_event, so they never appear inside a set_attribute call. camelCase `contextKeys` is
+    # intentional — the observability browser SDK already ships that name.
+    r'|"(feature_flag\.[a-zA-Z_.]+)"'
+    # Per-kind span attributes are interpolated: f"context.contextKeys.{kind}".
+    r'|f?"(context\.contextKeys)'
 )
 
 
@@ -413,6 +440,7 @@ def _emitted_vocabulary() -> set[str]:
                 "launchdarkly",
                 "feature_flag",
                 "ld",
+                "context",
             ):
                 found.add(key)
     return found
