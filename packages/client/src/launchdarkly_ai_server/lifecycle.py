@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any
 
+from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .types import InitClientOptions
 
 logger = logging.getLogger(__name__)
@@ -139,12 +140,14 @@ async def init_client(
 
     # Idempotent — if already initialized, return the existing client
     if _client is not None:
+        flush_ai_sdk_info(_client)
         return _client
 
     # BYOC path — pre-initialized client
     if client is not None:
         _client = client
         _setup_telemetry(opts.get("sdkKey", "byoc"), opts)
+        flush_ai_sdk_info(_client)
         return _client
 
     # Resolve SDK key
@@ -191,6 +194,7 @@ async def init_client(
 
     _client = ld_client
     _setup_telemetry(sdk_key, opts)
+    flush_ai_sdk_info(_client)
     return _client
 
 
@@ -207,6 +211,7 @@ async def shutdown() -> None:
     # Null the singleton before any awaits so a second call is a no-op
     _client = None
     _tracer_provider = None
+    reset_ai_sdk_info()
 
     if local_provider is not None:
         try:
@@ -256,7 +261,7 @@ async def inspect_config(
 
     - Never raises — returns ``{"enabled": False, "config": None, "meta": None}``
       on any error (unreachable LD, bad key, unparseable config, etc.)
-    - Does not emit any LaunchDarkly telemetry events
+    - Does not emit generation, duration, or token tracking events
     - Does not call any AI provider
 
     Returns a dict with keys:
