@@ -556,6 +556,73 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
     }
 
 
+def _usable_context_key(value: Any) -> str | None:
+    return value if isinstance(value, str) and value != "" else None
+
+
+def _escape_canonical_part(value: str) -> str:
+    return value.replace("%", "%25").replace(":", "%3A")
+
+
+def _compact_context_keys_json(keys: dict[str, str]) -> str:
+    """Compact JSON of per-kind keys in lexicographic kind order."""
+    parts = [
+        f"{json.dumps(kind, ensure_ascii=False)}:{json.dumps(keys[kind], ensure_ascii=False)}"
+        for kind in sorted(keys)
+    ]
+    return "{" + ",".join(parts) + "}"
+
+
+def _context_identity_from_ld_context(
+    ld_context: Any,
+) -> tuple[str, dict[str, str]] | None:
+    """Canonical key plus per-kind map, or None when there is no usable identity.
+
+    Never raises.
+    """
+    try:
+        if not isinstance(ld_context, dict):
+            return None
+
+        if ld_context.get("kind") == "multi":
+            raw: dict[str, str] = {}
+            for kind, value in ld_context.items():
+                if kind in ("kind", "_meta") or not isinstance(value, dict):
+                    continue
+                key = _usable_context_key(value.get("key"))
+                if key is not None:
+                    raw[kind] = key
+            kinds = sorted(raw)
+            if not kinds:
+                return None
+            keys = {kind: raw[kind] for kind in kinds}
+            canonical = ":".join(
+                f"{_escape_canonical_part(kind)}:{_escape_canonical_part(raw[kind])}"
+                for kind in kinds
+            )
+            return canonical, keys
+
+        key = _usable_context_key(ld_context.get("key"))
+        if key is None:
+            return None
+        if "kind" not in ld_context:
+            kind = "user"
+        else:
+            kind_value = ld_context["kind"]
+            if not isinstance(kind_value, str) or not kind_value:
+                return None
+            kind = kind_value
+        keys = {kind: key}
+        canonical = (
+            key
+            if kind == "user"
+            else f"{_escape_canonical_part(kind)}:{_escape_canonical_part(key)}"
+        )
+        return canonical, keys
+    except Exception:
+        return None
+
+
 def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     """
     Sets LaunchDarkly config-identifying attributes on an OTel span and emits
@@ -564,7 +631,8 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
 
     Reads the ``__ld`` entry injected into *variables* by
     ``execute_and_track`` / ``execute_and_stream``, so handlers never need to
-    receive ``TrackData`` directly.
+    receive ``TrackData`` directly. Context identity is read from
+    ``variables.ldContext``, never from ``TrackData``.
 
     Span attributes (LLM dashboard discovery and custom queries):
 
@@ -573,11 +641,14 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     * ``launchdarkly.variation.key``  = variationKey
     * ``launchdarkly.run.id``         = runId
     * ``launchdarkly.graph.key``      = graphKey  (only when present)
+    * ``context.contextKeys.<kind>``  = raw per-kind key (when ldContext has identity)
 
     Span event (required for AI Config Monitoring Traces tab correlation):
     ``name='feature_flag'`` with ``feature_flag.key``,
-    ``feature_flag.provider.name``, and ``feature_flag.set.id`` (when
-    ``LD_ENVIRONMENT_ID`` is set or the TS SDK auto-resolved it).
+    ``feature_flag.provider.name``, ``feature_flag.set.id`` (when
+    ``LD_ENVIRONMENT_ID`` is set or the TS SDK auto-resolved it),
+    ``feature_flag.context.id``, and ``feature_flag.contextKeys`` (when
+    ``ldContext`` has a usable identity).
     """
     span.set_attribute("launchdarkly.operation.type", "gen_ai")
     if not variables:
@@ -597,6 +668,17 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     }
     if ld.get("environmentId"):
         feature_flag_attrs["feature_flag.set.id"] = ld["environmentId"]
+
+    identity = _context_identity_from_ld_context(variables.get("ldContext"))
+    if identity is not None:
+        canonical, keys = identity
+        feature_flag_attrs["feature_flag.context.id"] = canonical
+        feature_flag_attrs["feature_flag.contextKeys"] = _compact_context_keys_json(
+            keys
+        )
+        for kind, key in keys.items():
+            span.set_attribute(f"context.contextKeys.{kind}", key)
+
     span.add_event("feature_flag", feature_flag_attrs)
 
 
