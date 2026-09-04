@@ -53,8 +53,9 @@ _FILE_MODE = 0o644
 and never executable."""
 
 SUPPORTS_DIR_FD = os.supports_dir_fd.issuperset(
-    # renameat, openat, unlinkat, fstatat — the four this module needs.
-    {os.rename, os.open, os.unlink, os.stat}
+    # renameat, openat, unlinkat, fstatat, mkdirat, and unlinkat's AT_REMOVEDIR
+    # form — the six this module and its caller need.
+    {os.rename, os.open, os.unlink, os.stat, os.mkdir, os.rmdir}
 )
 """
 Whether the ``*at()`` syscall family is available, so every operation under the
@@ -66,6 +67,11 @@ a descriptor refers to the inode that was checked, so replacing ``<root>/<key>``
 with a symlink after the check cannot redirect a write or an unlink out of the
 root. POSIX has these calls; Windows does not, and there the per-component
 ``lstat`` floor the spec permits applies instead.
+
+``os.mkdir`` and ``os.rmdir`` are in the set because the managed root is now
+pinned for a whole reconcile and the per-skill directory is created and removed
+relative to that descriptor. Both are registered by CPython under the names
+called here, so unlike the two below they need no indirection.
 
 The probe deliberately names ``os.rename`` and ``os.stat`` rather than the
 ``os.replace`` and ``os.lstat`` this module actually calls. ``os.supports_dir_fd``
@@ -79,9 +85,32 @@ silently disable the defense.
 """
 
 
-def open_directory_nofollow(directory: Path) -> int | None:
+def _at(directory: Path, dir_fd: int | None) -> str | Path:
+    """
+    What to name *directory* by, given a descriptor for its parent.
+
+    With a *dir_fd* the call must pass the bare final component, so the kernel
+    resolves it inside the pinned parent and no ancestor is re-resolved from its
+    path; without one the full path is the only thing there is to pass. Spelled
+    once because every operation in this module that accepts a parent
+    descriptor has to make the same choice, and one call site left on the full
+    path would silently re-open the window the descriptor closes.
+    """
+    return directory.name if dir_fd is not None else directory
+
+
+def open_directory_nofollow(
+    directory: Path, *, dir_fd: int | None = None
+) -> int | None:
     """
     Opens *directory* without following a final symlink, and pins it.
+
+    *dir_fd* is a descriptor for the *parent*, and passing one is what extends
+    the guarantee past the final component: ``O_NOFOLLOW`` refuses a link at
+    *directory* itself, but every ancestor above it is re-resolved from its path
+    on each open, so a parent swapped for a symlink after it was checked
+    redirects the open. Given a parent descriptor the bare name is resolved
+    inside the inode that was checked instead, and there is nothing left to swap.
 
     Everything the caller does afterwards goes through the returned descriptor
     instead of the path, which is what turns the "narrow window" into no
@@ -113,7 +142,7 @@ def open_directory_nofollow(directory: Path) -> int | None:
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(directory, flags)
+        fd = os.open(_at(directory, dir_fd), flags, dir_fd=dir_fd)
     except OSError as exc:
         raise ValueError(
             f"the directory could not be opened without following links: {exc}"
@@ -129,7 +158,9 @@ def open_directory_nofollow(directory: Path) -> int | None:
     return fd
 
 
-def open_or_create_directory(directory: Path) -> int | None:
+def open_or_create_directory(
+    directory: Path, *, dir_fd: int | None = None
+) -> int | None:
     """
     Creates *directory* if absent and returns a descriptor pinned to it.
 
@@ -137,20 +168,40 @@ def open_or_create_directory(directory: Path) -> int | None:
     "already there", which would re-open the very hole the caller's ``lstat``
     check just closed. ``os.mkdir`` plus an ``lstat`` on the ``FileExistsError``
     path does not: a link reports as a link, and is refused.
+
+    *dir_fd* is a descriptor for the parent, as in ``open_directory_nofollow``,
+    and the ``mkdir`` needs it every bit as much as the open does: ``mkdir``
+    follows a symlink at the parent, so a create issued against the full path is
+    how a directory gets made — and then written into — outside the root.
     """
+    # As in ``atomic_write``: a parent descriptor is only usable where the
+    # ``*at()`` family is. ``open_directory_nofollow`` returns ``None`` on the
+    # platforms without it, so no caller here can hold one — stated rather than
+    # left to that invariant, because the ``mkdir`` below would otherwise raise
+    # instead of taking the full-path floor the openers fall back to.
+    if not SUPPORTS_DIR_FD:
+        dir_fd = None
     try:
-        os.mkdir(directory, 0o755)
+        os.mkdir(_at(directory, dir_fd), 0o755, dir_fd=dir_fd)
     except FileExistsError:
-        mode = os.lstat(directory).st_mode
+        # os.stat(follow_symlinks=False) on the descriptor path, os.lstat off it:
+        # identical results, and the former is the spelling os.supports_dir_fd
+        # advertises.
+        if dir_fd is not None:
+            mode = os.stat(directory.name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+        else:
+            mode = os.lstat(directory).st_mode
         if stat.S_ISLNK(mode):
             raise ValueError("the directory is a symlink") from None
         if not stat.S_ISDIR(mode):
             raise ValueError("the path is not a directory") from None
-    return open_directory_nofollow(directory)
+    return open_directory_nofollow(directory, dir_fd=dir_fd)
 
 
 @contextmanager
-def pinned_directory(directory: Path, *, create: bool = False) -> Iterator[int | None]:
+def pinned_directory(
+    directory: Path, *, create: bool = False, dir_fd: int | None = None
+) -> Iterator[int | None]:
     """
     Holds *directory* pinned for the duration of the block, then releases it.
 
@@ -158,11 +209,15 @@ def pinned_directory(directory: Path, *, create: bool = False) -> Iterator[int |
     ``lstat`` floor — so the caller states the platform split once, as
     ``if dir_fd is not None``, and cannot forget the ``os.close``. Raises
     ``ValueError`` for a directory that will not pin, exactly as they do.
+
+    *dir_fd* is a descriptor for the parent and is passed straight through. Note
+    which descriptor is which: the one passed *in* pins the parent, and the one
+    yielded pins *directory* itself.
     """
     dir_fd = (
-        open_or_create_directory(directory)
+        open_or_create_directory(directory, dir_fd=dir_fd)
         if create
-        else open_directory_nofollow(directory)
+        else open_directory_nofollow(directory, dir_fd=dir_fd)
     )
     try:
         yield dir_fd
@@ -353,10 +408,13 @@ def atomic_write_in(directory: Path, name: str, data: bytes) -> None:
     """
     ``atomic_write`` against a directory this module does not already hold open.
 
-    Used for the skills manifest, whose directory is the managed root. The
-    descriptor is taken with ``O_NOFOLLOW``, so a root swapped for a symlink after
-    ``_resolve_root`` validated it fails the write instead of redirecting it —
-    the caller turns that into a run-level ``error`` action.
+    The descriptor is taken with ``O_NOFOLLOW``, so a directory swapped for a
+    symlink between the caller's checks and the write fails it rather than
+    redirecting it. That still leaves the directory's *ancestors* re-resolved on
+    the open, so this is the right primitive only where the caller holds nothing
+    better. ``skills_fs`` no longer does — it pins the managed root for the whole
+    reconcile and writes the manifest with ``atomic_write(..., dir_fd=root_fd)``
+    — so prefer passing a descriptor over reaching for this.
     """
     with pinned_directory(directory) as dir_fd:
         atomic_write(directory, name, data, dir_fd=dir_fd)

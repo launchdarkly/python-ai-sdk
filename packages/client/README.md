@@ -411,18 +411,24 @@ never writes through a symlink; writes are atomic (temp file, `fsync`, rename) a
 `0644`; and if the manifest is unreadable it performs no destructive action at all. Removing
 a skill from a variation is how revocation works — the next reconcile prunes it.
 
-**Platform bound: the descriptor-pinned guarantee is POSIX-only.** On POSIX every destructive
-step — the open, the rename, the unlink — runs relative to a directory descriptor opened
-`O_RDONLY|O_DIRECTORY|O_NOFOLLOW` and held for the whole reconcile, so a directory swapped for
-a symlink *after* its checks cannot redirect a write or a delete: the descriptor names the
-inode that was checked, which closes the swap window rather than narrowing it. Windows has no
+**Platform bound: the descriptor-pinned guarantee is POSIX-only.** On POSIX the managed root
+is opened once per reconcile — `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, checked with `fstat`, and
+held until the call returns — and every destructive step under it runs relative to that
+descriptor: the per-skill directory is created and opened relative to the root, the unlink and
+the `rmdir` relative to the directory, and the manifest write relative to the root. So a
+directory swapped for a symlink *after* its checks cannot redirect a write or a delete: the
+descriptor names the inode that was checked, which closes the swap window rather than
+narrowing it. Because the root itself is pinned this holds for the root and its ancestors too,
+not only for `<root>/<key>` — but only from the instant the root is opened, which is why the
+checklist below denies the agent write access to every ancestor. Windows has no
 `*at()` syscall family, so there `write_skills` falls back to a per-component `lstat` check
 taken immediately before each step. That floor is a check-then-use race rather than a closed
 window: an attacker who already holds **write permission on the managed root** can still win
 it. Windows reparse-point checks (`GetFileAttributesW` / `FILE_FLAG_OPEN_REPARSE_POINT`) are
 deliberately not implemented in this release, and Windows is not a tested platform for it —
-neither SDK repository has a Windows CI runner. Treat write permission on the managed root as
-the security boundary on every platform, and on Windows as the *only* one.
+neither SDK repository has a Windows CI runner. Treat write permission on the managed root
+**or on any directory above it** as the security boundary on every platform, and on Windows as
+the *only* one.
 
 **One exception, and it is what makes a crashed reconcile recoverable.** A file at a managed
 path whose bytes are *already byte-identical* to the content LaunchDarkly resolved is
@@ -510,7 +516,12 @@ they describe a directory the agent can freely rewrite.
 
 - the managed root itself,
 - the per-skill directories `<root>/<key>/` and the files `<root>/<key>/SKILL.md`,
-- the manifest at `<root>/.launchdarkly-skills.json`.
+- the manifest at `<root>/.launchdarkly-skills.json`,
+- **the root's parent, and every ancestor directory above it.** Write access to an ancestor is
+  write access to the root by another route: it permits renaming the root aside and leaving a
+  symlink in its place, which redirects the reconcile — and the agent's own skill lookups — at
+  a directory the agent controls. In the documented layout `<app>/.claude/skills` that parent
+  is `.claude`, which an agent identity is otherwise likely to own outright.
 
 ```bash
 # Run as the agent's user. Every line should print DENIED.
@@ -518,6 +529,15 @@ root=.claude/skills
 for target in "$root" "$root/.launchdarkly-skills.json" "$root"/*/ "$root"/*/SKILL.md; do
   [ -e "$target" ] || continue
   if [ -w "$target" ]; then echo "WRITABLE — fix this: $target"; else echo "DENIED: $target"; fi
+done
+
+# The root's ancestors, up to /. A writable one is enough to rename the root
+# aside and put a symlink where it was, so these matter as much as the root.
+ancestor=$(cd "$(dirname "$root")" && pwd)
+while :; do
+  if [ -w "$ancestor" ]; then echo "WRITABLE ANCESTOR — fix this: $ancestor"; else echo "DENIED: $ancestor"; fi
+  [ "$ancestor" = / ] && break
+  ancestor=$(dirname "$ancestor")
 done
 ```
 
@@ -535,6 +555,13 @@ skill LaunchDarkly has revoked, or aim the SDK's own delete path at something it
 touch. `write_skills` re-validates every manifest entry from scratch for exactly that reason —
 it treats that file as untrusted input, never as authorization — but an agent that cannot edit
 it at all is the stronger position, and only your deployment can provide that.
+
+The same reasoning is why the ancestors are on the list. An identity that can rename a
+directory above the root does not need write access to anything inside it: it can substitute
+the whole tree, and everything the agent then loads as a skill is a file it wrote itself. That
+is a different capability from racing the reconcile — no timing is involved, and it persists
+until someone notices — and no amount of descriptor pinning inside `write_skills` addresses
+it, because the substituted tree is what the agent reads, not what the SDK wrote.
 
 **The SDK deliberately does not report whether the root is writable.** There is no such field
 on `ReconcileReport`, and its absence is a decision rather than an oversight. The SDK knows
