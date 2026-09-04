@@ -580,7 +580,7 @@ A `Makefile` is provided as a consistent interface alongside the `uv` commands.
 |---|---|---|
 | `make start` | `uv run python main.py` | Run `main.py` |
 | `make test` | `uv run pytest` | Run all tests |
-| `make typecheck` | `uv run mypy .` | Type-check all packages |
+| `make typecheck` | `uv run mypy packages/*/src` | Type-check all package sources (the same invocation CI runs) |
 
 ### Running the examples
 

@@ -47,6 +47,9 @@ jobs:
           python-version: "3.12"
       - run: uv lock
       - run: uv sync --all-packages
+      # Not bare `mypy .`: the per-package `tests/conftest.py` files collide under mypy's module
+      # resolution, which aborts the run before anything is checked. `make typecheck` runs this
+      # same command.
       - run: uv run mypy packages/*/src
 
   # ─── Test ───────────────────────────────────────────────────────────────────

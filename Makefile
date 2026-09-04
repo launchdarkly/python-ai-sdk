@@ -9,8 +9,13 @@ test:
 	uv run pytest
 
 # Type-check all packages (uv run mypy)
+# Not bare `mypy .`: the per-package `tests/conftest.py` files all resolve to the module name
+# `conftest`, and mypy aborts on that clash (`Duplicate module named "conftest"`) before checking
+# anything, so the command gives no signal at all. CI type-checks package sources only — both
+# `.github/workflows/ci.yml` and `.github/actions/ci/action.yml` — and this mirrors that exactly so
+# local and CI agree. The test suites are not currently mypy-clean under `strict`.
 typecheck:
-	uv run mypy .
+	uv run mypy packages/*/src
 
 # Check for lint errors
 lint:
