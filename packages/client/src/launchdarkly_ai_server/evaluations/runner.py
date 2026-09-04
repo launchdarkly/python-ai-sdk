@@ -2,28 +2,52 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
+import logging
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from ..judge_scoring import (
+    FORMATTING_INSTRUCTIONS,
+    numeric_score,
+    parse_judge_response,
+)
+from ..lifecycle import extract_variation
 from ..types import NativeTool
-from ..utils import parse_template, parse_usage, to_ld_context
+from ..utils import (
+    parse_template,
+    parse_usage,
+    to_ld_context,
+)
 from .api import EvaluationsError, LDApiClient, LDApiError
+from .criteria import Criterion, Judge, Scorer
+from .events import (
+    DeterministicScorerEvaluationEventPayload,
+    EvaluationEventPayload,
+    EvaluationStatus,
+    LDJudgeEvaluationEventPayload,
+    TokenUsage,
+)
 from .types import (
     DatasetRef,
     DatasetRow,
     EvaluationRef,
     EvaluationRunRef,
     GenerationConfig,
+    ResolvedJudge,
     ResolvedTool,
     RunSummary,
 )
 
+logger = logging.getLogger(__name__)
+
 DATASET_PAGE_SIZE = 200
 GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
+EVALUATION_EVENT_NAME = "$ld:ai:offline-evals:evaluation"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
@@ -121,6 +145,44 @@ class EvaluationsRunner:
                 version=version,
                 description=str(raw.get("description") or ""),
                 schema=dict(schema),
+            )
+        return resolved
+
+    async def _resolve_judges(
+        self,
+        project_key: str,
+        judges: list[Judge],
+    ) -> dict[str, ResolvedJudge]:
+        """Resolve LD Judge configs before any evaluation records are created."""
+        resolved: dict[str, ResolvedJudge] = {}
+        # variation() rejects a context without kind and key; use the same
+        # context shape the emitted evaluation events are attributed to.
+        context: dict[str, Any] = {"kind": "evaluation", "key": project_key}
+        for judge in judges:
+            try:
+                variation = await extract_variation(judge.key, context)
+            except Exception as error:
+                raise EvaluationsError(
+                    f"Failed to resolve LaunchDarkly judge {judge.key!r}: {error} "
+                    f"If the judge does not exist in project {project_key!r}, "
+                    "create it in the LaunchDarkly UI and try again."
+                ) from error
+            config = variation.get("config")
+            meta_value = variation.get("meta")
+            meta: Mapping[str, Any] = (
+                meta_value if isinstance(meta_value, Mapping) else {}
+            )
+            if not isinstance(config, Mapping):
+                raise EvaluationsError(
+                    f"LaunchDarkly judge {judge.key!r} returned an invalid AI config variation"
+                )
+            resolved[judge.key] = ResolvedJudge(
+                key=judge.key,
+                config=dict(config),
+                variation_key=str(meta.get("variationKey") or ""),
+                version=int(meta["version"])
+                if isinstance(meta.get("version"), int)
+                else None,
             )
         return resolved
 
@@ -231,6 +293,7 @@ class EvaluationsRunner:
         key: str,
         generation: GenerationConfig,
         tools: Mapping[str, ResolvedTool],
+        criteria: list[Criterion] | None = None,
     ) -> EvaluationRef:
         body: dict[str, Any] = {
             "name": key,
@@ -253,6 +316,8 @@ class EvaluationsRunner:
             body["tools"] = [
                 {"key": tool.key, "version": tool.version} for tool in tools.values()
             ]
+        if criteria:
+            body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
 
         path = f"projects/{_segment(project_key)}/evaluations"
         raw = _mapping(self._api.post(path, body=body), description="evaluation")
@@ -269,22 +334,18 @@ class EvaluationsRunner:
         self,
         project_key: str,
         evaluation_id: str,
-        row_count: int,
         dataset_id: str,
     ) -> EvaluationRunRef:
         path = (
             f"projects/{_segment(project_key)}/evaluations/"
             f"{_segment(evaluation_id)}/runs"
         )
+        body: dict[str, Any] = {
+            "source": "api",
+            "datasetId": dataset_id,
+        }
         raw = _mapping(
-            self._api.post(
-                path,
-                body={
-                    "source": "api",
-                    "rowCount": row_count,
-                    "datasetId": dataset_id,
-                },
-            ),
+            self._api.post(path, body=body),
             description="evaluation run",
         )
         return self._run_ref(raw)
@@ -475,9 +536,348 @@ class EvaluationsRunner:
             if "usage" in generated:
                 payload["usage"] = generated["usage"]
             client.track(GENERATION_EVENT_NAME, context, payload, 1)
-            print(
-                f"{GENERATION_EVENT_NAME} emittedAt={emitted_at} eventId={event_id}",
-                flush=True,
+            logger.info(
+                "%s emittedAt=%s eventId=%s",
+                GENERATION_EVENT_NAME,
+                emitted_at,
+                event_id,
+            )
+
+    def _judge_variables(
+        self,
+        row_result: Mapping[str, Any],
+        judge: Judge,
+    ) -> dict[str, Any]:
+        """Variables available to the judge config's ``{{...}}`` placeholders.
+
+        Absent values become empty strings: ``parse_template`` leaves a
+        placeholder with a ``None`` value as-is, and literal mustache text must
+        not reach the judge model.
+        """
+        variables = dict(row_result.get("variables") or {})
+        output = row_result.get("output")
+        expected = row_result.get("expected_output")
+        ground_truth = judge.ground_truth_context
+        if ground_truth is not None:
+            ground_truth = parse_template(ground_truth, variables)
+        elif expected is not None:
+            ground_truth = str(expected)
+        variables.update(
+            {
+                "input": row_result.get("input") or "",
+                "response_to_evaluate": output if output is not None else "",
+                "message_history": "\n\n".join(
+                    str(value)
+                    for value in (row_result.get("input"), output)
+                    if value is not None
+                ),
+                "expected_output": expected if expected is not None else "",
+                "ground_truth_context": (
+                    ground_truth if ground_truth is not None else ""
+                ),
+            }
+        )
+        return variables
+
+    def _criterion_error_result(
+        self,
+        base: Mapping[str, Any],
+        started_clock: float,
+        code: str,
+        message: str,
+    ) -> dict[str, Any]:
+        completed = datetime.now(UTC)
+        return {
+            **base,
+            "status": "ERROR",
+            "error": {"code": code, "message": message},
+            "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
+            "latency_ms": round((time.perf_counter() - started_clock) * 1000),
+        }
+
+    async def _run_scorer_for_result(
+        self,
+        row: Mapping[str, Any],
+        scorer: Scorer,
+    ) -> dict[str, Any]:
+        started = datetime.now(UTC)
+        started_clock = time.perf_counter()
+        base: dict[str, Any] = {
+            "row_index": row["row_index"],
+            "criterion_type": scorer.criterion_type,
+            "kind": "scorer",
+            "started_at": started.isoformat().replace("+00:00", "Z"),
+        }
+        if row.get("status") != "COMPLETE":
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "generation_incomplete",
+                "generation did not complete",
+            )
+        dataset_row = DatasetRow(
+            row_index=row["row_index"],
+            input=row.get("input"),
+            expected_output=row.get("expected_output"),
+            variables=dict(row.get("variables") or {}),
+            metadata=row.get("metadata"),
+        )
+        try:
+            score_value = scorer.fn(dataset_row, row.get("output"))
+            if inspect.isawaitable(score_value):
+                score_value = await score_value
+        except Exception as error:
+            return self._criterion_error_result(
+                base, started_clock, "scorer_raised", f"scorer fn raised: {error}"
+            )
+        if isinstance(score_value, bool):
+            score: float = 1.0 if score_value else 0.0
+        else:
+            maybe_score = numeric_score(score_value)
+            if maybe_score is None:
+                return self._criterion_error_result(
+                    base,
+                    started_clock,
+                    "invalid_score",
+                    "scorer fn must return a bool or a finite number, "
+                    f"got {score_value!r}",
+                )
+            score = maybe_score
+        if score < 0 or score > 1:
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "invalid_score",
+                f"scorer fn score must be between 0 and 1, got {score_value!r}",
+            )
+        completed = datetime.now(UTC)
+        return {
+            **base,
+            "status": "COMPLETE",
+            "score": score,
+            "reason": None,
+            "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
+            "latency_ms": round((time.perf_counter() - started_clock) * 1000),
+        }
+
+    async def _run_ld_judge_for_result(
+        self,
+        row: Mapping[str, Any],
+        handler: EvalHandler,
+        tool_handlers: dict[str, ToolImplementation],
+        judge: Judge,
+        resolved: ResolvedJudge,
+    ) -> dict[str, Any]:
+        started = datetime.now(UTC)
+        started_clock = time.perf_counter()
+        base: dict[str, Any] = {
+            "row_index": row["row_index"],
+            "criterion_type": judge.criterion_type,
+            "kind": "judge",
+            "judge_key": judge.key,
+            "started_at": started.isoformat().replace("+00:00", "Z"),
+            "variation_key": resolved.variation_key,
+            "version": resolved.version,
+        }
+        if row.get("status") != "COMPLETE":
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "generation_incomplete",
+                "generation did not complete",
+            )
+        # The config is passed unrendered: the handler owns the single
+        # parse_template pass, so ``{{...}}`` sequences inside generated output
+        # or dataset values are never re-expanded into the judge prompt.
+        variables = self._judge_variables(row, judge)
+        try:
+            result = await handler(
+                dict(resolved.config),
+                row.get("output"),
+                tool_handlers,
+                {
+                    **variables,
+                    "formatting_instructions": FORMATTING_INSTRUCTIONS,
+                },
+            )
+        except Exception as error:
+            return self._criterion_error_result(
+                base, started_clock, "handler_raised", f"judge handler raised: {error}"
+            )
+        if not isinstance(result, Mapping):
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "invalid_judge_output",
+                "judge handler result must be a mapping",
+            )
+        try:
+            raw_score, reason = parse_judge_response(
+                result.get("output", result.get("response"))
+            )
+        except ValueError as error:
+            return self._criterion_error_result(
+                base, started_clock, "invalid_judge_output", str(error)
+            )
+        score = numeric_score(raw_score)
+        if score is None or score < 0 or score > 1:
+            return self._criterion_error_result(
+                base,
+                started_clock,
+                "invalid_score",
+                f"judge score must be a number between 0 and 1, got {raw_score!r}",
+            )
+        completed = datetime.now(UTC)
+        event = {
+            **base,
+            "status": "COMPLETE",
+            "score": score,
+            "reason": reason,
+            "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
+            "latency_ms": round((time.perf_counter() - started_clock) * 1000),
+        }
+        usage = result.get("usage")
+        if isinstance(usage, Mapping):
+            event["usage"] = dict(usage)
+        return event
+
+    async def _run_criteria_for_results(
+        self,
+        rows: list[dict[str, Any]],
+        handler: EvalHandler,
+        tool_handlers: dict[str, ToolImplementation],
+        criteria: list[Criterion],
+        resolved_judges: Mapping[str, ResolvedJudge],
+        concurrency: int,
+    ) -> list[dict[str, Any]]:
+        """Run every (row, criterion) pair, bounded by the run's concurrency."""
+        controller = ConcurrencyController(concurrency)
+
+        async def run_one(
+            row: Mapping[str, Any], criterion: Criterion
+        ) -> dict[str, Any]:
+            await controller.acquire()
+            try:
+                if isinstance(criterion, Scorer):
+                    return await self._run_scorer_for_result(row, criterion)
+                return await self._run_ld_judge_for_result(
+                    row,
+                    handler,
+                    tool_handlers,
+                    criterion,
+                    resolved_judges[criterion.key],
+                )
+            finally:
+                controller.release()
+
+        return list(
+            await asyncio.gather(
+                *(run_one(row, criterion) for row in rows for criterion in criteria)
+            )
+        )
+
+    def _emit_evaluation_events(
+        self,
+        client: Any,
+        *,
+        project_key: str,
+        evaluation: EvaluationRef,
+        evaluation_run: EvaluationRunRef,
+        dataset: DatasetRef,
+        results: list[dict[str, Any]],
+    ) -> None:
+        context = to_ld_context(
+            client,
+            {
+                "kind": "evaluation",
+                "key": evaluation_run.id,
+                "projectKey": project_key,
+                "evaluationId": evaluation.id,
+            },
+        )
+        for result in results:
+            # One bad criterion result must not abort the run or drop the
+            # events queued for the results that preceded it.
+            try:
+                identity = {
+                    "projectKey": project_key,
+                    "evaluationId": evaluation.id,
+                    "evaluationRunId": evaluation_run.id,
+                    "runId": evaluation_run.id,
+                    "datasetId": dataset.id,
+                    "rowIndex": result["row_index"],
+                    "criterionType": result["criterion_type"],
+                }
+                event_id = hashlib.sha256(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                emitted_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                usage: TokenUsage | None = None
+                if result["kind"] == "judge" and isinstance(
+                    result.get("usage"), Mapping
+                ):
+                    normalized_usage = parse_usage(dict(result["usage"]))
+                    usage = TokenUsage(
+                        input_tokens=normalized_usage["input"],
+                        output_tokens=normalized_usage["output"],
+                    )
+                error = result.get("error")
+                error_message: str | None = None
+                if result["status"] == "ERROR":
+                    if isinstance(error, Mapping) and error.get("message"):
+                        error_message = str(error["message"])
+                    else:
+                        error_message = str(error) if error else "Unknown error"
+                common_payload: dict[str, Any] = {
+                    "project_key": project_key,
+                    "evaluation_id": evaluation.id,
+                    "evaluation_run_id": evaluation_run.id,
+                    "run_id": evaluation_run.id,
+                    "dataset_id": dataset.id,
+                    "row_index": result["row_index"],
+                    "criterion_type": result["criterion_type"],
+                    "event_id": event_id,
+                    "emitted_at": emitted_at,
+                    "evaluation_key": evaluation.key,
+                    "evaluation_version": evaluation.version,
+                    "dataset_key": dataset.key,
+                    "status": EvaluationStatus(result["status"]),
+                    "started_at": result["started_at"],
+                    "evaluated_at": result["evaluated_at"],
+                    "latency_ms": result["latency_ms"],
+                    "score": result.get("score"),
+                    "reason": result.get("reason"),
+                    "error": error,
+                    "error_message": error_message,
+                }
+                payload_model: EvaluationEventPayload
+                if result["kind"] == "judge":
+                    payload_model = LDJudgeEvaluationEventPayload(
+                        **common_payload,
+                        judge_key=result["judge_key"],
+                        variation_key=result["variation_key"],
+                        version=result.get("version"),
+                        usage=usage,
+                    )
+                else:
+                    payload_model = DeterministicScorerEvaluationEventPayload(
+                        **common_payload
+                    )
+                client.track(
+                    EVALUATION_EVENT_NAME, context, payload_model.to_track_payload(), 1
+                )
+            except Exception:
+                logger.exception(
+                    "Skipping evaluation event for row %s criterion %s",
+                    result.get("row_index"),
+                    result.get("criterion_type"),
+                )
+                continue
+            logger.info(
+                "%s emittedAt=%s eventId=%s",
+                EVALUATION_EVENT_NAME,
+                emitted_at,
+                event_id,
             )
 
     def _get_summary(

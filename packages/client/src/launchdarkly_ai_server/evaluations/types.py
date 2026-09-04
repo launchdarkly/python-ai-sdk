@@ -68,6 +68,16 @@ class ResolvedTool:
 
 
 @dataclass
+class ResolvedJudge:
+    """A LaunchDarkly AI Judge config variation resolved for an evaluation run."""
+
+    key: str
+    config: dict[str, Any]
+    variation_key: str = ""
+    version: int | None = None
+
+
+@dataclass
 class EvaluationRef:
     """Identifiers returned after creating an evaluation."""
 

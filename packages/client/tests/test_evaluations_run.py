@@ -9,8 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from launchdarkly_ai_server.evaluations import (
+    DatasetRow,
     EvaluationsError,
     HttpResponse,
+    Judge,
+    Scorer,
     init_evaluations,
 )
 
@@ -117,8 +120,9 @@ def lookup_order(order_id: str) -> str:
 @pytest.mark.asyncio
 async def test_complete_run_with_zero_failed_and_error_rows_passes(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger="launchdarkly_ai_server.evaluations.runner")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
     init_client = AsyncMock()
     monkeypatch.setattr(
@@ -278,7 +282,6 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     )
     assert transport.requests[5]["body"] == {
         "source": "api",
-        "rowCount": 2,
         "datasetId": "33333333-3333-3333-3333-333333333333",
     }
 
@@ -306,9 +309,13 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert event["emittedAt"].endswith("Z")
     assert datetime.fromisoformat(event["emittedAt"]).tzinfo is not None
     assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(event)
-    output_lines = capsys.readouterr().out.splitlines()
-    assert len(output_lines) == 2
-    assert output_lines[0] == (
+    emit_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "launchdarkly_ai_server.evaluations.runner"
+    ]
+    assert len(emit_logs) == 2
+    assert emit_logs[0] == (
         "$ld:ai:offline-evals:generation "
         f"emittedAt={event['emittedAt']} eventId={event['eventId']}"
     )
@@ -1033,3 +1040,594 @@ async def test_complete_run_with_error_rows_does_not_pass(
     assert "inputTokens" not in error_event
     assert "outputTokens" not in error_event
     assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(error_event)
+
+
+@pytest.mark.asyncio
+async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {
+                            "rowIndex": 42,
+                            "input": "Question {{id}}",
+                            "expectedOutput": "Answer {{id}}",
+                            "variables": {"id": "A"},
+                        }
+                    ],
+                    total=1,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        assert key == "$ld:ai:judge:accuracy"
+        # An empty or kindless context is invalid to the real LD SDK and would
+        # make every judge resolution fail.
+        assert context == {"kind": "evaluation", "key": "proj"}
+        return {
+            "config": {
+                "provider": {"name": "OpenAI"},
+                "model": {"name": "gpt-4o"},
+                "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
+            },
+            "meta": {"variationKey": "default", "version": 12},
+        }
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            assert user_input == "generated"
+            assert variables["response_to_evaluate"] == "generated"
+            assert variables["expected_output"] == "Answer A"
+            # The SDK hands the judge config over unrendered; the handler owns
+            # the single template pass.
+            assert config["instructions"] == (
+                "Judge {{response_to_evaluate}} against {{expected_output}}"
+            )
+            assert variables["formatting_instructions"].startswith(
+                "Your response MUST be in valid JSON"
+            )
+            return {
+                "output": '{"score": 0.86, "reasoning": "matches policy"}',
+                "usage": {"input_tokens": 640, "output_tokens": 48},
+            }
+        return {
+            "output": "generated",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        }
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    assert transport.requests[2]["body"]["criteria"] == [
+        {
+            "criterionType": "$ld:ai:judge:accuracy",
+            "options": {},
+        }
+    ]
+    assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    judge_event = next(event for event in events if event.get("kind") == "judge")
+    assert judge_event["criterionType"] == "$ld:ai:judge:accuracy"
+    assert judge_event["judgeKey"] == "$ld:ai:judge:accuracy"
+    assert judge_event["status"] == "COMPLETE"
+    assert judge_event["score"] == 0.86
+    assert judge_event["reason"] == "matches policy"
+    assert judge_event["usage"] == {"inputTokens": 640, "outputTokens": 48}
+    assert judge_event["variationKey"] == "default"
+    assert judge_event["version"] == 12
+    assert len(judge_event["eventId"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_missing_ld_judge_aborts_before_mutating_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = SequencedTransport([])
+
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        raise RuntimeError("not found")
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(
+        EvaluationsError,
+        match=r"Failed to resolve LaunchDarkly judge 'security-judge': not found",
+    ):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[Judge(key="security-judge")],
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "support-golden-v3"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {
+                            "rowIndex": 42,
+                            "input": "Ticket {{id}}",
+                            "expectedOutput": "refund row",
+                            "variables": {"id": "A"},
+                        }
+                    ],
+                    total=1,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {
+            "output": "refund exists",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        }
+
+    def check_refund(row: DatasetRow, output: Any) -> bool:
+        assert row.row_index == 42
+        assert row.input == "Ticket A"
+        assert output == "refund exists"
+        return "refund" in str(output)
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="support-golden-v3",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="refund-exists", fn=check_refund)],
+    )
+
+    assert result.passed is True
+    assert transport.requests[2]["body"]["criteria"] == [
+        {"criterionType": "refund-exists", "options": {"threshold": 1.0}}
+    ]
+    assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert scorer_event["projectKey"] == "proj"
+    assert scorer_event["evaluationId"] == "evaluation-id"
+    assert scorer_event["evaluationRunId"] == "run-id"
+    assert scorer_event["runId"] == "run-id"
+    assert scorer_event["datasetId"] == "dataset-id"
+    assert scorer_event["rowIndex"] == 42
+    assert scorer_event["criterionType"] == "refund-exists"
+    assert scorer_event["evaluationKey"] == "support-qa"
+    assert scorer_event["evaluationVersion"] == 3
+    assert scorer_event["datasetKey"] == "support-golden-v3"
+    assert scorer_event["status"] == "COMPLETE"
+    assert scorer_event["score"] == 1
+    assert "reason" not in scorer_event
+    assert "usage" not in scorer_event
+    assert scorer_event["latencyMs"] >= 0
+    assert scorer_event["startedAt"].endswith("Z")
+    assert scorer_event["evaluatedAt"].endswith("Z")
+    assert "judgeKey" not in scorer_event
+    assert "variationKey" not in scorer_event
+    assert "version" not in scorer_event
+
+
+def judge_run_transport(*, summary: dict[str, Any] | None = None) -> SequencedTransport:
+    """Transport for a one-row run that resolves a dataset, evaluation, and run."""
+    return SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {
+                            "rowIndex": 7,
+                            "input": "Question {{id}}",
+                            "expectedOutput": "Answer {{id}}",
+                            "variables": {"id": "A"},
+                        }
+                    ],
+                    total=1,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                summary
+                or {
+                    "statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}
+                },
+            ),
+        ]
+    )
+
+
+def accuracy_judge_variation(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "config": {
+                "provider": {"name": "OpenAI"},
+                "model": {"name": "gpt-4o"},
+                "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
+            },
+            "meta": {"variationKey": "default", "version": 12},
+        }
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+
+
+@pytest.mark.parametrize(
+    ("judge_output", "expected_code"),
+    [
+        ('{"score": "high (0.9)", "reasoning": "confident"}', "invalid_score"),
+        ('{"score": 3, "reasoning": "confident"}', "invalid_score"),
+        ('{"score": NaN, "reasoning": "confident"}', "invalid_score"),
+        ("the answer looks right to me", "invalid_judge_output"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bad_judge_output_emits_error_event_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    judge_output: str,
+    expected_code: str,
+) -> None:
+    transport = judge_run_transport()
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            return {"output": judge_output}
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    judge_event = next(event for event in events if event.get("kind") == "judge")
+    assert judge_event["status"] == "ERROR"
+    assert judge_event["error"]["code"] == expected_code
+    assert judge_event["errorMessage"] == judge_event["error"]["message"]
+    assert "score" not in judge_event
+    stub_sdk_client.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generated_placeholders_are_not_expanded_into_judge_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    from launchdarkly_ai_server import parse_template
+
+    transport = judge_run_transport()
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            rendered = parse_template(config["instructions"], variables)
+            # The placeholder smuggled in via the generated output must stay
+            # literal text after the handler's single render pass.
+            assert rendered == "Judge {{expected_output}} leaked? against Answer A"
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "{{expected_output}} leaked?"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    judge_event = next(event for event in events if event.get("kind") == "judge")
+    assert judge_event["status"] == "COMPLETE"
+    assert judge_event["score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_missing_expected_output_renders_empty_judge_variables(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page([{"rowIndex": 7, "input": "Question"}], total=1),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            assert variables["expected_output"] == ""
+            assert variables["ground_truth_context"] == ""
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_duplicate_criteria_rejected_before_any_request() -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(EvaluationsError, match="Duplicate evaluation criteria"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[
+                Judge(key="accuracy"),
+                Scorer(name="accuracy", fn=lambda row, output: True),
+            ],
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_errored_generation_row_emits_generation_incomplete_criterion_event(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport(
+        summary={"statusCounts": {"total": 1, "passed": 0, "error": 1, "pending": 0}}
+    )
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            raise AssertionError("judges must not run for errored generations")
+        raise RuntimeError("provider unavailable")
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is False
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    judge_event = next(event for event in events if event.get("kind") == "judge")
+    assert judge_event["status"] == "ERROR"
+    assert judge_event["error"]["code"] == "generation_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_failed_evaluation_event_tracking_skips_event_but_completes_run(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    accuracy_judge_variation(monkeypatch)
+
+    def track(event_name: str, *args: Any) -> None:
+        if event_name == "$ld:ai:offline-evals:evaluation":
+            raise RuntimeError("event pipeline unavailable")
+
+    stub_sdk_client.track = MagicMock(side_effect=track)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    stub_sdk_client.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_criteria_run_concurrently_within_the_concurrency_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    import asyncio
+
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {"rowIndex": index, "input": f"Question {index}"}
+                        for index in range(3)
+                    ],
+                    total=3,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 3, "passed": 3, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    in_flight = 0
+    max_in_flight = 0
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal in_flight, max_in_flight
+        if "Judge" in config.get("instructions", ""):
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        concurrency=2,
+    )
+
+    assert result.passed is True
+    assert max_in_flight == 2

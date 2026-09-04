@@ -22,11 +22,15 @@ from .conversation import (
     set_conversation_id_if_absent,
 )
 from .evaluations import (
+    Criterion,
+    DatasetRow,
     EvalRunResult,
     EvaluationsError,
     EvaluationsModule,
     GenerationConfig,
+    Judge,
     RunSummary,
+    Scorer,
     init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
@@ -166,10 +170,14 @@ __all__ = [  # noqa: RUF022
     "VariationMeta",
     # evaluations
     "EvalRunResult",
+    "Criterion",
+    "DatasetRow",
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
+    "Judge",
     "RunSummary",
+    "Scorer",
     "init_evaluations",
     # utils
     "create_handler",
