@@ -46,6 +46,7 @@ from .skills import (
     skill_refs,
 )
 from .skills_core import SkillStore
+from .skills_fdv2 import FDv2SkillStore, StoreDiagnostics
 from .skills_fs import (
     MANIFEST_FILENAME,
     MANIFEST_VERSION,
@@ -53,6 +54,7 @@ from .skills_fs import (
     OnUnavailable,
     write_skills,
 )
+from .skills_watch import SkillWatcher, watch_skills
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -237,6 +239,11 @@ __all__ = [  # noqa: RUF022
     "write_skills",
     "SkillStore",
     "InMemorySkillStore",
+    # skills — the FDv2 delivery transport, and the eager re-reconcile it enables
+    "FDv2SkillStore",
+    "StoreDiagnostics",
+    "watch_skills",
+    "SkillWatcher",
     # skills — the three closed-set unions a typed consumer needs to name
     "ReconcileActionKind",
     "OnUnavailable",

@@ -30,6 +30,8 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
+| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the `objectVersion`/`version` translation, the held object set, and `FDv2SkillStore`. Sits **below** the store seam; imports `skills_core` only, and nothing imports it |
+| `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
@@ -216,6 +218,60 @@ object's own `key` and `version`, which are revalidated anyway. `newest_by_key` 
 one place that collapses the result to one object per key, because both whole-store
 consumers need it — `all_skills`, since a list holding two versions of one key is not a set
 of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single path.
+
+### The delivery transport, and the one field that will bite you
+
+`FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
+`GET /sdk/stream`, server-side SDK key in `Authorization`, `basis` + `mv` params,
+`If-None-Match`/304). It lives below the seam and produces raw objects in the shape
+`skills_core.SkillStore` documents; **nothing above the seam knows it exists**. The transport
+design was replaced wholesale late in this feature's life and cost zero changes above this
+line, which is the strongest evidence the seam is drawn correctly. If a transport change ever
+seems to require editing an accessor, verification, or `write_skills`, the adapter boundary is
+wrong.
+
+**`objectVersion` is the skill's version. `version` is the payload's.** On the wire a skill
+`put-object` carries both, and they are not interchangeable:
+
+```json
+{"key":"pdf-extraction","kind":"inline-resource","category":"skill",
+ "objectVersion":3,"version":42,
+ "object":{"contentType":"text/markdown","content":"…","contentHash":"…","name":"…"}}
+```
+
+`objectVersion` (3) is what a `{key, version}` reference pins and what becomes the seam's
+`version`. `version` (42) is the version of the *payload* the object arrived in — it moves
+when anything in the environment moves, including a flag with nothing to do with skills.
+Reading it as the skill's version fails **silently**: the object verifies, the hash matches,
+and the caller gets content under a version number that means nothing. Flags and segments
+carry only `version` and omit both `category` and `objectVersion`, which is exactly why the
+two fields look interchangeable. `seam_object_from_put` is the only place the translation
+happens, and `TestVersionTranslation` asserts it in both directions.
+
+**Skills are identified by `kind == "inline-resource" && category == "skill"`; everything else
+is ignored, not rejected.** An environment's payload assignment carries the flagging payload
+alongside the agent-skill payload, so flag and segment objects arrive as a matter of course.
+Erroring on an unrecognised kind is the unknown-kind reconnect loop this feature must not
+reproduce — a flag-delivery outage caused by a skills rollout.
+
+**Changes commit at `payload-transferred`, not as objects arrive.** A payload version is the
+unit of consistency: a half-applied full transfer would publish a state the server never
+described, and would briefly empty the store — which, with pruning on, is the difference
+between a reconcile and deleting a customer's skill files. An interrupted transfer therefore
+leaves last known good intact, and listeners fire once per commit.
+
+**A hashless object is held, not dropped.** Verification withholds it with
+`missing_content_hash`; the transport's job is to make that loud (an error per object, a
+summary per wholly-hashless payload, `diagnostics.hashless_objects`) rather than to work
+around it. Dropping it at the transport would report `absent` — indistinguishable from "no
+such skill" — and would let a prune delete the last known-good copy on disk. Never synthesize
+a hash from the delivered content: that certifies the content against itself and verifies
+nothing.
+
+**`close` interrupts the socket, it does not just set a flag.** The delivery thread spends its
+life blocked in a read that no flag can reach, and closing a response from another thread does
+not unblock CPython's buffered reader. `_interrupt_read` shuts the socket down underneath it.
+Without that, every shutdown of a *healthy* stream blocks for the full join timeout.
 
 ### The reported outcome vocabulary, and the `Resolution` mapping
 
