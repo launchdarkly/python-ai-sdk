@@ -1394,6 +1394,136 @@ class TestCorruptManifest:
         assert _manifest_path(root).read_text(encoding="utf-8") == "{not json at all"
 
 
+# The three literal cases the security review names for the prune path.
+#
+# The distinction from ``TestCorruptManifest`` above is the whole point: a
+# corrupt manifest suppresses every destructive action wholesale, so those tests
+# say nothing about these. Each manifest here is *well-formed* — parseable,
+# a ``manifestVersion`` this release understands, a real ``entries`` map, and an
+# entry whose ``key`` is a perfectly valid skill key that is genuinely absent
+# from the requested set. The implementation has every input it needs to prune
+# and must refuse anyway, because the recorded *path* is not one this SDK could
+# have written.
+HOSTILE_RECORDED_PATHS: list[str] = [
+    # Absolute: the classic. A recorded path read back and unlinked as-is is a
+    # delete of an attacker-chosen file with the reconcile's privileges.
+    "/etc/passwd",
+    # Traversing: the same attack for an implementation that rejects a leading
+    # slash and then joins the rest onto the root.
+    "../../../etc/passwd",
+]
+
+
+class _UnlinkSpy:
+    """Records every ``os.unlink`` while delegating to the real one.
+
+    Asserting only that ``/etc/passwd`` still exists proves nothing: the test
+    process cannot delete it anyway, so that assertion passes against an
+    implementation with no path check at all — permissions would be doing the
+    work. What has teeth is that the removal is never *attempted*: the refusal
+    happens above the syscall, on a path the SDK recomputes rather than trusts.
+    """
+
+    def __init__(self) -> None:
+        self.targets: list[str] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _UnlinkSpy:
+        real = os.unlink
+
+        def spy(path: Any, *args: Any, **kwargs: Any) -> None:
+            self.targets.append(os.fsdecode(path))
+            real(path, *args, **kwargs)
+
+        # ``safe_fs_module.os`` *is* the ``os`` module, so this covers both the
+        # descriptor-relative ``os.unlink(name, dir_fd=...)`` and the
+        # ``Path.unlink`` used on the no-``*at()`` floor.
+        monkeypatch.setattr(safe_fs_module.os, "unlink", spy)
+        return self
+
+
+class TestHostileManifestPrune:
+    """A well-formed manifest naming a path this SDK could not have written.
+
+    The manifest is untrusted input. It is a plain file on the customer's disk
+    that anything with write access to the managed root can edit, and ``prune``
+    is the one code path in the SDK that deletes. So a recorded path never
+    authorizes its own removal: it must match ``<key>/SKILL.md`` for a
+    re-validated key, and the target is recomputed from the *current* managed
+    root instead of being read back out of the entry.
+    """
+
+    @pytest.mark.parametrize("recorded", HOSTILE_RECORDED_PATHS)
+    async def test_recorded_path_outside_the_root_is_refused(
+        self, root: Path, recorded: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spy = _UnlinkSpy().install(monkeypatch)
+        _write_manifest(
+            root,
+            {
+                "manifestVersion": 1,
+                "entries": {recorded: _entry("a", 1, SKILL_BODY)},
+            },
+        )
+
+        report = await write_skills([], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert action.error is not None
+        # The refusal is about ownership of the path, not about the file's state.
+        assert "could own" in action.error
+        assert [a for a in report.actions if a.action == "removed"] == []
+        # Nothing was even attempted, let alone completed.
+        assert spy.targets == []
+        assert Path("/etc/passwd").exists()
+        # Left in place rather than tidied away: dropping the entry would let a
+        # single hostile edit erase the SDK's own record of what it manages.
+        assert recorded in _read_manifest(root)["entries"]
+
+    async def test_entry_under_a_since_symlinked_parent_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The recorded path is the SDK's own, and is still not enough.
+
+        Here the entry is exactly what a legitimate reconcile writes —
+        ``a/SKILL.md`` under key ``a`` — so the shape check that catches the two
+        cases above passes. What changed is the disk underneath it: ``<root>/a``
+        is now a symlink to somewhere else. This is the case a validate-then-act
+        implementation fails, because the manifest and the entry are both
+        entirely legitimate; only the current state of the parent is not.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        victim = elsewhere / "SKILL.md"
+        victim.write_text("victim content\n", encoding="utf-8")
+
+        # Managed legitimately first, so the manifest entry is one this SDK
+        # really did write...
+        managed = _place_managed(root, "a", SKILL_BODY)
+        # ...then the parent directory is swapped for a link out of the root.
+        managed.unlink()
+        (root / "a").rmdir()
+        (root / "a").symlink_to(elsewhere, target_is_directory=True)
+
+        spy = _UnlinkSpy().install(monkeypatch)
+        report = await write_skills([], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert action.error is not None
+        assert "symlink" in action.error
+        assert [a for a in report.actions if a.action == "removed"] == []
+        assert spy.targets == []
+        # The file the symlink pointed at is untouched, and so is the link.
+        assert victim.read_text(encoding="utf-8") == "victim content\n"
+        assert (root / "a").is_symlink()
+        assert "a/SKILL.md" in _read_manifest(root)["entries"]
+
+
 class TestWriteSkillsTelemetry:
     """Materialized / revoked signals from write_skills."""
 
