@@ -1154,25 +1154,6 @@ class TestSymlinkAttacks:
         assert [a.action for a in report.actions if a.key == "a"] == ["removed"]
 
 
-_root_not_held = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "SEC-8985 row 2: the managed root is validated once but never held open, "
-        "so a root swapped for a symlink before <root>/<key> is opened redirects "
-        "the operation out of the root. Remove this marker once write_skills pins "
-        "the root and walks from it (dir_fd=root_fd)."
-    ),
-)
-"""
-Strict, so the day the fix lands these tests fail as XPASS and the marker has
-to go — they cannot silently stay "expected to fail" past the fix. Narrowed to
-``AssertionError`` so a harness breakage (an unexpected ``OSError``, a race
-that never fires) is reported as a real failure rather than absorbed as the
-known gap.
-"""
-
-
 @pytest.mark.skipif(
     not hasattr(os, "symlink"), reason="platform has no symlink support"
 )
@@ -1191,15 +1172,14 @@ class TestRootSwapRaces:
 
     ``TestSymlinkAttacks`` proves the ``<root>/<key>`` swap is closed. These
     three state the same contract for the root — nothing lands outside it, no
-    outside file is overwritten, no outside file is removed — and are marked
-    expected-to-fail because the code does not yet meet it. The fix is to pin
-    the root once at the top of ``write_skills`` and walk from it:
+    outside file is overwritten, no outside file is removed. The code does not
+    yet meet it, so they fail, and the red run is the demonstration. The fix is
+    to pin the root once at the top of ``write_skills`` and walk from it:
     ``os.mkdir(key, dir_fd=root_fd)``, ``os.open(key, ..., dir_fd=root_fd)``,
     and ``atomic_write(..., dir_fd=root_fd)`` for the manifest.
     """
 
     @_needs_dir_fd
-    @_root_not_held
     async def test_root_swapped_at_the_skill_directory_create_cannot_redirect_the_write(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1216,8 +1196,7 @@ class TestRootSwapRaces:
 
         report = await write_skills([_skill("a")], root)
 
-        if not race.swapped:
-            pytest.fail("the race never fired; the test proves nothing")
+        assert race.swapped is True, "the race never fired; the test proves nothing"
         assert list(outside.iterdir()) == []
         # Either the skill landed in the real root or the run says it did not.
         assert report.ok is False or (
@@ -1225,7 +1204,6 @@ class TestRootSwapRaces:
         )
 
     @_needs_dir_fd
-    @_root_not_held
     async def test_root_swapped_at_the_skill_directory_open_cannot_clobber_an_outside_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1245,8 +1223,7 @@ class TestRootSwapRaces:
 
         report = await write_skills([_skill("a", 2, "served update\n")], root)
 
-        if not race.swapped:
-            pytest.fail("the race never fired; the test proves nothing")
+        assert race.swapped is True, "the race never fired; the test proves nothing"
         assert victim.read_text(encoding="utf-8") == "precious\n"
         assert report.ok is False or (
             (race.moved_to / "a" / "SKILL.md").read_text(encoding="utf-8")
@@ -1254,7 +1231,6 @@ class TestRootSwapRaces:
         )
 
     @_needs_dir_fd
-    @_root_not_held
     async def test_root_swapped_at_the_prune_cannot_redirect_the_unlink(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1273,8 +1249,7 @@ class TestRootSwapRaces:
 
         report = await write_skills([], root)
 
-        if not race.swapped:
-            pytest.fail("the race never fired; the test proves nothing")
+        assert race.swapped is True, "the race never fired; the test proves nothing"
         assert victim.exists() and victim.read_text(encoding="utf-8") == "precious\n"
         assert report.ok is False or not (race.moved_to / "a" / "SKILL.md").exists()
 
