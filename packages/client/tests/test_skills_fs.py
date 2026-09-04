@@ -198,6 +198,56 @@ class _SwapDirectoryDuring:
         return self
 
 
+class _SwapRootDuring:
+    """Fires the *root*-swap race at the exact instant of an operation.
+
+    ``_SwapDirectoryDuring`` one level up: renames the managed root itself aside
+    and leaves a symlink to *outside* in its place, then lets the intercepted
+    call proceed. ``O_NOFOLLOW`` guards only the final path component, so an
+    ``os.mkdir`` or ``os.open`` of ``<root>/<key>`` issued after the swap is
+    resolved by the kernel *through* the link: the descriptor that comes back is
+    pinned to ``<outside>/<key>``, and every descriptor-relative step that
+    follows is relative to the wrong directory.
+
+    The attacker capability is write permission on the root's *parent*, not on
+    the root. The README's privilege-separation checklist denies the agent
+    identity the root, the skill directories, the files and the manifest, and
+    says nothing about the parent; in the documented layout
+    (``<app>/.claude/skills``) that parent is ``.claude``, which the agent
+    identity typically owns.
+
+    Fires once, on the first call whose path argument is ``<root>/<key>``; every
+    other call passes straight through.
+    """
+
+    def __init__(self, attribute: str, root: Path, key: str, outside: Path) -> None:
+        self.attribute = attribute
+        self.root = Path(os.path.realpath(root))
+        self.trigger = self.root / key
+        self.moved_to = self.root.parent / f"{self.root.name}.real"
+        self.outside = outside
+        self.swapped = False
+        self._real = getattr(os, attribute)
+
+    def __call__(self, first: Any, *args: Any, **kwargs: Any) -> Any:
+        # ``os.mkdir(path, mode)`` and ``os.open(path, flags, ...)`` both take the
+        # path first; descriptor-relative calls pass a bare name, which never
+        # compares equal to the absolute trigger.
+        if (
+            not self.swapped
+            and isinstance(first, (str, os.PathLike))
+            and Path(os.fspath(first)) == self.trigger
+        ):
+            os.rename(self.root, self.moved_to)
+            os.symlink(self.outside, self.root, target_is_directory=True)
+            self.swapped = True
+        return self._real(first, *args, **kwargs)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _SwapRootDuring:
+        monkeypatch.setattr(safe_fs_module.os, self.attribute, self)
+        return self
+
+
 _needs_dir_fd = pytest.mark.skipif(
     not safe_fs_module.SUPPORTS_DIR_FD,
     reason="no *at() family on this platform; the per-component lstat floor applies",
@@ -1102,6 +1152,106 @@ class TestSymlinkAttacks:
         assert victim.read_text(encoding="utf-8") == "precious\n"
         assert not (race.moved_to / "SKILL.md").exists()
         assert [a.action for a in report.actions if a.key == "a"] == ["removed"]
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"), reason="platform has no symlink support"
+)
+class TestRootSwapRaces:
+    """The swap one level up: the managed *root*, not ``<root>/<key>``.
+
+    ``_resolve_root`` validates the root once and returns a path; nothing holds
+    it open. Each write and each prune then opens ``<root>/<key>`` *by path*
+    with ``O_NOFOLLOW | O_DIRECTORY`` and pins that. ``O_NOFOLLOW`` guards only
+    the final component, so the root and every ancestor are re-resolved on
+    every such open, and a root swapped for a symlink after validation
+    redirects the open — and with it every descriptor-relative step behind it
+    — into the attacker's directory. ``atomic_write_in`` does refuse the
+    manifest rewrite afterwards, but by then the skill file is already outside
+    the root.
+
+    ``TestSymlinkAttacks`` proves the ``<root>/<key>`` swap is closed. These
+    three state the same contract for the root — nothing lands outside it, no
+    outside file is overwritten, no outside file is removed. The code does not
+    yet meet it, so they fail, and the red run is the demonstration. The fix is
+    to pin the root once at the top of ``write_skills`` and walk from it:
+    ``os.mkdir(key, dir_fd=root_fd)``, ``os.open(key, ..., dir_fd=root_fd)``,
+    and ``atomic_write(..., dir_fd=root_fd)`` for the manifest.
+    """
+
+    @_needs_dir_fd
+    async def test_root_swapped_at_the_skill_directory_create_cannot_redirect_the_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """First reconcile against a fresh root: the skill directory does not
+        exist yet, so ``open_or_create_directory`` calls ``os.mkdir(<root>/a)``.
+        The swap fires there; the ``mkdir`` and the ``O_NOFOLLOW`` open that
+        follows both resolve through the link, and ``SKILL.md`` is written into
+        ``<outside>/a/``."""
+        root = tmp_path / "skills"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        race = _SwapRootDuring("mkdir", root, "a", outside).install(monkeypatch)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert race.swapped is True, "the race never fired; the test proves nothing"
+        assert list(outside.iterdir()) == []
+        # Either the skill landed in the real root or the run says it did not.
+        assert report.ok is False or (
+            (race.moved_to / "a" / "SKILL.md").read_text(encoding="utf-8") == SKILL_BODY
+        )
+
+    @_needs_dir_fd
+    async def test_root_swapped_at_the_skill_directory_open_cannot_clobber_an_outside_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Update of an already-managed skill: the swap fires at the first
+        ``O_NOFOLLOW`` open of ``<root>/a`` (the orphan-temp sweep's), and the
+        write re-opens by path and inherits it. ``<outside>/a/SKILL.md`` — a
+        file the manifest never recorded — is replaced with LaunchDarkly-served
+        content."""
+        root = tmp_path / "skills"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        (outside / "a").mkdir(parents=True)
+        victim = outside / "a" / "SKILL.md"
+        victim.write_text("precious\n", encoding="utf-8")
+        _place_managed(root, "a", SKILL_BODY)
+        race = _SwapRootDuring("open", root, "a", outside).install(monkeypatch)
+
+        report = await write_skills([_skill("a", 2, "served update\n")], root)
+
+        assert race.swapped is True, "the race never fired; the test proves nothing"
+        assert victim.read_text(encoding="utf-8") == "precious\n"
+        assert report.ok is False or (
+            (race.moved_to / "a" / "SKILL.md").read_text(encoding="utf-8")
+            == "served update\n"
+        )
+
+    @_needs_dir_fd
+    async def test_root_swapped_at_the_prune_cannot_redirect_the_unlink(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The destructive side. A prune of a formerly-managed key opens
+        ``<root>/a`` by path, unlinks ``SKILL.md`` relative to that descriptor,
+        then ``rmdir``s the directory — all three resolve through the swapped
+        root, so an outside file and its directory are removed."""
+        root = tmp_path / "skills"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        (outside / "a").mkdir(parents=True)
+        victim = outside / "a" / "SKILL.md"
+        victim.write_text("precious\n", encoding="utf-8")
+        _place_managed(root, "a", SKILL_BODY)
+        race = _SwapRootDuring("open", root, "a", outside).install(monkeypatch)
+
+        report = await write_skills([], root)
+
+        assert race.swapped is True, "the race never fired; the test proves nothing"
+        assert victim.exists() and victim.read_text(encoding="utf-8") == "precious\n"
+        assert report.ok is False or not (race.moved_to / "a" / "SKILL.md").exists()
 
 
 class TestWithoutDirFd:
