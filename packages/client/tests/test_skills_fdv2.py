@@ -1094,7 +1094,9 @@ class TestFailureHandling:
         try:
             store.start()
             assert wait_until(lambda: store.failed is not None)
-            assert "3 consecutive failures" in store.failed or "gave up" in store.failed
+            # Four, not three: the bound is the number of failures *tolerated*,
+            # so the run that exceeds it is the one that gives up.
+            assert "gave up after 4 consecutive failures" in store.failed
         finally:
             store.close()
 
