@@ -510,6 +510,31 @@ resolving to the skill directory's `(st_dev, st_ino)`) instead of by comparing p
 A spy must `fstat` the descriptor **inside** the intercepted call — the implementation closes
 it as soon as the write returns.
 
+**The platform bound is POSIX-only, and that is a decision — do not quietly "fix" it.**
+Windows reparse-point checks (`GetFileAttributesW`, `FILE_FLAG_OPEN_REPARSE_POINT`) are not
+implemented because Windows is not a supported or tested platform for this release: there is
+no Windows CI runner in either repository, so the checks would ship unverified, and the
+TypeScript SDK could not match them at all — Node exposes no `*at()` family on *any*
+platform, so its racy floor is universal rather than Windows-only. Implementing them in
+Python alone would break cross-language parity and trade a documented bound for an unverified
+one. Two follow-on facts: on Windows write permission on the managed root is the only
+boundary, which is why the privilege-separated deployment is documented as the mitigation
+rather than as advice; and this bound retroactively lowers the priority of the reserved-device-name
+work above — keep that code, but do not read it as evidence that Windows is hardened. If
+Windows becomes a supported platform, revisit both together, and add the CI runner first.
+
+**Privilege separation is the deployment-side half of this, and `ReconcileReport` must not
+grow a writability field.** The recommended deployment runs the reconcile as a different
+identity than the agent, so the `0644`/`0755` modes above actually deny something: the agent
+reads its instructions and cannot rewrite them or the manifest. That is the mitigation for a
+prompt-injected agent editing its own skills. The security review asked for the report to
+surface whether the managed root is writable; we declined, and the reasoning is load-bearing
+rather than a preference. The SDK knows only its *own* identity, which trivially has write
+access — it just wrote there — and cannot know which identity will later run the agent. Any
+check it could perform would answer a different question than the one asked and would create
+false confidence exactly where caution is wanted. The operator's verification steps live in
+the README instead. Do not add the field.
+
 ### Deferred: bounded retries
 
 `timeout` is implemented — a monotonic deadline, checked before each retrieval, before

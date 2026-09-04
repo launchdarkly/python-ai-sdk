@@ -272,7 +272,12 @@ async def main():
 asyncio.run(main())
 ```
 
-Pass `"*"` instead of a reference list to materialize every skill the store holds.
+Pass `"*"` instead of a reference list to materialize every skill the store holds — but know
+what you are asking for. `"*"` materializes the **whole project library**, which puts every
+skill's `description` into the agent's context, including skills no AI Config references and
+skills belonging to other teams. `write_skills(skill_refs(...), root)` is the form used above
+because it materializes only what the resolved variation actually asked for; reach for `"*"`
+when you genuinely want the whole library on disk.
 
 **`skills` is now a validated field.** Config parsing fails closed on a `skills` value that
 is not a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an
@@ -406,6 +411,19 @@ never writes through a symlink; writes are atomic (temp file, `fsync`, rename) a
 `0644`; and if the manifest is unreadable it performs no destructive action at all. Removing
 a skill from a variation is how revocation works — the next reconcile prunes it.
 
+**Platform bound: the descriptor-pinned guarantee is POSIX-only.** On POSIX every destructive
+step — the open, the rename, the unlink — runs relative to a directory descriptor opened
+`O_RDONLY|O_DIRECTORY|O_NOFOLLOW` and held for the whole reconcile, so a directory swapped for
+a symlink *after* its checks cannot redirect a write or a delete: the descriptor names the
+inode that was checked, which closes the swap window rather than narrowing it. Windows has no
+`*at()` syscall family, so there `write_skills` falls back to a per-component `lstat` check
+taken immediately before each step. That floor is a check-then-use race rather than a closed
+window: an attacker who already holds **write permission on the managed root** can still win
+it. Windows reparse-point checks (`GetFileAttributesW` / `FILE_FLAG_OPEN_REPARSE_POINT`) are
+deliberately not implemented in this release, and Windows is not a tested platform for it —
+neither SDK repository has a Windows CI runner. Treat write permission on the managed root as
+the security boundary on every platform, and on Windows as the *only* one.
+
 **One exception, and it is what makes a crashed reconcile recoverable.** A file at a managed
 path whose bytes are *already byte-identical* to the content LaunchDarkly resolved is
 adopted — recorded in the manifest and reported `skipped_current` — rather than refused.
@@ -476,6 +494,54 @@ to key its own map however the transport underneath does.
 > `Skill.content` is `bytes` — the verified verbatim bytes LaunchDarkly delivered, exactly
 > what was hashed. The SDK never parses or interprets them; if you want the frontmatter,
 > decode and parse the content on your side.
+
+#### Privilege separation: the agent must not be able to rewrite its own skills
+
+**The recommended deployment runs `write_skills` as a different identity than the agent.**
+Reconcile as one user, run the agent as another. Everything the reconcile puts on disk is
+owner-write-only, and set explicitly rather than inherited from your umask: skill files and
+the manifest at `0644` (via `fchmod` on the descriptor, so it cannot be redirected), the
+per-skill `<root>/<key>/` directories at `0755`, and the execute bit never set on anything.
+Those modes are only a defense if the two identities actually differ — under a single identity
+they describe a directory the agent can freely rewrite.
+
+**What to verify, as the identity that will run the agent.** The SDK cannot check this for you
+(see below), so make it a deployment step: confirm the agent's identity has no write access to
+
+- the managed root itself,
+- the per-skill directories `<root>/<key>/` and the files `<root>/<key>/SKILL.md`,
+- the manifest at `<root>/.launchdarkly-skills.json`.
+
+```bash
+# Run as the agent's user. Every line should print DENIED.
+root=.claude/skills
+for target in "$root" "$root/.launchdarkly-skills.json" "$root"/*/ "$root"/*/SKILL.md; do
+  [ -e "$target" ] || continue
+  if [ -w "$target" ]; then echo "WRITABLE — fix this: $target"; else echo "DENIED: $target"; fi
+done
+```
+
+Note that the managed root's own mode is **yours, not the SDK's**: `write_skills` creates only
+that one leaf directory and does so with your umask, precisely because the root is a path you
+chose. Own it — `chown reconcile-user:agent-group` and `chmod 0755` on the root is the shape
+that makes the rest of the tree's modes mean something.
+
+**Why this is the mitigation that matters.** A `SKILL.md` is agent *instructions*. An agent
+that can write its own skills directory can rewrite its own instructions, and an agent
+processing untrusted input is exactly the thing that might be induced to do so. Write access
+to the manifest is worse than write access to a skill, because the manifest is what tells the
+*next* reconcile which paths the SDK owns and may delete: an agent that can edit it can keep a
+skill LaunchDarkly has revoked, or aim the SDK's own delete path at something it should not
+touch. `write_skills` re-validates every manifest entry from scratch for exactly that reason —
+it treats that file as untrusted input, never as authorization — but an agent that cannot edit
+it at all is the stronger position, and only your deployment can provide that.
+
+**The SDK deliberately does not report whether the root is writable.** There is no such field
+on `ReconcileReport`, and its absence is a decision rather than an oversight. The SDK knows
+only its own identity, which trivially has write access — it just wrote there. It cannot know
+which identity will later run the agent, so any check it could make would answer a different
+question than the one that matters, and would read as reassurance exactly where caution is
+wanted. You know both identities; the SDK knows one.
 
 ---
 
