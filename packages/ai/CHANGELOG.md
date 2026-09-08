@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.4...launchdarkly-ai-python-0.1.5) (2026-09-08)
+
+
+### Bug Fixes
+
+* pin hatchling build backend to a metadata-compatible range ([#73](https://github.com/launchdarkly/python-ai-sdk/issues/73)) ([1f293a6](https://github.com/launchdarkly/python-ai-sdk/commit/1f293a60a772de1f7c7b3f05caba0c0b22c5591e))
+
 ## [0.1.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.3...launchdarkly-ai-python-0.1.4) (2026-09-08)
 
 

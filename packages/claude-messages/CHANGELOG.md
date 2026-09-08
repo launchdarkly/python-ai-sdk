@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-messages-0.2.0...launchdarkly-ai-claude-messages-0.2.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* pin hatchling build backend to a metadata-compatible range ([#73](https://github.com/launchdarkly/python-ai-sdk/issues/73)) ([1f293a6](https://github.com/launchdarkly/python-ai-sdk/commit/1f293a60a772de1f7c7b3f05caba0c0b22c5591e))
+
 ## [0.2.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-messages-0.1.4...launchdarkly-ai-claude-messages-0.2.0) (2026-09-08)
 
 
