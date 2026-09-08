@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.5...launchdarkly-ai-python-0.1.6) (2026-09-08)
+
+
+### Bug Fixes
+
+* document docs link in package docstrings ([#76](https://github.com/launchdarkly/python-ai-sdk/issues/76)) ([b75366d](https://github.com/launchdarkly/python-ai-sdk/commit/b75366df3a740753d45995f93d649d46e1ddf6b7))
+
 ## [0.1.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.4...launchdarkly-ai-python-0.1.5) (2026-09-08)
 
 
