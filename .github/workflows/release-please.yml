@@ -75,7 +75,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-client-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-client-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
@@ -106,7 +106,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-ai-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-ai-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
@@ -137,7 +137,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-claude-agents-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-claude-agents-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
@@ -168,7 +168,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-claude-messages-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-claude-messages-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
@@ -199,7 +199,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-openai-agents-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-openai-agents-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
@@ -230,7 +230,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-openai-messages-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-openai-messages-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
@@ -261,7 +261,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-langchain-agents-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-langchain-agents-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
@@ -292,7 +292,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    if: ${{ needs.release-please.outputs.package-langchain-messages-released == 'true' }}
+    if: ${{ !cancelled() && needs.release-please.outputs.package-langchain-messages-released == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/ci
