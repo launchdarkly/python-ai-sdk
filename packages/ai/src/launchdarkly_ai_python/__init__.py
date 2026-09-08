@@ -1,4 +1,7 @@
-"""LaunchDarkly AI SDK - convenience package for Python."""
+"""LaunchDarkly AI SDK - convenience package for Python.
+
+See https://launchdarkly.com/docs for usage.
+"""
 
 __version__ = "0.1.5"  # x-release-please-version
 
