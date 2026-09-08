@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.2.1...launchdarkly-ai-langchain-agents-0.2.2) (2026-09-08)
+
+
+### Bug Fixes
+
+* document docs link in package docstrings ([#76](https://github.com/launchdarkly/python-ai-sdk/issues/76)) ([b75366d](https://github.com/launchdarkly/python-ai-sdk/commit/b75366df3a740753d45995f93d649d46e1ddf6b7))
+
 ## [0.2.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.2.0...launchdarkly-ai-langchain-agents-0.2.1) (2026-09-08)
 
 
