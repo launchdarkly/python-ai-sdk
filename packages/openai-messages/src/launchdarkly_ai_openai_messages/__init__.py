@@ -1,6 +1,6 @@
 """LaunchDarkly AI SDK - integration for OpenAI messages."""
 
-__version__ = "0.1.4"  # x-release-please-version
+__version__ = "0.2.0"  # x-release-please-version
 
 from launchdarkly_ai_server import register_ai_sdk_package
 
