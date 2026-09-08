@@ -1,4 +1,7 @@
-"""LaunchDarkly AI SDK - core client for Python."""
+"""LaunchDarkly AI SDK - core client for Python.
+
+See https://launchdarkly.com/docs for usage.
+"""
 
 __version__ = "0.2.1"  # x-release-please-version
 

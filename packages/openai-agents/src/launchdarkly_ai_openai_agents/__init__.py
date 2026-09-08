@@ -1,4 +1,7 @@
-"""LaunchDarkly AI SDK - integration for OpenAI agents."""
+"""LaunchDarkly AI SDK - integration for OpenAI agents.
+
+See https://launchdarkly.com/docs for usage.
+"""
 
 __version__ = "0.2.1"  # x-release-please-version
 
