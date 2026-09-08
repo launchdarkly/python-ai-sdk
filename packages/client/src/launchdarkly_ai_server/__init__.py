@@ -1,6 +1,6 @@
 """LaunchDarkly AI SDK - core client for Python."""
 
-__version__ = "0.1.3"  # x-release-please-version
+__version__ = "0.2.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .content import (
