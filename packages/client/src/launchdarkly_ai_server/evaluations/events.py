@@ -91,6 +91,11 @@ class LDJudgeEvaluationEventPayload(EvaluationEventPayload):
     variation_key: str
     version: int | None = None
     usage: TokenUsage | None = None
+    # "lower_is_better" or "upper_is_better"; None when direction is unresolved (e.g.
+    # Gonfalon hasn't deployed the flag-payload change yet, or a custom judge with no
+    # direction set). Direction is authoritative from LaunchDarkly, never trusted from
+    # the client for verdict computation.
+    success_direction: str | None = None
 
     def to_track_payload(self) -> dict[str, Any]:
         payload = super().to_track_payload()
@@ -100,6 +105,8 @@ class LDJudgeEvaluationEventPayload(EvaluationEventPayload):
             payload["version"] = self.version
         if self.usage is not None:
             payload["usage"] = self.usage.to_wire()
+        if self.success_direction is not None:
+            payload["successDirection"] = self.success_direction
         return payload
 
 

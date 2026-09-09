@@ -183,6 +183,11 @@ class EvaluationsRunner:
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
                 else None,
+                # Absent (e.g. Gonfalon hasn't deployed the flag-payload change yet, or a
+                # custom judge with no direction set) resolves to None, not a raised error.
+                is_inverted=config.get("isInverted")
+                if isinstance(config.get("isInverted"), bool)
+                else None,
             )
         return resolved
 
@@ -678,6 +683,7 @@ class EvaluationsRunner:
             "started_at": started.isoformat().replace("+00:00", "Z"),
             "variation_key": resolved.variation_key,
             "version": resolved.version,
+            "is_inverted": resolved.is_inverted,
         }
         if row.get("status") != "COMPLETE":
             return self._criterion_error_result(
@@ -852,12 +858,19 @@ class EvaluationsRunner:
                 }
                 payload_model: EvaluationEventPayload
                 if result["kind"] == "judge":
+                    is_inverted = result.get("is_inverted")
+                    success_direction: str | None = None
+                    if is_inverted is True:
+                        success_direction = "lower_is_better"
+                    elif is_inverted is False:
+                        success_direction = "upper_is_better"
                     payload_model = LDJudgeEvaluationEventPayload(
                         **common_payload,
                         judge_key=result["judge_key"],
                         variation_key=result["variation_key"],
                         version=result.get("version"),
                         usage=usage,
+                        success_direction=success_direction,
                     )
                 else:
                     payload_model = DeterministicScorerEvaluationEventPayload(
