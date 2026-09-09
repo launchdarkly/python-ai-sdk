@@ -1153,6 +1153,109 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
     assert judge_event["variationKey"] == "default"
     assert judge_event["version"] == 12
     assert len(judge_event["eventId"]) == 64
+    # No threshold was set on the Judge, so there's nothing to compare the score
+    # against -- verdict must be omitted rather than sent as verdict=None.
+    assert "verdict" not in judge_event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_inverted", "threshold", "expected_verdict"),
+    [
+        # score is fixed at 0.86 in the handler below.
+        (False, 0.8, "pass"),  # upper-is-better, 0.86 >= 0.8
+        (False, 0.9, "fail"),  # upper-is-better, 0.86 < 0.9
+        (True, 0.9, "pass"),  # lower-is-better, 0.86 <= 0.9
+        (True, 0.5, "fail"),  # lower-is-better, 0.86 > 0.5
+        (None, 0.8, "pass"),  # unresolved direction defaults to upper-is-better
+    ],
+)
+async def test_run_with_ld_judge_computes_verdict_from_score_threshold_and_direction(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    is_inverted: bool | None,
+    threshold: float,
+    expected_verdict: str,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {
+                            "rowIndex": 42,
+                            "input": "Question {{id}}",
+                            "expectedOutput": "Answer {{id}}",
+                            "variables": {"id": "A"},
+                        }
+                    ],
+                    total=1,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "provider": {"name": "OpenAI"},
+            "model": {"name": "gpt-4o"},
+            "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
+        }
+        if is_inverted is not None:
+            config["isInverted"] = is_inverted
+        return {
+            "config": config,
+            "meta": {"variationKey": "default", "version": 12},
+        }
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            return {
+                "output": '{"score": 0.86, "reasoning": "matches policy"}',
+                "usage": {"input_tokens": 640, "output_tokens": 48},
+            }
+        return {
+            "output": "generated",
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        }
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy", threshold=threshold)],
+    )
+
+    assert result.passed is True
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    judge_event = next(event for event in events if event.get("kind") == "judge")
+    assert judge_event["verdict"] == expected_verdict
 
 
 @pytest.mark.asyncio

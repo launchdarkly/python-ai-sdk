@@ -15,6 +15,18 @@ class EvaluationEventKind(StrEnum):
     SCORER = "scorer"
 
 
+class EvaluationVerdict(StrEnum):
+    """Pass/fail outcome for one criterion result on one row.
+
+    Computed by the SDK, not the server: for a judge, the SDK compares score
+    against threshold using the judge's own direction (isInverted) before this
+    verdict is ever put on the wire.
+    """
+
+    PASS = "pass"
+    FAIL = "fail"
+
+
 @dataclass(frozen=True)
 class TokenUsage:
     """Token usage reported by an LD Judge provider call."""
@@ -51,6 +63,7 @@ class EvaluationEventPayload:
     latency_ms: int
     evaluation_version: int | None = None
     score: float | None = None
+    verdict: EvaluationVerdict | None = None
     reason: str | None = None
     error: dict[str, Any] | None = None
     error_message: str | None = None
@@ -75,6 +88,7 @@ class EvaluationEventPayload:
             "evaluatedAt": self.evaluated_at,
             "latencyMs": self.latency_ms,
             "score": self.score,
+            "verdict": self.verdict.value if self.verdict is not None else None,
             "reason": self.reason,
             "error": self.error,
             "errorMessage": self.error_message,

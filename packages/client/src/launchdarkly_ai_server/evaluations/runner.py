@@ -29,6 +29,7 @@ from .events import (
     DeterministicScorerEvaluationEventPayload,
     EvaluationEventPayload,
     EvaluationStatus,
+    EvaluationVerdict,
     LDJudgeEvaluationEventPayload,
     TokenUsage,
 )
@@ -182,6 +183,11 @@ class EvaluationsRunner:
                 variation_key=str(meta.get("variationKey") or ""),
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
+                else None,
+                # Absent (e.g. Gonfalon hasn't deployed the flag-payload change yet, or a
+                # custom judge with no direction set) resolves to None, not a raised error.
+                is_inverted=config.get("isInverted")
+                if isinstance(config.get("isInverted"), bool)
                 else None,
             )
         return resolved
@@ -727,11 +733,23 @@ class EvaluationsRunner:
                 "invalid_score",
                 f"judge score must be a number between 0 and 1, got {raw_score!r}",
             )
+        verdict: EvaluationVerdict | None = None
+        if judge.threshold is not None:
+            # An unresolved direction (e.g. Gonfalon hasn't deployed the flag-payload
+            # change yet, or a custom judge with none set) defaults to upper-is-better,
+            # matching Gonfalon's own default for a judge with no stored isInverted.
+            passed = (
+                score <= judge.threshold
+                if resolved.is_inverted
+                else score >= judge.threshold
+            )
+            verdict = EvaluationVerdict.PASS if passed else EvaluationVerdict.FAIL
         completed = datetime.now(UTC)
         event = {
             **base,
             "status": "COMPLETE",
             "score": score,
+            "verdict": verdict,
             "reason": reason,
             "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
             "latency_ms": round((time.perf_counter() - started_clock) * 1000),
@@ -846,6 +864,7 @@ class EvaluationsRunner:
                     "evaluated_at": result["evaluated_at"],
                     "latency_ms": result["latency_ms"],
                     "score": result.get("score"),
+                    "verdict": result.get("verdict"),
                     "reason": result.get("reason"),
                     "error": error,
                     "error_message": error_message,
