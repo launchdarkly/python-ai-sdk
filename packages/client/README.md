@@ -469,8 +469,8 @@ finally:
 ```
 
 **Nothing above the store changes.** The accessors, integrity verification, and
-`write_skills` are transport-agnostic: they see raw objects through the `SkillStore` seam and
-cannot tell which store produced them. Everything documented above about verification and
+`write_skills` are transport-agnostic: they see raw objects through the `SkillStore`
+interface and cannot tell which store produced them. Everything documented above about verification and
 reconcile semantics applies unchanged.
 
 **Server-side only.** Skills are for server-side agent runtimes and skill content is
@@ -491,9 +491,9 @@ They are skipped, not evaluated â€” this store does no evaluation of any kind â€
 
 > **Beta caveats, worth knowing before you deploy.** Payload signing does not exist on this
 > channel yet, so delivery is TLS-only and the content hash establishes self-consistency, not
-> origin authenticity. FDv2 is opt-in per account: without it the endpoints return HTTP 403,
-> which the store reports as a fatal error naming the setting. `ld-relay` does not speak the
-> FDv2 endpoints, so relay-only deployments cannot receive skills.
+> origin authenticity. The FDv2 protocol is opt-in per account: without it the endpoints
+> return HTTP 403, which the store reports as a fatal error explaining what to do. `ld-relay`
+> does not speak the FDv2 endpoints, so relay-only deployments cannot receive skills.
 
 **If every skill comes back empty, check `diagnostics.hashless_objects`.** Verification
 requires `contentHash` on the delivered object and withholds anything without one, so a

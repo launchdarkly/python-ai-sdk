@@ -1,37 +1,25 @@
 """
 Agent Skills — the FDv2 delivery transport.
 
-The store implementation that actually talks to LaunchDarkly. It sits *below*
-the ``SkillStore`` seam, not above it: it produces raw wire objects in the shape
+The store implementation that talks to LaunchDarkly. It sits *below* the
+``SkillStore`` interface: it produces raw wire objects in the shape
 ``skills_core`` documents, and everything above — the accessors, integrity
-verification, the ``Skill`` dataclass, materialization — is unchanged and
-unaware of it. That is the whole point of the seam, and the fact that replacing
-the transport design wholesale cost nothing above this line is the evidence it
-was drawn in the right place.
+verification, the ``Skill`` dataclass, materialization — is unaware of it.
 
 Layering::
 
     launchdarkly_ai_server
-      └─ SkillStore protocol (skills_core)     ── duck-typed accessor surface
-            └─ FDv2SkillStore (this module)    ── deserialize, hold, serve
-                  └─ the SDK-facing FDv2 channel on FDCore
+      └─ SkillStore protocol (skills_core)     ── the interface accessors call
+            └─ FDv2SkillStore (this module)    ── deserialise, hold, serve
+                  └─ LaunchDarkly's SDK-facing FDv2 channel
                      GET /sdk/poll, GET /sdk/stream, authenticated with the
                      environment's server-side SDK key
 
-Dependencies run one way. This module imports ``skills_core`` for the seam's
-kind constant and nothing else from the feature; ``skills.py`` and
+Dependencies run one way. This module imports ``skills_core`` for the
+interface's kind constant and nothing else from the feature; ``skills.py`` and
 ``skills_fs.py`` do not import it. It uses only the standard library, so the
 content path adds no dependency to a package whose sole runtime dependency is
 ``opentelemetry-api`` and whose LaunchDarkly base-SDK dependency is optional.
-
-**There is no bespoke private route here, deliberately.** An earlier design had
-this adapter poll ``/private/flagdlv/payloads/{id}/latest/obj/skill/{key}``.
-Those are gonfalon private endpoints authenticated by Cognito machine-token
-OAuth scopes with no per-tenant authorization; the security review ruled out
-both relaxing that auth and shipping a machine credential to a customer host.
-This transport uses the genuinely SDK-facing channel instead, which is also the
-channel payload signing will eventually cover. Do not reintroduce the private
-route.
 
 What this module does *not* do, on purpose:
 
@@ -42,8 +30,8 @@ What this module does *not* do, on purpose:
 - **It does not skip verification when the wire envelope has no
   ``contentHash``.** See ``_SkillObjectSet.put`` and ``StoreDiagnostics``: a
   hashless object is stored verbatim and *withheld* by verification with
-  ``missing_content_hash``, and this module's job is to make that outcome loud
-  rather than to paper over it.
+  ``missing_content_hash``. Making that outcome visible is this module's job;
+  working around it is not.
 - **It does not evaluate anything.** No flags, no segments, no targeting. Skills
   have no targeting; the SDK key fully determines the payload.
 """
@@ -77,11 +65,11 @@ FDV2_OBJECT_KIND = "inline-resource"
 """
 The FDv2 ``kind`` skills are delivered under.
 
-Distinct from ``skills_core.SKILL_OBJECT_KIND`` (``"skill"``), which is the
-*seam* value the SDK asks a store for. Translating this pair — kind
-``inline-resource`` plus category ``skill`` — onto that single value is exactly
-the adapter's job, and the reason ``SKILL_OBJECT_KIND`` is documented as a seam
-string rather than as the wire contract.
+Distinct from ``skills_core.SKILL_OBJECT_KIND`` (``"skill"``), which is the value
+the SDK asks a store for. Translating this pair — kind ``inline-resource`` plus
+category ``skill`` — onto that single value is the adapter's job, which is why
+``SKILL_OBJECT_KIND`` is documented as an interface value rather than as the wire
+contract.
 """
 
 FDV2_OBJECT_CATEGORY = "skill"
@@ -98,11 +86,8 @@ SDK_DATA_MODEL_VERSION = 1
 """
 The ``mv`` request parameter — the SDK data model version this adapter speaks.
 
-Overridable through ``FDv2SkillStore(data_model_version=...)`` because it is the
-one request parameter this side cannot verify: the LaunchDarkly base SDK's own
-FDv2 data source does not send ``mv`` at all today, and the streamer branch that
-carries skills is unmerged, so the value the server expects has not been
-observed. Confirm it with FDN before Beta rather than trusting this default.
+Override it with ``FDv2SkillStore(data_model_version=...)`` if a LaunchDarkly
+instance expects a different value.
 """
 
 _EVENT_SERVER_INTENT = "server-intent"
@@ -121,11 +106,10 @@ _ENVELOPE_FIELDS = ("contentType", "content", "contentHash", "name", "descriptio
 """
 The skill object envelope's fields, copied through verbatim.
 
-``contentHash`` is listed here and is the field the whole content path waits on;
-see ``StoreDiagnostics``. Nothing here is coerced, defaulted, or normalised —
-everything a store serves is untrusted input and is revalidated above the seam,
-so a transport that "helpfully" filled in a field would be forging the very
-thing verification exists to check.
+Nothing here is coerced, defaulted, or normalised: everything a store serves is
+untrusted input and is revalidated above the store interface, so a transport
+that filled in a missing field would be forging the very thing verification
+exists to check.
 """
 
 Mode = Literal["stream", "poll"]
@@ -149,13 +133,11 @@ def _require_server_side_credential(sdk_key: str) -> None:
     """
     Refuses a mobile key or a client-side environment ID.
 
-    Skills are for server-side agent runtimes. The payload assignment that
-    carries them is shared by every auth type, so the skill payload ID is
-    appended for mobile and environment-ID auth too — which means a client-side
-    credential may well *succeed* against these endpoints and deliver
-    customer-confidential skill content to a client-side process. Failing here
-    is the SDK-side half of that boundary; excluding skills at assignment time
-    is the platform-side half, and is an open ask on FDN (design §3.1c).
+    Skills are for server-side agent runtimes, and skill content is
+    customer-confidential. Payload assignment is shared across credential types,
+    so a client-side credential may well *succeed* against these endpoints and
+    deliver skill content to a client-side process. Refusing one here is what
+    keeps that from happening.
 
     Raises ``ValueError`` rather than logging, because there is no degraded mode
     that is correct: a store built on the wrong credential should not exist.
@@ -203,10 +185,9 @@ class StoreDiagnostics:
     """
     What the transport has seen. Read-only from a caller's perspective.
 
-    Not part of the ``SkillStore`` seam — nothing above the seam reads this — but
-    the difference between "this environment has no skills" and "every skill was
-    withheld" is the single most confusing failure this feature can produce, and
-    a counter a caller can assert on beats reading logs.
+    Not part of the ``SkillStore`` interface — nothing above it reads this — but
+    "this environment has no skills" and "every skill was withheld" are easy to
+    mistake for each other, and a counter is easier to assert on than a log line.
     """
 
     payloads_transferred: int = 0
@@ -225,8 +206,7 @@ class StoreDiagnostics:
 
     **Nonzero means skills are being withheld.** Verification withholds a
     hashless object with ``missing_content_hash``, so every one of these is a
-    skill that will never resolve. The field exists so that outcome is a number
-    a caller can read rather than an empty store they have to explain.
+    skill whose content will not resolve.
     """
     connection_failures: int = 0
     """Recoverable transport failures since the last successful transfer."""
@@ -256,10 +236,9 @@ def is_skill_event(data: Any) -> bool:
     categories, and flags and segments omit ``category`` entirely.
 
     Every other kind is **ignored, not rejected**. An environment's payload
-    assignment carries the flagging payload alongside the agent-skill payload, so
-    a connection delivers flag and segment objects as a matter of course. Erroring
-    on them would turn a normal payload into a permanent failure — which is
-    exactly the unknown-kind reconnect loop this feature must not reproduce.
+    assignment carries its flag payload alongside its agent-skill payload, so a
+    connection delivers flag and segment objects as a matter of course; erroring
+    on them would turn a normal payload into a permanent reconnect loop.
     """
     if not isinstance(data, dict):
         return False
@@ -271,7 +250,8 @@ def is_skill_event(data: Any) -> bool:
 
 def seam_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Translates one FDv2 skill ``put-object`` into a seam-shaped raw object.
+    Translates one FDv2 skill ``put-object`` into the raw object shape that the
+    ``SkillStore`` interface defines.
 
     ``None`` when the event cannot be filed at all — only when ``key`` is not a
     string, since a keyless object has no identity to store it under and no key
@@ -281,10 +261,10 @@ def seam_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
     indistinguishable from "no such skill" and would additionally let a prune
     delete the last known-good copy on disk.
 
-    **The translation this whole module exists to get right:**
+    **The one translation this adapter must get right:**
 
-        wire ``objectVersion``  →  seam ``version``      (the skill's own version)
-        wire ``version``        →  dropped                (the *payload* version)
+        wire ``objectVersion``  →  stored ``version``    (the skill's own version)
+        wire ``version``        →  dropped               (the *payload* version)
 
     ``objectVersion`` is what a ``{key, version}`` reference pins. ``version`` is
     the version of the payload the object arrived in — it changes when anything
@@ -359,11 +339,10 @@ class _SkillObjectSet:
     Lookup semantics are deliberately identical to ``InMemorySkillStore``'s, down
     to the fall-through to a version-less entry, so that the store a caller
     configures cannot change how a pinned reference resolves. They are
-    reimplemented here rather than inherited because the transport needs two
-    operations a hand-populated store does not have — ``delete`` and the atomic
-    ``replace`` a full transfer requires — and reaching into another store's
-    privates to get them would couple the two far harder than a test that asserts
-    they agree. ``test_skills_fdv2.py`` carries that parity test.
+    reimplemented rather than inherited because the transport needs two
+    operations a hand-populated store does not have: ``delete``, and the atomic
+    ``replace`` a full transfer requires. ``test_skills_fdv2.py`` asserts that the
+    two stores resolve identically.
 
     Several versions of one key coexist, because they coexist in a real payload:
     the newest version of every skill plus every version a variation currently
@@ -484,8 +463,7 @@ class _ProtocolReader:
     server never described, and on a full transfer it would briefly empty the
     store — which, with pruning on, is the difference between a reconcile and
     deleting a customer's skill files. Listeners therefore fire once per commit,
-    not once per object, which is also exactly the granularity the re-reconcile
-    wants.
+    not once per object.
     """
 
     def __init__(self, committed: _SkillObjectSet) -> None:
@@ -645,12 +623,11 @@ class _ProtocolReader:
 _HASHLESS_ADVICE = (
     "The delivered skill object carries no 'contentHash', so integrity "
     "verification withholds it with reason_code 'missing_content_hash' and its "
-    "content will never resolve. This is not a fault in this store and not "
-    "something the SDK can work around: verification hashes the verbatim bytes "
-    "and compares, and there is nothing to compare against. The field is "
-    "specified as an additive sha256-over-verbatim-UTF-8 value on the skill "
-    "envelope (LaunchDarkly AIC-2905) and has not shipped yet. Until it does, "
-    "expect an empty result from every skill accessor."
+    "content will not resolve. The SDK cannot work around this: verification "
+    "hashes the delivered bytes and compares them against the envelope's "
+    "'contentHash', and there is nothing to compare against. 'contentHash' is a "
+    "sha256 over the verbatim UTF-8 content. Contact LaunchDarkly support if "
+    "skills in your environment arrive without one."
 )
 
 _warned_hashless: set[tuple[str, Any]] = set()
@@ -662,10 +639,9 @@ def _warn_hashless(raw: dict[str, Any]) -> None:
     One ERROR per ``(key, version)`` whose envelope had no ``contentHash``.
 
     At ERROR rather than WARN, and per object rather than once per process,
-    because this is the difference between a broken deployment and an
-    empty-by-design one — the exact confusion the blocking gap produces. Deduped
-    so a re-delivered payload does not multiply it; a store that is restarted
-    reports again.
+    because an empty accessor result is otherwise indistinguishable from an
+    environment that has no skills. Deduped so a re-delivered payload does not
+    multiply it; a restarted process reports again.
     """
     identity = (raw["key"], raw.get("version"))
     with _warned_lock:
@@ -691,7 +667,7 @@ def _warn_if_nothing_can_verify(
     ``log_withholding_summary`` already reports a wholly-withheld batch at the
     accessor boundary, but only once a caller asks. This fires at delivery time,
     so the condition is visible in a process that boots, materializes nothing,
-    and exits — which is the shape a skills deployment fails in.
+    and exits, which is a common way a skills deployment fails.
     """
     del hashless_before_this_payload  # counted for the store, not for this check
     held = committed.all_raw()
@@ -726,10 +702,9 @@ class _RecoverableTransportError(Exception):
 
 
 _FORBIDDEN_ADVICE = (
-    "FDv2 is opt-in per account: the 'fdv2-protocol-control' setting defaults to "
-    "'forbid', which is served as HTTP 403. Skill delivery over this channel "
-    "needs that flag flipped for the account, and needs the FDCore/streamer "
-    "inline-resource support merged and deployed."
+    "The FDv2 protocol is opt-in per LaunchDarkly account and is served as HTTP "
+    "403 while it is off. Skill delivery needs it enabled; contact LaunchDarkly "
+    "support to enable it for your account."
 )
 
 
@@ -814,10 +789,9 @@ class _StreamConnection:
 
     Exists because ``close`` runs on a *different* thread from the read. The
     delivery thread spends nearly all its life blocked in a socket read on a
-    long-lived stream, where a stop flag it cannot check is no use. Without an
-    interruption a store's ``close`` would block for its whole join timeout on
-    every shutdown of a *healthy* stream — a hang in the caller's shutdown path,
-    paid every time.
+    long-lived stream, where a stop flag it cannot check is of no use; without an
+    interruption, closing a *healthy* stream would block the caller's shutdown
+    path for the whole join timeout.
     """
 
     def __init__(self, response: Any) -> None:
@@ -846,7 +820,7 @@ class _Requester:
 
     Standard library only, on purpose: this package's sole runtime dependency is
     ``opentelemetry-api`` and its LaunchDarkly base-SDK dependency is optional, so
-    the content path must not smuggle in an HTTP client.
+    the content path must not add an HTTP client dependency.
     """
 
     def __init__(
@@ -1055,13 +1029,13 @@ class FDv2SkillStore:
 
     **Server-side only.** Skills are for server-side agent runtimes and skill
     content is customer-confidential. A mobile key or a client-side environment
-    ID is refused in the constructor — see ``_require_server_side_credential``.
+    ID is refused in the constructor.
 
     **Delivery is in the background; retrieval is not.** ``SkillStore`` is a
-    synchronous seam, so a daemon thread owns the connection and fills memory,
-    and ``get_object`` only ever reads what has already arrived. Nothing here
-    blocks a retrieval on the network. The corollary is that a process which
-    calls ``get_skill`` immediately after ``start()`` may see an empty store;
+    synchronous interface, so a daemon thread owns the connection and fills
+    memory, and ``get_object`` only ever reads what has already arrived. Nothing
+    here blocks a retrieval on the network. The corollary is that a process
+    which calls ``get_skill`` immediately after ``start()`` may see an empty store;
     ``wait_for_skills`` is how you order boot against the first payload.
 
     **Last known good survives an outage.** A transport failure never empties the
@@ -1071,7 +1045,7 @@ class FDv2SkillStore:
 
     **What arrives is untrusted.** This store holds raw wire objects verbatim and
     verifies nothing — integrity verification lives at the accessor boundary so
-    it applies to every store equally. In particular an object with no
+    it applies to every store equally. In particular, an object with no
     ``contentHash`` is held and then *withheld* by verification; see
     ``StoreDiagnostics.hashless_objects``.
     """
@@ -1093,10 +1067,10 @@ class FDv2SkillStore:
     ) -> None:
         """
         *mode* is ``"stream"`` by default. Prefer it: a ``delete-object`` reaches a
-        live stream in seconds, which is what makes revocation seconds-latent
-        instead of restart-latent, and is why the change-listener re-reconcile is
-        worth wiring at all. ``"poll"`` exists for environments that cannot hold a
-        long-lived connection, and revocation there is one ``poll_interval`` late.
+        live stream in seconds, so a revoked skill stops resolving in seconds
+        rather than at the next restart. ``"poll"`` exists for environments that
+        cannot hold a long-lived connection, and revocation there is one
+        ``poll_interval`` late.
 
         *max_consecutive_failures* bounds the retry loop. On exceeding it the
         transport stops, logs an error, and the store keeps serving last known
@@ -1208,7 +1182,7 @@ class FDv2SkillStore:
         with self._lock:
             return StoreDiagnostics(**vars(self._reader.diagnostics))
 
-    # -- the SkillStore seam ----------------------------------------------
+    # -- the SkillStore interface -----------------------------------------
 
     def get_object(
         self, kind: str, key: str, version: int | None = None
@@ -1297,7 +1271,7 @@ class FDv2SkillStore:
                 if self._stop.wait(delay):
                     return
                 continue
-            except Exception as exc:  # pragma: no cover - belt and braces
+            except Exception as exc:  # pragma: no cover - defensive
                 self._give_up(f"unexpected error in skill delivery: {exc!r}")
                 logger.error("Unexpected error in skill delivery", exc_info=True)
                 return
@@ -1316,7 +1290,7 @@ class FDv2SkillStore:
             reason,
         )
         # Unblock anyone waiting on a first payload that is never coming, rather
-        # than making them eat the full timeout.
+        # than making them wait out the full timeout.
         self._first_payload.set()
 
     def _apply(self, name: str, data: Any) -> _TransferOutcome:
@@ -1368,8 +1342,8 @@ class FDv2SkillStore:
                     raise _RecoverableTransportError(outcome.disconnect)
         except Exception:
             if self._stop.is_set():
-                # `close` interrupted the read on purpose; unwinding quietly is
-                # the point, not a failure to report or retry.
+                # `close` interrupted the read on purpose: unwind quietly rather
+                # than reporting a delivery failure and retrying.
                 return
             raise
         finally:

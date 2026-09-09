@@ -8,8 +8,7 @@ Two layers, deliberately:
   ``mv`` query parameters, ``Authorization``, ``If-None-Match``/304, the
   ``{"events": [...]}`` polling envelope, and SSE for streaming. The store under
   test opens real sockets against it, so request construction and header
-  handling are exercised rather than mocked. This is what stands in for a live
-  server while the backend work is unmerged.
+  handling are exercised rather than mocked.
 - **The protocol reader driven directly.** Wire semantics — which objects are
   skills, ``objectVersion`` versus ``version``, revocation, mixed payloads — are
   asserted against ``_ProtocolReader``, which has no I/O, so those cases read as
@@ -76,7 +75,7 @@ def put_skill(
     omit_hash: bool = False,
     name: str = "PDF Extraction",
 ) -> dict[str, Any]:
-    """One skill ``put-object`` event's data, exactly as §2.3 specifies it."""
+    """One skill ``put-object`` event's data, in the shape the wire delivers it."""
     envelope: dict[str, Any] = {
         "contentType": "text/markdown",
         "content": content,
@@ -361,7 +360,7 @@ class TestObjectIdentification:
         assert is_skill_event(put_segment()) is False
 
     def test_inline_resource_of_another_category_is_not_a_skill(self) -> None:
-        """``inline-resource`` is a broad kind; the category is load-bearing."""
+        """``inline-resource`` is a broad kind, so the category is required too."""
         other = put_skill()
         other["category"] = "prompt-template"
         assert is_skill_event(other) is False
@@ -382,7 +381,7 @@ class TestObjectIdentification:
 
 
 # ---------------------------------------------------------------------------
-# objectVersion is not version. This is the whole ballgame.
+# objectVersion is not version
 # ---------------------------------------------------------------------------
 
 
@@ -585,7 +584,7 @@ class TestProtocolReader:
     def test_flag_and_segment_objects_are_skipped_cleanly(self) -> None:
         """
         The mixed payload is the normal case, not an edge one: an environment's
-        assignment carries the flagging payload alongside the agent-skill payload.
+        assignment carries its flag payload alongside its agent-skill payload.
         """
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -607,8 +606,9 @@ class TestProtocolReader:
 
     def test_an_unknown_kind_is_ignored_rather_than_fatal(self) -> None:
         """
-        Erroring here is the unknown-kind reconnect loop this feature must not
-        reproduce — a flag-delivery outage caused by a skills rollout.
+        Erroring on an unrecognised kind would turn a normal payload into a
+        permanent reconnect loop — a flag-delivery outage caused by a skills
+        rollout.
         """
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -692,11 +692,11 @@ class TestProtocolReader:
 
 
 # ---------------------------------------------------------------------------
-# Seam parity with InMemorySkillStore
+# Interface parity with InMemorySkillStore
 # ---------------------------------------------------------------------------
 
 
-class TestSeamParity:
+class TestInterfaceParity:
     """
     The two stores must resolve identically. ``_SkillObjectSet`` reimplements the
     lookup rather than inheriting it — see its docstring for why — so this is the
@@ -1030,7 +1030,7 @@ class _ScriptedRequester:
 
 
 class TestFailureHandling:
-    def test_a_403_stops_delivery_and_names_the_protocol_control_flag(
+    def test_a_403_stops_delivery_and_explains_why(
         self, endpoint: Any, caplog: Any
     ) -> None:
         endpoint.queue_poll(status=403)
@@ -1038,8 +1038,8 @@ class TestFailureHandling:
             with poll_store(endpoint) as store:
                 assert wait_until(lambda: store.failed is not None)
         assert "403" in store.failed
-        assert "fdv2-protocol-control" in store.failed
-        assert any("fdv2-protocol-control" in r.getMessage() for r in caplog.records)
+        assert "opt-in" in store.failed
+        assert any("opt-in" in r.getMessage() for r in caplog.records)
 
     def test_a_401_stops_delivery(self, endpoint: Any) -> None:
         endpoint.queue_poll(status=401)
@@ -1183,7 +1183,7 @@ class TestFailureHandling:
 
 class TestMissingContentHash:
     """
-    The blocking backend gap, asserted as behaviour rather than assumed.
+    A skill delivered without a ``contentHash``, asserted as behaviour.
 
     An envelope with no ``contentHash`` must produce a *withheld* skill with the
     ``missing_content_hash`` reason — loudly, diagnosably, and without a crash.
@@ -1287,8 +1287,9 @@ class TestMissingContentHash:
     async def test_a_hash_that_does_not_match_is_a_different_failure(
         self, endpoint: Any
     ) -> None:
-        """``missing_content_hash`` and ``hash_mismatch`` must not collapse: one is
-        a backend gap and the other is possible tampering."""
+        """``missing_content_hash`` and ``hash_mismatch`` must not collapse: one
+        means the envelope carried no hash, the other means the content did not
+        match the hash it carried."""
         endpoint.queue_poll(
             full_payload(
                 ("put-object", put_skill(content_hash=_hash("something else")))
@@ -1303,7 +1304,7 @@ class TestMissingContentHash:
             ).reason == "integrity_failure"
 
     async def test_a_hashed_skill_resolves_end_to_end(self, endpoint: Any) -> None:
-        """The positive control: everything above is a gap, not a broken adapter."""
+        """The positive control: a well-formed envelope resolves end to end."""
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
@@ -1405,9 +1406,8 @@ class TestWatchSkills:
         self, endpoint: Any, tmp_path: Any
     ) -> None:
         """
-        AV-1, closed at this layer. The store's change listener drives the
-        reconcile, so the file goes away seconds after the ``delete-object``
-        rather than at the next process start.
+        The store's change listener drives the reconcile, so the file goes away
+        seconds after the ``delete-object`` rather than at the next process start.
         """
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         endpoint.queue_poll(
@@ -1479,8 +1479,8 @@ class TestWatchSkills:
     async def test_the_default_keeps_last_known_good_during_an_outage(
         self, endpoint: Any, tmp_path: Any
     ) -> None:
-        """``on_unavailable="keep"`` is the endorsed default: an outage must not
-        read as "everything was revoked"."""
+        """``on_unavailable="keep"`` is the default: an outage must not read as
+        "everything was revoked"."""
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         endpoint.queue_poll(status=500)
         with poll_store(endpoint, poll_interval=0.05) as store:
@@ -1522,7 +1522,8 @@ class TestWatchSkills:
     async def test_the_in_memory_store_can_also_drive_a_watch(
         self, tmp_path: Any
     ) -> None:
-        """The watcher is wired to the seam, not to the FDv2 store."""
+        """The watcher is wired to the ``SkillStore`` interface, not to the FDv2
+        store."""
         store = InMemorySkillStore()
         store.put(
             {

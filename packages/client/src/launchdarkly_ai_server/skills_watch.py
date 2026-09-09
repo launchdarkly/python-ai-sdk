@@ -2,22 +2,18 @@
 Agent Skills — re-reconcile on delivery, so revocation does not wait for a restart.
 
 ``write_skills`` is a one-shot reconcile: it materializes what the store holds
-now. That was the whole story while the only transport was a hand-populated
-store, and the design accordingly deferred an eager re-reconcile — revocation
-would take effect at the next process restart, which the security review filed
-as AV-1.
+now. With a hand-populated store that is sufficient, and a revocation takes
+effect at the next process restart.
 
 A streaming FDv2 connection changes the premise. A ``delete-object`` reaches a
-live connection in **seconds**, and the store already publishes a change
-listener, so the gap between "LaunchDarkly revoked this skill" and "its
-``SKILL.md`` is off the agent's disk" collapses from a process lifetime to a
-debounce interval. That is the single largest resilience improvement available
-at this layer, which is why it is here rather than in a later phase.
+live connection in **seconds**, and the store publishes a change listener, so
+wiring the two together collapses the gap between "LaunchDarkly revoked this
+skill" and "its ``SKILL.md`` is off the agent's disk" from a process lifetime to
+a debounce interval.
 
-``on_unavailable="keep"`` stays the default, deliberately and per the review: an
-outage must not read as "everything was revoked". A watcher that pruned on a
-failed retrieval would convert every transport blip into deletion of a
-customer's skill files.
+``on_unavailable="keep"`` stays the default: an outage must not read as
+"everything was revoked". A watcher that pruned on a failed retrieval would
+convert every transport failure into deletion of a customer's skill files.
 
 Layering: this module sits *above* ``skills_fs`` and calls ``write_skills``
 without modifying it. Nothing in the reconcile, the accessors, or verification
@@ -221,10 +217,11 @@ async def watch_skills(
     files within ``debounce`` of arriving, rather than at the next restart.
 
     Requires a store that implements the optional ``add_listener`` half of the
-    seam. Raises ``RuntimeError`` when no store is configured, and when the
-    configured store has no ``add_listener`` — the second case failing loudly
-    rather than degrading to a one-shot reconcile, because a watcher that
-    silently never fires looks exactly like a watcher whose skills never changed.
+    ``SkillStore`` interface. Raises ``RuntimeError`` when no store is configured,
+    and when the configured store has no ``add_listener`` — the second case
+    failing loudly rather than degrading to a one-shot reconcile, because a
+    watcher that silently never fires looks exactly like a watcher whose skills
+    never changed.
     """
     store = get_store()
     if store is None:
