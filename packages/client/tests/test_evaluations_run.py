@@ -1153,25 +1153,29 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
     assert judge_event["variationKey"] == "default"
     assert judge_event["version"] == 12
     assert len(judge_event["eventId"]) == 64
-    # The fake resolved config never set isInverted (e.g. Gonfalon hasn't deployed the
-    # flag-payload change yet); direction is unresolved, so the key must be omitted
-    # rather than sent as successDirection=None.
-    assert "successDirection" not in judge_event
+    # No threshold was set on the Judge, so there's nothing to compare the score
+    # against -- verdict must be omitted rather than sent as verdict=None.
+    assert "verdict" not in judge_event
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("is_inverted", "expected_direction"),
+    ("is_inverted", "threshold", "expected_verdict"),
     [
-        (True, "lower_is_better"),
-        (False, "upper_is_better"),
+        # score is fixed at 0.86 in the handler below.
+        (False, 0.8, "pass"),  # upper-is-better, 0.86 >= 0.8
+        (False, 0.9, "fail"),  # upper-is-better, 0.86 < 0.9
+        (True, 0.9, "pass"),  # lower-is-better, 0.86 <= 0.9
+        (True, 0.5, "fail"),  # lower-is-better, 0.86 > 0.5
+        (None, 0.8, "pass"),  # unresolved direction defaults to upper-is-better
     ],
 )
-async def test_run_with_ld_judge_emits_success_direction_from_is_inverted(
+async def test_run_with_ld_judge_computes_verdict_from_score_threshold_and_direction(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
-    is_inverted: bool,
-    expected_direction: str,
+    is_inverted: bool | None,
+    threshold: float,
+    expected_verdict: str,
 ) -> None:
     transport = SequencedTransport(
         [
@@ -1205,13 +1209,15 @@ async def test_run_with_ld_judge_emits_success_direction_from_is_inverted(
     async def fake_extract_variation(
         key: str, context: dict[str, Any]
     ) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "provider": {"name": "OpenAI"},
+            "model": {"name": "gpt-4o"},
+            "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
+        }
+        if is_inverted is not None:
+            config["isInverted"] = is_inverted
         return {
-            "config": {
-                "provider": {"name": "OpenAI"},
-                "model": {"name": "gpt-4o"},
-                "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
-                "isInverted": is_inverted,
-            },
+            "config": config,
             "meta": {"variationKey": "default", "version": 12},
         }
 
@@ -1243,13 +1249,13 @@ async def test_run_with_ld_judge_emits_success_direction_from_is_inverted(
         dataset="golden",
         handler=handler,
         generation={"provider": "OpenAI", "model": "gpt-4o"},
-        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        criteria=[Judge(key="$ld:ai:judge:accuracy", threshold=threshold)],
     )
 
     assert result.passed is True
     events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
     judge_event = next(event for event in events if event.get("kind") == "judge")
-    assert judge_event["successDirection"] == expected_direction
+    assert judge_event["verdict"] == expected_verdict
 
 
 @pytest.mark.asyncio

@@ -29,6 +29,7 @@ from .events import (
     DeterministicScorerEvaluationEventPayload,
     EvaluationEventPayload,
     EvaluationStatus,
+    EvaluationVerdict,
     LDJudgeEvaluationEventPayload,
     TokenUsage,
 )
@@ -683,7 +684,6 @@ class EvaluationsRunner:
             "started_at": started.isoformat().replace("+00:00", "Z"),
             "variation_key": resolved.variation_key,
             "version": resolved.version,
-            "is_inverted": resolved.is_inverted,
         }
         if row.get("status") != "COMPLETE":
             return self._criterion_error_result(
@@ -733,11 +733,23 @@ class EvaluationsRunner:
                 "invalid_score",
                 f"judge score must be a number between 0 and 1, got {raw_score!r}",
             )
+        verdict: EvaluationVerdict | None = None
+        if judge.threshold is not None:
+            # An unresolved direction (e.g. Gonfalon hasn't deployed the flag-payload
+            # change yet, or a custom judge with none set) defaults to upper-is-better,
+            # matching Gonfalon's own default for a judge with no stored isInverted.
+            passed = (
+                score <= judge.threshold
+                if resolved.is_inverted
+                else score >= judge.threshold
+            )
+            verdict = EvaluationVerdict.PASS if passed else EvaluationVerdict.FAIL
         completed = datetime.now(UTC)
         event = {
             **base,
             "status": "COMPLETE",
             "score": score,
+            "verdict": verdict,
             "reason": reason,
             "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
             "latency_ms": round((time.perf_counter() - started_clock) * 1000),
@@ -852,25 +864,19 @@ class EvaluationsRunner:
                     "evaluated_at": result["evaluated_at"],
                     "latency_ms": result["latency_ms"],
                     "score": result.get("score"),
+                    "verdict": result.get("verdict"),
                     "reason": result.get("reason"),
                     "error": error,
                     "error_message": error_message,
                 }
                 payload_model: EvaluationEventPayload
                 if result["kind"] == "judge":
-                    is_inverted = result.get("is_inverted")
-                    success_direction: str | None = None
-                    if is_inverted is True:
-                        success_direction = "lower_is_better"
-                    elif is_inverted is False:
-                        success_direction = "upper_is_better"
                     payload_model = LDJudgeEvaluationEventPayload(
                         **common_payload,
                         judge_key=result["judge_key"],
                         variation_key=result["variation_key"],
                         version=result.get("version"),
                         usage=usage,
-                        success_direction=success_direction,
                     )
                 else:
                     payload_model = DeterministicScorerEvaluationEventPayload(
