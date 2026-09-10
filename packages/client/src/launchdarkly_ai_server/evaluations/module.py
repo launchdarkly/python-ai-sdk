@@ -291,20 +291,25 @@ class EvaluationsModule:
         """Reject duplicate criterion identities before any records are created.
 
         A judge key and a scorer name that collide would share a criterionType,
-        and with it the deterministic event identity of their results.
+        and with it the deterministic event identity of their results. Case-
+        insensitive, matching the API's own dedup: the worker's retry gate
+        lowercases criterion types, so two criteria differing only by case
+        would still collide there even though they look distinct here.
         """
         seen: set[str] = set()
         duplicates: list[str] = []
         for criterion in criteria:
             criterion_type = criterion.criterion_type
-            if criterion_type in seen and criterion_type not in duplicates:
+            normalized = criterion_type.lower()
+            if normalized in seen and criterion_type not in duplicates:
                 duplicates.append(criterion_type)
-            seen.add(criterion_type)
+            seen.add(normalized)
         if duplicates:
             raise EvaluationsError(
                 "Duplicate evaluation criteria: "
                 + ", ".join(repr(name) for name in duplicates)
-                + ". Judge keys and scorer names must be unique within a run."
+                + ". Judge keys and scorer names must be unique within a run "
+                "(case-insensitive)."
             )
 
     @staticmethod

@@ -1745,6 +1745,34 @@ async def test_duplicate_criteria_rejected_before_any_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_criteria_rejected_case_insensitively() -> None:
+    """Matches the API's own dedup, which lowercases criterionType before
+    comparing: the worker's retry gate does the same, so criteria differing
+    only by case would still collide there even though they'd look distinct
+    to a case-sensitive check."""
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(EvaluationsError, match="Duplicate evaluation criteria"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[
+                Judge(key="Accuracy"),
+                Scorer(name="accuracy", fn=lambda row, output: True),
+            ],
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 async def test_errored_generation_row_emits_generation_incomplete_criterion_event(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
