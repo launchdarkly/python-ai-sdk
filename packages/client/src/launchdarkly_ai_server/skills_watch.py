@@ -56,7 +56,7 @@ class SkillWatcher:
     reconcile's own contract is one root, one reconcile at a time, because two
     interleaved runs lose the loser's manifest entries and leave the files it
     wrote unmanaged. This class enforces that for its *own* reconciles — they run
-    on a single worker thread, serialized — and cannot enforce it against a
+    on a single worker thread, serialised — and cannot enforce it against a
     caller who reconciles the same root by hand.
 
     The watcher owns its registration on *store*: it registers ``notify`` when

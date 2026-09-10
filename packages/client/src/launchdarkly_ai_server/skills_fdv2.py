@@ -87,6 +87,8 @@ SDK_DATA_MODEL_VERSION = 1
 """
 The ``mv`` request parameter — the SDK data model version this adapter speaks.
 
+Of the request parameters this adapter sends, it is the one whose value could
+not be confirmed against a live server, so treat the default as provisional.
 Override it with ``FDv2SkillStore(data_model_version=...)`` if a LaunchDarkly
 instance expects a different value.
 """
@@ -229,7 +231,7 @@ class StoreDiagnostics:
 
 
 # ---------------------------------------------------------------------------
-# Deserialization — where objectVersion is not version
+# Deserialisation — where objectVersion is not version
 # ---------------------------------------------------------------------------
 
 
@@ -1199,8 +1201,9 @@ class FDv2SkillStore:
 
         Held content is *not* dropped: a closed store still answers from what it
         received, so shutting the transport down does not turn into an integrity
-        failure or an empty reconcile mid-flight. ``shutdown()`` is what detaches
-        the store from the accessors.
+        failure or an empty reconcile mid-flight. Detaching the store from the
+        accessors is the job of the package-level ``launchdarkly_ai_server.shutdown()``
+        coroutine, not of this method.
         """
         self._stop.set()
         # Interrupt the read before joining. The delivery thread is normally

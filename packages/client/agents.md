@@ -204,7 +204,7 @@ Three layers, in increasing order of blast radius:
 pair `add_listener(kind, fn)` / `remove_listener(kind, fn)`. Version is part of the **lookup
 identity**, not a filter applied to the answer, and that is load-bearing: a delivery payload
 carries the newest version of every skill *plus* every version any variation currently pins,
-so two versions of one key coexist routinely. A seam keyed by key alone would answer a pinned reference with the newest
+so two versions of one key coexist routinely. A store keyed by key alone would answer a pinned reference with the newest
 object, and the caller would then have to reject it — turning the primary use case, a
 version-pinned attachment, into a missing skill. `version=None` asks for the newest held.
 

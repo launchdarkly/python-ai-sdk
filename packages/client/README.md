@@ -453,6 +453,8 @@ channel — the same `GET /sdk/poll` and `GET /sdk/stream` endpoints the base SD
 source uses, authenticated with the environment's server-side SDK key.
 
 ```python
+import os
+
 from launchdarkly_ai_server import FDv2SkillStore, init_client, watch_skills
 
 store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
