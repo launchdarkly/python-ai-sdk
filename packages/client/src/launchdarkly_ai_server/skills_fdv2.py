@@ -1,15 +1,10 @@
 """
-Agent Skills — the FDv2 delivery protocol.
+Agent Skills — the FDv2 delivery transport.
 
-The half of the delivery transport that has no I/O: identifying skill objects
-on the wire, translating them into the raw object shape the ``SkillStore``
-interface defines, holding them by ``(key, version)``, and applying a
-payload's events as one consistent commit. ``FDv2SkillStore``, the store that
-puts a network connection underneath this, follows in a separate change.
-
-It sits *below* the ``SkillStore`` interface, and everything above — the
-accessors, integrity verification, the ``Skill`` dataclass, materialization —
-is unaware of it.
+The store implementation that talks to LaunchDarkly. It sits *below* the
+``SkillStore`` interface: it produces raw wire objects in the shape
+``skills_core`` documents, and everything above — the accessors, integrity
+verification, the ``Skill`` dataclass, materialization — is unaware of it.
 
 Layering::
 
@@ -20,12 +15,12 @@ Layering::
                      GET /sdk/poll, GET /sdk/stream, authenticated with the
                      environment's server-side SDK key
 
-Dependencies run one way: this module imports nothing from the feature beyond
-the version validator in ``types_validation``, and nothing in the feature
-imports it. It uses only the standard library, so it adds no dependency
+Dependencies run one way: this module imports ``skills_core`` for the
+interface's kind constant and nothing else from the feature, and nothing in the
+feature imports it. It uses only the standard library, so it adds no dependency
 to a package whose sole runtime dependency is ``opentelemetry-api``.
 
-Three things this layer does *not* do, on purpose:
+Three things this module does *not* do, on purpose:
 
 - **It does not verify content.** Verification lives at the accessor boundary in
   ``skills_core`` so that it applies to every store equally, including a
@@ -36,24 +31,29 @@ Three things this layer does *not* do, on purpose:
 - **It does not evaluate anything.** Flag and segment objects that share the
   connection are skipped and counted, nothing more.
 
-One assumption it *does* make, and states: **the payload intent it reads is the
-payload skills arrive on.** Delivery sends one payload per credential and the
-protocol tells a client to read only the first payload intent, so today those are
-the same payload. ``_ProtocolReader`` keeps the pair apart anyway, because the
-cost of conflating them is an emptied skill set.
-
 The design rationale — why the skill's version is read from the object's
 ``key`` and never from ``version``, why changes commit at
-``payload-transferred`` — is in ``agents.md`` under *The delivery transport*.
+``payload-transferred``, why there is one network timeout — is in
+``agents.md`` under *The delivery transport*.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import random
 import re
+import socket
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
+from .skills_core import SKILL_OBJECT_KIND
 from .types_validation import is_valid_skill_version
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,20 @@ a registered category and skill keys cannot contain it, so a well-formed wire ke
 has exactly one.
 """
 
+DEFAULT_BASE_URI = "https://sdk.launchdarkly.com"
+"""Where the SDK-facing FDv2 endpoints live. Overridable for Federal and private
+instances."""
+
+POLL_PATH = "/sdk/poll"
+STREAM_PATH = "/sdk/stream"
+
+DEFAULT_POLL_TIMEOUT = 10.0
+"""Default ``read_timeout`` in ``"poll"`` mode: the bound on one whole request."""
+
+DEFAULT_STREAM_READ_TIMEOUT = 300.0
+"""Default ``read_timeout`` in ``"stream"`` mode: the longest gap tolerated
+between two reads. LaunchDarkly's heartbeats arrive well inside this."""
+
 _EVENT_SERVER_INTENT = "server-intent"
 _EVENT_PUT_OBJECT = "put-object"
 _EVENT_DELETE_OBJECT = "delete-object"
@@ -114,6 +128,8 @@ The selector is the only place a completed transfer names its own payload:
 of their own. ``_ProtocolReader`` reads it as a fallback for an intent that named
 no ``id``.
 """
+
+Mode = Literal["stream", "poll"]
 
 _MOBILE_KEY_PREFIX = "mob-"
 _SERVER_KEY_PREFIX = "sdk-"
@@ -504,7 +520,6 @@ class _ProtocolReader:
         self.diagnostics = StoreDiagnostics()
         # Identities already reported by ``_warn_hashless``. Per reader, so a
         # recreated store reports again and two stores never quieten each other.
-        # No lock: ``handle`` runs only on its owner's single delivery thread.
         self._warned_hashless: set[tuple[str, Any]] = set()
         # The payload the current intent describes, and the payload skills have
         # actually arrived on. One payload per connection makes these the same
@@ -609,8 +624,8 @@ class _ProtocolReader:
         self.diagnostics.objects_revoked += 1
         # A revocation identifies the payload as ours just as a put does.
         self._skills_in_payload += 1
-        # A tombstone carries identity and no content, so a listener that reads
-        # content must check for ``content`` rather than assume it.
+        # A tombstone carries identity and no content; see
+        # ``FDv2SkillStore.add_listener`` for what listeners should expect.
         self._changes.append(
             {"key": tombstone.key, "version": tombstone.object_version}
         )
@@ -780,3 +795,686 @@ def _warn_if_nothing_can_verify(committed: _SkillObjectSet) -> None:
         len(held),
         _HASHLESS_ADVICE,
     )
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+
+class _FatalTransportError(Exception):
+    """A failure retrying cannot fix: bad credential, forbidden, wrong URI."""
+
+
+class _RecoverableTransportError(Exception):
+    """A failure worth retrying. Carries a server-requested delay when given one."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+_FORBIDDEN_ADVICE = (
+    "The FDv2 protocol is opt-in per LaunchDarkly account and is served as HTTP "
+    "403 while it is off. Skill delivery needs it enabled; contact LaunchDarkly "
+    "support to enable it for your account."
+)
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    """
+    ``Retry-After`` in seconds, when the server sent a usable one.
+
+    The HTTP-date form, and non-finite values such as ``inf`` or ``1e309`` that
+    ``float`` accepts, fall back to our own backoff: none of them is a delay,
+    and an infinite one would overflow the wait that honours it.
+    """
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        seconds: float = float(str(raw).strip())
+    except ValueError:
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return max(0.0, seconds)
+
+
+def _classify_status(status: int, headers: Any) -> Exception:
+    """Turns an HTTP error status into the right exception type."""
+    if status == 401:
+        return _FatalTransportError(
+            "LaunchDarkly rejected the SDK key (HTTP 401). Skill delivery cannot "
+            "start. Check that the key is the environment's server-side SDK key."
+        )
+    if status == 403:
+        return _FatalTransportError(
+            f"LaunchDarkly returned HTTP 403. {_FORBIDDEN_ADVICE}"
+        )
+    if status in (400, 405, 406, 414, 501):
+        return _FatalTransportError(
+            f"LaunchDarkly returned HTTP {status}, which retrying will not fix. "
+            "The request this adapter sent was not understood. It carries only "
+            "the SDK key and, after the first payload, a 'basis' selector, so "
+            "check the base URI and that the endpoint speaks FDv2."
+        )
+    return _RecoverableTransportError(
+        f"LaunchDarkly returned HTTP {status}", _retry_after_seconds(headers)
+    )
+
+
+def _interrupt_read(response: Any) -> None:
+    """
+    Best-effort interruption of a read blocked on *response*, from another thread.
+
+    Closing the response is not enough: CPython's buffered reader stays parked in
+    ``readline`` until bytes arrive. Shutting the *socket* down underneath it
+    unblocks it immediately. Reaching the socket means walking urllib's private
+    attribute chain, so every step is guarded and failure is silent: the
+    delivery thread is a daemon and ``close``'s join timeout is the backstop.
+    """
+    for path in (("fp", "raw", "_sock"), ("fp", "_sock"), ("_sock",)):
+        found: Any = response
+        for name in path:
+            found = getattr(found, name, None)
+            if found is None:
+                break
+        if found is not None and hasattr(found, "shutdown"):
+            try:
+                found.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+
+
+class _StreamConnection:
+    """
+    One open streaming connection: an event iterator plus a way to interrupt it
+    from another thread, which is what ``FDv2SkillStore.close`` needs.
+    """
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self.events = _iter_sse(response)
+
+    def close(self) -> None:
+        """Interrupts the read. Safe to call from any thread, and twice."""
+        _interrupt_read(self._response)
+        try:
+            self._response.close()
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class _PollResult:
+    not_modified: bool
+    events: list[tuple[str, Any]]
+    etag: str | None
+
+
+class _Requester:
+    """
+    The only place this module opens a socket. Standard library only, on purpose.
+
+    *read_timeout* is applied to every socket operation of a request. ``urllib``
+    has no separate connect timeout: its ``timeout`` becomes the socket timeout
+    for the whole operation, so connecting, waiting for headers and each body
+    read are all bounded by the same value.
+    """
+
+    def __init__(
+        self,
+        sdk_key: str,
+        base_uri: str,
+        *,
+        read_timeout: float,
+        opener: Any = None,
+    ) -> None:
+        self._sdk_key = sdk_key
+        self._base_uri = base_uri.rstrip("/")
+        self._read_timeout = read_timeout
+        # Injectable so tests can drive a fake endpoint without a socket.
+        self._opener = opener or urllib.request.build_opener()
+
+    def _url(self, path: str, basis: str | None) -> str:
+        """
+        The request URL: the path, plus ``basis`` once a payload has committed.
+
+        Deliberately no ``mv`` (data model version). That parameter selects the
+        *flag* data model and the connection rejects any value but the flag
+        default; the agent-skill payload is generic, is served regardless of it,
+        and has no model version of its own to ask for.
+        """
+        if not basis:
+            return f"{self._base_uri}{path}"
+        return f"{self._base_uri}{path}?{urllib.parse.urlencode({'basis': basis})}"
+
+    def _request(
+        self, path: str, basis: str | None, headers: dict[str, str]
+    ) -> urllib.request.Request:
+        all_headers = {"Authorization": self._sdk_key, **headers}
+        return urllib.request.Request(
+            self._url(path, basis), headers=all_headers, method="GET"
+        )
+
+    def poll(self, basis: str | None, etag: str | None) -> _PollResult:
+        """One ``GET /sdk/poll``. A 304 is a first-class outcome, not an error."""
+        headers = {"Accept": "application/json"}
+        if etag:
+            headers["If-None-Match"] = etag
+        request = self._request(POLL_PATH, basis, headers)
+        try:
+            with self._opener.open(request, timeout=self._read_timeout) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                if status == 304:
+                    return _PollResult(not_modified=True, events=[], etag=etag)
+                body = response.read()
+                new_etag = response.headers.get("ETag") or etag
+        except urllib.error.HTTPError as exc:
+            if exc.code == 304:
+                # urllib raises on 304 when no redirect handler swallows it.
+                return _PollResult(not_modified=True, events=[], etag=etag)
+            raise _classify_status(exc.code, exc.headers) from exc
+        except Exception as exc:
+            raise _RecoverableTransportError(
+                f"polling request failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        return _PollResult(
+            not_modified=False, events=_decode_poll_body(body), etag=new_etag
+        )
+
+    def stream(self, basis: str | None) -> _StreamConnection:
+        """Opens ``GET /sdk/stream``."""
+        request = self._request(
+            STREAM_PATH,
+            basis,
+            {"Accept": "text/event-stream", "Cache-Control": "no-cache"},
+        )
+        try:
+            response = self._opener.open(request, timeout=self._read_timeout)
+        except urllib.error.HTTPError as exc:
+            raise _classify_status(exc.code, exc.headers) from exc
+        except Exception as exc:
+            raise _RecoverableTransportError(
+                f"streaming request failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return _StreamConnection(response)
+
+
+def _decode_poll_body(body: bytes) -> list[tuple[str, Any]]:
+    """
+    Unwraps ``{"events": [...]}``. Polling and streaming carry identical event
+    objects, which is why the protocol reader is shared between the two modes.
+    """
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _RecoverableTransportError(
+            f"polling response was not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("events"), list):
+        raise _RecoverableTransportError("polling response had no 'events' array")
+    events: list[tuple[str, Any]] = []
+    for entry in parsed["events"]:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("event")
+        if isinstance(name, str):
+            events.append((name, entry.get("data")))
+    return events
+
+
+def _iter_sse(response: Any) -> Any:
+    """
+    Decodes an SSE body into ``(event name, data)`` pairs.
+
+    Minimal on purpose: ``event:``/``data:`` fields, multi-line ``data`` joined
+    with newlines, a blank line dispatching, and ``:`` comments skipped.
+    """
+    try:
+        name: str | None = None
+        data_lines: list[str] = []
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line == "":
+                if name is not None:
+                    payload = "\n".join(data_lines)
+                    try:
+                        parsed = json.loads(payload) if payload else None
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Discarding FDv2 '%s' event whose data was not JSON", name
+                        )
+                        parsed = None
+                    else:
+                        yield name, parsed
+                name = None
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            field_name, _, value = line.partition(":")
+            value = value[1:] if value.startswith(" ") else value
+            if field_name == "event":
+                name = value
+            elif field_name == "data":
+                data_lines.append(value)
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Backoff
+# ---------------------------------------------------------------------------
+
+
+def _backoff_delay(
+    attempt: int, *, base: float, maximum: float, jitter: float = 0.5
+) -> float:
+    """
+    Exponential backoff with jitter, capped at *maximum*.
+
+    Jitter is subtractive over the whole range rather than added on top, so the
+    cap is a real ceiling: a fleet restarted together must not reconnect in
+    lockstep, and must not exceed the interval the cap promises.
+    """
+    # float(2 ** n): the integer power is untyped to mypy.
+    ceiling: float = min(maximum, base * float(2 ** max(0, attempt - 1)))
+    return ceiling * (1.0 - jitter * random.random())
+
+
+# ---------------------------------------------------------------------------
+# The store
+# ---------------------------------------------------------------------------
+
+
+class FDv2SkillStore:
+    """
+    A ``SkillStore`` fed by LaunchDarkly's SDK-facing FDv2 delivery channel.
+
+    Constructed with the environment's server-side SDK key, started explicitly,
+    and passed to ``init_client``::
+
+        store = FDv2SkillStore(sdk_key=os.environ["LD_SDK_KEY"])
+        store.start()
+        store.wait_for_skills(timeout=10)
+        await init_client(options={"skillStore": store})
+
+        skill = await get_skill("pdf-extraction")
+        ...
+        store.close()
+
+    It also works as a context manager.
+
+    **Server-side only.** A mobile key or a client-side environment ID is
+    refused in the constructor.
+
+    **Delivery is in the background; retrieval is not.** A daemon thread owns
+    the connection and fills memory, and ``get_object`` only ever reads what has
+    already arrived. A process that calls ``get_skill`` immediately after
+    ``start()`` may see an empty store; ``wait_for_skills`` orders boot against
+    the first payload.
+
+    **Last known good survives an outage.** A transport failure never empties
+    the store and never makes ``get_object`` raise, which is what makes
+    ``write_skills(on_unavailable="keep")`` correct. ``diagnostics`` and
+    ``failed`` report the degradation.
+
+    **What arrives is untrusted.** Raw wire objects are held verbatim and
+    verified at the accessor boundary, not here. In particular an object with no
+    ``contentHash`` is held and then *withheld*; see
+    ``StoreDiagnostics.hashless_objects``.
+    """
+
+    def __init__(
+        self,
+        sdk_key: str,
+        *,
+        base_uri: str = DEFAULT_BASE_URI,
+        mode: Mode = "stream",
+        poll_interval: float = 30.0,
+        read_timeout: float | None = None,
+        initial_backoff: float = 1.0,
+        max_backoff: float = 30.0,
+        max_consecutive_failures: int = 10,
+        _requester: Any = None,
+    ) -> None:
+        """
+        *mode* is ``"stream"`` by default. Prefer it: a ``delete-object`` reaches
+        a live stream in seconds. ``"poll"`` exists for environments that cannot
+        hold a long-lived connection, and revocation there is one
+        ``poll_interval`` late.
+
+        *read_timeout* is the only network timeout and bounds every socket
+        operation of a request, so its meaning and default follow the mode: in
+        ``"poll"`` it bounds the whole request (``DEFAULT_POLL_TIMEOUT``); in
+        ``"stream"`` it bounds each wait for the next bytes
+        (``DEFAULT_STREAM_READ_TIMEOUT``). Must be positive when given.
+
+        *max_backoff* caps every delay between retries, including one the server
+        asks for with ``Retry-After``.
+
+        *max_consecutive_failures* bounds the retry loop. On exceeding it the
+        transport stops, logs an error, and the store keeps serving last known
+        good; ``failed`` reports it. Only failures in a row count: a committed
+        payload resets the count.
+        """
+        _require_server_side_credential(sdk_key)
+        if mode not in ("stream", "poll"):
+            raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
+        if poll_interval <= 0:
+            raise ValueError(f"poll_interval must be positive, got {poll_interval!r}")
+        if read_timeout is None:
+            read_timeout = (
+                DEFAULT_STREAM_READ_TIMEOUT
+                if mode == "stream"
+                else DEFAULT_POLL_TIMEOUT
+            )
+        elif not (math.isfinite(read_timeout) and read_timeout > 0):
+            raise ValueError(f"read_timeout must be positive, got {read_timeout!r}")
+
+        self._mode: Mode = mode
+        self._poll_interval = poll_interval
+        self._initial_backoff = initial_backoff
+        self._max_backoff = max_backoff
+        self._max_consecutive_failures = max_consecutive_failures
+
+        self._objects = _SkillObjectSet()
+        self._reader = _ProtocolReader(self._objects)
+        self._lock = threading.RLock()
+        self._listeners: dict[str, list[Callable[[dict[str, Any]], Any]]] = {}
+
+        self._basis: str | None = None
+        self._etag: str | None = None
+
+        self._requester = _requester or _Requester(
+            sdk_key.strip(),
+            base_uri,
+            read_timeout=read_timeout,
+        )
+
+        self._stop = threading.Event()
+        self._first_payload = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failed_reason: str | None = None
+        # The open streaming connection, so ``close`` can interrupt its read.
+        self._connection: Any = None
+        # Recoverable failures since the last committed payload. Reset at the
+        # commit rather than when a connection returns: a stream only ever ends
+        # by being dropped, so resetting on return would count every healthy,
+        # server-recycled connection as a failure.
+        self._failures = 0
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self) -> FDv2SkillStore:
+        """
+        Starts the delivery thread. Idempotent; returns ``self`` so it chains.
+
+        Does not block: use ``wait_for_skills`` when boot ordering matters.
+        """
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="ld-ai-skills-fdv2", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def close(self, timeout: float = 5.0) -> None:
+        """
+        Stops delivery. Idempotent, and safe to call from any thread.
+
+        Held content is *not* dropped: a closed store still answers from what it
+        received. Detaching the store from the accessors is the job of the
+        package-level ``launchdarkly_ai_server.shutdown()`` coroutine.
+        """
+        self._stop.set()
+        # The delivery thread is normally blocked in a socket read that no flag
+        # can reach; without this the join waits out its full timeout.
+        with self._lock:
+            connection = self._connection
+        if connection is not None:
+            connection.close()
+        thread = self._thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=timeout)
+
+    def __enter__(self) -> FDv2SkillStore:
+        return self.start()
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def wait_for_skills(self, timeout: float = 10.0) -> bool:
+        """
+        Blocks until the first payload has been committed, or *timeout* elapses.
+
+        ``True`` means a payload arrived — not that any skill in it verified, and
+        not that the environment has any skills. ``diagnostics`` answers the rest.
+        """
+        return self._first_payload.wait(timeout=timeout)
+
+    @property
+    def failed(self) -> str | None:
+        """Why delivery stopped for good, or ``None`` while it is running."""
+        with self._lock:
+            return self._failed_reason
+
+    @property
+    def diagnostics(self) -> StoreDiagnostics:
+        """A snapshot of what the transport has seen. See ``StoreDiagnostics``."""
+        with self._lock:
+            return StoreDiagnostics(**vars(self._reader.diagnostics))
+
+    # -- the SkillStore interface -----------------------------------------
+
+    def get_object(
+        self, kind: str, key: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        if kind != SKILL_OBJECT_KIND:
+            return None
+        with self._lock:
+            return self._objects.get(key, version)
+
+    def all_objects(self, kind: str) -> dict[str, dict[str, Any]]:
+        if kind != SKILL_OBJECT_KIND:
+            return {}
+        with self._lock:
+            return self._objects.snapshot()
+
+    def add_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:
+        """
+        Registers *fn* to be called once per changed object, at
+        ``payload-transferred`` rather than as objects stream in.
+
+        A put notifies with the raw skill object. A revocation notifies with a
+        ``{"key", "version"}`` tombstone carrying no content, so a listener that
+        reads content must check for ``content`` rather than assume it.
+
+        *fn* runs on the delivery thread. Keep it cheap and non-blocking. An
+        exception it raises is logged and swallowed, because a broken listener
+        must not be able to kill delivery.
+        """
+        with self._lock:
+            self._listeners.setdefault(kind, []).append(fn)
+
+    def remove_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:
+        """
+        Unregisters *fn* from *kind*. Safe to call from any thread, including
+        from inside a listener: a removal during one commit takes effect from
+        the next.
+
+        Removes one occurrence; removing a callable that is not registered is a
+        no-op, so ``SkillWatcher.close`` can detach unconditionally.
+        """
+        with self._lock:
+            listeners = self._listeners.get(kind)
+            if listeners is None:
+                return
+            try:
+                listeners.remove(fn)
+            except ValueError:
+                return
+
+    def _notify(self, changes: list[dict[str, Any]]) -> None:
+        with self._lock:
+            listeners = list(self._listeners.get(SKILL_OBJECT_KIND, []))
+        for raw in changes:
+            for listener in listeners:
+                try:
+                    listener(raw)
+                except Exception:
+                    logger.error(
+                        "A skill store change listener raised; delivery continues",
+                        exc_info=True,
+                    )
+
+    # -- the delivery loop -------------------------------------------------
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self._mode == "stream":
+                    self._stream_once()
+                else:
+                    self._poll_once()
+                # A poll that returned is a current answer even when it committed
+                # nothing (HTTP 304). A stream never returns normally; its
+                # successes are counted at each commit in ``_apply``.
+                self._record_success()
+            except _FatalTransportError as exc:
+                self._give_up(str(exc))
+                return
+            except _RecoverableTransportError as exc:
+                with self._lock:
+                    self._failures += 1
+                    failures = self._failures
+                    self._reader.diagnostics.connection_failures = failures
+                    self._reader.diagnostics.last_error = str(exc)
+                if failures > self._max_consecutive_failures:
+                    self._give_up(
+                        f"gave up after {failures} consecutive failures; "
+                        f"last error: {exc}"
+                    )
+                    return
+                delay = exc.retry_after
+                if delay is None or not math.isfinite(delay):
+                    delay = _backoff_delay(
+                        failures, base=self._initial_backoff, maximum=self._max_backoff
+                    )
+                # ``Retry-After`` is a request and ``max_backoff`` is a promise.
+                # The header may come from a proxy rather than LaunchDarkly, and
+                # a value in the hours would park revocation for that long.
+                delay = min(delay, self._max_backoff)
+                logger.warning(
+                    "Skill delivery failed (%s); retrying in %.1fs", exc, delay
+                )
+                if self._stop.wait(delay):
+                    return
+                continue
+            except Exception as exc:  # pragma: no cover - defensive
+                self._give_up(f"unexpected error in skill delivery: {exc!r}")
+                logger.error("Unexpected error in skill delivery", exc_info=True)
+                return
+
+            if self._mode == "poll" and self._stop.wait(self._poll_interval):
+                return
+
+    def _record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._reader.diagnostics.connection_failures = 0
+
+    def _give_up(self, reason: str) -> None:
+        with self._lock:
+            self._failed_reason = reason
+            self._reader.diagnostics.last_error = reason
+        logger.error(
+            "Skill delivery has stopped and will not retry: %s. The store keeps "
+            "serving the last content it received; skills will not update until "
+            "the process restarts with a working connection.",
+            reason,
+        )
+        # Unblock anyone waiting on a first payload that is never coming.
+        self._first_payload.set()
+
+    def _apply(self, name: str, data: Any) -> None:
+        """
+        Feeds one event to the reader, publishes a commit, and raises the
+        transport error the event calls for, if any.
+        """
+        with self._lock:
+            outcome = self._reader.handle(name, data)
+            if outcome.committed and outcome.basis is not None:
+                self._basis = outcome.basis
+        if outcome.committed:
+            # A commit breaks the row of consecutive failures.
+            self._record_success()
+            self._first_payload.set()
+            if outcome.changes:
+                self._notify(outcome.changes)
+        if outcome.fatal:
+            raise _FatalTransportError(outcome.fatal)
+        if outcome.disconnect:
+            raise _RecoverableTransportError(outcome.disconnect)
+
+    def _poll_once(self) -> None:
+        with self._lock:
+            basis, etag = self._basis, self._etag
+        result = self._requester.poll(basis, etag)
+        with self._lock:
+            self._etag = result.etag
+        if result.not_modified:
+            logger.debug("Skill payload unchanged (HTTP 304)")
+            # A 304 counts as a first payload, so a boot that reconnects with a
+            # cached basis is not blocked on a transfer the server will not send.
+            self._first_payload.set()
+            return
+        for name, data in result.events:
+            self._apply(name, data)
+
+    def _stream_once(self) -> None:
+        with self._lock:
+            basis = self._basis
+        connection = self._requester.stream(basis)
+        with self._lock:
+            self._connection = connection
+        try:
+            # ``close`` may have run while the connect was in flight and found
+            # no connection to interrupt; this is the last chance to notice
+            # before the read below blocks.
+            if self._stop.is_set():
+                return
+            for name, data in connection.events:
+                if self._stop.is_set():
+                    return
+                self._apply(name, data)
+        except Exception:
+            if self._stop.is_set():
+                # ``close`` interrupted the read on purpose.
+                return
+            raise
+        finally:
+            connection.close()
+            with self._lock:
+                self._connection = None
+        # A stream that ends without a goodbye is a dropped connection.
+        raise _RecoverableTransportError("the FDv2 stream closed unexpectedly")
