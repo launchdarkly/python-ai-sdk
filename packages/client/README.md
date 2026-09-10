@@ -484,6 +484,15 @@ outage the store keeps serving the last content it received and `write_skills`' 
 `on_unavailable="keep"` leaves managed files alone — an outage must not read as "everything
 was revoked".
 
+**One network timeout, and its default depends on the mode.** `read_timeout` bounds every
+socket operation of a request — connecting, waiting for headers, and each read — because the
+standard library offers no separate connect timeout, and the store deliberately adds no HTTP
+client dependency to provide one. In `mode="poll"` it therefore bounds the whole request and
+defaults to 10 seconds, so a poll against a host that never answers fails in that time and is
+retried. In `mode="stream"` it bounds each wait for the next bytes and defaults to 300 seconds:
+a stream is meant to sit idle between events, and LaunchDarkly's heartbeats arrive well inside
+that, so a stream silent for longer has genuinely gone. Pass `read_timeout` to override either.
+
 **The connection also carries your flags.** A client cannot request only the skill payload,
 so a skills-enabled environment delivers flag and segment objects on the same connection.
 They are skipped, not evaluated — this store does no evaluation of any kind — and

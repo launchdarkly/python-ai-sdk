@@ -266,6 +266,14 @@ such skill" — and would let a prune delete the last known-good copy on disk. N
 a hash from the delivered content: that certifies the content against itself and verifies
 nothing.
 
+**There is one network timeout, not two.** `urllib`'s `timeout` is the socket timeout for the
+whole operation, so connect, headers and each read share it, and the module cannot bound the
+connect separately without a custom connection class it should not carry. `read_timeout` is
+therefore the only knob, and its default is per mode (`DEFAULT_POLL_TIMEOUT` for a whole poll
+request, `DEFAULT_STREAM_READ_TIMEOUT` for the gap between reads on a stream). Do not add a
+parameter that the standard library cannot honour; `TestTimeouts` measures the bound against a
+socket that accepts and never answers.
+
 **`close` interrupts the socket, it does not just set a flag.** The delivery thread spends its
 life blocked in a read that no flag can reach, and closing a response from another thread does
 not unblock CPython's buffered reader. `_interrupt_read` shuts the socket down underneath it.

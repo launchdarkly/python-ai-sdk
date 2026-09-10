@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,10 +39,13 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
+    DEFAULT_POLL_TIMEOUT,
+    DEFAULT_STREAM_READ_TIMEOUT,
     FDV2_OBJECT_CATEGORY,
     FDV2_OBJECT_KIND,
     _ProtocolReader,
     _RecoverableTransportError,
+    _Requester,
     _retry_after_seconds,
     _SkillObjectSet,
     backoff_delay,
@@ -1821,3 +1825,133 @@ class TestLifecycle:
         store = FDv2SkillStore(SDK_KEY)
         assert store.get_object(SKILL_OBJECT_KIND, "anything") is None
         assert store.all_objects(SKILL_OBJECT_KIND) == {}
+
+
+# ---------------------------------------------------------------------------
+# Timeouts
+# ---------------------------------------------------------------------------
+
+
+class _BlackHole:
+    """
+    A listening socket that accepts connections and never sends a byte.
+
+    This is the host ``read_timeout`` exists for: the TCP handshake completes, so
+    nothing fails fast, and then no response ever comes. A request against it can
+    only end by timing out, which makes the elapsed time a direct measurement of
+    the timeout actually applied.
+    """
+
+    def __init__(self) -> None:
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self._accepted: list[socket.socket] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept_forever, daemon=True)
+        self._thread.start()
+        host, port = self._listener.getsockname()
+        self.base_uri = f"http://{host}:{port}"
+
+    def _accept_forever(self) -> None:
+        self._listener.settimeout(0.05)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                continue
+            self._accepted.append(conn)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        for conn in self._accepted:
+            conn.close()
+        self._listener.close()
+
+
+@pytest.fixture
+def black_hole() -> Any:
+    server = _BlackHole()
+    yield server
+    server.close()
+
+
+class TestTimeouts:
+    """
+    ``read_timeout`` is the only network timeout, and every request honours it.
+
+    The bounds asserted here are loose on purpose: the point is that a request
+    against an unresponsive host fails in roughly ``read_timeout`` rather than in
+    minutes, and that a regression back to a much longer default fails this
+    suite quickly instead of hanging it.
+    """
+
+    def test_a_poll_against_an_unresponsive_host_fails_within_read_timeout(
+        self, black_hole: Any
+    ) -> None:
+        requester = _Requester(
+            SDK_KEY, black_hole.base_uri, read_timeout=0.3, data_model_version=1
+        )
+        started = time.monotonic()
+        with pytest.raises(_RecoverableTransportError) as excinfo:
+            requester.poll(None, None)
+        elapsed = time.monotonic() - started
+        assert 0.2 <= elapsed < 2.0
+        assert "timed out" in str(excinfo.value)
+
+    def test_a_stream_against_an_unresponsive_host_fails_within_read_timeout(
+        self, black_hole: Any
+    ) -> None:
+        requester = _Requester(
+            SDK_KEY, black_hole.base_uri, read_timeout=0.3, data_model_version=1
+        )
+        started = time.monotonic()
+        with pytest.raises(_RecoverableTransportError):
+            requester.stream(None)
+        assert time.monotonic() - started < 2.0
+
+    def test_the_store_reports_the_timeout_and_keeps_going(
+        self, black_hole: Any
+    ) -> None:
+        store = FDv2SkillStore(
+            SDK_KEY,
+            base_uri=black_hole.base_uri,
+            mode="poll",
+            poll_interval=0.05,
+            initial_backoff=0.01,
+            max_backoff=0.05,
+            read_timeout=0.3,
+        )
+        try:
+            store.start()
+            assert wait_until(lambda: store.diagnostics.connection_failures >= 1)
+            assert store.failed is None
+            assert "timed out" in (store.diagnostics.last_error or "")
+        finally:
+            store.close()
+
+    def test_the_default_bound_depends_on_the_mode(self) -> None:
+        assert DEFAULT_POLL_TIMEOUT == 10.0
+        assert DEFAULT_STREAM_READ_TIMEOUT == 300.0
+        polling = FDv2SkillStore(SDK_KEY, mode="poll")
+        streaming = FDv2SkillStore(SDK_KEY, mode="stream")
+        assert polling._requester._read_timeout == DEFAULT_POLL_TIMEOUT
+        assert streaming._requester._read_timeout == DEFAULT_STREAM_READ_TIMEOUT
+
+    @pytest.mark.parametrize("mode", ["poll", "stream"])
+    def test_an_explicit_read_timeout_overrides_the_default(self, mode: Any) -> None:
+        store = FDv2SkillStore(SDK_KEY, mode=mode, read_timeout=42.0)
+        assert store._requester._read_timeout == 42.0
+
+    @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
+    def test_a_non_positive_read_timeout_is_rejected(self, value: float) -> None:
+        with pytest.raises(ValueError, match="read_timeout"):
+            FDv2SkillStore(SDK_KEY, read_timeout=value)
+
+    def test_there_is_no_separate_connect_timeout(self) -> None:
+        # ``urllib`` cannot bound the connect separately from the reads, so the
+        # constructor does not offer a parameter that would only pretend to.
+        with pytest.raises(TypeError):
+            FDv2SkillStore(SDK_KEY, connect_timeout=2.0)  # type: ignore[call-arg]

@@ -91,6 +91,19 @@ Override it with ``FDv2SkillStore(data_model_version=...)`` if a LaunchDarkly
 instance expects a different value.
 """
 
+DEFAULT_POLL_TIMEOUT = 10.0
+"""
+Default ``read_timeout`` in ``"poll"`` mode: the bound on one whole
+``GET /sdk/poll``, from opening the connection to reading the last byte.
+"""
+
+DEFAULT_STREAM_READ_TIMEOUT = 300.0
+"""
+Default ``read_timeout`` in ``"stream"`` mode: the longest a live stream may go
+silent before it is treated as dead. LaunchDarkly sends heartbeats well inside
+this, so an idle stream this long genuinely has gone away.
+"""
+
 _EVENT_SERVER_INTENT = "server-intent"
 _EVENT_PUT_OBJECT = "put-object"
 _EVENT_DELETE_OBJECT = "delete-object"
@@ -838,7 +851,6 @@ class _Requester:
         sdk_key: str,
         base_uri: str,
         *,
-        connect_timeout: float,
         read_timeout: float,
         data_model_version: int,
         opener: Any = None,
@@ -846,7 +858,15 @@ class _Requester:
         self._sdk_key = sdk_key
         self._base_uri = base_uri.rstrip("/")
         self._read_timeout = read_timeout
-        self._connect_timeout = connect_timeout
+        """
+        The one timeout, applied to every socket operation of a request.
+
+        ``urllib`` has no separate connect timeout: its ``timeout`` becomes the
+        socket timeout for the whole operation, so connecting, waiting for headers
+        and each body read are all bounded by this same value. For a poll that
+        makes it the bound on the whole request; for a stream it is the longest
+        gap tolerated between two reads.
+        """
         self._data_model_version = data_model_version
         # Injectable so the tests drive a fake endpoint without a socket; the
         # default is urllib's global opener.
@@ -1067,8 +1087,7 @@ class FDv2SkillStore:
         base_uri: str = DEFAULT_BASE_URI,
         mode: Mode = "stream",
         poll_interval: float = 30.0,
-        connect_timeout: float = 10.0,
-        read_timeout: float = 300.0,
+        read_timeout: float | None = None,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
         max_consecutive_failures: int = 10,
@@ -1081,6 +1100,19 @@ class FDv2SkillStore:
         rather than at the next restart. ``"poll"`` exists for environments that
         cannot hold a long-lived connection, and revocation there is one
         ``poll_interval`` late.
+
+        *read_timeout* is the only network timeout, and it bounds every socket
+        operation of a request: connecting, waiting for headers, and each read.
+        There is no separate connect timeout because the standard library offers
+        none, so a host that accepts and never answers, or never accepts, fails
+        after ``read_timeout`` too. What the value means therefore depends on the
+        mode, and so does its default. In ``"poll"`` mode it bounds the whole
+        request and defaults to ``DEFAULT_POLL_TIMEOUT`` (10s). In ``"stream"``
+        mode it bounds each wait for the next bytes and defaults to
+        ``DEFAULT_STREAM_READ_TIMEOUT`` (300s): a stream is meant to sit idle
+        between events, and LaunchDarkly's heartbeats arrive well inside that.
+        Pass a value to override the default for either mode; it must be
+        positive.
 
         *max_backoff* caps every delay between retries, including one the server
         asks for with ``Retry-After``; a header cannot park delivery for longer
@@ -1096,6 +1128,14 @@ class FDv2SkillStore:
             raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
         if poll_interval <= 0:
             raise ValueError(f"poll_interval must be positive, got {poll_interval!r}")
+        if read_timeout is None:
+            read_timeout = (
+                DEFAULT_STREAM_READ_TIMEOUT
+                if mode == "stream"
+                else DEFAULT_POLL_TIMEOUT
+            )
+        elif not (math.isfinite(read_timeout) and read_timeout > 0):
+            raise ValueError(f"read_timeout must be positive, got {read_timeout!r}")
 
         self._mode: Mode = mode
         self._poll_interval = poll_interval
@@ -1114,7 +1154,6 @@ class FDv2SkillStore:
         self._requester = _requester or _Requester(
             sdk_key.strip(),
             base_uri,
-            connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             data_model_version=data_model_version,
         )
