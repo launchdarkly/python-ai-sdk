@@ -448,13 +448,6 @@ class _SkillObjectSet:
 
 
 @dataclass
-class _Change:
-    """One committed change, as handed to a listener."""
-
-    raw: dict[str, Any]
-
-
-@dataclass
 class _TransferOutcome:
     """What one event did. Aggregated by the caller; nothing here does I/O."""
 
@@ -598,9 +591,8 @@ class _ProtocolReader:
         state = data.get("state") if isinstance(data, dict) else None
         version = data.get("version") if isinstance(data, dict) else None
         if self._pending is not None:
-            hashless_before = self.diagnostics.hashless_objects
             self._committed.replace_with(self._pending)
-            _warn_if_nothing_can_verify(self._committed, hashless_before)
+            _warn_if_nothing_can_verify(self._committed)
         self._pending = None
         self._intent = None
         changes = self._changes
@@ -677,9 +669,7 @@ _HASHLESS_ADVICE = (
 )
 
 
-def _warn_if_nothing_can_verify(
-    committed: _SkillObjectSet, hashless_before_this_payload: int
-) -> None:
+def _warn_if_nothing_can_verify(committed: _SkillObjectSet) -> None:
     """
     One ERROR per committed payload in which *nothing* the store now holds can
     possibly verify.
@@ -689,7 +679,6 @@ def _warn_if_nothing_can_verify(
     so the condition is visible in a process that boots, materializes nothing,
     and exits, which is a common way a skills deployment fails.
     """
-    del hashless_before_this_payload  # counted for the store, not for this check
     held = committed.all_raw()
     if not held:
         return
@@ -909,8 +898,6 @@ class _Requester:
                 # urllib raises on 304 when no redirect handler swallows it.
                 return _PollResult(not_modified=True, events=[], etag=etag)
             raise _classify_status(exc.code, exc.headers) from exc
-        except _FatalTransportError:
-            raise
         except Exception as exc:
             raise _RecoverableTransportError(
                 f"polling request failed: {type(exc).__name__}: {exc}"
@@ -936,8 +923,6 @@ class _Requester:
             response = self._opener.open(request, timeout=self._read_timeout)
         except urllib.error.HTTPError as exc:
             raise _classify_status(exc.code, exc.headers) from exc
-        except _FatalTransportError:
-            raise
         except Exception as exc:
             raise _RecoverableTransportError(
                 f"streaming request failed: {type(exc).__name__}: {exc}"
