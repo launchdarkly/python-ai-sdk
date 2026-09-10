@@ -470,10 +470,8 @@ finally:
     store.close()
 ```
 
-**Nothing above the store changes.** The accessors, integrity verification, and
-`write_skills` are transport-agnostic: they see raw objects through the `SkillStore`
-interface and cannot tell which store produced them. Everything documented above about verification and
-reconcile semantics applies unchanged.
+**Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
+objects through the `SkillStore` interface and cannot tell which store produced them.
 
 **Server-side only.** Skills are for server-side agent runtimes and skill content is
 customer-confidential. A mobile key (`mob-…`) or a client-side environment ID raises from the
@@ -487,13 +485,9 @@ outage the store keeps serving the last content it received and `write_skills`' 
 was revoked".
 
 **One network timeout, and its default depends on the mode.** `read_timeout` bounds every
-socket operation of a request — connecting, waiting for headers, and each read — because the
-standard library offers no separate connect timeout, and the store deliberately adds no HTTP
-client dependency to provide one. In `mode="poll"` it therefore bounds the whole request and
-defaults to 10 seconds, so a poll against a host that never answers fails in that time and is
-retried. In `mode="stream"` it bounds each wait for the next bytes and defaults to 300 seconds:
-a stream is meant to sit idle between events, and LaunchDarkly's heartbeats arrive well inside
-that, so a stream silent for longer has genuinely gone. Pass `read_timeout` to override either.
+socket operation of a request, connecting included. In `mode="poll"` it bounds the whole
+request and defaults to 10 seconds; in `mode="stream"` it bounds each wait for the next bytes
+and defaults to 300 seconds, well beyond LaunchDarkly's heartbeat interval.
 
 **The connection also carries your flags.** A client cannot request only the skill payload,
 so a skills-enabled environment delivers flag and segment objects on the same connection.
@@ -507,12 +501,9 @@ They are skipped, not evaluated — this store does no evaluation of any kind �
 > does not speak the FDv2 endpoints, so relay-only deployments cannot receive skills.
 
 **If every skill comes back empty, check `diagnostics.hashless_objects`.** Verification
-requires `contentHash` on the delivered object and withholds anything without one, so a
-nonzero count there means skills are being withheld rather than that the environment has
-none. The store logs an error per hashless object and one summary per wholly-hashless
-payload, both naming the reason. There is deliberately no fallback that skips verification: a
-hash the SDK computed from the content it was handed would certify the content against
-itself.
+withholds any delivered object without a `contentHash`, so a nonzero count means skills are
+being withheld rather than that the environment has none. The store also logs an error per
+hashless object naming the reason. There is deliberately no fallback that skips verification.
 
 **Total path length is yours to bound, not the SDK's.** The 255-byte bound above is per
 *component*; the root is your path, so `<root>` + `<key>` + `/SKILL.md` can still exceed
