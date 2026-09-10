@@ -21,6 +21,7 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    lang_chain_content_text,
     lang_chain_span_messages,
     lang_chain_span_usage,
     parse_template,
@@ -133,23 +134,48 @@ def _build_initial_messages(
     return messages
 
 
+def _model_constructor_kwargs(
+    config: AiConfigRep, fallback_name: str
+) -> dict[str, Any]:
+    raw = (config.get("model") or {}).get("parameters")
+    parameters = dict(raw) if isinstance(raw, dict) else {}
+    parameters["model"] = (config.get("model") or {}).get("name") or fallback_name
+    return parameters
+
+
+def _is_model_factory(llm: Any) -> bool:
+    """LangChain models are callable, so ``callable`` is not enough to spot a factory."""
+    return callable(llm) and not hasattr(llm, "invoke") and not hasattr(llm, "ainvoke")
+
+
 def _make_default_chat_model(config: AiConfigRep) -> Any:
     """
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
+    ``model.parameters`` are passed through unchanged.
     """
     import importlib
 
     provider = ((config.get("provider") or {}).get("name") or "openai").lower()
-    model_name = (config.get("model") or {}).get("name", "")
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            model=model_name or "claude-3-5-sonnet-20241022"
+            **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
         )
     lc_openai = importlib.import_module("langchain_openai")
-    return lc_openai.ChatOpenAI(model=model_name or "gpt-4o")
+    return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
+
+
+async def _resolve_base_model(config: AiConfigRep, llm: Any) -> Any:
+    if llm is None:
+        return _make_default_chat_model(config)
+    if _is_model_factory(llm):
+        model = llm(config)
+        if asyncio.iscoroutine(model):
+            return await model
+        return model
+    return llm
 
 
 def _run_usage_from_messages(messages: list[Any]) -> Any:
@@ -177,6 +203,9 @@ def create_langchain_agents_handler(
     llm: Any = None, *, capture_content: bool = False
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
+
+    Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
+    called after flag evaluation so ``model.parameters`` can be applied unchanged.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
@@ -229,9 +258,7 @@ def create_langchain_agents_handler(
                     system_instructions=system_prompt,
                     messages=lang_chain_span_messages(initial_messages)[1],
                 )
-            base_model = llm
-            if base_model is None:
-                base_model = _make_default_chat_model(config)
+            base_model = await _resolve_base_model(config, llm)
 
             langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
             create_react_agent = langgraph_prebuilt.create_react_agent
@@ -261,20 +288,11 @@ def create_langchain_agents_handler(
                 run_usage = span_callbacks.run_usage
 
             last_msg = msgs[-1] if msgs else None
-            output = (
-                (last_msg.content if isinstance(last_msg.content, str) else "")
-                if last_msg
-                else ""
-            )
+            output = lang_chain_content_text(last_msg.content) if last_msg else ""
 
             # Built through the same conversion the chat span uses, not from `output`. A chat model
-            # may return content as a list of blocks, and `output` is deliberately blank for that
-            # case because it is also what this function returns to the caller. Reading it here made
-            # the root record an empty completion while its own chat child held the real text, so the
-            # two spans described the same reply differently.
-            #
-            # The blank return value is a separate question. It predates this work and is not
-            # telemetry, so it stays as it is.
+            # may return content as a list of blocks. Keeping that conversion here preserves
+            # non-text parts in telemetry while the caller-facing output contains visible text.
             set_output_content_attributes(
                 span,
                 capture_content,
@@ -396,9 +414,7 @@ async def _stream_gen(
                 system_instructions=system_prompt,
                 messages=lang_chain_span_messages(initial_messages)[1],
             )
-        base_model = llm
-        if base_model is None:
-            base_model = _make_default_chat_model(config)
+        base_model = await _resolve_base_model(config, llm)
 
         langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
         create_react_agent = langgraph_prebuilt.create_react_agent
@@ -430,7 +446,7 @@ async def _stream_gen(
                     if usage:
                         run_usage.add(lang_chain_span_usage(usage))
                     if getattr(msg, "type", None) == "ai":
-                        text = msg.content if isinstance(msg.content, str) else ""
+                        text = lang_chain_content_text(msg.content)
                         if text:
                             yield {"type": "chunk", "text": text}
                             full_output = text

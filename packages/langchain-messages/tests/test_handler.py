@@ -5,6 +5,7 @@ Covers §1.1-1.10 (generic handler tests) plus TELEMETRY-CONTRACT.md sections 1-
 
 from __future__ import annotations
 
+import sys
 from collections.abc import AsyncGenerator
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,7 +25,7 @@ import pytest
 class FakeAIMessage:
     def __init__(
         self,
-        content: str = "Hello",
+        content: Any = "Hello",
         tool_calls: list[dict[str, Any]] | None = None,
         input_tokens: int = 10,
         output_tokens: int = 5,
@@ -54,7 +55,7 @@ class FakeAIMessage:
         return "ai"
 
 
-def _make_llm(response_content: str = "Hello") -> MagicMock:
+def _make_llm(response_content: Any = "Hello") -> MagicMock:
     """Creates a mock LangChain LLM."""
     llm = MagicMock()
     ai_msg = FakeAIMessage(response_content)
@@ -298,6 +299,18 @@ class TestPromptConstruction:
         all_content = " ".join(str(getattr(m, "content", "")) for m in call_args)
         assert "from-messages" in all_content
         assert "Be helpful" not in all_content
+
+    async def test_returns_text_from_mixed_thinking_and_text_blocks(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        content = [
+            {"type": "thinking", "thinking": "internal reasoning"},
+            {"type": "text", "text": "visible answer"},
+        ]
+        result = await create_langchain_messages_handler(llm=_make_llm(content))(
+            CONFIG, "q"
+        )
+        assert result["output"] == "visible answer"
 
 
 # ---------------------------------------------------------------------------
@@ -1130,7 +1143,7 @@ class TestConvenienceExport:
 
 class TestStreaming:
     def _make_streaming_llm(
-        self, chunks: list[str], input_tok: int = 5, output_tok: int = 3
+        self, chunks: list[Any], input_tok: int = 5, output_tok: int = 3
     ) -> MagicMock:
         llm = MagicMock()
         llm.bind_tools = MagicMock(return_value=llm)
@@ -1162,6 +1175,26 @@ class TestStreaming:
         assert len(chunks) == 2
         assert chunks[0]["text"] == "hello "
         assert chunks[1]["text"] == "world"
+
+    async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = self._make_streaming_llm(
+            [
+                [
+                    {"type": "thinking", "thinking": "internal reasoning"},
+                    {"type": "text", "text": "visible answer"},
+                ]
+            ]
+        )
+        events = [
+            event
+            async for event in await create_langchain_messages_handler(llm=llm).stream(
+                CONFIG, "q"
+            )
+        ]
+        assert {"type": "chunk", "text": "visible answer"} in events
+        assert events[-1]["output"] == "visible answer"
 
     async def test_yields_exactly_one_done_event(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
@@ -2220,3 +2253,132 @@ class TestStreamingRootOutputRespectsTheCaptureFlag:
             pass
 
         assert calls["n"] == 0
+
+
+class TestModelSource:
+    @pytest.mark.asyncio
+    async def test_factory_receives_config_and_returned_model_is_used(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("from-factory")
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {"temperature": 0.2, "max_tokens": 512},
+            },
+        }
+        with ctx:
+            result = await create_langchain_messages_handler(llm=factory)(
+                cfg, "q", {}, {}
+            )
+        assert seen[0]["model"]["parameters"] == {"temperature": 0.2, "max_tokens": 512}
+        assert result["output"] == "from-factory"
+        llm.ainvoke.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prebuilt_instance_is_used_as_is(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("from-instance")
+        with ctx:
+            result = await create_langchain_messages_handler(llm=llm)(
+                {
+                    **CONFIG,
+                    "model": {"name": "gpt-4o", "parameters": {"temperature": 0.2}},
+                },
+                "q",
+                {},
+                {},
+            )
+        assert result["output"] == "from-instance"
+        llm.ainvoke.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_default_openai_constructor_receives_parameters(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("default-openai")
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {"temperature": 0.2, "max_tokens": 512},
+            },
+        }
+        with (
+            ctx,
+            patch.dict(sys.modules, {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "model": "gpt-4o",
+        }
+
+    @pytest.mark.asyncio
+    async def test_default_anthropic_constructor_receives_parameters(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("default-anthropic")
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Anthropic"},
+            "model": {
+                "name": "claude-sonnet-4-5",
+                "parameters": {"temperature": 0.1, "thinking": {"type": "enabled"}},
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                sys.modules, {"langchain_anthropic": MagicMock(ChatAnthropic=ctor)}
+            ),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.1,
+            "thinking": {"type": "enabled"},
+            "model": "claude-sonnet-4-5",
+        }
+
+    @pytest.mark.asyncio
+    async def test_factory_is_resolved_on_the_streaming_path(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("streamed")
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **CONFIG,
+            "model": {"name": "gpt-4o", "parameters": {"temperature": 0.2}},
+        }
+        with ctx:
+            events = [
+                e
+                async for e in await create_langchain_messages_handler(
+                    llm=factory
+                ).stream(cfg, "q", {}, {})
+            ]
+        assert seen[0]["model"]["parameters"] == {"temperature": 0.2}
+        assert any(
+            e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
+        )

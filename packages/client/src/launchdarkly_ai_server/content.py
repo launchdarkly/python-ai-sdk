@@ -302,7 +302,7 @@ def lang_chain_span_messages(
         msg_type = (
             str(get_type()) if callable(get_type) else str(_get(raw, "type") or "")
         )
-        text = _lang_chain_content_text(_get(raw, "content"))
+        text = lang_chain_content_text(_get(raw, "content"))
 
         if msg_type in ("system", "developer"):
             if text:
@@ -358,7 +358,7 @@ def lang_chain_span_messages(
     return ("\n".join(system) if system else None, converted)
 
 
-def _lang_chain_content_text(content: Any) -> str:
+def lang_chain_content_text(content: Any) -> str:
     """LangChain message content is a string, or a list holding typed blocks and bare strings.
 
     LangChain types it as ``str | list[str | dict]``, so a bare string inside the list is what the
