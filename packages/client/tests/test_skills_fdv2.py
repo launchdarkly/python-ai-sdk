@@ -1610,11 +1610,19 @@ class TestServerSideOnly:
 
 
 # ---------------------------------------------------------------------------
-# The eager re-reconcile
+# The eager re-reconcile, end to end over the transport
 # ---------------------------------------------------------------------------
 
 
-class TestWatchSkills:
+class TestWatchSkillsOverTheTransport:
+    """
+    ``watch_skills`` against a live ``FDv2SkillStore``. The watcher's own
+    behaviour — debounce, refusal of a store without ``add_listener``, detaching
+    on close — is covered in ``test_skills_watch.py`` against the in-memory
+    store; these are the cases that only mean something with a transport
+    underneath: a wire-level revocation, an ``objectVersion`` bump, and an outage.
+    """
+
     async def test_a_revocation_prunes_without_a_restart(
         self, endpoint: Any, tmp_path: Any
     ) -> None:
@@ -1670,25 +1678,6 @@ class TestWatchSkills:
             finally:
                 watcher.close()
 
-    async def test_a_burst_of_changes_coalesces_into_few_reconciles(
-        self, endpoint: Any, tmp_path: Any
-    ) -> None:
-        endpoint.queue_poll(
-            full_payload(*[("put-object", put_skill(f"skill-{i}")) for i in range(12)])
-        )
-        endpoint.queue_poll(status=304)
-        with poll_store(endpoint) as store:
-            store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
-            _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.1)
-            try:
-                time.sleep(0.5)
-                # Twelve objects committed in one payload fire twelve listener
-                # calls; without coalescing that is twelve reconciles of one root.
-                assert watcher.reconciles <= 2
-            finally:
-                watcher.close()
-
     async def test_the_default_keeps_last_known_good_during_an_outage(
         self, endpoint: Any, tmp_path: Any
     ) -> None:
@@ -1714,145 +1703,16 @@ class TestWatchSkills:
             finally:
                 watcher.close()
 
-    async def test_a_store_with_no_listener_support_is_refused_loudly(
-        self, tmp_path: Any
-    ) -> None:
-        class NoListeners:
-            def get_object(self, *_a: Any, **_k: Any) -> None:
-                return None
 
-            def all_objects(self, _kind: str) -> dict[str, Any]:
-                return {}
-
-        await init_client(options={"skillStore": NoListeners()}, client=object())
-        with pytest.raises(RuntimeError, match="add_listener"):
-            await watch_skills("*", tmp_path / "s")
-
-    async def test_no_store_configured_raises(self, tmp_path: Any) -> None:
-        with pytest.raises(RuntimeError, match="configured skill store"):
-            await watch_skills("*", tmp_path / "s")
-
-    async def test_the_in_memory_store_can_also_drive_a_watch(
-        self, tmp_path: Any
-    ) -> None:
-        """The watcher is wired to the ``SkillStore`` interface, not to the FDv2
-        store."""
-        store = InMemorySkillStore()
-        store.put(
-            {
-                "key": "a",
-                "version": 1,
-                "content": "body",
-                "contentHash": _hash("body"),
-            }
-        )
-        await init_client(options={"skillStore": store}, client=object())
-        _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
-        try:
-            written = tmp_path / "s" / "a" / "SKILL.md"
-            assert written.read_text() == "body"
-            store.put(
-                {
-                    "key": "a",
-                    "version": 2,
-                    "content": "new body",
-                    "contentHash": _hash("new body"),
-                }
-            )
-            assert wait_until(lambda: written.read_text() == "new body", timeout=10)
-        finally:
-            watcher.close()
+# ---------------------------------------------------------------------------
+# Listener registration
+# ---------------------------------------------------------------------------
 
 
-class TestWatcherDetachesOnClose:
-    """``SkillWatcher.close`` unregisters ``notify``, so a closed watcher is
-    neither called nor kept alive by the store."""
-
+class TestListenerRegistration:
     @staticmethod
     def _skill_listeners(store: Any) -> list[Any]:
         return list(store._listeners.get(SKILL_OBJECT_KIND, []))
-
-    async def test_a_closed_watcher_is_no_longer_notified(
-        self, endpoint: Any, tmp_path: Any
-    ) -> None:
-        endpoint.queue_poll(full_payload(("put-object", put_skill(content="first"))))
-        endpoint.queue_poll(status=304)
-        endpoint.queue_poll(
-            events(
-                ("server-intent", server_intent("xfer-full")),
-                ("put-object", put_skill(object_version=4, content="second")),
-                ("payload-transferred", transferred("basis-2")),
-            )
-        )
-        endpoint.queue_poll(status=304)
-
-        with poll_store(endpoint, poll_interval=0.1) as store:
-            store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
-            _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
-            assert watcher.notify in self._skill_listeners(store)
-
-            watcher.close()
-
-            assert watcher.notify not in self._skill_listeners(store)
-            written = tmp_path / "s" / "pdf-extraction" / "SKILL.md"
-            assert wait_until(
-                lambda: (
-                    store.get_object(SKILL_OBJECT_KIND, "pdf-extraction", 4) is not None
-                ),
-                timeout=10,
-            )
-            time.sleep(0.3)
-            assert written.read_text() == "first"
-            assert watcher.reconciles == 0
-
-    async def test_close_twice_does_not_raise(self, tmp_path: Any) -> None:
-        store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
-        _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
-        watcher.close()
-        watcher.close()
-        assert self._skill_listeners(store) == []
-
-    async def test_repeated_watchers_leave_no_listeners_behind(
-        self, tmp_path: Any
-    ) -> None:
-        store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
-        for _ in range(5):
-            _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
-            assert len(self._skill_listeners(store)) == 1
-            watcher.close()
-        assert self._skill_listeners(store) == []
-
-    async def test_a_store_without_remove_listener_still_closes(
-        self, tmp_path: Any
-    ) -> None:
-        """``remove_listener`` is optional: an older store keeps working, at the
-        cost of the listener staying registered."""
-
-        class AddOnly:
-            def __init__(self) -> None:
-                self.listeners: list[Any] = []
-
-            def get_object(self, *_a: Any, **_k: Any) -> None:
-                return None
-
-            def all_objects(self, _kind: str) -> dict[str, Any]:
-                return {}
-
-            def add_listener(self, _kind: str, fn: Any) -> None:
-                self.listeners.append(fn)
-
-        store = AddOnly()
-        await init_client(options={"skillStore": store}, client=object())
-        _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
-        assert store.listeners == [watcher.notify]
-
-        watcher.close()
-        watcher.close()
-
-        assert store.listeners == [watcher.notify]
 
     def test_fdv2_remove_listener_of_an_unregistered_callable_is_a_no_op(
         self, endpoint: Any
