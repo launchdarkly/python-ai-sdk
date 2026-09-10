@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import re
 import socket
@@ -724,6 +725,11 @@ def _retry_after_seconds(headers: Any) -> float | None:
         # The HTTP-date form is legal and rare; falling back to our own backoff
         # is better than parsing a date to honour it approximately.
         return None
+    if not math.isfinite(seconds):
+        # ``float`` accepts "inf", "nan" and out-of-range literals such as
+        # "1e309". None of them is a delay, and an infinite one would overflow
+        # the wait that honours it, so treat them like the date form.
+        return None
     return max(0.0, seconds)
 
 
@@ -1072,9 +1078,14 @@ class FDv2SkillStore:
         cannot hold a long-lived connection, and revocation there is one
         ``poll_interval`` late.
 
+        *max_backoff* caps every delay between retries, including one the server
+        asks for with ``Retry-After``; a header cannot park delivery for longer
+        than the cap promises.
+
         *max_consecutive_failures* bounds the retry loop. On exceeding it the
         transport stops, logs an error, and the store keeps serving last known
-        good rather than pretending to be live — ``failed`` reports it.
+        good rather than pretending to be live — ``failed`` reports it. Only
+        failures in a row count: a committed payload resets the count.
         """
         _require_server_side_credential(sdk_key)
         if mode not in ("stream", "poll"):
@@ -1110,6 +1121,16 @@ class FDv2SkillStore:
         self._failed_reason: str | None = None
         self._connection: Any = None
         """The open streaming connection, so ``close`` can interrupt its read."""
+        self._failures = 0
+        """
+        Recoverable failures since the last committed payload.
+
+        Held on the store rather than in the loop because the reset belongs at
+        the commit, not at the return: a streaming connection only ever ends by
+        being dropped, so a loop that reset on return would count every healthy,
+        server-recycled connection as a failure and eventually give up on a
+        transport that never failed.
+        """
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1236,22 +1257,24 @@ class FDv2SkillStore:
     # -- the delivery loop -------------------------------------------------
 
     def _run(self) -> None:
-        failures = 0
         while not self._stop.is_set():
             try:
                 if self._mode == "stream":
                     self._stream_once()
                 else:
                     self._poll_once()
-                failures = 0
-                with self._lock:
-                    self._reader.diagnostics.connection_failures = 0
+                # A poll that returned is a current answer even when it committed
+                # nothing (HTTP 304), so it counts as a success in its own right.
+                # A stream never returns normally; its successes are counted where
+                # they happen, at each commit in ``_apply``.
+                self._record_success()
             except _FatalTransportError as exc:
                 self._give_up(str(exc))
                 return
             except _RecoverableTransportError as exc:
-                failures += 1
                 with self._lock:
+                    self._failures += 1
+                    failures = self._failures
                     self._reader.diagnostics.connection_failures = failures
                     self._reader.diagnostics.last_error = str(exc)
                 if failures > self._max_consecutive_failures:
@@ -1261,10 +1284,16 @@ class FDv2SkillStore:
                     )
                     return
                 delay = exc.retry_after
-                if delay is None:
+                if delay is None or not math.isfinite(delay):
                     delay = backoff_delay(
                         failures, base=self._initial_backoff, maximum=self._max_backoff
                     )
+                # ``Retry-After`` is a request, and ``max_backoff`` is a promise.
+                # The header comes from whatever answered on the error path,
+                # which may be a proxy or a CDN rather than LaunchDarkly, and a
+                # value in the hours would park delivery (and revocation) for
+                # that long. The promise wins. A zero still means "now".
+                delay = min(delay, self._max_backoff)
                 logger.warning(
                     "Skill delivery failed (%s); retrying in %.1fs", exc, delay
                 )
@@ -1278,6 +1307,11 @@ class FDv2SkillStore:
 
             if self._mode == "poll" and self._stop.wait(self._poll_interval):
                 return
+
+    def _record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._reader.diagnostics.connection_failures = 0
 
     def _give_up(self, reason: str) -> None:
         with self._lock:
@@ -1299,6 +1333,10 @@ class FDv2SkillStore:
             if outcome.committed and outcome.basis is not None:
                 self._basis = outcome.basis
         if outcome.committed:
+            # A connection that transferred a payload succeeded, whatever it does
+            # afterwards: the give-up bound counts failures in a row, and a
+            # commit breaks the row.
+            self._record_success()
             self._first_payload.set()
             if outcome.changes:
                 self._notify(outcome.changes)
@@ -1332,6 +1370,13 @@ class FDv2SkillStore:
         with self._lock:
             self._connection = connection
         try:
+            # ``close`` may have run while the connect above was in flight. It
+            # found no connection to interrupt then, so this is the last chance
+            # to notice before the read below blocks for as long as the server
+            # stays quiet. Either ``close`` saw the connection and interrupted
+            # it, or it set the stop flag before this check: there is no window.
+            if self._stop.is_set():
+                return
             for name, data in connection.events:
                 if self._stop.is_set():
                     return

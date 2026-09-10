@@ -42,6 +42,7 @@ from launchdarkly_ai_server.skills_fdv2 import (
     FDV2_OBJECT_KIND,
     _ProtocolReader,
     _RecoverableTransportError,
+    _retry_after_seconds,
     _SkillObjectSet,
     backoff_delay,
     is_skill_event,
@@ -1029,6 +1030,69 @@ class _ScriptedRequester:
         return _ScriptedConnection(outcome)
 
 
+class _RecyclingRequester:
+    """
+    A healthy server that recycles connections: every ``stream`` call succeeds,
+    transfers a full payload, and then ends the connection, as LaunchDarkly and
+    any proxy in between do to a long-lived stream.
+    """
+
+    def __init__(self) -> None:
+        self.connections = 0
+
+    def stream(self, basis: str | None) -> Any:
+        self.connections += 1
+        return _ScriptedConnection(
+            [
+                (e["event"], e["data"])
+                for e in full_payload(
+                    ("put-object", put_skill()), state=f"basis-{self.connections}"
+                )
+            ]
+        )
+
+
+class _BlockingConnection:
+    """A stream that never produces an event until it is closed."""
+
+    def __init__(self) -> None:
+        self._closed = threading.Event()
+
+    @property
+    def events(self) -> Any:
+        self._closed.wait()
+        return iter(())
+
+    def close(self) -> None:
+        self._closed.set()
+
+
+class _SlowConnectRequester:
+    """
+    A ``stream`` whose connect does not return until the test releases it,
+    standing in for a slow TLS handshake, followed by a read that never yields.
+    """
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def stream(self, basis: str | None) -> Any:
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return _BlockingConnection()
+
+
+def stream_store(**kwargs: Any) -> FDv2SkillStore:
+    return FDv2SkillStore(
+        SDK_KEY,
+        mode="stream",
+        initial_backoff=kwargs.pop("initial_backoff", 0.001),
+        max_backoff=kwargs.pop("max_backoff", 0.002),
+        **kwargs,
+    )
+
+
 class TestFailureHandling:
     def test_a_403_stops_delivery_and_explains_why(
         self, endpoint: Any, caplog: Any
@@ -1100,6 +1164,62 @@ class TestFailureHandling:
         finally:
             store.close()
 
+    def test_recycled_stream_connections_are_not_failures(self) -> None:
+        # A streaming connection only ever ends by being dropped, so a loop
+        # that counted every drop as a failure would give up on a healthy
+        # server after max_consecutive_failures + 1 recycles, and delivery
+        # (including revocation) would silently stop for the process lifetime.
+        requester = _RecyclingRequester()
+        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        try:
+            store.start()
+            assert wait_until(lambda: requester.connections >= 8)
+            assert store.failed is None
+            assert store.diagnostics.payloads_transferred >= 8
+            # A drop is a failure until the next commit clears it, so the count
+            # may read 1 mid-reconnect. What it must never do is climb.
+            assert store.diagnostics.connection_failures <= 1
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+        finally:
+            store.close()
+
+    def test_a_stream_commit_resets_the_failure_count(self) -> None:
+        payload = [
+            (e["event"], e["data"]) for e in full_payload(("put-object", put_skill()))
+        ]
+        requester = _ScriptedRequester(
+            _RecoverableTransportError("x"),
+            _RecoverableTransportError("x"),
+            _RecoverableTransportError("x"),
+            payload,
+        )
+        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        try:
+            store.start()
+            assert store.wait_for_skills(timeout=5)
+            # Three failures reach the bound, then a commit, then the exhausted
+            # requester fails on every reconnect. The count must start again at
+            # the commit: the stream's own drop is failure one, and three more
+            # connects are owed before giving up. Carrying the three over would
+            # give up on the drop itself, with no further connect at all.
+            assert wait_until(lambda: store.failed is not None)
+            assert "gave up after 4 consecutive failures" in store.failed
+            assert "last error: x" in store.failed
+            assert len(requester.calls) == 7
+        finally:
+            store.close()
+
+    def test_stream_retries_are_bounded(self) -> None:
+        store = stream_store(
+            max_consecutive_failures=3, _requester=_ScriptedRequester()
+        )
+        try:
+            store.start()
+            assert wait_until(lambda: store.failed is not None)
+            assert "gave up after 4 consecutive failures" in store.failed
+        finally:
+            store.close()
+
     def test_a_retry_after_header_is_honoured(self) -> None:
         requester = _ScriptedRequester(
             _RecoverableTransportError("slow down", retry_after=0.25),
@@ -1127,6 +1247,51 @@ class TestFailureHandling:
         with poll_store(endpoint, initial_backoff=5.0) as store:
             # If Retry-After were ignored the 5s backoff would blow the timeout.
             assert store.wait_for_skills(timeout=3) is True
+
+    @pytest.mark.parametrize("raw", ["inf", "Infinity", "-inf", "nan", "1e309"])
+    def test_a_non_finite_retry_after_is_ignored(self, raw: str) -> None:
+        assert _retry_after_seconds({"Retry-After": raw}) is None
+
+    def test_retry_after_parsing_keeps_its_edges(self) -> None:
+        assert _retry_after_seconds({"Retry-After": "0"}) == 0.0
+        assert _retry_after_seconds({"Retry-After": "-5"}) == 0.0
+        assert (
+            _retry_after_seconds({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})
+            is None
+        )
+        assert _retry_after_seconds({"Retry-After": "2.5"}) == 2.5
+
+    @pytest.mark.parametrize("retry_after", [float("inf"), float("nan"), 86400.0])
+    def test_an_unreasonable_retry_after_neither_kills_delivery_nor_parks_it(
+        self, retry_after: float
+    ) -> None:
+        # An infinite wait would overflow inside the retry handler and kill the
+        # thread with `failed` still None; a day-long one would be honoured to
+        # the second. Both must fall back to the max_backoff cap and carry on.
+        requester = _ScriptedRequester(
+            _RecoverableTransportError("slow down", retry_after=retry_after),
+            [
+                (e["event"], e["data"])
+                for e in full_payload(("put-object", put_skill()))
+            ],
+        )
+        store = stream_store(max_backoff=0.05, _requester=requester)
+        try:
+            store.start()
+            assert store.wait_for_skills(timeout=3) is True
+            assert store.failed is None
+            assert store._thread is not None and store._thread.is_alive()
+        finally:
+            store.close()
+
+    def test_a_non_finite_retry_after_off_the_wire_falls_back_to_backoff(
+        self, endpoint: Any
+    ) -> None:
+        endpoint.queue_poll(status=429, retry_after="inf")
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=3) is True
+            assert store.failed is None
 
     def test_backoff_is_exponential_and_capped(self) -> None:
         assert backoff_delay(1, base=1.0, maximum=30.0, jitter=0.0) == 1.0
@@ -1572,6 +1737,22 @@ class TestLifecycle:
         store.start()
         store.close()
         store.close()
+
+    def test_close_during_a_slow_connect_returns_promptly(self) -> None:
+        # Before the connect returns there is no connection for close() to
+        # interrupt. If the delivery thread then enters the read anyway, close()
+        # sits out its whole join timeout on a stream that will never speak.
+        requester = _SlowConnectRequester()
+        store = stream_store(_requester=requester)
+        store.start()
+        assert requester.entered.wait(timeout=5)
+        threading.Timer(0.1, requester.release.set).start()
+        started = time.monotonic()
+        store.close(timeout=5.0)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0
+        assert store._thread is not None
+        assert not store._thread.is_alive()
 
     def test_a_closed_store_still_answers_from_what_it_received(
         self, endpoint: Any
