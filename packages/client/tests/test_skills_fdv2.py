@@ -43,15 +43,15 @@ from launchdarkly_ai_server.skills_fdv2 import (
     DEFAULT_STREAM_READ_TIMEOUT,
     FDV2_OBJECT_CATEGORY,
     FDV2_OBJECT_KIND,
+    _backoff_delay,
+    _is_skill_event,
     _ProtocolReader,
     _RecoverableTransportError,
     _Requester,
     _retry_after_seconds,
     _SkillObjectSet,
-    backoff_delay,
-    is_skill_event,
-    seam_object_from_put,
-    tombstone_from_delete,
+    _store_object_from_put,
+    _tombstone_from_delete,
 )
 
 pytestmark = pytest.mark.usefixtures("reset_skill_state")
@@ -347,24 +347,24 @@ def wait_until(predicate: Any, timeout: float = 5.0) -> bool:
 
 class TestObjectIdentification:
     def test_kind_and_category_together_identify_a_skill(self) -> None:
-        assert is_skill_event(put_skill()) is True
+        assert _is_skill_event(put_skill()) is True
 
     def test_a_flag_is_not_a_skill(self) -> None:
-        assert is_skill_event(put_flag()) is False
+        assert _is_skill_event(put_flag()) is False
 
     def test_a_segment_is_not_a_skill(self) -> None:
-        assert is_skill_event(put_segment()) is False
+        assert _is_skill_event(put_segment()) is False
 
     def test_inline_resource_of_another_category_is_not_a_skill(self) -> None:
         """``inline-resource`` is a broad kind, so the category is required too."""
         other = put_skill()
         other["category"] = "prompt-template"
-        assert is_skill_event(other) is False
+        assert _is_skill_event(other) is False
 
     def test_skill_category_under_another_kind_is_not_a_skill(self) -> None:
         other = put_skill()
         other["kind"] = "some-future-kind"
-        assert is_skill_event(other) is False
+        assert _is_skill_event(other) is False
 
     def test_a_flag_shaped_object_with_no_category_is_not_a_skill(self) -> None:
         """Flags and segments omit ``category`` entirely — the documented shape."""
@@ -373,7 +373,7 @@ class TestObjectIdentification:
 
     @pytest.mark.parametrize("value", [None, "skill", 3, [], ()])
     def test_non_dict_events_are_not_skills(self, value: Any) -> None:
-        assert is_skill_event(value) is False
+        assert _is_skill_event(value) is False
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +383,7 @@ class TestObjectIdentification:
 
 class TestVersionTranslation:
     def test_object_version_becomes_the_seam_version(self) -> None:
-        raw = seam_object_from_put(put_skill(object_version=3, payload_version=42))
+        raw = _store_object_from_put(put_skill(object_version=3, payload_version=42))
         assert raw is not None
         assert raw["version"] == 3
 
@@ -393,7 +393,7 @@ class TestVersionTranslation:
         would serve verifiable content under a version number that means nothing,
         and every pinned reference would resolve to the wrong thing with no error.
         """
-        raw = seam_object_from_put(put_skill(object_version=3, payload_version=42))
+        raw = _store_object_from_put(put_skill(object_version=3, payload_version=42))
         assert raw is not None
         assert raw["version"] != 42
         assert 42 not in raw.values()
@@ -401,42 +401,42 @@ class TestVersionTranslation:
     def test_the_two_are_distinguished_even_when_the_payload_version_is_lower(
         self,
     ) -> None:
-        raw = seam_object_from_put(put_skill(object_version=99, payload_version=1))
+        raw = _store_object_from_put(put_skill(object_version=99, payload_version=1))
         assert raw is not None
         assert raw["version"] == 99
 
     def test_a_missing_object_version_is_not_defaulted_from_the_payload(self) -> None:
         wire = put_skill()
         del wire["objectVersion"]
-        raw = seam_object_from_put(wire)
+        raw = _store_object_from_put(wire)
         assert raw is not None
         assert "version" not in raw
 
     def test_an_explicitly_null_object_version_is_carried_through_as_null(self) -> None:
         """Carried, not invented: verification reports ``invalid_version``."""
-        raw = seam_object_from_put(put_skill(object_version=None))
+        raw = _store_object_from_put(put_skill(object_version=None))
         assert raw is not None
         assert raw["version"] is None
 
     def test_a_delete_translates_object_version_too(self) -> None:
-        tombstone = tombstone_from_delete(
+        tombstone = _tombstone_from_delete(
             delete_skill(object_version=3, payload_version=43)
         )
         assert tombstone is not None
         assert tombstone.object_version == 3
 
     def test_a_delete_with_no_usable_object_version_revokes_every_version(self) -> None:
-        tombstone = tombstone_from_delete(delete_skill(object_version=None))
+        tombstone = _tombstone_from_delete(delete_skill(object_version=None))
         assert tombstone is not None
         assert tombstone.object_version is None
 
     def test_a_keyless_put_is_dropped_because_it_has_no_identity(self) -> None:
         wire = put_skill()
         del wire["key"]
-        assert seam_object_from_put(wire) is None
+        assert _store_object_from_put(wire) is None
 
     def test_the_envelope_is_copied_verbatim(self) -> None:
-        raw = seam_object_from_put(put_skill())
+        raw = _store_object_from_put(put_skill())
         assert raw is not None
         assert raw["content"] == SKILL_BODY
         assert raw["contentHash"] == _hash(SKILL_BODY)
@@ -446,7 +446,7 @@ class TestVersionTranslation:
     def test_an_absent_envelope_field_is_absent_rather_than_defaulted(self) -> None:
         wire = put_skill()
         del wire["object"]["name"]
-        raw = seam_object_from_put(wire)
+        raw = _store_object_from_put(wire)
         assert raw is not None
         assert "name" not in raw
 
@@ -1289,15 +1289,15 @@ class TestFailureHandling:
             assert store.failed is None
 
     def test_backoff_is_exponential_and_capped(self) -> None:
-        assert backoff_delay(1, base=1.0, maximum=30.0, jitter=0.0) == 1.0
-        assert backoff_delay(2, base=1.0, maximum=30.0, jitter=0.0) == 2.0
-        assert backoff_delay(3, base=1.0, maximum=30.0, jitter=0.0) == 4.0
-        assert backoff_delay(20, base=1.0, maximum=30.0, jitter=0.0) == 30.0
+        assert _backoff_delay(1, base=1.0, maximum=30.0, jitter=0.0) == 1.0
+        assert _backoff_delay(2, base=1.0, maximum=30.0, jitter=0.0) == 2.0
+        assert _backoff_delay(3, base=1.0, maximum=30.0, jitter=0.0) == 4.0
+        assert _backoff_delay(20, base=1.0, maximum=30.0, jitter=0.0) == 30.0
 
     def test_jitter_never_exceeds_the_cap(self) -> None:
         for attempt in range(1, 12):
             for _ in range(50):
-                assert 0.0 <= backoff_delay(attempt, base=1.0, maximum=5.0) <= 5.0
+                assert 0.0 <= _backoff_delay(attempt, base=1.0, maximum=5.0) <= 5.0
 
     def test_a_malformed_polling_envelope_is_recoverable_not_fatal(
         self, endpoint: Any

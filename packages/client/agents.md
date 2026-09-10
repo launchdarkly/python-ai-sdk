@@ -243,7 +243,7 @@ when anything in the environment moves, including a flag with nothing to do with
 Reading it as the skill's version fails **silently**: the object verifies, the hash matches,
 and the caller gets content under a version number that means nothing. Flags and segments
 carry only `version` and omit both `category` and `objectVersion`, which is exactly why the
-two fields look interchangeable. `seam_object_from_put` is the only place the translation
+two fields look interchangeable. `_store_object_from_put` is the only place the translation
 happens, and `TestVersionTranslation` asserts it in both directions.
 
 **Skills are identified by `kind == "inline-resource" && category == "skill"`; everything else

@@ -243,7 +243,7 @@ class _Tombstone:
     object_version: int | None
 
 
-def is_skill_event(data: Any) -> bool:
+def _is_skill_event(data: Any) -> bool:
     """
     Whether one ``put-object`` / ``delete-object`` payload is a skill.
 
@@ -264,7 +264,7 @@ def is_skill_event(data: Any) -> bool:
     )
 
 
-def seam_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
+def _store_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
     """
     Translates one FDv2 skill ``put-object`` into the raw object shape that the
     ``SkillStore`` interface defines.
@@ -315,7 +315,7 @@ def seam_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
     return raw
 
 
-def tombstone_from_delete(data: dict[str, Any]) -> _Tombstone | None:
+def _tombstone_from_delete(data: dict[str, Any]) -> _Tombstone | None:
     """
     Narrows one FDv2 skill ``delete-object`` to the identity it revokes.
 
@@ -384,7 +384,7 @@ class _SkillObjectSet:
         Removes what *tombstone* revokes; returns the raw objects that went away.
 
         A tombstone with no usable version removes every version of the key — see
-        ``tombstone_from_delete`` for why that is the safe reading.
+        ``_tombstone_from_delete`` for why that is the safe reading.
         """
         removed: list[dict[str, Any]] = []
         if tombstone.object_version is None:
@@ -543,7 +543,7 @@ class _ProtocolReader:
         return self._pending
 
     def _put_object(self, data: Any) -> _TransferOutcome:
-        if not is_skill_event(data):
+        if not _is_skill_event(data):
             self.diagnostics.objects_ignored += 1
             return _TransferOutcome()
         if self._pending is None and self._intent is None:
@@ -552,7 +552,7 @@ class _ProtocolReader:
         if target is None:
             return _TransferOutcome()
 
-        raw = seam_object_from_put(data)
+        raw = _store_object_from_put(data)
         if raw is None:
             return _TransferOutcome()
         target.put(raw)
@@ -564,7 +564,7 @@ class _ProtocolReader:
         return _TransferOutcome()
 
     def _delete_object(self, data: Any) -> _TransferOutcome:
-        if not is_skill_event(data):
+        if not _is_skill_event(data):
             self.diagnostics.objects_ignored += 1
             return _TransferOutcome()
         if self._pending is None and self._intent is None:
@@ -573,7 +573,7 @@ class _ProtocolReader:
         if target is None:
             return _TransferOutcome()
 
-        tombstone = tombstone_from_delete(data)
+        tombstone = _tombstone_from_delete(data)
         if tombstone is None:
             return _TransferOutcome()
         target.delete(tombstone)
@@ -1004,7 +1004,7 @@ def _iter_sse(response: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def backoff_delay(
+def _backoff_delay(
     attempt: int, *, base: float, maximum: float, jitter: float = 0.5
 ) -> float:
     """
@@ -1337,7 +1337,7 @@ class FDv2SkillStore:
                     return
                 delay = exc.retry_after
                 if delay is None or not math.isfinite(delay):
-                    delay = backoff_delay(
+                    delay = _backoff_delay(
                         failures, base=self._initial_backoff, maximum=self._max_backoff
                     )
                 # ``Retry-After`` is a request, and ``max_backoff`` is a promise.
