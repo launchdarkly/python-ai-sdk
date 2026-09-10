@@ -58,12 +58,19 @@ class SkillWatcher:
     wrote unmanaged. This class enforces that for its *own* reconciles — they run
     on a single worker thread, serialized — and cannot enforce it against a
     caller who reconciles the same root by hand.
+
+    The watcher owns its registration on *store*: it registers ``notify`` when
+    constructed and unregisters it in ``close``, so a closed watcher is no longer
+    reachable from the store and can be collected. *store* must implement
+    ``add_listener``; ``remove_listener`` is probed for and, when the store does
+    not offer it, the listener stays registered for the store's lifetime.
     """
 
     def __init__(
         self,
         request: Sequence[Skill | SkillReference | str] | str,
         root: str | os.PathLike[str],
+        store: Any,
         *,
         prune: bool,
         timeout: float,
@@ -86,6 +93,14 @@ class SkillWatcher:
         self._thread = threading.Thread(
             target=self._run, name="ld-ai-skills-reconcile", daemon=True
         )
+
+        # Register before starting the worker: ``notify`` only sets an event, so a
+        # change that lands in between is picked up as soon as the worker runs,
+        # and a store whose ``add_listener`` raises leaves no thread behind.
+        self._store = store
+        self._registered = False
+        store.add_listener(SKILL_OBJECT_KIND, self.notify)
+        self._registered = True
         self._thread.start()
 
     # -- the listener the store calls -------------------------------------
@@ -175,11 +190,26 @@ class SkillWatcher:
         reconcile killed between its content writes and its manifest rewrite is
         the one case the manifest format has to recover from — worth avoiding when
         we control the timing.
+
+        Detaches ``notify`` from the store first, so no further change reaches a
+        watcher that is shutting down and the store no longer holds a reference to
+        it. A store without the optional ``remove_listener`` is left as it is
+        rather than failing the close.
         """
+        self._detach()
         self._stop.set()
         self._wake.set()
         if self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(timeout=timeout)
+
+    def _detach(self) -> None:
+        with self._lock:
+            if not self._registered:
+                return
+            self._registered = False
+        remove_listener = getattr(self._store, "remove_listener", None)
+        if callable(remove_listener):
+            remove_listener(SKILL_OBJECT_KIND, self.notify)
 
     def __enter__(self) -> SkillWatcher:
         return self
@@ -221,7 +251,9 @@ async def watch_skills(
     and when the configured store has no ``add_listener`` — the second case
     failing loudly rather than degrading to a one-shot reconcile, because a
     watcher that silently never fires looks exactly like a watcher whose skills
-    never changed.
+    never changed. The optional ``remove_listener`` lets ``SkillWatcher.close``
+    detach from the store; a store without it still works, but each closed
+    watcher then stays registered for the store's lifetime.
     """
     store = get_store()
     if store is None:
@@ -250,11 +282,11 @@ async def watch_skills(
     watcher = SkillWatcher(
         skills,
         root,
+        store,
         prune=prune,
         timeout=timeout,
         on_unavailable=on_unavailable,
         debounce=debounce,
         on_reconcile=on_reconcile,
     )
-    add_listener(SKILL_OBJECT_KIND, watcher.notify)
     return report, watcher

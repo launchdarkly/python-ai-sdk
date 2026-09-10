@@ -548,6 +548,35 @@ class TestInMemorySkillStore:
 
         assert seen == []
 
+    def test_remove_listener_stops_put_notifying_it(self, make_raw_skill: Any) -> None:
+        s = InMemorySkillStore()
+        seen: list[dict[str, Any]] = []
+        s.add_listener("skill", seen.append)
+        s.remove_listener("skill", seen.append)
+
+        s.put(make_raw_skill(key="a"))
+
+        assert seen == []
+
+    def test_remove_listener_removes_one_occurrence(self, make_raw_skill: Any) -> None:
+        s = InMemorySkillStore()
+        seen: list[dict[str, Any]] = []
+        s.add_listener("skill", seen.append)
+        s.add_listener("skill", seen.append)
+        s.remove_listener("skill", seen.append)
+
+        s.put(make_raw_skill(key="a"))
+
+        assert len(seen) == 1
+
+    def test_remove_listener_of_an_unregistered_callable_is_a_no_op(self) -> None:
+        s = InMemorySkillStore()
+        s.remove_listener("skill", print)
+        s.add_listener("skill", print)
+        s.remove_listener("flag", print)
+        s.remove_listener("skill", print)
+        s.remove_listener("skill", print)
+
 
 class TestStoreConfiguration:
     """Store wiring on the lifecycle layer."""

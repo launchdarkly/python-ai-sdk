@@ -1284,6 +1284,27 @@ class FDv2SkillStore:
         with self._lock:
             self._listeners.setdefault(kind, []).append(fn)
 
+    def remove_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:
+        """
+        Unregisters *fn* from *kind*, so later committed changes no longer call it.
+
+        Safe to call from any thread, including from inside a listener: the
+        listener list is copied under the lock before a commit's notifications
+        run, so a removal during one commit takes effect from the next.
+
+        Removes one occurrence: a callable registered twice must be removed twice.
+        Removing a callable that is not registered is a no-op, not an error, so
+        ``SkillWatcher.close`` can detach unconditionally.
+        """
+        with self._lock:
+            listeners = self._listeners.get(kind)
+            if listeners is None:
+                return
+            try:
+                listeners.remove(fn)
+            except ValueError:
+                return
+
     def _notify(self, changes: list[dict[str, Any]]) -> None:
         with self._lock:
             listeners = list(self._listeners.get(SKILL_OBJECT_KIND, []))

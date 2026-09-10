@@ -151,11 +151,17 @@ class SkillStore(Protocol):
     Duck-typed on purpose, mirroring how the LaunchDarkly client interface works
     in this package: pass any object carrying these methods.
 
-    ``add_listener(kind, fn)`` is part of the seam but
-    **optional**, which is why it is deliberately not declared here: a Protocol
-    member is required for structural compatibility, so declaring it would reject
-    every store that does not implement it. Nothing in this module calls it — it
-    exists for the delivery transport to push updates through.
+    ``add_listener(kind, fn)`` and ``remove_listener(kind, fn)`` are part of the
+    interface but **optional**, which is why they are deliberately not declared
+    here: a Protocol member is required for structural compatibility, so declaring
+    them would reject every store that does not implement them. Nothing in this
+    module calls either — they exist for the delivery transport to push updates
+    through, and for a consumer such as ``watch_skills`` to stop receiving them.
+    A store that implements ``add_listener`` should implement ``remove_listener``
+    too; consumers probe for it and skip detaching when it is absent, so an
+    older store keeps working at the cost of a listener that lives as long as
+    the store does. ``remove_listener`` removes one occurrence of *fn* under
+    *kind* and is a no-op when *fn* is not registered.
 
     The raw objects a store serves are wire-shaped, with camelCase field names
     identical across language implementations::
