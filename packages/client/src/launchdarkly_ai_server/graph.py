@@ -15,6 +15,7 @@ from .types import (
     GraphDefinition,
     GraphEdge,
     GraphNode,
+    JudgeDiagnostic,
     JudgeResult,
     LDContext,
     NativeTool,
@@ -214,7 +215,8 @@ async def _build_graph(
                 else str(result["response"])
             )
 
-            judge_results = await run_judges(
+            # Graph nodes do not receive a caller judge context in v1.
+            judge_run = await run_judges(
                 config=node.config,
                 user_context=context,
                 handler=handler,
@@ -241,7 +243,8 @@ async def _build_graph(
             return {
                 "response": response,
                 "usage": result["usage"],
-                "judge_results": judge_results,
+                "judge_results": judge_run.judge_results,
+                "judge_diagnostics": judge_run.judge_diagnostics or None,
             }
         except Exception:
             if from_node:
@@ -347,7 +350,8 @@ async def _build_graph(
             )
 
             # Judge against the node's original config, not the routing-augmented one.
-            judge_results = await run_judges(
+            # Graph nodes do not receive a caller judge context in v1.
+            judge_run = await run_judges(
                 config=node.config,
                 user_context=context,
                 handler=handler,
@@ -376,7 +380,8 @@ async def _build_graph(
             return {
                 "response": response,
                 "usage": result["usage"],
-                "judge_results": judge_results,
+                "judge_results": judge_run.judge_results,
+                "judge_diagnostics": judge_run.judge_diagnostics or None,
                 "next": next_node,
             }
         except Exception:
@@ -642,6 +647,7 @@ class GraphInstance:
 
             # Optional graph-level judge run against the final response.
             judge_results: dict[str, JudgeResult] | None = None
+            judge_diagnostics: list[JudgeDiagnostic] | None = None
             graph_judge: str | None = resolved_options.get("graph_judge")
             root_node = graph_def.root
             if graph_judge and root_node and resolved_handlers:
@@ -651,7 +657,7 @@ class GraphInstance:
                     resolved_handlers,
                     strict=False,
                 )
-                judge_results = await run_judges(
+                graph_judge_run = await run_judges(
                     config={
                         "judgeConfiguration": {
                             "judges": [{"key": graph_judge, "samplingRate": 1}]
@@ -666,6 +672,8 @@ class GraphInstance:
                     tool_handlers=resolved_tools,
                     graph_key=self._key,
                 )
+                judge_results = graph_judge_run.judge_results or None
+                judge_diagnostics = graph_judge_run.judge_diagnostics or None
 
             return ProviderGraphResponse(
                 response=final_response,
@@ -679,6 +687,7 @@ class GraphInstance:
                     total=total_usage["total"],
                 ),
                 judge_results=judge_results,
+                judge_diagnostics=judge_diagnostics,
             )
 
         except Exception:

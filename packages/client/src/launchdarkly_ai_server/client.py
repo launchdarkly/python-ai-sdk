@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
 
 from .conversation import bind_conversation_id
-from .judges import build_judge_tasks, run_judges
+from .judges import (
+    DEFAULT_JUDGE_TIMEOUT_MS,
+    build_judge_tasks,
+    resolve_judge_context,
+    run_judges,
+)
 from .lifecycle import extract_variation
 from .registry import resolve_handlers, resolve_tools
 from .tracking import execute_and_stream, execute_and_track
 from .types import (
     AiConfigRep,
+    JsonValue,
+    JudgeDiagnostic,
     LDContext,
     NativeTool,
     ProviderHandler,
@@ -52,12 +59,16 @@ class ConfigInstance:
         tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
         registry: Any,  # Registry | None
         skip_judges: bool = False,
+        judge_context: Callable[[], JsonValue | Awaitable[JsonValue]] | None = None,
+        judge_timeout_ms: int = DEFAULT_JUDGE_TIMEOUT_MS,
     ) -> None:
         self._key = key
         self._handler = handler
         self._tool_handlers = tool_handlers
         self._registry = registry
         self._skip_judges = skip_judges
+        self._judge_context = judge_context
+        self._judge_timeout_ms = judge_timeout_ms
 
     def _normalize_handlers(self) -> list[ProviderHandler] | None:
         if self._handler is None:
@@ -102,6 +113,10 @@ class ConfigInstance:
         usage: dict[str, int] = result["usage"]
         track_data = result["track_data"]
 
+        # Freeze the caller's context the moment the primary handler succeeds, before output
+        # parsing. Sampling controls judge execution, never this boundary.
+        context_resolution = await resolve_judge_context(self._judge_context)
+
         parsed_response = _resolve_output_format_response(
             raw_response,
             config.get("outputFormat") if isinstance(config, dict) else None,
@@ -116,35 +131,54 @@ class ConfigInstance:
         usage_obj = to_usage_dict(usage)
 
         if self._skip_judges:
-            judge_tasks = await build_judge_tasks(
+            build_result = await build_judge_tasks(
                 config=config,
                 user_context=context,
                 handler=handler,
                 handlers=resolved_handler_list,
                 llm_response=llm_str,
                 base_track_data=track_data,
+                context_resolution=context_resolution,
             )
             return ProviderResponse(
                 response=parsed_response,
                 usage=usage_obj,
-                judge_tasks=judge_tasks,
+                judge_context=build_result.judge_context,
+                judge_diagnostics=build_result.judge_diagnostics or None,
+                judge_tasks=build_result.judge_tasks,
                 track_data=track_data,
             )
 
-        judge_results = await run_judges(
-            config=config,
-            user_context=context,
-            handler=handler,
-            handlers=resolved_handler_list,
-            user_input=user_input,
-            llm_response=llm_str,
-            base_track_data=track_data,
-            tool_handlers=resolved_tools,
+        diagnostics: list[JudgeDiagnostic] = (
+            [context_resolution.diagnostic]
+            if context_resolution.diagnostic is not None
+            else []
         )
+        if not context_resolution.failed:
+            judge_run = await run_judges(
+                config=config,
+                user_context=context,
+                handler=handler,
+                handlers=resolved_handler_list,
+                user_input=user_input,
+                llm_response=llm_str,
+                base_track_data=track_data,
+                tool_handlers=resolved_tools,
+                judge_context=context_resolution.judge_context,
+                judge_context_json=context_resolution.serialized,
+                judge_timeout_ms=self._judge_timeout_ms,
+            )
+            diagnostics.extend(judge_run.judge_diagnostics)
+            judge_results = judge_run.judge_results
+        else:
+            judge_results = {}
+
         return ProviderResponse(
             response=parsed_response,
             usage=usage_obj,
-            judge_results=judge_results if judge_results else None,
+            judge_context=context_resolution.judge_context,
+            judge_diagnostics=diagnostics or None,
+            judge_results=judge_results or None,
             track_data=track_data,
         )
 
@@ -206,25 +240,39 @@ class ConfigInstance:
 
         if done_event:
             track_data = done_event.get("track_data", {})
-            judge_results = (
-                {}
-                if self._skip_judges
-                else await run_judges(
-                    config=config,
-                    user_context=context,
-                    handler=handler,
-                    handlers=resolved_handler_list,
-                    user_input=user_input,
-                    llm_response=done_event.get("response", ""),
-                    base_track_data=track_data,
-                    tool_handlers=resolved_tools,
-                )
-            )
+            judge_results: dict[str, Any] = {}
+            diagnostics: list[JudgeDiagnostic] = []
+            judge_context: JsonValue | None = None
+
+            if not self._skip_judges:
+                context_resolution = await resolve_judge_context(self._judge_context)
+                judge_context = context_resolution.judge_context
+                if context_resolution.diagnostic is not None:
+                    diagnostics.append(context_resolution.diagnostic)
+                if not context_resolution.failed:
+                    judge_run = await run_judges(
+                        config=config,
+                        user_context=context,
+                        handler=handler,
+                        handlers=resolved_handler_list,
+                        user_input=user_input,
+                        llm_response=done_event.get("response", ""),
+                        base_track_data=track_data,
+                        tool_handlers=resolved_tools,
+                        judge_context=context_resolution.judge_context,
+                        judge_context_json=context_resolution.serialized,
+                        judge_timeout_ms=self._judge_timeout_ms,
+                    )
+                    judge_results = judge_run.judge_results
+                    diagnostics.extend(judge_run.judge_diagnostics)
+
             yield {
                 "type": "done",
                 "response": done_event.get("response", ""),
                 "usage": done_event.get("usage"),
-                "judge_results": judge_results if judge_results else None,
+                "judge_context": judge_context,
+                "judge_results": judge_results or None,
+                "judge_diagnostics": diagnostics or None,
             }
 
 
@@ -235,6 +283,8 @@ def config(
     tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     skip_judges: bool = False,
+    judge_context: Callable[[], JsonValue | Awaitable[JsonValue]] | None = None,
+    judge_timeout_ms: int = DEFAULT_JUDGE_TIMEOUT_MS,
 ) -> ConfigInstance:
     """
     Creates a ``ConfigInstance`` bound to *key*. Accepts a single handler or a
@@ -247,6 +297,12 @@ def config(
     ``.invoke()`` / ``.stream()``. When set, ``invoke()`` returns
     ``judge_tasks: list[JudgeTask]`` — pre-packaged tasks ready for a background
     thread calling ``run_judge(task, handlers)``.
+
+    ``judge_context`` is a callback returning JSON-safe evidence for the judges. It is lazy on
+    purpose: the value does not exist yet when ``config()`` is called, and the caller's tools
+    fill it while the primary handler runs. It resolves exactly once per request, right after
+    the primary handler succeeds, and reaches the judges only through their ``message_history``
+    variable. ``judge_timeout_ms`` bounds one judge's config lookup, provider call and parse.
     """
     return ConfigInstance(
         key=key,
@@ -254,4 +310,6 @@ def config(
         tool_handlers=tool_handlers,
         registry=registry,
         skip_judges=skip_judges,
+        judge_context=judge_context,
+        judge_timeout_ms=judge_timeout_ms,
     )

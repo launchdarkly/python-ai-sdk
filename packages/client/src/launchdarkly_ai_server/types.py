@@ -229,10 +229,46 @@ class JudgeResult:
     score: float
 
 
+JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+"""Any value that survives a ``json.dumps`` / ``json.loads`` round trip unchanged."""
+
+
+@dataclass
+class JudgeDiagnostic:
+    """One reason a judge did not produce a result, or produced a partial one.
+
+    The ``status``, ``stage`` and ``code`` strings are shared with the TypeScript SDK on the
+    wire. Never rename them. A diagnostic never carries raw exception text.
+    """
+
+    status: Literal["skipped", "failed"]
+    stage: Literal["context", "config", "provider", "parse", "track", "timeout"]
+    code: Literal[
+        "context_callback_failed",
+        "context_invalid_json",
+        "context_too_large",
+        "judge_duplicate_key",
+        "judge_config_failed",
+        "judge_provider_failed",
+        "judge_response_invalid",
+        "judge_tracking_failed",
+        "judge_timed_out",
+    ]
+    judge_key: str | None = None
+
+
 @dataclass
 class ProviderResponse(Generic[T]):
     response: T
     usage: UsageDict
+    judge_context: JsonValue | None = None
+    """
+    The value the ``judge_context`` callback returned, unchanged. Resolved exactly once, right
+    after the primary handler succeeded. ``None`` when no callback was given or it failed
+    validation (a :class:`JudgeDiagnostic` says which).
+    """
+    judge_diagnostics: list[JudgeDiagnostic] | None = None
+    """Why judges were skipped or failed. ``None`` when nothing went wrong."""
     judge_results: dict[str, JudgeResult] | None = None
     """
     Judge evaluation results. Populated when ``skip_judges=False`` (default) and
@@ -300,6 +336,12 @@ class JudgeTask:
     """Optional extra template variables for the judge prompt."""
     evaluation_metric_key: str | None = None
     """LD metric key to track the score against."""
+    judge_context: JsonValue | None = None
+    """
+    The already-resolved judge context, so a worker calling ``run_judge(task, handlers)``
+    injects the identical evidence block without re-running the caller's callback. JSON-safe,
+    like every other field on this task.
+    """
 
 
 @dataclass
@@ -418,6 +460,8 @@ class ProviderGraphResponse:
     """Aggregate token counts across all nodes."""
     judge_results: dict[str, JudgeResult] | None = None
     """Results from a graph-level judge, if configured."""
+    judge_diagnostics: list[JudgeDiagnostic] | None = None
+    """Diagnostics from the graph-level judge. ``None`` when nothing went wrong."""
 
 
 # ---------------------------------------------------------------------------

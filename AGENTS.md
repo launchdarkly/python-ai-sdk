@@ -203,7 +203,28 @@ The value returned to callers of `config().invoke()`. A `dataclass` with the fol
 | `usage` | `UsageDict` | Normalized token counts (`input`, `output`, `total`). |
 | `track_data` | `TrackData` | Tracking payload from this invocation (run ID, config key, etc.). Carried inside each `JudgeTask` so background judge results are attributed to the originating request. |
 | `judge_results` | `dict[str, JudgeResult]?` | Results from inline judge evaluations. Present when `skip_judges=False` (default) and judges ran. |
-| `judge_tasks` | `list[JudgeTask]?` | Pre-packaged judge tasks. Present (as a list) when `skip_judges=True`. Each task is a serialisable dataclass ready to pass to a background thread running `run_judge(task, handlers)`. `None` when `skip_judges=False`. |
+| `judge_tasks` | `list[JudgeTask]?` | Pre-packaged judge tasks. Present (as a list) when `skip_judges=True`. Each task is a serialisable dataclass ready to pass to a background thread running `run_judge(task, handlers)`, and carries the resolved `judge_context` so the worker injects the identical evidence block. `None` when `skip_judges=False`. |
+| `judge_context` | `JsonValue?` | The value the `judge_context` callback returned, unchanged. `None` when no callback was given or it failed validation. |
+| `judge_diagnostics` | `list[JudgeDiagnostic]?` | Why judges were skipped or failed. `None` when nothing went wrong (never `[]`). |
+
+#### `JsonValue`
+
+`None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]` — a value that survives a `json.dumps` / `json.loads` round trip unchanged.
+
+#### `JudgeDiagnostic`
+
+One reason a judge produced no result, or a partial one. The strings are shared with the TypeScript SDK on the wire; never rename them. A diagnostic carries no raw exception text.
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | `"skipped" \| "failed"` | Skipped means the judge never ran. |
+| `stage` | `"context" \| "config" \| "provider" \| "parse" \| "track" \| "timeout"` | Where it went wrong. |
+| `code` | `"context_callback_failed" \| "context_invalid_json" \| "context_too_large" \| "judge_duplicate_key" \| "judge_config_failed" \| "judge_provider_failed" \| "judge_response_invalid" \| "judge_tracking_failed" \| "judge_timed_out"` | The specific reason. |
+| `judge_key` | `str?` | The judge this concerns. Absent for context-stage diagnostics. |
+
+#### Stream `done` event
+
+The final event of `config().stream()`: `{"type": "done", "response": str, "usage": UsageDict, "judge_context": JsonValue \| None, "judge_results": dict[str, JudgeResult] \| None, "judge_diagnostics": list[JudgeDiagnostic] \| None}`. Exactly one is yielded, after every `chunk`. Empty results and diagnostics are `None`.
 
 #### `ProviderGraphResponse`
 
@@ -214,6 +235,7 @@ The value returned by `graph().invoke()`. A dataclass with attribute access.
 | `response` | `str` | The final text output (from the last node executed). |
 | `usage` | `UsageDict` | Aggregate token counts across all nodes. |
 | `judge_results` | `dict[str, JudgeResult]?` | Results from a graph-level judge, if configured. |
+| `judge_diagnostics` | `list[JudgeDiagnostic]?` | Diagnostics from the graph-level judge. Graph nodes do not receive a caller judge context in v1. |
 
 #### `ConfigArgs`
 
@@ -225,6 +247,8 @@ Arguments accepted by `config()`.
 | `handler` | `ProviderHandler \| list[ProviderHandler]`? | One handler or an ordered list of handlers. Routing selects the match by provider + mode. |
 | `tool_handlers` | `dict[str, Callable \| NativeTool]?` | Map of tool name → implementation function (or `NativeTool` sentinel). |
 | `registry` | `Registry?` | Registry to source handlers and tools from. Local `handler`/`tool_handlers` take precedence. |
+| `judge_context` | `Callable[[], JsonValue \| Awaitable[JsonValue]]?` | Lazily resolves JSON-safe evidence for the judges. Lazy on purpose: the value does not exist when `config()` is called, and the caller's tools fill it while the primary handler runs. |
+| `judge_timeout_ms` | `int` | Per-judge budget covering config lookup, provider call and parse. Default: `30_000`. |
 | `skip_judges` | `bool`? | When `True`, `invoke()` does not run judges inline. Instead it returns `judge_tasks: list[JudgeTask]` — pre-packaged tasks ready for background thread execution via `run_judge(task, handlers)`. Default: `False`. |
 
 #### `TrackData`
@@ -353,10 +377,11 @@ Returns a `ConfigInstance` with:
 2. Selects the handler by matching on `[config.provider.name, normalized mode]`. Selection priority: (a) exact provider match, (b) wildcard `['*', mode]` fallback for multi-provider adapters (e.g. LangChain). Raises if no matching handler is found.
 3. Invokes the selected handler with the config, user input, tool handlers, variables, and history. The `context` passed to `.invoke()` is automatically merged into `variables` under the key `ldContext`, so templates can reference `{{ldContext.key}}`, `{{ldContext.email}}`, etc. If `history` is provided, it is passed to the handler as the 5th positional argument — messages-mode handlers splice it into the messages array; agent-mode handlers append it to the system prompt.
 4. Emits LaunchDarkly telemetry events: duration (`$ld:ai:duration:total`), outcome (`$ld:ai:generation:success` / `$ld:ai:generation:error`), and token counts (`$ld:ai:tokens:*`).
-5. If `judgeConfiguration` is present:
-   - **Default (`skip_judges=False`):** runs each configured judge inline at its `samplingRate`. Results are returned in `ProviderResponse.judge_results`.
-   - **`skip_judges=True`:** builds serialisable `JudgeTask` objects for each judge (no AI calls). Returns them in `ProviderResponse.judge_tasks`. Pass each task to a background thread running `run_judge(task, handlers)`.
-6. Returns a `ProviderResponse` (always includes `response`, `usage`, and `track_data`).
+5. If a `judge_context` callback was given, resolves it exactly once — immediately after the handler succeeds, before output-format parsing, whether or not any judge is sampled. The value must be acyclic JSON of at most 64 KiB encoded; it is returned unchanged on `ProviderResponse.judge_context` and is never truncated or transformed. An invalid value produces a `context` diagnostic and skips every judge.
+6. If `judgeConfiguration` is present:
+   - **Default (`skip_judges=False`):** runs sampled judges sequentially, in configured order, only the first occurrence of each key. Results are returned in `ProviderResponse.judge_results`. Each judge is isolated: a failure adds one `JudgeDiagnostic` and never erases the primary result or another judge's result. Each judge is bounded by `judge_timeout_ms`, and its reasoning is capped at 4 KiB. The resolved context reaches a judge only through its `message_history` variable, between the lines `UNTRUSTED_ACTUATOR_EVIDENCE_BEGIN` and `UNTRUSTED_ACTUATOR_EVIDENCE_END`: never the primary model, never track data, never a span.
+   - **`skip_judges=True`:** builds serialisable `JudgeTask` objects for each judge (no AI calls). Returns them in `ProviderResponse.judge_tasks`, with the resolved context on each task and any build-step diagnostics on `ProviderResponse.judge_diagnostics`. Pass each task to a background thread running `run_judge(task, handlers)`.
+7. Returns a `ProviderResponse` (always includes `response`, `usage`, and `track_data`).
 
 ### `graph(key, **options)`
 
