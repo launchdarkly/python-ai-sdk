@@ -26,11 +26,10 @@ from ..utils import (
 from .api import EvaluationsError, LDApiClient, LDApiError
 from .criteria import Criterion, Judge, Scorer
 from .events import (
-    DeterministicScorerEvaluationEventPayload,
-    EvaluationEventPayload,
-    EvaluationStatus,
-    EvaluationVerdict,
-    LDJudgeEvaluationEventPayload,
+    CriterionEventPayload,
+    CriterionStatus,
+    DeterministicScorerCriterionEventPayload,
+    LDJudgeCriterionEventPayload,
     TokenUsage,
 )
 from .types import (
@@ -48,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 DATASET_PAGE_SIZE = 200
 GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
-EVALUATION_EVENT_NAME = "$ld:ai:offline-evals:evaluation"
+CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
@@ -183,11 +182,6 @@ class EvaluationsRunner:
                 variation_key=str(meta.get("variationKey") or ""),
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
-                else None,
-                # Absent (e.g. Gonfalon hasn't deployed the flag-payload change yet, or a
-                # custom judge with no direction set) resolves to None, not a raised error.
-                is_inverted=config.get("isInverted")
-                if isinstance(config.get("isInverted"), bool)
                 else None,
             )
         return resolved
@@ -733,23 +727,17 @@ class EvaluationsRunner:
                 "invalid_score",
                 f"judge score must be a number between 0 and 1, got {raw_score!r}",
             )
-        verdict: EvaluationVerdict | None = None
-        if judge.threshold is not None:
-            # An unresolved direction (e.g. Gonfalon hasn't deployed the flag-payload
-            # change yet, or a custom judge with none set) defaults to upper-is-better,
-            # matching Gonfalon's own default for a judge with no stored isInverted.
-            passed = (
-                score <= judge.threshold
-                if resolved.is_inverted
-                else score >= judge.threshold
-            )
-            verdict = EvaluationVerdict.PASS if passed else EvaluationVerdict.FAIL
         completed = datetime.now(UTC)
+        # No verdict: the SDK reports the score and LaunchDarkly rules on it. The
+        # criterion carries the threshold and the judge's success direction, and
+        # ai-evaluator compares them at ingest -- so pass/fail policy is one
+        # server-side implementation that applies to every SDK version and to runs
+        # already recorded, rather than one frozen into each release of each
+        # language's SDK.
         event = {
             **base,
             "status": "COMPLETE",
             "score": score,
-            "verdict": verdict,
             "reason": reason,
             "evaluated_at": completed.isoformat().replace("+00:00", "Z"),
             "latency_ms": round((time.perf_counter() - started_clock) * 1000),
@@ -859,19 +847,18 @@ class EvaluationsRunner:
                     "evaluation_key": evaluation.key,
                     "evaluation_version": evaluation.version,
                     "dataset_key": dataset.key,
-                    "status": EvaluationStatus(result["status"]),
+                    "status": CriterionStatus(result["status"]),
                     "started_at": result["started_at"],
                     "evaluated_at": result["evaluated_at"],
                     "latency_ms": result["latency_ms"],
                     "score": result.get("score"),
-                    "verdict": result.get("verdict"),
                     "reason": result.get("reason"),
                     "error": error,
                     "error_message": error_message,
                 }
-                payload_model: EvaluationEventPayload
+                payload_model: CriterionEventPayload
                 if result["kind"] == "judge":
-                    payload_model = LDJudgeEvaluationEventPayload(
+                    payload_model = LDJudgeCriterionEventPayload(
                         **common_payload,
                         judge_key=result["judge_key"],
                         variation_key=result["variation_key"],
@@ -879,11 +866,11 @@ class EvaluationsRunner:
                         usage=usage,
                     )
                 else:
-                    payload_model = DeterministicScorerEvaluationEventPayload(
+                    payload_model = DeterministicScorerCriterionEventPayload(
                         **common_payload
                     )
                 client.track(
-                    EVALUATION_EVENT_NAME, context, payload_model.to_track_payload(), 1
+                    CRITERION_EVENT_NAME, context, payload_model.to_track_payload(), 1
                 )
             except Exception:
                 logger.exception(
@@ -894,7 +881,7 @@ class EvaluationsRunner:
                 continue
             logger.info(
                 "%s emittedAt=%s eventId=%s",
-                EVALUATION_EVENT_NAME,
+                CRITERION_EVENT_NAME,
                 emitted_at,
                 event_id,
             )

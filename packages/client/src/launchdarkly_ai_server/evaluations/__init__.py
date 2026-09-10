@@ -9,7 +9,7 @@ from .api import (
     Transport,
     urllib_transport,
 )
-from .criteria import Criterion, Judge, Scorer
+from .criteria import Criterion, Judge, Scorer, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
 from .types import DatasetRow, EvalRunResult, GenerationConfig, RunSummary, Usage
 
@@ -27,6 +27,7 @@ __all__ = [
     "LDApiError",
     "RunSummary",
     "Scorer",
+    "SuccessDirection",
     "Transport",
     "Usage",
     "init_evaluations",
