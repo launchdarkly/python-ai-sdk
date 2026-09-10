@@ -215,7 +215,16 @@ class EvaluationsModule:
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
-            passed=(summary.error_rows == 0 and summary.pending_rows == 0),
+            # failed_rows counts rows whose criteria were scored and did not
+            # meet their threshold, so a gate that ignores it exits 0 on a run
+            # where every row failed its judge. It was omissible while runs were
+            # generation-only -- a row either generated or errored, and nothing
+            # produced a fail -- and stops being so the moment criteria exist.
+            passed=(
+                summary.error_rows == 0
+                and summary.failed_rows == 0
+                and summary.pending_rows == 0
+            ),
             url=url,
             run_id=evaluation_run.id,
             summary=summary,

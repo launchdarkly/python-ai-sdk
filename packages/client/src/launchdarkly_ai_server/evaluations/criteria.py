@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .types import DatasetRow
 
 type ScorerFn = Callable[[DatasetRow, Any], float | bool | Awaitable[float | bool]]
+
+type SuccessDirection = Literal["higher_is_better", "lower_is_better"]
+
+#: The threshold a judge is held to when its reference sets none. A criterion
+#: with no threshold gives LaunchDarkly nothing to compare a score against, so
+#: it would be recorded and never ruled on; defaulting is what keeps a judge
+#: usable as a gate without every caller restating the obvious.
+DEFAULT_JUDGE_THRESHOLD = 0.5
 
 
 @dataclass(frozen=True)
@@ -16,10 +24,15 @@ class Judge:
     The SDK does not create or provide built-in judges. Pass the key of a judge
     that exists in LaunchDarkly. Resolution uses LaunchDarkly flag delivery for
     the currently served variation.
+
+    A judge's success direction is not set here. It lives on the judge's AI
+    Config as ``isInverted`` and is injected onto the criterion by LaunchDarkly
+    when the evaluation is created, so the one input a verdict is ruled on stays
+    server-attested even though the score beside it is client-reported.
     """
 
     key: str
-    threshold: float | None = None
+    threshold: float | None = DEFAULT_JUDGE_THRESHOLD
     pass_rate_threshold: float | None = None
     ground_truth_context: str | None = None
 
@@ -41,7 +54,12 @@ class Judge:
             pass_rate_threshold=self.pass_rate_threshold,
             ground_truth_context=self.ground_truth_context,
         )
-        return {"criterionType": self.criterion_type, "options": options}
+        return {
+            "criterionType": self.criterion_type,
+            "kind": "judge",
+            "judgeKey": self.key,
+            "options": options,
+        }
 
 
 @dataclass(frozen=True)
@@ -57,12 +75,20 @@ class Scorer:
     ``threshold`` defaults to 1.0: a row passes only on a perfect score, which
     matches the common case of boolean scorers. Pass a lower threshold for
     graded numeric scorers.
+
+    ``success_direction`` says which way the score points, and defaults to
+    higher-is-better. Unlike a judge, a scorer has no LaunchDarkly-side config
+    to read a direction from, so the declaration here is the only source --
+    LaunchDarkly derives each row's verdict by comparing score to threshold in
+    this direction. Set ``"lower_is_better"`` for a scorer that counts
+    something unwanted, e.g. a regex hit count or an edit distance.
     """
 
     name: str
     fn: ScorerFn
     threshold: float | None = 1.0
     pass_rate_threshold: float | None = None
+    success_direction: SuccessDirection = "higher_is_better"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -81,6 +107,8 @@ class Scorer:
     def to_criteria_wire(self) -> dict[str, Any]:
         return {
             "criterionType": self.criterion_type,
+            "kind": "scorer",
+            "successDirection": self.success_direction,
             "options": _criteria_options(
                 threshold=self.threshold,
                 pass_rate_threshold=self.pass_rate_threshold,

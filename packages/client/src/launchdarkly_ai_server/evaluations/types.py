@@ -75,7 +75,6 @@ class ResolvedJudge:
     config: dict[str, Any]
     variation_key: str = ""
     version: int | None = None
-    is_inverted: bool | None = None
 
 
 @dataclass

@@ -5,26 +5,14 @@ from enum import StrEnum
 from typing import Any
 
 
-class EvaluationStatus(StrEnum):
+class CriterionStatus(StrEnum):
     COMPLETE = "COMPLETE"
     ERROR = "ERROR"
 
 
-class EvaluationEventKind(StrEnum):
+class CriterionEventKind(StrEnum):
     JUDGE = "judge"
     SCORER = "scorer"
-
-
-class EvaluationVerdict(StrEnum):
-    """Pass/fail outcome for one criterion result on one row.
-
-    Computed by the SDK, not the server: for a judge, the SDK compares score
-    against threshold using the judge's own direction (isInverted) before this
-    verdict is ever put on the wire.
-    """
-
-    PASS = "pass"
-    FAIL = "fail"
 
 
 @dataclass(frozen=True)
@@ -42,7 +30,7 @@ class TokenUsage:
 
 
 @dataclass(frozen=True, kw_only=True)
-class EvaluationEventPayload:
+class CriterionEventPayload:
     """Common fields emitted for every SDK-run evaluation criterion result."""
 
     project_key: str
@@ -52,18 +40,17 @@ class EvaluationEventPayload:
     dataset_id: str
     row_index: int
     criterion_type: str
-    kind: EvaluationEventKind
+    kind: CriterionEventKind
     event_id: str
     emitted_at: str
     evaluation_key: str
     dataset_key: str
-    status: EvaluationStatus
+    status: CriterionStatus
     started_at: str
     evaluated_at: str
     latency_ms: int
     evaluation_version: int | None = None
     score: float | None = None
-    verdict: EvaluationVerdict | None = None
     reason: str | None = None
     error: dict[str, Any] | None = None
     error_message: str | None = None
@@ -88,7 +75,6 @@ class EvaluationEventPayload:
             "evaluatedAt": self.evaluated_at,
             "latencyMs": self.latency_ms,
             "score": self.score,
-            "verdict": self.verdict.value if self.verdict is not None else None,
             "reason": self.reason,
             "error": self.error,
             "errorMessage": self.error_message,
@@ -97,10 +83,10 @@ class EvaluationEventPayload:
 
 
 @dataclass(frozen=True, kw_only=True)
-class LDJudgeEvaluationEventPayload(EvaluationEventPayload):
+class LDJudgeCriterionEventPayload(CriterionEventPayload):
     """Payload for one LaunchDarkly AI Judge result on one dataset row."""
 
-    kind: EvaluationEventKind = EvaluationEventKind.JUDGE
+    kind: CriterionEventKind = CriterionEventKind.JUDGE
     judge_key: str
     variation_key: str
     version: int | None = None
@@ -118,7 +104,7 @@ class LDJudgeEvaluationEventPayload(EvaluationEventPayload):
 
 
 @dataclass(frozen=True, kw_only=True)
-class DeterministicScorerEvaluationEventPayload(EvaluationEventPayload):
+class DeterministicScorerCriterionEventPayload(CriterionEventPayload):
     """Payload for one local deterministic scorer result on one dataset row."""
 
-    kind: EvaluationEventKind = EvaluationEventKind.SCORER
+    kind: CriterionEventKind = CriterionEventKind.SCORER

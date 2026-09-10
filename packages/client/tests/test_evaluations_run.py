@@ -812,7 +812,15 @@ async def test_run_raises_when_no_sdk_key_and_no_initialized_client(
 
 
 @pytest.mark.asyncio
-async def test_generation_failed_rows_do_not_fail_the_result() -> None:
+async def test_failed_rows_fail_the_result() -> None:
+    """A row the server scored and marked failed must fail the gate.
+
+    This reverses the previous assertion, which was written when runs were
+    generation-only -- a row then either generated or errored, and nothing
+    produced a "failed", so excluding failed_rows was unobservable. With
+    criteria it is the normal way a run fails, and a gate that ignores it exits
+    0 on a run where every row failed its judge.
+    """
     transport = SequencedTransport(
         [
             response(200, {"id": "dataset-id", "name": "golden"}),
@@ -856,7 +864,7 @@ async def test_generation_failed_rows_do_not_fail_the_result() -> None:
     )
 
     assert result.summary.failed_rows == 1
-    assert result.passed is True
+    assert result.passed is False
 
 
 @pytest.mark.asyncio
@@ -1135,10 +1143,16 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
     )
 
     assert result.passed is True
+    # kind and judgeKey are what let ai-evaluator store this as a judge rather
+    # than default it to a deepeval metric and reject the key. successDirection
+    # is deliberately absent: LaunchDarkly injects it from the judge's AI Config
+    # on the way through, so the SDK must not assert a direction of its own.
     assert transport.requests[2]["body"]["criteria"] == [
         {
             "criterionType": "$ld:ai:judge:accuracy",
-            "options": {},
+            "kind": "judge",
+            "judgeKey": "$ld:ai:judge:accuracy",
+            "options": {"threshold": 0.5},
         }
     ]
     assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
@@ -1153,30 +1167,37 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
     assert judge_event["variationKey"] == "default"
     assert judge_event["version"] == 12
     assert len(judge_event["eventId"]) == 64
-    # No threshold was set on the Judge, so there's nothing to compare the score
-    # against -- verdict must be omitted rather than sent as verdict=None.
+    # The SDK reports the score and never rules on it: ai-evaluator derives the
+    # verdict at ingest from the criterion's stored threshold and direction.
     assert "verdict" not in judge_event
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("is_inverted", "threshold", "expected_verdict"),
+    ("is_inverted", "threshold"),
     [
-        # score is fixed at 0.86 in the handler below.
-        (False, 0.8, "pass"),  # upper-is-better, 0.86 >= 0.8
-        (False, 0.9, "fail"),  # upper-is-better, 0.86 < 0.9
-        (True, 0.9, "pass"),  # lower-is-better, 0.86 <= 0.9
-        (True, 0.5, "fail"),  # lower-is-better, 0.86 > 0.5
-        (None, 0.8, "pass"),  # unresolved direction defaults to upper-is-better
+        # The score is fixed at 0.86 below. Under every direction and on both
+        # sides of the threshold, the SDK reports the same thing: a score.
+        (False, 0.8),
+        (False, 0.9),
+        (True, 0.9),
+        (True, 0.5),
+        (None, 0.8),
     ],
 )
-async def test_run_with_ld_judge_computes_verdict_from_score_threshold_and_direction(
+async def test_run_with_ld_judge_never_sends_a_verdict(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
     is_inverted: bool | None,
     threshold: float,
-    expected_verdict: str,
 ) -> None:
+    """Pass/fail is ai-evaluator's ruling, not the SDK's.
+
+    Parametrized over isInverted -- including the served-payload value -- to
+    pin that the SDK does not compare even when it could: verdict policy has to
+    be able to change server-side and apply to runs already recorded, which it
+    cannot if each SDK release freezes its own comparison.
+    """
     transport = SequencedTransport(
         [
             response(200, {"id": "dataset-id", "name": "golden"}),
@@ -1255,7 +1276,128 @@ async def test_run_with_ld_judge_computes_verdict_from_score_threshold_and_direc
     assert result.passed is True
     events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
     judge_event = next(event for event in events if event.get("kind") == "judge")
-    assert judge_event["verdict"] == expected_verdict
+    assert judge_event["score"] == 0.86
+    assert "verdict" not in judge_event
+    assert "successDirection" not in judge_event
+
+
+@pytest.mark.asyncio
+async def test_judges_resolve_once_per_run_not_once_per_row(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """One resolution for the whole run, however many rows it has.
+
+    extract_variation reads flag delivery, an in-memory store that updates
+    within seconds of a UI edit, so resolving per row would let an edit
+    mid-run change the rubric text, judge model, and provider between one row
+    and the next -- rows in a single run scored against different judges. The
+    online path does resolve per invocation (judges.build_judge_tasks), so
+    routing the offline runner through it for convenience is a live way to
+    reintroduce this.
+    """
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {"rowIndex": 0, "input": "one", "variables": {}},
+                        {"rowIndex": 1, "input": "two", "variables": {}},
+                        {"rowIndex": 2, "input": "three", "variables": {}},
+                    ],
+                    total=3,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa"}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 3, "passed": 3, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+
+    resolutions: list[str] = []
+
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        resolutions.append(key)
+        return {
+            "config": {
+                "provider": {"name": "OpenAI"},
+                "model": {"name": "gpt-4o"},
+                "instructions": "Judge {{response_to_evaluate}}",
+            },
+            "meta": {"variationKey": "default", "version": 12},
+        }
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            return {"output": '{"score": 0.9, "reasoning": "fine"}'}
+        return {"output": "generated"}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert resolutions == ["$ld:ai:judge:accuracy"]
+
+
+def test_scorer_lower_is_better_reaches_the_criteria_wire() -> None:
+    """A scorer counting something unwanted -- regex hits, edit distance --
+    inverts, and only the SDK knows: there is no AI Config for the proxy to
+    read a scorer's direction off, so what the caller declares is the sole
+    source ai-evaluator derives its verdict from."""
+
+    def count_violations(row: DatasetRow, output: Any) -> float:
+        return 0.0
+
+    scorer = Scorer(
+        name="policy-violations",
+        fn=count_violations,
+        threshold=0.0,
+        success_direction="lower_is_better",
+    )
+
+    assert scorer.to_criteria_wire() == {
+        "criterionType": "policy-violations",
+        "kind": "scorer",
+        "successDirection": "lower_is_better",
+        "options": {"threshold": 0.0},
+    }
+
+
+def test_judge_threshold_defaults_so_a_criterion_is_always_rulable() -> None:
+    """A judge with no threshold gives LaunchDarkly nothing to compare against,
+    so the criterion would be stored and never ruled on."""
+    assert Judge(key="$ld:ai:judge:accuracy").to_criteria_wire() == {
+        "criterionType": "$ld:ai:judge:accuracy",
+        "kind": "judge",
+        "judgeKey": "$ld:ai:judge:accuracy",
+        "options": {"threshold": 0.5},
+    }
 
 
 @pytest.mark.asyncio
@@ -1350,8 +1492,15 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
     )
 
     assert result.passed is True
+    # A scorer has no LaunchDarkly-side config, so unlike a judge it declares
+    # its own direction and the proxy leaves it alone.
     assert transport.requests[2]["body"]["criteria"] == [
-        {"criterionType": "refund-exists", "options": {"threshold": 1.0}}
+        {
+            "criterionType": "refund-exists",
+            "kind": "scorer",
+            "successDirection": "higher_is_better",
+            "options": {"threshold": 1.0},
+        }
     ]
     assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
     events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
@@ -1641,7 +1790,7 @@ async def test_failed_evaluation_event_tracking_skips_event_but_completes_run(
     accuracy_judge_variation(monkeypatch)
 
     def track(event_name: str, *args: Any) -> None:
-        if event_name == "$ld:ai:offline-evals:evaluation":
+        if event_name == "$ld:ai:offline-evals:criterion":
             raise RuntimeError("event pipeline unavailable")
 
     stub_sdk_client.track = MagicMock(side_effect=track)
