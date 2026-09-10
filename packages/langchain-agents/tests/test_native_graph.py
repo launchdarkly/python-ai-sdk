@@ -259,6 +259,44 @@ class TestToLangGraphLangChainSpecific:
                 await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
 
     @pytest.mark.asyncio
+    async def test_default_chat_openai_receives_model_parameters(self) -> None:
+        ai_msg = _make_ai_msg("final")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {
+                            "name": "gpt-4o",
+                            "parameters": {"temperature": 0.2, "max_tokens": 512},
+                        },
+                        "instructions": "help",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+
+        async def _visit(fn: Any, ctx: Any = None) -> None:
+            if graph_def.root is not None:
+                await fn(graph_def.root)
+
+        graph_def.traverse = _visit
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        mocks["langchain_openai"].ChatOpenAI.assert_called_once()
+        assert mocks["langchain_openai"].ChatOpenAI.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "model": "gpt-4o",
+        }
+
+    @pytest.mark.asyncio
     async def test_null_root_throws(self) -> None:
         ai_msg = _make_ai_msg()
         mocks = _make_langgraph_mocks(ai_msg)

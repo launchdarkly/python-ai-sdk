@@ -196,9 +196,11 @@ def to_lang_graph(
                 chat_model = model_factory(node)
             else:
                 lc_openai = importlib.import_module("langchain_openai")
-                chat_model = lc_openai.ChatOpenAI(
-                    model=node.config.get("model", {}).get("name", "gpt-4o")
-                )
+                model_cfg = node.config.get("model") or {}
+                raw = model_cfg.get("parameters")
+                kwargs = dict(raw) if isinstance(raw, dict) else {}
+                kwargs["model"] = model_cfg.get("name") or "gpt-4o"
+                chat_model = lc_openai.ChatOpenAI(**kwargs)
 
             regular_tools = _build_node_tools(node, tool_handlers)
 
