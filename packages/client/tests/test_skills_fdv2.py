@@ -49,7 +49,6 @@ from launchdarkly_ai_server.skills_fdv2 import (
     seam_object_from_put,
     tombstone_from_delete,
 )
-from launchdarkly_ai_server.skills_fdv2 import _warned_hashless as _hashless_dedupe
 
 pytestmark = pytest.mark.usefixtures("reset_skill_state")
 
@@ -313,14 +312,6 @@ def endpoint() -> Any:
     server = _FakeFDv2Endpoint()
     yield server
     server.close()
-
-
-@pytest.fixture(autouse=True)
-def _clear_hashless_dedupe() -> Any:
-    """The hashless-object ERROR is deduped per process; per test here."""
-    _hashless_dedupe.clear()
-    yield
-    _hashless_dedupe.clear()
 
 
 def poll_store(endpoint: Any, **kwargs: Any) -> FDv2SkillStore:
@@ -1346,6 +1337,17 @@ class TestFailureHandling:
 # ---------------------------------------------------------------------------
 
 
+def _per_object_hashless_errors(caplog: Any) -> list[Any]:
+    """The per-object ERROR, as distinct from the whole-payload summary."""
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "ERROR"
+        and "arrived without a contentHash" in r.getMessage()
+        and "No skill content will resolve" not in r.getMessage()
+    ]
+
+
 class TestMissingContentHash:
     """
     A skill delivered without a ``contentHash``, asserted as behaviour.
@@ -1413,6 +1415,48 @@ class TestMissingContentHash:
         assert "missing_content_hash" in rendered
         assert "pdf-extraction" in rendered
         assert "contentHash" in rendered
+
+    def test_a_redelivered_hashless_object_logs_once_per_store(
+        self, caplog: Any
+    ) -> None:
+        """Re-delivering the same ``(key, version)`` to one store must not
+        multiply the ERROR: a polling store sees every object on every poll."""
+        reader = _ProtocolReader(_SkillObjectSet())
+        payload = full_payload(("put-object", put_skill(omit_hash=True)))
+        with caplog.at_level("ERROR"):
+            drive(reader, payload)
+            drive(reader, payload)
+        assert len(_per_object_hashless_errors(caplog)) == 1
+
+    def test_a_recreated_store_reports_the_same_hashless_object_again(
+        self, caplog: Any
+    ) -> None:
+        """
+        The dedupe belongs to the store, not the process. A host that rebuilds
+        its store (reconnect wrapper, config reload, credential rotation) must
+        get the ERROR again, since it is the loudest signal that a deployment is
+        broken rather than empty by design.
+        """
+        payload = full_payload(("put-object", put_skill(omit_hash=True)))
+        with caplog.at_level("ERROR"):
+            drive(_ProtocolReader(_SkillObjectSet()), payload)
+            first = len(_per_object_hashless_errors(caplog))
+            drive(_ProtocolReader(_SkillObjectSet()), payload)
+        assert first == 1
+        assert len(_per_object_hashless_errors(caplog)) == 2
+
+    def test_two_live_stores_do_not_suppress_each_other(self, caplog: Any) -> None:
+        """Two stores in one process (say, two environments) each report."""
+        one = _ProtocolReader(_SkillObjectSet())
+        two = _ProtocolReader(_SkillObjectSet())
+        payload = full_payload(("put-object", put_skill(omit_hash=True)))
+        with caplog.at_level("ERROR"):
+            drive(one, payload)
+            drive(two, payload)
+            # And each still dedupes its own re-deliveries.
+            drive(one, payload)
+            drive(two, payload)
+        assert len(_per_object_hashless_errors(caplog)) == 2
 
     def test_a_wholly_hashless_payload_says_so_once(
         self, endpoint: Any, caplog: Any

@@ -473,6 +473,11 @@ class _ProtocolReader:
         self._pending: _SkillObjectSet | None = None
         self._changes: list[dict[str, Any]] = []
         self.diagnostics = StoreDiagnostics()
+        # Identities already reported by ``_warn_hashless``. Held per reader, so a
+        # store that is recreated in the same process reports again and two
+        # stores never quieten each other. No lock: ``handle`` only runs under
+        # the owning store's lock, on that store's single delivery thread.
+        self._warned_hashless: set[tuple[str, Any]] = set()
 
     # -- events ------------------------------------------------------------
 
@@ -547,7 +552,7 @@ class _ProtocolReader:
         self.diagnostics.skill_objects_received += 1
         if not isinstance(raw.get("contentHash"), str):
             self.diagnostics.hashless_objects += 1
-            _warn_hashless(raw)
+            self._warn_hashless(raw)
         return _TransferOutcome()
 
     def _delete_object(self, data: Any) -> _TransferOutcome:
@@ -620,6 +625,31 @@ class _ProtocolReader:
             )
         return _TransferOutcome(disconnect=f"server said goodbye: {reason}")
 
+    # -- diagnostics ---------------------------------------------------------
+
+    def _warn_hashless(self, raw: dict[str, Any]) -> None:
+        """
+        One ERROR per ``(key, version)`` whose envelope had no ``contentHash``.
+
+        At ERROR rather than WARN, and per object rather than once per process,
+        because an empty accessor result is otherwise indistinguishable from an
+        environment that has no skills. Deduped within this reader so a
+        re-delivered payload does not multiply it; a store that is recreated,
+        in this process or another, reports again, and stores for different
+        environments in one process do not share the dedupe.
+        """
+        identity = (raw["key"], raw.get("version"))
+        if identity in self._warned_hashless:
+            return
+        self._warned_hashless.add(identity)
+        logger.error(
+            "Skill '%s' version %s arrived without a contentHash and will be withheld. %s",
+            raw["key"],
+            raw.get("version"),
+            _HASHLESS_ADVICE,
+            extra={"ld_skill_key": raw["key"], "ld_skill_version": raw.get("version")},
+        )
+
 
 _HASHLESS_ADVICE = (
     "The delivered skill object carries no 'contentHash', so integrity "
@@ -630,32 +660,6 @@ _HASHLESS_ADVICE = (
     "sha256 over the verbatim UTF-8 content. Contact LaunchDarkly support if "
     "skills in your environment arrive without one."
 )
-
-_warned_hashless: set[tuple[str, Any]] = set()
-_warned_lock = threading.Lock()
-
-
-def _warn_hashless(raw: dict[str, Any]) -> None:
-    """
-    One ERROR per ``(key, version)`` whose envelope had no ``contentHash``.
-
-    At ERROR rather than WARN, and per object rather than once per process,
-    because an empty accessor result is otherwise indistinguishable from an
-    environment that has no skills. Deduped so a re-delivered payload does not
-    multiply it; a restarted process reports again.
-    """
-    identity = (raw["key"], raw.get("version"))
-    with _warned_lock:
-        if identity in _warned_hashless:
-            return
-        _warned_hashless.add(identity)
-    logger.error(
-        "Skill '%s' version %s arrived without a contentHash and will be withheld. %s",
-        raw["key"],
-        raw.get("version"),
-        _HASHLESS_ADVICE,
-        extra={"ld_skill_key": raw["key"], "ld_skill_version": raw.get("version")},
-    )
 
 
 def _warn_if_nothing_can_verify(
