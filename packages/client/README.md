@@ -458,8 +458,9 @@ Windows.
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative `timeout`, or an unrecognised `on_unavailable`. **Performs synchronous filesystem I/O — see the note below.** |
-| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)`. |
+| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)` / `remove_listener(kind, fn)`. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
+| `watch_skills(skills, root, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,
 the accessors raise `RuntimeError` explaining what to do and `write_skills` reports the

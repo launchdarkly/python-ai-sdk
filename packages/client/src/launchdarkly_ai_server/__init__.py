@@ -53,6 +53,7 @@ from .skills_fs import (
     OnUnavailable,
     write_skills,
 )
+from .skills_watch import SkillWatcher, watch_skills
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -237,6 +238,9 @@ __all__ = [  # noqa: RUF022
     "write_skills",
     "SkillStore",
     "InMemorySkillStore",
+    # skills — the eager re-reconcile
+    "watch_skills",
+    "SkillWatcher",
     # skills — the three closed-set unions a typed consumer needs to name
     "ReconcileActionKind",
     "OnUnavailable",
