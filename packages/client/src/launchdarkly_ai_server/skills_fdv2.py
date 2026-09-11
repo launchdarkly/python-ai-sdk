@@ -1032,6 +1032,25 @@ def _decode_poll_body(body: bytes) -> list[tuple[str, Any]]:
     return events
 
 
+def _iter_stream_lines(response: Any) -> Any:
+    """
+    Yields a streaming body's raw lines, presenting a read failure as retryable.
+
+    A live stream dies mid-body far more often than it refuses to open: a read
+    timeout on a stream that went quiet, a reset, a truncated chunk. Each of
+    those arrives as whatever the socket raised, and the delivery loop retries
+    only the transport errors this module defines — anything else it reads as a
+    bug and stops for the process lifetime. Connecting is already wrapped in
+    ``_Requester.stream``; this is the same promise for the body.
+    """
+    try:
+        yield from response
+    except Exception as exc:
+        raise _RecoverableTransportError(
+            f"reading the FDv2 stream failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def _iter_sse(response: Any) -> Any:
     """
     Decodes an SSE body into ``(event name, data)`` pairs.
@@ -1042,7 +1061,7 @@ def _iter_sse(response: Any) -> Any:
     try:
         name: str | None = None
         data_lines: list[str] = []
-        for raw_line in response:
+        for raw_line in _iter_stream_lines(response):
             line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
             if line == "":
                 if name is not None:

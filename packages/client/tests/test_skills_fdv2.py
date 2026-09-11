@@ -23,6 +23,7 @@ import json
 import socket
 import threading
 import time
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
@@ -52,6 +53,7 @@ from launchdarkly_ai_server.skills_fdv2 import (
     _retry_after_seconds,
     _SkillObjectSet,
     _store_object_from_put,
+    _StreamConnection,
     _tombstone_from_delete,
 )
 
@@ -1287,6 +1289,41 @@ class TestStreamingAgainstTheEndpoint:
 # ---------------------------------------------------------------------------
 
 
+class _DyingResponse:
+    """
+    A streaming body that transfers a payload and then fails mid-read.
+
+    This is how a live stream actually ends: not with a clean end of body but
+    with a read timeout on a stream that went quiet, or a reset from the server
+    or a proxy in between.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def __iter__(self) -> Any:
+        for event in full_payload(("put-object", put_skill())):
+            yield f"event: {event['event']}\n".encode()
+            yield f"data: {json.dumps(event['data'])}\n".encode()
+            yield b"\n"
+        raise self._exc
+
+    def close(self) -> None:
+        pass
+
+
+class _DyingStreamRequester:
+    """Every connection transfers a payload, then dies with *exc* mid-read."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.connections = 0
+        self._exc = exc
+
+    def stream(self, basis: str | None) -> Any:
+        self.connections += 1
+        return _StreamConnection(_DyingResponse(self._exc))
+
+
 class _ScriptedConnection:
     """Stands in for ``_StreamConnection``: an event iterator plus a close."""
 
@@ -1474,6 +1511,30 @@ class TestFailureHandling:
             # may read 1 mid-reconnect. What it must never do is climb.
             assert store.diagnostics.connection_failures <= 1
             assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            TimeoutError("timed out"),
+            ConnectionResetError(54, "Connection reset by peer"),
+            IncompleteRead(b"partial"),
+        ],
+        ids=["read timeout", "reset", "truncated body"],
+    )
+    def test_a_stream_that_dies_mid_read_reconnects(self, exc: BaseException) -> None:
+        # A stream fails in its body far more often than at its connect, and
+        # ``read_timeout`` exists to bound one that has gone quiet. Treating
+        # such a failure as unexpected would stop delivery — including
+        # revocation — for the process lifetime the first time a socket died.
+        requester = _DyingStreamRequester(exc)
+        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        try:
+            store.start()
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: requester.connections >= 5)
+            assert store.failed is None
         finally:
             store.close()
 
