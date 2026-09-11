@@ -1145,13 +1145,16 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
     assert result.passed is True
     # kind and judgeKey are what let ai-evaluator store this as a judge rather
     # than default it to a deepeval metric and reject the key. successDirection
-    # is deliberately absent: LaunchDarkly injects it from the judge's AI Config
-    # on the way through, so the SDK must not assert a direction of its own.
+    # is TEMPORARILY hardcoded on the wire (see Judge.to_criteria_wire) to
+    # unblock testing the gonfalon-judge-proxy injection middleware while its
+    # enabling flag is off; remove this key here alongside that hardcode once
+    # the proxy is live and LaunchDarkly injects the direction itself.
     assert transport.requests[2]["body"]["criteria"] == [
         {
             "criterionType": "$ld:ai:judge:accuracy",
             "kind": "judge",
             "judgeKey": "$ld:ai:judge:accuracy",
+            "successDirection": "higher_is_better",
             "options": {"threshold": 0.5},
         }
     ]
@@ -1392,10 +1395,13 @@ def test_scorer_lower_is_better_reaches_the_criteria_wire() -> None:
 def test_judge_threshold_defaults_so_a_criterion_is_always_rulable() -> None:
     """A judge with no threshold gives LaunchDarkly nothing to compare against,
     so the criterion would be stored and never ruled on."""
+    # successDirection is TEMPORARILY hardcoded on the wire; see the matching
+    # comment on Judge.to_criteria_wire.
     assert Judge(key="$ld:ai:judge:accuracy").to_criteria_wire() == {
         "criterionType": "$ld:ai:judge:accuracy",
         "kind": "judge",
         "judgeKey": "$ld:ai:judge:accuracy",
+        "successDirection": "higher_is_better",
         "options": {"threshold": 0.5},
     }
 

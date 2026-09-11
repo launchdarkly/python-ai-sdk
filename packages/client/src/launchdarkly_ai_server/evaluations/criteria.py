@@ -58,6 +58,11 @@ class Judge:
             "criterionType": self.criterion_type,
             "kind": "judge",
             "judgeKey": self.key,
+            # TEMPORARY: hardcoded to unblock testing the gonfalon-judge-proxy
+            # successDirection-injection middleware while its enabling flag is
+            # off. The proxy is expected to overwrite this; remove once that
+            # lands and ai-evaluator no longer needs it on the raw request.
+            "successDirection": "higher_is_better",
             "options": options,
         }
 
