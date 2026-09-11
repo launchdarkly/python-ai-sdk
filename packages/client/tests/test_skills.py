@@ -27,6 +27,7 @@ from launchdarkly_ai_server import (
     shutdown,
     skill_refs,
 )
+from launchdarkly_ai_server.skills_core import list_raw_objects, require_store
 
 SKILL_BODY = "---\nname: Test Skill\n---\nDo the thing.\n"
 
@@ -631,6 +632,28 @@ class TestGetSkill:
     async def test_missing_key_returns_none(self, store: InMemorySkillStore) -> None:
         assert await get_skill("nope") is None
 
+    async def test_a_store_answering_under_a_different_key_is_withheld(
+        self, make_raw_skill: Any
+    ) -> None:
+        """The key needs the same post-fetch defense the version already has.
+
+        Identity is read off the object itself, and the store is untrusted. An
+        answer served under a different key would otherwise be handed back
+        under the key the caller asked for while carrying its own.
+        """
+
+        class _AliasingStore:
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return make_raw_skill(key="other-key")
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {}
+
+        skills_module._set_store(_AliasingStore())
+        assert await get_skill("asked-for") is None
+
     async def test_multibyte_content_verifies(
         self, store: InMemorySkillStore, make_raw_skill: Any
     ) -> None:
@@ -723,6 +746,33 @@ class TestAllSkills:
         result = await all_skills()
         assert {s.key for s in result} == {"good"}
         assert len(recording_emitter.signals(INTEGRITY_SIGNAL)) == 1
+
+    async def test_a_non_mapping_listing_is_reported_as_a_broken_store(self) -> None:
+        """A listing that is not a mapping is a broken store, not an empty one.
+
+        ``all_skills`` has no way to report the difference, so it returns an
+        empty list either way — but the reason has to reach the caller that
+        does act on it. Collapsing the answer to "no skills" reads downstream
+        as "every skill was revoked".
+        """
+
+        class _BrokenListingStore:
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return None
+
+            def all_objects(self, kind: str) -> Any:
+                return None
+
+        skills_module._set_store(_BrokenListingStore())
+
+        assert await all_skills() == []
+
+        objects, error = list_raw_objects(require_store())
+        assert objects == {}
+        assert error is not None
+        assert "rather than an object" in error
 
 
 class TestVersionPinning:
