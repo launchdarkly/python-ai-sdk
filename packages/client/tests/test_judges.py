@@ -3,6 +3,8 @@ Tests for §3.14 run_judges.
 Reference: TESTING.md §3.14
 """
 
+import json
+from dataclasses import asdict
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +12,7 @@ import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server import JudgeResult, ProviderHandler, run_judges
+from launchdarkly_ai_server.judges import build_judge_tasks, run_judge
 
 CONTEXT = {"kind": "user", "key": "u1"}
 
@@ -406,3 +409,304 @@ class TestScoreGuard:
         assert _numeric_score(0) == 0.0
         assert _numeric_score(inf) is None
         assert _numeric_score(nan) is None
+
+
+def _judge_variation_with_output_format() -> dict[str, Any]:
+    return {
+        "model": {"name": "gpt-4"},
+        "provider": {"name": "TestProvider"},
+        "instructions": "judge",
+        "outputFormat": {
+            "type": "json_schema",
+            "properties": {"message": "string"},
+            "required": ["message"],
+        },
+        "_ldMeta": {
+            "enabled": True,
+            "variationKey": "j1",
+            "version": 1,
+            "mode": "messages",
+        },
+    }
+
+
+class TestJudgeOutputFormatStripped:
+    """A judge's own ``outputFormat`` must never reach a handler or a JudgeTask.
+
+    The judge verdict contract (``{score, reasoning}``) is owned by this SDK. A schema
+    on the judge config itself would hard-constrain the provider away from that shape
+    and the judge would never produce a score.
+    """
+
+    async def test_handler_never_sees_output_format(
+        self, mock_ld_client: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        received_configs: list[Any] = []
+
+        async def recording_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            received_configs.append(config)
+            return {
+                "output": '{"score": 0.8, "reasoning": "ok"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        handler = ProviderHandler(
+            fn=recording_fn, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+
+        judge_variation = _judge_variation_with_output_format()
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.judges"):
+            with patch.object(random, "random", return_value=0.0):
+                result = await run_judges(
+                    config=config,
+                    user_context=CONTEXT,
+                    handler=handler,
+                    user_input="q",
+                    llm_response="response",
+                    base_track_data={"runId": "x"},
+                )
+
+        assert len(received_configs) == 1
+        effective = received_configs[0]
+        assert "outputFormat" not in effective
+        assert effective["model"] == {"name": "gpt-4"}
+        assert effective["provider"] == {"name": "TestProvider"}
+        assert effective["instructions"] == "judge"
+
+        # A valid verdict still parses.
+        assert result["judge-1"].score == 0.8
+        assert result["judge-1"].response == "ok"
+
+        # This is what was broken: before the fix, a strict provider schema on the judge
+        # config made a valid {score, reasoning} verdict impossible. It must be present now.
+        assert "judge-1" in result
+
+        # The reason is stated once, naming the judge key.
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and "judge-1" in r.message
+        ]
+        assert len(warnings) == 1
+        assert "outputFormat" in warnings[0].message
+
+    async def test_input_config_not_mutated(self, mock_ld_client: MagicMock) -> None:
+        judge_variation = _judge_variation_with_output_format()
+        original_output_format = judge_variation["outputFormat"]
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=_make_handler(),
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+
+        # The caller's original variation dict must be untouched.
+        assert judge_variation["outputFormat"] is original_output_format
+
+    async def test_no_output_format_means_no_change_and_no_log(
+        self, mock_ld_client: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        judge_variation = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "judge",
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.judges"):
+            with patch.object(random, "random", return_value=0.0):
+                result = await run_judges(
+                    config=config,
+                    user_context=CONTEXT,
+                    handler=_make_handler(),
+                    user_input="q",
+                    llm_response="response",
+                    base_track_data={"runId": "x"},
+                )
+
+        assert result["judge-1"].score == 0.9
+        assert not any("outputFormat" in r.message for r in caplog.records)
+
+    async def test_collapsed_messages_still_apply(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        received_configs: list[Any] = []
+
+        async def recording_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            received_configs.append(config)
+            return {
+                "output": '{"score": 0.7, "reasoning": "ok"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        agent_handler = ProviderHandler(
+            fn=recording_fn, provides_for=("Anthropic", "agent")
+        )  # type: ignore[arg-type]
+
+        judge_variation = {
+            "model": {"name": "claude-3-5-sonnet"},
+            "provider": {"name": "Anthropic"},
+            "messages": [{"role": "user", "content": "Judge this response."}],
+            "outputFormat": {"type": "json_schema", "properties": {"x": "string"}},
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "judge",
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "claude-3-5-sonnet"},
+            "provider": {"name": "Anthropic"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=agent_handler,
+                handlers=[agent_handler],
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+
+        assert len(received_configs) == 1
+        effective = received_configs[0]
+        # Collapsed to instructions...
+        assert effective.get("instructions") == "Judge this response."
+        assert effective.get("messages") == []
+        # ...and stripped.
+        assert "outputFormat" not in effective
+
+    async def test_judge_task_carries_no_output_format(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        judge_variation = _judge_variation_with_output_format()
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            tasks = await build_judge_tasks(
+                config=config,
+                user_context=CONTEXT,
+                handler=_make_handler(),
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert "outputFormat" not in task.judge_config
+
+        # Must still survive a JSON round-trip (serialisable for a background thread).
+        roundtripped = json.loads(json.dumps(asdict(task)))
+        assert "outputFormat" not in roundtripped["judge_config"]
+
+    async def test_run_judge_strips_defensively(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        from launchdarkly_ai_server.types import JudgeTask
+
+        received_configs: list[Any] = []
+
+        async def recording_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            received_configs.append(config)
+            return {
+                "output": '{"score": 0.6, "reasoning": "ok"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        handler = ProviderHandler(
+            fn=recording_fn, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+
+        # Simulate an older serialized task that still carries outputFormat.
+        task = JudgeTask(
+            config_key="judge-1",
+            judge_config={
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+                "outputFormat": {"type": "json_schema", "properties": {"x": "string"}},
+            },
+            judge_meta={
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+            actual_output="response",
+            user_context=CONTEXT,
+            judge_provider="TestProvider",
+            judge_mode="messages",
+            collapse_messages=False,
+            parent_track_data={"runId": "x"},
+        )
+
+        result = await run_judge(task, handlers=[handler])
+
+        assert len(received_configs) == 1
+        assert "outputFormat" not in received_configs[0]
+        assert result is not None
+        assert result.score == 0.6

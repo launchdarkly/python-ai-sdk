@@ -166,6 +166,10 @@ The AI configuration object fetched from a LaunchDarkly flag variation. Represen
 
 At least one of `instructions` or a non-empty `messages` list must be present.
 
+A judge is itself an `AiConfigRep`, so it may carry its own `outputFormat`. The SDK ignores it:
+the judge verdict contract is fixed at `{score, reasoning}` (see `judges.py`), so set
+`outputFormat` on the primary config being evaluated, never on the judge.
+
 #### `Tool`
 
 A tool definition that can be registered with a provider.
