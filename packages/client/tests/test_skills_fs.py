@@ -532,6 +532,120 @@ class TestResilience:
         assert _actions_by_key(report)["pdf-extraction"].action == "error"
         assert "pdf-extraction/SKILL.md" in _read_manifest(root)["entries"]
 
+    async def test_a_non_mapping_listing_never_prunes(self, root: Path) -> None:
+        """A store that cannot list is not a store holding nothing.
+
+        A listing collapsed to "no skills" is indistinguishable from every
+        skill having been revoked, and prune would then delete every managed
+        file and report a clean run. The listing failure has to reach the
+        prune gate as an incomplete run.
+        """
+
+        class NoListingStore:
+            """Answers the listing with something that is not a mapping."""
+
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return None
+
+            def all_objects(self, kind: str) -> Any:
+                return None
+
+        existing = _place_managed(root, "pdf-extraction", SKILL_BODY)
+        skills_module._set_store(NoListingStore())
+
+        report = await write_skills("*", root)
+
+        assert report.ok is False
+        assert existing.read_text(encoding="utf-8") == SKILL_BODY
+        assert [a.action for a in report.actions] == ["error"]
+        assert any("rather than an object" in m for m in _error_messages(report))
+        # The entry survives, so the next reconcile picks it up.
+        assert "pdf-extraction/SKILL.md" in _read_manifest(root)["entries"]
+
+    async def test_an_answer_under_another_key_writes_nothing(self, root: Path) -> None:
+        """The file is named after the key the object carries, so a store
+        answering under a different key would write one path and prune another.
+
+        Left unchecked, the run wrote the aliased key, then deleted it in the
+        same pass because prune keys off the request — and reported ok. The
+        requested key has to be the one the outcome is reported against.
+        """
+
+        class AliasingStore:
+            """Answers every lookup with an object carrying its own key."""
+
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return {
+                    "key": "other-key",
+                    "version": 1,
+                    "content": SKILL_BODY,
+                    "contentHash": _hash(SKILL_BODY),
+                }
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {}
+
+        skills_module._set_store(AliasingStore())
+
+        report = await write_skills(["requested-key"], root)
+
+        assert report.ok is False
+        assert [a.action for a in report.actions] == ["error"]
+        # Reported against the key that was asked for, not the one served.
+        assert _actions_by_key(report)["requested-key"].action == "error"
+        assert not (root / "other-key").exists()
+        assert _read_manifest(root)["entries"] == {}
+
+    async def test_an_answer_under_another_key_does_not_overwrite_that_key(
+        self, root: Path
+    ) -> None:
+        """The aliased answer must not reach the real key's file.
+
+        Both keys are requested here, so nothing is prunable and the write
+        itself is what is under test: unchecked, the object served under the
+        alias is written to the *other* key's path, clobbering the content that
+        key's own lookup resolved — and the run still reports ok.
+        """
+        aliased = "aliased\n"
+
+        class AliasingStore:
+            """Answers one key honestly and the other under that same key."""
+
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                if key == "other-key":
+                    return {
+                        "key": "other-key",
+                        "version": 1,
+                        "content": SKILL_BODY,
+                        "contentHash": _hash(SKILL_BODY),
+                    }
+                return {
+                    "key": "other-key",
+                    "version": 2,
+                    "content": aliased,
+                    "contentHash": _hash(aliased),
+                }
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {}
+
+        existing = _place_managed(root, "other-key", SKILL_BODY)
+        skills_module._set_store(AliasingStore())
+
+        # The alias is resolved last, so an unchecked write lands on top.
+        report = await write_skills(["other-key", "requested-key"], root)
+
+        assert report.ok is False
+        assert existing.read_text(encoding="utf-8") == SKILL_BODY
+        assert _actions_by_key(report)["requested-key"].action == "error"
+        assert _actions_by_key(report)["other-key"].action == "skipped_current"
+
     async def test_unavailable_run_does_not_corrupt_manifest(self, root: Path) -> None:
         _place_managed(root, "a", SKILL_BODY)
         before = _read_manifest(root)
