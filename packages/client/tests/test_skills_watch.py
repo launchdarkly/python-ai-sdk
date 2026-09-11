@@ -93,6 +93,68 @@ class TestWatchSkills:
 
 
 # ---------------------------------------------------------------------------
+# Changes that land while the initial reconcile is running
+# ---------------------------------------------------------------------------
+
+
+class TestChangesDuringTheInitialReconcile:
+    """The listener attaches before the initial reconcile, so a change delivered
+    while that reconcile is still running is acted on rather than lost."""
+
+    async def test_a_revocation_landing_mid_reconcile_is_not_missed(
+        self, tmp_path: Any, make_raw_skill: Any
+    ) -> None:
+        class RevokesAfterSnapshot(InMemorySkillStore):
+            """Revokes everything the moment the reconcile has taken its
+            snapshot — where a ``delete-object`` lands when it arrives a fraction
+            of a second into startup, with nothing after it."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.snapshots = 0
+
+            def all_objects(self, kind: str) -> dict[str, dict[str, Any]]:
+                objects = super().all_objects(kind)
+                self.snapshots += 1
+                if self.snapshots == 1:
+                    self._versions.clear()
+                    self._loose.clear()
+                    for listener in self._listeners.get(SKILL_OBJECT_KIND, []):
+                        listener({"key": "pdf-extraction"})
+                return objects
+
+        store = RevokesAfterSnapshot()
+        store.put(make_raw_skill(key="pdf-extraction", version=1, content="body"))
+        await init_client(options={"skillStore": store}, client=object())
+
+        _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
+        try:
+            written = tmp_path / "s" / "pdf-extraction" / "SKILL.md"
+            # The initial reconcile wrote what its snapshot held, so the file is
+            # on disk and the revocation that followed it is the only change
+            # left to act on.
+            assert written.read_text() == "body"
+            assert wait_until(lambda: not written.exists(), timeout=10)
+        finally:
+            watcher.close()
+
+    async def test_a_failed_initial_reconcile_leaves_no_listener_behind(
+        self, tmp_path: Any
+    ) -> None:
+        """Registering first means a reconcile that raises has to detach: the
+        caller is handed an exception, not a watcher to close."""
+        store = InMemorySkillStore()
+        await init_client(options={"skillStore": store}, client=object())
+        not_a_directory = tmp_path / "file"
+        not_a_directory.write_text("")
+
+        with pytest.raises(ValueError, match="not a directory"):
+            await watch_skills("*", not_a_directory)
+
+        assert store._listeners.get(SKILL_OBJECT_KIND, []) == []
+
+
+# ---------------------------------------------------------------------------
 # Closing a watch
 # ---------------------------------------------------------------------------
 

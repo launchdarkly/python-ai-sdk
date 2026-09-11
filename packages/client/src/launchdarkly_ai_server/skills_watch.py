@@ -94,13 +94,26 @@ class SkillWatcher:
             target=self._run, name="ld-ai-skills-reconcile", daemon=True
         )
 
-        # Register before starting the worker: ``notify`` only sets an event, so a
-        # change that lands in between is picked up as soon as the worker runs,
-        # and a store whose ``add_listener`` raises leaves no thread behind.
+        # Register before the initial reconcile, and leave the worker unstarted
+        # until ``start``. ``notify`` only sets an event, so a change that lands
+        # while that reconcile is still running is recorded rather than lost, and
+        # the worker cannot reconcile the root while the caller's own reconcile is
+        # in flight. A store whose ``add_listener`` raises leaves no thread behind.
         self._store = store
         self._registered = False
         store.add_listener(SKILL_OBJECT_KIND, self.notify)
         self._registered = True
+
+    def _start(self) -> None:
+        """
+        Starts the worker. ``watch_skills`` calls this once, after the initial
+        reconcile; it is not part of the caller-facing interface.
+
+        Split from construction so registration and reconciling can be ordered
+        independently: the listener attaches first, so no change is missed, while
+        the first re-reconcile waits for the initial one to finish, so a root only
+        ever has one reconcile running at a time.
+        """
         self._thread.start()
 
     # -- the listener the store calls -------------------------------------
@@ -272,13 +285,13 @@ async def watch_skills(
     if debounce < 0:
         raise ValueError(f"debounce must not be negative, got {debounce!r}")
 
-    # The initial reconcile runs first and on the caller's thread, so its report
-    # is the caller's to inspect and a bad root raises out of `watch_skills`
-    # rather than into a worker thread's log.
-    report = await write_skills(
-        skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
-    )
-
+    # The watcher attaches its listener before the initial reconcile, not after.
+    # The reconcile snapshots the store as its first step and then spends the
+    # rest of its time on the filesystem — a write and an fsync per skill, the
+    # prune, the manifest rewrite — so a change delivered after that snapshot
+    # needs something already listening to be seen at all. Nothing re-reconciles
+    # on a timer, so a revocation that landed unobserved would wait for the next
+    # unrelated change, which on a quiet root means the next restart.
     watcher = SkillWatcher(
         skills,
         root,
@@ -289,4 +302,22 @@ async def watch_skills(
         debounce=debounce,
         on_reconcile=on_reconcile,
     )
+    try:
+        # The initial reconcile runs on the caller's thread, so its report is the
+        # caller's to inspect and a bad root raises out of `watch_skills` rather
+        # than into a worker thread's log.
+        report = await write_skills(
+            skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
+        )
+    except BaseException:
+        # The listener is already attached, so a reconcile that raises must not
+        # leave it on the store: the caller has no watcher to close.
+        watcher.close()
+        raise
+
+    # Only now start the worker. A change that arrived during the reconcile has
+    # already set the wake event, so the worker's first pass picks it up; one that
+    # arrived before the reconcile's snapshot is already on disk, and the
+    # redundant pass it triggers converges on the same state.
+    watcher._start()
     return report, watcher
