@@ -3,10 +3,14 @@ from __future__ import annotations
 import logging
 import random
 from collections.abc import Callable
-from math import isfinite
 from typing import Any
 
 from .conversation import with_judge_evaluation
+from .judge_scoring import (
+    FORMATTING_INSTRUCTIONS,
+    numeric_score,
+    parse_judge_response,
+)
 from .types import (
     AiConfigRep,
     JudgeResult,
@@ -22,7 +26,6 @@ from .utils import (
 )
 from .utils import (
     normalize_mode,
-    parse_json_with_possible_fences,
     to_ld_context,
     to_usage_dict,
 )
@@ -37,29 +40,6 @@ def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
 
 
 logger = logging.getLogger(__name__)
-
-_FORMATTING_INSTRUCTIONS = "\n".join(
-    [
-        "Your response MUST be in valid JSON format with the following structure:",
-        '{ "score": <number, 0-1>, "reasoning": <string> }',
-        "The output must be valid, parseable JSON. Do not include additional tags, comments, "
-        "formatting, or newlines.",
-        "It should be returned in a format that is immediately parseable by a JSON parsing "
-        "function. Do not include ```json tags.",
-    ]
-)
-
-
-def _numeric_score(score: Any) -> float | None:
-    """Return ``score`` as a float only when it already is a finite number.
-
-    Never raises. A judge that returns ``"0.9 (high)"`` or ``None`` must not take down the
-    evaluation metric track that follows, and must not put a string where semconv defines a double.
-    """
-    if isinstance(score, bool) or not isinstance(score, (int, float)):
-        return None
-    value = float(score)
-    return value if isfinite(value) else None
 
 
 async def run_judges(
@@ -166,7 +146,7 @@ async def run_judges(
             )
 
             message_history = "\n\n".join(
-                filter(None, [user_input, llm_response, _FORMATTING_INSTRUCTIONS])
+                filter(None, [user_input, llm_response, FORMATTING_INSTRUCTIONS])
             )
 
             async with with_judge_evaluation(judge_key) as record_evaluation:
@@ -185,24 +165,16 @@ async def run_judges(
                     },
                 )
 
-                raw = result["response"]
-                judge_response = raw if isinstance(raw, str) else str(raw)
-
-                parsed = parse_json_with_possible_fences(judge_response)
-                if not parsed:
-                    raise ValueError("Invalid JSON from judge")
-
-                score = parsed.get("score")
-                reasoning = parsed.get("reasoning", "")
+                score, reasoning = parse_judge_response(result["response"])
                 judge_results[judge_key] = JudgeResult(
                     usage=to_usage_dict(result["usage"]),
                     response=reasoning,
                     score=score,
                 )
-                numeric_score = _numeric_score(score)
-                if numeric_score is not None:
+                metric_score = numeric_score(score)
+                if metric_score is not None:
                     record_evaluation(
-                        numeric_score,
+                        metric_score,
                         reasoning if judge_handler.capture_content else None,
                     )
 
@@ -403,7 +375,7 @@ async def run_judge(
     )
 
     message_history = "\n\n".join(
-        filter(None, [task.actual_output, _FORMATTING_INSTRUCTIONS])
+        filter(None, [task.actual_output, FORMATTING_INSTRUCTIONS])
     )
 
     async with with_judge_evaluation(task.config_key) as record_evaluation:
@@ -422,18 +394,17 @@ async def run_judge(
             },
         )
 
-        raw = result["response"]
-        judge_response = raw if isinstance(raw, str) else str(raw)
-        parsed = parse_json_with_possible_fences(judge_response)
-        if not parsed:
+        try:
+            score, reasoning = parse_judge_response(result["response"])
+        except ValueError:
             return None
 
-        score = parsed.get("score", 0.0)
-        reasoning = parsed.get("reasoning", "")
-        numeric_score = _numeric_score(score)
-        if numeric_score is not None:
+        if score is None:
+            score = 0.0
+        metric_score = numeric_score(score)
+        if metric_score is not None:
             record_evaluation(
-                numeric_score,
+                metric_score,
                 reasoning if judge_handler.capture_content else None,
             )
         raw_usage = result["usage"]
