@@ -67,10 +67,16 @@ whatever the SDK hands it, which is this constant reached through
 ``launchdarkly_ai_server.skills_core``.
 """
 
-MAX_SKILL_CONTENT_BYTES = 64 * 1024
+MAX_SKILL_CONTENT_BYTES = 10 * 1024 * 1024
 """
 Hard cap on skill content. Legitimately delivered skills are well under this
 bound, so anything larger is withheld regardless of whether its hash checks out.
+
+Set well above the platform's own limit on purpose. This is a backstop against
+absurd input, not a second enforcement of the real bound: the platform refuses
+oversized skills before they are ever delivered, and a client-side number sitting
+just above that one would turn every backend increase into an SDK release. The
+headroom lets the real limit grow without this constant moving.
 
 Deliberately **not** exported from the package root, unlike the on-disk and
 on-the-wire constants beside it. Those are values this SDK defines and a caller

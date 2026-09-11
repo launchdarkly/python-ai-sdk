@@ -248,7 +248,7 @@ class TestPackageExports:
         import launchdarkly_ai_server as package
         from launchdarkly_ai_server import skills_core
 
-        assert skills_core.MAX_SKILL_CONTENT_BYTES == 65536
+        assert skills_core.MAX_SKILL_CONTENT_BYTES == 10485760
         assert "MAX_SKILL_CONTENT_BYTES" not in package.__all__
         assert not hasattr(package, "MAX_SKILL_CONTENT_BYTES")
 
@@ -969,7 +969,7 @@ class TestIntegrityVerification:
         self, store: InMemorySkillStore, make_raw_skill: Any, recording_emitter: Any
     ) -> None:
         skills_module._set_emitter_for_testing(recording_emitter)
-        oversize = "x" * (64 * 1024 + 1)
+        oversize = "x" * (10 * 1024 * 1024 + 1)
         store.put(make_raw_skill(key="a", content=oversize))
         assert await get_skill("a") is None
         assert len(recording_emitter.signals(INTEGRITY_SIGNAL)) == 1
@@ -977,11 +977,11 @@ class TestIntegrityVerification:
     async def test_content_at_size_cap_is_accepted(
         self, store: InMemorySkillStore, make_raw_skill: Any
     ) -> None:
-        at_cap = "x" * (64 * 1024)
+        at_cap = "x" * (10 * 1024 * 1024)
         store.put(make_raw_skill(key="a", content=at_cap))
         skill = await get_skill("a")
         assert skill is not None
-        assert len(skill.content) == 64 * 1024
+        assert len(skill.content) == 10 * 1024 * 1024
 
     async def test_key_at_length_bound_from_store_accepted(
         self, store: InMemorySkillStore, make_raw_skill: Any
@@ -1132,7 +1132,7 @@ def _raw_without(field: str) -> dict[str, Any]:
     return raw
 
 
-_OVERSIZE = "x" * (64 * 1024 + 1)
+_OVERSIZE = "x" * (10 * 1024 * 1024 + 1)
 
 REASON_CODE_CASES = [
     # Not a dict at all. Reachable through ``all_skills`` and not through

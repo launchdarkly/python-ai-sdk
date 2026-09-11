@@ -224,7 +224,7 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   themselves.
 - **Integrity is mandatory and doubled, through one implementation.** Every raw object is
   verified at the accessor boundary (key pattern and length, integer version >= 1, content
-  at most 64 KiB, sha256 lowercase hex over the verbatim bytes against `contentHash`)
+  at most 10 MiB, sha256 lowercase hex over the verbatim bytes against `contentHash`)
   and the hash is re-verified immediately before a write, both through
   `skills_core.verified_bytes`, so the integrity signal's property set cannot depend on
   which layer caught the defect. A `Skill` is only ever constructed from content that

@@ -275,7 +275,7 @@ field of a different shape must rename it before upgrading.
 
 **Integrity is not optional.** Content is only returned after its sha256 (lowercase hex,
 over the verbatim UTF-8 bytes) matches the delivered `contentHash`, its key and version
-revalidate, and its size is within 64 KiB. Anything that fails is withheld and treated as
+revalidate, and its size is within 10 MiB. Anything that fails is withheld and treated as
 missing — no unverified content ever reaches your code. A retrieval that withheld anything
 logs a count at WARN, so a run that resolved nothing is not silent.
 
