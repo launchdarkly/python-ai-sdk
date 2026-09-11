@@ -38,6 +38,19 @@ def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
 
 logger = logging.getLogger(__name__)
 
+
+def _without_output_format(config: AiConfigRep) -> AiConfigRep:
+    """Returns ``config`` without an ``outputFormat`` key.
+
+    The judge verdict contract (``{score, reasoning}``) is owned by this module, never by
+    the author of the judge config. Returns ``config`` unchanged when the key is absent.
+    Never mutates the input, which came from ``extract_variation`` and may be cached.
+    """
+    if not isinstance(config, dict) or "outputFormat" not in config:
+        return config
+    return {k: v for k, v in config.items() if k != "outputFormat"}
+
+
 _FORMATTING_INSTRUCTIONS = "\n".join(
     [
         "Your response MUST be in valid JSON format with the following structure:",
@@ -159,11 +172,19 @@ async def run_judges(
                         and handler.provides_for[1] == "agent"
                     )
 
+            if isinstance(judge_ai_config, dict) and "outputFormat" in judge_ai_config:
+                logger.warning(
+                    "Judge '%s': ignoring outputFormat - a judge must return "
+                    "{score, reasoning}.",
+                    judge_key,
+                )
+
             effective_judge_config = (
                 _collapse_messages_to_instructions(judge_ai_config)
                 if collapse_messages
                 else judge_ai_config
             )
+            effective_judge_config = _without_output_format(effective_judge_config)
 
             message_history = "\n\n".join(
                 filter(None, [user_input, llm_response, _FORMATTING_INSTRUCTIONS])
@@ -328,10 +349,17 @@ async def build_judge_tasks(
                 else None
             )
 
+            if isinstance(judge_ai_config, dict) and "outputFormat" in judge_ai_config:
+                logger.warning(
+                    "Judge '%s': ignoring outputFormat - a judge must return "
+                    "{score, reasoning}.",
+                    judge_key,
+                )
+
             tasks.append(
                 JudgeTask(
                     config_key=judge_key,
-                    judge_config=judge_ai_config,
+                    judge_config=_without_output_format(judge_ai_config),
                     judge_meta=judge_meta,
                     actual_output=llm_response,
                     user_context=user_context,
@@ -396,11 +424,19 @@ async def run_judge(
     if judge_handler is None:
         return None
 
+    if isinstance(task.judge_config, dict) and "outputFormat" in task.judge_config:
+        logger.warning(
+            "Judge '%s': ignoring outputFormat - a judge must return "
+            "{score, reasoning}.",
+            task.config_key,
+        )
+
     effective_config = (
         _collapse_messages_to_instructions(task.judge_config)
         if task.collapse_messages
         else task.judge_config
     )
+    effective_config = _without_output_format(effective_config)
 
     message_history = "\n\n".join(
         filter(None, [task.actual_output, _FORMATTING_INSTRUCTIONS])
