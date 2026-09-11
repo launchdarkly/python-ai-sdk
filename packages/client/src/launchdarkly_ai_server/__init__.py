@@ -38,8 +38,13 @@ from .registry import (
     resolve_tools,
 )
 from .skills import (
+    InMemorySkillStore,
+    all_skills,
+    get_skill,
+    get_skills,
     skill_refs,
 )
+from .skills_core import SkillStore
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -208,4 +213,9 @@ __all__ = [  # noqa: RUF022
     "GraphInstance",
     # skills
     "skill_refs",
+    "get_skill",
+    "get_skills",
+    "all_skills",
+    "SkillStore",
+    "InMemorySkillStore",
 ]
