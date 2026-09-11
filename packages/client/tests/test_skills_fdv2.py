@@ -1,0 +1,897 @@
+"""
+Tests for the FDv2 skill delivery protocol.
+
+Wire semantics — which objects are skills, the skill's version in the wire ``key``
+versus the payload's in ``version``, revocation, mixed payloads, the commit at ``payload-transferred`` — are asserted
+against ``_ProtocolReader``, which has no I/O, so each case reads as the contract
+it is rather than as a server script.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from typing import Any, ClassVar
+
+import pytest
+
+from launchdarkly_ai_server import InMemorySkillStore
+from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
+from launchdarkly_ai_server.skills_fdv2 import (
+    FDV2_KEY_DELIMITER,
+    FDV2_OBJECT_KIND,
+    _is_skill_event,
+    _ProtocolReader,
+    _SkillObjectSet,
+    _store_object_from_put,
+    _tombstone_from_delete,
+)
+
+pytestmark = pytest.mark.usefixtures("reset_skill_state")
+
+SKILL_BODY = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
+
+
+def _hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Wire builders — one place that knows the shape, so a contract change is one edit
+# ---------------------------------------------------------------------------
+
+
+def wire_key(key: str, object_version: Any) -> str:
+    """
+    The wire ``key`` of one skill object: ``<key>:<version>``.
+
+    ``None`` builds a key with no version at all, which is how the tests spell a
+    malformed object; anything else is spelled after the delimiter verbatim.
+    """
+    if object_version is None:
+        return key
+    return f"{key}{FDV2_KEY_DELIMITER}{object_version}"
+
+
+def put_skill(
+    key: str = "pdf-extraction",
+    *,
+    object_version: Any = 3,
+    payload_version: int = 42,
+    content: str = SKILL_BODY,
+    content_hash: Any = None,
+    omit_hash: bool = False,
+    name: str = "PDF Extraction",
+) -> dict[str, Any]:
+    """One skill ``put-object`` event's data, in the shape the wire delivers it."""
+    envelope: dict[str, Any] = {
+        "contentType": "text/markdown",
+        "content": content,
+        "name": name,
+        "description": "Extracts text",
+    }
+    if not omit_hash:
+        envelope["contentHash"] = (
+            content_hash if content_hash is not None else _hash(content)
+        )
+    return {
+        "key": wire_key(key, object_version),
+        "kind": FDV2_OBJECT_KIND,
+        "version": payload_version,
+        "object": envelope,
+    }
+
+
+def delete_skill(
+    key: str = "pdf-extraction", *, object_version: Any = 3, payload_version: int = 43
+) -> dict[str, Any]:
+    return {
+        "key": wire_key(key, object_version),
+        "kind": FDV2_OBJECT_KIND,
+        "version": payload_version,
+    }
+
+
+def put_flag(key: str = "my-flag", version: int = 17) -> dict[str, Any]:
+    """A flag ``put-object``: the same envelope fields, a different ``kind``."""
+    return {
+        "key": key,
+        "kind": "flag",
+        "version": version,
+        "object": {
+            "key": key,
+            "version": version,
+            "on": True,
+            "variations": [True, False],
+        },
+    }
+
+
+def put_segment(key: str = "beta-users", version: int = 4) -> dict[str, Any]:
+    return {
+        "key": key,
+        "kind": "segment",
+        "version": version,
+        "object": {"key": key, "version": version, "included": []},
+    }
+
+
+def server_intent(
+    code: str = "xfer-full", payload_id: str = "agent-skill"
+) -> dict[str, Any]:
+    return {
+        "payloads": [
+            {"id": payload_id, "target": 1, "intentCode": code, "reason": "test"}
+        ]
+    }
+
+
+def transferred(state: str = "basis-1", version: int = 42) -> dict[str, Any]:
+    return {"state": state, "version": version}
+
+
+def events(*pairs: tuple[str, Any]) -> list[dict[str, Any]]:
+    return [{"event": name, "data": data} for name, data in pairs]
+
+
+def full_payload(
+    *object_events: tuple[str, Any], state: str = "basis-1"
+) -> list[dict[str, Any]]:
+    return events(
+        ("server-intent", server_intent("xfer-full")),
+        *object_events,
+        ("payload-transferred", transferred(state)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Identifying skill objects, and ignoring everything else
+# ---------------------------------------------------------------------------
+
+
+class TestObjectIdentification:
+    def test_the_kind_alone_identifies_a_skill(self) -> None:
+        assert _is_skill_event(put_skill()) is True
+
+    def test_the_kind_is_the_bare_category_name(self) -> None:
+        """
+        Object kinds on the channel are open strings and the agent-skill payload
+        is ``generic``, so a skill arrives under the kind its producer
+        registered — ``skill`` — not under a broader wrapper kind.
+        """
+        assert FDV2_OBJECT_KIND == "skill"
+
+    def test_a_flag_is_not_a_skill(self) -> None:
+        assert _is_skill_event(put_flag()) is False
+
+    def test_a_segment_is_not_a_skill(self) -> None:
+        assert _is_skill_event(put_segment()) is False
+
+    def test_another_generic_kind_is_not_a_skill(self) -> None:
+        """A generic payload may carry other registered kinds one day."""
+        other = put_skill()
+        other["kind"] = "prompt-template"
+        assert _is_skill_event(other) is False
+
+    def test_a_skill_shaped_envelope_under_another_kind_is_not_a_skill(self) -> None:
+        other = put_skill()
+        other["kind"] = "some-future-kind"
+        assert _is_skill_event(other) is False
+
+    def test_nothing_but_the_kind_is_consulted(self) -> None:
+        """No secondary field narrows the kind, and none may be required."""
+        assert set(put_skill()) == {"key", "kind", "version", "object"}
+
+    @pytest.mark.parametrize("value", [None, "skill", 3, [], ()])
+    def test_non_dict_events_are_not_skills(self, value: Any) -> None:
+        assert _is_skill_event(value) is False
+
+
+# ---------------------------------------------------------------------------
+# The skill's version is in the wire key; `version` is the payload's
+# ---------------------------------------------------------------------------
+
+
+class TestVersionTranslation:
+    def test_the_wire_key_is_key_colon_version(self) -> None:
+        assert (
+            put_skill("pdf-extraction", object_version=3)["key"] == "pdf-extraction:3"
+        )
+
+    def test_the_version_after_the_delimiter_becomes_the_seam_version(self) -> None:
+        raw = _store_object_from_put(put_skill(object_version=3, payload_version=42))
+        assert raw is not None
+        assert raw["version"] == 3
+        assert isinstance(raw["version"], int)
+
+    def test_the_key_before_the_delimiter_becomes_the_seam_key(self) -> None:
+        """A caller asks for ``pdf-extraction``, never for ``pdf-extraction:3``."""
+        raw = _store_object_from_put(put_skill("pdf-extraction", object_version=3))
+        assert raw is not None
+        assert raw["key"] == "pdf-extraction"
+
+    def test_the_payload_version_never_reaches_the_seam(self) -> None:
+        """
+        The failure this asserts against is silent: a store that read ``version``
+        would serve verifiable content under a version number that means nothing,
+        and every pinned reference would resolve to the wrong thing with no error.
+        """
+        raw = _store_object_from_put(put_skill(object_version=3, payload_version=42))
+        assert raw is not None
+        assert raw["version"] != 42
+        assert 42 not in raw.values()
+
+    def test_the_two_are_distinguished_even_when_the_payload_version_is_lower(
+        self,
+    ) -> None:
+        raw = _store_object_from_put(put_skill(object_version=99, payload_version=1))
+        assert raw is not None
+        assert raw["version"] == 99
+
+    def test_a_key_with_no_delimiter_is_held_version_less(self) -> None:
+        """Not defaulted from the payload version, and not dropped: verification
+        reports ``invalid_version`` under a key the caller recognises."""
+        raw = _store_object_from_put(put_skill(object_version=None))
+        assert raw is not None
+        assert raw["key"] == "pdf-extraction"
+        assert "version" not in raw
+
+    @pytest.mark.parametrize("spelling", ["latest", "", "3.0", "-1", "1:2", "３"])
+    def test_a_version_that_is_not_digits_is_carried_through_as_invalid(
+        self, spelling: str
+    ) -> None:
+        """Carried, not invented: verification reports ``invalid_version`` for
+        the object rather than the transport reporting it absent."""
+        raw = _store_object_from_put(put_skill(object_version=spelling))
+        assert raw is not None
+        assert raw["key"] == "pdf-extraction"
+        assert raw["version"] == spelling
+
+    def test_leading_zeros_spell_the_same_version(self) -> None:
+        raw = _store_object_from_put(put_skill(object_version="03"))
+        assert raw is not None
+        assert raw["version"] == 3
+
+    def test_a_delete_reads_the_wire_key_the_same_way(self) -> None:
+        tombstone = _tombstone_from_delete(
+            delete_skill(object_version=3, payload_version=43)
+        )
+        assert tombstone is not None
+        assert tombstone.key == "pdf-extraction"
+        assert tombstone.object_version == 3
+
+    @pytest.mark.parametrize("spelling", [None, "latest", "0"])
+    def test_a_delete_with_no_usable_version_revokes_every_version(
+        self, spelling: Any
+    ) -> None:
+        tombstone = _tombstone_from_delete(delete_skill(object_version=spelling))
+        assert tombstone is not None
+        assert tombstone.key == "pdf-extraction"
+        assert tombstone.object_version is None
+
+    @pytest.mark.parametrize("bad_key", [":3", "", None, 3])
+    def test_a_put_with_no_skill_key_is_dropped_because_it_has_no_identity(
+        self, bad_key: Any
+    ) -> None:
+        wire = put_skill()
+        wire["key"] = bad_key
+        assert _store_object_from_put(wire) is None
+
+    def test_a_keyless_put_is_dropped_because_it_has_no_identity(self) -> None:
+        wire = put_skill()
+        del wire["key"]
+        assert _store_object_from_put(wire) is None
+
+    def test_a_delete_with_no_skill_key_is_ignored(self) -> None:
+        wire = delete_skill()
+        wire["key"] = ":3"
+        assert _tombstone_from_delete(wire) is None
+
+    def test_the_stored_identity_round_trips_to_the_wire_key(self) -> None:
+        """``_SkillObjectSet.snapshot`` spells its opaque keys the way the wire
+        does, so a held object can be matched back to the event that carried it."""
+        held = _SkillObjectSet()
+        wire = put_skill("pdf-extraction", object_version=3)
+        raw = _store_object_from_put(wire)
+        assert raw is not None
+        held.put(raw)
+        assert set(held.snapshot()) == {wire["key"]}
+
+    def test_the_envelope_is_copied_verbatim(self) -> None:
+        raw = _store_object_from_put(put_skill())
+        assert raw is not None
+        assert raw["content"] == SKILL_BODY
+        assert raw["contentHash"] == _hash(SKILL_BODY)
+        assert raw["name"] == "PDF Extraction"
+        assert raw["contentType"] == "text/markdown"
+
+    def test_an_absent_envelope_field_is_absent_rather_than_defaulted(self) -> None:
+        wire = put_skill()
+        del wire["object"]["name"]
+        raw = _store_object_from_put(wire)
+        assert raw is not None
+        assert "name" not in raw
+
+
+# ---------------------------------------------------------------------------
+# The protocol reader
+# ---------------------------------------------------------------------------
+
+
+def drive(reader: _ProtocolReader, payload_events: list[dict[str, Any]]) -> list[Any]:
+    return [reader.handle(e["event"], e.get("data")) for e in payload_events]
+
+
+class TestProtocolReader:
+    def test_a_full_transfer_commits_at_payload_transferred(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        outcomes = drive(reader, full_payload(("put-object", put_skill())))
+        assert len(held) == 1
+        assert outcomes[-1].committed is True
+        assert outcomes[-1].basis == "basis-1"
+
+    def test_nothing_is_visible_before_payload_transferred(self) -> None:
+        """A payload version is the unit of consistency; half of one is not a state."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-full")),
+                ("put-object", put_skill()),
+            ),
+        )
+        assert len(held) == 0
+
+    def test_an_interrupted_full_transfer_leaves_last_known_good_intact(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=1))))
+        assert held.get("pdf-extraction", None) is not None
+
+        # A second full transfer starts and never completes.
+        drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-full")),
+                ("put-object", put_skill(object_version=2)),
+            ),
+        )
+        still_held = held.get("pdf-extraction", None)
+        assert still_held is not None
+        assert still_held["version"] == 1
+
+    def test_a_full_transfer_replaces_rather_than_merges(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill("first"))))
+        drive(
+            reader, full_payload(("put-object", put_skill("second")), state="basis-2")
+        )
+        assert held.get("first", None) is None
+        assert held.get("second", None) is not None
+
+    def test_a_change_transfer_applies_deltas_over_what_is_held(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill("first"))))
+        drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("put-object", put_skill("second")),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert held.get("first", None) is not None
+        assert held.get("second", None) is not None
+
+    def test_a_delete_object_revokes_the_skill(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=3))))
+        drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("delete-object", delete_skill(object_version=3)),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert held.get("pdf-extraction", None) is None
+        assert reader.diagnostics.objects_revoked == 1
+
+    def test_a_delete_notifies_with_a_tombstone_carrying_no_content(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill())))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("delete-object", delete_skill()),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        (change,) = outcomes[-1].changes
+        assert change == {"key": "pdf-extraction", "version": 3}
+        assert "content" not in change
+
+    def test_a_delete_for_one_version_leaves_the_other_held(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            full_payload(
+                ("put-object", put_skill(object_version=2)),
+                ("put-object", put_skill(object_version=3)),
+            ),
+        )
+        drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("delete-object", delete_skill(object_version=3)),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert held.get("pdf-extraction", 2) is not None
+        assert held.get("pdf-extraction", None)["version"] == 2
+
+    def test_flag_and_segment_objects_are_skipped_cleanly(self) -> None:
+        """
+        The mixed payload is the normal case, not an edge one: an environment's
+        assignment carries its flag payload alongside its agent-skill payload.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        outcomes = drive(
+            reader,
+            full_payload(
+                ("put-object", put_flag("flag-a")),
+                ("put-object", put_skill("pdf-extraction")),
+                ("put-object", put_segment("beta-users")),
+                ("put-object", put_flag("flag-b")),
+                ("delete-object", put_flag("flag-c")),
+            ),
+        )
+        assert len(held) == 1
+        assert held.get("pdf-extraction", None) is not None
+        assert reader.diagnostics.objects_ignored == 4
+        assert reader.diagnostics.skill_objects_received == 1
+        assert all(o.fatal is None and o.disconnect is None for o in outcomes)
+
+    def test_an_unknown_kind_is_ignored_rather_than_fatal(self) -> None:
+        """
+        Erroring on an unrecognised kind would turn a normal payload into a
+        permanent reconnect loop — a flag-delivery outage caused by a skills
+        rollout.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        exotic = {
+            "key": "x",
+            "kind": "quantum-widget",
+            "version": 1,
+            "object": {"a": 1},
+        }
+        outcomes = drive(reader, full_payload(("put-object", exotic)))
+        assert len(held) == 0
+        assert all(o.fatal is None and o.disconnect is None for o in outcomes)
+
+    def test_an_unknown_event_name_is_ignored(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        outcome = reader.handle("some-future-event", {"anything": True})
+        assert outcome.fatal is None
+        assert outcome.disconnect is None
+
+    def test_a_heartbeat_does_nothing(self) -> None:
+        reader = _ProtocolReader(_SkillObjectSet())
+        outcome = reader.handle("heart-beat", None)
+        assert outcome == type(outcome)()
+
+    def test_an_error_event_abandons_the_in_flight_payload(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=1))))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-full")),
+                ("put-object", put_skill(object_version=2)),
+                (
+                    "error",
+                    {"payloadId": "agent-skill", "reason": "backend unavailable"},
+                ),
+            ),
+        )
+        assert outcomes[-1].disconnect is not None
+        assert held.get("pdf-extraction", None)["version"] == 1
+
+    def test_a_goodbye_asks_for_a_reconnect(self) -> None:
+        reader = _ProtocolReader(_SkillObjectSet())
+        outcome = reader.handle("goodbye", {"reason": "rebalancing", "silent": False})
+        assert outcome.disconnect is not None
+        assert outcome.fatal is None
+
+    def test_a_catastrophic_goodbye_is_fatal(self) -> None:
+        reader = _ProtocolReader(_SkillObjectSet())
+        outcome = reader.handle(
+            "goodbye", {"reason": "no", "silent": False, "catastrophe": True}
+        )
+        assert outcome.fatal is not None
+
+    def test_transfer_none_holds_everything_and_commits(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill())))
+        drive(
+            reader,
+            events(
+                ("server-intent", server_intent("none")),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert len(held) == 1
+
+    def test_an_object_arriving_with_no_intent_is_treated_as_a_delta(self) -> None:
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            events(
+                ("put-object", put_skill()),
+                ("payload-transferred", transferred("basis-1")),
+            ),
+        )
+        assert len(held) == 1
+
+
+# ---------------------------------------------------------------------------
+# Which payload a transfer completed
+# ---------------------------------------------------------------------------
+
+
+def _payload_warnings(caplog: Any, fragment: str) -> list[Any]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and fragment in r.getMessage()
+    ]
+
+
+def skill_payload(
+    *object_events: tuple[str, Any],
+    payload_id: str = "agent-skill",
+    code: str = "xfer-full",
+    state: str = "basis-1",
+) -> list[dict[str, Any]]:
+    """One payload's events, with the payload it belongs to named explicitly."""
+    return events(
+        ("server-intent", server_intent(code, payload_id)),
+        *object_events,
+        ("payload-transferred", transferred(state)),
+    )
+
+
+class TestPayloadIdentity:
+    """
+    Which payload a transfer completed, and why this layer tracks it at all.
+
+    Delivery provides one payload per credential and the protocol requires a
+    client to read only the first payload intent, so today the payload read is
+    the payload skills arrive on. These assert the behaviour that survives if
+    the first of those stops holding: another payload's ``xfer-full`` must not
+    publish an empty skill set, because with pruning on that deletes a
+    customer's materialized files.
+    """
+
+    def test_only_the_first_payload_intent_is_read(self) -> None:
+        """Reading only the first is what the protocol asks for, however many
+        arrive — the point of the rest of this class is to make that safe."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            events(
+                (
+                    "server-intent",
+                    {
+                        "payloads": [
+                            {
+                                "id": "agent-skill",
+                                "target": 1,
+                                "intentCode": "xfer-full",
+                            },
+                            {"id": "env-flags", "target": 2, "intentCode": "none"},
+                        ]
+                    },
+                ),
+                ("put-object", put_skill()),
+                ("payload-transferred", transferred()),
+            ),
+        )
+        assert len(held) == 1
+
+    def test_more_than_one_payload_intent_warns_once(self, caplog: Any) -> None:
+        reader = _ProtocolReader(_SkillObjectSet())
+        intent = {
+            "payloads": [
+                {"id": "env-flags", "target": 1, "intentCode": "xfer-changes"},
+                {"id": "agent-skill", "target": 2, "intentCode": "xfer-changes"},
+            ]
+        }
+        with caplog.at_level("WARNING"):
+            reader.handle("server-intent", intent)
+            reader.handle("server-intent", intent)
+        assert len(_payload_warnings(caplog, "described 2 payloads")) == 1
+
+    def test_one_payload_intent_warns_about_nothing(self, caplog: Any) -> None:
+        with caplog.at_level("WARNING"):
+            drive(
+                _ProtocolReader(_SkillObjectSet()),
+                skill_payload(("put-object", put_skill())),
+            )
+        assert _payload_warnings(caplog, "payload") == []
+
+    def test_another_payloads_full_transfer_does_not_empty_the_skills_held(
+        self, caplog: Any
+    ) -> None:
+        """
+        The case this guard exists for. A flag payload's ``xfer-full`` starts an
+        empty pending set; applying it at ``payload-transferred`` would publish
+        every skill as revoked, which a reconcile with pruning on reads as
+        "delete these files".
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, skill_payload(("put-object", put_skill())))
+        with caplog.at_level("WARNING"):
+            outcomes = drive(
+                reader,
+                skill_payload(
+                    ("put-object", put_flag()), payload_id="env-flags", state="basis-2"
+                ),
+            )
+        assert held.get("pdf-extraction", None) is not None
+        assert reader.diagnostics.payloads_ignored == 1
+        assert len(_payload_warnings(caplog, "was not applied")) == 1
+        # Nothing changed, so no listener is woken to reconcile against it.
+        assert outcomes[-1].changes == []
+
+    def test_a_declined_transfer_warns_once_however_often_it_repeats(
+        self, caplog: Any
+    ) -> None:
+        """A polling connection sees the other payload on every poll."""
+        reader = _ProtocolReader(_SkillObjectSet())
+        drive(reader, skill_payload(("put-object", put_skill())))
+        foreign = skill_payload(("put-object", put_flag()), payload_id="env-flags")
+        with caplog.at_level("WARNING"):
+            drive(reader, foreign)
+            drive(reader, foreign)
+        assert len(_payload_warnings(caplog, "was not applied")) == 1
+        assert reader.diagnostics.payloads_ignored == 2
+
+    def test_a_full_transfer_of_the_skill_payload_still_empties_it(self) -> None:
+        """Every skill deleted is a real state, and the guard must not mask it."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, skill_payload(("put-object", put_skill())))
+        drive(reader, skill_payload(state="basis-2"))
+        assert len(held) == 0
+        assert reader.diagnostics.payloads_ignored == 0
+
+    def test_a_revocation_identifies_the_payload_as_the_skill_payload(self) -> None:
+        """A payload that only revokes is still a payload skills arrive on."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            skill_payload(("delete-object", delete_skill()), code="xfer-changes"),
+        )
+        drive(
+            reader, skill_payload(("put-object", put_skill()), payload_id="env-flags")
+        )
+        assert reader.diagnostics.payloads_ignored == 1
+
+    def test_the_payload_is_identified_from_the_selector_when_no_id_is_named(
+        self,
+    ) -> None:
+        """``payload-transferred``'s selector is the only other place a completed
+        transfer names its payload."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        unnamed = {"payloads": [{"target": 1, "intentCode": "xfer-full"}]}
+        drive(
+            reader,
+            events(
+                ("server-intent", unnamed),
+                ("put-object", put_skill()),
+                ("payload-transferred", transferred("(p:agent-skill:53)")),
+            ),
+        )
+        drive(
+            reader,
+            events(
+                ("server-intent", unnamed),
+                ("put-object", put_flag()),
+                ("payload-transferred", transferred("(p:env-flags:12)")),
+            ),
+        )
+        assert held.get("pdf-extraction", None) is not None
+        assert reader.diagnostics.payloads_ignored == 1
+
+    def test_an_unidentifiable_payload_is_applied_rather_than_withheld(self) -> None:
+        """
+        A transfer naming no payload at all is the store's own, since delivery
+        sends it one payload. Withholding it would break the common case to
+        defend against a hypothetical one.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, skill_payload(("put-object", put_skill())))
+        drive(
+            reader,
+            events(
+                ("server-intent", {"payloads": [{"intentCode": "xfer-full"}]}),
+                ("put-object", put_skill(object_version=4)),
+                ("payload-transferred", {"version": 44}),
+            ),
+        )
+        assert held.get("pdf-extraction", None)["version"] == 4
+        assert reader.diagnostics.payloads_ignored == 0
+
+    def test_the_first_transfer_of_a_connection_is_the_residual(
+        self, caplog: Any
+    ) -> None:
+        """
+        Before a skill has arrived there is nothing to compare a payload
+        against, so another payload's ``xfer-full`` arriving first cannot be
+        told apart. The multiple-payload WARNING is the only signal there is,
+        which is why it exists.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        with caplog.at_level("WARNING"):
+            drive(
+                reader,
+                events(
+                    (
+                        "server-intent",
+                        {
+                            "payloads": [
+                                {"id": "env-flags", "intentCode": "xfer-full"},
+                                {"id": "agent-skill", "intentCode": "xfer-full"},
+                            ]
+                        },
+                    ),
+                    ("put-object", put_flag()),
+                    ("payload-transferred", transferred()),
+                ),
+            )
+        assert len(held) == 0
+        assert len(_payload_warnings(caplog, "described 2 payloads")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Interface parity with InMemorySkillStore
+# ---------------------------------------------------------------------------
+
+
+class TestInterfaceParity:
+    """
+    The two stores must resolve identically. ``_SkillObjectSet`` reimplements the
+    lookup rather than inheriting it — see its docstring for why — so this is the
+    test that stops the two from drifting.
+    """
+
+    RAWS: ClassVar[list[dict[str, Any]]] = [
+        {"key": "a", "version": 1, "content": "x", "contentHash": _hash("x")},
+        {"key": "a", "version": 4, "content": "y", "contentHash": _hash("y")},
+        {"key": "b", "version": 2, "content": "z", "contentHash": _hash("z")},
+        {"key": "malformed", "version": "not-a-version", "content": "q"},
+    ]
+
+    def _both(self) -> tuple[InMemorySkillStore, _SkillObjectSet]:
+        memory = InMemorySkillStore()
+        objects = _SkillObjectSet()
+        for raw in self.RAWS:
+            memory.put(dict(raw))
+            objects.put(dict(raw))
+        return memory, objects
+
+    @pytest.mark.parametrize(
+        "key,version",
+        [
+            ("a", None),
+            ("a", 1),
+            ("a", 4),
+            ("a", 9),
+            ("b", 2),
+            ("b", None),
+            ("missing", None),
+            ("missing", 1),
+            ("malformed", None),
+            ("malformed", 7),
+        ],
+    )
+    def test_get_agrees(self, key: str, version: int | None) -> None:
+        memory, objects = self._both()
+        assert memory.get_object(SKILL_OBJECT_KIND, key, version) == objects.get(
+            key, version
+        )
+
+    def test_snapshot_agrees(self) -> None:
+        memory, objects = self._both()
+        assert memory.all_objects(SKILL_OBJECT_KIND) == objects.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# The contentHash gap
+# ---------------------------------------------------------------------------
+
+
+def _per_object_hashless_errors(caplog: Any) -> list[Any]:
+    """The per-object ERROR, as distinct from the whole-payload summary."""
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "ERROR"
+        and "arrived without a contentHash" in r.getMessage()
+        and "No skill content will resolve" not in r.getMessage()
+    ]
+
+
+class TestMissingContentHash:
+    """
+    A skill delivered without a ``contentHash``, asserted as behaviour.
+
+    An envelope with no ``contentHash`` must produce a *withheld* skill with the
+    ``missing_content_hash`` reason — loudly, diagnosably, and without a crash.
+    There is deliberately no fallback that skips verification: a hash the SDK
+    computed from the content it was handed would certify the content against
+    itself and verify nothing.
+    """
+
+    def test_a_redelivered_hashless_object_logs_once_per_store(
+        self, caplog: Any
+    ) -> None:
+        """Re-delivering the same ``(key, version)`` to one store must not
+        multiply the ERROR: a polling store sees every object on every poll."""
+        reader = _ProtocolReader(_SkillObjectSet())
+        payload = full_payload(("put-object", put_skill(omit_hash=True)))
+        with caplog.at_level("ERROR"):
+            drive(reader, payload)
+            drive(reader, payload)
+        assert len(_per_object_hashless_errors(caplog)) == 1
+
+    def test_a_recreated_store_reports_the_same_hashless_object_again(
+        self, caplog: Any
+    ) -> None:
+        """
+        The dedupe belongs to the store, not the process. A host that rebuilds
+        its store (reconnect wrapper, config reload, credential rotation) must
+        get the ERROR again, since it is the loudest signal that a deployment is
+        broken rather than empty by design.
+        """
+        payload = full_payload(("put-object", put_skill(omit_hash=True)))
+        with caplog.at_level("ERROR"):
+            drive(_ProtocolReader(_SkillObjectSet()), payload)
+            first = len(_per_object_hashless_errors(caplog))
+            drive(_ProtocolReader(_SkillObjectSet()), payload)
+        assert first == 1
+        assert len(_per_object_hashless_errors(caplog)) == 2
+
+    def test_two_live_stores_do_not_suppress_each_other(self, caplog: Any) -> None:
+        """Two stores in one process (say, two environments) each report."""
+        one = _ProtocolReader(_SkillObjectSet())
+        two = _ProtocolReader(_SkillObjectSet())
+        payload = full_payload(("put-object", put_skill(omit_hash=True)))
+        with caplog.at_level("ERROR"):
+            drive(one, payload)
+            drive(two, payload)
+            # And each still dedupes its own re-deliveries.
+            drive(one, payload)
+            drive(two, payload)
+        assert len(_per_object_hashless_errors(caplog)) == 2
