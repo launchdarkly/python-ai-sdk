@@ -131,14 +131,17 @@ class InMemorySkillStore:
         if kind != SKILL_OBJECT_KIND:
             return None
         held = self._versions.get(key, {})
+        if not held:
+            # Nothing well-formed is filed under this key, so the version-less
+            # entry is all there is: serve it, and let verification withhold it
+            # with a signal rather than have it read as simply absent. A pin that
+            # misses while well-formed versions do exist is a plain miss, and
+            # answering it with a leftover malformed object would record an
+            # integrity failure for a skill whose integrity is not in question.
+            return self._loose.get(key)
         if version is not None:
-            # Fall through to the version-less entry when the pin does not match
-            # anything well-formed, so a malformed object reaches verification and
-            # is withheld with a signal rather than reading as simply absent.
-            return held.get(version) or self._loose.get(key)
-        if held:
-            return held[max(held)]
-        return self._loose.get(key)
+            return held.get(version)
+        return held[max(held)]
 
     def all_objects(self, kind: str) -> dict[str, dict[str, Any]]:
         """

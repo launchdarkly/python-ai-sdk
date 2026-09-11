@@ -621,13 +621,27 @@ def list_raw_objects(
     worded identically. Letting the exception out instead would make each of
     them re-derive the log line and the message, which is the drift this module
     exists to prevent.
+
+    An answer that is not a mapping is a broken store, on the same footing as
+    one that raised — **not** an empty one. Collapsing it to ``{}`` would make a
+    store that served nothing usable indistinguishable from a store that holds
+    no skills, which reads downstream as "every skill was revoked".
     """
     try:
         objects = store.all_objects(SKILL_OBJECT_KIND)
     except Exception as exc:
         logger.error("Skill store raised while listing skills", exc_info=True)
         return {}, store_raised(exc)
-    return (objects if isinstance(objects, dict) else {}), None
+    if not isinstance(objects, dict):
+        logger.error(
+            "Skill store listed skills as %s rather than an object",
+            type(objects).__name__,
+        )
+        return {}, (
+            f"the skill store listed skills as {type(objects).__name__} "
+            "rather than an object"
+        )
+    return objects, None
 
 
 def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
@@ -696,7 +710,10 @@ def resolve_from_store(
     versions of one key and only it can pick between them; ``None`` asks for the
     newest. The equality check afterwards is kept as a **defense**, not as the
     selection mechanism: the store is untrusted, so an answer that is not the
-    version that was asked for is withheld rather than returned.
+    version that was asked for is withheld rather than returned. The key is
+    checked the same way and for the same reason: identity is read off the
+    object itself, so an answer served under a different key would otherwise be
+    returned under the caller's key while carrying its own.
     """
     try:
         raw = store.get_object(SKILL_OBJECT_KIND, key, wanted_version)
@@ -713,6 +730,13 @@ def resolve_from_store(
     if skill is None:
         return Resolution(
             error=f"skill '{key}' failed integrity verification and was withheld"
+        )
+    if skill.key != key:
+        return Resolution(
+            error=(
+                f"skill '{key}' is not available: the store answered under "
+                f"key '{skill.key}'"
+            )
         )
     if wanted_version is not None and skill.version != wanted_version:
         return Resolution(
