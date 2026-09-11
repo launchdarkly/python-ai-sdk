@@ -267,7 +267,7 @@ async def watch_skills(
             "watch_skills needs a skill store that implements add_listener(kind, "
             "fn); the configured store does not, so delivery changes cannot be "
             "observed. Use write_skills for a one-shot reconcile, or configure a "
-            "store with a delivery transport."
+            "store with a delivery transport (FDv2SkillStore)."
         )
     if debounce < 0:
         raise ValueError(f"debounce must not be negative, got {debounce!r}")

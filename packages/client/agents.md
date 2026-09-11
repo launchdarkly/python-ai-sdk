@@ -30,7 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
-| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery protocol — the wire-key/`version` translation, the held object set, and the pure `_ProtocolReader` that commits a payload's events at `payload-transferred`. Sits **below** the store interface; nothing in the feature imports it |
+| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `FDv2SkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
 | `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
@@ -221,10 +221,12 @@ of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single pa
 
 ### The delivery transport, and the one field that will bite you
 
-`skills_fdv2.py` translates LaunchDarkly's FDv2 delivery protocol into raw objects in the
-shape `skills_core.SkillStore` documents. It lives below the store interface; **nothing above
-that interface knows it exists**. If a transport change ever seems to require editing an
-accessor, verification, or `write_skills`, the adapter boundary is wrong.
+`FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
+`GET /sdk/stream`, server-side SDK key in `Authorization`, `basis` + `mv` params,
+`If-None-Match`/304). It lives below the store interface and produces raw objects in the
+shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**. If a transport
+change ever seems to require editing an accessor, verification, or `write_skills`, the adapter
+boundary is wrong.
 
 **The skill's version is in the object's `key`. `version` is the payload's.** Each version
 of a skill is its own object on the wire, identified as `<key>:<version>`:
@@ -284,6 +286,19 @@ around it. Dropping it at the transport would report `absent` — indistinguisha
 such skill" — and would let a prune delete the last known-good copy on disk. Never synthesize
 a hash from the delivered content: that certifies the content against itself and verifies
 nothing.
+
+**There is one network timeout, not two.** `urllib`'s `timeout` is the socket timeout for the
+whole operation, so connect, headers and each read share it, and the module cannot bound the
+connect separately without a custom connection class it should not carry. `read_timeout` is
+therefore the only knob, and its default is per mode (`DEFAULT_POLL_TIMEOUT` for a whole poll
+request, `DEFAULT_STREAM_READ_TIMEOUT` for the gap between reads on a stream). Do not add a
+parameter that the standard library cannot honour; `TestTimeouts` measures the bound against a
+socket that accepts and never answers.
+
+**`close` interrupts the socket, it does not just set a flag.** The delivery thread spends its
+life blocked in a read that no flag can reach, and closing a response from another thread does
+not unblock CPython's buffered reader. `_interrupt_read` shuts the socket down underneath it.
+Without that, every shutdown of a *healthy* stream blocks for the full join timeout.
 
 ### The reported outcome vocabulary, and the `Resolution` mapping
 
