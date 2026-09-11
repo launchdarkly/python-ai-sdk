@@ -45,6 +45,13 @@ from .skills import (
     skill_refs,
 )
 from .skills_core import SkillStore
+from .skills_fs import (
+    MANIFEST_FILENAME,
+    MANIFEST_VERSION,
+    SKILL_FILENAME,
+    OnUnavailable,
+    write_skills,
+)
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -74,6 +81,9 @@ from .types import (
     ProviderGraphResponse,
     ProviderHandler,
     ProviderResponse,
+    ReconcileAction,
+    ReconcileActionKind,
+    ReconcileReport,
     Skill,
     SkillReference,
     StreamChunkEvent,
@@ -136,6 +146,9 @@ __all__ = [  # noqa: RUF022
     "ProviderGraphResponse",
     "ProviderHandler",
     "ProviderResponse",
+    "ReconcileAction",
+    "ReconcileActionKind",
+    "ReconcileReport",
     "Skill",
     "SkillReference",
     "StreamChunkEvent",
@@ -216,6 +229,14 @@ __all__ = [  # noqa: RUF022
     "get_skill",
     "get_skills",
     "all_skills",
+    "write_skills",
     "SkillStore",
     "InMemorySkillStore",
+    # skills — the two closed-set unions a typed consumer needs to name
+    "ReconcileActionKind",
+    "OnUnavailable",
+    # skills — on-disk constants, identical across languages
+    "SKILL_FILENAME",
+    "MANIFEST_FILENAME",
+    "MANIFEST_VERSION",
 ]

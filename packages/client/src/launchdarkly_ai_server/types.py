@@ -452,6 +452,54 @@ class Skill:
     """Description from LaunchDarkly metadata; never parsed from the content."""
 
 
+ReconcileActionKind = Literal[
+    "written", "updated", "skipped_current", "removed", "error"
+]
+"""The closed set of outcomes ``write_skills`` reports."""
+
+
+@dataclass(frozen=True)
+class ReconcileAction:
+    """What ``write_skills`` did — or refused to do — for one skill."""
+
+    key: str
+    """
+    The skill key, or the **empty string** for a failure that belongs to the run
+    rather than to one skill — a corrupt manifest, a manifest that could not be
+    rewritten, a retrieval that failed before any key was known. Callers grouping
+    a report by key need to expect that sentinel; a report may carry both kinds.
+    """
+    action: ReconcileActionKind
+    version: int | None = None
+    path: str | None = None
+    """Canonical resolved path, when one was determined."""
+    error: str | None = None
+    """Failure detail, set only when ``action == "error"``."""
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """The result of a ``write_skills`` run — every outcome is visible here."""
+
+    actions: list[ReconcileAction] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """``True`` iff no action is an ``error``."""
+        return not self.errors
+
+    @property
+    def errors(self) -> list[ReconcileAction]:
+        """
+        The ``error`` actions, in ``actions`` order.
+
+        Exposed so callers never re-derive it — filtering ``actions`` is
+        boilerplate that otherwise reappears in every consumer. ``ok`` is defined
+        in terms of this, so the two can never disagree.
+        """
+        return [a for a in self.actions if a.action == "error"]
+
+
 # ---------------------------------------------------------------------------
 # Model / graph options
 # ---------------------------------------------------------------------------

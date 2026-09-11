@@ -223,15 +223,17 @@ asyncio.run(main())
 ### Agent Skills
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
-variations by reference. The SDK surfaces which skills a config references and retrieves
-their content. Materializing them onto disk, where agent runtimes discover them, follows.
+variations by reference. The SDK surfaces which skills a config references, retrieves their
+content, and materializes them onto disk where agent runtimes (Claude Agent SDK, and
+anything else following the `<root>/<key>/SKILL.md` convention) discover them.
 
 ```python
 import asyncio
 import hashlib
+from pathlib import Path
 
 from launchdarkly_ai_server import (
-    init_client, inspect_config, skill_refs, get_skill, get_skills,
+    init_client, inspect_config, skill_refs, get_skill, write_skills,
     InMemorySkillStore,
 )
 
@@ -260,12 +262,17 @@ async def main():
     if skill is not None:
         print(skill.content)
 
-    # 3. Or resolve the config's references in one call.
-    for s in await get_skills(refs):
-        print(s.key, s.version)
+    # 3. Write them where the agent runtime will look. Only the leaf directory is
+    #    created, so the parent must already exist.
+    Path(".claude").mkdir(exist_ok=True)
+    report = await write_skills(refs, ".claude/skills")
+    for action in report.errors:
+        print(f"skill {action.key or '<run>'}: {action.error}")
 
 asyncio.run(main())
 ```
+
+Pass `"*"` instead of a reference list to materialize every skill the store holds.
 
 **`skills` is now a validated field.** Config parsing fails closed on a `skills` value that
 is not a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an
@@ -333,7 +340,22 @@ treat `expected_hash` / `observed_hash` as the evidence pair.
 **Versions are selected, not filtered.** A store may hold several versions of one key at
 once, because a delivery payload does: the newest version of every skill, plus every
 version a variation currently pins. `get_skill("k", version=1)` asks the store for version
-1 and gets it even when a newer one is also held.
+1 and gets it even when a newer one is also held. `all_skills()` and `write_skills("*")`
+collapse to one skill per key at its newest version, since `<root>/<key>/SKILL.md` is a
+single path.
+
+**The root's parent must exist.** `write_skills` creates the root itself but never its
+ancestors, so a typo cannot scatter a directory tree across your project. An absent parent,
+a root that is an existing file, and a root that is a symlink each raise `ValueError` —
+these are caller errors, distinct from the per-skill `error` actions in the report.
+
+**`write_skills` is deliberately conservative** about your filesystem. It writes only
+`<root>/<key>/SKILL.md`, tracks what it owns in a manifest at
+`<root>/.launchdarkly-skills.json`, and will overwrite or delete **only** paths that
+manifest records. A file you placed yourself is reported as an error and left untouched; it
+never writes through a symlink; writes are atomic (temp file, `fsync`, rename) at mode
+`0644`; and if the manifest is unreadable it performs no destructive action at all. Removing
+a skill from a variation is how revocation works — the next reconcile prunes it.
 
 | Export | Description |
 |---|---|
@@ -341,11 +363,34 @@ version a variation currently pins. `get_skill("k", version=1)` asks the store f
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
+| `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative `timeout`, or an unrecognised `on_unavailable`. **Performs synchronous filesystem I/O — see the note below.** |
 | `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)`. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,
-the accessors raise `RuntimeError` explaining what to do. `shutdown()` clears it.
+the accessors raise `RuntimeError` explaining what to do and `write_skills` reports the
+failure in its report (or raises, with `on_unavailable="raise"`). `shutdown()` clears it.
+
+`ReconcileReport.actions` holds one `ReconcileAction` per outcome — `written`, `updated`,
+`skipped_current`, `removed`, or `error` — each carrying `key`, `version`, the resolved
+`path`, and `error`. `report.ok` is `True` when no action is an `error`, and
+`report.errors` is just the `error` actions, so you rarely need to filter `actions`
+yourself. A failure that belongs to the whole run rather than to one skill — an unreadable
+manifest, for instance — carries the empty string as its `key`.
+
+The fixed on-disk values are exported too, so you do not have to hardcode them:
+`MANIFEST_FILENAME` (`.launchdarkly-skills.json`, handy for a `.gitignore`),
+`SKILL_FILENAME`, and `MANIFEST_VERSION`. So are the two closed-set types, for annotating
+your own helpers: `ReconcileActionKind` (`written` / `updated` / `skipped_current` /
+`removed` / `error`) and `OnUnavailable` (`keep` / `raise`).
+
+**`write_skills` blocks.** It is `async` for parity with the other accessors and with the
+TypeScript SDK, but it awaits nothing: every read, write, `fsync` and rename runs inline,
+so a large reconcile holds the event loop for its duration. Wrap it in
+`asyncio.to_thread` if that matters. For the same reason `timeout` is checked between
+steps rather than interrupting one already in progress. Reconcile one root at a time,
+though: because nothing yields today, a run is atomic against the rest of your loop, and
+wrapping it to run concurrently makes two runs against the same root race on the manifest.
 
 `all_objects` returns one entry per `(key, version)` under keys that are **opaque** to the
 SDK — identity is read from each object's own `key` and `version` fields, so a store is free
@@ -389,3 +434,5 @@ All types are exported from this package. Handler packages import them from here
 | `GraphTopology` | The parsed graph flag shape (`root` + `edges`) |
 | `Skill` | A frozen skill document: `.key`, `.version`, `.content` (verified verbatim `bytes`), `.content_hash`, `.name?`, `.description?` |
 | `SkillReference` | A frozen version-pinned pointer to a skill: `.key`, `.version` |
+| `ReconcileAction` | One `write_skills` outcome: `.key`, `.action`, `.version?`, `.path?`, `.error?` |
+| `ReconcileReport` | The `write_skills` result: `.actions`, `.ok`, and `.errors` |
