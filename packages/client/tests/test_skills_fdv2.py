@@ -483,6 +483,232 @@ class TestProtocolReader:
 
 
 # ---------------------------------------------------------------------------
+# Which payload a transfer completed
+# ---------------------------------------------------------------------------
+
+
+def _payload_warnings(caplog: Any, fragment: str) -> list[Any]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and fragment in r.getMessage()
+    ]
+
+
+def skill_payload(
+    *object_events: tuple[str, Any],
+    payload_id: str = "agent-skill",
+    code: str = "xfer-full",
+    state: str = "basis-1",
+) -> list[dict[str, Any]]:
+    """One payload's events, with the payload it belongs to named explicitly."""
+    return events(
+        ("server-intent", server_intent(code, payload_id)),
+        *object_events,
+        ("payload-transferred", transferred(state)),
+    )
+
+
+class TestPayloadIdentity:
+    """
+    Which payload a transfer completed, and why this layer tracks it at all.
+
+    Delivery provides one payload per credential and the protocol requires a
+    client to read only the first payload intent, so today the payload read is
+    the payload skills arrive on. These assert the behaviour that survives if
+    the first of those stops holding: another payload's ``xfer-full`` must not
+    publish an empty skill set, because with pruning on that deletes a
+    customer's materialized files.
+    """
+
+    def test_only_the_first_payload_intent_is_read(self) -> None:
+        """Reading only the first is what the protocol asks for, however many
+        arrive — the point of the rest of this class is to make that safe."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            events(
+                (
+                    "server-intent",
+                    {
+                        "payloads": [
+                            {
+                                "id": "agent-skill",
+                                "target": 1,
+                                "intentCode": "xfer-full",
+                            },
+                            {"id": "env-flags", "target": 2, "intentCode": "none"},
+                        ]
+                    },
+                ),
+                ("put-object", put_skill()),
+                ("payload-transferred", transferred()),
+            ),
+        )
+        assert len(held) == 1
+
+    def test_more_than_one_payload_intent_warns_once(self, caplog: Any) -> None:
+        reader = _ProtocolReader(_SkillObjectSet())
+        intent = {
+            "payloads": [
+                {"id": "env-flags", "target": 1, "intentCode": "xfer-changes"},
+                {"id": "agent-skill", "target": 2, "intentCode": "xfer-changes"},
+            ]
+        }
+        with caplog.at_level("WARNING"):
+            reader.handle("server-intent", intent)
+            reader.handle("server-intent", intent)
+        assert len(_payload_warnings(caplog, "described 2 payloads")) == 1
+
+    def test_one_payload_intent_warns_about_nothing(self, caplog: Any) -> None:
+        with caplog.at_level("WARNING"):
+            drive(
+                _ProtocolReader(_SkillObjectSet()),
+                skill_payload(("put-object", put_skill())),
+            )
+        assert _payload_warnings(caplog, "payload") == []
+
+    def test_another_payloads_full_transfer_does_not_empty_the_skills_held(
+        self, caplog: Any
+    ) -> None:
+        """
+        The case this guard exists for. A flag payload's ``xfer-full`` starts an
+        empty pending set; applying it at ``payload-transferred`` would publish
+        every skill as revoked, which a reconcile with pruning on reads as
+        "delete these files".
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, skill_payload(("put-object", put_skill())))
+        with caplog.at_level("WARNING"):
+            outcomes = drive(
+                reader,
+                skill_payload(
+                    ("put-object", put_flag()), payload_id="env-flags", state="basis-2"
+                ),
+            )
+        assert held.get("pdf-extraction", None) is not None
+        assert reader.diagnostics.payloads_ignored == 1
+        assert len(_payload_warnings(caplog, "was not applied")) == 1
+        # Nothing changed, so no listener is woken to reconcile against it.
+        assert outcomes[-1].changes == []
+
+    def test_a_declined_transfer_warns_once_however_often_it_repeats(
+        self, caplog: Any
+    ) -> None:
+        """A polling connection sees the other payload on every poll."""
+        reader = _ProtocolReader(_SkillObjectSet())
+        drive(reader, skill_payload(("put-object", put_skill())))
+        foreign = skill_payload(("put-object", put_flag()), payload_id="env-flags")
+        with caplog.at_level("WARNING"):
+            drive(reader, foreign)
+            drive(reader, foreign)
+        assert len(_payload_warnings(caplog, "was not applied")) == 1
+        assert reader.diagnostics.payloads_ignored == 2
+
+    def test_a_full_transfer_of_the_skill_payload_still_empties_it(self) -> None:
+        """Every skill deleted is a real state, and the guard must not mask it."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, skill_payload(("put-object", put_skill())))
+        drive(reader, skill_payload(state="basis-2"))
+        assert len(held) == 0
+        assert reader.diagnostics.payloads_ignored == 0
+
+    def test_a_revocation_identifies_the_payload_as_the_skill_payload(self) -> None:
+        """A payload that only revokes is still a payload skills arrive on."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            skill_payload(("delete-object", delete_skill()), code="xfer-changes"),
+        )
+        drive(
+            reader, skill_payload(("put-object", put_skill()), payload_id="env-flags")
+        )
+        assert reader.diagnostics.payloads_ignored == 1
+
+    def test_the_payload_is_identified_from_the_selector_when_no_id_is_named(
+        self,
+    ) -> None:
+        """``payload-transferred``'s selector is the only other place a completed
+        transfer names its payload."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        unnamed = {"payloads": [{"target": 1, "intentCode": "xfer-full"}]}
+        drive(
+            reader,
+            events(
+                ("server-intent", unnamed),
+                ("put-object", put_skill()),
+                ("payload-transferred", transferred("(p:agent-skill:53)")),
+            ),
+        )
+        drive(
+            reader,
+            events(
+                ("server-intent", unnamed),
+                ("put-object", put_flag()),
+                ("payload-transferred", transferred("(p:env-flags:12)")),
+            ),
+        )
+        assert held.get("pdf-extraction", None) is not None
+        assert reader.diagnostics.payloads_ignored == 1
+
+    def test_an_unidentifiable_payload_is_applied_rather_than_withheld(self) -> None:
+        """
+        A transfer naming no payload at all is the store's own, since delivery
+        sends it one payload. Withholding it would break the common case to
+        defend against a hypothetical one.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, skill_payload(("put-object", put_skill())))
+        drive(
+            reader,
+            events(
+                ("server-intent", {"payloads": [{"intentCode": "xfer-full"}]}),
+                ("put-object", put_skill(object_version=4)),
+                ("payload-transferred", {"version": 44}),
+            ),
+        )
+        assert held.get("pdf-extraction", None)["version"] == 4
+        assert reader.diagnostics.payloads_ignored == 0
+
+    def test_the_first_transfer_of_a_connection_is_the_residual(
+        self, caplog: Any
+    ) -> None:
+        """
+        Before a skill has arrived there is nothing to compare a payload
+        against, so another payload's ``xfer-full`` arriving first cannot be
+        told apart. The multiple-payload WARNING is the only signal there is,
+        which is why it exists.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        with caplog.at_level("WARNING"):
+            drive(
+                reader,
+                events(
+                    (
+                        "server-intent",
+                        {
+                            "payloads": [
+                                {"id": "env-flags", "intentCode": "xfer-full"},
+                                {"id": "agent-skill", "intentCode": "xfer-full"},
+                            ]
+                        },
+                    ),
+                    ("put-object", put_flag()),
+                    ("payload-transferred", transferred()),
+                ),
+            )
+        assert len(held) == 0
+        assert len(_payload_warnings(caplog, "described 2 payloads")) == 1
+
+
+# ---------------------------------------------------------------------------
 # Interface parity with InMemorySkillStore
 # ---------------------------------------------------------------------------
 

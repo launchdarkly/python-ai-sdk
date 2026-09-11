@@ -256,6 +256,19 @@ described, and would briefly empty the store — which, with pruning on, is the 
 between a reconcile and deleting a customer's skill files. An interrupted transfer therefore
 leaves last known good intact, and listeners fire once per commit.
 
+**The first payload intent is read, and is assumed to be the skill payload.** Delivery
+provides one payload per credential and the protocol requires a client to ignore all but the
+first payload intent, so `payloads[0]` is both what arrives and what the protocol says to
+read. The cost of that assumption is that an `xfer-full` for somebody *else's* payload would
+start an empty pending set, and the next `payload-transferred` would publish it — every skill
+reported revoked, and with pruning on, a customer's files deleted. `_ProtocolReader`
+therefore learns which payload skills arrive on, from the intent's `id` or from the
+`(p:<id>:<version>)` selector, and declines to apply a transfer of any other: once at
+WARNING, counted in `diagnostics.payloads_ignored`, holding last known good. A transfer that
+names no payload is applied, since one-payload delivery is the common case. The residual is
+the first transfer of a connection — before a skill has arrived there is nothing to compare
+against — which is what the separate WARNING on a multi-payload intent is for.
+
 **A hashless object is held, not dropped.** Verification withholds it with
 `missing_content_hash`; the transport's job is to make that loud (an error per object, a
 summary per wholly-hashless payload, `diagnostics.hashless_objects`) rather than to work

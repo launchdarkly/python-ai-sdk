@@ -36,6 +36,12 @@ Three things this layer does *not* do, on purpose:
 - **It does not evaluate anything.** Flag and segment objects that share the
   connection are skipped and counted, nothing more.
 
+One assumption it *does* make, and states: **the payload intent it reads is the
+payload skills arrive on.** Delivery sends one payload per credential and the
+protocol tells a client to read only the first payload intent, so today those are
+the same payload. ``_ProtocolReader`` keeps the pair apart anyway, because the
+cost of conflating them is an emptied skill set.
+
 The design rationale — why ``objectVersion`` is not ``version``, why changes
 commit at ``payload-transferred`` — is in ``agents.md`` under *The delivery
 transport*.
@@ -91,6 +97,16 @@ _ENVELOPE_FIELDS = ("contentType", "content", "contentHash", "name", "descriptio
 The skill object envelope's fields, copied through verbatim. Nothing is coerced
 or defaulted: a transport that filled in a missing field would be forging the
 very thing verification exists to check.
+"""
+
+_PAYLOAD_SELECTOR = re.compile(r"\(p:([^:()]+):\d+\)")
+"""
+The payload identity inside a transfer's selector, ``(p:<id>:<version>)``.
+
+The selector is the only place a completed transfer names its own payload:
+``put-object``, ``delete-object`` and ``payload-transferred`` carry no payload id
+of their own. ``_ProtocolReader`` reads it as a fallback for an intent that named
+no ``id``.
 """
 
 _MOBILE_KEY_PREFIX = "mob-"
@@ -169,6 +185,11 @@ class StoreDiagnostics:
     future kind. Skipping is the contract, not a failure."""
     objects_revoked: int = 0
     """``delete-object`` events applied to skills."""
+    payloads_ignored: int = 0
+    """
+    Transfers not applied because they completed a payload other than the one
+    skills arrive on. Zero while delivery sends one payload per connection.
+    """
     hashless_objects: int = 0
     """
     Skill objects whose envelope carried no ``contentHash``.
@@ -253,6 +274,22 @@ def _store_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
             if wire_field in envelope:
                 raw[wire_field] = envelope[wire_field]
     return raw
+
+
+def _payload_id_of(intent: Any) -> str | None:
+    """The payload id one payload intent names, when it names a usable one."""
+    if not isinstance(intent, dict):
+        return None
+    value = intent.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def _payload_id_from_selector(state: Any) -> str | None:
+    """The payload id inside a transfer's selector, when it carries one."""
+    if not isinstance(state, str):
+        return None
+    match = _PAYLOAD_SELECTOR.search(state)
+    return match.group(1) if match else None
 
 
 def _tombstone_from_delete(data: dict[str, Any]) -> _Tombstone | None:
@@ -394,6 +431,18 @@ class _ProtocolReader:
     version is the unit of consistency: applying half of one would publish a
     state the server never described, and on a full transfer would briefly empty
     the store. Listeners therefore fire once per commit, not once per object.
+
+    **The first payload intent is read, and is assumed to be the skill payload.**
+    Delivery provides one payload per credential and the protocol requires a
+    client to ignore all but the first payload intent, so ``payloads[0]`` is both
+    what arrives and what the protocol says to read. If that ever widens, an
+    ``xfer-full`` for somebody else's payload would empty the skill set and the
+    next ``payload-transferred`` would publish it empty — with pruning on, the
+    difference between a reconcile and deleting a customer's files. This layer
+    therefore learns which payload skills arrive on and declines to apply a
+    transfer of any other, once at WARNING and counted. The residual is the first
+    transfer of a connection: before a skill has arrived there is nothing to
+    compare a payload against.
     """
 
     def __init__(self, committed: _SkillObjectSet) -> None:
@@ -406,6 +455,14 @@ class _ProtocolReader:
         # recreated store reports again and two stores never quieten each other.
         # No lock: ``handle`` runs only on its owner's single delivery thread.
         self._warned_hashless: set[tuple[str, Any]] = set()
+        # The payload the current intent describes, and the payload skills have
+        # actually arrived on. One payload per connection makes these the same
+        # payload; the class docstring says why they are kept apart regardless.
+        self._intent_payload_id: str | None = None
+        self._skill_payload_id: str | None = None
+        self._skills_in_payload = 0
+        self._warned_multiple_payloads = False
+        self._warned_foreign_payload = False
 
     # -- events ------------------------------------------------------------
 
@@ -434,10 +491,15 @@ class _ProtocolReader:
             return _TransferOutcome(
                 disconnect="server-intent carried no payload description"
             )
+        if len(payloads) > 1:
+            self._warn_multiple_payloads(payloads)
+        # The first payload only, as the protocol requires.
         first = payloads[0]
         intent = first.get("intentCode") if isinstance(first, dict) else None
         self._intent = intent
+        self._intent_payload_id = _payload_id_of(first)
         self._changes = []
+        self._skills_in_payload = 0
         if intent == _INTENT_TRANSFER_FULL:
             # Built alongside the live set rather than in place, so an
             # interrupted transfer leaves last known good intact.
@@ -479,6 +541,7 @@ class _ProtocolReader:
         target.put(raw)
         self._changes.append(raw)
         self.diagnostics.skill_objects_received += 1
+        self._skills_in_payload += 1
         if not isinstance(raw.get("contentHash"), str):
             self.diagnostics.hashless_objects += 1
             self._warn_hashless(raw)
@@ -493,6 +556,8 @@ class _ProtocolReader:
             return _TransferOutcome()
         target.delete(tombstone)
         self.diagnostics.objects_revoked += 1
+        # A revocation identifies the payload as ours just as a put does.
+        self._skills_in_payload += 1
         # A tombstone carries identity and no content, so a listener that reads
         # content must check for ``content`` rather than assume it.
         self._changes.append(
@@ -503,11 +568,23 @@ class _ProtocolReader:
     def _payload_transferred(self, data: Any) -> _TransferOutcome:
         state = data.get("state") if isinstance(data, dict) else None
         version = data.get("version") if isinstance(data, dict) else None
-        if self._pending is not None:
+        payload_id = self._intent_payload_id or _payload_id_from_selector(state)
+        if self._pending is not None and self._is_foreign_payload(payload_id):
+            self._warn_foreign_payload(payload_id)
+            self.diagnostics.payloads_ignored += 1
+            self._changes = []
+        elif self._pending is not None:
             self._committed.replace_with(self._pending)
             _warn_if_nothing_can_verify(self._committed)
+            if self._skills_in_payload and payload_id is not None:
+                # Learnt, not configured: nothing below the interface is told
+                # which payload is which, so the payload that carried a skill
+                # put or revocation is the payload skills arrive on.
+                self._skill_payload_id = payload_id
         self._pending = None
         self._intent = None
+        self._intent_payload_id = None
+        self._skills_in_payload = 0
         changes = self._changes
         self._changes = []
         self.diagnostics.payloads_transferred += 1
@@ -526,6 +603,8 @@ class _ProtocolReader:
         """Drops the in-flight payload and keeps what is committed."""
         self._pending = None
         self._intent = None
+        self._intent_payload_id = None
+        self._skills_in_payload = 0
         self._changes = []
 
     def _error(self, data: Any) -> _TransferOutcome:
@@ -546,7 +625,58 @@ class _ProtocolReader:
             )
         return _TransferOutcome(disconnect=f"server said goodbye: {reason}")
 
+    # -- payload identity ----------------------------------------------------
+
+    def _is_foreign_payload(self, payload_id: str | None) -> bool:
+        """
+        Whether a transfer completes a payload other than the one skills arrive on.
+
+        ``False`` unless both payloads are known, so one-payload delivery and the
+        first transfer of a connection behave exactly as they did before this
+        check existed.
+        """
+        return (
+            self._skill_payload_id is not None
+            and payload_id is not None
+            and payload_id != self._skill_payload_id
+        )
+
     # -- diagnostics ---------------------------------------------------------
+
+    def _warn_multiple_payloads(self, payloads: list[Any]) -> None:
+        """
+        One WARNING per reader for an intent describing more than one payload.
+
+        Not an error: reading only the first is what the protocol asks for. But it
+        means the first payload is no longer *guaranteed* to be the skill payload,
+        and an intent for another payload arriving before any skill has been seen
+        is the one case ``_is_foreign_payload`` cannot catch.
+        """
+        if self._warned_multiple_payloads:
+            return
+        self._warned_multiple_payloads = True
+        logger.warning(
+            "An FDv2 server-intent described %d payloads (%s). Only the first is "
+            "read, as the protocol requires, and it is taken to be the payload "
+            "skills arrive on. If skills stop resolving from this point, that is "
+            "the assumption that broke; contact LaunchDarkly support.",
+            len(payloads),
+            ", ".join(str(_payload_id_of(p)) for p in payloads),
+        )
+
+    def _warn_foreign_payload(self, payload_id: str | None) -> None:
+        """One WARNING per reader for a transfer this layer declined to apply."""
+        if self._warned_foreign_payload:
+            return
+        self._warned_foreign_payload = True
+        logger.warning(
+            "An FDv2 transfer of payload %s was not applied to the skills held, "
+            "which arrive on payload %s. Applying it would have replaced them "
+            "with whatever that payload carried — nothing, in the case of a flag "
+            "payload. The skills held are unchanged.",
+            payload_id,
+            self._skill_payload_id,
+        )
 
     def _warn_hashless(self, raw: dict[str, Any]) -> None:
         """
