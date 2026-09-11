@@ -378,6 +378,23 @@ class TestInMemorySkillStore:
         assert s.get_object("skill", "a", 2) == malformed
         assert s.get_object("skill", "a") == malformed
 
+    def test_get_object_unknown_version_beside_well_formed_ones_is_absent(
+        self, make_raw_skill: Any
+    ) -> None:
+        """A pin miss is a miss, not an integrity failure.
+
+        The fall-back above applies only when nothing well-formed is filed under
+        the key. Once well-formed versions are held, a leftover malformed object
+        must not answer for a version that was never delivered: verification
+        would withhold it and record an integrity failure against a skill whose
+        integrity is not in question.
+        """
+        s = InMemorySkillStore()
+        s.put(make_raw_skill(key="a", version=1, content="one\n"))
+        s.put(make_raw_skill(key="a", version=2, content="two\n"))
+        s.put(make_raw_skill(key="a", version="two"))
+        assert s.get_object("skill", "a", 5) is None
+
     def test_all_objects_unknown_kind_is_empty(self, make_raw_skill: Any) -> None:
         s = InMemorySkillStore()
         s.put(make_raw_skill(key="a"))
@@ -768,6 +785,28 @@ class TestVersionPinning:
     ) -> None:
         await self._two_versions(store, make_raw_skill)
         assert await get_skill("a", version=9) is None
+
+    async def test_pin_miss_beside_a_malformed_object_records_no_failure(
+        self,
+        store: Any,
+        make_raw_skill: Any,
+        recording_emitter: Any,
+    ) -> None:
+        """An undelivered version must not raise an integrity alarm.
+
+        A malformed object is filed under its key alone, and a pinned lookup
+        serves it when that is all the store holds — so verification withholds it
+        with a signal rather than letting tampering read as a skill that was
+        never delivered. Once well-formed versions are held, that reasoning no
+        longer applies: the pin is simply not there, and reporting an integrity
+        failure would point an alert at the wrong skill.
+        """
+        skills_module._set_emitter_for_testing(recording_emitter)
+        await self._two_versions(store, make_raw_skill)
+        store.put(make_raw_skill(key="a", version="two"))
+
+        assert await get_skill("a", version=9) is None
+        assert recording_emitter.signals(INTEGRITY_SIGNAL) == []
 
     async def test_all_skills_returns_one_entry_per_key_at_the_newest_version(
         self, store: Any, make_raw_skill: Any
