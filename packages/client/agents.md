@@ -30,6 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
+| `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
@@ -333,6 +334,52 @@ The injection path is deliberately narrower than the state's location: `skills.p
 `skills_core`. `init_client` and `shutdown` use those, tests inject through those
 (`skills._set_store(store)` is the same setter `init_client` uses), and neither should
 reach into `skills_core` directly.
+
+### Descriptor-pinned filesystem access
+
+A path check is only as good as the last path resolution after it. Every `lstat`, `realpath`
+and containment check validates an *inode*, but a following
+`os.replace(tmp, root / key / "SKILL.md")` re-resolves `<root>/<key>` from its *name* — so
+anything holding write permission on a managed directory can move the validated directory
+aside, leave a symlink in its place, and redirect the write (or an unlink) somewhere else.
+Narrowing that window is not a fix; the race is winnable at any width.
+
+So the checks hand off to a descriptor and nothing re-resolves a path afterwards. The
+primitives live in `safe_fs.py`, which knows nothing about skills:
+
+- `open_directory_nofollow` opens the directory with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`
+  and confirms `S_ISDIR` on the `fstat` (the explicit check is what covers platforms with no
+  `O_DIRECTORY`). `open_or_create_directory` wraps it with `os.mkdir` plus an `lstat` on the
+  `FileExistsError` path — `Path.mkdir(exist_ok=True)` accepts a symlink-to-directory as
+  "already there", which would reopen the hole the caller's check just closed.
+  `pinned_directory` holds either for the duration of a block, so a caller states the
+  platform split once as `if dir_fd is not None` and cannot forget the `os.close`.
+- `atomic_write` creates the temp file with `O_CREAT | O_EXCL | O_NOFOLLOW` **at** that
+  descriptor (`_mkstemp_at`, since `tempfile` has no `dir_fd` form), `fchmod`s the
+  descriptor rather than `chmod`ing a path, writes, fsyncs, and renames with
+  `os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)`, then fsyncs the directory so the
+  rename survives a crash. `atomic_write_in` is the same against a directory the caller does
+  not already hold open. `os.replace` is the single rename call site, reached by attribute
+  lookup so tests can intercept it, and `os.rename` must not be substituted for it — it is
+  also the only one with defined overwrite semantics on Windows.
+- `unlink_file` probes and unlinks descriptor-relative too. `unlink` never follows a
+  *trailing* symlink, but it does resolve the directory above it, so the same swap turns a
+  removal into a delete of an attacker-chosen file. A symlink found where this SDK expects
+  its own file raises `SymlinkRefused` rather than being tidied away: the state on disk is
+  not what the caller believes, and that is the caller's to report.
+
+`safe_fs.SUPPORTS_DIR_FD` gates all of it, and the probe is not the obvious one.
+`os.supports_dir_fd` is populated per underlying syscall, and CPython registers `renameat`
+under `os.rename` only and `fstatat` under `os.stat` only — even though `os.replace` is the
+same `renameat`-backed function and `os.lstat` is `fstatat` with `AT_SYMLINK_NOFOLLOW`.
+Probing the names this module actually calls reports "unsupported" on every POSIX platform
+and silently turns the defense off, so the probe names the advertised twins
+(`{os.rename, os.open, os.unlink, os.stat}`) and a caller's symlink check is spelled
+`os.stat(..., follow_symlinks=False)` rather than `os.lstat`. Where the family is absent
+(Windows) `open_directory_nofollow` returns `None` after an `lstat` check instead of
+attempting the descriptor open — `os.open` cannot open a directory there — and every caller
+falls back to the identical full-path sequence, the per-component `lstat` floor. The
+residual window on those platforms is documented rather than closed.
 
 ---
 
