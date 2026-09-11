@@ -1124,6 +1124,15 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
             assert variables["formatting_instructions"].startswith(
                 "Your response MUST be in valid JSON"
             )
+            # message_history must carry the formatting instructions the same
+            # way judges.run_judges (the online path) builds it: every judge
+            # built from the AI Library's default templates references
+            # {{message_history}}, not the standalone formatting_instructions
+            # variable above, to ask for the {score, reasoning} JSON shape.
+            assert (
+                "Your response MUST be in valid JSON format"
+                in (variables["message_history"])
+            )
             return {
                 "output": '{"score": 0.86, "reasoning": "matches policy"}',
                 "usage": {"input_tokens": 640, "output_tokens": 48},

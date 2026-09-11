@@ -562,14 +562,25 @@ class EvaluationsRunner:
             ground_truth = parse_template(ground_truth, variables)
         elif expected is not None:
             ground_truth = str(expected)
+        # message_history carries FORMATTING_INSTRUCTIONS the same way the
+        # online path builds it (judges.run_judges), because that -- not the
+        # standalone formatting_instructions variable below -- is what every
+        # judge built from the AI Library's default templates (accuracy,
+        # relevance, toxicity, and any judge cloned from them) actually
+        # references. A judge authored before this variable existed must keep
+        # getting scored without edits.
         variables.update(
             {
                 "input": row_result.get("input") or "",
                 "response_to_evaluate": output if output is not None else "",
                 "message_history": "\n\n".join(
                     str(value)
-                    for value in (row_result.get("input"), output)
-                    if value is not None
+                    for value in (
+                        row_result.get("input"),
+                        output,
+                        FORMATTING_INSTRUCTIONS,
+                    )
+                    if value
                 ),
                 "expected_output": expected if expected is not None else "",
                 "ground_truth_context": (
