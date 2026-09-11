@@ -30,6 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
+| `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
@@ -198,11 +199,11 @@ Three layers, in increasing order of blast radius:
 
 ### The store seam, and why version is part of the lookup
 
-`SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, and an optional
-`add_listener(kind, fn)`. Version is part of the **lookup identity**, not a filter applied
-to the answer, and that is load-bearing: a delivery payload carries the newest version of
-every skill *plus* every version any variation currently pins, so two versions of one key
-coexist routinely. A seam keyed by key alone would answer a pinned reference with the newest
+`SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, and the optional
+pair `add_listener(kind, fn)` / `remove_listener(kind, fn)`. Version is part of the **lookup
+identity**, not a filter applied to the answer, and that is load-bearing: a delivery payload
+carries the newest version of every skill *plus* every version any variation currently pins,
+so two versions of one key coexist routinely. A store keyed by key alone would answer a pinned reference with the newest
 object, and the caller would then have to reject it — turning the primary use case, a
 version-pinned attachment, into a missing skill. `version=None` asks for the newest held.
 
