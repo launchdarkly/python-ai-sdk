@@ -238,6 +238,10 @@ attributes require `captureContent` / `capture_content`, a handler-factory optio
 not receive. The reasoning is still returned to the caller in `judgeResults` / `judge_results`;
 only the telemetry copy is withheld. Exporting it needs its own opt-in.
 
+The caller-supplied judge context (`judge_context` / `judgeContext`) is never recorded in
+telemetry either: it reaches the judge only through its prompt, and never becomes a span
+attribute, a span event, or track data.
+
 ---
 
 ## 5. Finish reasons

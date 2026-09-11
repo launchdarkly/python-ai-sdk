@@ -61,7 +61,8 @@ class TestRunJudges:
             llm_response="r",
             base_track_data={},
         )
-        assert result == {}
+        assert result.judge_results == {}
+        assert result.judge_diagnostics == []
 
     async def test_skips_judges_with_sampling_rate_zero(
         self, mock_ld_client: MagicMock
@@ -80,7 +81,8 @@ class TestRunJudges:
             llm_response="r",
             base_track_data={},
         )
-        assert result == {}
+        assert result.judge_results == {}
+        assert result.judge_diagnostics == []
 
     async def test_tool_handlers_not_forwarded_to_judge_calls(
         self, mock_ld_client: MagicMock
@@ -363,8 +365,8 @@ class TestRunJudges:
                 base_track_data={"runId": "x"},
             )
 
-        assert "judge-1" in result
-        judge = result["judge-1"]
+        assert "judge-1" in result.judge_results
+        judge = result.judge_results["judge-1"]
         assert isinstance(judge, JudgeResult)
         # Attribute access — the pattern the conversation example uses.
         assert getattr(judge, "score", None) == 0.9
@@ -387,7 +389,8 @@ class TestRunJudges:
             llm_response="r",
             base_track_data={},
         )
-        assert result == {}
+        assert result.judge_results == {}
+        assert result.judge_diagnostics == []
 
 
 class TestScoreGuard:
@@ -487,12 +490,13 @@ class TestJudgeOutputFormatStripped:
         assert effective["instructions"] == "judge"
 
         # A valid verdict still parses.
-        assert result["judge-1"].score == 0.8
-        assert result["judge-1"].response == "ok"
+        assert result.judge_results["judge-1"].score == 0.8
+        assert result.judge_diagnostics == []
+        assert result.judge_results["judge-1"].response == "ok"
 
         # This is what was broken: before the fix, a strict provider schema on the judge
         # config made a valid {score, reasoning} verdict impossible. It must be present now.
-        assert "judge-1" in result
+        assert "judge-1" in result.judge_results
 
         # The reason is stated once, naming the judge key.
         warnings = [
@@ -566,7 +570,8 @@ class TestJudgeOutputFormatStripped:
                     base_track_data={"runId": "x"},
                 )
 
-        assert result["judge-1"].score == 0.9
+        assert result.judge_results["judge-1"].score == 0.9
+        assert result.judge_diagnostics == []
         assert not any("outputFormat" in r.message for r in caplog.records)
 
     async def test_collapsed_messages_still_apply(
@@ -653,8 +658,8 @@ class TestJudgeOutputFormatStripped:
                 base_track_data={"runId": "x"},
             )
 
-        assert len(tasks) == 1
-        task = tasks[0]
+        assert len(tasks.judge_tasks) == 1
+        task = tasks.judge_tasks[0]
         assert "outputFormat" not in task.judge_config
 
         # Must still survive a JSON round-trip (serialisable for a background thread).
