@@ -1,8 +1,8 @@
 """
 Tests for the FDv2 skill delivery protocol.
 
-Wire semantics — which objects are skills, ``objectVersion`` versus ``version``,
-revocation, mixed payloads, the commit at ``payload-transferred`` — are asserted
+Wire semantics — which objects are skills, the skill's version in the wire ``key``
+versus the payload's in ``version``, revocation, mixed payloads, the commit at ``payload-transferred`` — are asserted
 against ``_ProtocolReader``, which has no I/O, so each case reads as the contract
 it is rather than as a server script.
 """
@@ -17,7 +17,7 @@ import pytest
 from launchdarkly_ai_server import InMemorySkillStore
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
-    FDV2_OBJECT_CATEGORY,
+    FDV2_KEY_DELIMITER,
     FDV2_OBJECT_KIND,
     _is_skill_event,
     _ProtocolReader,
@@ -38,6 +38,18 @@ def _hash(content: str) -> str:
 # ---------------------------------------------------------------------------
 # Wire builders — one place that knows the shape, so a contract change is one edit
 # ---------------------------------------------------------------------------
+
+
+def wire_key(key: str, object_version: Any) -> str:
+    """
+    The wire ``key`` of one skill object: ``<key>:<version>``.
+
+    ``None`` builds a key with no version at all, which is how the tests spell a
+    malformed object; anything else is spelled after the delimiter verbatim.
+    """
+    if object_version is None:
+        return key
+    return f"{key}{FDV2_KEY_DELIMITER}{object_version}"
 
 
 def put_skill(
@@ -62,10 +74,8 @@ def put_skill(
             content_hash if content_hash is not None else _hash(content)
         )
     return {
-        "key": key,
+        "key": wire_key(key, object_version),
         "kind": FDV2_OBJECT_KIND,
-        "category": FDV2_OBJECT_CATEGORY,
-        "objectVersion": object_version,
         "version": payload_version,
         "object": envelope,
     }
@@ -75,16 +85,14 @@ def delete_skill(
     key: str = "pdf-extraction", *, object_version: Any = 3, payload_version: int = 43
 ) -> dict[str, Any]:
     return {
-        "key": key,
+        "key": wire_key(key, object_version),
         "kind": FDV2_OBJECT_KIND,
-        "category": FDV2_OBJECT_CATEGORY,
-        "objectVersion": object_version,
         "version": payload_version,
     }
 
 
 def put_flag(key: str = "my-flag", version: int = 17) -> dict[str, Any]:
-    """A flag ``put-object``: no ``category``, no ``objectVersion``."""
+    """A flag ``put-object``: the same envelope fields, a different ``kind``."""
     return {
         "key": key,
         "kind": "flag",
@@ -141,8 +149,16 @@ def full_payload(
 
 
 class TestObjectIdentification:
-    def test_kind_and_category_together_identify_a_skill(self) -> None:
+    def test_the_kind_alone_identifies_a_skill(self) -> None:
         assert _is_skill_event(put_skill()) is True
+
+    def test_the_kind_is_the_bare_category_name(self) -> None:
+        """
+        Object kinds on the channel are open strings and the agent-skill payload
+        is ``generic``, so a skill arrives under the kind its producer
+        registered — ``skill`` — not under a broader wrapper kind.
+        """
+        assert FDV2_OBJECT_KIND == "skill"
 
     def test_a_flag_is_not_a_skill(self) -> None:
         assert _is_skill_event(put_flag()) is False
@@ -150,21 +166,20 @@ class TestObjectIdentification:
     def test_a_segment_is_not_a_skill(self) -> None:
         assert _is_skill_event(put_segment()) is False
 
-    def test_inline_resource_of_another_category_is_not_a_skill(self) -> None:
-        """``inline-resource`` is a broad kind, so the category is required too."""
+    def test_another_generic_kind_is_not_a_skill(self) -> None:
+        """A generic payload may carry other registered kinds one day."""
         other = put_skill()
-        other["category"] = "prompt-template"
+        other["kind"] = "prompt-template"
         assert _is_skill_event(other) is False
 
-    def test_skill_category_under_another_kind_is_not_a_skill(self) -> None:
+    def test_a_skill_shaped_envelope_under_another_kind_is_not_a_skill(self) -> None:
         other = put_skill()
         other["kind"] = "some-future-kind"
         assert _is_skill_event(other) is False
 
-    def test_a_flag_shaped_object_with_no_category_is_not_a_skill(self) -> None:
-        """Flags and segments omit ``category`` entirely — the documented shape."""
-        assert "category" not in put_flag()
-        assert "objectVersion" not in put_flag()
+    def test_nothing_but_the_kind_is_consulted(self) -> None:
+        """No secondary field narrows the kind, and none may be required."""
+        assert set(put_skill()) == {"key", "kind", "version", "object"}
 
     @pytest.mark.parametrize("value", [None, "skill", 3, [], ()])
     def test_non_dict_events_are_not_skills(self, value: Any) -> None:
@@ -172,15 +187,27 @@ class TestObjectIdentification:
 
 
 # ---------------------------------------------------------------------------
-# objectVersion is not version
+# The skill's version is in the wire key; `version` is the payload's
 # ---------------------------------------------------------------------------
 
 
 class TestVersionTranslation:
-    def test_object_version_becomes_the_seam_version(self) -> None:
+    def test_the_wire_key_is_key_colon_version(self) -> None:
+        assert (
+            put_skill("pdf-extraction", object_version=3)["key"] == "pdf-extraction:3"
+        )
+
+    def test_the_version_after_the_delimiter_becomes_the_seam_version(self) -> None:
         raw = _store_object_from_put(put_skill(object_version=3, payload_version=42))
         assert raw is not None
         assert raw["version"] == 3
+        assert isinstance(raw["version"], int)
+
+    def test_the_key_before_the_delimiter_becomes_the_seam_key(self) -> None:
+        """A caller asks for ``pdf-extraction``, never for ``pdf-extraction:3``."""
+        raw = _store_object_from_put(put_skill("pdf-extraction", object_version=3))
+        assert raw is not None
+        assert raw["key"] == "pdf-extraction"
 
     def test_the_payload_version_never_reaches_the_seam(self) -> None:
         """
@@ -200,35 +227,74 @@ class TestVersionTranslation:
         assert raw is not None
         assert raw["version"] == 99
 
-    def test_a_missing_object_version_is_not_defaulted_from_the_payload(self) -> None:
-        wire = put_skill()
-        del wire["objectVersion"]
-        raw = _store_object_from_put(wire)
-        assert raw is not None
-        assert "version" not in raw
-
-    def test_an_explicitly_null_object_version_is_carried_through_as_null(self) -> None:
-        """Carried, not invented: verification reports ``invalid_version``."""
+    def test_a_key_with_no_delimiter_is_held_version_less(self) -> None:
+        """Not defaulted from the payload version, and not dropped: verification
+        reports ``invalid_version`` under a key the caller recognises."""
         raw = _store_object_from_put(put_skill(object_version=None))
         assert raw is not None
-        assert raw["version"] is None
+        assert raw["key"] == "pdf-extraction"
+        assert "version" not in raw
 
-    def test_a_delete_translates_object_version_too(self) -> None:
+    @pytest.mark.parametrize("spelling", ["latest", "", "3.0", "-1", "1:2", "３"])
+    def test_a_version_that_is_not_digits_is_carried_through_as_invalid(
+        self, spelling: str
+    ) -> None:
+        """Carried, not invented: verification reports ``invalid_version`` for
+        the object rather than the transport reporting it absent."""
+        raw = _store_object_from_put(put_skill(object_version=spelling))
+        assert raw is not None
+        assert raw["key"] == "pdf-extraction"
+        assert raw["version"] == spelling
+
+    def test_leading_zeros_spell_the_same_version(self) -> None:
+        raw = _store_object_from_put(put_skill(object_version="03"))
+        assert raw is not None
+        assert raw["version"] == 3
+
+    def test_a_delete_reads_the_wire_key_the_same_way(self) -> None:
         tombstone = _tombstone_from_delete(
             delete_skill(object_version=3, payload_version=43)
         )
         assert tombstone is not None
+        assert tombstone.key == "pdf-extraction"
         assert tombstone.object_version == 3
 
-    def test_a_delete_with_no_usable_object_version_revokes_every_version(self) -> None:
-        tombstone = _tombstone_from_delete(delete_skill(object_version=None))
+    @pytest.mark.parametrize("spelling", [None, "latest", "0"])
+    def test_a_delete_with_no_usable_version_revokes_every_version(
+        self, spelling: Any
+    ) -> None:
+        tombstone = _tombstone_from_delete(delete_skill(object_version=spelling))
         assert tombstone is not None
+        assert tombstone.key == "pdf-extraction"
         assert tombstone.object_version is None
+
+    @pytest.mark.parametrize("bad_key", [":3", "", None, 3])
+    def test_a_put_with_no_skill_key_is_dropped_because_it_has_no_identity(
+        self, bad_key: Any
+    ) -> None:
+        wire = put_skill()
+        wire["key"] = bad_key
+        assert _store_object_from_put(wire) is None
 
     def test_a_keyless_put_is_dropped_because_it_has_no_identity(self) -> None:
         wire = put_skill()
         del wire["key"]
         assert _store_object_from_put(wire) is None
+
+    def test_a_delete_with_no_skill_key_is_ignored(self) -> None:
+        wire = delete_skill()
+        wire["key"] = ":3"
+        assert _tombstone_from_delete(wire) is None
+
+    def test_the_stored_identity_round_trips_to_the_wire_key(self) -> None:
+        """``_SkillObjectSet.snapshot`` spells its opaque keys the way the wire
+        does, so a held object can be matched back to the event that carried it."""
+        held = _SkillObjectSet()
+        wire = put_skill("pdf-extraction", object_version=3)
+        raw = _store_object_from_put(wire)
+        assert raw is not None
+        held.put(raw)
+        assert set(held.snapshot()) == {wire["key"]}
 
     def test_the_envelope_is_copied_verbatim(self) -> None:
         raw = _store_object_from_put(put_skill())

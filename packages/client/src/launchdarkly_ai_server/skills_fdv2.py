@@ -3,7 +3,7 @@ Agent Skills — the FDv2 delivery protocol.
 
 The half of the delivery transport that has no I/O: identifying skill objects
 on the wire, translating them into the raw object shape the ``SkillStore``
-interface defines, holding them by ``(key, objectVersion)``, and applying a
+interface defines, holding them by ``(key, version)``, and applying a
 payload's events as one consistent commit. ``FDv2SkillStore``, the store that
 puts a network connection underneath this, follows in a separate change.
 
@@ -42,9 +42,9 @@ protocol tells a client to read only the first payload intent, so today those ar
 the same payload. ``_ProtocolReader`` keeps the pair apart anyway, because the
 cost of conflating them is an emptied skill set.
 
-The design rationale — why ``objectVersion`` is not ``version``, why changes
-commit at ``payload-transferred`` — is in ``agents.md`` under *The delivery
-transport*.
+The design rationale — why the skill's version is read from the object's
+``key`` and never from ``version``, why changes commit at
+``payload-transferred`` — is in ``agents.md`` under *The delivery transport*.
 """
 
 from __future__ import annotations
@@ -63,21 +63,27 @@ logger = logging.getLogger(__name__)
 # The wire contract
 # ---------------------------------------------------------------------------
 
-FDV2_OBJECT_KIND = "inline-resource"
+FDV2_OBJECT_KIND = "skill"
 """
-The FDv2 ``kind`` skills are delivered under. Together with
-``FDV2_OBJECT_CATEGORY`` it maps onto the single interface value
-``skills_core.SKILL_OBJECT_KIND``; that translation is this adapter's job.
+The FDv2 ``kind`` skills are delivered under.
+
+Object kinds on the SDK-facing channel are open strings: the agent-skill payload
+is classified ``generic`` and every object in it carries the kind its producer
+registered, which for skills is the bare category name. Delivery lower-cases the
+kind, so an exact comparison is the whole test. The kind happens to equal
+``skills_core.SKILL_OBJECT_KIND`` today; they are still separate constants,
+because one is a wire value LaunchDarkly owns and the other is an SDK seam.
 """
 
-FDV2_OBJECT_CATEGORY = "skill"
-"""The ``category`` that narrows ``inline-resource`` to an agent skill."""
-
-SDK_DATA_MODEL_VERSION = 1
+FDV2_KEY_DELIMITER = ":"
 """
-The ``mv`` request parameter. The one request parameter whose value could not be
-confirmed against a live server, so treat the default as provisional and
-override it through the store's ``data_model_version`` if needed.
+What separates a skill's key from its version inside the object's wire ``key``.
+
+A generic object is identified on the wire as ``<key>:<version>`` — the skill's
+own key, one delimiter, the skill's own version — because each version of a
+skill is a distinct object in the payload. Delivery forbids the delimiter inside
+a registered category and skill keys cannot contain it, so a well-formed wire key
+has exactly one.
 """
 
 _EVENT_SERVER_INTENT = "server-intent"
@@ -204,7 +210,7 @@ class StoreDiagnostics:
 
 
 # ---------------------------------------------------------------------------
-# Deserialisation — where objectVersion is not version
+# Deserialisation — where the skill's version lives in the key, not in version
 # ---------------------------------------------------------------------------
 
 
@@ -220,17 +226,58 @@ def _is_skill_event(data: Any) -> bool:
     """
     Whether one ``put-object`` / ``delete-object`` payload is a skill.
 
-    Both halves are required: ``inline-resource`` may carry other categories,
-    and flags and segments omit ``category`` entirely. Every other kind is
-    ignored, not rejected, because flag and segment objects share the connection
-    and erroring on them would turn a normal payload into a reconnect loop.
+    The kind alone decides it. Every other kind is ignored, not rejected,
+    because flag and segment objects share the connection and erroring on them
+    would turn a normal payload into a reconnect loop.
     """
     if not isinstance(data, dict):
         return False
-    return (
-        data.get("kind") == FDV2_OBJECT_KIND
-        and data.get("category") == FDV2_OBJECT_CATEGORY
-    )
+    return data.get("kind") == FDV2_OBJECT_KIND
+
+
+@dataclass(frozen=True)
+class _WireIdentity:
+    """A skill object's wire ``key``, split into the skill's key and version."""
+
+    key: str
+    version: Any
+    """``int`` when the wire carried one; the offending text when it did not;
+    absent (``_NO_VERSION``) when the wire key had no delimiter at all."""
+
+
+_NO_VERSION = object()
+
+
+def _split_wire_key(wire_key: Any) -> _WireIdentity | None:
+    """
+    Reads ``<key>:<version>`` off one object's wire ``key``.
+
+    Lenient where leniency keeps the object diagnosable and strict only where
+    there is nothing to diagnose:
+
+    - No delimiter: the whole wire key is the skill key and there is no version,
+      so the object is held version-less and verification reports
+      ``invalid_version`` under a key the caller can recognise.
+    - A version that is not a run of digits (``"pdf:latest"``, ``"pdf:"``,
+      ``"a:1:2"``): the text is carried through *as the version*, for the same
+      reason — the caller learns that ``pdf`` arrived broken, not that it is
+      absent.
+    - An empty key before the delimiter (``":3"``): there is no identity to hold
+      it under, so ``None``, and the caller drops it.
+
+    Leading zeros are accepted (``"pdf:03"`` is version 3) since ``int`` is the
+    identity a reference pins, not the spelling.
+    """
+    if not isinstance(wire_key, str) or not wire_key:
+        return None
+    key, delimiter, version_text = wire_key.partition(FDV2_KEY_DELIMITER)
+    if not key:
+        return None
+    if not delimiter:
+        return _WireIdentity(key=key, version=_NO_VERSION)
+    if version_text.isascii() and version_text.isdigit():
+        return _WireIdentity(key=key, version=int(version_text))
+    return _WireIdentity(key=key, version=version_text)
 
 
 def _store_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -240,33 +287,36 @@ def _store_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
 
     **The one translation this adapter must get right:**
 
-        wire ``objectVersion``  →  stored ``version``    (the skill's own version)
-        wire ``version``        →  dropped               (the *payload* version)
+        wire ``key``      →  stored ``key`` and ``version``  (split on ``:``)
+        wire ``version``  →  dropped                          (the *payload* version)
 
-    ``objectVersion`` is what a ``{key, version}`` reference pins; ``version``
-    moves whenever anything in the environment moves. Confusing them fails
-    silently: the object verifies and the caller gets content under a version
-    number that means nothing.
+    Each version of a skill is its own object on the wire, identified as
+    ``<key>:<version>``; that version is what a ``{key, version}`` reference
+    pins. The event's ``version`` field is the version of the payload the object
+    arrived in and moves whenever anything in the environment moves. Confusing
+    them fails silently: the object verifies and the caller gets content under a
+    version number that means nothing.
 
-    Returns ``None`` only when ``key`` is not a string, since a keyless object
-    has no identity to store it under. Every other defect is carried through
-    verbatim so that verification withholds it with a reason code rather than
-    the transport dropping it into indistinguishable absence.
+    Returns ``None`` only when the wire ``key`` carries no skill key at all,
+    since such an object has no identity to store it under. Every other defect
+    is carried through so that verification withholds it with a reason code
+    rather than the transport dropping it into indistinguishable absence.
     """
-    key = data.get("key")
-    if not isinstance(key, str) or not key:
+    identity = _split_wire_key(data.get("key"))
+    if identity is None:
         logger.warning(
-            "An FDv2 skill put-object carried no string 'key' and could not be "
-            "stored under any identity; it was dropped."
+            "An FDv2 skill put-object carried no usable 'key' (%r) and could not "
+            "be stored under any identity; it was dropped.",
+            data.get("key"),
         )
         return None
 
-    raw: dict[str, Any] = {"key": key}
+    raw: dict[str, Any] = {"key": identity.key}
 
-    # A membership test rather than a `.get` default, so an explicitly-null
-    # objectVersion stays null and reaches verification as `invalid_version`.
-    if "objectVersion" in data:
-        raw["version"] = data["objectVersion"]
+    # Absent stays absent and malformed stays malformed, so verification sees
+    # what arrived (as `invalid_version`) rather than something invented here.
+    if identity.version is not _NO_VERSION:
+        raw["version"] = identity.version
 
     envelope = data.get("object")
     if isinstance(envelope, dict):
@@ -294,25 +344,26 @@ def _payload_id_from_selector(state: Any) -> str | None:
 
 def _tombstone_from_delete(data: dict[str, Any]) -> _Tombstone | None:
     """
-    Narrows one FDv2 skill ``delete-object`` to the identity it revokes, with
-    the same ``objectVersion`` translation as a put.
+    Narrows one FDv2 skill ``delete-object`` to the identity it revokes, reading
+    the wire ``key`` the same way a put does.
 
     An ``object_version`` of ``None`` means the delete named no usable version
     and is read as "revoke every version of this key". That is the safe
     direction: the alternative is continuing to serve content LaunchDarkly has
-    withdrawn.
+    withdrawn. It also removes whatever a malformed put of the same wire key
+    left held, since that was stored version-less under the same skill key.
     """
-    key = data.get("key")
-    if not isinstance(key, str) or not key:
+    identity = _split_wire_key(data.get("key"))
+    if identity is None:
         logger.warning(
-            "An FDv2 skill delete-object carried no string 'key'; it was ignored."
+            "An FDv2 skill delete-object carried no usable 'key' (%r); it was ignored.",
+            data.get("key"),
         )
         return None
-    object_version = data.get("objectVersion")
     return _Tombstone(
-        key=key,
-        object_version=object_version
-        if is_valid_skill_version(object_version)
+        key=identity.key,
+        object_version=identity.version
+        if is_valid_skill_version(identity.version)
         else None,
     )
 
@@ -324,7 +375,7 @@ def _tombstone_from_delete(data: dict[str, Any]) -> _Tombstone | None:
 
 class _SkillObjectSet:
     """
-    Raw skill objects held in memory, keyed by ``(key, objectVersion)``.
+    Raw skill objects held in memory, keyed by ``(key, version)``.
 
     Lookup semantics are identical to ``InMemorySkillStore``'s, down to the
     fall-through to a version-less entry, so that the store a caller configures

@@ -30,7 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
-| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery protocol — the `objectVersion`/`version` translation, the held object set, and the pure `_ProtocolReader` that commits a payload's events at `payload-transferred`. Sits **below** the store interface; nothing in the feature imports it |
+| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery protocol — the wire-key/`version` translation, the held object set, and the pure `_ProtocolReader` that commits a payload's events at `payload-transferred`. Sits **below** the store interface; nothing in the feature imports it |
 | `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
@@ -226,29 +226,37 @@ shape `skills_core.SkillStore` documents. It lives below the store interface; **
 that interface knows it exists**. If a transport change ever seems to require editing an
 accessor, verification, or `write_skills`, the adapter boundary is wrong.
 
-**`objectVersion` is the skill's version. `version` is the payload's.** On the wire a skill
-`put-object` carries both, and they are not interchangeable:
+**The skill's version is in the object's `key`. `version` is the payload's.** Each version
+of a skill is its own object on the wire, identified as `<key>:<version>`:
 
 ```json
-{"key":"pdf-extraction","kind":"inline-resource","category":"skill",
- "objectVersion":3,"version":42,
+{"key":"pdf-extraction:3","kind":"skill","version":42,
  "object":{"contentType":"text/markdown","content":"…","contentHash":"…","name":"…"}}
 ```
 
-`objectVersion` (3) is what a `{key, version}` reference pins and what becomes the stored
-`version`. `version` (42) is the version of the *payload* the object arrived in — it moves
-when anything in the environment moves, including a flag with nothing to do with skills.
-Reading it as the skill's version fails **silently**: the object verifies, the hash matches,
-and the caller gets content under a version number that means nothing. Flags and segments
-carry only `version` and omit both `category` and `objectVersion`, which is exactly why the
-two fields look interchangeable. `_store_object_from_put` is the only place the translation
-happens, and `TestVersionTranslation` asserts it in both directions.
+The `3` after the delimiter is what a `{key, version}` reference pins and what becomes the
+stored `version`, under the stored key `pdf-extraction`. `version` (42) is the version of the
+*payload* the object arrived in — it moves when anything in the environment moves,
+including a flag with nothing to do with skills. Reading it as the skill's version fails
+**silently**: the object verifies, the hash matches, and the caller gets content under a
+version number that means nothing. There is no separate field for the skill's version: the
+agent-skill payload is a *generic* payload, and generic objects carry only `key`, `kind`,
+`version` and `object`, exactly like a flag. `_split_wire_key` is the only place the wire key
+is read, `_store_object_from_put` and `_tombstone_from_delete` both go through it, and
+`TestVersionTranslation` asserts the translation in both directions. A wire key that will
+not split cleanly is *held*, not dropped — version-less, or with the offending text as its
+version — so verification withholds it with `invalid_version` under a key the caller
+recognises; only a key with nothing before the delimiter is dropped, since there is no
+identity to hold it under.
 
-**Skills are identified by `kind == "inline-resource" && category == "skill"`; everything else
-is ignored, not rejected.** An environment's payload assignment carries its flag payload
-alongside its agent-skill payload, so flag and segment objects arrive as a matter of course.
-Erroring on an unrecognised kind would turn a normal payload into a permanent reconnect
-loop — a flag-delivery outage caused by a skills rollout.
+**Skills are identified by `kind == "skill"`; everything else is ignored, not rejected.**
+Object kinds on the SDK-facing channel are open strings, and the agent-skill payload is
+classified `generic`, so a skill arrives under the kind its producer registered — the bare
+category name — not under a broader wrapper kind with a narrowing field. An environment's
+payload assignment carries its flag payload alongside its agent-skill payload, so flag and
+segment objects arrive as a matter of course. Erroring on an unrecognised kind would turn a
+normal payload into a permanent reconnect loop — a flag-delivery outage caused by a skills
+rollout.
 
 **Changes commit at `payload-transferred`, not as objects arrive.** A payload version is the
 unit of consistency: a half-applied full transfer would publish a state the server never
