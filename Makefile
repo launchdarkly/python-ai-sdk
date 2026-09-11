@@ -8,9 +8,11 @@ start:
 test:
 	uv run pytest
 
-# Type-check all packages (uv run mypy)
+# Type-check all package sources (matches CI: uv run mypy packages/*/src).
+# Not `mypy .`: that walks every package's tests/conftest.py, which mypy sees as
+# duplicate top-level `conftest` modules and aborts before checking anything.
 typecheck:
-	uv run mypy .
+	uv run mypy packages/*/src
 
 # Check for lint errors
 lint:
