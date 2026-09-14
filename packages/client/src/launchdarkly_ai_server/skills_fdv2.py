@@ -1283,6 +1283,10 @@ class FDv2SkillStore:
         # by being dropped, so resetting on return would count every healthy,
         # server-recycled connection as a failure.
         self._failures = 0
+        # Whether the current attempt got a complete answer before it ended.
+        # A stream only ever ends by being dropped, so this is what separates
+        # a recycled healthy connection from one that failed.
+        self._attempt_answered = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1456,6 +1460,8 @@ class FDv2SkillStore:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            with self._lock:
+                self._attempt_answered = False
             try:
                 if self._mode == "stream":
                     self._stream_once()
@@ -1477,6 +1483,7 @@ class FDv2SkillStore:
                 with self._lock:
                     self._failures += 1
                     failures = self._failures
+                    answered = self._attempt_answered
                     self._reader.diagnostics.connection_failures = failures
                     self._reader.diagnostics.last_error = str(exc)
                 if failures > self._max_consecutive_failures:
@@ -1494,9 +1501,22 @@ class FDv2SkillStore:
                 # The header may come from a proxy rather than LaunchDarkly, and
                 # a value in the hours would park revocation for that long.
                 delay = min(delay, self._max_backoff)
-                logger.warning(
-                    "Skill delivery failed (%s); retrying in %.1fs", exc, delay
-                )
+                if answered:
+                    # LaunchDarkly, and any proxy in between, recycles a
+                    # long-lived stream. A connection that answered before it
+                    # ended delivered everything it was asked for, so the
+                    # reconnect is routine rather than a fault worth warning
+                    # about for as long as the process runs.
+                    logger.debug(
+                        "The FDv2 stream ended after a complete answer (%s); "
+                        "reconnecting in %.1fs",
+                        exc,
+                        delay,
+                    )
+                else:
+                    logger.warning(
+                        "Skill delivery failed (%s); retrying in %.1fs", exc, delay
+                    )
                 if self._stop.wait(delay):
                     return
                 continue
@@ -1511,6 +1531,7 @@ class FDv2SkillStore:
     def _record_success(self) -> None:
         with self._lock:
             self._failures = 0
+            self._attempt_answered = True
             self._reader.diagnostics.connection_failures = 0
 
     def _give_up(self, reason: str) -> None:

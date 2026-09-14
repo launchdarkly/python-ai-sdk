@@ -1608,6 +1608,38 @@ class TestFailureHandling:
         finally:
             store.close()
 
+    def test_a_recycled_connection_reconnects_quietly(self, caplog: Any) -> None:
+        # A healthy idle stream reconnects for as long as the process runs, so
+        # warning on each one would fill a customer's logs with a fault they do
+        # not have and teach them to ignore the level that means something.
+        requester = _UpToDateRecyclingRequester()
+        store = stream_store(_requester=requester)
+        with caplog.at_level("DEBUG", logger="launchdarkly_ai_server.skills_fdv2"):
+            try:
+                store.start()
+                assert wait_until(lambda: requester.connections >= 5)
+            finally:
+                store.close()
+        assert store.failed is None
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        assert [r for r in caplog.records if "reconnecting in" in r.getMessage()]
+
+    def test_a_connection_that_never_answered_still_warns(self, caplog: Any) -> None:
+        # The quiet path is earned by answering. A connection that failed before
+        # it told us anything is the case the warning exists for.
+        store = stream_store(
+            max_consecutive_failures=10, _requester=_ScriptedRequester()
+        )
+        with caplog.at_level("DEBUG", logger="launchdarkly_ai_server.skills_fdv2"):
+            try:
+                store.start()
+                assert wait_until(lambda: store.diagnostics.connection_failures >= 3)
+            finally:
+                store.close()
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings
+        assert all("Skill delivery failed" in r.getMessage() for r in warnings)
+
     @pytest.mark.parametrize(
         "exc",
         [
