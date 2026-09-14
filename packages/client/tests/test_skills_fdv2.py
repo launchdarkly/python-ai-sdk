@@ -538,6 +538,17 @@ class TestProtocolReader:
         assert outcomes[-1].committed is True
         assert outcomes[-1].basis == "basis-1"
 
+    def test_an_up_to_date_intent_is_reported_as_such(self) -> None:
+        """``intentCode: "none"`` is the stream's 304: current, nothing to send."""
+        reader = _ProtocolReader(_SkillObjectSet())
+        outcome = reader.handle("server-intent", server_intent("none"))
+        assert outcome.up_to_date is True
+        assert outcome.committed is False
+        assert outcome.disconnect is None
+        # A transfer intent is a promise of content, not an up-to-date answer.
+        transfer = reader.handle("server-intent", server_intent("xfer-full"))
+        assert transfer.up_to_date is False
+
     def test_nothing_is_visible_before_payload_transferred(self) -> None:
         """A payload version is the unit of consistency; half of one is not a state."""
         held = _SkillObjectSet()
@@ -1312,7 +1323,17 @@ class _DyingResponse:
         pass
 
 
-class _DyingStreamRequester:
+class _FakeRequester:
+    """
+    Base for the requester fakes: supplies the ``interrupt`` the store calls on
+    ``close``, so each fake only scripts the part it is about.
+    """
+
+    def interrupt(self) -> None:
+        """No real socket to reach; these fakes end their own connections."""
+
+
+class _DyingStreamRequester(_FakeRequester):
     """Every connection transfers a payload, then dies with *exc* mid-read."""
 
     def __init__(self, exc: BaseException) -> None:
@@ -1335,7 +1356,7 @@ class _ScriptedConnection:
         self.closed = True
 
 
-class _ScriptedRequester:
+class _ScriptedRequester(_FakeRequester):
     """Raises a scripted sequence, so backoff is asserted without real sockets."""
 
     def __init__(self, *outcomes: Any) -> None:
@@ -1361,7 +1382,7 @@ class _ScriptedRequester:
         return _ScriptedConnection(outcome)
 
 
-class _RecyclingRequester:
+class _RecyclingRequester(_FakeRequester):
     """
     A healthy server that recycles connections: every ``stream`` call succeeds,
     transfers a full payload, and then ends the connection, as LaunchDarkly and
@@ -1383,6 +1404,53 @@ class _RecyclingRequester:
         )
 
 
+class _UpToDateRecyclingRequester(_FakeRequester):
+    """
+    A healthy server with nothing new to say: every connection answers
+    ``intentCode: "none"`` — the stream's equivalent of a 304 — transfers
+    nothing, and is then recycled. This is the steady state of an environment
+    whose skills are not changing, which is most environments most of the time.
+    """
+
+    def __init__(self, farewell: bool = False) -> None:
+        self.connections = 0
+        self._farewell = farewell
+
+    def stream(self, basis: str | None) -> Any:
+        self.connections += 1
+        script: list[tuple[str, Any]] = [
+            ("server-intent", server_intent("none")),
+            ("heart-beat", {}),
+        ]
+        if self._farewell:
+            # A recycle is often announced rather than abrupt.
+            script.append(("goodbye", {"reason": "connection recycled"}))
+        return _ScriptedConnection(script)
+
+
+class _SlowPollRequester(_FakeRequester):
+    """
+    A poll whose request does not return until the test releases it, standing in
+    for one blocked where no interrupt can reach: inside its connect.
+    """
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def poll(self, basis: str | None, etag: str | None) -> Any:
+        self.entered.set()
+        self.release.wait(timeout=10)
+        raise _RecoverableTransportError("released")
+
+
+class _SilentStreamRequester(_FakeRequester):
+    """A stream that connects and then delivers nothing until it is closed."""
+
+    def stream(self, basis: str | None) -> Any:
+        return _BlockingConnection()
+
+
 class _BlockingConnection:
     """A stream that never produces an event until it is closed."""
 
@@ -1398,7 +1466,7 @@ class _BlockingConnection:
         self._closed.set()
 
 
-class _SlowConnectRequester:
+class _SlowConnectRequester(_FakeRequester):
     """
     A ``stream`` whose connect does not return until the test releases it,
     standing in for a slow TLS handshake, followed by a read that never yields.
@@ -1447,7 +1515,11 @@ class TestFailureHandling:
     ) -> None:
         endpoint.queue_poll(status=401)
         with poll_store(endpoint) as store:
-            assert store.wait_for_skills(timeout=5) is True
+            started = time.monotonic()
+            # Released promptly, and ``False``: no payload arrived, and saying
+            # otherwise would send a caller on to read a store holding nothing.
+            assert store.wait_for_skills(timeout=5) is False
+            assert time.monotonic() - started < 2.0
             assert store.failed is not None
 
     def test_a_fatal_failure_keeps_last_known_good_servable(
@@ -1511,6 +1583,28 @@ class TestFailureHandling:
             # may read 1 mid-reconnect. What it must never do is climb.
             assert store.diagnostics.connection_failures <= 1
             assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("farewell", [False, True], ids=["dropped", "goodbye"])
+    def test_an_up_to_date_recycled_stream_is_not_a_failure(
+        self, farewell: bool
+    ) -> None:
+        # Resetting at a commit covers only a connection that carried new
+        # content. An environment whose skills are not changing answers every
+        # reconnect with ``intentCode: "none"`` and transfers nothing, so a loop
+        # that counted those drops would give up on a *healthy* idle stream
+        # after max_consecutive_failures + 1 recycles — and revocation, the one
+        # thing streaming exists to deliver promptly, would never arrive again.
+        requester = _UpToDateRecyclingRequester(farewell=farewell)
+        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        try:
+            store.start()
+            assert wait_until(lambda: requester.connections >= 8)
+            assert store.failed is None
+            # As with a payload-carrying recycle, the count may read 1
+            # mid-reconnect. What it must never do is climb.
+            assert store.diagnostics.connection_failures <= 1
         finally:
             store.close()
 
@@ -2194,6 +2288,64 @@ class _BlackHole:
         self._listener.close()
 
 
+class _StalledBody:
+    """
+    A listening socket that answers with headers and then stalls the body.
+
+    Distinct from ``_BlackHole``: here the request succeeds far enough to hand
+    urllib a response, and the caller then parks in ``read``. That is the state
+    ``close`` has to interrupt — and, unlike a request still inside its connect,
+    the state an interrupt can actually reach.
+    """
+
+    def __init__(self) -> None:
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self._accepted: list[socket.socket] = []
+        self.serving = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve_forever, daemon=True)
+        self._thread.start()
+        host, port = self._listener.getsockname()
+        self.base_uri = f"http://{host}:{port}"
+
+    def _serve_forever(self) -> None:
+        self._listener.settimeout(0.05)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                continue
+            self._accepted.append(conn)
+            try:
+                conn.recv(4096)
+                # A length far longer than the body that follows, so the read
+                # blocks rather than seeing the end of the message.
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: 4096\r\n\r\n"
+                )
+            except OSError:
+                continue
+            self.serving.set()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        for conn in self._accepted:
+            conn.close()
+        self._listener.close()
+
+
+@pytest.fixture
+def stalled_body() -> Any:
+    server = _StalledBody()
+    yield server
+    server.close()
+
+
 @pytest.fixture
 def black_hole() -> Any:
     server = _BlackHole()
@@ -2274,3 +2426,156 @@ class TestTimeouts:
         # constructor does not offer a parameter that would only pretend to.
         with pytest.raises(TypeError):
             FDv2SkillStore(SDK_KEY, connect_timeout=2.0)  # type: ignore[call-arg]
+
+
+class TestWaitingForSkills:
+    """
+    ``wait_for_skills`` answers with what happened, and never outlives it.
+
+    Its budget is a boot-ordering allowance, not a delay to spend: a store that
+    already knows no payload is coming owes the caller that answer immediately.
+    """
+
+    def test_close_releases_a_waiter_rather_than_leaving_it_parked(self) -> None:
+        # A shutdown racing a waiter is the ordinary case, not an exotic one:
+        # ``close`` on the main thread while a worker is still waiting for its
+        # first payload. Parking that worker for the rest of its timeout adds
+        # the whole budget to a process that has already decided to stop.
+        store = stream_store(_requester=_SilentStreamRequester())
+        store.start()
+        answers: list[bool] = []
+        waiter = threading.Thread(
+            target=lambda: answers.append(store.wait_for_skills(timeout=10)),
+            daemon=True,
+        )
+        waiter.start()
+        time.sleep(0.2)
+        started = time.monotonic()
+        store.close()
+        waiter.join(timeout=5)
+        assert not waiter.is_alive()
+        assert time.monotonic() - started < 2.0
+        assert answers == [False]
+
+    def test_a_payload_already_held_still_answers_true_after_close(self) -> None:
+        # ``close`` does not drop content, so it must not turn the answer about
+        # that content into a lie either.
+        requester = _RecyclingRequester()
+        store = stream_store(_requester=requester)
+        try:
+            store.start()
+            assert store.wait_for_skills(timeout=5) is True
+        finally:
+            store.close()
+        assert store.wait_for_skills(timeout=5) is True
+
+    def test_a_restarted_store_waits_again(self) -> None:
+        # The released flag is sticky by design, so a store closed before any
+        # payload and then started again has to re-arm: otherwise the next
+        # waiter is let go before delivery has had a chance to begin.
+        store = stream_store(_requester=_SilentStreamRequester())
+        store.start()
+        store.close()
+        assert store.wait_for_skills(timeout=0.1) is False
+        store.start()
+        try:
+            started = time.monotonic()
+            assert store.wait_for_skills(timeout=0.5) is False
+            # Waited, rather than being released by the previous close.
+            assert time.monotonic() - started >= 0.4
+        finally:
+            store.close()
+
+
+class TestPollShutdown:
+    """
+    ``close`` has to interrupt a poll in flight, as it already does a stream.
+
+    Without it the delivery thread stays parked in its request and ``close``
+    returns only when the join times out — on a 300s-class request, long after
+    the process meant to exit. The bound is loose on purpose: the point is
+    promptly rather than a particular number of milliseconds.
+    """
+
+    def test_interrupt_unblocks_a_poll_stalled_in_its_body(
+        self, stalled_body: Any
+    ) -> None:
+        requester = _Requester(SDK_KEY, stalled_body.base_uri, read_timeout=30.0)
+        raised: list[BaseException] = []
+
+        def poll_until_interrupted() -> None:
+            try:
+                requester.poll(None, None)
+            except BaseException as exc:
+                raised.append(exc)
+
+        thread = threading.Thread(target=poll_until_interrupted, daemon=True)
+        thread.start()
+        assert stalled_body.serving.wait(timeout=5)
+        # The response is in hand; give the read a moment to park in it.
+        time.sleep(0.2)
+        started = time.monotonic()
+        requester.interrupt()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert time.monotonic() - started < 2.0
+        assert raised and isinstance(raised[0], _RecoverableTransportError)
+
+    def test_close_during_a_stalled_poll_returns_promptly(
+        self, stalled_body: Any
+    ) -> None:
+        store = FDv2SkillStore(
+            SDK_KEY,
+            base_uri=stalled_body.base_uri,
+            mode="poll",
+            poll_interval=0.05,
+            read_timeout=30.0,
+        )
+        store.start()
+        assert stalled_body.serving.wait(timeout=5)
+        time.sleep(0.2)
+        started = time.monotonic()
+        store.close(timeout=5.0)
+        assert time.monotonic() - started < 2.0
+        assert store._thread is not None and not store._thread.is_alive()
+
+    def test_a_poll_we_interrupted_is_not_a_delivery_failure(
+        self, stalled_body: Any
+    ) -> None:
+        # Our own shutdown is not an outage: counting it would spend a retry
+        # from the bounded budget and leave a misleading ``last_error`` behind
+        # on a store whose content is still perfectly good.
+        store = FDv2SkillStore(
+            SDK_KEY,
+            base_uri=stalled_body.base_uri,
+            mode="poll",
+            poll_interval=0.05,
+            read_timeout=30.0,
+        )
+        store.start()
+        assert stalled_body.serving.wait(timeout=5)
+        time.sleep(0.2)
+        store.close(timeout=5.0)
+        assert store.diagnostics.connection_failures == 0
+        assert store.diagnostics.last_error is None
+        assert store.failed is None
+
+    def test_a_close_that_timed_out_leaves_the_store_restartable(self) -> None:
+        # A request blocked inside its connect is beyond any interrupt, so
+        # ``close`` can still return with the thread alive. ``start`` must not
+        # then find that thread and return with the stop flag set: the store
+        # would report itself started and never deliver again.
+        requester = _SlowPollRequester()
+        store = FDv2SkillStore(
+            SDK_KEY, mode="poll", poll_interval=0.01, _requester=requester
+        )
+        try:
+            store.start()
+            assert requester.entered.wait(timeout=5)
+            store.close(timeout=0.2)
+            assert store._thread is not None and store._thread.is_alive()
+            store.start()
+            assert store._stop.is_set() is False
+        finally:
+            requester.release.set()
+            store.close(timeout=2)

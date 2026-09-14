@@ -487,6 +487,14 @@ class _TransferOutcome:
     basis: str | None = None
     fatal: str | None = None
     disconnect: str | None = None
+    up_to_date: bool = False
+    """
+    The server said what we hold is current and it has nothing to transfer.
+
+    A complete answer that commits nothing, which is exactly what a 304 is to a
+    poll. The delivery loop counts it as a healthy connection; see
+    ``FDv2SkillStore._apply``.
+    """
 
 
 class _ProtocolReader:
@@ -576,6 +584,10 @@ class _ProtocolReader:
             if intent != _INTENT_TRANSFER_NONE:
                 logger.debug("Ignoring FDv2 server-intent with intentCode %r", intent)
             self._pending = None
+            # ``none`` is a complete answer that carries nothing. An intent this
+            # module does not recognise is not an answer at all, so only the
+            # former reports itself up to date.
+            return _TransferOutcome(up_to_date=intent == _INTENT_TRANSFER_NONE)
         return _TransferOutcome()
 
     def _target_for(self, data: Any) -> _SkillObjectSet | None:
@@ -942,6 +954,25 @@ class _Requester:
         self._read_timeout = read_timeout
         # Injectable so tests can drive a fake endpoint without a socket.
         self._opener = opener or urllib.request.build_opener()
+        self._lock = threading.Lock()
+        # The response of a poll in flight, so ``interrupt`` can reach its
+        # socket from another thread. Polling only: a stream's response is
+        # handed straight to the caller as a ``_StreamConnection``, which
+        # carries an interrupt of its own.
+        self._in_flight: Any = None
+
+    def interrupt(self) -> None:
+        """
+        Unblocks a poll parked in its body read, from another thread.
+
+        Best effort, and safe to call when nothing is in flight. A request still
+        inside its connect has no response to reach yet and is bounded only by
+        ``read_timeout``; ``FDv2SkillStore.start`` covers what that leaves.
+        """
+        with self._lock:
+            response = self._in_flight
+        if response is not None:
+            _interrupt_read(response)
 
     def _url(self, path: str, basis: str | None) -> str:
         """
@@ -972,11 +1003,17 @@ class _Requester:
         request = self._request(POLL_PATH, basis, headers)
         try:
             with self._opener.open(request, timeout=self._read_timeout) as response:
-                status = getattr(response, "status", None) or response.getcode()
-                if status == 304:
-                    return _PollResult(not_modified=True, events=[], etag=etag)
-                body = response.read()
-                new_etag = response.headers.get("ETag") or etag
+                with self._lock:
+                    self._in_flight = response
+                try:
+                    status = getattr(response, "status", None) or response.getcode()
+                    if status == 304:
+                        return _PollResult(not_modified=True, events=[], etag=etag)
+                    body = response.read()
+                    new_etag = response.headers.get("ETag") or etag
+                finally:
+                    with self._lock:
+                        self._in_flight = None
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
                 # urllib raises on 304 when no redirect handler swallows it.
@@ -1225,6 +1262,18 @@ class FDv2SkillStore:
 
         self._stop = threading.Event()
         self._first_payload = threading.Event()
+        """A payload has committed. The fact ``wait_for_skills`` reports."""
+        self._delivery_ended = threading.Event()
+        """
+        Delivery has stopped, by ``close`` or by ``_give_up``. Kept apart from
+        ``_first_payload`` because it is not one: a waiter has to be let go
+        either way, but only a payload makes ``wait_for_skills`` true.
+        """
+        self._released = threading.Event()
+        """
+        Either of the two above, and what a waiter actually parks on: an
+        ``Event`` cannot wait on two, so the setters funnel through here.
+        """
         self._thread: threading.Thread | None = None
         self._failed_reason: str | None = None
         # The open streaming connection, so ``close`` can interrupt its read.
@@ -1244,7 +1293,13 @@ class FDv2SkillStore:
         Does not block: use ``wait_for_skills`` when boot ordering matters.
         """
         with self._lock:
+            self._rearm_waiters()
             if self._thread is not None and self._thread.is_alive():
+                # A ``close`` whose join timed out leaves the previous thread
+                # running with the stop flag still set. Clearing it lets that
+                # thread carry on delivering, rather than leaving a store that
+                # reports itself started and never delivers again.
+                self._stop.clear()
                 return self
             self._stop.clear()
             self._thread = threading.Thread(
@@ -1252,6 +1307,16 @@ class FDv2SkillStore:
             )
             self._thread.start()
         return self
+
+    def _rearm_waiters(self) -> None:
+        """
+        Re-arms ``wait_for_skills`` for a store being started again after a
+        ``close``. A payload already held stays an answer; an ended delivery
+        does not, or the next waiter would be released before it began.
+        """
+        self._delivery_ended.clear()
+        if not self._first_payload.is_set():
+            self._released.clear()
 
     def close(self, timeout: float = 5.0) -> None:
         """
@@ -1262,12 +1327,17 @@ class FDv2SkillStore:
         package-level ``launchdarkly_ai_server.shutdown()`` coroutine.
         """
         self._stop.set()
+        # A waiter parked in ``wait_for_skills`` is owed an answer now rather
+        # than at the end of its timeout; delivery is over either way.
+        self._end_delivery()
         # The delivery thread is normally blocked in a socket read that no flag
-        # can reach; without this the join waits out its full timeout.
+        # can reach; without this the join waits out its full timeout. Streaming
+        # parks in the connection, polling in the request, so interrupt both.
         with self._lock:
             connection = self._connection
         if connection is not None:
             connection.close()
+        self._requester.interrupt()
         thread = self._thread
         if (
             thread is not None
@@ -1288,8 +1358,24 @@ class FDv2SkillStore:
 
         ``True`` means a payload arrived — not that any skill in it verified, and
         not that the environment has any skills. ``diagnostics`` answers the rest.
+
+        Returns early, ``False``, when delivery ends before any payload does:
+        a ``close`` from another thread, or a failure delivery cannot retry.
+        Waiting out the full timeout for an answer that has already arrived
+        would delay every shutdown that raced a waiter.
         """
-        return self._first_payload.wait(timeout=timeout)
+        self._released.wait(timeout=timeout)
+        return self._first_payload.is_set()
+
+    def _publish_first_payload(self) -> None:
+        """Records the first committed payload and lets any waiter go."""
+        self._first_payload.set()
+        self._released.set()
+
+    def _end_delivery(self) -> None:
+        """Records that delivery has stopped and lets any waiter go."""
+        self._delivery_ended.set()
+        self._released.set()
 
     @property
     def failed(self) -> str | None:
@@ -1383,6 +1469,11 @@ class FDv2SkillStore:
                 self._give_up(str(exc))
                 return
             except _RecoverableTransportError as exc:
+                if self._stop.is_set():
+                    # ``close`` interrupted the request on purpose. Counting it
+                    # would spend a retry from the bounded budget and leave a
+                    # misleading ``last_error`` on a healthy store.
+                    return
                 with self._lock:
                     self._failures += 1
                     failures = self._failures
@@ -1432,8 +1523,8 @@ class FDv2SkillStore:
             "the process restarts with a working connection.",
             reason,
         )
-        # Unblock anyone waiting on a first payload that is never coming.
-        self._first_payload.set()
+        # Let go of anyone waiting on a first payload that is never coming.
+        self._end_delivery()
 
     def _apply(self, name: str, data: Any) -> None:
         """
@@ -1444,10 +1535,16 @@ class FDv2SkillStore:
             outcome = self._reader.handle(name, data)
             if outcome.committed and outcome.basis is not None:
                 self._basis = outcome.basis
-        if outcome.committed:
-            # A commit breaks the row of consecutive failures.
+        if outcome.committed or outcome.up_to_date:
+            # Both break the row of consecutive failures: a commit is a payload
+            # delivered, and ``up_to_date`` is the server confirming we already
+            # hold it. Counting only the commit would give up on a healthy
+            # stream serving an environment whose skills are not changing:
+            # nothing to transfer means no commit, while every recycled
+            # connection still ends in a drop.
             self._record_success()
-            self._first_payload.set()
+        if outcome.committed:
+            self._publish_first_payload()
             if outcome.changes:
                 self._notify(outcome.changes)
         if outcome.fatal:
@@ -1465,7 +1562,7 @@ class FDv2SkillStore:
             logger.debug("Skill payload unchanged (HTTP 304)")
             # A 304 counts as a first payload, so a boot that reconnects with a
             # cached basis is not blocked on a transfer the server will not send.
-            self._first_payload.set()
+            self._publish_first_payload()
             return
         for name, data in result.events:
             self._apply(name, data)
