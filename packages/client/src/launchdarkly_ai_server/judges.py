@@ -29,7 +29,7 @@ from .utils import (
     truncate_judge_reasoning,
 )
 
-_REASONING_DISABLED_VALUES = frozenset({"0", "false", "off", "no"})
+_REASONING_ENABLED_VALUES = frozenset({"1", "true", "on", "yes"})
 
 
 def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
@@ -44,11 +44,13 @@ logger = logging.getLogger(__name__)
 
 
 def judge_reasoning_enabled() -> bool:
-    """Whether judge reasoning leaves the process. Enabled unless ``LD_CAPTURE_JUDGE_REASONING``
-    is set to a falsy value.
+    """Whether judge reasoning leaves the process. Opt-in via ``LD_CAPTURE_JUDGE_REASONING``.
+
+    Reasoning is model prose about the evaluated conversation and may quote it, so it stays in
+    the process until a deployment asks for it.
     """
     value = os.environ.get("LD_CAPTURE_JUDGE_REASONING", "").strip().lower()
-    return value not in _REASONING_DISABLED_VALUES
+    return value in _REASONING_ENABLED_VALUES
 
 
 def build_judge_track_data(

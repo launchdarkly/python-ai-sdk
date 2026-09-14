@@ -426,6 +426,10 @@ class TestJudgeReasoning:
             "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
         }
 
+    @pytest.fixture(autouse=True)
+    def _opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LD_CAPTURE_JUDGE_REASONING", "true")
+
     async def _run(
         self, client: MagicMock, reasoning: str = "clear and correct"
     ) -> None:
@@ -464,10 +468,10 @@ class TestJudgeReasoning:
         assert track_data["judgeConfigKey"] == "judge-1"
         assert track_data["runId"] == "run-1"
 
-    async def test_reasoning_can_be_suppressed_without_losing_the_score(
+    async def test_reasoning_is_withheld_by_default_without_losing_the_score(
         self, mock_ld_client: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("LD_CAPTURE_JUDGE_REASONING", "false")
+        monkeypatch.delenv("LD_CAPTURE_JUDGE_REASONING")
         await self._run(mock_ld_client)
 
         _metric_key, _context, track_data, score = mock_ld_client.track.call_args[0]
@@ -489,13 +493,13 @@ class TestJudgeReasoning:
         assert len(track_data["judgeReasoning"]) == JUDGE_REASONING_MAX_LENGTH + 1
         assert track_data["judgeReasoning"].endswith("…")
 
-    def test_explanation_is_not_gated_on_capture_content(
+    def test_explanation_follows_the_opt_in_not_capture_content(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         assert judge_explanation("clear and correct") == "clear and correct"
         assert judge_explanation("") is None
 
-        monkeypatch.setenv("LD_CAPTURE_JUDGE_REASONING", "off")
+        monkeypatch.delenv("LD_CAPTURE_JUDGE_REASONING")
         assert judge_explanation("clear and correct") is None
 
 
@@ -524,8 +528,10 @@ class TestRunJudgeTrackData:
         )
 
     async def test_track_data_carries_reasoning(
-        self, mock_ld_client: MagicMock
+        self, mock_ld_client: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("LD_CAPTURE_JUDGE_REASONING", "true")
+
         async def fn(
             config, user_input, tool_handlers, variables, history=None
         ) -> dict:  # type: ignore[override]
