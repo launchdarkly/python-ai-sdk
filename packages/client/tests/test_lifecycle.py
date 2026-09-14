@@ -12,14 +12,20 @@ import pytest
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server import get_client, init_client, inspect_config, shutdown
 from launchdarkly_ai_server.lifecycle import _reset_for_testing
+from launchdarkly_ai_server.sdk_info import (
+    register_ai_sdk_package,
+    reset_ai_sdk_info,
+)
 
 
 @pytest.fixture(autouse=True)
 def reset_singleton() -> None:
     """Ensure a fresh singleton for every test."""
     _reset_for_testing()
+    reset_ai_sdk_info(clear_known=True)
     yield
     _reset_for_testing()
+    reset_ai_sdk_info(clear_known=True)
 
 
 def _make_stub_client() -> MagicMock:
@@ -66,6 +72,39 @@ class TestInitClientBYOC:
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=stub)
         assert get_client() is stub
+
+    async def test_flushes_registered_ai_package_information(self) -> None:
+        stub = _make_stub_client()
+        register_ai_sdk_package("launchdarkly-ai-server", "0.1.3")
+
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+
+        stub.track.assert_called_once_with(
+            "$ld:ai:sdk:info",
+            {"kind": "ld_ai", "key": "ld-internal-tracking", "anonymous": True},
+            {
+                "aiSdkName": "launchdarkly-ai-server",
+                "aiSdkVersion": "0.1.3",
+                "aiSdkLanguage": "python",
+            },
+            1,
+        )
+
+    async def test_flushes_package_registered_after_initialization(self) -> None:
+        stub = _make_stub_client()
+        register_ai_sdk_package("launchdarkly-ai-server", "0.1.3")
+
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+            stub.track.reset_mock()
+            register_ai_sdk_package("launchdarkly-ai-openai-agents", "0.1.4")
+            await init_client()
+
+        stub.track.assert_called_once()
+        assert (
+            stub.track.call_args.args[2]["aiSdkName"] == "launchdarkly-ai-openai-agents"
+        )
 
     async def test_does_not_call_node_sdk(self) -> None:
         stub = _make_stub_client()
@@ -218,6 +257,19 @@ class TestShutdown:
             await shutdown()
             await init_client(client=stub2)
         assert get_client() is stub2
+
+    async def test_reemits_registered_packages_after_shutdown(self) -> None:
+        stub1 = _make_stub_client()
+        stub2 = _make_stub_client()
+        register_ai_sdk_package("launchdarkly-ai-server", "0.1.3")
+
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub1)
+            await shutdown()
+            await init_client(client=stub2)
+
+        stub1.track.assert_called_once()
+        stub2.track.assert_called_once()
 
     async def test_idempotent_double_shutdown(self) -> None:
         stub = _make_stub_client()

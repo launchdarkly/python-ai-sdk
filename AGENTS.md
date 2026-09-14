@@ -123,10 +123,11 @@ The client manages a singleton connection to LaunchDarkly and the associated tel
 
 | Export | Description |
 |---|---|
-| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. |
-| `init_client(client=...)` | **BYOC overload** — accepts a pre-initialized `LDClientInterface`. Stores it directly without calling the SDK. |
+| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. |
+| `init_client(client=...)` | **BYOC overload** — accepts a pre-initialized `LDClientInterface`. Stores it directly without calling the SDK. Flushes pending `$ld:ai:sdk:info` events. |
 | `get_client()` | Returns the initialized `LDClientInterface`. Throws if initialization has not completed. |
-| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. |
+| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. |
+| `register_ai_sdk_package(name, version)` | Records a LaunchDarkly AI package identity. Handler and convenience packages call this at import time. |
 
 ### Core Data Types
 
@@ -235,7 +236,7 @@ Payload attached to every LaunchDarkly tracking event.
 | `modelName` | `str` | Model name from the config. |
 | `providerName` | `str` | Provider name from the config. |
 | `graphKey` | `str?` | Present when the event was produced inside an agent graph. |
-| `toolName` | `str?` | Present when the event is for a tool call. |
+| `toolKey` | `str?` | Present when the event is for a tool call. |
 | `judgeConfigKey` | `str?` | Present when the event is from a judge execution. |
 | `judgeReasoning` | `str?` | The judge's explanation of its score. Present on judge evaluation metric events when the judge returned reasoning. Truncated at 4000 characters; suppressed by `LD_CAPTURE_JUDGE_REASONING=false`. |
 
@@ -506,7 +507,7 @@ Do not hand-write a `span.set_attribute` for anything a shared helper covers. Th
 |---|---|
 | `set_model_identity_attributes` | `gen_ai.system`, `gen_ai.provider.name`, `gen_ai.request.model` |
 | `set_usage_span_attributes` | all seven `gen_ai.usage.*` keys, always, including zeros |
-| `set_ld_span_attributes` | the `launchdarkly.*` identity and the `feature_flag` event |
+| `set_ld_span_attributes` | the `launchdarkly.*` identity, per-kind `context.contextKeys.*`, and the `feature_flag` event |
 | `set_input_content_attributes` | prompts, system instructions, tool catalog, gated |
 | `set_output_content_attributes` | model output, gated |
 | `set_tool_call_content_attributes` | tool arguments and results, gated |
@@ -704,3 +705,10 @@ response = await graph(
     },
 ).invoke(user_input, context)
 ```
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.

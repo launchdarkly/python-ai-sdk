@@ -1,8 +1,35 @@
 # LaunchDarkly AI SDK — Python
 
-- [Repository Layout](#repository-layout)
+---
+
+Your prompts, models, tools, and agent workflows live in LaunchDarkly instead of in your code. Call the SDK and it resolves the right configuration for the user in front of you, routes the call to whichever provider that configuration names, runs the tool loop, and records cost, latency, and quality on the way back.
+
+```python
+from launchdarkly_ai_openai_messages import openai_messages
+
+result = await openai_messages(
+    "What is feature flagging?",
+    {"kind": "user", "key": "user-123"},
+    {"key": "my-ai-config-flag"},
+)
+print(result.response)
+```
+
+That call is the whole integration. Everything it does is configured in LaunchDarkly, not in your source.
+
+## What you get
+
+- Change prompts, models, and parameters in production without redeploying
+- Serve different configurations to different users, with the same targeting you already use for feature flags
+- Roll a change out gradually, watch live metrics, and revert automatically when one crosses a threshold
+- Run agents and multi-step graphs, where each step can use a different provider
+- Score output quality with judges, including scoring that stays off the request path
+- See cost, latency, token usage, errors, and full conversations with no instrumentation code
+- Keep the providers and frameworks you already run: OpenAI, Anthropic, LangChain, or your own handler
+
+- [What you get](#what-you-get)
 - [How It Works](#how-it-works)
-- [Package Structure](#package-structure)
+- [Packages](#packages)
 - [Quick Start](#quick-start)
   - [1. Install](#1-install)
   - [2. Configure environment](#2-configure-environment)
@@ -20,38 +47,7 @@
 - [Telemetry](#telemetry)
 - [Development](#development)
   - [Running the examples](#running-the-examples)
-
----
-
-A Python monorepo for integrating LaunchDarkly AgentControl with multiple AI providers. LaunchDarkly manages which model, provider, prompt, and tools are used at runtime via feature flags — your code just calls the right handler.
-
-## Repository Layout
-
-```
-python-ai-sdk/
-├── main.py              # Entry point — brokers to an example based on CLI args
-├── examples/            # Runnable examples (not part of any published package)
-│   ├── agent.py         # config() with the global registry
-│   ├── graph_example.py # graph() multi-agent workflow
-│   ├── openai_only.py   # config() with an OpenAI-only registry
-│   ├── register.py      # Global registry setup (handlers + tools)
-│   ├── streaming.py     # config().stream() — token-by-token output
-│   ├── tools.py         # Tool implementations (get_preferences, web_search, etc.)
-│   └── utils.py         # Shared helpers (new_context, write_output)
-├── packages/
-│   ├── client/          # launchdarkly-ai-server       — core client (Tier 0)
-│   ├── ai/              # launchdarkly-ai-python        — convenience barrel re-export
-│   ├── claude-agents/   # launchdarkly-ai-claude-agents
-│   ├── claude-messages/ # launchdarkly-ai-claude-messages
-│   ├── openai-agents/   # launchdarkly-ai-openai-agents
-│   ├── openai-messages/ # launchdarkly-ai-openai-messages
-│   ├── langchain-agents/   # launchdarkly-ai-langchain-agents
-│   └── langchain-messages/ # launchdarkly-ai-langchain-messages
-├── .env.example         # Template — copy to .env and fill in your values
-└── agents.md            # Architecture reference for AI agents and contributors
-```
-
-The `examples/` directory is a **sample implementation** showing how a consumer application wires the packages together. These files are not published and are not part of any package.
+  - [Repository layout](#repository-layout)
 
 ## How It Works
 
@@ -60,9 +56,9 @@ The `examples/` directory is a **sample implementation** showing how a consumer 
 3. The SDK routes to the correct provider handler, executes the call, and emits telemetry.
 4. You can change providers, models, or prompts in LaunchDarkly without deploying code.
 
-## Package Structure
+## Packages
 
-This monorepo follows a three-tier architecture. Dependencies only flow downward.
+Packages are layered so that dependencies only flow downward.
 
 ```
 Tier 2 — Consumer Application  (main.py, your app)
@@ -77,9 +73,9 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | Package | Description |
 | --- | --- |
 | [`launchdarkly-ai-server`](packages/client/README.md) | Core client — LaunchDarkly lifecycle, telemetry, shared types, `config()`, `graph()` |
-| [`launchdarkly-ai`](packages/ai/README.md) | Convenience barrel — re-exports all of `launchdarkly-ai-server`. Install this for the simplest setup. |
+| [`launchdarkly-ai-python`](packages/ai/README.md) | Convenience barrel — re-exports all of `launchdarkly-ai-server`. Install this for the simplest setup. |
 
-### Handler Packages
+### Pick your providers
 
 | Package | Provider | Mode | Description |
 | --- | --- | --- | --- |
@@ -95,15 +91,15 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 ### 1. Install
 
 ```bash
-pip install launchdarkly-ai-python launchdarkly-ai-openai-messages
+pip install launchdarkly-ai-python launchdarkly-server-sdk launchdarkly-ai-openai-messages
 ```
 
-`launchdarkly-ai` is a thin barrel that re-exports all of `launchdarkly-ai-server`. `init_client()` auto-discovers `launchdarkly-server-sdk` at runtime — no extra setup required.
+`launchdarkly-ai-python` is a thin barrel that re-exports all of `launchdarkly-ai-server`. The base LaunchDarkly Python SDK is a peer dependency rather than a bundled one, so install `launchdarkly-server-sdk` alongside it. `init_client()` discovers it at runtime, or you can skip it entirely by passing a pre-initialized client with `init_client(client=my_client)`.
 
 **With telemetry** (recommended for production) — traces export to the LaunchDarkly Observability dashboard:
 
 ```bash
-pip install "launchdarkly-ai-python[otel]" launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-python[otel]" launchdarkly-server-sdk launchdarkly-ai-openai-messages
 ```
 
 No code changes are needed — `init_client()` detects whether the OTel packages are present at runtime and configures the tracer provider automatically. If they are absent, the SDK logs a one-time warning and continues normally.
@@ -617,3 +613,31 @@ uv run python main.py openai-only my-flag-key "What is feature flagging?"
 Output from each run is written as a timestamped JSON file to the `output/` directory.
 
 See [`agents.md`](agents.md) for the full architecture reference.
+
+### Repository layout
+
+```
+python-ai-sdk/
+├── main.py              # Entry point — brokers to an example based on CLI args
+├── examples/            # Runnable examples (not part of any published package)
+│   ├── agent.py         # config() with the global registry
+│   ├── graph_example.py # graph() multi-agent workflow
+│   ├── openai_only.py   # config() with an OpenAI-only registry
+│   ├── register.py      # Global registry setup (handlers + tools)
+│   ├── streaming.py     # config().stream() — token-by-token output
+│   ├── tools.py         # Tool implementations (get_preferences, web_search, etc.)
+│   └── utils.py         # Shared helpers (new_context, write_output)
+├── packages/
+│   ├── client/          # launchdarkly-ai-server       — core client (Tier 0)
+│   ├── ai/              # launchdarkly-ai-python        — convenience barrel re-export
+│   ├── claude-agents/   # launchdarkly-ai-claude-agents
+│   ├── claude-messages/ # launchdarkly-ai-claude-messages
+│   ├── openai-agents/   # launchdarkly-ai-openai-agents
+│   ├── openai-messages/ # launchdarkly-ai-openai-messages
+│   ├── langchain-agents/   # launchdarkly-ai-langchain-agents
+│   └── langchain-messages/ # launchdarkly-ai-langchain-messages
+├── .env.example         # Template — copy to .env and fill in your values
+└── agents.md            # Architecture reference for AI agents and contributors
+```
+
+The `examples/` directory is a **sample implementation** showing how a consumer application wires the packages together. These files are not published and are not part of any package.

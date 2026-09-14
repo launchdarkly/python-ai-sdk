@@ -1,6 +1,9 @@
-"""LaunchDarkly AI SDK - core client for Python."""
+"""LaunchDarkly AI SDK - core client for Python.
 
-__version__ = "0.1.3"  # x-release-please-version
+See https://launchdarkly.com/docs for usage.
+"""
+
+__version__ = "0.2.2"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .content import (
@@ -21,6 +24,14 @@ from .conversation import (
     conversation_id,
     set_conversation_id_if_absent,
 )
+from .evaluations import (
+    EvalRunResult,
+    EvaluationsError,
+    EvaluationsModule,
+    GenerationConfig,
+    RunSummary,
+    init_evaluations,
+)
 from .graph import GraphInstance, graph, resolve_graph
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
@@ -37,6 +48,7 @@ from .registry import (
     resolve_handlers,
     resolve_tools,
 )
+from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -155,6 +167,13 @@ __all__ = [  # noqa: RUF022
     "text_message",
     "to_semconv_finish_reason",
     "VariationMeta",
+    # evaluations
+    "EvalRunResult",
+    "EvaluationsError",
+    "EvaluationsModule",
+    "GenerationConfig",
+    "RunSummary",
+    "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",
@@ -184,6 +203,9 @@ __all__ = [  # noqa: RUF022
     "shutdown",
     "extract_variation",
     "inspect_config",
+    "SDK_INFO_CONTEXT",
+    "SDK_INFO_EVENT",
+    "register_ai_sdk_package",
     # judges
     "build_judge_tasks",
     "run_judge",
@@ -200,3 +222,5 @@ __all__ = [  # noqa: RUF022
     "resolve_graph",
     "GraphInstance",
 ]
+
+register_ai_sdk_package("launchdarkly-ai-server", __version__)

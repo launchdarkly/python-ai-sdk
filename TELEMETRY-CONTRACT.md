@@ -94,7 +94,10 @@ able to tell from the trace which path ran.
 | `launchdarkly.variation.key` | `TrackData.variationKey` | `set_ld_span_attributes` |
 | `launchdarkly.run.id` | `TrackData.runId` | `set_ld_span_attributes` |
 | `launchdarkly.graph.key` | `TrackData.graphKey`, only when present | `set_ld_span_attributes` |
+| `context.contextKeys.<kind>` | raw per-kind context key, only when `variables.ldContext` has a usable identity | `set_ld_span_attributes` |
 | `launchdarkly.stream.abandoned` | `True`, only when abandoned | `end_span_once` |
+| `gen_ai.evaluation.name` | judge config key, judge roots only | `with_judge_evaluation`, see section 4a |
+| `gen_ai.evaluation.score.value` | numeric score, judge roots only | `with_judge_evaluation`, see section 4a |
 
 The root also carries one span event, `feature_flag`, with these event attributes:
 
@@ -103,6 +106,8 @@ The root also carries one span event, `feature_flag`, with these event attribute
 | `feature_flag.key` | config key |
 | `feature_flag.provider.name` | `LaunchDarkly` |
 | `feature_flag.set.id` | environment id, only when present |
+| `feature_flag.context.id` | canonical context key, only when `variables.ldContext` has a usable identity |
+| `feature_flag.contextKeys` | compact JSON of per-kind keys, only when identity is present |
 
 The root is the only span that carries the config-association attributes and the `feature_flag`
 event. Child spans carry neither. A test asserts this, so do not add them to children out of
@@ -212,31 +217,27 @@ when `conversation_id(...)` is bound.
 
 ---
 
-## 4b. Attributes on a judge span, `launchdarkly.judge`
+## 4a. Judge evaluation events
 
-Python-only, ahead of `js-ai-sdk`. One span per sampled judge evaluation, opened as a plain span
-and ended by hand. It is not made current: the judge is itself a tracked AI call, so making it
-current would reparent that call's `invoke_agent` root underneath it.
+A judge run is itself a tracked AI call (`invoke_agent` + `chat`). After the score is parsed, the
+SDK writes a `gen_ai.evaluation.result` span event on that `invoke_agent` span:
 
-| Key | Value |
+| Event attribute | Value |
 |---|---|
-| `launchdarkly.operation.type` | `judge` |
-| `launchdarkly.judge.key` | judge config key |
-| `launchdarkly.judge.score` | parsed score, only when present |
-| `launchdarkly.judge.reasoning` | parsed reasoning, only when non-empty. Truncated at 4000 characters |
-| `launchdarkly.judge.metric.key` | `evaluationMetricKey`, only when present |
-| `launchdarkly.run.id` | `TrackData.runId` of the run being evaluated |
+| `gen_ai.evaluation.name` | judge config key |
+| `gen_ai.evaluation.score.value` | numeric score, only when the judge returned a finite number |
+| `gen_ai.evaluation.explanation` | judge reasoning, only when non-empty. Truncated at 4000 characters |
 
-`launchdarkly.judge.reasoning` is not gated behind `capture_content` (section 7). Reasoning is the
-judge's own explanation of a score LaunchDarkly already receives, not conversation content, and
+The same keys are mirrored as span attributes, so section 2 lists them too.
+`gen_ai.evaluation.score.label` is not invented.
+The existing `track(evaluationMetricKey)` call still feeds AI Config Monitoring — a judge that
+returns a non-numeric score emits no evaluation event but still tracks the metric.
+
+`gen_ai.evaluation.explanation` is **not** gated behind `capture_content` (section 7). Reasoning is
+the judge's own explanation of a score LaunchDarkly already receives, not conversation content, and
 gating it there would force a caller who wants it to also ship every request and response.
-`LD_CAPTURE_JUDGE_REASONING` is the narrow switch instead.
-Setting it to `false`, `0`, `off` or `no` suppresses reasoning on the span and in the track payload
-while keeping the score.
-
-No config-association attributes and no `feature_flag` event: those stay on the root, so a
-config-scoped query keeps finding exactly one span per run. `launchdarkly.run.id` joins this span
-back to the run it evaluates.
+`LD_CAPTURE_JUDGE_REASONING` is the narrow switch instead: set it to `false`, `0`, `off` or `no` to
+suppress reasoning on the span and in the track payload while keeping the score.
 
 The same reasoning also rides the evaluation metric event as `TrackData.judgeReasoning`, on both
 the inline path and the deferred `run_judge` path, so it reaches LaunchDarkly through the

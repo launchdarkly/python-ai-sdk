@@ -9,24 +9,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import launchdarkly_ai_server.judges as judges_module
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import JudgeTask, ProviderHandler, run_judge, run_judges
+from launchdarkly_ai_server import (
+    JudgeResult,
+    JudgeTask,
+    ProviderHandler,
+    run_judge,
+    run_judges,
+)
+from launchdarkly_ai_server.judges import judge_explanation
 from launchdarkly_ai_server.utils import JUDGE_REASONING_MAX_LENGTH
 
 CONTEXT = {"kind": "user", "key": "u1"}
-
-
-class FakeSpan:
-    def __init__(self) -> None:
-        self.attributes: dict[str, Any] = {}
-        self.ended = 0
-
-    def set_attribute(self, key: str, value: Any) -> None:
-        self.attributes[key] = value
-
-    def end(self) -> None:
-        self.ended += 1
 
 
 def _make_client() -> MagicMock:
@@ -334,6 +328,54 @@ class TestRunJudges:
 
         assert called_handlers == ["messages"]
 
+    async def test_returns_judge_result_objects_with_score_and_reasoning(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """Inline results must be ``JudgeResult`` instances.
+
+        The conversation example (and ``ProviderResponse.judge_results``) read
+        ``.score`` / ``.response`` as attributes. A plain dict makes those always
+        ``None`` even when a judge ran.
+        """
+        judge_variation = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "judge",
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            result = await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=_make_handler(),
+                user_input="q",
+                llm_response="r",
+                base_track_data={"runId": "x"},
+            )
+
+        assert "judge-1" in result
+        judge = result["judge-1"]
+        assert isinstance(judge, JudgeResult)
+        # Attribute access — the pattern the conversation example uses.
+        assert getattr(judge, "score", None) == 0.9
+        assert getattr(judge, "response", None) == "good"
+
     async def test_returns_empty_dict_when_judges_array_is_empty(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -355,7 +397,7 @@ class TestRunJudges:
 
 
 class TestJudgeReasoning:
-    """Reasoning leaves the process on the metric event and on the judge span.
+    """Reasoning leaves the process on the metric event and on the evaluation event.
 
     Reference: TELEMETRY-CONTRACT.md §4a
     """
@@ -447,32 +489,14 @@ class TestJudgeReasoning:
         assert len(track_data["judgeReasoning"]) == JUDGE_REASONING_MAX_LENGTH + 1
         assert track_data["judgeReasoning"].endswith("…")
 
-    async def test_judge_span_carries_reasoning_and_score(
-        self, mock_ld_client: MagicMock
+    def test_explanation_is_not_gated_on_capture_content(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        spans: list[FakeSpan] = []
+        assert judge_explanation("clear and correct") == "clear and correct"
+        assert judge_explanation("") is None
 
-        def start_span(_span_name: str) -> FakeSpan:
-            spans.append(FakeSpan())
-            return spans[-1]
-
-        tracer = MagicMock()
-        tracer.start_span = start_span
-
-        with patch.object(judges_module.trace, "get_tracer", return_value=tracer):
-            await self._run(mock_ld_client)
-
-        assert len(spans) == 1
-        span = spans[0]
-        assert span.ended == 1
-        assert span.attributes == {
-            "launchdarkly.operation.type": "judge",
-            "launchdarkly.judge.key": "judge-1",
-            "launchdarkly.judge.score": 0.9,
-            "launchdarkly.judge.reasoning": "clear and correct",
-            "launchdarkly.judge.metric.key": "quality",
-            "launchdarkly.run.id": "run-1",
-        }
+        monkeypatch.setenv("LD_CAPTURE_JUDGE_REASONING", "off")
+        assert judge_explanation("clear and correct") is None
 
 
 class TestRunJudgeTrackData:
@@ -518,3 +542,24 @@ class TestRunJudgeTrackData:
         assert result.response == "missed the question"
         assert result.track_data["judgeReasoning"] == "missed the question"
         assert result.track_data["judgeConfigKey"] == "judge-1"
+
+
+class TestScoreGuard:
+    """`float(score)` used to sit ahead of the evaluation-metric track, so a junk score killed it."""
+
+    def test_rejects_non_numeric_scores_without_raising(self) -> None:
+        from launchdarkly_ai_server.judges import _numeric_score
+
+        for junk in ("0.9 (high)", "85%", None, {"v": 1}, [], True, False):
+            assert _numeric_score(junk) is None
+
+    def test_accepts_finite_numbers(self) -> None:
+        from math import inf, nan
+
+        from launchdarkly_ai_server.judges import _numeric_score
+
+        assert _numeric_score(0.9) == 0.9
+        assert _numeric_score(1) == 1.0
+        assert _numeric_score(0) == 0.0
+        assert _numeric_score(inf) is None
+        assert _numeric_score(nan) is None

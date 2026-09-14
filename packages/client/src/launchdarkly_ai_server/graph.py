@@ -15,6 +15,7 @@ from .types import (
     GraphDefinition,
     GraphEdge,
     GraphNode,
+    JudgeResult,
     LDContext,
     NativeTool,
     ProviderGraphResponse,
@@ -640,7 +641,7 @@ class GraphInstance:
             client.track("$ld:ai:graph:invocation_success", ld_ctx, graph_track_data, 1)
 
             # Optional graph-level judge run against the final response.
-            judge_results: dict[str, Any] | None = None
+            judge_results: dict[str, JudgeResult] | None = None
             graph_judge: str | None = resolved_options.get("graph_judge")
             root_node = graph_def.root
             if graph_judge and root_node and resolved_handlers:

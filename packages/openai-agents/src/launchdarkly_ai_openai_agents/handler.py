@@ -509,7 +509,12 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
             capture_content=capture_content,
         )
 
-    return create_handler(("OpenAI", "agent"), _call_impl, _stream_impl)  # type: ignore[arg-type]
+    return create_handler(
+        ("OpenAI", "agent"),
+        _call_impl,  # type: ignore[arg-type]
+        _stream_impl,  # type: ignore[arg-type]
+        capture_content=capture_content,
+    )
 
 
 def _stringify_output(value: Any) -> str:
