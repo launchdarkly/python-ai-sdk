@@ -26,8 +26,11 @@ from launchdarkly_ai_server import (
     SkillReference,
     get_skill,
     init_client,
+    parse_ai_config,
+    skill_refs,
     write_skills,
 )
+from launchdarkly_ai_server.types_validation import is_valid_skill_key
 
 MANIFEST_NAME = ".launchdarkly-skills.json"
 SKILL_BODY = "---\nname: Test Skill\n---\nDo the thing.\n"
@@ -1391,6 +1394,136 @@ class TestCorruptManifest:
         assert _manifest_path(root).read_text(encoding="utf-8") == "{not json at all"
 
 
+# The three literal cases the security review names for the prune path.
+#
+# The distinction from ``TestCorruptManifest`` above is the whole point: a
+# corrupt manifest suppresses every destructive action wholesale, so those tests
+# say nothing about these. Each manifest here is *well-formed* — parseable,
+# a ``manifestVersion`` this release understands, a real ``entries`` map, and an
+# entry whose ``key`` is a perfectly valid skill key that is genuinely absent
+# from the requested set. The implementation has every input it needs to prune
+# and must refuse anyway, because the recorded *path* is not one this SDK could
+# have written.
+HOSTILE_RECORDED_PATHS: list[str] = [
+    # Absolute: the classic. A recorded path read back and unlinked as-is is a
+    # delete of an attacker-chosen file with the reconcile's privileges.
+    "/etc/passwd",
+    # Traversing: the same attack for an implementation that rejects a leading
+    # slash and then joins the rest onto the root.
+    "../../../etc/passwd",
+]
+
+
+class _UnlinkSpy:
+    """Records every ``os.unlink`` while delegating to the real one.
+
+    Asserting only that ``/etc/passwd`` still exists proves nothing: the test
+    process cannot delete it anyway, so that assertion passes against an
+    implementation with no path check at all — permissions would be doing the
+    work. What has teeth is that the removal is never *attempted*: the refusal
+    happens above the syscall, on a path the SDK recomputes rather than trusts.
+    """
+
+    def __init__(self) -> None:
+        self.targets: list[str] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _UnlinkSpy:
+        real = os.unlink
+
+        def spy(path: Any, *args: Any, **kwargs: Any) -> None:
+            self.targets.append(os.fsdecode(path))
+            real(path, *args, **kwargs)
+
+        # ``safe_fs_module.os`` *is* the ``os`` module, so this covers both the
+        # descriptor-relative ``os.unlink(name, dir_fd=...)`` and the
+        # ``Path.unlink`` used on the no-``*at()`` floor.
+        monkeypatch.setattr(safe_fs_module.os, "unlink", spy)
+        return self
+
+
+class TestHostileManifestPrune:
+    """A well-formed manifest naming a path this SDK could not have written.
+
+    The manifest is untrusted input. It is a plain file on the customer's disk
+    that anything with write access to the managed root can edit, and ``prune``
+    is the one code path in the SDK that deletes. So a recorded path never
+    authorizes its own removal: it must match ``<key>/SKILL.md`` for a
+    re-validated key, and the target is recomputed from the *current* managed
+    root instead of being read back out of the entry.
+    """
+
+    @pytest.mark.parametrize("recorded", HOSTILE_RECORDED_PATHS)
+    async def test_recorded_path_outside_the_root_is_refused(
+        self, root: Path, recorded: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spy = _UnlinkSpy().install(monkeypatch)
+        _write_manifest(
+            root,
+            {
+                "manifestVersion": 1,
+                "entries": {recorded: _entry("a", 1, SKILL_BODY)},
+            },
+        )
+
+        report = await write_skills([], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert action.error is not None
+        # The refusal is about ownership of the path, not about the file's state.
+        assert "could own" in action.error
+        assert [a for a in report.actions if a.action == "removed"] == []
+        # Nothing was even attempted, let alone completed.
+        assert spy.targets == []
+        assert Path("/etc/passwd").exists()
+        # Left in place rather than tidied away: dropping the entry would let a
+        # single hostile edit erase the SDK's own record of what it manages.
+        assert recorded in _read_manifest(root)["entries"]
+
+    async def test_entry_under_a_since_symlinked_parent_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The recorded path is the SDK's own, and is still not enough.
+
+        Here the entry is exactly what a legitimate reconcile writes —
+        ``a/SKILL.md`` under key ``a`` — so the shape check that catches the two
+        cases above passes. What changed is the disk underneath it: ``<root>/a``
+        is now a symlink to somewhere else. This is the case a validate-then-act
+        implementation fails, because the manifest and the entry are both
+        entirely legitimate; only the current state of the parent is not.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        victim = elsewhere / "SKILL.md"
+        victim.write_text("victim content\n", encoding="utf-8")
+
+        # Managed legitimately first, so the manifest entry is one this SDK
+        # really did write...
+        managed = _place_managed(root, "a", SKILL_BODY)
+        # ...then the parent directory is swapped for a link out of the root.
+        managed.unlink()
+        (root / "a").rmdir()
+        (root / "a").symlink_to(elsewhere, target_is_directory=True)
+
+        spy = _UnlinkSpy().install(monkeypatch)
+        report = await write_skills([], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert action.error is not None
+        assert "symlink" in action.error
+        assert [a for a in report.actions if a.action == "removed"] == []
+        assert spy.targets == []
+        # The file the symlink pointed at is untouched, and so is the link.
+        assert victim.read_text(encoding="utf-8") == "victim content\n"
+        assert (root / "a").is_symlink()
+        assert "a/SKILL.md" in _read_manifest(root)["entries"]
+
+
 class TestWriteSkillsTelemetry:
     """Materialized / revoked signals from write_skills."""
 
@@ -1640,3 +1773,388 @@ class TestWriteSkillsTelemetry:
             f"write-only keys: {sorted(write_keys - accessor_keys)}"
         )
         assert "expected_hash" in accessor_keys
+
+
+# ---------------------------------------------------------------------------
+# Self-healing partial reconciles
+# ---------------------------------------------------------------------------
+
+
+def _place_unmanaged(root: Path, key: str, content: str) -> Path:
+    """A file at a managed path with **no** manifest entry.
+
+    Exactly the state a reconcile killed between the content writes and the
+    final manifest rewrite leaves behind — and, indistinguishably on disk, the
+    state a customer authoring their own file there creates. Which is why the
+    bytes are the only thing that may decide between them.
+    """
+    target = root / key / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return target
+
+
+class TestCrashMidReconcileRecovery:
+    """A crash between the writes and the manifest rewrite must not wedge a skill."""
+
+    async def test_byte_identical_unmanaged_file_is_adopted(self, root: Path) -> None:
+        """The whole point: the second reconcile repairs the first one's crash.
+
+        Without adoption every later reconcile takes the clobber-refusal branch
+        forever, because the file is at a managed path with no manifest entry.
+        """
+        target = _place_unmanaged(root, "a", SKILL_BODY)
+
+        first = await write_skills([_skill("a")], root)
+
+        assert first.ok is True, _error_messages(first)
+        action = _actions_by_key(first)["a"]
+        assert action.action == "skipped_current"
+        assert action.version == 1
+        assert action.path == str(target)
+        # Adopted, not rewritten, and now recorded.
+        assert target.read_text(encoding="utf-8") == SKILL_BODY
+        entry = _read_manifest(root)["entries"]["a/SKILL.md"]
+        assert entry["key"] == "a"
+        assert entry["version"] == 1
+        assert entry["sha256"] == _hash(SKILL_BODY)
+
+        # And the run after it is an ordinary no-op, through the managed path.
+        second = await write_skills([_skill("a")], root)
+        assert second.ok is True, _error_messages(second)
+        assert _actions_by_key(second)["a"].action == "skipped_current"
+
+    async def test_adoption_writes_nothing(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adoption is a manifest edit, not a write. Nothing touches the bytes."""
+        _place_unmanaged(root, "a", SKILL_BODY)
+        spy = _ReplaceSpy().install(monkeypatch)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert spy.calls == []
+
+    async def test_adoption_reports_skipped_current_not_a_new_action_kind(
+        self, root: Path, recording_emitter: Any
+    ) -> None:
+        """``skipped_current`` is reused deliberately — no ``adopted`` kind exists."""
+        skills_module._set_emitter_for_testing(recording_emitter)
+        _place_unmanaged(root, "a", SKILL_BODY)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert {a.action for a in report.actions} == {"skipped_current"}
+        props = recording_emitter.signals(MATERIALIZED_SIGNAL)[0]
+        assert props["reconcile_action"] == "skipped_current"
+        assert props["skill_key"] == "a"
+
+    async def test_an_adopted_file_is_prunable_afterwards(self, root: Path) -> None:
+        """The documented caveat, pinned.
+
+        Adoption records a manifest entry, so a later reconcile may prune the
+        file. That is correct rather than a weakening: only content byte-identical
+        to what LaunchDarkly resolved is ever adopted, so the prune removes
+        content LaunchDarkly delivered — exactly what would have happened had the
+        crash never occurred.
+        """
+        target = _place_unmanaged(root, "a", SKILL_BODY)
+        await write_skills([_skill("a")], root)
+
+        report = await write_skills([], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert _actions_by_key(report)["a"].action == "removed"
+        assert not target.exists()
+
+    async def test_differing_unmanaged_content_is_still_refused(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The clobber guarantee, restated against the adoption rule.
+
+        Adoption compares bytes, so anything that is not byte-identical to the
+        resolved content falls through to the same refusal as before.
+        """
+        target = _place_unmanaged(root, "a", "user authored\n")
+        spy = _ReplaceSpy().install(monkeypatch)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert action.error is not None
+        assert "did not write" in action.error
+        assert target.read_text(encoding="utf-8") == "user authored\n"
+        assert spy.calls == []
+
+    async def test_a_longer_file_sharing_the_content_prefix_is_not_adopted(
+        self, root: Path
+    ) -> None:
+        """The read is bounded at ``len(content) + 1``, and that one byte matters.
+
+        A bound of exactly ``len(content)`` would make every file that merely
+        *begins* with the resolved content hash as current, adopting — and later
+        pruning — a customer file with the skill body at its head.
+        """
+        longer = SKILL_BODY + "and my own notes below\n"
+        target = _place_unmanaged(root, "a", longer)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is False
+        assert _actions_by_key(report)["a"].action == "error"
+        assert target.read_text(encoding="utf-8") == longer
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+    async def test_an_unmanaged_fifo_is_refused_and_never_read(
+        self, root: Path
+    ) -> None:
+        """Adoption widened the read to foreign files, so this refusal is load-bearing.
+
+        Opening a FIFO with no writer blocks forever; the descriptor-pinned read
+        opens ``O_NONBLOCK`` and rejects anything that is not a regular file, so
+        this returns rather than hanging the reconcile and the event loop with it.
+        """
+        skill_dir = root / "a"
+        skill_dir.mkdir()
+        os.mkfifo(skill_dir / "SKILL.md")
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert action.error is not None
+        assert "regular file" in action.error
+        assert stat.S_ISFIFO(os.lstat(skill_dir / "SKILL.md").st_mode)
+
+    async def test_a_read_failure_on_an_unmanaged_file_refuses(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed read proves nothing, so it must never become an overwrite.
+
+        The adoption comparison is what would otherwise authorize the write, and
+        a file whose bytes could not be read has not been shown to be ours.
+        """
+        target = _place_unmanaged(root, "a", SKILL_BODY)
+        spy = _ReplaceSpy().install(monkeypatch)
+        real_open = os.open
+
+        def refuse_the_target(path: Any, *args: Any, **kwargs: Any) -> int:
+            if isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(target):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(skills_fs_module.os, "open", refuse_the_target)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert action.error is not None
+        # Distinguishable from the byte-mismatch refusal: this one says the
+        # comparison could not be made at all.
+        assert "could not be read to compare" in action.error
+        assert spy.calls == []
+        assert target.read_text(encoding="utf-8") == SKILL_BODY
+        assert "a/SKILL.md" not in _read_manifest(root)["entries"]
+
+
+# ---------------------------------------------------------------------------
+# Orphaned temp files
+# ---------------------------------------------------------------------------
+
+
+def _temp_name(token: str = "0123456789abcdef") -> str:
+    """A name ``atomic_write`` could have created for ``SKILL.md``.
+
+    The prefix comes from ``safe_fs`` itself rather than a copy of its format
+    string, so a change to the naming breaks this helper instead of silently
+    making the sweep a no-op.
+    """
+    return f"{safe_fs_module.temp_name_prefix('SKILL.md')}{token}.tmp"
+
+
+class TestOrphanedTempFiles:
+    """A ``SIGKILL`` mid-write leaves a temp file nothing else records."""
+
+    async def test_an_orphan_is_swept_on_the_next_write(self, root: Path) -> None:
+        _place_managed(root, "a", SKILL_BODY)
+        orphan = root / "a" / _temp_name()
+        orphan.write_text("half-written body", encoding="utf-8")
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert not orphan.exists()
+        assert (root / "a" / "SKILL.md").read_text(encoding="utf-8") == SKILL_BODY
+
+    async def test_an_orphan_no_longer_blocks_directory_cleanup(
+        self, root: Path
+    ) -> None:
+        """The second-order effect: ``rmdir`` fails on a non-empty directory.
+
+        One orphaned temp file would otherwise pin the skill's directory under
+        the managed root forever, long after the skill itself was revoked.
+        """
+        _place_managed(root, "a", SKILL_BODY)
+        orphan = root / "a" / _temp_name()
+        orphan.write_text("half-written body", encoding="utf-8")
+
+        report = await write_skills([], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert _actions_by_key(report)["a"].action == "removed"
+        assert not (root / "a").exists()
+
+    @pytest.mark.parametrize(
+        "innocent",
+        [
+            "notes.tmp",
+            "SKILL.md.tmp",
+            ".SKILL.md.tmp",
+            ".SKILL.md..tmp",
+            _temp_name("not-a-token"),
+            _temp_name("0123456789abcdef") + ".bak",
+            "x" + _temp_name(),
+            _temp_name("0123456789abcdefff"),
+        ],
+    )
+    async def test_a_lookalike_name_is_left_alone(
+        self, root: Path, innocent: str
+    ) -> None:
+        """The recognizer is anchored at both ends, and the sweep deletes files.
+
+        Anything that is not exactly the naming ``safe_fs`` produces belongs to
+        the customer, whatever it resembles.
+        """
+        _place_managed(root, "a", SKILL_BODY)
+        bystander = root / "a" / innocent
+        bystander.write_text("mine\n", encoding="utf-8")
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert bystander.read_text(encoding="utf-8") == "mine\n"
+
+    @pytest.mark.skipif(
+        not hasattr(os, "symlink"), reason="platform has no symlink support"
+    )
+    async def test_a_symlink_wearing_the_temp_name_is_not_removed(
+        self, root: Path, tmp_path: Path
+    ) -> None:
+        """The temp naming must not become a way to have the SDK delete elsewhere.
+
+        Only a regular file is ever swept, and the type comes off the descriptor
+        rather than a followed path.
+        """
+        outside = tmp_path / "precious.txt"
+        outside.write_text("do not delete\n", encoding="utf-8")
+        _place_managed(root, "a", SKILL_BODY)
+        link = root / "a" / _temp_name()
+        link.symlink_to(outside)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert outside.read_text(encoding="utf-8") == "do not delete\n"
+        assert link.is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# Windows reserved device names
+# ---------------------------------------------------------------------------
+
+# Spelled out independently of the implementation's own set, so a name dropped
+# from that set fails here rather than agreeing with itself.
+WINDOWS_RESERVED_KEYS = (
+    ["con", "prn", "aux", "nul"]
+    + [f"com{digit}" for digit in range(1, 10)]
+    + [f"lpt{digit}" for digit in range(1, 10)]
+)
+
+
+class TestWindowsReservedNames:
+    """Keys Windows cannot hold as directory names, refused on every platform."""
+
+    def test_the_set_is_exactly_twenty_two_names(self) -> None:
+        assert len(WINDOWS_RESERVED_KEYS) == len(set(WINDOWS_RESERVED_KEYS)) == 22
+
+    @pytest.mark.parametrize("reserved", WINDOWS_RESERVED_KEYS)
+    async def test_a_reserved_key_is_refused_by_write_skills(
+        self, root: Path, reserved: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spy = _ReplaceSpy().install(monkeypatch)
+
+        report = await write_skills([_skill(reserved)], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)[reserved]
+        assert action.action == "error"
+        assert action.error is not None
+        assert "Windows reserves" in action.error
+        assert reserved in action.error
+        # Rejected before any filesystem call, not by the OS.
+        assert spy.calls == []
+        assert not (root / reserved).exists()
+
+    @pytest.mark.parametrize("reserved", WINDOWS_RESERVED_KEYS)
+    async def test_a_reserved_key_is_refused_by_the_prune_path(
+        self, root: Path, reserved: str
+    ) -> None:
+        """``_key_rejection_reason`` gates both destructive paths, so both refuse.
+
+        A manifest naming a reserved key is left in place rather than acted on:
+        the same key check that stops the write stops the delete.
+        """
+        target = _place_managed(root, reserved, SKILL_BODY)
+
+        report = await write_skills([], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)[reserved]
+        assert action.action == "error"
+        assert action.error is not None
+        assert "left in place" in action.error
+        assert target.read_text(encoding="utf-8") == SKILL_BODY
+
+    @pytest.mark.parametrize("not_reserved", ["com0", "lpt0", "con1", "nul2", "conx"])
+    async def test_neighbouring_names_are_not_reserved(
+        self, root: Path, not_reserved: str
+    ) -> None:
+        """``com0`` and ``lpt0`` are not device names, and must still write."""
+        report = await write_skills([_skill(not_reserved)], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert (root / not_reserved / "SKILL.md").exists()
+
+    @pytest.mark.parametrize("reserved", WINDOWS_RESERVED_KEYS)
+    def test_a_reserved_name_is_still_a_valid_key_to_every_pure_layer(
+        self, reserved: str
+    ) -> None:
+        """The layer choice, asserted — this is the whole point of it.
+
+        The constraint lives in the filesystem layer and must not migrate into
+        the key grammar. At the grammar level a rejection would fail the *entire*
+        AI Config — model, provider, instructions, tools — for a Linux customer
+        over a Windows-only constraint, and would shrink ``skill_refs``, which is
+        what authorizes a prune: "this skill fails to write on Windows" would
+        become "this skill gets deleted on Linux".
+        """
+        assert is_valid_skill_key(reserved) is True
+
+        parsed = parse_ai_config(
+            {
+                "model": {"name": "claude-3"},
+                "provider": {"name": "Anthropic"},
+                "instructions": "You are helpful.",
+                "skills": [{"key": reserved, "version": 1}],
+            }
+        )
+        assert parsed.success is True
+
+        refs = skill_refs(parsed.data)
+        assert [ref.key for ref in refs] == [reserved]

@@ -452,6 +452,61 @@ class Skill:
     """Description from LaunchDarkly metadata; never parsed from the content."""
 
 
+SkillOutcomeReason = Literal[
+    "absent", "integrity_failure", "ok", "store_unavailable", "wrong_version"
+]
+"""
+The closed set of outcomes ``get_skill_result`` reports.
+
+Alphabetical, as ``reason_code`` is in the integrity log record, so the token
+list reads identically in every LaunchDarkly AI SDK. Each token is a distinct
+*decision* a caller can make, which is the point of the type: ``absent`` is a
+skill the store does not hold, ``integrity_failure`` is content that was
+delivered and did not verify, and a caller that wants to fail closed on
+suspected tampering while tolerating a merely-absent skill needs the two to be
+told apart.
+
+- ``ok`` — a verified skill was returned.
+- ``absent`` — the store answered, and does not hold the key.
+- ``integrity_failure`` — content was delivered and failed verification; it was
+  withheld. The one token worth failing closed on.
+- ``store_unavailable`` — the store itself could not answer: it raised.
+  Deliberately distinct from ``absent``, because an outage is not a deletion.
+- ``wrong_version`` — the store answered with a version other than the one
+  asked for, so the answer was withheld.
+"""
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """
+    Why one retrieval returned what it did — the reported form of ``get_skill``.
+
+    ``get_skill`` collapses every failure to ``None``, which is the right shape
+    for a caller that only wants content and cannot act on the difference. This
+    is the shape for a caller that can: ``reason`` names which of the five
+    outcomes happened, so an integrity failure is distinguishable from a skill
+    that simply is not configured. The two accessors differ only in what they
+    report — the retrieval, the verification, and the telemetry are the same
+    code path, run once.
+
+    Instances are immutable.
+    """
+
+    skill: Skill | None
+    """The verified skill, and only ever populated when ``reason == "ok"``."""
+    reason: SkillOutcomeReason
+    """Which outcome happened. A closed set — see ``SkillOutcomeReason``."""
+    detail: str | None
+    """
+    Human-readable detail, set for every reason except ``ok``.
+
+    Safe to log or surface to an operator: it carries the skill key and the
+    failure mode, and never any skill content or filesystem path. Intended for a
+    human, not for matching on — branch on ``reason``.
+    """
+
+
 ReconcileActionKind = Literal[
     "written", "updated", "skipped_current", "removed", "error"
 ]
