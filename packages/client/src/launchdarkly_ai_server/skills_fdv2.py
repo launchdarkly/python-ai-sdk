@@ -1321,8 +1321,14 @@ class FDv2SkillStore:
         Re-arms ``wait_for_skills`` for a store being started again after a
         ``close``. A payload already held stays an answer; an ended delivery
         does not, or the next waiter would be released before it began.
+
+        A terminal ``failed`` reason is dropped for the same reason: it says why
+        delivery stopped for good, and delivery is about to run again. Leaving
+        it would have a healthy store reporting a failure it has recovered from.
+        Called with the lock held, which is what ``failed`` reads under.
         """
         self._delivery_ended.clear()
+        self._failed_reason = None
         if not self._first_payload.is_set():
             self._released.clear()
 

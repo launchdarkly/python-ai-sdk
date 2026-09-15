@@ -82,6 +82,19 @@ MANIFEST_FILENAME = ".launchdarkly-skills.json"
 MANIFEST_VERSION = 1
 """Manifest schema version this release writes, and the highest it can read."""
 
+_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+"""
+Hard cap on the manifest, so a reconcile cannot be made to read an arbitrary
+amount into memory.
+
+Set far above any real manifest: an entry is a path, a key, a version, a digest
+and a timestamp, so even tens of thousands of skills land a couple of orders of
+magnitude below this. Anything larger is treated as corruption, which is what
+every other unreadable manifest is — the file lives in a directory the SDK does
+not own exclusively, and a reconcile must not be the thing that exhausts the
+process.
+"""
+
 SKILL_FILENAME = "SKILL.md"
 """The single file each skill materializes to, under ``<root>/<key>/``."""
 
@@ -682,13 +695,21 @@ def _load_manifest(
     try:
         raw = _read_regular_file(
             MANIFEST_FILENAME if root_fd is not None else root / MANIFEST_FILENAME,
-            max_bytes=None,
+            max_bytes=_MAX_MANIFEST_BYTES,
             dir_fd=root_fd,
         )
     except FileNotFoundError:
         return fresh, None
     except OSError as exc:
         return {}, f"the skills manifest {MANIFEST_FILENAME} could not be read: {exc}"
+
+    # ``_read_regular_file`` stops one byte past the cap, which is the byte that
+    # proves the overage without reading the rest of the file.
+    if len(raw) > _MAX_MANIFEST_BYTES:
+        return {}, (
+            f"the skills manifest {MANIFEST_FILENAME} is larger than the "
+            f"{_MAX_MANIFEST_BYTES} byte cap; refusing every destructive action"
+        )
 
     try:
         text = raw.decode("utf-8")
@@ -712,9 +733,11 @@ def _load_manifest(
         )
 
     version = data.get("manifestVersion")
-    # Bounded at both ends. No release ever wrote a version below 1, so 0 or a
-    # negative is not an older schema this release could still read — it is a
-    # schema that never existed, and acting on its entries would be a guess.
+    # Bounded at both ends. Above, because a manifest from a future release may
+    # record fields whose meaning this one would guess at. Below, because 1 is
+    # the first version ever written, so 0 or a negative is not an older schema
+    # this release could still read — it is a schema that never existed, and
+    # acting on its entries would be a guess.
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
@@ -927,7 +950,7 @@ def _write_one(
 
 
 def _read_regular_file(
-    target: Path | str, *, max_bytes: int | None, dir_fd: int | None = None
+    target: Path | str, *, max_bytes: int, dir_fd: int | None = None
 ) -> bytes:
     """
     Reads *target*, refusing anything that is not a regular file.
@@ -951,13 +974,12 @@ def _read_regular_file(
     ``<key>/SKILL.md``, so covering it the same way needs a descriptor for the
     skill directory rather than for the root.
 
-    ``max_bytes`` bounds the read at ``max_bytes + 1`` bytes: the comparison
-    consumer only ever hashes the result, and anything longer than the resolved
-    content cannot match it, so the one extra byte is enough to prove
-    inequality — which is what keeps a foreign file of arbitrary size from being
-    pulled into memory now that adoption reads files the manifest does not
-    list. ``None`` reads to EOF, for the manifest, whose length no caller can
-    predict and which is parsed rather than compared.
+    ``max_bytes`` bounds the read at ``max_bytes + 1`` bytes, so no read here
+    can be made to pull an arbitrary file into memory. The extra byte is what
+    lets a caller tell "at the cap" from "over it" without reading the rest:
+    the comparison consumer hashes the result and anything longer than the
+    resolved content cannot match it, and the manifest reader reports the
+    overage as corruption.
     """
     flags = (
         os.O_RDONLY
@@ -970,14 +992,13 @@ def _read_regular_file(
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError("the target file is not a regular file")
         chunks: list[bytes] = []
-        remaining = None if max_bytes is None else max_bytes + 1
-        while remaining is None or remaining > 0:
-            chunk = os.read(fd, 65536 if remaining is None else min(remaining, 65536))
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
             if not chunk:
                 break
             chunks.append(chunk)
-            if remaining is not None:
-                remaining -= len(chunk)
+            remaining -= len(chunk)
         return b"".join(chunks)
     finally:
         os.close(fd)

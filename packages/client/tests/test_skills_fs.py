@@ -2019,11 +2019,64 @@ CORRUPT_MANIFESTS: list[tuple[str, Any]] = [
         "version_not_int_live_entries",
         {"manifestVersion": "1", "entries": _live_entries()},
     ),
+    # Bounded below as well as above: 1 is the first version ever written, so a
+    # manifest declaring 0 or a negative is not one this SDK produced.
+    ("version_zero", {"manifestVersion": 0, "entries": {}}),
+    (
+        "version_negative_live_entries",
+        {"manifestVersion": -1, "entries": _live_entries()},
+    ),
 ]
 
 LIVE_ENTRY_MANIFESTS: list[tuple[str, Any]] = [
     case for case in CORRUPT_MANIFESTS if case[0].endswith("_live_entries")
 ]
+
+
+class TestOversizeManifest:
+    """A manifest past the read cap is corruption, not a reason to allocate.
+
+    Every other read in the reconcile is bounded. The manifest is a plain file
+    in a directory the SDK does not own exclusively, so an unbounded read of it
+    is a way to have a reconcile exhaust the process.
+    """
+
+    async def test_a_manifest_over_the_cap_is_refused_non_destructively(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = _place_managed(root, "a", SKILL_BODY)
+        # Derived from the cap rather than written as a literal, so raising the
+        # bound cannot leave this test passing against a read it no longer bounds.
+        filler = "x" * (skills_fs_module._MAX_MANIFEST_BYTES + 1)
+        _write_manifest(root, {"manifestVersion": 1, "entries": {}, "pad": filler})
+        spy = _UnlinkSpy().install(monkeypatch)
+
+        report = await write_skills([], root)
+
+        assert report.ok is False
+        assert any("cap" in m for m in _error_messages(report))
+        # Non-destructive on both counts: nothing removed, and the manifest the
+        # SDK could not read is left for an operator rather than overwritten.
+        assert spy.targets == []
+        assert target.read_text(encoding="utf-8") == SKILL_BODY
+        assert "pad" in json.loads(_manifest_path(root).read_text(encoding="utf-8"))
+
+    async def test_a_manifest_at_the_cap_is_still_read(self, root: Path) -> None:
+        """The positive control — the bound is a cap, not an off-by-one refusal."""
+        manifest: dict[str, Any] = {"manifestVersion": 1, "entries": {}}
+        # Pad to exactly the cap, accounting for the rest of the document.
+        overhead = len(json.dumps({**manifest, "pad": ""}).encode("utf-8"))
+        manifest["pad"] = "x" * (skills_fs_module._MAX_MANIFEST_BYTES - overhead)
+        _write_manifest(root, manifest)
+        assert (
+            _manifest_path(root).stat().st_size == skills_fs_module._MAX_MANIFEST_BYTES
+        )
+
+        report = await write_skills([], root)
+
+        assert report.ok is True
+        # Read, so the unknown field round-trips as any other future field does.
+        assert "pad" in json.loads(_manifest_path(root).read_text(encoding="utf-8"))
 
 
 class TestCorruptManifest:

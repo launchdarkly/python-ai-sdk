@@ -1513,6 +1513,25 @@ class TestFailureHandling:
         assert "opt-in" in store.failed
         assert any("opt-in" in r.getMessage() for r in caplog.records)
 
+    def test_a_restarted_store_does_not_report_the_old_failure(
+        self, endpoint: Any
+    ) -> None:
+        """``failed`` says why delivery stopped *for good*.
+
+        A store started again is delivering, so the terminal reason from the
+        previous run is no longer true of it. Leaving it would have a healthy
+        store reporting a failure it has recovered from.
+        """
+        endpoint.queue_poll(status=401)
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+            assert "401" in store.failed
+
+            endpoint.queue_poll(full_payload(("put-object", put_skill())))
+            store.start()
+            assert store.wait_for_skills(timeout=5) is True
+            assert store.failed is None
+
     def test_a_401_stops_delivery(self, endpoint: Any) -> None:
         endpoint.queue_poll(status=401)
         with poll_store(endpoint) as store:

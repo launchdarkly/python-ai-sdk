@@ -518,7 +518,17 @@ class SkillOutcome:
 ReconcileActionKind = Literal[
     "written", "updated", "skipped_current", "removed", "error"
 ]
-"""The closed set of outcomes ``write_skills`` reports."""
+"""
+The closed set of outcomes ``write_skills`` reports.
+
+- ``written`` — the file did not exist and now holds the resolved content.
+- ``updated`` — a managed file held different bytes and was overwritten.
+- ``skipped_current`` — the bytes on disk already are the resolved content.
+- ``removed`` — the skill is no longer managed and is not on disk. Reported
+  whether or not this run was the one that deleted the file, since a formerly
+  managed file a caller had already removed by hand reaches the same end state.
+- ``error`` — the outcome was refused or failed; see ``ReconcileAction.error``.
+"""
 
 
 @dataclass(frozen=True)
