@@ -18,6 +18,15 @@ def new_context() -> dict[str, Any]:
     return {"kind": "user", "key": key}
 
 
+def new_multi_context() -> dict[str, Any]:
+    """Returns a unique multi-context that exercises canonical-key escaping."""
+    return {
+        "kind": "multi",
+        "organization": {"key": "example-org:west%region"},
+        "user": {"key": f"example-user-{uuid4().hex[:8]}"},
+    }
+
+
 def new_conversation_id(label: str) -> str:
     """A fresh conversation id per run.
 
