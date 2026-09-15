@@ -467,10 +467,9 @@ checklist below denies the agent write access to every ancestor. Windows has no
 taken immediately before each step. That floor is a check-then-use race rather than a closed
 window: an attacker who already holds **write permission on the managed root** can still win
 it. Windows reparse-point checks (`GetFileAttributesW` / `FILE_FLAG_OPEN_REPARSE_POINT`) are
-deliberately not implemented in this release, and Windows is not a tested platform for it —
-neither SDK repository has a Windows CI runner. Treat write permission on the managed root
-**or on any directory above it** as the security boundary on every platform, and on Windows as
-the *only* one.
+deliberately not implemented in this release, and Windows is not a supported or tested
+platform for it. Treat write permission on the managed root **or on any directory above it**
+as the security boundary on every platform, and on Windows as the *only* one.
 
 **One exception, and it is what makes a crashed reconcile recoverable.** A file at a managed
 path whose bytes are *already byte-identical* to the content LaunchDarkly resolved is
@@ -600,8 +599,8 @@ your own helpers: `ReconcileActionKind` (`written` / `updated` / `skipped_curren
 `removed` / `error`), `OnUnavailable` (`keep` / `raise`), and `SkillOutcomeReason`
 (`absent` / `integrity_failure` / `ok` / `store_unavailable` / `wrong_version`).
 
-**`write_skills` blocks.** It is `async` for parity with the other accessors and with the
-TypeScript SDK, but it awaits nothing: every read, write, `fsync` and rename runs inline,
+**`write_skills` blocks.** It is `async` for parity with the other accessors, but it awaits
+nothing: every read, write, `fsync` and rename runs inline,
 so a large reconcile holds the event loop for its duration. Wrap it in
 `asyncio.to_thread` if that matters. For the same reason `timeout` is checked between
 steps rather than interrupting one already in progress. Reconcile one root at a time,

@@ -431,9 +431,16 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   from the writer); only regular files, with the type read off the descriptor; unlinked
   through the pinned descriptor. It never raises and never aborts a run.
 - **A corrupt manifest fails closed**: unreadable, unparseable, not an object, malformed
-  `entries`, or a `manifestVersion` this release cannot read means no overwrites and no
-  prunes, brand-new paths may still be written, an `error` action names the manifest, and
-  the manifest file itself is not rewritten.
+  `entries`, larger than `_MAX_MANIFEST_BYTES`, or a `manifestVersion` outside
+  `1 <= v <= MANIFEST_VERSION` means no overwrites and no prunes, brand-new paths may still
+  be written, an `error` action names the manifest, and the manifest file itself is not
+  rewritten. The version is bounded on *both* sides: 1 is the first version ever written, so
+  0 or a negative is not a manifest this SDK produced, and accepting one would act
+  destructively on it and then silently rewrite it as version 1. The size bound exists
+  because the manifest is the one file here whose length no caller can predict, it lives in
+  a directory the SDK does not own exclusively, and a reconcile must not be the thing that
+  exhausts the process — every read in `skills_fs` is bounded, and `_read_regular_file`
+  takes a required `max_bytes` so a new call site cannot opt out by omission.
 - **An incomplete retrieval suppresses pruning.** Otherwise a transport outage would read
   as "everything was revoked" and delete the customer's managed files.
 - **Writes are atomic**: temp file created exclusively in the target's *own* directory,

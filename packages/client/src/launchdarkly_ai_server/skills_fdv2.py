@@ -148,7 +148,8 @@ def _require_server_side_credential(sdk_key: str) -> None:
 
     Skill content is customer-confidential, and payload assignment is shared
     across credential types, so a client-side credential may well *succeed*
-    against these endpoints. Raises rather than logs: a store built on the wrong
+    against these endpoints — which is why this refuses rather than relying on
+    the server to. Raises rather than logs: a store built on the wrong
     credential should not exist.
     """
     if not isinstance(sdk_key, str) or not sdk_key.strip():
@@ -512,13 +513,11 @@ class _ProtocolReader:
 
     **The first payload intent is read, and is taken to be the skill payload.**
     Delivery provides one payload per credential and the protocol requires a
-    client to ignore all but the first intent, so ``payloads[0]`` is both what
-    arrives and what the protocol says to read. Should that ever widen, an
-    ``xfer-full`` for another payload would empty the skill set and the next
-    ``payload-transferred`` would publish it empty — with pruning on, the
-    difference between a reconcile and deleting the application's files. So this
-    layer learns which payload skills arrive on and declines to apply a transfer
-    of any other, warning once and counting it. The residual case is the first
+    client to ignore all but the first intent. Should that ever widen, an
+    ``xfer-full`` for another payload would publish the skill set empty — with
+    pruning on, the difference between a reconcile and deleting the
+    application's files. So this layer learns which payload skills arrive on and
+    declines to apply a transfer of any other. The residual case is the first
     transfer of a connection, where there is nothing to compare against yet.
     """
 

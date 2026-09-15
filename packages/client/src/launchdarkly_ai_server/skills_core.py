@@ -6,14 +6,17 @@ except the two constants that are public API, and the dependency runs one way �
 this module imports neither ``skills`` nor ``skills_fs``.
 
 It holds the store interface and the configured store, the telemetry emitter,
-integrity verification, and store resolution. Each lives here in one copy so
-that the accessors and the materialization path cannot disagree: about whether a
-store is configured, about which signals exist, about what verification accepts,
-or about how a raising store is handled.
+integrity verification, and store resolution. Each lives here in one copy so the
+accessors and the materialization path cannot disagree: about whether a store is
+configured, about which signals exist, about what verification accepts, or about
+how a raising store is handled.
 
-Everything the store hands back is untrusted input; the transport is not part of
-the trust boundary. Key, version, size, and content hash are revalidated here on
-every pass.
+**Everything a store hands back is untrusted input**; the transport is not part
+of the trust boundary. Key, version, size, and content hash are revalidated here
+on every pass, and no value off the wire is echoed into a signal or a log line
+without a shape check. The reasoning, and the signal and log-record contracts
+these must satisfy, are in ``agents.md`` under *Security posture*, *Telemetry*
+and *The integrity-failure log record*.
 """
 
 from __future__ import annotations
@@ -73,13 +76,10 @@ INTEGRITY_FAILURE_EVENT = "ld.skills.integrity_failure"
 Stable event identity for the local integrity-failure log record.
 
 A compatibility surface, not an implementation detail: this is the string a SIEM
-matches on, so it must never be renamed.
-
-It appears verbatim **in the message text**, not only in ``extra``. Severity
-alone cannot discriminate — ``list_raw_objects`` and ``resolve_from_store`` in
-this module also log ERROR when a store raises — and the stdlib's default
-formatter drops ``extra`` entirely, so under a plain ``logging.basicConfig()``
-an ``extra``-only record would be invisible.
+matches on, so it must never be renamed. It appears verbatim in the message
+text, not only in ``extra``, because the stdlib's default formatter drops
+``extra`` and severity alone cannot discriminate — a raising store logs ERROR
+from this module too.
 """
 
 _ACTION_WITHHELD = "withheld"
@@ -306,23 +306,17 @@ def record_integrity_failure(
     Carries hashes and byte counts only — the skill body never appears in a
     signal, a log line, or an error message.
 
-    The two are deliberately different sizes. The signal is product telemetry:
-    no-op by default, with a fixed property set. The log record is the
-    application's own detection path — the only one that works when telemetry is
-    off — so it additionally carries the stable event name, the action taken, the
-    human-readable reason, and the machine-parseable ``reason_code``.
-
-    The record is emitted in two forms because neither alone is enough: the
-    message text carries ``INTEGRITY_FAILURE_EVENT`` followed by compact JSON, so
-    it survives ``logging.basicConfig()`` and is greppable and ``jq``-able under
-    any handler configuration, and ``extra["ld_skills"]`` carries the same
-    mapping unflattened for a structured handler that would rather not reparse.
+    The signal is product telemetry: no-op by default, with a fixed property
+    set. The log record is the application's own detection path — the only one
+    that works when telemetry is off — so it also carries the stable event name,
+    the action taken, the reason, and the machine-parseable ``reason_code``, in
+    both the message text and ``extra["ld_skills"]``. Neither form alone
+    survives every handler configuration; ``agents.md`` states the contract.
     """
-    # Both of these come off the wire, so neither may be echoed verbatim: a store
-    # that set contentHash (or key) to the skill body would otherwise publish the
-    # body itself. Shape-check, then redact. Every field the log record adds on
-    # top is either a literal or SDK-authored, so the record introduces no new
-    # untrusted value — anything added later needs this same treatment.
+    # Key and expected hash come off the wire, so neither may be echoed
+    # verbatim: a store could put the skill body in either. Shape-check, then
+    # redact. Every field added below is a literal or SDK-authored; anything
+    # added later needs this same treatment.
     safe_key = skill_key if is_valid_skill_key(skill_key) else "<invalid-key>"
     properties: dict[str, Any] = {"skill_key": safe_key, "language": _LANGUAGE}
     if is_valid_skill_version(version):
@@ -337,9 +331,8 @@ def record_integrity_failure(
         properties["observed_hash"] = observed_hash
 
     # Spread the signal's properties rather than rebuilding them, so the record
-    # cannot drift from the signal on the fields they share — in particular on
-    # which of them are redacted and which are omitted. Absent optional fields
-    # stay absent; the record never carries a null.
+    # cannot drift from the signal on which fields are redacted or omitted.
+    # Absent optional fields stay absent; the record never carries a null.
     record: dict[str, Any] = {
         "event": INTEGRITY_FAILURE_EVENT,
         "action": _ACTION_WITHHELD,
@@ -347,10 +340,9 @@ def record_integrity_failure(
         "reason": reason,
         **properties,
     }
-    # ``sort_keys`` is part of the record's format rather than cosmetic: it is
-    # what makes the serialized line stable for a given input, so a detection
-    # rule can match on it. Do not drop it, and do not reorder the keys above
-    # expecting the output to follow.
+    # ``sort_keys`` is part of the record's format, not cosmetic: it is what
+    # makes the line stable for a given input. Do not drop it, and do not
+    # reorder the keys above expecting the output to follow.
     logger.error(
         "%s %s",
         INTEGRITY_FAILURE_EVENT,
@@ -364,10 +356,10 @@ def record_materialized(
     skill_key: str, content_bytes: int, content_hash: str, reconcile_action: str
 ) -> None:
     """
-    Records a materialization. Deliberately carries no ``target_path`` and no
-    filesystem path of any kind — the same reasoning that keeps the skill body
-    out of telemetry keeps the application's directory layout out. Paths live in the
-    returned ``ReconcileReport``, which is user-facing API rather than telemetry.
+    Records a materialization. Carries no filesystem path of any kind: the same
+    reasoning that keeps the skill body out of telemetry keeps the directory
+    layout out. Paths live in the returned ``ReconcileReport`` instead, which is
+    API rather than telemetry.
     """
     emit(
         _SIGNAL_MATERIALIZED,
@@ -431,23 +423,20 @@ def verified_bytes(
     """
     The whole content half of integrity verification: encode, size, hash.
 
-    Accepts either shape content legitimately arrives in. Wire-shaped ``str``
-    input — a raw store object's JSON string — is UTF-8 encoded here, once, and
-    this is the only place that encode happens. ``bytes`` input is an already
-    verified ``Skill.content`` being re-verified, and is hashed directly: those
-    bytes are the verbatim value, so re-encoding does not apply.
+    Accepts either shape content arrives in. A wire-shaped ``str`` is UTF-8
+    encoded here, once — the only place that encode happens. ``bytes`` is an
+    already-verified ``Skill.content`` being re-verified, and is hashed directly.
 
     Returns the verbatim bytes and their locally computed sha256, or a
-    human-readable reason — having already recorded the integrity signal, so the
-    signal does not depend on which caller noticed. The hash handed back is
-    always the one computed here, never the caller's expected value, which keeps
-    an untrusted string out of ``Skill``.
+    human-readable reason, having already recorded the integrity signal so it
+    does not depend on which caller noticed. The hash handed back is always the
+    one computed here, never the caller's expected value, which keeps an
+    untrusted string out of ``Skill``.
 
-    This runs twice per skill by design: once at the accessor boundary, and again
-    immediately before a write, because a ``Skill`` can also be constructed
-    directly by a caller. The second pass re-hashes bytes the first pass already
-    hashed, which is negligible next to the write it guards — and carrying the
-    first pass's verdict forward would put a "trust the value computed upstream"
+    Runs twice per skill by design — at the accessor boundary, and again
+    immediately before a write, since a ``Skill`` can also be constructed
+    directly by a caller. Do not optimise the second pass away by carrying the
+    first one's verdict forward: that puts a "trust the value computed upstream"
     branch inside the one function whose job is not to.
     """
     if isinstance(content, bytes):
@@ -456,11 +445,10 @@ def verified_bytes(
         try:
             encoded = content.encode("utf-8")
         except UnicodeEncodeError:
-            # json.loads turns a "\ud800" escape into an unpaired surrogate, which
-            # has no UTF-8 encoding. There are no bytes the server could have
-            # hashed, so this is not authentic content. Never use
-            # errors="surrogatepass" here: that would fabricate bytes and could
-            # satisfy the hash comparison.
+            # json.loads turns a "\ud800" escape into an unpaired surrogate,
+            # which has no UTF-8 encoding — so there are no bytes the server
+            # could have hashed. Never reach for errors="surrogatepass": it
+            # would fabricate bytes that could satisfy the hash comparison.
             reason = "content is not encodable as UTF-8"
             record_integrity_failure(
                 key,
