@@ -18,7 +18,13 @@ from .api import (
     urllib_transport,
 )
 from .criteria import Criterion, Judge
-from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
+from .runner import (
+    EvalHandler,
+    EvaluationsRunner,
+    ToolImplementation,
+    _provides_for,
+    _segment,
+)
 from .types import EvalRunResult, GenerationConfig, RunSummary
 
 logger = logging.getLogger(__name__)
@@ -95,6 +101,7 @@ class EvaluationsModule:
         generation: GenerationConfig,
         tools: Mapping[str, ToolImplementation] | None = None,
         criteria: list[Criterion] | None = None,
+        judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
         poll_interval_seconds: float | None = None,
         poll_timeout_seconds: float | None = None,
@@ -107,6 +114,12 @@ class EvaluationsModule:
         deterministic :class:`Scorer` functions — is then run against each
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
+
+        A :class:`Judge` is an independent AI Config and may be served by a
+        different provider or mode than ``generation``. ``handler`` runs a judge
+        only when it provides for that judge's provider; pass handlers for any
+        other providers your judges use in ``judge_handlers``. A judge no
+        handler covers fails the run before any records are created.
 
         The returned pass/fail result is derived from LaunchDarkly's run summary.
         A CI script can exit with ``0 if result.passed else 1`` after awaiting
@@ -130,7 +143,9 @@ class EvaluationsModule:
         )
         run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
+        run_judge_handlers = list(judge_handlers or [])
         self._validate_criteria(run_criteria)
+        self._validate_judge_handlers(run_judge_handlers)
         ld_judges = [
             criterion for criterion in run_criteria if isinstance(criterion, Judge)
         ]
@@ -142,7 +157,9 @@ class EvaluationsModule:
         resolved_tools = await asyncio.to_thread(
             self._runner._resolve_tools, project_key, run_tools
         )
-        resolved_judges = await self._runner._resolve_judges(project_key, ld_judges)
+        resolved_judges = await self._runner._resolve_judges(
+            project_key, ld_judges, handler, run_judge_handlers
+        )
         dataset_ref = await asyncio.to_thread(
             self._runner._fetch_dataset, project_key, dataset
         )
@@ -183,7 +200,6 @@ class EvaluationsModule:
             if run_criteria:
                 criterion_results = await self._runner._run_criteria_for_results(
                     results,
-                    handler,
                     run_tools,
                     run_criteria,
                     resolved_judges,
@@ -311,6 +327,26 @@ class EvaluationsModule:
                 + ". Judge keys and scorer names must be unique within a run "
                 "(case-insensitive)."
             )
+
+    @staticmethod
+    def _validate_judge_handlers(judge_handlers: list[EvalHandler]) -> None:
+        """Reject judge handlers that cannot be routed by provider and mode.
+
+        A judge handler is only ever chosen by matching its ``provides_for``
+        against the judge's resolved provider and mode. One without that
+        metadata could never be selected, so it would silently fall through to
+        the generation handler instead of running the judge it was passed for.
+        """
+        for index, candidate in enumerate(judge_handlers):
+            if not callable(candidate):
+                raise EvaluationsError(f"judge_handlers[{index}] must be callable")
+            if _provides_for(candidate) is None:
+                raise EvaluationsError(
+                    f"judge_handlers[{index}] does not declare provides_for. "
+                    "Build judge handlers with create_handler() (or a provider "
+                    "package's create_*_handler()) so they can be matched to a "
+                    "judge's provider and mode."
+                )
 
     @staticmethod
     def _validate_run_args(

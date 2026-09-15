@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from math import isnan
 from typing import Any, Literal
 
 from .types import DatasetRow
@@ -133,8 +134,14 @@ def _validate_thresholds(
         ("threshold", threshold),
         ("pass_rate_threshold", pass_rate_threshold),
     ):
-        if value is not None and (value < 0 or value > 1):
-            raise ValueError(f"{name} must be between 0 and 1")
+        if value is None:
+            continue
+        # NaN passes both range comparisons, so without an explicit check it
+        # reaches to_criteria_wire and is serialized as a bare ``NaN`` literal
+        # the management API rejects -- an evaluation that fails to be created
+        # rather than a threshold that fails to validate.
+        if isnan(value) or value < 0 or value > 1:
+            raise ValueError(f"{name} must be a number between 0 and 1")
 
 
 def _criteria_options(

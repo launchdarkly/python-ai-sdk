@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from launchdarkly_ai_server import create_handler
 from launchdarkly_ai_server.evaluations import (
     DatasetRow,
     EvaluationsError,
@@ -1825,15 +1826,25 @@ async def test_errored_generation_row_emits_generation_incomplete_criterion_even
 
 
 @pytest.mark.asyncio
-async def test_failed_evaluation_event_tracking_skips_event_but_completes_run(
+async def test_failed_evaluation_event_tracking_raises_after_attempting_every_result(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
 ) -> None:
+    """A dropped criterion event is a delivery failure, not a silent skip.
+
+    The evaluation is created with a fixed criterion list, so the backend needs
+    one result per (row, criterion) before row accounting can finish. Swallowing
+    the failure leaves run() polling to its timeout and hides the cause, so the
+    run attempts every result, flushes what it queued, and then raises.
+    """
     transport = judge_run_transport()
     accuracy_judge_variation(monkeypatch)
 
+    attempted: list[str] = []
+
     def track(event_name: str, *args: Any) -> None:
         if event_name == "$ld:ai:offline-evals:criterion":
+            attempted.append(args[1]["criterionType"])
             raise RuntimeError("event pipeline unavailable")
 
     stub_sdk_client.track = MagicMock(side_effect=track)
@@ -1849,17 +1860,254 @@ async def test_failed_evaluation_event_tracking_skips_event_but_completes_run(
             return {"output": '{"score": 1, "reasoning": "ok"}'}
         return {"output": "generated"}
 
+    with pytest.raises(EvaluationsError) as error:
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[
+                Judge(key="$ld:ai:judge:accuracy"),
+                Scorer(name="nonempty", fn=lambda row, output: bool(output)),
+            ],
+        )
+
+    # Every criterion is attempted before the failures are reported together,
+    # so one bad result never drops the ones behind it.
+    assert attempted == ["$ld:ai:judge:accuracy", "nonempty"]
+    assert "Failed to emit 2 of 2 evaluation criterion events" in str(error.value)
+    assert "event pipeline unavailable" in str(error.value)
+    stub_sdk_client.flush.assert_awaited()
+
+
+@pytest.mark.parametrize("value", [float("nan"), -0.1, 1.1])
+@pytest.mark.parametrize("field", ["threshold", "pass_rate_threshold"])
+def test_criteria_reject_thresholds_outside_zero_to_one(
+    field: str, value: float
+) -> None:
+    """NaN passes both range comparisons, so it needs its own rejection.
+
+    Left in, it is serialized into the criteria wire payload as a bare ``NaN``
+    literal and the management API rejects the whole evaluation.
+    """
+    with pytest.raises(ValueError, match=f"{field} must be a number between 0 and 1"):
+        Judge(key="$ld:ai:judge:accuracy", **{field: value})
+    with pytest.raises(ValueError, match=f"{field} must be a number between 0 and 1"):
+        Scorer(name="nonempty", fn=lambda row, output: True, **{field: value})
+
+
+def judge_variation(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider: str,
+    mode: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> None:
+    """Serve one judge variation for the given provider and mode."""
+
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        meta: dict[str, Any] = {"variationKey": "default", "version": 12}
+        if mode is not None:
+            meta["mode"] = mode
+        return {
+            "config": {
+                "provider": {"name": provider},
+                "model": {"name": "judge-model"},
+                **(config or {"instructions": "Judge {{response_to_evaluate}}"}),
+            },
+            "meta": meta,
+        }
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+
+
+async def _generation_only(
+    config: dict[str, Any],
+    user_input: str | None = None,
+    tool_handlers: dict[str, Callable[..., Any]] | None = None,
+    variables: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {"output": "generated"}
+
+
+@pytest.mark.asyncio
+async def test_judge_on_another_provider_fails_before_any_records_are_created(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider handler cannot execute another provider's judge config.
+
+    Passing it anyway spent the generation budget and then recorded every row
+    as handler_raised, so the mismatch is caught while it is still only a
+    configuration error: before the dataset is read or any record is created.
+    """
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    with pytest.raises(EvaluationsError) as error:
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=create_handler(("OpenAI", "messages"), _generation_only),
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        )
+
+    assert "No handler can run LaunchDarkly judge" in str(error.value)
+    assert "'Anthropic'" in str(error.value)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_judge_handlers_route_a_judge_to_its_own_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    judged: list[dict[str, Any]] = []
+
+    async def anthropic_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        judged.append(config)
+        return {"output": '{"score": 0.75, "reasoning": "ok"}'}
+
     result = await evals.run(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        judge_handlers=[create_handler(("Anthropic", "messages"), anthropic_judge)],
+    )
+
+    assert result.passed is True
+    assert [config["provider"]["name"] for config in judged] == ["Anthropic"]
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    judge_event = next(event for event in events if event.get("kind") == "judge")
+    assert judge_event["status"] == "COMPLETE"
+    assert judge_event["score"] == 0.75
+
+
+@pytest.mark.asyncio
+async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """Mirrors the online path's agent-mode fallback for a messages-mode judge."""
+    transport = judge_run_transport()
+    judge_variation(
+        monkeypatch,
+        provider="Anthropic",
+        mode="messages",
+        config={
+            "messages": [
+                {"role": "system", "content": "Grade strictly."},
+                {"role": "user", "content": "Judge {{response_to_evaluate}}"},
+            ]
+        },
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    judged: list[dict[str, Any]] = []
+
+    async def anthropic_agent_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        judged.append(config)
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        judge_handlers=[create_handler(("Anthropic", "agent"), anthropic_agent_judge)],
+    )
+
+    assert result.passed is True
+    assert judged[0]["instructions"] == (
+        "Grade strictly.\n\nJudge {{response_to_evaluate}}"
+    )
+    assert judged[0]["messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_generation_handler_runs_a_judge_on_the_same_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="OpenAI")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    calls: list[str | None] = []
+
+    async def openai_handler(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        calls.append(config.get("instructions"))
+        if "Judge" in (config.get("instructions") or ""):
+            return {"output": '{"score": 0.9, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=create_handler(("OpenAI", "messages"), openai_handler),
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
     assert result.passed is True
-    stub_sdk_client.flush.assert_awaited()
+    assert any("Judge" in (instructions or "") for instructions in calls)
+
+
+@pytest.mark.asyncio
+async def test_judge_handlers_must_declare_the_provider_they_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrouted judge handler would silently never be selected."""
+    transport = judge_run_transport()
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="does not declare provides_for"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=_generation_only,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[Judge(key="$ld:ai:judge:accuracy")],
+            judge_handlers=[_generation_only],
+        )
+
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio

@@ -399,8 +399,10 @@ async def run_judge(
         except ValueError:
             return None
 
-        if score is None:
-            score = 0.0
+        # The score is reported as the judge gave it. A missing or null score
+        # is not a zero: coercing it would record a gen_ai.evaluation of 0 --
+        # indistinguishable from a judge that scored the output a hard fail --
+        # where every other non-numeric judge output skips the metric instead.
         metric_score = numeric_score(score)
         if metric_score is not None:
             record_evaluation(

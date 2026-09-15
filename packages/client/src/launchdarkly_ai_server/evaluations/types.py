@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 @dataclass
@@ -69,12 +69,20 @@ class ResolvedTool:
 
 @dataclass
 class ResolvedJudge:
-    """A LaunchDarkly AI Judge config variation resolved for an evaluation run."""
+    """A LaunchDarkly AI Judge config variation resolved for an evaluation run.
+
+    ``provider`` and ``mode`` come from the judge's own variation, not the
+    evaluation's generation config: a judge is an independent AI Config and may
+    be served by a different provider in a different mode. They are kept here
+    because they are what selects the handler that can actually run this config.
+    """
 
     key: str
     config: dict[str, Any]
     variation_key: str = ""
     version: int | None = None
+    provider: str | None = None
+    mode: Literal["agent", "messages"] = "messages"
 
 
 @dataclass

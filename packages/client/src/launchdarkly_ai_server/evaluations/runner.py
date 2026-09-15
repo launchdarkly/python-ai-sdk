@@ -8,8 +8,9 @@ import logging
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
@@ -19,6 +20,8 @@ from ..judge_scoring import (
 from ..lifecycle import extract_variation
 from ..types import NativeTool
 from ..utils import (
+    collapse_messages_to_instructions,
+    normalize_mode,
     parse_template,
     parse_usage,
     to_ld_context,
@@ -51,6 +54,89 @@ CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
+
+
+@dataclass(frozen=True)
+class JudgeExecution:
+    """A resolved judge paired with the handler selected to run its config."""
+
+    resolved: ResolvedJudge
+    handler: EvalHandler
+    collapse_messages: bool = False
+
+
+def _provides_for(
+    handler: EvalHandler,
+) -> tuple[str, Literal["agent", "messages"]] | None:
+    provides_for = getattr(handler, "provides_for", None)
+    if (
+        isinstance(provides_for, tuple | list)
+        and len(provides_for) == 2
+        and isinstance(provides_for[0], str)
+    ):
+        return (provides_for[0], normalize_mode(provides_for[1]))
+    return None
+
+
+def _covers_provider(
+    provides_for: tuple[str, Literal["agent", "messages"]],
+    provider: str | None,
+) -> bool:
+    return provides_for[0] == provider or provides_for[0] == "*"
+
+
+def _select_judge_handler(
+    resolved: ResolvedJudge,
+    handler: EvalHandler,
+    judge_handlers: list[EvalHandler],
+) -> JudgeExecution | None:
+    """Pick the handler that can run this judge's config, or ``None``.
+
+    A judge is an independent AI Config: it may resolve to a different provider
+    and mode than the evaluation's generation config, and a handler built for
+    one provider cannot execute another's config. The priority mirrors the
+    online path (``judges.run_judges``):
+
+    1. a judge handler matching the judge's provider (or a wildcard) and mode;
+    2. an agent-mode judge handler for a messages-mode judge, whose messages
+       are collapsed into a single instructions block;
+    3. the generation handler, when it covers the judge's provider.
+
+    A handler that declares no ``provides_for`` is a plain callable doing its
+    own routing -- the same contract it already honours for the generation
+    config -- so it is treated as covering every judge.
+    """
+    for candidate in judge_handlers:
+        provides_for = _provides_for(candidate)
+        if (
+            provides_for
+            and _covers_provider(provides_for, resolved.provider)
+            and provides_for[1] == resolved.mode
+        ):
+            return JudgeExecution(resolved=resolved, handler=candidate)
+    if resolved.mode == "messages":
+        for candidate in judge_handlers:
+            provides_for = _provides_for(candidate)
+            if (
+                provides_for
+                and _covers_provider(provides_for, resolved.provider)
+                and provides_for[1] == "agent"
+            ):
+                return JudgeExecution(
+                    resolved=resolved, handler=candidate, collapse_messages=True
+                )
+    generation_provides_for = _provides_for(handler)
+    if generation_provides_for is None:
+        return JudgeExecution(resolved=resolved, handler=handler)
+    if _covers_provider(generation_provides_for, resolved.provider):
+        return JudgeExecution(
+            resolved=resolved,
+            handler=handler,
+            collapse_messages=(
+                generation_provides_for[1] == "agent" and resolved.mode == "messages"
+            ),
+        )
+    return None
 
 
 def _segment(value: str) -> str:
@@ -152,9 +238,17 @@ class EvaluationsRunner:
         self,
         project_key: str,
         judges: list[Judge],
-    ) -> dict[str, ResolvedJudge]:
-        """Resolve LD Judge configs before any evaluation records are created."""
-        resolved: dict[str, ResolvedJudge] = {}
+        handler: EvalHandler,
+        judge_handlers: list[EvalHandler] | None = None,
+    ) -> dict[str, JudgeExecution]:
+        """Resolve LD Judge configs before any evaluation records are created.
+
+        Each judge is paired with the handler that can execute its config here,
+        rather than at scoring time, so a judge no handler covers fails the run
+        before any records exist or any generation spend happens.
+        """
+        available_judge_handlers = list(judge_handlers or [])
+        resolved: dict[str, JudgeExecution] = {}
         # variation() rejects a context without kind and key; use the same
         # context shape the emitted evaluation events are attributed to.
         context: dict[str, Any] = {"kind": "evaluation", "key": project_key}
@@ -176,14 +270,36 @@ class EvaluationsRunner:
                 raise EvaluationsError(
                     f"LaunchDarkly judge {judge.key!r} returned an invalid AI config variation"
                 )
-            resolved[judge.key] = ResolvedJudge(
+            provider_value = config.get("provider")
+            provider = (
+                provider_value.get("name")
+                if isinstance(provider_value, Mapping)
+                else None
+            )
+            resolved_judge = ResolvedJudge(
                 key=judge.key,
                 config=dict(config),
                 variation_key=str(meta.get("variationKey") or ""),
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
                 else None,
+                provider=str(provider) if isinstance(provider, str) else None,
+                mode=normalize_mode(
+                    meta.get("mode") if isinstance(meta.get("mode"), str) else None
+                ),
             )
+            execution = _select_judge_handler(
+                resolved_judge, handler, available_judge_handlers
+            )
+            if execution is None:
+                raise EvaluationsError(
+                    f"No handler can run LaunchDarkly judge {judge.key!r}: its "
+                    f"config is served by provider {resolved_judge.provider!r} in "
+                    f"{resolved_judge.mode!r} mode, which neither the generation "
+                    "handler nor any judge_handlers entry provides for. Pass a "
+                    "handler for that provider to run(judge_handlers=[...])."
+                )
+            resolved[judge.key] = execution
         return resolved
 
     def _fetch_dataset(self, project_key: str, dataset_key: str) -> DatasetRef:
@@ -674,11 +790,11 @@ class EvaluationsRunner:
     async def _run_ld_judge_for_result(
         self,
         row: Mapping[str, Any],
-        handler: EvalHandler,
         tool_handlers: dict[str, ToolImplementation],
         judge: Judge,
-        resolved: ResolvedJudge,
+        execution: JudgeExecution,
     ) -> dict[str, Any]:
+        resolved = execution.resolved
         started = datetime.now(UTC)
         started_clock = time.perf_counter()
         base: dict[str, Any] = {
@@ -701,9 +817,17 @@ class EvaluationsRunner:
         # parse_template pass, so ``{{...}}`` sequences inside generated output
         # or dataset values are never re-expanded into the judge prompt.
         variables = self._judge_variables(row, judge)
+        # An agent-mode handler standing in for a messages-mode judge needs the
+        # messages folded into one instructions block, exactly as the online
+        # path does before handing a judge config to an agent handler.
+        judge_config = (
+            collapse_messages_to_instructions(resolved.config)
+            if execution.collapse_messages
+            else resolved.config
+        )
         try:
-            result = await handler(
-                dict(resolved.config),
+            result = await execution.handler(
+                dict(judge_config),
                 row.get("output"),
                 tool_handlers,
                 {
@@ -761,10 +885,9 @@ class EvaluationsRunner:
     async def _run_criteria_for_results(
         self,
         rows: list[dict[str, Any]],
-        handler: EvalHandler,
         tool_handlers: dict[str, ToolImplementation],
         criteria: list[Criterion],
-        resolved_judges: Mapping[str, ResolvedJudge],
+        resolved_judges: Mapping[str, JudgeExecution],
         concurrency: int,
     ) -> list[dict[str, Any]]:
         """Run every (row, criterion) pair, bounded by the run's concurrency."""
@@ -779,7 +902,6 @@ class EvaluationsRunner:
                     return await self._run_scorer_for_result(row, criterion)
                 return await self._run_ld_judge_for_result(
                     row,
-                    handler,
                     tool_handlers,
                     criterion,
                     resolved_judges[criterion.key],
@@ -812,9 +934,12 @@ class EvaluationsRunner:
                 "evaluationId": evaluation.id,
             },
         )
+        failures: list[str] = []
         for result in results:
-            # One bad criterion result must not abort the run or drop the
-            # events queued for the results that preceded it.
+            # One bad criterion result must not stop the remaining results from
+            # being emitted, or drop the events already queued for the ones
+            # before it -- so every result is attempted and the failures are
+            # raised together once the loop is done.
             try:
                 identity = {
                     "projectKey": project_key,
@@ -883,11 +1008,15 @@ class EvaluationsRunner:
                 client.track(
                     CRITERION_EVENT_NAME, context, payload_model.to_track_payload(), 1
                 )
-            except Exception:
+            except Exception as error:
                 logger.exception(
-                    "Skipping evaluation event for row %s criterion %s",
+                    "Failed to emit evaluation event for row %s criterion %s",
                     result.get("row_index"),
                     result.get("criterion_type"),
+                )
+                failures.append(
+                    f"row {result.get('row_index')} criterion "
+                    f"{result.get('criterion_type')!r}: {error}"
                 )
                 continue
             logger.info(
@@ -895,6 +1024,17 @@ class EvaluationsRunner:
                 CRITERION_EVENT_NAME,
                 emitted_at,
                 event_id,
+            )
+        if failures:
+            # The evaluation was created with a fixed criterion list, so the
+            # backend needs one result per (row, criterion) before it can finish
+            # row accounting. A dropped event is never converted into an error
+            # result by anything downstream -- swallowing it here would leave
+            # run() polling to its timeout instead of reporting what failed.
+            raise EvaluationsError(
+                f"Failed to emit {len(failures)} of {len(results)} evaluation "
+                "criterion events, so the run cannot be fully accounted for: "
+                + "; ".join(failures)
             )
 
     def _get_summary(
