@@ -779,11 +779,19 @@ def resolve_from_store(
             error=f"skill '{key}' failed integrity verification and was withheld",
         )
     if skill.key != key:
+        # ``integrity_failure`` rather than ``absent``: content was delivered
+        # and its identity did not verify, which is the one token a caller is
+        # expected to fail closed on. Reporting ``absent`` would file a store
+        # that substitutes one skill for another in the bucket the same caller
+        # is invited to tolerate. It is not ``wrong_version`` either — that
+        # token names a version mismatch specifically, and there is deliberately
+        # no ``wrong_key`` to parallel it.
         return Resolution(
+            reason="integrity_failure",
             error=(
                 f"skill '{key}' is not available: the store answered under "
                 f"key '{skill.key}'"
-            )
+            ),
         )
     if wanted_version is not None and skill.version != wanted_version:
         return Resolution(

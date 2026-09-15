@@ -935,6 +935,43 @@ class TestGetSkillResult:
         # letter that appears in half the words in the message.
         assert "'a'" in outcome.detail
 
+    async def test_integrity_failure_when_the_store_answers_under_another_key(
+        self, make_raw_skill: Any
+    ) -> None:
+        """Identity is part of verification, so a substitution fails closed.
+
+        Grouped with the tampered-content case above rather than with
+        ``absent``, and the grouping is the assertion: the store did answer, it
+        answered with a skill, and what disqualified the answer was its
+        identity. A caller that fails closed on suspected tampering has to see
+        that. Filing it as ``absent`` would put a store substituting one skill
+        for another in the bucket that same caller is invited to tolerate.
+
+        Pinned in a test because the token is not recoverable from the message
+        and the construction site went without one long enough to raise
+        ``TypeError`` on this path.
+        """
+
+        class _AliasingStore:
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return make_raw_skill(key="other-key")
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {}
+
+        skills_module._set_store(_AliasingStore())
+
+        outcome = await get_skill_result("asked-for")
+
+        assert outcome.reason == "integrity_failure"
+        assert outcome.skill is None
+        assert outcome.detail
+        # Both keys, since the detail is what makes a substitution diagnosable.
+        assert "'asked-for'" in outcome.detail
+        assert "'other-key'" in outcome.detail
+
     async def test_wrong_version_when_the_store_answers_with_another(
         self, make_raw_skill: Any
     ) -> None:
