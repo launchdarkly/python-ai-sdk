@@ -1010,6 +1010,12 @@ class TestInterfaceParity:
         {"key": "a", "version": 4, "content": "y", "contentHash": _hash("y")},
         {"key": "b", "version": 2, "content": "z", "contentHash": _hash("z")},
         {"key": "malformed", "version": "not-a-version", "content": "q"},
+        # A key holding a well-formed version *and* a version-less entry. The
+        # quadrant the fixtures above miss: "malformed" has no usable version
+        # at all, and "a"/"b" have no version-less entry, so neither exercises
+        # what happens when a pin misses a key that has both.
+        {"key": "mixed", "version": 2, "content": "m", "contentHash": _hash("m")},
+        {"key": "mixed", "version": "not-a-version", "content": "n"},
     ]
 
     def _both(self) -> tuple[InMemorySkillStore, _SkillObjectSet]:
@@ -1033,6 +1039,9 @@ class TestInterfaceParity:
             ("missing", 1),
             ("malformed", None),
             ("malformed", 7),
+            ("mixed", None),
+            ("mixed", 2),
+            ("mixed", 7),
         ],
     )
     def test_get_agrees(self, key: str, version: int | None) -> None:
@@ -2036,6 +2045,36 @@ class TestMissingContentHash:
             newest = await get_skill("pdf-extraction")
             assert newest is not None
             assert newest.version == 5
+
+    async def test_a_missed_pin_is_absent_even_beside_a_malformed_sibling(
+        self, endpoint: Any
+    ) -> None:
+        """
+        A key can hold a well-formed version and a version-less entry at once —
+        a malformed object arrives with no version in its wire key, and is held
+        anyway so verification withholds it with a signal.
+
+        A pin that misses is still a plain miss. Answering it with the
+        version-less entry would report ``integrity_failure`` for a skill whose
+        integrity is not in question, and that is the one reason callers are
+        told to fail closed on.
+        """
+        endpoint.queue_poll(
+            full_payload(
+                ("put-object", put_skill(object_version=3)),
+                ("put-object", put_skill(object_version=None)),
+            )
+        )
+        with poll_store(endpoint) as store:
+            store.wait_for_skills(timeout=5)
+            await init_client(options={"skillStore": store}, client=object())
+
+            missed = await get_skill_result("pdf-extraction", version=9)
+            assert missed.skill is None
+            assert missed.reason == "absent"
+            # The well-formed version still resolves, and the malformed sibling
+            # is still reachable to be withheld when nothing else answers.
+            assert await get_skill("pdf-extraction", version=3) is not None
 
     async def test_the_payload_version_is_not_resolvable_as_a_skill_version(
         self, endpoint: Any

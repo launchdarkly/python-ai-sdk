@@ -393,11 +393,11 @@ class _SkillObjectSet:
     """
     Raw skill objects held in memory, keyed by ``(key, version)``.
 
-    Lookup semantics are identical to ``InMemorySkillStore``'s, down to the
-    fall-through to a version-less entry, so that the store a caller configures
-    cannot change how a pinned reference resolves; ``TestInterfaceParity``
-    asserts it. Reimplemented rather than inherited because the transport needs
-    ``delete`` and the atomic ``replace_with`` a full transfer requires.
+    Lookup semantics are identical to ``InMemorySkillStore``'s, down to when a
+    version-less entry is reachable, so the store an application configures
+    cannot change how a pinned reference resolves. Reimplemented rather than
+    inherited because the transport needs ``delete`` and the atomic
+    ``replace_with`` a full transfer requires.
 
     An object too malformed to carry a usable version is still held, under its
     key alone, so verification withholds it with a signal rather than the
@@ -437,13 +437,17 @@ class _SkillObjectSet:
 
     def get(self, key: str, version: int | None) -> dict[str, Any] | None:
         held = self._versions.get(key, {})
+        if not held:
+            # Nothing well-formed is filed under this key, so the version-less
+            # entry is all there is: serve it, and let verification withhold it
+            # with a signal rather than have it read as simply absent. A pin
+            # that misses while well-formed versions do exist is a plain miss,
+            # and answering it with a leftover malformed object would record an
+            # integrity failure for a skill whose integrity is not in question.
+            return self._loose.get(key)
         if version is not None:
-            # Fall through to the version-less entry so a malformed object
-            # reaches verification rather than reading as simply absent.
-            return held.get(version) or self._loose.get(key)
-        if held:
-            return held[max(held)]
-        return self._loose.get(key)
+            return held.get(version)
+        return held[max(held)]
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """One entry per ``(key, version)``, under keys opaque to the SDK."""
