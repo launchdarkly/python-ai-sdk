@@ -30,6 +30,8 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
+| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `FDv2SkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
+| `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
@@ -77,10 +79,10 @@ from launchdarkly_ai_server import config, graph, resolve_graph
 
 # Agent Skills
 from launchdarkly_ai_server import (
-    skill_refs, get_skill, get_skills, all_skills, write_skills,
-    SkillStore, InMemorySkillStore,
+    skill_refs, get_skill, get_skill_result, get_skills, all_skills, write_skills,
+    SkillStore, InMemorySkillStore, SkillOutcome,
     SKILL_FILENAME, MANIFEST_FILENAME, MANIFEST_VERSION,
-    ReconcileActionKind, OnUnavailable,   # the two closed-set unions
+    ReconcileActionKind, OnUnavailable, SkillOutcomeReason,  # the three closed-set unions
 )
 ```
 
@@ -188,8 +190,8 @@ Three layers, in increasing order of blast radius:
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
    Validation of the array itself lives in `parse_ai_config` and is **fail closed** — one
    malformed reference fails the whole config parse.
-2. **Content accessors** — `get_skill`, `get_skills`, `all_skills` read through the
-   `SkillStore` seam. Configure a store with
+2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
+   through the `SkillStore` seam. Configure a store with
    `init_client(options={"skillStore": store})`; with none configured the accessors raise
    an actionable `RuntimeError`. A delivery transport can be added behind the seam
    without touching the public API.
@@ -198,11 +200,11 @@ Three layers, in increasing order of blast radius:
 
 ### The store seam, and why version is part of the lookup
 
-`SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, and an optional
-`add_listener(kind, fn)`. Version is part of the **lookup identity**, not a filter applied
-to the answer, and that is load-bearing: a delivery payload carries the newest version of
-every skill *plus* every version any variation currently pins, so two versions of one key
-coexist routinely. A seam keyed by key alone would answer a pinned reference with the newest
+`SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, and the optional
+pair `add_listener(kind, fn)` / `remove_listener(kind, fn)`. Version is part of the **lookup
+identity**, not a filter applied to the answer, and that is load-bearing: a delivery payload
+carries the newest version of every skill *plus* every version any variation currently pins,
+so two versions of one key coexist routinely. A store keyed by key alone would answer a pinned reference with the newest
 object, and the caller would then have to reject it — turning the primary use case, a
 version-pinned attachment, into a missing skill. `version=None` asks for the newest held.
 
@@ -216,6 +218,136 @@ object's own `key` and `version`, which are revalidated anyway. `newest_by_key` 
 one place that collapses the result to one object per key, because both whole-store
 consumers need it — `all_skills`, since a list holding two versions of one key is not a set
 of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single path.
+
+### The delivery transport, and the one field that will bite you
+
+`FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
+`GET /sdk/stream`, server-side SDK key in `Authorization`, `basis` + `mv` params,
+`If-None-Match`/304). It lives below the store interface and produces raw objects in the
+shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**. If a transport
+change ever seems to require editing an accessor, verification, or `write_skills`, the adapter
+boundary is wrong.
+
+**The skill's version is in the object's `key`. `version` is the payload's.** Each version
+of a skill is its own object on the wire, identified as `<key>:<version>`:
+
+```json
+{"key":"pdf-extraction:3","kind":"skill","version":42,
+ "object":{"contentType":"text/markdown","content":"…","contentHash":"…","name":"…"}}
+```
+
+The `3` after the delimiter is what a `{key, version}` reference pins and what becomes the
+stored `version`, under the stored key `pdf-extraction`. `version` (42) is the version of the
+*payload* the object arrived in — it moves when anything in the environment moves,
+including a flag with nothing to do with skills. Reading it as the skill's version fails
+**silently**: the object verifies, the hash matches, and the caller gets content under a
+version number that means nothing. There is no separate field for the skill's version: the
+agent-skill payload is a *generic* payload, and generic objects carry only `key`, `kind`,
+`version` and `object`, exactly like a flag. `_split_wire_key` is the only place the wire key
+is read, `_store_object_from_put` and `_tombstone_from_delete` both go through it, and
+`TestVersionTranslation` asserts the translation in both directions. A wire key that will
+not split cleanly is *held*, not dropped — version-less, or with the offending text as its
+version — so verification withholds it with `invalid_version` under a key the caller
+recognises; only a key with nothing before the delimiter is dropped, since there is no
+identity to hold it under.
+
+**Skills are identified by `kind == "skill"`; everything else is ignored, not rejected.**
+Object kinds on the SDK-facing channel are open strings, and the agent-skill payload is
+classified `generic`, so a skill arrives under the kind its producer registered — the bare
+category name — not under a broader wrapper kind with a narrowing field. An environment's
+payload assignment carries its flag payload alongside its agent-skill payload, so flag and
+segment objects arrive as a matter of course. Erroring on an unrecognised kind would turn a
+normal payload into a permanent reconnect loop — a flag-delivery outage caused by a skills
+rollout.
+
+**Changes commit at `payload-transferred`, not as objects arrive.** A payload version is the
+unit of consistency: a half-applied full transfer would publish a state the server never
+described, and would briefly empty the store — which, with pruning on, is the difference
+between a reconcile and deleting a customer's skill files. An interrupted transfer therefore
+leaves last known good intact, and listeners fire once per commit.
+
+**The first payload intent is read, and is assumed to be the skill payload.** Delivery
+provides one payload per credential and the protocol requires a client to ignore all but the
+first payload intent, so `payloads[0]` is both what arrives and what the protocol says to
+read. The cost of that assumption is that an `xfer-full` for somebody *else's* payload would
+start an empty pending set, and the next `payload-transferred` would publish it — every skill
+reported revoked, and with pruning on, a customer's files deleted. `_ProtocolReader`
+therefore learns which payload skills arrive on, from the intent's `id` or from the
+`(p:<id>:<version>)` selector, and declines to apply a transfer of any other: once at
+WARNING, counted in `diagnostics.payloads_ignored`, holding last known good. A transfer that
+names no payload is applied, since one-payload delivery is the common case. The residual is
+the first transfer of a connection — before a skill has arrived there is nothing to compare
+against — which is what the separate WARNING on a multi-payload intent is for.
+
+**A hashless object is held, not dropped.** Verification withholds it with
+`missing_content_hash`; the transport's job is to make that loud (an error per object, a
+summary per wholly-hashless payload, `diagnostics.hashless_objects`) rather than to work
+around it. Dropping it at the transport would report `absent` — indistinguishable from "no
+such skill" — and would let a prune delete the last known-good copy on disk. Never synthesize
+a hash from the delivered content: that certifies the content against itself and verifies
+nothing.
+
+**There is one network timeout, not two.** `urllib`'s `timeout` is the socket timeout for the
+whole operation, so connect, headers and each read share it, and the module cannot bound the
+connect separately without a custom connection class it should not carry. `read_timeout` is
+therefore the only knob, and its default is per mode (`DEFAULT_POLL_TIMEOUT` for a whole poll
+request, `DEFAULT_STREAM_READ_TIMEOUT` for the gap between reads on a stream). Do not add a
+parameter that the standard library cannot honour; `TestTimeouts` measures the bound against a
+socket that accepts and never answers.
+
+**`close` interrupts the socket, it does not just set a flag.** The delivery thread spends its
+life blocked in a read that no flag can reach, and closing a response from another thread does
+not unblock CPython's buffered reader. `_interrupt_read` shuts the socket down underneath it.
+Without that, every shutdown of a *healthy* stream blocks for the full join timeout.
+
+### The reported outcome vocabulary, and the `Resolution` mapping
+
+`get_skill` returns `Skill | None`; `get_skill_result` returns a frozen `SkillOutcome`
+(`skill`, `reason`, `detail`) naming *which* outcome happened. Both are
+`resolve_from_store` — one retrieval, one verification, one telemetry pass — and they differ
+only in what they report. `get_skill`'s contract is load-bearing and **frozen**: `None` for
+every failure, never raises for one, documented in its docstring and in the README. Change
+it and every caller that treats `None` as "no skill" breaks silently.
+
+`SkillOutcomeReason` is five tokens, listed alphabetically for the same reason
+`IntegrityReasonCode` is — so the vocabulary reads identically in the Python and TypeScript
+SDKs, where the type name, the accessor name, and the tokens are all deliberately the same.
+Do not rename one on one side.
+
+Internal `Resolution.reason` maps 1:1 onto it, set explicitly at every construction site:
+
+| `resolve_from_store` outcome | `reason` |
+|---|---|
+| the store raised (`unavailable=True`) | `store_unavailable` |
+| `raw` is not a dict | `absent` |
+| `verify_raw_skill` returned `None` | `integrity_failure` |
+| `skill.version != wanted_version` | `wrong_version` |
+| success | `ok` |
+
+**Adding a sixth internal outcome means choosing which public token it maps to.**
+`Resolution.reason` has no default, so the compiler asks the question; answer it rather than
+defaulting to `absent`, which claims the store does not hold the skill. If the new outcome
+is genuinely neither of the five, the token set grows — on both sides, in the same commit.
+
+Two things the reason is deliberately *not*:
+
+- **Not derived from `Resolution.error`.** That string is prose for a human; recovering a
+  decision a caller fails closed on by matching it is the fragility the typed token exists
+  to remove. `detail` *is* that string, passed straight through — safe to surface (key and
+  failure mode only, never content, never a path), and not for matching on.
+- **Not `Resolution.unavailable`.** The flag answers "may prune run?" and the token answers
+  "what does the caller learn?". They agree by construction — `unavailable` is `True` in
+  exactly the `store_unavailable` case — and both exist because `store_unavailable` must
+  stay distinct from `absent`: only a raising store suppresses pruning, since deleting
+  managed files after a failed lookup turns an outage into data loss.
+
+`get_skill_result` emits nothing of its own. The integrity log record and signal already
+fired inside verification before `resolve_from_store` returned; recording anything here
+would double-count one failure in a SIEM and in the product counter.
+
+There is no `get_skills_result` or `all_skills_result`. The batch accessors keep omitting
+unresolved entries and keep logging the run-level WARN count, and a second accessor per
+batch form would double the surface for a case nobody has asked for.
 
 ### Security posture — do not relax any of this
 
@@ -460,6 +592,31 @@ same-directory requirement is proved by descriptor identity (`src_dir_fd == dst_
 resolving to the skill directory's `(st_dev, st_ino)`) instead of by comparing path strings.
 A spy must `fstat` the descriptor **inside** the intercepted call — the implementation closes
 it as soon as the write returns.
+
+**The platform bound is POSIX-only, and that is a decision — do not quietly "fix" it.**
+Windows reparse-point checks (`GetFileAttributesW`, `FILE_FLAG_OPEN_REPARSE_POINT`) are not
+implemented because Windows is not a supported or tested platform for this release: there is
+no Windows CI runner in either repository, so the checks would ship unverified, and the
+TypeScript SDK could not match them at all — Node exposes no `*at()` family on *any*
+platform, so its racy floor is universal rather than Windows-only. Implementing them in
+Python alone would break cross-language parity and trade a documented bound for an unverified
+one. Two follow-on facts: on Windows write permission on the managed root is the only
+boundary, which is why the privilege-separated deployment is documented as the mitigation
+rather than as advice; and this bound retroactively lowers the priority of the reserved-device-name
+work above — keep that code, but do not read it as evidence that Windows is hardened. If
+Windows becomes a supported platform, revisit both together, and add the CI runner first.
+
+**Privilege separation is the deployment-side half of this, and `ReconcileReport` must not
+grow a writability field.** The recommended deployment runs the reconcile as a different
+identity than the agent, so the `0644`/`0755` modes above actually deny something: the agent
+reads its instructions and cannot rewrite them or the manifest. That is the mitigation for a
+prompt-injected agent editing its own skills. The security review asked for the report to
+surface whether the managed root is writable; we declined, and the reasoning is load-bearing
+rather than a preference. The SDK knows only its *own* identity, which trivially has write
+access — it just wrote there — and cannot know which identity will later run the agent. Any
+check it could perform would answer a different question than the one asked and would create
+false confidence exactly where caution is wanted. The operator's verification steps live in
+the README instead. Do not add the field.
 
 ### Deferred: bounded retries
 

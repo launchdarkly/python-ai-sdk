@@ -41,10 +41,12 @@ from .skills import (
     InMemorySkillStore,
     all_skills,
     get_skill,
+    get_skill_result,
     get_skills,
     skill_refs,
 )
 from .skills_core import SkillStore
+from .skills_fdv2 import FDv2SkillStore, StoreDiagnostics
 from .skills_fs import (
     MANIFEST_FILENAME,
     MANIFEST_VERSION,
@@ -52,6 +54,7 @@ from .skills_fs import (
     OnUnavailable,
     write_skills,
 )
+from .skills_watch import SkillWatcher, watch_skills
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -85,6 +88,8 @@ from .types import (
     ReconcileActionKind,
     ReconcileReport,
     Skill,
+    SkillOutcome,
+    SkillOutcomeReason,
     SkillReference,
     StreamChunkEvent,
     StreamDoneEvent,
@@ -150,6 +155,7 @@ __all__ = [  # noqa: RUF022
     "ReconcileActionKind",
     "ReconcileReport",
     "Skill",
+    "SkillOutcome",
     "SkillReference",
     "StreamChunkEvent",
     "StreamDoneEvent",
@@ -227,14 +233,21 @@ __all__ = [  # noqa: RUF022
     # skills
     "skill_refs",
     "get_skill",
+    "get_skill_result",
     "get_skills",
     "all_skills",
     "write_skills",
     "SkillStore",
     "InMemorySkillStore",
-    # skills — the two closed-set unions a typed consumer needs to name
+    # skills — the FDv2 delivery transport, and the eager re-reconcile it enables
+    "FDv2SkillStore",
+    "StoreDiagnostics",
+    "watch_skills",
+    "SkillWatcher",
+    # skills — the three closed-set unions a typed consumer needs to name
     "ReconcileActionKind",
     "OnUnavailable",
+    "SkillOutcomeReason",
     # skills — on-disk constants, identical across languages
     "SKILL_FILENAME",
     "MANIFEST_FILENAME",

@@ -11,6 +11,29 @@ descriptor pinned to a directory the caller has already validated, rather than
 re-resolving a name — which is what closes the swap window rather than merely
 narrowing it. Where the platform has no ``*at()`` syscall family (Windows) the
 identical sequence runs against full paths, the per-component ``lstat`` floor.
+
+**Platform bound — this guarantee is POSIX-only, deliberately.** On POSIX the
+descriptor walk closes the swap window. On Windows it does not exist: there is no
+``*at()`` family, so the ``lstat`` floor is all that runs, and a floor is a
+check-then-use race rather than a closed window. The remedy would be
+reparse-point checks (``GetFileAttributesW``, or opening with
+``FILE_FLAG_OPEN_REPARSE_POINT``) and it is **not implemented, by decision rather
+than by oversight**: Windows is not a supported or tested platform for this
+release, and neither SDK repository has a Windows CI runner, so the checks would
+ship untested — and the TypeScript SDK could not match them in any case, because
+Node exposes no ``*at()`` family on *any* platform. Shipping them in Python alone
+would break the cross-language parity the two SDKs are held to and would trade a
+documented bound for an unverified one.
+
+Two consequences worth stating plainly rather than discovering later. First, on
+Windows write permission on the managed root is the *only* boundary, so the
+privilege-separated deployment the README documents is not advice there but the
+mitigation. Second, this bound retroactively lowers the priority of the Windows
+reserved-device-name work in ``skills_fs.py`` (``_WINDOWS_RESERVED_NAMES``): that
+code stays, because it is cheap and it keeps a managed root written on Linux
+usable when read from Windows, but it should not be read as evidence that Windows
+is a hardened target. It is not. Revisit both together if Windows becomes
+supported.
 """
 
 from __future__ import annotations
