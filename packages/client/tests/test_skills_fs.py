@@ -537,6 +537,46 @@ class TestReconcileSemantics:
         assert not (root / "gone").exists()
         assert _read_manifest(root)["entries"] == {}
 
+    async def test_star_does_not_report_an_error_for_a_key_that_wrote(
+        self, root: Path, store: InMemorySkillStore, make_raw_skill: Any
+    ) -> None:
+        """A malformed object beside a good version of the same key.
+
+        The good version resolves and materializes, so the run succeeded for
+        that key. Reporting the malformed sibling as well would flip
+        ``report.ok`` to ``False`` for a skill that is correctly on disk, and
+        say the copy there "was left alone" when this run had just written it.
+        """
+        store.put(make_raw_skill(key="a", version=1))
+        store.put(make_raw_skill(key="a", version="not-a-version"))
+
+        report = await write_skills("*", root)
+
+        assert report.ok is True
+        assert [(a.key, a.action) for a in report.actions] == [("a", "written")]
+        assert (root / "a" / "SKILL.md").read_text(encoding="utf-8") == SKILL_BODY
+
+    async def test_star_still_reports_a_key_nothing_could_resolve(
+        self, root: Path, store: InMemorySkillStore, make_raw_skill: Any
+    ) -> None:
+        """The converse, and the reason the malformed object is kept at all.
+
+        No version of ``b`` is usable, so it stays in the requested set: the
+        failure is reported, and prune leaves any copy already on disk alone
+        rather than reading the key as revoked.
+        """
+        existing = _place_managed(root, "b", SKILL_BODY)
+        store.put(make_raw_skill(key="a", version=1))
+        store.put(make_raw_skill(key="b", version="not-a-version"))
+
+        report = await write_skills("*", root)
+
+        assert report.ok is False
+        assert _actions_by_key(report)["a"].action == "written"
+        assert _actions_by_key(report)["b"].action == "error"
+        assert [a for a in report.actions if a.action == "removed"] == []
+        assert existing.read_text(encoding="utf-8") == SKILL_BODY
+
     async def test_prune_false_keeps_the_file(self, root: Path) -> None:
         target = _place_managed(root, "gone", SKILL_BODY)
 

@@ -1414,6 +1414,30 @@ class TestWithholdingSummary:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
 
+    async def test_a_key_that_resolved_is_not_also_reported_withheld(
+        self, store: Any, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A store may hold a malformed object beside a well-formed version of the
+        same key. The well-formed one resolves, so the key is not withheld and
+        must not be counted as though it were.
+        """
+        store.put(make_raw_skill(key="a", version=1))
+        store.put(make_raw_skill(key="a", version="not-a-version"))
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills_core"):
+            skills = await all_skills()
+        assert [s.key for s in skills] == ["a"]
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    async def test_a_key_with_no_usable_version_is_still_withheld(
+        self, store: Any, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The converse: nothing resolved the key, so the withholding stands."""
+        store.put(make_raw_skill(key="a", version="not-a-version"))
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills_core"):
+            assert await all_skills() == []
+        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
     async def test_a_fully_resolved_run_is_silent(
         self, store: Any, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
     ) -> None:

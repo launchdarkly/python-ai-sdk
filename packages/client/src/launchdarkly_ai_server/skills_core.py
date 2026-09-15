@@ -679,10 +679,13 @@ def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
     The store key is carried through rather than discarded because the reconcile
     attributes a failure to it when the object's own key is unusable.
 
-    Objects too malformed to carry a usable key and version are **kept**, not
-    dropped, so verification is what withholds them: a silently dropped object
-    falls out of the requested set, and prune would then delete the last
-    known-good copy already on disk.
+    An object too malformed to carry a usable key and version is **kept**, so
+    verification is what withholds it: a silently dropped object falls out of
+    the requested set, and prune would then delete the last known-good copy
+    already on disk. The exception is an object whose skill key resolved anyway
+    from another version — there the resolved object already holds the key in
+    the requested set, so keeping the malformed one would only report a
+    withholding for a key that in fact resolved.
     """
     best: dict[str, tuple[str, Any]] = {}
     unusable: list[tuple[str, Any]] = []
@@ -695,7 +698,16 @@ def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
         held = best.get(skill_key)
         if held is None or version > held[1]["version"]:
             best[skill_key] = (object_key, raw)
-    return list(best.values()) + unusable
+    withheld = [
+        (object_key, raw)
+        for object_key, raw in unusable
+        # ``is_valid_skill_key`` first: an unhashable key cannot be looked up.
+        if not (
+            is_valid_skill_key(raw.get("key") if isinstance(raw, dict) else None)
+            and raw["key"] in best
+        )
+    ]
+    return list(best.values()) + withheld
 
 
 # ---------------------------------------------------------------------------
