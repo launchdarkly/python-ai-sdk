@@ -35,6 +35,7 @@ from .events import (
     LDJudgeCriterionEventPayload,
     TokenUsage,
 )
+from .trajectory import TrajectoryRecorder, render_row_trajectory, row_fields
 from .types import (
     DatasetRef,
     DatasetRow,
@@ -544,11 +545,16 @@ class EvaluationsRunner:
 
         async def invoke(row: DatasetRow) -> dict[str, Any]:
             await controller.acquire(config["provider"]["name"])
+            # One recorder per row, not one per run: rows are generated
+            # concurrently against the same tool map, so a shared recorder
+            # would splice one row's tool calls into another's trajectory.
+            recorder = TrajectoryRecorder()
+            row_tool_handlers = recorder.wrap(tool_handlers)
             started = datetime.now(UTC)
             started_clock = time.perf_counter()
             try:
                 result = await handler(
-                    config, row.input, tool_handlers, dict(row.variables)
+                    config, row.input, row_tool_handlers, dict(row.variables)
                 )
                 if not isinstance(result, Mapping):
                     raise TypeError("handler result must be a mapping")
@@ -564,6 +570,7 @@ class EvaluationsRunner:
                     "generated_at": completed.isoformat().replace("+00:00", "Z"),
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
                     "status": "COMPLETE",
+                    **row_fields(recorder),
                 }
                 usage = result.get("usage")
                 if isinstance(usage, Mapping):
@@ -583,6 +590,9 @@ class EvaluationsRunner:
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
                     "status": "ERROR",
                     "error": {"code": 5001, "message": f"handler raised: {error}"},
+                    # The calls that ran before the handler raised are what
+                    # explain why it raised, so an errored row records them too.
+                    **row_fields(recorder),
                 }
             finally:
                 controller.release()
@@ -696,6 +706,12 @@ class EvaluationsRunner:
             ground_truth = parse_template(ground_truth, variables)
         elif expected is not None:
             ground_truth = str(expected)
+        # The tool calls the row made on its way to `output`, recorded during
+        # generation (evaluations.trajectory). It sits between the input and the
+        # output in message_history because that is where it happened: a judge
+        # reading the history sees the request, what the agent did about it, and
+        # what it finally answered, in order.
+        trajectory = render_row_trajectory(row_result)
         # message_history carries FORMATTING_INSTRUCTIONS the same way the
         # online path builds it (judges.run_judges), because that -- not the
         # standalone formatting_instructions variable below -- is what every
@@ -703,6 +719,12 @@ class EvaluationsRunner:
         # relevance, toxicity, and any judge cloned from them) actually
         # references. A judge authored before this variable existed must keep
         # getting scored without edits.
+        #
+        # The trajectory goes here and nowhere else. It was briefly also
+        # exposed as a standalone tool_trajectory variable, which bought
+        # nothing: this is already the transcript variable every judge reads,
+        # and two overlapping variables only invited a rubric to interpolate
+        # both and pay for the trajectory twice.
         variables.update(
             {
                 "input": row_result.get("input") or "",
@@ -711,6 +733,7 @@ class EvaluationsRunner:
                     str(value)
                     for value in (
                         row_result.get("input"),
+                        trajectory,
                         output,
                         FORMATTING_INSTRUCTIONS,
                     )

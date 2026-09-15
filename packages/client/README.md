@@ -116,6 +116,31 @@ result = await init_evaluations().run(
 
 **The SDK reports scores and never rules on them.** LaunchDarkly derives each row's verdict at ingest by comparing the score against the criterion's stored threshold and success direction, so pass/fail policy is one server-side implementation that applies to every SDK version and to runs already recorded. A judge's direction lives on its AI Config and is injected server-side, keeping the one input a verdict turns on server-attested; a `Scorer` has no LaunchDarkly-side config to read, so it declares its own `success_direction` (default `"higher_is_better"` — set `"lower_is_better"` for a scorer that counts something unwanted, like a regex hit count).
 
+#### Judge the tool trajectory
+
+A judge is shown the tool calls the row made on the way to its output, so a rubric can grade *how* the agent answered and not only *what* it answered — whether it called the right tool, in the right order, with the right arguments, and how it handled a tool that failed.
+
+The harness records this itself: it wraps your tool implementations once per row before handing them to the handler, so every handler package is covered without changes and your tools still return and raise exactly what they did before.
+
+The trajectory is rendered into **`{{message_history}}`** — the row input, then the trajectory, then the generated output, then the formatting instructions, in that order. There is no separate trajectory variable: `message_history` is already the transcript variable every judge reads, and judges built from the AI Library's default templates reference it, so a trajectory rubric can be written against an existing judge template with no new placeholder.
+
+```
+Tools available: lookup_order, issue_refund
+Tool calls made while producing the response, in order:
+1. lookup_order
+   arguments: {"id":"A1"}
+   result: order A1 shipped 2026-08-02
+2. issue_refund
+   arguments: {"id":"A1","amount":19.99}
+   error: refund window closed
+```
+
+A row with tools that called none of them says so explicitly, which is the finding a tool-selection rubric most needs. A run with no tools adds no block at all, so judges written before trajectories existed read exactly the history they read before.
+
+Two limits keep a trajectory from spending the judge's context window: at most 50 recorded calls per row and 2000 characters per rendered argument bag or result, with anything beyond either reported as a count or marked truncated. Calls past the limit still execute — truncation drops the record, never the work. A `NativeTool` runs inside the provider, so no local wrapper sees it; such a tool is left out of the trajectory and out of the "Tools available" line, since naming a tool whose use cannot be shown would invite a judge to conclude the model ignored it.
+
+A tool result is now judge-prompt input. It stays literal for the same reason the generated output does: the judge config is handed to the handler unrendered and the handler makes exactly one template pass, so a `{{...}}` sequence coming back from a tool is never expanded into the judge prompt.
+
 **Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`, and a handler built for one provider cannot execute another's config. `handler` runs a judge when it provides for that judge's provider; pass handlers for any other providers in `judge_handlers`. Selection prefers a handler naming the judge's provider outright over a wildcard multi-provider adapter, and an agent-mode handler can serve a messages-mode judge with its messages collapsed into one instructions block. A plain callable that declares no `provides_for` routes itself, exactly as it already does for the generation config.
 
 Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge or one no handler covers fails the run up front rather than after the generation spend. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
