@@ -748,6 +748,105 @@ class TestSkillsArgumentErrors:
         assert list(root.iterdir()) == []
 
 
+class TestUninitializedStore:
+    """A store that has not received its initial data must not authorize a prune.
+
+    Through ``all_objects`` there is no difference between "this environment
+    holds no skills" and "delivery has not answered yet": both are an empty
+    result. ``write_skills("*")`` reads the first as every skill having been
+    revoked, so without the optional ``is_initialized()`` probe a reconcile
+    racing a slow boot deletes every managed file and reports success.
+    """
+
+    class _Waiting:
+        """A delivery store whose first payload has not arrived."""
+
+        def __init__(self, initialized: bool = False) -> None:
+            self._initialized = initialized
+
+        def is_initialized(self) -> bool:
+            return self._initialized
+
+        def get_object(
+            self, kind: str, key: str, version: int | None = None
+        ) -> dict[str, Any] | None:
+            return None
+
+        def all_objects(self, kind: str) -> dict[str, dict[str, Any]]:
+            return {}
+
+    async def test_star_does_not_prune_before_the_first_payload(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        existing = _place_managed(root, "a", SKILL_BODY)
+        spy = _UnlinkSpy().install(monkeypatch)
+        skills_module._set_store(self._Waiting())
+
+        report = await write_skills("*", root)
+
+        assert report.ok is False
+        assert existing.read_text(encoding="utf-8") == SKILL_BODY
+        assert [a for a in report.actions if a.action == "removed"] == []
+        assert spy.targets == []
+        # The entry survives, so a later reconcile still knows it owns the file.
+        assert "a/SKILL.md" in _read_manifest(root)["entries"]
+        assert any("initial data" in m for m in _error_messages(report))
+
+    async def test_star_raises_in_raise_mode_before_the_first_payload(
+        self, root: Path
+    ) -> None:
+        skills_module._set_store(self._Waiting())
+        with pytest.raises(RuntimeError, match=r"initial data"):
+            await write_skills("*", root, on_unavailable="raise")
+
+    async def test_an_initialized_store_prunes_as_before(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The positive control: the probe must not disable pruning outright."""
+        _place_managed(root, "a", SKILL_BODY)
+        skills_module._set_store(self._Waiting(initialized=True))
+
+        report = await write_skills("*", root)
+
+        assert report.ok is True
+        assert _actions_by_key(report)["a"].action == "removed"
+        assert not (root / "a").exists()
+
+    async def test_a_store_without_the_probe_prunes_as_before(
+        self, root: Path, store: InMemorySkillStore
+    ) -> None:
+        """``is_initialized()`` is optional; absent means initialized.
+
+        A hand-populated store is never waiting for anything, so requiring the
+        probe would break every ``InMemorySkillStore`` caller.
+        """
+        assert not hasattr(store, "is_initialized")
+        _place_managed(root, "a", SKILL_BODY)
+
+        report = await write_skills("*", root)
+
+        assert report.ok is True
+        assert _actions_by_key(report)["a"].action == "removed"
+
+    async def test_a_probe_that_raises_counts_as_uninitialized(
+        self, root: Path
+    ) -> None:
+        """A store that cannot say whether it is ready does not get to delete."""
+
+        class Exploding(TestUninitializedStore._Waiting):
+            def is_initialized(self) -> bool:
+                raise RuntimeError("cannot tell")
+
+        existing = _place_managed(root, "a", SKILL_BODY)
+        skills_module._set_store(Exploding())
+
+        report = await write_skills("*", root)
+
+        assert report.ok is False
+        assert existing.exists()
+        assert [a for a in report.actions if a.action == "removed"] == []
+
+
 class TestResilience:
     """Unavailable retrieval and timeout."""
 

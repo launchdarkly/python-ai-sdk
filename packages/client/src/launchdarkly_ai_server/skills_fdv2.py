@@ -1385,6 +1385,23 @@ class FDv2SkillStore:
         self._delivery_ended.set()
         self._released.set()
 
+    def is_initialized(self) -> bool:
+        """
+        Whether a payload has arrived, so reads reflect delivery rather than an
+        empty store still waiting for its first one.
+
+        The optional half of the ``SkillStore`` interface, and the same fact
+        ``wait_for_skills`` returns — without the wait. ``write_skills("*")``
+        consults it so a reconcile that runs before delivery reports the
+        retrieval unavailable rather than pruning every managed skill as though
+        the environment had revoked it.
+
+        Stays ``True`` once a payload has arrived, including after ``close``: a
+        closed store still answers from what it received, and a later
+        reconcile against that content is a reconcile against real delivery.
+        """
+        return self._first_payload.is_set()
+
     @property
     def failed(self) -> str | None:
         """Why delivery stopped for good, or ``None`` while it is running."""

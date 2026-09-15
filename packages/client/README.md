@@ -506,7 +506,9 @@ import os
 from launchdarkly_ai_server import FDv2SkillStore, init_client, watch_skills
 
 store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
-store.wait_for_skills(timeout=10)
+if not store.wait_for_skills(timeout=10):
+    # No payload arrived. Reconciling now would find an empty store; see below.
+    print(f"skill delivery has not answered yet: {store.failed or 'still waiting'}")
 await init_client(options={"skillStore": store})
 
 # Materialize now, and re-materialize whenever delivery changes.
@@ -517,6 +519,14 @@ finally:
     watcher.close()
     store.close()
 ```
+
+**A reconcile that runs before delivery answers does not prune.** Through the `SkillStore`
+interface, a store still waiting for its first payload and an environment that holds no
+skills give the same answer — an empty one — and `write_skills("*")` would otherwise read
+that as every skill having been revoked and delete the files it wrote on a previous run.
+`FDv2SkillStore` reports readiness through the optional `is_initialized()`, so a reconcile
+against a store that has not received a payload reports the retrieval unavailable and leaves
+everything on disk alone. `report.ok` is `False` in that case, and the error names it.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
 objects through the `SkillStore` interface and cannot tell which store produced them.
@@ -566,9 +576,9 @@ Windows.
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative `timeout`, or an unrecognised `on_unavailable`. **Performs synchronous filesystem I/O — see the note below.** |
-| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)` / `remove_listener(kind, fn)`. |
+| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `is_initialized()`, `add_listener(kind, fn)` / `remove_listener(kind, fn)`. A store without `is_initialized()` is treated as initialized. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
-| `FDv2SkillStore(sdk_key, *, base_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `close()`, `diagnostics`, `failed`; also a context manager. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
+| `FDv2SkillStore(sdk_key, *, base_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
 | `watch_skills(skills, root, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `hashless_objects`, `connection_failures`, `last_error`. |
 

@@ -2528,6 +2528,32 @@ class TestWaitingForSkills:
         assert time.monotonic() - started < 2.0
         assert answers == [False]
 
+    def test_is_initialized_tracks_the_first_payload(self) -> None:
+        """The probe ``write_skills("*")`` reads to decide whether it may prune.
+
+        Before the first payload, an empty store and an environment with no
+        skills are the same answer through ``all_objects``; this is what tells
+        them apart.
+        """
+        store = stream_store(_requester=_SilentStreamRequester())
+        try:
+            assert store.is_initialized() is False
+            store.start()
+            assert store.wait_for_skills(timeout=0.2) is False
+            assert store.is_initialized() is False
+        finally:
+            store.close()
+
+        delivering = stream_store(_requester=_RecyclingRequester())
+        try:
+            delivering.start()
+            assert delivering.wait_for_skills(timeout=5) is True
+            assert delivering.is_initialized() is True
+        finally:
+            delivering.close()
+        # Content outlives the connection, so the fact about it does too.
+        assert delivering.is_initialized() is True
+
     def test_a_payload_already_held_still_answers_true_after_close(self) -> None:
         # ``close`` does not drop content, so it must not turn the answer about
         # that content into a lie either.

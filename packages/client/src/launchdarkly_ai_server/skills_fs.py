@@ -57,6 +57,7 @@ from .skills_core import (
     record_revoked,
     reference_target,
     resolve_from_store,
+    store_is_initialized,
     verified_bytes,
     verify_raw_skill,
 )
@@ -411,6 +412,21 @@ def _available_store(deadline: float, subject: str) -> SkillStore | _RetrievalBl
     store = get_store()
     if store is None:
         return _RetrievalBlocked(_unavailable(NO_STORE_MESSAGE))
+    if not store_is_initialized(store):
+        # A store still waiting for its first delivery answers every read with
+        # "nothing", which is indistinguishable from an environment that holds
+        # no skills — and the "*" form reads that as every skill having been
+        # revoked. Blocking here reports the run incomplete, which is what
+        # suppresses the prune.
+        return _RetrievalBlocked(
+            _unavailable(
+                "the skill store has not received its initial data, so "
+                f"{subject} could not be retrieved and nothing on disk was "
+                "changed. Wait for delivery before reconciling: "
+                "FDv2SkillStore.wait_for_skills(timeout) returns True once the "
+                "first payload has arrived."
+            )
+        )
     return store
 
 

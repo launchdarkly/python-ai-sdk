@@ -166,9 +166,9 @@ class SkillStore(Protocol):
     Duck-typed on purpose, mirroring how the LaunchDarkly client interface works
     in this package: pass any object carrying these methods.
 
-    ``add_listener(kind, fn)`` and ``remove_listener(kind, fn)`` are part of the
-    interface but **optional**, which is why they are deliberately not declared
-    here: a Protocol member is required for structural compatibility, so declaring
+    ``is_initialized()``, ``add_listener(kind, fn)`` and
+    ``remove_listener(kind, fn)`` are part of the interface but **optional**,
+    which is why they are deliberately not declared here: a Protocol member is required for structural compatibility, so declaring
     them would reject every store that does not implement them. Nothing in this
     module calls either — they exist for the delivery transport to push updates
     through, and for a consumer such as ``watch_skills`` to stop receiving them.
@@ -177,6 +177,14 @@ class SkillStore(Protocol):
     older store keeps working at the cost of a listener that lives as long as
     the store does. ``remove_listener`` removes one occurrence of *fn* under
     *kind* and is a no-op when *fn* is not registered.
+
+    ``is_initialized()`` reports whether the store has received its initial data
+    — for a delivery transport, whether a payload has arrived yet. A store that
+    does not implement it is treated as initialized, which is correct for one
+    that is populated by hand. It matters because "the store holds nothing" and
+    "the store has not heard yet" are the same answer through ``all_objects``,
+    and ``write_skills("*")`` reads the first as "every skill was revoked": see
+    ``store_is_initialized``.
 
     The raw objects a store serves are wire-shaped, with camelCase field names
     identical across language implementations::
@@ -279,6 +287,39 @@ def require_store() -> SkillStore:
     if store is None:
         raise RuntimeError(NO_STORE_MESSAGE)
     return store
+
+
+def store_is_initialized(store: Any) -> bool:
+    """
+    Whether *store* has received its initial data.
+
+    ``True`` for a store that does not implement the optional
+    ``is_initialized()``, since a hand-populated store is never waiting for
+    anything. Probed rather than declared on the Protocol for the reason
+    ``SkillStore`` gives: a declared member would reject every store without it.
+
+    This is what keeps ``write_skills("*")`` from reading a store that has not
+    yet received a payload as an environment whose every skill was revoked.
+    Retrieval through such a store is reported unavailable, which suppresses
+    pruning — the same treatment a raising store gets, and for the same reason:
+    deleting a customer's files because content could not be retrieved would
+    turn a slow boot into data loss.
+
+    A probe that raises counts as not initialized. A store that cannot answer
+    whether it is ready is not one to authorize deletions on.
+    """
+    probe = getattr(store, "is_initialized", None)
+    if not callable(probe):
+        return True
+    try:
+        return bool(probe())
+    except Exception:
+        logger.warning(
+            "The skill store's is_initialized() raised; treating the store as "
+            "not yet initialized",
+            exc_info=True,
+        )
+        return False
 
 
 def emit(signal: str, properties: dict[str, Any]) -> None:

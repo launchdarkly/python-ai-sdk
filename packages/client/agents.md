@@ -211,7 +211,8 @@ Three layers, in increasing order of blast radius:
 ### The store seam, and why version is part of the lookup
 
 `SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, and the optional
-pair `add_listener(kind, fn)` / `remove_listener(kind, fn)`. Version is part of the **lookup
+`is_initialized()` plus the optional pair `add_listener(kind, fn)` /
+`remove_listener(kind, fn)`. Version is part of the **lookup
 identity**, not a filter applied to the answer, and that is load-bearing: a delivery payload
 carries the newest version of every skill *plus* every version any variation currently pins,
 so two versions of one key coexist routinely. A store keyed by key alone would answer a pinned reference with the newest
@@ -227,7 +228,24 @@ SDK. Do not parse them and do not assume one per skill key; identity is read off
 object's own `key` and `version`, which are revalidated anyway. `newest_by_key` is the
 one place that collapses the result to one object per key, because both whole-store
 consumers need it — `all_skills`, since a list holding two versions of one key is not a set
-of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single path.
+of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single path. It keeps
+an object too malformed to carry a usable key and version, so verification is what withholds
+it and the key stays in the requested set where prune cannot touch its on-disk copy — unless
+another version resolved that key anyway, in which case keeping it would only report a
+withholding for a key that resolved.
+
+### `is_initialized()` is what stands between a slow boot and deleting a customer's files
+
+Through the store interface, "this environment holds no skills" and "delivery has not
+answered yet" are the same empty answer, and `write_skills("*")` reads the first as every
+skill having been revoked. So `_available_store` — the single gate that sets `unavailable`
+and therefore suppresses pruning — consults `store_is_initialized`, and a store that has not
+received its initial data blocks retrieval instead of authorizing a prune. A store that does
+not implement the probe is treated as initialized, which is right for one populated by hand;
+a probe that *raises* counts as not initialized, because a store that cannot say whether it
+is ready is not one to delete on. Keep this check in that one gate: maintained in two places,
+a condition added to one and not the other does not merely produce a wrong message — it
+deletes the user's files.
 
 ### The delivery transport, and the one field that will bite you
 
