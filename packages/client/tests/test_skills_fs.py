@@ -2505,6 +2505,10 @@ class TestWriteSkillsTelemetry:
         self, root: Path, mock_ld_client: Any
     ) -> None:
         await init_client(client=mock_ld_client)
+        # init_client flushes $ld:ai:sdk:info on the first client of a process,
+        # so it may or may not have fired depending on what ran before. This
+        # test is about write_skills, so start counting from here.
+        mock_ld_client.track.reset_mock()
 
         await write_skills([_skill("a"), _skill("../evil")], root)
 

@@ -1959,6 +1959,9 @@ class TestTelemetrySeam:
         store.put(make_raw_skill(key="a"))
         store.put(make_raw_skill(key="bad", contentHash="0" * 64))
         await init_client(options={"skillStore": store}, client=mock_ld_client)
+        # See the note in test_no_ld_track_calls_from_write_skills: the
+        # sdk-info flush belongs to init_client, not to the accessors.
+        mock_ld_client.track.reset_mock()
 
         await get_skill("a")
         await get_skill("bad")
