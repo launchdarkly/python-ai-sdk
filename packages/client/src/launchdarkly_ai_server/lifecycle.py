@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any
 
+from . import skills
 from .types import InitClientOptions
 
 logger = logging.getLogger(__name__)
@@ -130,12 +131,42 @@ async def init_client(
 
     - Pass *client* directly (BYOC) to skip the LaunchDarkly Python SDK path.
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
+    - ``options['skillStore']`` configures the store the Agent Skills accessors
+      read from. Absent by default, in which case they raise an actionable error.
+
+    This function is idempotent for the client singleton: a second call returns
+    the existing client without re-initializing, and every option is ignored —
+    **except** ``skillStore``, which is applied on every successful call. That
+    asymmetry is deliberate, and it is what lets a client that was lazily
+    auto-initialized, or initialized without a store, be given one afterwards.
+    A ``skillStore`` of ``None`` (or absent) never clears an already-configured
+    store; use ``shutdown()`` for that. The store is installed only once
+    initialization has succeeded: a call that raises leaves no global state
+    behind, so a failed init cannot leave the skill accessors working against a
+    store the application believes was never installed.
 
     Returns the initialized ``LDClientInterface`` instance.
     """
-    global _client
-
     opts = options or {}
+
+    ld_client = await _resolve_client(opts, client)
+
+    # The single success point: every path that raises returns before here, so
+    # "installed only on success" is one statement rather than a copy per exit.
+    skill_store = opts.get("skillStore")
+    if skill_store is not None:
+        skills._set_store(skill_store)
+    return ld_client
+
+
+async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
+    """
+    Returns the singleton client, initializing it on first call.
+
+    Split from ``init_client`` so that function has exactly one success point to
+    hang the ``skillStore`` carve-out on.
+    """
+    global _client
 
     # Idempotent — if already initialized, return the existing client
     if _client is not None:
@@ -198,11 +229,17 @@ async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
+
+    Also clears the configured skill store (and telemetry emitter): after a
+    shutdown, re-pass ``skillStore`` to the next ``init_client`` if the skill
+    accessors should keep working.
     """
     global _client, _tracer_provider
 
     local_client = _client
     local_provider = _tracer_provider
+
+    skills._clear_state()
 
     # Null the singleton before any awaits so a second call is a no-op
     _client = None
@@ -240,6 +277,7 @@ def _reset_for_testing() -> None:
     global _client, _tracer_provider
     _client = None
     _tracer_provider = None
+    skills._clear_state()
 
 
 async def inspect_config(
