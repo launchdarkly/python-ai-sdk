@@ -1,39 +1,24 @@
 """
 Descriptor-pinned filesystem primitives.
 
-Split out because none of this knows what a skill is: it is the "write a file
-under a directory an attacker may be racing you for" problem, solved once.
-``skills_fs.py`` is the only caller today.
+Nothing here knows what a skill is: this is the "write a file under a directory
+an attacker may be racing you for" problem, solved once. ``skills_fs.py`` is the
+only caller today.
 
-The whole point is that a path check is only as good as the last path
-resolution after it. Every operation here therefore runs relative to a
-descriptor pinned to a directory the caller has already validated, rather than
-re-resolving a name — which is what closes the swap window rather than merely
-narrowing it. Where the platform has no ``*at()`` syscall family (Windows) the
-identical sequence runs against full paths, the per-component ``lstat`` floor.
+A path check is only as good as the last path resolution after it. Every
+operation here therefore runs relative to a descriptor pinned to a directory the
+caller has already validated, rather than re-resolving a name — which is what
+closes the swap window rather than merely narrowing it.
 
-**Platform bound — this guarantee is POSIX-only, deliberately.** On POSIX the
-descriptor walk closes the swap window. On Windows it does not exist: there is no
-``*at()`` family, so the ``lstat`` floor is all that runs, and a floor is a
-check-then-use race rather than a closed window. The remedy would be
-reparse-point checks (``GetFileAttributesW``, or opening with
-``FILE_FLAG_OPEN_REPARSE_POINT``) and it is **not implemented, by decision rather
-than by oversight**: Windows is not a supported or tested platform for this
-release, and neither SDK repository has a Windows CI runner, so the checks would
-ship untested — and the TypeScript SDK could not match them in any case, because
-Node exposes no ``*at()`` family on *any* platform. Shipping them in Python alone
-would break the cross-language parity the two SDKs are held to and would trade a
-documented bound for an unverified one.
-
-Two consequences worth stating plainly rather than discovering later. First, on
-Windows write permission on the managed root is the *only* boundary, so the
-privilege-separated deployment the README documents is not advice there but the
-mitigation. Second, this bound retroactively lowers the priority of the Windows
-reserved-device-name work in ``skills_fs.py`` (``_WINDOWS_RESERVED_NAMES``): that
-code stays, because it is cheap and it keeps a managed root written on Linux
-usable when read from Windows, but it should not be read as evidence that Windows
-is a hardened target. It is not. Revisit both together if Windows becomes
-supported.
+**This guarantee is POSIX-only.** On POSIX the descriptor walk closes the swap
+window. Windows has no ``*at()`` syscall family, so only the per-component
+``lstat`` floor runs there, and a floor is a check-then-use race rather than a
+closed window; closing it would need reparse-point checks
+(``GetFileAttributesW``, or opening with ``FILE_FLAG_OPEN_REPARSE_POINT``), which
+this release does not implement. The practical consequence: on Windows, write
+permission on the managed root is the *only* boundary, so the privilege-separated
+deployment the README describes is the mitigation there rather than merely good
+advice.
 """
 
 from __future__ import annotations
@@ -72,26 +57,20 @@ Whether the ``*at()`` syscall family is available, so every operation under the
 managed root can be performed relative to a descriptor pinned to a directory
 this module has already verified rather than re-resolved from its path.
 
-That is what closes the swap window rather than merely narrowing it:
-a descriptor refers to the inode that was checked, so replacing ``<root>/<key>``
-with a symlink after the check cannot redirect a write or an unlink out of the
-root. POSIX has these calls; Windows does not, and there the per-component
-``lstat`` floor the spec permits applies instead.
+A descriptor refers to the inode that was checked, so replacing
+``<root>/<key>`` with a symlink after the check cannot redirect a write or an
+unlink out of the root. POSIX has these calls; Windows does not, and there the
+per-component ``lstat`` floor applies instead.
 
-``os.mkdir`` and ``os.rmdir`` are in the set because the managed root is now
-pinned for a whole reconcile and the per-skill directory is created and removed
-relative to that descriptor. Both are registered by CPython under the names
-called here, so unlike the two below they need no indirection.
-
-The probe deliberately names ``os.rename`` and ``os.stat`` rather than the
-``os.replace`` and ``os.lstat`` this module actually calls. ``os.supports_dir_fd``
-is populated per underlying syscall, and CPython registers ``renameat`` under
-``rename`` only and ``fstatat`` under ``stat`` only — even though ``os.replace``
-is the same ``renameat``-backed function and ``os.lstat`` is ``fstatat`` with
+**Do not "correct" the names in this probe.** It deliberately names
+``os.rename`` and ``os.stat`` rather than the ``os.replace`` and ``os.lstat``
+this module actually calls, because ``os.supports_dir_fd`` is populated per
+underlying syscall: CPython registers ``renameat`` under ``rename`` only and
+``fstatat`` under ``stat`` only, even though ``os.replace`` is the same
+``renameat``-backed function and ``os.lstat`` is ``fstatat`` with
 ``AT_SYMLINK_NOFOLLOW``, and both accept the descriptor keywords wherever their
-advertised twin does (verified on CPython 3.12 and 3.13, macOS). Probing the
-names this module calls would report "unsupported" on every POSIX platform and
-silently disable the defense.
+advertised twin does. Probing the names this module calls would report
+"unsupported" on every POSIX platform and silently disable the defense.
 """
 
 
@@ -121,12 +100,6 @@ def open_directory_nofollow(
     on each open, so a parent swapped for a symlink after it was checked
     redirects the open. Given a parent descriptor the bare name is resolved
     inside the inode that was checked instead, and there is nothing left to swap.
-
-    Everything the caller does afterwards goes through the returned descriptor
-    instead of the path, which is what turns the "narrow window" into no
-    window at all: the descriptor names the inode that was checked, so swapping
-    the path for a symlink between the check and the write cannot redirect the
-    write out of the managed root.
 
     On a platform without the ``*at()`` family (Windows) this returns ``None``
     after verifying via ``lstat`` that the path is a real, non-symlink
@@ -364,10 +337,9 @@ def atomic_write(
     Without one (Windows) the identical sequence runs against full paths, which
     is the per-component ``lstat`` floor.
 
-    ``os.replace`` is the one and only rename call site, reached by attribute
-    lookup on the ``os`` module so tests can intercept it; ``os.rename`` must
-    not be substituted for it (it is also the only one with defined overwrite
-    semantics on Windows).
+    ``os.replace`` is the one and only rename call site. ``os.rename`` must not
+    be substituted for it: only ``os.replace`` has defined overwrite semantics
+    on Windows.
     """
     at_fd = dir_fd if dir_fd is not None and SUPPORTS_DIR_FD else None
     prefix = temp_name_prefix(name)
@@ -385,8 +357,8 @@ def atomic_write(
     try:
         try:
             # fchmod, not chmod: operating on the descriptor cannot be redirected
-            # by anything that swaps the temp path underneath us, and it makes the
-            # mode independent of the process umask (both creation paths open 0600).
+            # by a swap of the temp path, and it makes the mode independent of
+            # the process umask (both creation paths open 0600).
             if _SUPPORTS_FCHMOD:
                 os.fchmod(fd, _FILE_MODE)
             elif at_fd is None:
@@ -432,10 +404,8 @@ def atomic_write_in(directory: Path, name: str, data: bytes) -> None:
     The descriptor is taken with ``O_NOFOLLOW``, so a directory swapped for a
     symlink between the caller's checks and the write fails it rather than
     redirecting it. That still leaves the directory's *ancestors* re-resolved on
-    the open, so this is the right primitive only where the caller holds nothing
-    better. ``skills_fs`` no longer does — it pins the managed root for the whole
-    reconcile and writes the manifest with ``atomic_write(..., dir_fd=root_fd)``
-    — so prefer passing a descriptor over reaching for this.
+    the open, so prefer ``atomic_write`` with a descriptor the caller already
+    holds; this is for callers that hold nothing better.
     """
     with pinned_directory(directory) as dir_fd:
         atomic_write(directory, name, data, dir_fd=dir_fd)

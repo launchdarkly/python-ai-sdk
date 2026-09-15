@@ -466,13 +466,11 @@ SkillOutcomeReason = Literal[
 """
 The closed set of outcomes ``get_skill_result`` reports.
 
-Alphabetical, as ``reason_code`` is in the integrity log record, so the token
-list reads identically in every LaunchDarkly AI SDK. Each token is a distinct
-*decision* a caller can make, which is the point of the type: ``absent`` is a
-skill the store does not hold, ``integrity_failure`` is content that was
-delivered and did not verify, and a caller that wants to fail closed on
-suspected tampering while tolerating a merely-absent skill needs the two to be
-told apart.
+Each token is a distinct *decision* a caller can make, which is the point of the
+type: ``absent`` is a skill the store does not hold, ``integrity_failure`` is
+content that was delivered and did not verify, and a caller that wants to fail
+closed on suspected tampering while tolerating a merely-absent skill needs the
+two told apart.
 
 - ``ok`` — a verified skill was returned.
 - ``absent`` — the store answered, and does not hold the key.

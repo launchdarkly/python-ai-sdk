@@ -1,38 +1,19 @@
 """
 Agent Skills — the internals ``skills`` and ``skills_fs`` both need.
 
-Extracted so the two layers above it share one implementation through an
-explicit surface instead of reaching into each other's privates. Everything
-here is package-internal — nothing in this module is exported from
-``launchdarkly_ai_server`` except the two constants that are public API — and
-the dependency runs one way: this module imports neither ``skills`` nor
-``skills_fs``.
+Package-internal: nothing here is exported from ``launchdarkly_ai_server``
+except the two constants that are public API, and the dependency runs one way —
+this module imports neither ``skills`` nor ``skills_fs``.
 
-What lives here, and why it has to be one copy:
-
-- **The store seam and the configured store.** One place holds the store, so
-  the accessors and the materialization path cannot disagree about whether one
-  is configured.
-- **The telemetry seam.** Every signal the feature can emit is constructed by a
-  ``record_*`` function in this file and nowhere else, which is what makes the
-  three-signal allowlist enforceable by reading one section. ``emit`` is never
-  called from outside this module.
-- **Integrity verification.** ``verified_bytes`` runs twice per skill by design
-  — once at the accessor boundary, and again immediately before a write, since a
-  ``Skill`` can also be constructed directly by a caller. Sharing the
-  implementation is what keeps the two passes from drifting — the signal's
-  property keys must match whichever layer caught the defect.
-- **Store resolution.** ``resolve_from_store`` is the fetch-and-verify sequence
-  the accessors and the reconcile share, so its call sites cannot drift apart —
-  in particular on how a raising store is handled.
+It holds the store interface and the configured store, the telemetry emitter,
+integrity verification, and store resolution. Each lives here in one copy so
+that the accessors and the materialization path cannot disagree: about whether a
+store is configured, about which signals exist, about what verification accepts,
+or about how a raising store is handled.
 
 Everything the store hands back is untrusted input; the transport is not part of
 the trust boundary. Key, version, size, and content hash are revalidated here on
 every pass.
-
-The store and emitter are injected through ``skills._set_store`` and
-``skills._set_emitter_for_testing`` — those names are the documented seam,
-and they delegate here.
 """
 
 from __future__ import annotations
@@ -53,18 +34,11 @@ SKILL_OBJECT_KIND = "skill"
 """
 The kind this SDK asks a store for.
 
-An **internal seam value**, deliberately not exported from the package root. It
-is the string ``skills.py`` and ``skills_fs.py`` pass to ``SkillStore.get_object``
-and ``SkillStore.all_objects``, and a store adapter is free to map it onto
-whatever the transport underneath actually uses — the value happens to match
-the kind LaunchDarkly's delivery channel uses today, but a transport that spelt
-it differently would translate, and that translation is the adapter's job.
-
-Exporting it would publish an SDK-side seam string as though it were the wire
-contract, which is a claim this side cannot make and would be hard to walk back
-once a caller depends on it. A store that needs to agree on a kind agrees with
-whatever the SDK hands it, which is this constant reached through
-``launchdarkly_ai_server.skills_core``.
+Internal, and deliberately not exported from the package root: it is what the
+accessors pass to ``SkillStore.get_object`` and ``SkillStore.all_objects``, and
+a store adapter is free to map it onto whatever its transport uses underneath.
+A store that needs to agree on a kind agrees with whatever the SDK hands it,
+reached through ``launchdarkly_ai_server.skills_core``.
 """
 
 MAX_SKILL_CONTENT_BYTES = 10 * 1024 * 1024
@@ -72,27 +46,23 @@ MAX_SKILL_CONTENT_BYTES = 10 * 1024 * 1024
 Hard cap on skill content. Legitimately delivered skills are well under this
 bound, so anything larger is withheld regardless of whether its hash checks out.
 
-Set well above the platform's own limit on purpose. This is a backstop against
-absurd input, not a second enforcement of the real bound: the platform refuses
-oversized skills before they are ever delivered, and a client-side number sitting
-just above that one would turn every backend increase into an SDK release. The
-headroom lets the real limit grow without this constant moving.
+Set well above LaunchDarkly's own limit on purpose. This is a backstop against
+absurd input, not a second enforcement of the real bound, so the headroom lets
+that bound grow without this constant moving.
 
-Deliberately **not** exported from the package root, unlike the on-disk and
-on-the-wire constants beside it. Those are values this SDK defines and a caller
-may need to agree with; this one is a local enforcement bound on content the
-platform produces, so publishing it would semver-lock a number this side does
-not own — and a caller pre-flighting "will my skill fit?" against it would be
-reading the client's guess rather than the real limit. The reason string from
-``verified_bytes`` already reports the bound when it is what withheld content.
+Not exported from the package root, unlike the on-disk and on-the-wire constants
+beside it: it is a local enforcement bound rather than a value a caller needs to
+agree with, and a caller pre-flighting "will my skill fit?" against it would be
+reading the client's guess rather than the real limit. ``verified_bytes``
+reports the bound in its reason string when it is what withheld content.
 """
 
 _LANGUAGE = "python"
 
 _SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 """What a legitimate content hash looks like. Anything else is redacted before
-it reaches telemetry — ``contentHash`` is attacker-controlled, and a store that
-put the skill body there would otherwise leak it into a signal."""
+it reaches telemetry: ``contentHash`` is untrusted, and a store that put the
+skill body there would otherwise leak it into a signal."""
 
 _SIGNAL_INTEGRITY_FAILURE = "AgentControl Skill Integrity Failure"
 _SIGNAL_MATERIALIZED = "AgentControl Skill Materialized"
@@ -102,8 +72,8 @@ INTEGRITY_FAILURE_EVENT = "ld.skills.integrity_failure"
 """
 Stable event identity for the local integrity-failure log record.
 
-A **compatibility surface**, not an implementation detail: the README documents
-it as the string a customer's SIEM matches on, so it must never be renamed.
+A compatibility surface, not an implementation detail: this is the string a SIEM
+matches on, so it must never be renamed.
 
 It appears verbatim **in the message text**, not only in ``extra``. Severity
 alone cannot discriminate — ``list_raw_objects`` and ``resolve_from_store`` in
@@ -126,13 +96,10 @@ IntegrityReasonCode = Literal[
     "hash_mismatch",
 ]
 """
-The closed ``reason_code`` vocabulary — one token per ``record_integrity_failure``
-call site, and the same eight tokens in every language implementation of this
-feature, so a detection rule written against one SDK reads the others.
-
-A ``Literal`` rather than a bare ``str`` so a typo at a call site is a type
-error, and so widening the vocabulary is a deliberate edit here rather than a
-new string invented at the site that needed it.
+The closed ``reason_code`` vocabulary — one token per
+``record_integrity_failure`` call site. Stable: a detection rule written against
+these tokens keeps working, so adding one is a deliberate edit here rather than
+a new string invented at the call site that needed it.
 """
 
 INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode))
@@ -145,17 +112,14 @@ NO_STORE_MESSAGE = (
     "development and testing."
 )
 """
-The first thing a user sees when no store is configured, so it names both stores.
-
-``FDv2SkillStore`` comes first because it is the answer in production, and a
-message that offered only ``InMemorySkillStore`` would point a deployment at the
-development store. Callers match on "skill store"; keep that phrase if the
-wording changes.
+The first thing a user sees when no store is configured, so it names both stores,
+``FDv2SkillStore`` first because it is the answer in production. Callers match on
+"skill store"; keep that phrase if the wording changes.
 """
 
 
 # ---------------------------------------------------------------------------
-# The store seam
+# The store interface
 # ---------------------------------------------------------------------------
 
 
@@ -166,28 +130,26 @@ class SkillStore(Protocol):
     Duck-typed on purpose, mirroring how the LaunchDarkly client interface works
     in this package: pass any object carrying these methods.
 
-    ``is_initialized()``, ``add_listener(kind, fn)`` and
-    ``remove_listener(kind, fn)`` are part of the interface but **optional**,
-    which is why they are deliberately not declared here: a Protocol member is required for structural compatibility, so declaring
-    them would reject every store that does not implement them. Nothing in this
-    module calls either — they exist for the delivery transport to push updates
-    through, and for a consumer such as ``watch_skills`` to stop receiving them.
-    A store that implements ``add_listener`` should implement ``remove_listener``
-    too; consumers probe for it and skip detaching when it is absent, so an
-    older store keeps working at the cost of a listener that lives as long as
-    the store does. ``remove_listener`` removes one occurrence of *fn* under
-    *kind* and is a no-op when *fn* is not registered.
+    Three members are **optional**, and are deliberately not declared here: a
+    Protocol member is required for structural compatibility, so declaring them
+    would reject every store that does not implement them. Each is probed for
+    instead, and each has a defined behaviour when absent.
 
     ``is_initialized()`` reports whether the store has received its initial data
-    — for a delivery transport, whether a payload has arrived yet. A store that
-    does not implement it is treated as initialized, which is correct for one
-    that is populated by hand. It matters because "the store holds nothing" and
-    "the store has not heard yet" are the same answer through ``all_objects``,
-    and ``write_skills("*")`` reads the first as "every skill was revoked": see
-    ``store_is_initialized``.
+    — for a delivery transport, whether a payload has arrived yet. Absent means
+    initialized, which is right for a store populated by hand. It matters
+    because "the store holds nothing" and "the store has not heard yet" are the
+    same answer through ``all_objects``, and ``write_skills("*")`` would read the
+    first as "every skill was revoked": see ``store_is_initialized``.
 
-    The raw objects a store serves are wire-shaped, with camelCase field names
-    identical across language implementations::
+    ``add_listener(kind, fn)`` lets a delivery transport push updates, and
+    ``remove_listener(kind, fn)`` lets a consumer such as ``watch_skills`` stop
+    receiving them; it removes one occurrence of *fn* under *kind* and is a
+    no-op when *fn* is not registered. A store offering the first should offer
+    the second: consumers skip detaching when it is absent, so such a store
+    works at the cost of a listener that lives as long as it does.
+
+    The raw objects a store serves are wire-shaped, with camelCase field names::
 
         {"key": "pdf-extraction", "version": 2, "content": "---\\n...",
          "contentHash": "9f3a...", "name": "PDF Extraction", "description": "..."}
@@ -195,11 +157,10 @@ class SkillStore(Protocol):
     **Version is part of the lookup identity, not a filter applied afterwards.**
     A delivery payload holds the newest version of every skill *and* every
     version any variation currently pins, so two versions of one key coexist
-    routinely. A seam keyed by key alone cannot express "the one this variation
-    pinned": it would answer with the newest and the caller would then have to
-    reject it, which turns a pinned reference into a missing skill. So
-    ``get_object`` takes the wanted version, and ``version=None`` means "the
-    newest you hold".
+    routinely. An interface keyed by key alone cannot express "the one this
+    variation pinned": it would answer with the newest, and the caller rejecting
+    it turns a pinned reference into a missing skill. So ``get_object`` takes the
+    wanted version, and ``version=None`` means "the newest you hold".
 
     ``all_objects`` returns one entry per *(key, version)* the store holds. Its
     dict keys are **opaque store-internal identifiers** — do not parse them, and
@@ -216,7 +177,7 @@ class SkillStore(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Telemetry seam
+# Telemetry
 # ---------------------------------------------------------------------------
 
 
@@ -228,12 +189,11 @@ class _NoOpEmitter:
     """
     The default emitter.
 
-    No skills telemetry leaves the process in this release: ``client.track()`` is
-    the wrong channel (it needs an LD context, spends the customer's event
-    volume, and lands in their data export), and the diagnostic-event channel
-    that would be right has no wrapper-SDK extension point yet. Signals are
-    recorded through this seam so the eventual transport drops in behind it
-    without touching a single call site.
+    No skills telemetry leaves the process: ``client.track()`` is the wrong
+    channel for it — that needs an LD context, spends the application's event
+    volume, and lands in its data export. Signals are still constructed and
+    recorded, so a transport can be installed behind this interface without
+    touching a call site.
     """
 
     def record(self, signal: str, properties: dict[str, Any]) -> None:
@@ -254,24 +214,21 @@ has one code path instead of re-deciding on every signal."""
 
 def set_store(store: Any) -> None:
     """
-    Replaces the configured store.
-
-    Reached through ``skills._set_store``, which is the documented seam; see that
-    function for who calls it and why it has no test-only twin.
+    Replaces the configured store. Reached through ``skills._set_store``, the
+    documented injection point.
     """
     global _store
     _store = store
 
 
 def set_emitter(emitter: Any) -> None:
-    """Replaces the telemetry emitter. Reached through
-    ``skills._set_emitter_for_testing``."""
+    """Replaces the telemetry emitter."""
     global _emitter
     _emitter = emitter
 
 
 def clear_state() -> None:
-    """Drops both the store and the emitter. Reached through ``skills._clear_state``."""
+    """Drops both the store and the emitter."""
     global _store, _emitter
     _store = None
     _emitter = _NOOP_EMITTER
@@ -302,7 +259,7 @@ def store_is_initialized(store: Any) -> bool:
     yet received a payload as an environment whose every skill was revoked.
     Retrieval through such a store is reported unavailable, which suppresses
     pruning — the same treatment a raising store gets, and for the same reason:
-    deleting a customer's files because content could not be retrieved would
+    deleting the application's files because content could not be retrieved would
     turn a slow boot into data loss.
 
     A probe that raises counts as not initialized. A store that cannot answer
@@ -349,20 +306,16 @@ def record_integrity_failure(
     Carries hashes and byte counts only — the skill body never appears in a
     signal, a log line, or an error message.
 
-    The two surfaces are deliberately different sizes, and the log record is the
-    more important of the two. The signal is product telemetry: opt-out
-    respecting, no-op by default, and its property set is a documented allowlist
-    (``agents.md``) that does not grow. The **log record** is the customer-owned
-    detection path — the only one that works when telemetry is off, and the only
-    one that exists at all in an instance with no telemetry destination — so it
-    is designed to be ingested and alerted on, and additionally carries the
-    stable event name, the action taken, the human-readable reason, and the
-    machine-parseable ``reason_code``.
+    The two are deliberately different sizes. The signal is product telemetry:
+    no-op by default, with a fixed property set. The log record is the
+    application's own detection path — the only one that works when telemetry is
+    off — so it additionally carries the stable event name, the action taken, the
+    human-readable reason, and the machine-parseable ``reason_code``.
 
-    Emitted twice over, because neither form alone is sufficient: the message
-    text carries ``INTEGRITY_FAILURE_EVENT`` followed by compact JSON, so the
-    record survives ``logging.basicConfig()`` and is greppable and ``jq``-able
-    under any handler configuration; ``extra["ld_skills"]`` carries the same
+    The record is emitted in two forms because neither alone is enough: the
+    message text carries ``INTEGRITY_FAILURE_EVENT`` followed by compact JSON, so
+    it survives ``logging.basicConfig()`` and is greppable and ``jq``-able under
+    any handler configuration, and ``extra["ld_skills"]`` carries the same
     mapping unflattened for a structured handler that would rather not reparse.
     """
     # Both of these come off the wire, so neither may be echoed verbatim: a store
@@ -394,11 +347,10 @@ def record_integrity_failure(
         "reason": reason,
         **properties,
     }
-    # ``sort_keys`` is load-bearing rather than cosmetic: the other language
-    # implementations build this object in alphabetical key order, so sorting
-    # here makes the serialized line byte-identical across SDKs for the same
-    # input, modulo ``language``. Do not drop it, and do not reorder the keys
-    # above expecting the output to follow.
+    # ``sort_keys`` is part of the record's format rather than cosmetic: it is
+    # what makes the serialized line stable for a given input, so a detection
+    # rule can match on it. Do not drop it, and do not reorder the keys above
+    # expecting the output to follow.
     logger.error(
         "%s %s",
         INTEGRITY_FAILURE_EVENT,
@@ -414,7 +366,7 @@ def record_materialized(
     """
     Records a materialization. Deliberately carries no ``target_path`` and no
     filesystem path of any kind — the same reasoning that keeps the skill body
-    out of telemetry keeps the customer's directory layout out. Paths live in the
+    out of telemetry keeps the application's directory layout out. Paths live in the
     returned ``ReconcileReport``, which is user-facing API rather than telemetry.
     """
     emit(
@@ -433,10 +385,9 @@ def record_revoked(skill_key: str, version: Any) -> None:
     """
     Records a revocation — a prune that removed a formerly managed skill.
 
-    Lives here with the other two recorders rather than at the prune site so the
-    signal allowlist is maintained in one place: every signal this SDK can emit
-    is visible in this section of this module, and nothing outside it touches
-    ``emit``.
+    Lives here with the other two recorders rather than at the prune site, so
+    every signal this SDK can emit is visible in one place and nothing outside
+    this module touches ``emit``.
     """
     # Both fields come off the manifest, which is untrusted — same rule as
     # ``record_integrity_failure``: shape-check, then redact, so a hand-edited
@@ -488,25 +439,16 @@ def verified_bytes(
 
     Returns the verbatim bytes and their locally computed sha256, or a
     human-readable reason — having already recorded the integrity signal, so the
-    signal's property set cannot depend on which caller noticed. The hash handed
-    back is the one computed here, never the caller's expected value: the two are
-    equal on this path by construction, and returning the locally derived one
-    keeps an attacker-supplied string out of ``Skill``.
-
-    The two outcomes are distinct types rather than a ``tuple | str`` union so a
-    call site reads as "verification failed" instead of "the result is a string",
-    and so a future success payload carrying a ``str`` cannot silently invert the
-    discrimination.
+    signal does not depend on which caller noticed. The hash handed back is
+    always the one computed here, never the caller's expected value, which keeps
+    an untrusted string out of ``Skill``.
 
     This runs twice per skill by design: once at the accessor boundary, and again
     immediately before a write, because a ``Skill`` can also be constructed
-    directly by a caller. Sharing the implementation is what keeps those two
-    passes from drifting — the property keys must match.
-
-    The second pass re-hashes bytes the first pass already hashed. That
-    redundancy is deliberate: it is negligible next to the write it guards, and
-    carrying the first pass's verdict forward would put a "trust the value
-    computed upstream" branch inside the one function whose entire job is not to.
+    directly by a caller. The second pass re-hashes bytes the first pass already
+    hashed, which is negligible next to the write it guards — and carrying the
+    first pass's verdict forward would put a "trust the value computed upstream"
+    branch inside the one function whose job is not to.
     """
     if isinstance(content, bytes):
         encoded = content
@@ -633,14 +575,12 @@ def log_withholding_summary(subject: str, requested: int, resolved: int) -> None
     One WARN per run when content was withheld, naming the counts.
 
     Every individual withholding already records an integrity signal and an error
-    log line, but a caller reading logs at WARN sees neither. That matters most in
-    the case where *nothing* verified — a payload built before ``contentHash`` is
-    populated, say — because the feature then returns an empty result that is
-    indistinguishable from "this project has no skills". A run-level summary is
-    the difference between a silent no-op and a visible one.
+    line, but a caller reading logs at WARN sees neither — and the case that
+    matters most is a run where *nothing* verified, because the result is then an
+    empty list indistinguishable from "this project has no skills".
 
-    Called once per batch retrieval, not once per skill, so a large withholding
-    run does not itself become the noise.
+    Called once per batch, not once per skill, so a large withholding run does
+    not itself become the noise.
     """
     withheld = requested - resolved
     if withheld <= 0:
@@ -679,10 +619,8 @@ def list_raw_objects(
     result themselves; ``newest_by_key`` does it.
 
     Returns the reason rather than raising, because both callers need the
-    distinction between "no skills" and "the store is broken" — and they need it
-    worded identically. Letting the exception out instead would make each of
-    them re-derive the log line and the message, which is the drift this module
-    exists to prevent.
+    distinction between "no skills" and "the store is broken", worded
+    identically.
 
     An answer that is not a mapping is a broken store, on the same footing as
     one that raised — **not** an empty one. Collapsing it to ``{}`` would make a
@@ -711,22 +649,19 @@ def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
     One raw object per skill key — the highest version of each, paired with the
     store key it was served under.
 
-    ``all_objects`` may hold several versions of one key, and both callers that
-    consume the whole store want one skill per key: ``all_skills`` because a list
-    holding two versions of one key is not a set of skills, and the ``"*"``
-    reconcile because ``<root>/<key>/SKILL.md`` is a single path and writing it
-    twice in one run is a bug rather than a policy.
-
-    The store key is carried through rather than discarded because the reconcile
-    attributes a failure to it when the object's own key is unusable.
+    ``all_objects`` may hold several versions of one key, and both whole-store
+    callers want one skill per key: ``all_skills``, because a list holding two
+    versions of one key is not a set of skills, and the ``"*"`` reconcile,
+    because ``<root>/<key>/SKILL.md`` is a single path. The store key is carried
+    through because the reconcile attributes a failure to it when the object's
+    own key is unusable.
 
     An object too malformed to carry a usable key and version is **kept**, so
-    verification is what withholds it: a silently dropped object falls out of
-    the requested set, and prune would then delete the last known-good copy
-    already on disk. The exception is an object whose skill key resolved anyway
-    from another version — there the resolved object already holds the key in
-    the requested set, so keeping the malformed one would only report a
-    withholding for a key that in fact resolved.
+    verification is what withholds it: dropped silently it would fall out of the
+    requested set, and prune would then delete the last known-good copy on disk.
+    The exception is an object whose key resolved from another version anyway —
+    that key is already in the requested set, so keeping the malformed sibling
+    would only report a withholding for a key that resolved.
     """
     best: dict[str, tuple[str, Any]] = {}
     unusable: list[tuple[str, Any]] = []
@@ -765,20 +700,15 @@ class Resolution:
     Which of the five public outcomes this resolution is.
 
     Declared first and **without a default**, so every construction site has to
-    state it. A default would be the wrong shape twice over: a contributor
-    adding a sixth internal outcome would inherit whichever token happened to be
-    the default rather than deciding which public token it maps to, and if that
-    default were ``"ok"`` a failure would publish ``ok`` with no skill attached.
+    state which public token it maps to rather than inheriting one.
 
-    Carried as a token rather than derived from ``error`` on the way out:
-    ``get_skill_result`` publishes this value, and pattern-matching prose to
-    recover a decision a caller fails closed on is exactly the fragility the
-    typed outcome exists to remove. A reviewer can read the mapping here.
+    ``get_skill_result`` publishes this value directly. It is carried as a token
+    rather than recovered from ``error``, because pattern-matching prose for a
+    decision a caller fails closed on is the fragility the typed outcome removes.
 
-    Distinct from ``unavailable`` on purpose — that flag answers one question
-    (may prune run?) and this token answers a different one (what does the
-    caller learn?) — but the two can only disagree by a bug: ``unavailable`` is
-    ``True`` in exactly the ``store_unavailable`` case.
+    Distinct from ``unavailable``, which answers a different question (may prune
+    run?), but the two can only disagree by a bug: ``unavailable`` is ``True`` in
+    exactly the ``store_unavailable`` case.
     """
     skill: Skill | None = None
     error: str | None = None
@@ -795,10 +725,8 @@ def resolve_from_store(
 ) -> Resolution:
     """
     Fetches one key and verifies it — the sequence the accessors and the
-    materialization path share.
-
-    Written once on purpose, so the call sites cannot drift apart — in
-    particular on the policy for a raising store.
+    materialization path share, written once so the two cannot drift apart on
+    the policy for a raising store.
 
     ``wanted_version`` goes *into* the lookup, because a store may hold several
     versions of one key and only it can pick between them; ``None`` asks for the

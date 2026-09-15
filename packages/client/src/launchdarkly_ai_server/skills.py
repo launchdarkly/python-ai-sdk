@@ -2,22 +2,16 @@
 Agent Skills — reference discovery and content accessors.
 
 The public retrieval surface: projecting the skill references a resolved AI
-Config carries, and retrieving skill content through an injectable store seam.
+Config carries, and retrieving skill content through a configurable store.
 
-The three layers of the feature sit in three modules, and the dependencies run
-one way only:
+The feature is three modules, and the dependencies run one way only:
 
-- ``skills_core.py`` — the store and telemetry seams, module state, integrity
+- ``skills_core.py`` — the store interface, module state, integrity
   verification, and store resolution. Shared, and imports neither of the others.
 - ``skills.py`` (this file) — ``skill_refs``, the accessors, and
   ``InMemorySkillStore``.
-- ``skills_fs.py`` — the highest-blast-radius layer, the one that writes to a
-  customer's disk. It owns the manifest format and the on-disk filenames;
-  nothing here knows about the filesystem.
-
-``_set_store``, ``_set_emitter_for_testing`` and ``_clear_state`` live here
-because this module is the documented injection path; the
-state they mutate lives in ``skills_core``.
+- ``skills_fs.py`` — materialization onto disk. It owns the manifest format and
+  the on-disk filenames; nothing here knows about the filesystem.
 """
 
 from __future__ import annotations
@@ -50,17 +44,14 @@ logger = logging.getLogger(__name__)
 # Injection points
 # ---------------------------------------------------------------------------
 #
-# These three names are the documented seam: ``init_client`` and ``shutdown``
-# call them, and tests inject through them. They delegate to ``skills_core``,
-# which owns the state, so that there is exactly one store and one emitter no
-# matter which layer reaches for them.
-
-
-# Bound directly to the implementations rather than wrapped: a one-line
-# delegation per name would give every state mutation two definitions and two
-# docstrings to keep in agreement, which is the drift these names exist to
-# avoid. ``_set_emitter_for_testing`` keeps its distinct name because it has no
-# production caller.
+# ``init_client`` and ``shutdown`` reach the configured store through these
+# names. They delegate to ``skills_core``, which owns the state, so there is
+# exactly one store and one emitter no matter which layer reaches for it.
+#
+# Bound directly to the implementations rather than wrapped: a delegating
+# one-liner per name would give every state mutation two definitions to keep in
+# agreement. ``_set_emitter_for_testing`` keeps its distinct name because it has
+# no production caller.
 _set_store = skills_core.set_store
 _set_emitter_for_testing = skills_core.set_emitter
 _clear_state = skills_core.clear_state
@@ -70,10 +61,9 @@ class InMemorySkillStore:
     """
     A skill store backed by plain dicts.
 
-    Ships for local development, tests, and bring-your-own-content injection.
-    Holds raw wire objects verbatim and performs no validation of its own —
-    verification belongs at the accessor boundary, where it applies to every
-    store equally.
+    For local development, tests, and bring-your-own-content. Holds raw wire
+    objects verbatim and performs no validation of its own: verification belongs
+    at the accessor boundary, where it applies to every store equally.
 
     Several versions of one key coexist here, because they coexist in a real
     delivery payload: the newest version of every skill, plus every version a
@@ -114,9 +104,8 @@ class InMemorySkillStore:
         ``(key, version)`` twice replaces it.
 
         Notifies every skill-kind listener with the raw object as a single
-        positional argument. No validation happens here — verification belongs at
-        the accessor boundary, where it applies to every store equally — so a
-        listener sees exactly what was put, unverified.
+        positional argument. No validation happens here, so a listener sees
+        exactly what was put, unverified.
         """
         key = raw.get("key")
         if not isinstance(key, str):
@@ -201,9 +190,9 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
     per-context resolution: ``await get_skills(skill_refs(config))``.
 
     A config that came through ``parse_ai_config`` never contains an invalid
-    entry — parsing fails closed on one. A hand-built dict can, and a silently
-    shortened projection would let ``write_skills`` prune the dropped skill's
-    on-disk copy, so every dropped entry is logged.
+    entry, since parsing fails closed on one. A hand-built dict can, and a
+    silently shortened projection would let ``write_skills`` prune the dropped
+    skill's on-disk copy, so every dropped entry is logged.
     """
     if not isinstance(config, dict):
         return []
@@ -270,10 +259,10 @@ async def get_skill_result(key: str, *, version: int | None = None) -> SkillOutc
     """
     Retrieves one verified skill, reporting *why* when there is none.
 
-    Same retrieval, same verification, same telemetry as ``get_skill`` — the two
+    Same retrieval, same verification, same telemetry as ``get_skill``; the two
     differ only in what they report. ``get_skill`` collapses "no such skill",
     "the store raised", "that is not the version held", and "the content failed
-    integrity verification" to one ``None``; this returns a ``SkillOutcome``
+    integrity verification" to one ``None``. This returns a ``SkillOutcome``
     whose ``reason`` names which of them happened, so a caller can fail closed on
     suspected tampering while tolerating a merely-absent skill:
 
@@ -289,10 +278,10 @@ async def get_skill_result(key: str, *, version: int | None = None) -> SkillOutc
     failure mode, never any skill content or filesystem path. Branch on
     ``reason``, not on ``detail``.
 
-    Emits nothing of its own: an integrity failure has already recorded its log
-    record and its signal inside verification, and recording a second here would
-    double-count one failure. Raises ``RuntimeError`` only when no skill store is
-    configured, exactly as ``get_skill`` does.
+    Emits nothing of its own: verification has already recorded the log record
+    and the signal, and a second here would double-count one failure. Raises
+    ``RuntimeError`` only when no skill store is configured, as ``get_skill``
+    does.
     """
     resolved = resolve_from_store(require_store(), key, version)
     return SkillOutcome(

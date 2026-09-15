@@ -1,23 +1,22 @@
 """
 Agent Skills — filesystem materialization.
 
-The highest-blast-radius layer of the feature: this is the part that writes to a
-customer's disk. Split out of ``skills.py`` on that boundary — everything here
-takes already-verified content and reconciles it against a managed root, while
-``skills.py`` owns retrieval and verification and knows nothing about the
-filesystem. The dependency runs one way only, and the descriptor-pinned
-primitives every destructive step goes through live in ``safe_fs.py``.
+This is the part that writes to disk. Everything here takes already-verified
+content and reconciles it against a managed root, while ``skills.py`` owns
+retrieval and verification and knows nothing about the filesystem. The
+dependency runs one way only, and the descriptor-pinned primitives every
+destructive step goes through live in ``safe_fs.py``.
 
 The managed root is pinned to a descriptor once per reconcile and every
 destructive operation runs relative to it, so no ancestor of the root is ever
-re-resolved from its path mid-run. The path checks are still there and still
-run, but they are defense in depth rather than the boundary: a check on a path
-is only as good as the last resolution of that path after it, and the descriptor
-is what makes there be no later resolution.
+re-resolved from its path mid-run. The path checks still run, but they are
+defense in depth rather than the boundary: a check on a path is only as good as
+the last resolution of that path after it, and the descriptor is what makes
+there be no later resolution.
 
-The reconcile is manifest-driven and fails closed: destructive operations only
+The reconcile is manifest-driven and fails closed. Destructive operations only
 ever touch paths ``<root>/.launchdarkly-skills.json`` records under a matching
-key, a corrupt manifest suppresses every destructive action, and an incomplete
+key; a corrupt manifest suppresses every destructive action; and an incomplete
 retrieval suppresses pruning. Content is re-verified immediately before the
 write, because a ``Skill`` can also be constructed directly by a caller.
 """
@@ -124,11 +123,9 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 )
 """
 The 22 MS-DOS device names Windows still reserves, which cannot be directory
-names there. The key grammar admits every one of them, so a customer who names a
-skill ``con`` gets a working reconcile on Linux and a broken one on Windows —
-rejected here instead, on every platform, so the on-disk result never depends on
-which OS ran the write. Neither repository has a Windows CI runner, which is the
-condition that produced the gap in the first place.
+names there. The key grammar admits every one of them, so a skill named ``con``
+would reconcile on Linux and fail on Windows. Rejected here instead, on every
+platform, so the on-disk result never depends on which OS ran the write.
 
 The bare names are the whole set: no suffix stripping is needed because the key
 grammar admits no ``.``, so ``con.txt`` is unreachable, and ``CONIN$`` /
@@ -187,23 +184,22 @@ async def write_skills(
     so a root replaced after validation is refused rather than followed. The
     manifest is read through it too, so the record that authorizes those
     removals comes from inside the pinned root rather than from wherever the
-    root's path led by the time it was read. This guarantee is POSIX-only, for
-    the reasons ``safe_fs`` states at length.
+    root's path led by the time it was read. This guarantee is POSIX-only; see
+    ``safe_fs``.
 
     **This call performs synchronous filesystem I/O and does not yield.** It is
-    ``async`` for signature parity with the other accessors and with the
-    TypeScript SDK, not because it awaits anything: every read, write, ``fsync``
-    and rename runs inline, so a large reconcile blocks the event loop for its
-    duration. Wrap it in ``asyncio.to_thread`` if that matters on your loop.
-    ``timeout`` is checked between steps rather than interrupting one in
-    progress, for the same reason.
+    ``async`` for signature parity with the other accessors, not because it
+    awaits anything: every read, write, ``fsync`` and rename runs inline, so a
+    large reconcile blocks the event loop for its duration. Wrap it in
+    ``asyncio.to_thread`` if that matters on your loop. ``timeout`` is checked
+    between steps rather than interrupting one in progress, for the same
+    reason.
 
-    **One root, one reconcile at a time.** Because nothing here yields, a whole
-    reconcile is atomic against every other task on the loop today. Wrapping it
-    to run concurrently makes that the caller's problem instead: two runs
-    against the same root interleave on the manifest, and the loser's entries
-    are lost — which leaves the files it wrote unmanaged, and a later reconcile
-    then refuses them as files the SDK did not write.
+    **One root, one reconcile at a time.** Because nothing here yields, a
+    reconcile is atomic against every other task on the loop. Wrapping it to run
+    concurrently makes that the caller's problem: two runs against the same root
+    interleave on the manifest, the loser's entries are lost, and a later
+    reconcile then refuses the files it wrote as files the SDK did not write.
     """
     # Both of these are annotated as closed sets, but the values can still arrive
     # from untyped code, so they are checked rather than assumed.
@@ -261,9 +257,9 @@ async def write_skills(
         incomplete = incomplete or write_timed_out
 
         # Pruning is destructive, so it needs a trustworthy picture of both
-        # sides: a corrupt manifest means we do not know what we own, and an
+        # sides: a corrupt manifest leaves the SDK unsure what it owns, and an
         # incomplete run — a retrieval that failed, or a deadline that expired
-        # mid-write — means we do not know what is still current. Either way,
+        # mid-write — leaves it unsure what is still current. Either way,
         # deleting would be a guess.
         if prune and manifest_error is None and not incomplete:
             actions.extend(
@@ -371,10 +367,8 @@ def _rewrite_manifest(
     """
     Writes the updated manifest. Returns an error action, or nothing.
 
-    Relative to the root descriptor the caller has held all along, rather than
-    re-opening the root by path: this used to be the one operation that pinned
-    the root, and it pinned it too late to matter, since every skill file was
-    already written by the time it ran.
+    Written relative to the root descriptor the caller holds, rather than
+    re-opening the root by path — the same reason every other step here is.
     """
     manifest["manifestVersion"] = MANIFEST_VERSION
     manifest["entries"] = entries
@@ -412,9 +406,9 @@ def _available_store(deadline: float, subject: str) -> SkillStore | _RetrievalBl
     The configured store, or why retrieval must not be attempted.
 
     Written once because this gate is what sets ``unavailable`` and therefore
-    suppresses pruning. If it were maintained in two places, a condition added
-    to one and not the other would not merely produce a wrong message — it
-    would delete the user's files.
+    suppresses pruning. Maintained in two places, a condition added to one and
+    not the other would not merely produce a wrong message — it would delete
+    the application's files.
     """
     if time.monotonic() >= deadline:
         return _RetrievalBlocked(
@@ -664,31 +658,24 @@ def _load_manifest(
     Loads the manifest. Returns ``(manifest, error)``.
 
     A manifest that cannot be read, cannot be parsed, is not an object, carries a
-    ``manifestVersion`` this release does not understand, or has a malformed
-    ``entries`` map is **corrupt**. The caller then performs no destructive
-    action and leaves the file itself alone: rewriting it would destroy the only
-    record of what the SDK owns, and acting on a manifest we cannot read would
-    mean guessing at which of the customer's files are ours.
+    ``manifestVersion`` this release does not understand, is larger than the
+    read cap, or has a malformed ``entries`` map is **corrupt**. The caller then
+    performs no destructive action and leaves the file itself alone: rewriting it
+    would destroy the only record of what the SDK owns, and acting on a manifest
+    it cannot read would mean guessing at which files those are.
 
     An absent manifest is not corrupt — that is simply a fresh root.
 
     Read relative to the root descriptor the caller holds, for the same reason
-    every destructive step is: this file is what decides which of the
-    customer's files the SDK may overwrite and delete. Read by path it
-    re-resolved the root on the way in, so a root swapped after the pin handed
-    the run somebody else's entries — and every consequence then landed in the
-    *real* root through the descriptor. An empty manifest from the wrong
-    directory made every managed file look unowned; a populated one aimed the
-    prune; and either way ``_rewrite_manifest`` committed the result back over
-    the real manifest, destroying the ownership record that protects the
-    customer's files on the next run. Reading it through the descriptor is what
-    makes the pin cover the decision as well as the actions.
+    every destructive step is: this file decides which of the application's
+    files the SDK may overwrite and delete, so the pin has to cover the decision
+    as well as the actions. Read by path, a root swapped after the pin would
+    hand the run somebody else's entries while every consequence landed in the
+    real root.
 
-    The single descriptor-relative open also replaces an ``exists()``-then-read
-    pair on the same path, so absence is now ``ENOENT`` on the read itself. It
-    is the same open the skill files get, which additionally means a symlink or
-    a FIFO wearing the manifest's name is refused as corruption rather than
-    followed or waited on.
+    That single open also means absence is ``ENOENT`` on the read itself, and
+    that a symlink or a FIFO wearing the manifest's name is refused as
+    corruption rather than followed or waited on.
     """
     fresh: dict[str, Any] = {"manifestVersion": MANIFEST_VERSION, "entries": {}}
 
@@ -770,8 +757,8 @@ def _unsafe_path_reason(
     The path defenses, in one place.
 
     Returns why ``<root>/<key>/SKILL.md`` must not be touched, or ``None``.
-    Shared by the write and prune paths: ``agents.md`` marks these checks
-    non-relaxable, and maintaining them twice is how they drift.
+    Shared by the write and prune paths, and not to be relaxed in either:
+    maintaining these twice is how they drift.
 
     These are defense in depth and not the boundary. Every one of them inspects
     a path, so each is a check-then-use against anything that can rename a
@@ -805,11 +792,10 @@ def _key_rejection_reason(key: Any) -> str | None:
     """
     Why *key* must not become a directory name under the managed root, or ``None``.
 
-    Re-validated locally whatever any upstream layer already did, and
-    before any filesystem call, because a key becomes a path component. Shared by
-    the write and the prune paths so the two cannot disagree about which keys
-    this SDK could own; ``agents.md`` marks these checks non-relaxable, and
-    maintaining them twice is how they drift.
+    Re-validated locally whatever any upstream layer already did, and before
+    any filesystem call, because a key becomes a path component. Shared by the
+    write and prune paths so the two cannot disagree about which keys this SDK
+    could own, and not to be relaxed in either.
 
     ``key.encode`` is safe here only because it runs *after* the pattern check:
     the key grammar admits no surrogate, so there is no unencodable key left to
@@ -826,11 +812,11 @@ def _key_rejection_reason(key: Any) -> str | None:
             f"skill key '{key[:32]}...' is {key_bytes} bytes, over the "
             f"{_MAX_PATH_COMPONENT_BYTES}-byte limit for a single directory name"
         )
-    # Same reasoning as the byte bound above, and it lives at the same layer for
-    # the same reason: the grammar itself must keep admitting these, because
-    # rejecting them there would fail the whole AI Config over one skill, and
-    # would shrink ``skill_refs`` — which is what authorizes a prune, so a
-    # Windows-only constraint would delete the skill's file on Linux.
+    # Checked here rather than in the grammar, for the same reason as the byte
+    # bound above: rejecting these in the grammar would fail a whole AI Config
+    # over one skill, and would shrink ``skill_refs`` — which is what authorizes
+    # a prune, so a Windows-only constraint would delete the skill's file on
+    # Linux.
     if key in _WINDOWS_RESERVED_NAMES:
         return (
             f"skill key '{key}' is a name Windows reserves for a device and "
@@ -882,20 +868,20 @@ def _write_one(
     # to create can never be a candidate.
     _sweep_orphan_temp_files(root, root_fd, key)
 
-    # Overwrite only what the manifest records as ours under this key.
+    # Overwrite only what the manifest records as the SDK's under this key.
     entry = entries.get(relative)
     managed = isinstance(entry, dict) and entry.get("key") == key
     exists = target.exists()
 
     if exists:
-        # Hash first, and decide from the bytes. The manifest check below is what
-        # protects a customer's own file, but it also refuses the file this SDK
-        # itself wrote and was killed before recording — the reconcile writes
-        # every skill and only then rewrites the manifest, so a crash in that
-        # window leaves a managed path with no entry, and every later reconcile
-        # takes the refusal branch forever. Comparing the bytes distinguishes the
-        # two cases without weakening anything: only content byte-identical to
-        # what LaunchDarkly resolved is ever adopted.
+        # Hash first, and decide from the bytes. The manifest check below is
+        # what protects a file the SDK did not write, but on its own it also
+        # refuses one the SDK wrote and was killed before recording: the
+        # reconcile writes every skill and only then rewrites the manifest, so a
+        # crash in that window leaves a managed path with no entry, and every
+        # later reconcile would take the refusal branch forever. Comparing the
+        # bytes separates the two cases without weakening anything, since only
+        # content byte-identical to what LaunchDarkly resolved is adopted.
         try:
             on_disk = _read_regular_file(target, max_bytes=len(encoded))
         except OSError as exc:
@@ -911,12 +897,12 @@ def _write_one(
             return failed(f"'{relative}' could not be read: {exc}")
 
         if hashlib.sha256(on_disk).hexdigest() == content_hash:
-            # ``skipped_current`` covers this deliberately, rather than a new
-            # action kind: its documented meaning is that the bytes on disk
-            # already are the resolved content, which is exactly as true for an
-            # adopted file as for one this SDK wrote and recorded. Adoption does
-            # add a manifest entry, so the file becomes prunable later — correct,
-            # because a prune then removes content LaunchDarkly delivered anyway.
+            # ``skipped_current`` rather than a new action kind: its meaning is
+            # that the bytes on disk already are the resolved content, which is
+            # as true for an adopted file as for one the SDK wrote and recorded.
+            # Adoption adds a manifest entry, so the file becomes prunable
+            # later — correct, since a prune then removes content LaunchDarkly
+            # delivered anyway.
             _update_entry(entries, relative, skill, content_hash)
             record_materialized(key, len(encoded), content_hash, "skipped_current")
             return ReconcileAction(
@@ -955,31 +941,20 @@ def _read_regular_file(
     """
     Reads *target*, refusing anything that is not a regular file.
 
-    A plain ``Path.read_bytes`` would ``open()`` by name — and opening a FIFO
-    with no writer blocks forever, so an attacker who can swap the managed file
-    for one (the same capability the symlink checks defend against) could hang
-    the whole reconcile, and the event loop with it. ``O_NONBLOCK`` makes that
-    open return immediately (it is a no-op for regular files), ``O_NOFOLLOW``
-    refuses a trailing symlink, and the ``fstat`` on the descriptor — not the
-    path — is what the type check trusts. ``O_BINARY`` is what keeps these
-    bytes the *verbatim* bytes: it is 0 on POSIX, but on Windows a descriptor
-    without it translates CRLF on read, which would fail the hash comparison
-    against content that is actually current.
+    Each flag earns its place. ``O_NONBLOCK`` because opening a FIFO with no
+    writer blocks forever, so a managed file swapped for one would hang the
+    reconcile and the event loop with it (it is a no-op for regular files).
+    ``O_NOFOLLOW`` to refuse a trailing symlink. ``O_BINARY`` to keep the bytes
+    verbatim: 0 on POSIX, but without it a Windows descriptor translates CRLF on
+    read, which would fail the hash comparison against current content. The type
+    check reads ``fstat`` on the descriptor, never the path.
 
-    With *dir_fd*, *target* is a bare component resolved against that
-    descriptor rather than a path the kernel walks from the root down. The
-    manifest read passes the root descriptor, because the manifest is what
-    decides which of the customer's files the SDK may touch. ``_write_one``'s
-    comparison read still resolves a path: what it names is
-    ``<key>/SKILL.md``, so covering it the same way needs a descriptor for the
-    skill directory rather than for the root.
+    With *dir_fd*, *target* is a bare component resolved against that descriptor
+    rather than a path the kernel walks from the root down.
 
-    ``max_bytes`` bounds the read at ``max_bytes + 1`` bytes, so no read here
-    can be made to pull an arbitrary file into memory. The extra byte is what
-    lets a caller tell "at the cap" from "over it" without reading the rest:
-    the comparison consumer hashes the result and anything longer than the
-    resolved content cannot match it, and the manifest reader reports the
-    overage as corruption.
+    ``max_bytes`` bounds the read at ``max_bytes + 1`` bytes, so no read here can
+    be made to pull an arbitrary file into memory. The extra byte distinguishes
+    "at the cap" from "over it" without reading the rest.
     """
     flags = (
         os.O_RDONLY
@@ -1008,24 +983,23 @@ def _sweep_orphan_temp_files(root: Path, root_fd: int | None, key: str) -> None:
     """
     Removes temp files a killed reconcile left behind under ``<root>/<key>/``.
 
-    ``atomic_write`` unlinks its own temp file on any exception, but a ``SIGKILL``
-    between the create and the rename leaves one on disk, and nothing else
-    records that it exists: ``_prune`` walks manifest entries, and an orphan
-    never has one. The second-order effect is what makes this worth doing —
-    ``_prune_one``'s ``rmdir`` only succeeds on an empty directory, so a single
-    orphaned temp pins a skill's directory permanently.
+    ``atomic_write`` unlinks its own temp file on any exception, but a
+    ``SIGKILL`` between the create and the rename leaves one behind that nothing
+    on disk records — ``_prune`` walks manifest entries, and an orphan never has
+    one. That matters because ``_prune_one``'s ``rmdir`` only succeeds on an
+    empty directory, so a single orphaned temp pins a skill's directory
+    permanently.
 
     Bounded on every axis, because this is the one place the SDK removes a file
     the manifest does not list: only inside a directory named by a key that
-    passes ``_key_rejection_reason``; only names ``safe_fs`` itself recognizes as
-    its own temp naming for ``SKILL.md``, anchored at both ends, and asked of
-    ``safe_fs`` rather than re-spelled here so the recognizer cannot drift from
-    the writer; only regular files; and every removal relative to a descriptor
-    pinned with ``O_NOFOLLOW`` which is itself opened relative to the root
-    descriptor, so neither the root nor the skill directory can be swapped for
-    somewhere else to delete from. It never raises and never aborts the run: the
-    reconcile itself has succeeded either way, so a sweep that cannot happen is
-    a warning.
+    passes ``_key_rejection_reason``; only names ``safe_fs`` recognizes as its
+    own temp naming for ``SKILL.md``, asked of ``safe_fs`` so the recognizer
+    cannot drift from the writer; only regular files; and every removal relative
+    to a descriptor pinned with ``O_NOFOLLOW`` that is itself opened relative to
+    the root descriptor.
+
+    Never raises and never aborts the run: the reconcile has succeeded either
+    way, so a sweep that cannot happen is a warning.
     """
     if _key_rejection_reason(key) is not None:
         return
@@ -1087,8 +1061,8 @@ def _write_through_descriptor(
     invalidated by a swap between here and the rename.
 
     The skill directory is created and opened relative to *root_fd*, so the
-    ``mkdir`` cannot be redirected either — ``mkdir`` follows a symlink at its
-    parent, which made a root swapped before this point enough to have the
+    ``mkdir`` cannot be redirected either: ``mkdir`` follows a symlink at its
+    parent, so against a full path a swapped root is enough to have the
     directory, and then the file, created outside the root.
     """
     try:
@@ -1113,10 +1087,9 @@ def _update_entry(
     Merges into any existing entry rather than replacing it, so fields written by
     a future SDK release survive this one's rewrite.
 
-    ``sha256`` and ``writtenAt`` are recorded for forensics only: the reconcile
-    decides currency by hashing the bytes on disk, precisely because the
-    manifest is untrusted, so neither field is ever read back as a decision
-    input.
+    ``sha256`` and ``writtenAt`` are recorded for forensics only. The reconcile
+    decides currency by hashing the bytes on disk, precisely because the manifest
+    is untrusted, so neither field is ever read back as a decision input.
     """
     existing = entries.get(relative)
     entry = dict(existing) if isinstance(existing, dict) else {}
@@ -1136,11 +1109,10 @@ def _prune_error(key: str, message: str, version: Any = None) -> ReconcileAction
     """
     A prune refusal. Mirrors ``_write_one``'s local ``failed`` helper.
 
-    *version* comes off the manifest, which is untrusted, so it is validated here
-    rather than at each call site — the same guard the ``removed`` action applies,
-    so a refusal and a removal report the field identically.
-    Callers that genuinely do not know a version pass nothing; none of them may
-    invent one.
+    *version* comes off the manifest, which is untrusted, so it is validated
+    here rather than at each call site — the same guard the ``removed`` action
+    applies, so a refusal and a removal report the field identically. A caller
+    that does not know a version passes nothing rather than inventing one.
     """
     return ReconcileAction(
         key=key,
@@ -1273,16 +1245,16 @@ def _prune_one(
         removed_from_disk = True
         try:
             # Relative to the root descriptor. rmdir never follows a trailing
-            # symlink (it fails ENOTDIR) and only ever succeeds on an empty
-            # directory, so the *key* was never the exposure here — the root
-            # above it was, since a path-based rmdir re-resolves it and would
-            # remove an attacker-chosen directory that happened to be empty.
+            # symlink (it fails ENOTDIR) and only succeeds on an empty
+            # directory, so the *key* is not the exposure here — the root above
+            # it is, since a path-based rmdir re-resolves it and could remove an
+            # attacker-chosen empty directory.
             if root_fd is not None:
                 os.rmdir(key, dir_fd=root_fd)
             else:
                 skill_dir.rmdir()
         except OSError:
-            pass  # the customer keeps their own files here too
+            pass  # the directory is not empty: other files live here too
 
     entries.pop(relative, None)
 

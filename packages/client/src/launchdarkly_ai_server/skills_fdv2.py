@@ -24,17 +24,16 @@ Three things this module does *not* do, on purpose:
 
 - **It does not verify content.** Verification lives at the accessor boundary in
   ``skills_core`` so that it applies to every store equally, including a
-  customer's own.
+  a store the application supplies itself.
 - **It does not work around a missing ``contentHash``.** A hashless object is
   held verbatim and *withheld* by verification with ``missing_content_hash``.
   This module's job is to make that outcome loud — see ``StoreDiagnostics``.
 - **It does not evaluate anything.** Flag and segment objects that share the
   connection are skipped and counted, nothing more.
 
-The design rationale — why the skill's version is read from the object's
-``key`` and never from ``version``, why changes commit at
-``payload-transferred``, why there is one network timeout — is in
-``agents.md`` under *The delivery transport*.
+Why the skill's version is read from the object's ``key`` and never from
+``version``, why changes commit at ``payload-transferred``, and why there is one
+network timeout are each explained where the code does it.
 """
 
 from __future__ import annotations
@@ -70,9 +69,9 @@ The FDv2 ``kind`` skills are delivered under.
 Object kinds on the SDK-facing channel are open strings: the agent-skill payload
 is classified ``generic`` and every object in it carries the kind its producer
 registered, which for skills is the bare category name. Delivery lower-cases the
-kind, so an exact comparison is the whole test. The kind happens to equal
-``skills_core.SKILL_OBJECT_KIND`` today; they are still separate constants,
-because one is a wire value LaunchDarkly owns and the other is an SDK seam.
+kind, so an exact comparison is the whole test. The value happens to equal
+``skills_core.SKILL_OBJECT_KIND``; they remain separate constants, because one is
+a wire value LaunchDarkly owns and the other is what this SDK asks a store for.
 """
 
 FDV2_KEY_DELIMITER = ":"
@@ -493,35 +492,34 @@ class _TransferOutcome:
     disconnect: str | None = None
     up_to_date: bool = False
     """
-    The server said what we hold is current and it has nothing to transfer.
+    The server said the content held is current and it has nothing to transfer.
 
-    A complete answer that commits nothing, which is exactly what a 304 is to a
-    poll. The delivery loop counts it as a healthy connection; see
+    A complete answer that commits nothing, which is what a 304 is to a poll.
+    The delivery loop counts it as a healthy connection; see
     ``FDv2SkillStore._apply``.
     """
 
 
 class _ProtocolReader:
     """
-    Applies FDv2 events to an object set. Pure — no sockets, no threads, no clock —
-    so every wire case is testable without a server.
+    Applies FDv2 events to an object set. Pure — no sockets, no threads, no
+    clock — so every wire case is testable without a server.
 
     **Changes are buffered and committed at ``payload-transferred``.** A payload
     version is the unit of consistency: applying half of one would publish a
     state the server never described, and on a full transfer would briefly empty
     the store. Listeners therefore fire once per commit, not once per object.
 
-    **The first payload intent is read, and is assumed to be the skill payload.**
+    **The first payload intent is read, and is taken to be the skill payload.**
     Delivery provides one payload per credential and the protocol requires a
-    client to ignore all but the first payload intent, so ``payloads[0]`` is both
-    what arrives and what the protocol says to read. If that ever widens, an
-    ``xfer-full`` for somebody else's payload would empty the skill set and the
-    next ``payload-transferred`` would publish it empty — with pruning on, the
-    difference between a reconcile and deleting a customer's files. This layer
-    therefore learns which payload skills arrive on and declines to apply a
-    transfer of any other, once at WARNING and counted. The residual is the first
-    transfer of a connection: before a skill has arrived there is nothing to
-    compare a payload against.
+    client to ignore all but the first intent, so ``payloads[0]`` is both what
+    arrives and what the protocol says to read. Should that ever widen, an
+    ``xfer-full`` for another payload would empty the skill set and the next
+    ``payload-transferred`` would publish it empty — with pruning on, the
+    difference between a reconcile and deleting the application's files. So this
+    layer learns which payload skills arrive on and declines to apply a transfer
+    of any other, warning once and counting it. The residual case is the first
+    transfer of a connection, where there is nothing to compare against yet.
     """
 
     def __init__(self, committed: _SkillObjectSet) -> None:
@@ -638,7 +636,7 @@ class _ProtocolReader:
             return _TransferOutcome()
         target.delete(tombstone)
         self.diagnostics.objects_revoked += 1
-        # A revocation identifies the payload as ours just as a put does.
+        # A revocation identifies the skill payload just as a put does.
         self._skills_in_payload += 1
         # A tombstone carries identity and no content; see
         # ``FDv2SkillStore.add_listener`` for what listeners should expect.
@@ -713,9 +711,8 @@ class _ProtocolReader:
         """
         Whether a transfer completes a payload other than the one skills arrive on.
 
-        ``False`` unless both payloads are known, so one-payload delivery and the
-        first transfer of a connection behave exactly as they did before this
-        check existed.
+        ``False`` unless both payloads are known, so one-payload delivery and
+        the first transfer of a connection are unaffected.
         """
         return (
             self._skill_payload_id is not None
@@ -729,10 +726,10 @@ class _ProtocolReader:
         """
         One WARNING per reader for an intent describing more than one payload.
 
-        Not an error: reading only the first is what the protocol asks for. But it
-        means the first payload is no longer *guaranteed* to be the skill payload,
-        and an intent for another payload arriving before any skill has been seen
-        is the one case ``_is_foreign_payload`` cannot catch.
+        Not an error: reading only the first is what the protocol asks for. But
+        it means the first payload is no longer *guaranteed* to be the skill
+        payload, and an intent for another payload arriving before any skill has
+        been seen is the one case ``_is_foreign_payload`` cannot catch.
         """
         if self._warned_multiple_payloads:
             return
@@ -842,7 +839,7 @@ def _retry_after_seconds(headers: Any) -> float | None:
     ``Retry-After`` in seconds, when the server sent a usable one.
 
     The HTTP-date form, and non-finite values such as ``inf`` or ``1e309`` that
-    ``float`` accepts, fall back to our own backoff: none of them is a delay,
+    ``float`` accepts, fall back to this module's backoff: none is a delay,
     and an infinite one would overflow the wait that honours it.
     """
     if headers is None:
@@ -956,7 +953,7 @@ class _Requester:
         self._sdk_key = sdk_key
         self._base_uri = base_uri.rstrip("/")
         self._read_timeout = read_timeout
-        # Injectable so tests can drive a fake endpoint without a socket.
+        # Injectable, so an alternative transport can be supplied.
         self._opener = opener or urllib.request.build_opener()
         self._lock = threading.Lock()
         # The response of a poll in flight, so ``interrupt`` can reach its
@@ -1168,7 +1165,8 @@ class FDv2SkillStore:
 
         store = FDv2SkillStore(sdk_key=os.environ["LD_SDK_KEY"])
         store.start()
-        store.wait_for_skills(timeout=10)
+        if not store.wait_for_skills(timeout=10):
+            ...  # no payload yet: see is_initialized
         await init_client(options={"skillStore": store})
 
         skill = await get_skill("pdf-extraction")
@@ -1184,7 +1182,9 @@ class FDv2SkillStore:
     the connection and fills memory, and ``get_object`` only ever reads what has
     already arrived. A process that calls ``get_skill`` immediately after
     ``start()`` may see an empty store; ``wait_for_skills`` orders boot against
-    the first payload.
+    the first payload, and ``is_initialized`` reports the same fact without
+    waiting — which is what stops ``write_skills("*")`` from pruning against a
+    store that has not heard yet.
 
     **Last known good survives an outage.** A transport failure never empties
     the store and never makes ``get_object`` raise, which is what makes
@@ -1585,8 +1585,8 @@ class FDv2SkillStore:
                 self._basis = outcome.basis
         if outcome.committed or outcome.up_to_date:
             # Both break the row of consecutive failures: a commit is a payload
-            # delivered, and ``up_to_date`` is the server confirming we already
-            # hold it. Counting only the commit would give up on a healthy
+            # delivered, and ``up_to_date`` is the server confirming the store
+            # already holds it. Counting only the commit would give up on a healthy
             # stream serving an environment whose skills are not changing:
             # nothing to transfer means no commit, while every recycled
             # connection still ends in a drop.

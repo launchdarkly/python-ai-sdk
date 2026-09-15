@@ -13,7 +13,7 @@ a debounce interval.
 
 ``on_unavailable="keep"`` stays the default: an outage must not read as
 "everything was revoked". A watcher that pruned on a failed retrieval would
-convert every transport failure into deletion of a customer's skill files.
+convert every transport failure into deletion of the application's skill files.
 
 Layering: this module sits *above* ``skills_fs`` and calls ``write_skills``
 without modifying it. Nothing in the reconcile, the accessors, or verification
@@ -201,8 +201,8 @@ class SkillWatcher:
 
         Waits out an in-flight reconcile rather than interrupting one, because a
         reconcile killed between its content writes and its manifest rewrite is
-        the one case the manifest format has to recover from — worth avoiding when
-        we control the timing.
+        the one case the manifest format has to recover from — worth avoiding
+        where the timing is under the SDK's control.
 
         Detaches ``notify`` from the store first, so no further change reaches a
         watcher that is shutting down and the store no longer holds a reference to
