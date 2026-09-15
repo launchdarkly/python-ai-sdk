@@ -56,9 +56,9 @@ The kind this SDK asks a store for.
 An **internal seam value**, deliberately not exported from the package root. It
 is the string ``skills.py`` and ``skills_fs.py`` pass to ``SkillStore.get_object``
 and ``SkillStore.all_objects``, and a store adapter is free to map it onto
-whatever the transport underneath actually uses — a delivery payload may well
-carry skills under a broader kind with a narrower category, in which case
-translating that pair to this one value is the adapter's job.
+whatever the transport underneath actually uses — the value happens to match
+the kind LaunchDarkly's delivery channel uses today, but a transport that spelt
+it differently would translate, and that translation is the adapter's job.
 
 Exporting it would publish an SDK-side seam string as though it were the wire
 contract, which is a claim this side cannot make and would be hard to walk back
@@ -134,9 +134,18 @@ INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode)
 
 NO_STORE_MESSAGE = (
     "No skill store is configured, so skill content cannot be retrieved. Configure "
-    'one with init_client(options={"skillStore": store}) — InMemorySkillStore is '
-    "available for local development and testing."
+    'one with init_client(options={"skillStore": store}) — FDv2SkillStore receives '
+    "content from LaunchDarkly, and InMemorySkillStore is available for local "
+    "development and testing."
 )
+"""
+The first thing a user sees when no store is configured, so it names both stores.
+
+``FDv2SkillStore`` comes first because it is the answer in production, and a
+message that offered only ``InMemorySkillStore`` would point a deployment at the
+development store. Callers match on "skill store"; keep that phrase if the
+wording changes.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +160,17 @@ class SkillStore(Protocol):
     Duck-typed on purpose, mirroring how the LaunchDarkly client interface works
     in this package: pass any object carrying these methods.
 
-    ``add_listener(kind, fn)`` is part of the seam but
-    **optional**, which is why it is deliberately not declared here: a Protocol
-    member is required for structural compatibility, so declaring it would reject
-    every store that does not implement it. Nothing in this module calls it — it
-    exists for the delivery transport to push updates through.
+    ``add_listener(kind, fn)`` and ``remove_listener(kind, fn)`` are part of the
+    interface but **optional**, which is why they are deliberately not declared
+    here: a Protocol member is required for structural compatibility, so declaring
+    them would reject every store that does not implement them. Nothing in this
+    module calls either — they exist for the delivery transport to push updates
+    through, and for a consumer such as ``watch_skills`` to stop receiving them.
+    A store that implements ``add_listener`` should implement ``remove_listener``
+    too; consumers probe for it and skip detaching when it is absent, so an
+    older store keeps working at the cost of a listener that lives as long as
+    the store does. ``remove_listener`` removes one occurrence of *fn* under
+    *kind* and is a no-op when *fn* is not registered.
 
     The raw objects a store serves are wire-shaped, with camelCase field names
     identical across language implementations::

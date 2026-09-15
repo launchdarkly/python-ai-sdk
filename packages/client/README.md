@@ -272,7 +272,12 @@ async def main():
 asyncio.run(main())
 ```
 
-Pass `"*"` instead of a reference list to materialize every skill the store holds.
+Pass `"*"` instead of a reference list to materialize every skill the store holds — but know
+what you are asking for. `"*"` materializes the **whole project library**, which puts every
+skill's `description` into the agent's context, including skills no AI Config references and
+skills belonging to other teams. `write_skills(skill_refs(...), root)` is the form used above
+because it materializes only what the resolved variation actually asked for; reach for `"*"`
+when you genuinely want the whole library on disk.
 
 **`skills` is now a validated field.** Config parsing fails closed on a `skills` value that
 is not a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an
@@ -406,6 +411,19 @@ never writes through a symlink; writes are atomic (temp file, `fsync`, rename) a
 `0644`; and if the manifest is unreadable it performs no destructive action at all. Removing
 a skill from a variation is how revocation works — the next reconcile prunes it.
 
+**Platform bound: the descriptor-pinned guarantee is POSIX-only.** On POSIX every destructive
+step — the open, the rename, the unlink — runs relative to a directory descriptor opened
+`O_RDONLY|O_DIRECTORY|O_NOFOLLOW` and held for the whole reconcile, so a directory swapped for
+a symlink *after* its checks cannot redirect a write or a delete: the descriptor names the
+inode that was checked, which closes the swap window rather than narrowing it. Windows has no
+`*at()` syscall family, so there `write_skills` falls back to a per-component `lstat` check
+taken immediately before each step. That floor is a check-then-use race rather than a closed
+window: an attacker who already holds **write permission on the managed root** can still win
+it. Windows reparse-point checks (`GetFileAttributesW` / `FILE_FLAG_OPEN_REPARSE_POINT`) are
+deliberately not implemented in this release, and Windows is not a tested platform for it —
+neither SDK repository has a Windows CI runner. Treat write permission on the managed root as
+the security boundary on every platform, and on Windows as the *only* one.
+
 **One exception, and it is what makes a crashed reconcile recoverable.** A file at a managed
 path whose bytes are *already byte-identical* to the content LaunchDarkly resolved is
 adopted — recorded in the manifest and reported `skipped_current` — rather than refused.
@@ -427,6 +445,66 @@ which OS ran the write. The keys stay valid everywhere else: an AI Config refere
 named `aux` parses, and its other fields are unaffected. If you have a skill named for a
 device, rename it.
 
+#### Receiving skills from LaunchDarkly
+
+`InMemorySkillStore` is for tests and bring-your-own-content. In production, skill content
+arrives through `FDv2SkillStore`, which speaks LaunchDarkly's SDK-facing FDv2 delivery
+channel — the same `GET /sdk/poll` and `GET /sdk/stream` endpoints the base SDK's FDv2 data
+source uses, authenticated with the environment's server-side SDK key.
+
+```python
+import os
+
+from launchdarkly_ai_server import FDv2SkillStore, init_client, watch_skills
+
+store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
+store.wait_for_skills(timeout=10)
+await init_client(options={"skillStore": store})
+
+# Materialize now, and re-materialize whenever delivery changes.
+report, watcher = await watch_skills("*", ".claude/skills")
+try:
+    ...
+finally:
+    watcher.close()
+    store.close()
+```
+
+**Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
+objects through the `SkillStore` interface and cannot tell which store produced them.
+
+**Server-side only.** Skills are for server-side agent runtimes and skill content is
+customer-confidential. A mobile key (`mob-…`) or a client-side environment ID raises from the
+constructor.
+
+**Streaming is the default, and it is what makes revocation fast.** A `delete-object` reaches
+a live stream in seconds; with `mode="poll"` it arrives within one `poll_interval`. Paired
+with `watch_skills`, a revoked skill's `SKILL.md` leaves the disk without a restart. During an
+outage the store keeps serving the last content it received and `write_skills`' default
+`on_unavailable="keep"` leaves managed files alone — an outage must not read as "everything
+was revoked".
+
+**One network timeout, and its default depends on the mode.** `read_timeout` bounds every
+socket operation of a request, connecting included. In `mode="poll"` it bounds the whole
+request and defaults to 10 seconds; in `mode="stream"` it bounds each wait for the next bytes
+and defaults to 300 seconds, well beyond LaunchDarkly's heartbeat interval.
+
+**The connection also carries your flags.** A client cannot request only the skill payload,
+so a skills-enabled environment delivers flag and segment objects on the same connection.
+They are skipped, not evaluated — this store does no evaluation of any kind — and
+`diagnostics.objects_ignored` counts them.
+
+> **Beta caveats, worth knowing before you deploy.** Payload signing does not exist on this
+> channel yet, so delivery is TLS-only and the content hash establishes self-consistency, not
+> origin authenticity. The FDv2 protocol is opt-in per account: without it the endpoints
+> return HTTP 403, which the store reports as a fatal error explaining what to do. `ld-relay`
+> does not speak the FDv2 endpoints, so relay-only deployments cannot receive skills.
+
+**If every skill comes back empty, check `diagnostics.hashless_objects`.** Verification
+withholds any delivered object without a `contentHash`, so a nonzero count means skills are
+being withheld rather than that the environment has none. The store also logs an error per
+hashless object naming the reason. There is deliberately no fallback that skips verification.
+
 **Total path length is yours to bound, not the SDK's.** The 255-byte bound above is per
 *component*; the root is your path, so `<root>` + `<key>` + `/SKILL.md` can still exceed
 Windows' 260-character `MAX_PATH` with a perfectly legal key. Choose a short managed root on
@@ -440,8 +518,11 @@ Windows.
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative `timeout`, or an unrecognised `on_unavailable`. **Performs synchronous filesystem I/O — see the note below.** |
-| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)`. |
+| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)` / `remove_listener(kind, fn)`. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
+| `FDv2SkillStore(sdk_key, *, base_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `close()`, `diagnostics`, `failed`; also a context manager. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
+| `watch_skills(skills, root, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. |
+| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,
 the accessors raise `RuntimeError` explaining what to do and `write_skills` reports the
@@ -476,6 +557,54 @@ to key its own map however the transport underneath does.
 > `Skill.content` is `bytes` — the verified verbatim bytes LaunchDarkly delivered, exactly
 > what was hashed. The SDK never parses or interprets them; if you want the frontmatter,
 > decode and parse the content on your side.
+
+#### Privilege separation: the agent must not be able to rewrite its own skills
+
+**The recommended deployment runs `write_skills` as a different identity than the agent.**
+Reconcile as one user, run the agent as another. Everything the reconcile puts on disk is
+owner-write-only, and set explicitly rather than inherited from your umask: skill files and
+the manifest at `0644` (via `fchmod` on the descriptor, so it cannot be redirected), the
+per-skill `<root>/<key>/` directories at `0755`, and the execute bit never set on anything.
+Those modes are only a defense if the two identities actually differ — under a single identity
+they describe a directory the agent can freely rewrite.
+
+**What to verify, as the identity that will run the agent.** The SDK cannot check this for you
+(see below), so make it a deployment step: confirm the agent's identity has no write access to
+
+- the managed root itself,
+- the per-skill directories `<root>/<key>/` and the files `<root>/<key>/SKILL.md`,
+- the manifest at `<root>/.launchdarkly-skills.json`.
+
+```bash
+# Run as the agent's user. Every line should print DENIED.
+root=.claude/skills
+for target in "$root" "$root/.launchdarkly-skills.json" "$root"/*/ "$root"/*/SKILL.md; do
+  [ -e "$target" ] || continue
+  if [ -w "$target" ]; then echo "WRITABLE — fix this: $target"; else echo "DENIED: $target"; fi
+done
+```
+
+Note that the managed root's own mode is **yours, not the SDK's**: `write_skills` creates only
+that one leaf directory and does so with your umask, precisely because the root is a path you
+chose. Own it — `chown reconcile-user:agent-group` and `chmod 0755` on the root is the shape
+that makes the rest of the tree's modes mean something.
+
+**Why this is the mitigation that matters.** A `SKILL.md` is agent *instructions*. An agent
+that can write its own skills directory can rewrite its own instructions, and an agent
+processing untrusted input is exactly the thing that might be induced to do so. Write access
+to the manifest is worse than write access to a skill, because the manifest is what tells the
+*next* reconcile which paths the SDK owns and may delete: an agent that can edit it can keep a
+skill LaunchDarkly has revoked, or aim the SDK's own delete path at something it should not
+touch. `write_skills` re-validates every manifest entry from scratch for exactly that reason —
+it treats that file as untrusted input, never as authorization — but an agent that cannot edit
+it at all is the stronger position, and only your deployment can provide that.
+
+**The SDK deliberately does not report whether the root is writable.** There is no such field
+on `ReconcileReport`, and its absence is a decision rather than an oversight. The SDK knows
+only its own identity, which trivially has write access — it just wrote there. It cannot know
+which identity will later run the agent, so any check it could make would answer a different
+question than the one that matters, and would read as reassurance exactly where caution is
+wanted. You know both identities; the SDK knows one.
 
 ---
 
