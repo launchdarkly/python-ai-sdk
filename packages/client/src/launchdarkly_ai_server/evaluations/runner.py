@@ -85,6 +85,33 @@ def _covers_provider(
     return provides_for[0] == provider or provides_for[0] == "*"
 
 
+def _find_judge_handler(
+    judge_handlers: list[EvalHandler],
+    provider: str | None,
+    mode: Literal["agent", "messages"],
+) -> EvalHandler | None:
+    """Find a handler for ``provider`` in ``mode``, exact match before wildcard.
+
+    A wildcard handler is a fallback for multi-provider adapters, so it is only
+    chosen when no handler names the provider outright -- the priority
+    ``config()`` already applies to a generation config. Searching in one pass
+    would instead let the order the caller happened to list its handlers in
+    decide, sending an OpenAI judge through a LangChain adapter that was merely
+    listed first.
+    """
+    for exact in (True, False):
+        for candidate in judge_handlers:
+            provides_for = _provides_for(candidate)
+            if provides_for is None or provides_for[1] != mode:
+                continue
+            if exact:
+                if provides_for[0] == provider:
+                    return candidate
+            elif provides_for[0] == "*":
+                return candidate
+    return None
+
+
 def _select_judge_handler(
     resolved: ResolvedJudge,
     handler: EvalHandler,
@@ -97,7 +124,8 @@ def _select_judge_handler(
     one provider cannot execute another's config. The priority mirrors the
     online path (``judges.run_judges``):
 
-    1. a judge handler matching the judge's provider (or a wildcard) and mode;
+    1. a judge handler in the judge's mode, naming its provider outright
+       before any wildcard adapter;
     2. an agent-mode judge handler for a messages-mode judge, whose messages
        are collapsed into a single instructions block;
     3. the generation handler, when it covers the judge's provider.
@@ -106,25 +134,15 @@ def _select_judge_handler(
     own routing -- the same contract it already honours for the generation
     config -- so it is treated as covering every judge.
     """
-    for candidate in judge_handlers:
-        provides_for = _provides_for(candidate)
-        if (
-            provides_for
-            and _covers_provider(provides_for, resolved.provider)
-            and provides_for[1] == resolved.mode
-        ):
-            return JudgeExecution(resolved=resolved, handler=candidate)
+    match = _find_judge_handler(judge_handlers, resolved.provider, resolved.mode)
+    if match is not None:
+        return JudgeExecution(resolved=resolved, handler=match)
     if resolved.mode == "messages":
-        for candidate in judge_handlers:
-            provides_for = _provides_for(candidate)
-            if (
-                provides_for
-                and _covers_provider(provides_for, resolved.provider)
-                and provides_for[1] == "agent"
-            ):
-                return JudgeExecution(
-                    resolved=resolved, handler=candidate, collapse_messages=True
-                )
+        agent_fallback = _find_judge_handler(judge_handlers, resolved.provider, "agent")
+        if agent_fallback is not None:
+            return JudgeExecution(
+                resolved=resolved, handler=agent_fallback, collapse_messages=True
+            )
     generation_provides_for = _provides_for(handler)
     if generation_provides_for is None:
         return JudgeExecution(resolved=resolved, handler=handler)

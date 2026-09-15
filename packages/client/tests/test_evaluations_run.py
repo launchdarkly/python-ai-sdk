@@ -1999,6 +1999,87 @@ async def test_judge_handlers_route_a_judge_to_its_own_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wildcard_first", [True, False])
+async def test_exact_provider_judge_handler_beats_a_wildcard_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    wildcard_first: bool,
+) -> None:
+    """A wildcard is a fallback, so the order handlers are listed in cannot decide.
+
+    Taking the first provider-or-wildcard match would send an Anthropic judge
+    through a multi-provider adapter that merely happened to be listed first.
+    """
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    chosen: list[str] = []
+
+    def judge_handler(name: str) -> Any:
+        async def run(
+            config: dict[str, Any],
+            user_input: str | None = None,
+            tool_handlers: dict[str, Callable[..., Any]] | None = None,
+            variables: dict[str, Any] | None = None,
+            history: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+            chosen.append(name)
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+        return run
+
+    wildcard = create_handler(("*", "messages"), judge_handler("wildcard"))
+    exact = create_handler(("Anthropic", "messages"), judge_handler("exact"))
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        judge_handlers=[wildcard, exact] if wildcard_first else [exact, wildcard],
+    )
+
+    assert result.passed is True
+    assert chosen == ["exact"]
+
+
+@pytest.mark.asyncio
+async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    judged: list[dict[str, Any]] = []
+
+    async def wildcard_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        judged.append(config)
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        judge_handlers=[create_handler(("*", "messages"), wildcard_judge)],
+    )
+
+    assert result.passed is True
+    assert [config["provider"]["name"] for config in judged] == ["Anthropic"]
+
+
+@pytest.mark.asyncio
 async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
