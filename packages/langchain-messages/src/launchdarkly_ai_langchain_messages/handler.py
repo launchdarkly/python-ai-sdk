@@ -18,6 +18,7 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    lang_chain_content_text,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     lang_chain_span_usage,
@@ -170,21 +171,47 @@ def _is_coroutine(fn: Any) -> bool:
 _MAX_STEPS = 10
 
 
+def _model_constructor_kwargs(
+    config: AiConfigRep, fallback_name: str
+) -> dict[str, Any]:
+    raw = (config.get("model") or {}).get("parameters")
+    parameters = dict(raw) if isinstance(raw, dict) else {}
+    # Name from the config always wins over a colliding ``model`` key in the parameter bag.
+    parameters["model"] = (config.get("model") or {}).get("name") or fallback_name
+    return parameters
+
+
+def _is_model_factory(llm: Any) -> bool:
+    """LangChain models are callable, so ``callable`` is not enough to spot a factory."""
+    return callable(llm) and not hasattr(llm, "invoke") and not hasattr(llm, "ainvoke")
+
+
 def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     """
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
+    ``model.parameters`` are passed through unchanged.
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
-    model_name = config.get("model", {}).get("name", "")
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            model=model_name or "claude-3-5-sonnet-20241022"
+            **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
         )
     lc_openai = importlib.import_module("langchain_openai")
-    return lc_openai.ChatOpenAI(model=model_name or "gpt-4o")
+    return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
+
+
+async def _resolve_base_model(config: AiConfigRep, llm: Any, importlib: Any) -> Any:
+    if llm is None:
+        return _make_default_chat_model(config, importlib)
+    if _is_model_factory(llm):
+        model = llm(config)
+        if asyncio.iscoroutine(model):
+            return await model
+        return model
+    return llm
 
 
 async def _run_structured_turn(
@@ -281,8 +308,10 @@ def create_langchain_messages_handler(
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
     Requires ``langchain-openai`` or another LangChain integration to be installed.
-    Pass *llm* to use a specific chat model; omit to default to
-    ``ChatOpenAI(model=<config model name>)`` resolved at call time.
+    Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
+    called after flag evaluation so ``model.parameters`` can be applied unchanged. Omit
+    to default to ``ChatOpenAI`` / ``ChatAnthropic`` constructed at call time from the
+    config's model name and parameters.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
@@ -325,9 +354,7 @@ def create_langchain_messages_handler(
                     system_instructions=system_instructions,
                     messages=span_messages,
                 )
-            base_model = (
-                llm if llm is not None else _make_default_chat_model(config, importlib)
-            )
+            base_model = await _resolve_base_model(config, llm, importlib)
 
             tool_defs = _build_tools(config.get("tools") or {})
             output_format = config.get("outputFormat")
@@ -479,11 +506,7 @@ def create_langchain_messages_handler(
                                 run_usage=run_usage,
                             )
                         else:
-                            output = (
-                                response.content
-                                if isinstance(response.content, str)
-                                else ""
-                            )
+                            output = lang_chain_content_text(response.content)
                         break
 
                     if steps >= _MAX_STEPS:
@@ -643,7 +666,7 @@ async def _stream_gen(
     """
     import importlib
 
-    base_model = llm if llm is not None else _make_default_chat_model(config, importlib)
+    base_model = await _resolve_base_model(config, llm, importlib)
 
     span = start_root_span(config, variables)
     parent = parent_context_of(span)
@@ -723,7 +746,7 @@ async def _stream_gen(
                 chunk_stream = tool_model.astream(conversation_messages)
                 open_chunk_stream = chunk_stream
                 async for chunk in chunk_stream:
-                    text = chunk.content if isinstance(chunk.content, str) else ""
+                    text = lang_chain_content_text(chunk.content)
                     if text:
                         yield {"type": "chunk", "text": text}
                         accumulated_content += text

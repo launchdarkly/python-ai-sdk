@@ -35,7 +35,7 @@ def _make_config(**kwargs: Any) -> dict[str, Any]:
 
 
 def _make_ai_msg(
-    content: str = "answer", input_tokens: int = 10, output_tokens: int = 5
+    content: Any = "answer", input_tokens: int = 10, output_tokens: int = 5
 ) -> Any:
     msg = MagicMock()
     msg.content = content
@@ -181,6 +181,19 @@ class TestFactory:
         h1 = create_langchain_agents_handler()
         h2 = create_langchain_agents_handler()
         assert h1 is not h2
+
+    @pytest.mark.asyncio
+    async def test_returns_text_from_mixed_thinking_and_text_blocks(self) -> None:
+        mocks = _make_langchain_mock()
+        mocks["_ai_msg"].content = [
+            {"type": "thinking", "thinking": "internal reasoning"},
+            {"type": "text", "text": "visible answer"},
+        ]
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            result = await create_langchain_agents_handler(llm=MagicMock())(
+                _make_config(), "q"
+            )
+        assert result["output"] == "visible answer"
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +508,7 @@ class _FakeToolModel(BaseChatModel):
 
 
 def _ai_message(
-    content: str = "",
+    content: Any = "",
     input_tokens: int = 10,
     output_tokens: int = 5,
     tool_calls: list[dict[str, Any]] | None = None,
@@ -1230,6 +1243,30 @@ class TestStreaming:
 
         done_events = [e for e in events if e.get("type") == "done"]
         assert len(done_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
+        mocks = _make_langchain_mock()
+        msg = _make_ai_msg(
+            [
+                {"type": "thinking", "thinking": "internal reasoning"},
+                {"type": "text", "text": "visible answer"},
+            ]
+        )
+
+        async def _mock_astream(*a: Any, **kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [msg]}}
+
+        mocks["_agent"].astream = _mock_astream
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            events = [
+                event
+                async for event in await create_langchain_agents_handler(
+                    llm=MagicMock()
+                ).stream(_make_config(), "q")
+            ]
+        assert {"type": "chunk", "text": "visible answer"} in events
+        assert events[-1]["output"] == "visible answer"
 
     @pytest.mark.asyncio
     async def test_generator_throws_on_provider_error(self) -> None:
@@ -2055,3 +2092,112 @@ class TestRootCompletionWithBlockContent:
 
         assert rec.root.attributes["gen_ai.completion.0.content"] == "a typed block"
         assert "a typed block" in str(rec.root.attributes["gen_ai.output.messages"])
+
+
+class TestModelSource:
+    @pytest.mark.asyncio
+    async def test_factory_receives_config_and_returned_model_is_used(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("from-factory")])
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {"temperature": 0.2, "max_tokens": 512},
+            },
+        }
+        with ctx:
+            result = await create_langchain_agents_handler(factory)(cfg, "q")
+        assert seen[0]["model"]["parameters"] == {"temperature": 0.2, "max_tokens": 512}
+        assert result["output"] == "from-factory"
+
+    @pytest.mark.asyncio
+    async def test_prebuilt_instance_is_used_as_is(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("from-instance")])
+        with ctx:
+            result = await create_langchain_agents_handler(llm)(
+                {
+                    **BASE_CONFIG,
+                    "model": {"name": "gpt-4o", "parameters": {"temperature": 0.2}},
+                },
+                "q",
+            )
+        assert result["output"] == "from-instance"
+
+    @pytest.mark.asyncio
+    async def test_default_openai_constructor_receives_parameters(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("default-openai")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {"temperature": 0.2, "max_tokens": 512},
+            },
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "model": "gpt-4o",
+        }
+
+    @pytest.mark.asyncio
+    async def test_default_anthropic_constructor_receives_parameters(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("default-anthropic")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Anthropic"},
+            "model": {"name": "claude-sonnet-4-5", "parameters": {"temperature": 0.1}},
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules", {"langchain_anthropic": MagicMock(ChatAnthropic=ctor)}
+            ),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.1,
+            "model": "claude-sonnet-4-5",
+        }
+
+    @pytest.mark.asyncio
+    async def test_factory_is_resolved_on_the_streaming_path(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("streamed")])
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **BASE_CONFIG,
+            "model": {"name": "gpt-4o", "parameters": {"temperature": 0.2}},
+        }
+        with ctx:
+            events = [
+                e
+                async for e in await create_langchain_agents_handler(factory).stream(
+                    cfg, "q", {}, {}
+                )
+            ]
+        assert seen[0]["model"]["parameters"] == {"temperature": 0.2}
+        assert any(
+            e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
+        )
