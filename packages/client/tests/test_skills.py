@@ -603,6 +603,18 @@ class TestStoreConfiguration:
         with pytest.raises(RuntimeError, match="skill store"):
             await all_skills()
 
+    async def test_the_no_store_message_names_the_delivery_store_first(self) -> None:
+        """
+        A deployment that hits this message must be pointed at the store that
+        receives content from LaunchDarkly, not only at the development one.
+        """
+        with pytest.raises(RuntimeError) as reported:
+            await get_skill("a")
+        message = str(reported.value)
+        assert "FDv2SkillStore" in message
+        assert "InMemorySkillStore" in message
+        assert message.index("FDv2SkillStore") < message.index("InMemorySkillStore")
+
     async def test_shutdown_clears_the_store(
         self, make_raw_skill: Any, mock_ld_client: Any
     ) -> None:
