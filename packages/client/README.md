@@ -445,6 +445,66 @@ which OS ran the write. The keys stay valid everywhere else: an AI Config refere
 named `aux` parses, and its other fields are unaffected. If you have a skill named for a
 device, rename it.
 
+#### Receiving skills from LaunchDarkly
+
+`InMemorySkillStore` is for tests and bring-your-own-content. In production, skill content
+arrives through `FDv2SkillStore`, which speaks LaunchDarkly's SDK-facing FDv2 delivery
+channel — the same `GET /sdk/poll` and `GET /sdk/stream` endpoints the base SDK's FDv2 data
+source uses, authenticated with the environment's server-side SDK key.
+
+```python
+import os
+
+from launchdarkly_ai_server import FDv2SkillStore, init_client, watch_skills
+
+store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
+store.wait_for_skills(timeout=10)
+await init_client(options={"skillStore": store})
+
+# Materialize now, and re-materialize whenever delivery changes.
+report, watcher = await watch_skills("*", ".claude/skills")
+try:
+    ...
+finally:
+    watcher.close()
+    store.close()
+```
+
+**Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
+objects through the `SkillStore` interface and cannot tell which store produced them.
+
+**Server-side only.** Skills are for server-side agent runtimes and skill content is
+customer-confidential. A mobile key (`mob-…`) or a client-side environment ID raises from the
+constructor.
+
+**Streaming is the default, and it is what makes revocation fast.** A `delete-object` reaches
+a live stream in seconds; with `mode="poll"` it arrives within one `poll_interval`. Paired
+with `watch_skills`, a revoked skill's `SKILL.md` leaves the disk without a restart. During an
+outage the store keeps serving the last content it received and `write_skills`' default
+`on_unavailable="keep"` leaves managed files alone — an outage must not read as "everything
+was revoked".
+
+**One network timeout, and its default depends on the mode.** `read_timeout` bounds every
+socket operation of a request, connecting included. In `mode="poll"` it bounds the whole
+request and defaults to 10 seconds; in `mode="stream"` it bounds each wait for the next bytes
+and defaults to 300 seconds, well beyond LaunchDarkly's heartbeat interval.
+
+**The connection also carries your flags.** A client cannot request only the skill payload,
+so a skills-enabled environment delivers flag and segment objects on the same connection.
+They are skipped, not evaluated — this store does no evaluation of any kind — and
+`diagnostics.objects_ignored` counts them.
+
+> **Beta caveats, worth knowing before you deploy.** Payload signing does not exist on this
+> channel yet, so delivery is TLS-only and the content hash establishes self-consistency, not
+> origin authenticity. The FDv2 protocol is opt-in per account: without it the endpoints
+> return HTTP 403, which the store reports as a fatal error explaining what to do. `ld-relay`
+> does not speak the FDv2 endpoints, so relay-only deployments cannot receive skills.
+
+**If every skill comes back empty, check `diagnostics.hashless_objects`.** Verification
+withholds any delivered object without a `contentHash`, so a nonzero count means skills are
+being withheld rather than that the environment has none. The store also logs an error per
+hashless object naming the reason. There is deliberately no fallback that skips verification.
+
 **Total path length is yours to bound, not the SDK's.** The 255-byte bound above is per
 *component*; the root is your path, so `<root>` + `<key>` + `/SKILL.md` can still exceed
 Windows' 260-character `MAX_PATH` with a perfectly legal key. Choose a short managed root on
@@ -460,7 +520,9 @@ Windows.
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative `timeout`, or an unrecognised `on_unavailable`. **Performs synchronous filesystem I/O — see the note below.** |
 | `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `add_listener(kind, fn)` / `remove_listener(kind, fn)`. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
+| `FDv2SkillStore(sdk_key, *, base_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `close()`, `diagnostics`, `failed`; also a context manager. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
 | `watch_skills(skills, root, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. |
+| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,
 the accessors raise `RuntimeError` explaining what to do and `write_skills` reports the

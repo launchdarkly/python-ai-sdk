@@ -4,7 +4,10 @@ Tests for ``watch_skills`` / ``SkillWatcher`` — the eager re-reconcile.
 The watcher is wired to the ``SkillStore`` interface, not to any one transport:
 it needs a store that implements ``add_listener``, and nothing more. These tests
 therefore drive it from ``InMemorySkillStore``, whose ``put`` notifies its
-listeners synchronously, and from small hand-written store doubles.
+listeners synchronously, and from small hand-written store doubles. The
+end-to-end path — a ``delete-object`` arriving over a live FDv2 connection and
+pruning a skill's files — is exercised in ``test_skills_fdv2.py``, where the fake
+endpoint lives.
 
 Every test writes only inside pytest's ``tmp_path``. The watcher runs a real
 worker thread, so tests wait on observable outcomes rather than on fixed sleeps

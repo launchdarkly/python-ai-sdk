@@ -134,9 +134,18 @@ INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode)
 
 NO_STORE_MESSAGE = (
     "No skill store is configured, so skill content cannot be retrieved. Configure "
-    'one with init_client(options={"skillStore": store}) — InMemorySkillStore is '
-    "available for local development and testing."
+    'one with init_client(options={"skillStore": store}) — FDv2SkillStore receives '
+    "content from LaunchDarkly, and InMemorySkillStore is available for local "
+    "development and testing."
 )
+"""
+The first thing a user sees when no store is configured, so it names both stores.
+
+``FDv2SkillStore`` comes first because it is the answer in production, and a
+message that offered only ``InMemorySkillStore`` would point a deployment at the
+development store. Callers match on "skill store"; keep that phrase if the
+wording changes.
+"""
 
 
 # ---------------------------------------------------------------------------
