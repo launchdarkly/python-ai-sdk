@@ -17,7 +17,14 @@ from .api import (
     Transport,
     urllib_transport,
 )
-from .runner import EvalHandler, EvaluationsRunner, ToolImplementation, _segment
+from .criteria import Criterion, Judge
+from .runner import (
+    EvalHandler,
+    EvaluationsRunner,
+    ToolImplementation,
+    _provides_for,
+    _segment,
+)
 from .types import EvalRunResult, GenerationConfig, RunSummary
 
 logger = logging.getLogger(__name__)
@@ -93,12 +100,26 @@ class EvaluationsModule:
         handler: EvalHandler,
         generation: GenerationConfig,
         tools: Mapping[str, ToolImplementation] | None = None,
+        criteria: list[Criterion] | None = None,
+        judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
         poll_interval_seconds: float | None = None,
         poll_timeout_seconds: float | None = None,
     ) -> EvalRunResult:
         """
-        Create and run a generation-only evaluation in the caller's process.
+        Create and run an evaluation in the caller's process.
+
+        Each dataset row is generated with ``handler``; every entry in
+        ``criteria`` — LaunchDarkly :class:`Judge` references and local
+        deterministic :class:`Scorer` functions — is then run against each
+        generated row, and one evaluation event is emitted per
+        ``(row, criterion)`` result.
+
+        A :class:`Judge` is an independent AI Config and may be served by a
+        different provider or mode than ``generation``. ``handler`` runs a judge
+        only when it provides for that judge's provider; pass handlers for any
+        other providers your judges use in ``judge_handlers``. A judge no
+        handler covers fails the run before any records are created.
 
         The returned pass/fail result is derived from LaunchDarkly's run summary.
         A CI script can exit with ``0 if result.passed else 1`` after awaiting
@@ -121,13 +142,23 @@ class EvaluationsModule:
             poll_timeout_seconds=poll_timeout_seconds,
         )
         run_tools = dict(tools or {})
+        run_criteria = list(criteria or [])
+        run_judge_handlers = list(judge_handlers or [])
+        self._validate_criteria(run_criteria)
+        self._validate_judge_handlers(run_judge_handlers)
+        ld_judges = [
+            criterion for criterion in run_criteria if isinstance(criterion, Judge)
+        ]
         client = await self._resolve_client()
 
         # The management API client is synchronous; running it in a worker thread
         # keeps the caller's event loop free.
-        # Tool verification is deliberately first: a typo must not create records.
+        # Tool/judge verification is deliberately first: a typo must not create records.
         resolved_tools = await asyncio.to_thread(
             self._runner._resolve_tools, project_key, run_tools
+        )
+        resolved_judges = await self._runner._resolve_judges(
+            project_key, ld_judges, handler, run_judge_handlers
         )
         dataset_ref = await asyncio.to_thread(
             self._runner._fetch_dataset, project_key, dataset
@@ -141,12 +172,12 @@ class EvaluationsModule:
             key,
             generation,
             resolved_tools,
+            run_criteria,
         )
         evaluation_run = await asyncio.to_thread(
             self._runner._create_evaluation_run,
             project_key,
             evaluation.id,
-            len(rows),
             dataset_ref.id,
         )
         config = self._runner._build_handler_config(generation, resolved_tools)
@@ -157,17 +188,37 @@ class EvaluationsModule:
             run_tools,
             concurrency,
         )
-        self._runner._emit_generation_events(
-            client,
-            project_key=project_key,
-            evaluation=evaluation,
-            evaluation_run=evaluation_run,
-            dataset=dataset_ref,
-            results=results,
-        )
-        flush_result = client.flush()
-        if inspect.isawaitable(flush_result):
-            await flush_result
+        try:
+            self._runner._emit_generation_events(
+                client,
+                project_key=project_key,
+                evaluation=evaluation,
+                evaluation_run=evaluation_run,
+                dataset=dataset_ref,
+                results=results,
+            )
+            if run_criteria:
+                criterion_results = await self._runner._run_criteria_for_results(
+                    results,
+                    run_tools,
+                    run_criteria,
+                    resolved_judges,
+                    concurrency,
+                )
+                self._runner._emit_evaluation_events(
+                    client,
+                    project_key=project_key,
+                    evaluation=evaluation,
+                    evaluation_run=evaluation_run,
+                    dataset=dataset_ref,
+                    results=criterion_results,
+                )
+        finally:
+            # Generation results already queued on the SDK event buffer must
+            # reach LaunchDarkly even when the criteria phase fails.
+            flush_result = client.flush()
+            if inspect.isawaitable(flush_result):
+                await flush_result
         summary = await self._poll_summary_until_terminal(
             project_key,
             evaluation.id,
@@ -180,7 +231,16 @@ class EvaluationsModule:
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
-            passed=(summary.error_rows == 0 and summary.pending_rows == 0),
+            # failed_rows counts rows whose criteria were scored and did not
+            # meet their threshold, so a gate that ignores it exits 0 on a run
+            # where every row failed its judge. It was omissible while runs were
+            # generation-only -- a row either generated or errored, and nothing
+            # produced a fail -- and stops being so the moment criteria exist.
+            passed=(
+                summary.error_rows == 0
+                and summary.failed_rows == 0
+                and summary.pending_rows == 0
+            ),
             url=url,
             run_id=evaluation_run.id,
             summary=summary,
@@ -241,6 +301,52 @@ class EvaluationsModule:
                 "LaunchDarkly client is available to deliver generation events."
             )
         return await init_client({"sdkKey": self._sdk_key})
+
+    @staticmethod
+    def _validate_criteria(criteria: list[Criterion]) -> None:
+        """Reject duplicate criterion identities before any records are created.
+
+        A judge key and a scorer name that collide would share a criterionType,
+        and with it the deterministic event identity of their results. Case-
+        insensitive, matching the API's own dedup: the worker's retry gate
+        lowercases criterion types, so two criteria differing only by case
+        would still collide there even though they look distinct here.
+        """
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for criterion in criteria:
+            criterion_type = criterion.criterion_type
+            normalized = criterion_type.lower()
+            if normalized in seen and criterion_type not in duplicates:
+                duplicates.append(criterion_type)
+            seen.add(normalized)
+        if duplicates:
+            raise EvaluationsError(
+                "Duplicate evaluation criteria: "
+                + ", ".join(repr(name) for name in duplicates)
+                + ". Judge keys and scorer names must be unique within a run "
+                "(case-insensitive)."
+            )
+
+    @staticmethod
+    def _validate_judge_handlers(judge_handlers: list[EvalHandler]) -> None:
+        """Reject judge handlers that cannot be routed by provider and mode.
+
+        A judge handler is only ever chosen by matching its ``provides_for``
+        against the judge's resolved provider and mode. One without that
+        metadata could never be selected, so it would silently fall through to
+        the generation handler instead of running the judge it was passed for.
+        """
+        for index, candidate in enumerate(judge_handlers):
+            if not callable(candidate):
+                raise EvaluationsError(f"judge_handlers[{index}] must be callable")
+            if _provides_for(candidate) is None:
+                raise EvaluationsError(
+                    f"judge_handlers[{index}] does not declare provides_for. "
+                    "Build judge handlers with create_handler() (or a provider "
+                    "package's create_*_handler()) so they can be matched to a "
+                    "judge's provider and mode."
+                )
 
     @staticmethod
     def _validate_run_args(
