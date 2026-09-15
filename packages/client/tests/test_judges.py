@@ -3,13 +3,22 @@ Tests for §3.14 run_judges.
 Reference: TESTING.md §3.14
 """
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import JudgeResult, ProviderHandler, run_judges
+from launchdarkly_ai_server import (
+    JudgeResult,
+    JudgeTask,
+    ProviderHandler,
+    run_judge,
+    run_judges,
+)
+from launchdarkly_ai_server.judges import judge_explanation
+from launchdarkly_ai_server.utils import JUDGE_REASONING_MAX_LENGTH
 
 CONTEXT = {"kind": "user", "key": "u1"}
 
@@ -385,6 +394,160 @@ class TestRunJudges:
             base_track_data={},
         )
         assert result == {}
+
+
+class TestJudgeReasoning:
+    """Reasoning leaves the process on the metric event and on the evaluation event.
+
+    Reference: TELEMETRY-CONTRACT.md §4a
+    """
+
+    @staticmethod
+    def _judge_variation() -> dict[str, Any]:
+        return {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "judge",
+            "evaluationMetricKey": "quality",
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+
+    @staticmethod
+    def _parent_config() -> dict[str, Any]:
+        return {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+    @pytest.fixture(autouse=True)
+    def _opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LD_CAPTURE_JUDGE_REASONING", "true")
+
+    async def _run(
+        self, client: MagicMock, reasoning: str = "clear and correct"
+    ) -> None:
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {
+                "output": json.dumps({"score": 0.9, "reasoning": reasoning}),
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        handler = ProviderHandler(fn=fn, provides_for=("TestProvider", "messages"))  # type: ignore[arg-type]
+        client.variation = AsyncMock(return_value=self._judge_variation())
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=self._parent_config(),
+                user_context=CONTEXT,
+                handler=handler,
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "run-1", "configKey": "parent"},
+            )
+
+    async def test_metric_event_carries_reasoning(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        await self._run(mock_ld_client)
+
+        metric_key, _context, track_data, score = mock_ld_client.track.call_args[0]
+        assert metric_key == "quality"
+        assert score == 0.9
+        assert track_data["judgeReasoning"] == "clear and correct"
+        assert track_data["judgeConfigKey"] == "judge-1"
+        assert track_data["runId"] == "run-1"
+
+    async def test_reasoning_is_withheld_by_default_without_losing_the_score(
+        self, mock_ld_client: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LD_CAPTURE_JUDGE_REASONING")
+        await self._run(mock_ld_client)
+
+        _metric_key, _context, track_data, score = mock_ld_client.track.call_args[0]
+        assert "judgeReasoning" not in track_data
+        assert score == 0.9
+
+    async def test_empty_reasoning_is_omitted(self, mock_ld_client: MagicMock) -> None:
+        await self._run(mock_ld_client, reasoning="")
+
+        _metric_key, _context, track_data, _score = mock_ld_client.track.call_args[0]
+        assert "judgeReasoning" not in track_data
+
+    async def test_long_reasoning_is_truncated(self, mock_ld_client: MagicMock) -> None:
+        await self._run(
+            mock_ld_client, reasoning="a" * (JUDGE_REASONING_MAX_LENGTH + 50)
+        )
+
+        _metric_key, _context, track_data, _score = mock_ld_client.track.call_args[0]
+        assert len(track_data["judgeReasoning"]) == JUDGE_REASONING_MAX_LENGTH + 1
+        assert track_data["judgeReasoning"].endswith("…")
+
+    def test_explanation_follows_the_opt_in_not_capture_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert judge_explanation("clear and correct") == "clear and correct"
+        assert judge_explanation("") is None
+
+        monkeypatch.delenv("LD_CAPTURE_JUDGE_REASONING")
+        assert judge_explanation("clear and correct") is None
+
+
+class TestRunJudgeTrackData:
+    """The deferred path must carry reasoning too, so a background worker's track call
+    is not a downgrade from the inline one.
+    """
+
+    @staticmethod
+    def _task() -> JudgeTask:
+        return JudgeTask(
+            config_key="judge-1",
+            judge_config={
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+            },
+            judge_meta={"enabled": True, "variationKey": "j1", "version": 1},
+            actual_output="response",
+            user_context=CONTEXT,
+            judge_provider="TestProvider",
+            judge_mode="messages",
+            collapse_messages=False,
+            parent_track_data={"runId": "run-1", "configKey": "parent"},
+            evaluation_metric_key="quality",
+        )
+
+    async def test_track_data_carries_reasoning(
+        self, mock_ld_client: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_CAPTURE_JUDGE_REASONING", "true")
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {
+                "output": '{"score": 0.4, "reasoning": "missed the question"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        handler = ProviderHandler(fn=fn, provides_for=("TestProvider", "messages"))  # type: ignore[arg-type]
+
+        result = await run_judge(self._task(), [handler])
+
+        assert result is not None
+        assert result.response == "missed the question"
+        assert result.track_data["judgeReasoning"] == "missed the question"
+        assert result.track_data["judgeConfigKey"] == "judge-1"
 
 
 class TestScoreGuard:

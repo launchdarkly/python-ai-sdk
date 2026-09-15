@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 from collections.abc import Callable
 from math import isfinite
@@ -25,7 +26,10 @@ from .utils import (
     parse_json_with_possible_fences,
     to_ld_context,
     to_usage_dict,
+    truncate_judge_reasoning,
 )
+
+_REASONING_ENABLED_VALUES = frozenset({"1", "true", "on", "yes"})
 
 
 def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
@@ -37,6 +41,38 @@ def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
 
 
 logger = logging.getLogger(__name__)
+
+
+def judge_reasoning_enabled() -> bool:
+    """Whether judge reasoning leaves the process. Opt-in via ``LD_CAPTURE_JUDGE_REASONING``.
+
+    Reasoning is model prose about the evaluated conversation and may quote it, so it stays in
+    the process until a deployment asks for it.
+    """
+    value = os.environ.get("LD_CAPTURE_JUDGE_REASONING", "").strip().lower()
+    return value in _REASONING_ENABLED_VALUES
+
+
+def build_judge_track_data(
+    base_track_data: TrackData,
+    judge_config_key: str,
+    reasoning: str | None,
+) -> TrackData:
+    """Builds the payload for a judge's evaluation metric event, carrying ``judgeReasoning``
+    alongside the score.
+    """
+    track_data: TrackData = {**base_track_data, "judgeConfigKey": judge_config_key}
+    if reasoning and judge_reasoning_enabled():
+        track_data["judgeReasoning"] = truncate_judge_reasoning(reasoning)
+    return track_data
+
+
+def judge_explanation(reasoning: str | None) -> str | None:
+    """The reasoning to put on telemetry, or ``None`` when suppressed."""
+    if not reasoning or not judge_reasoning_enabled():
+        return None
+    return truncate_judge_reasoning(reasoning)
+
 
 _FORMATTING_INSTRUCTIONS = "\n".join(
     [
@@ -201,10 +237,7 @@ async def run_judges(
                 )
                 numeric_score = _numeric_score(score)
                 if numeric_score is not None:
-                    record_evaluation(
-                        numeric_score,
-                        reasoning if judge_handler.capture_content else None,
-                    )
+                    record_evaluation(numeric_score, judge_explanation(reasoning))
 
                 evaluation_metric_key = (
                     judge_ai_config.get("evaluationMetricKey")
@@ -218,7 +251,7 @@ async def run_judges(
                     client.track(
                         evaluation_metric_key,
                         to_ld_context(client, user_context),
-                        {**base_track_data, "judgeConfigKey": judge_key},
+                        build_judge_track_data(base_track_data, judge_key, reasoning),
                         score,
                     )
 
@@ -432,19 +465,16 @@ async def run_judge(
         reasoning = parsed.get("reasoning", "")
         numeric_score = _numeric_score(score)
         if numeric_score is not None:
-            record_evaluation(
-                numeric_score,
-                reasoning if judge_handler.capture_content else None,
-            )
+            record_evaluation(numeric_score, judge_explanation(reasoning))
         raw_usage = result["usage"]
 
         usage = to_usage_dict(raw_usage)
 
-        merged_track_data: TrackData = {
-            **task.parent_track_data,
-            **result["track_data"],
-            "judgeConfigKey": task.config_key,
-        }
+        merged_track_data: TrackData = build_judge_track_data(
+            {**task.parent_track_data, **result["track_data"]},
+            task.config_key,
+            reasoning,
+        )
 
         return JudgeRunResult(
             score=score, response=reasoning, usage=usage, track_data=merged_track_data

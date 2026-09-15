@@ -226,17 +226,31 @@ SDK writes a `gen_ai.evaluation.result` span event on that `invoke_agent` span:
 |---|---|
 | `gen_ai.evaluation.name` | judge config key |
 | `gen_ai.evaluation.score.value` | numeric score, only when the judge returned a finite number |
+| `gen_ai.evaluation.explanation` | judge reasoning, only when opted in and non-empty. Truncated at 4000 characters |
 
 The same keys are mirrored as span attributes, so section 2 lists them too.
 `gen_ai.evaluation.score.label` is not invented.
-The existing `track(evaluationMetricKey)` call is unchanged and still feeds AI Config Monitoring —
-a judge that returns a non-numeric score emits no evaluation event but still tracks the metric.
+The existing `track(evaluationMetricKey)` call still feeds AI Config Monitoring — a judge that
+returns a non-numeric score emits no evaluation event but still tracks the metric.
 
-`gen_ai.evaluation.explanation` is deliberately **not** emitted. The judge's reasoning is
-model-generated prose about the user's conversation — content, under section 7 — and content
-attributes require `captureContent` / `capture_content`, a handler-factory option this layer does
-not receive. The reasoning is still returned to the caller in `judgeResults` / `judge_results`;
-only the telemetry copy is withheld. Exporting it needs its own opt-in.
+`gen_ai.evaluation.explanation` is **opt-in and off by default**. Set
+`LD_CAPTURE_JUDGE_REASONING` to `true`, `1`, `on` or `yes` to export it; anything else, including
+an unset variable, withholds reasoning from both the span and the track payload while keeping the
+score.
+
+> **Warning — reasoning can contain sensitive data.** A judge sees the full input and output it is
+> grading, and its reasoning is free-form model prose that may quote them verbatim. Enabling this
+> can therefore send PII, secrets, or other regulated content to LaunchDarkly. Nothing in the SDK
+> redacts it: there is no PII or token detection on the reasoning text, only a 4000-character clip.
+> Enable it only where the evaluated conversations are known not to carry sensitive data, or where
+> your own judge instructions keep reasoning abstract.
+
+The switch is separate from `capture_content` (section 7) deliberately: gating reasoning there
+would force a caller who wants this one field to also ship every request and response.
+
+When enabled, the same reasoning rides the evaluation metric event as `TrackData.judgeReasoning`,
+on both the inline path and the deferred `run_judge` path, so it reaches LaunchDarkly through the
+evaluation pipeline rather than only through the collector.
 
 ---
 

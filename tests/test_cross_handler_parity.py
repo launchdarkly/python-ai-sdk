@@ -327,8 +327,8 @@ EXPECTED_VOCABULARY = {
     "gen_ai.agent.name",
     "gen_ai.conversation.id",
     # Judge evaluation event + mirrored span attributes on the judge invoke_agent span.
-    # `explanation` is gated on the judge handler's capture_content, like every other content
-    # attribute. See TELEMETRY-CONTRACT.md 4a.
+    # `explanation` carries the judge's reasoning and is opt-in via
+    # LD_CAPTURE_JUDGE_REASONING. See TELEMETRY-CONTRACT.md 4a.
     "gen_ai.evaluation.result",
     "gen_ai.evaluation.name",
     "gen_ai.evaluation.score.value",
