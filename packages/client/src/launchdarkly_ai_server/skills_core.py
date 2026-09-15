@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, get_args
 
-from .types import Skill, SkillReference
+from .types import Skill, SkillOutcomeReason, SkillReference
 from .types_validation import is_valid_skill_key, is_valid_skill_version
 
 logger = logging.getLogger(__name__)
@@ -56,9 +56,9 @@ The kind this SDK asks a store for.
 An **internal seam value**, deliberately not exported from the package root. It
 is the string ``skills.py`` and ``skills_fs.py`` pass to ``SkillStore.get_object``
 and ``SkillStore.all_objects``, and a store adapter is free to map it onto
-whatever the transport underneath actually uses — a delivery payload may well
-carry skills under a broader kind with a narrower category, in which case
-translating that pair to this one value is the adapter's job.
+whatever the transport underneath actually uses — the value happens to match
+the kind LaunchDarkly's delivery channel uses today, but a transport that spelt
+it differently would translate, and that translation is the adapter's job.
 
 Exporting it would publish an SDK-side seam string as though it were the wire
 contract, which is a claim this side cannot make and would be hard to walk back
@@ -140,9 +140,18 @@ INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode)
 
 NO_STORE_MESSAGE = (
     "No skill store is configured, so skill content cannot be retrieved. Configure "
-    'one with init_client(options={"skillStore": store}) — InMemorySkillStore is '
-    "available for local development and testing."
+    'one with init_client(options={"skillStore": store}) — FDv2SkillStore receives '
+    "content from LaunchDarkly, and InMemorySkillStore is available for local "
+    "development and testing."
 )
+"""
+The first thing a user sees when no store is configured, so it names both stores.
+
+``FDv2SkillStore`` comes first because it is the answer in production, and a
+message that offered only ``InMemorySkillStore`` would point a deployment at the
+development store. Callers match on "skill store"; keep that phrase if the
+wording changes.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +166,17 @@ class SkillStore(Protocol):
     Duck-typed on purpose, mirroring how the LaunchDarkly client interface works
     in this package: pass any object carrying these methods.
 
-    ``add_listener(kind, fn)`` is part of the seam but
-    **optional**, which is why it is deliberately not declared here: a Protocol
-    member is required for structural compatibility, so declaring it would reject
-    every store that does not implement it. Nothing in this module calls it — it
-    exists for the delivery transport to push updates through.
+    ``add_listener(kind, fn)`` and ``remove_listener(kind, fn)`` are part of the
+    interface but **optional**, which is why they are deliberately not declared
+    here: a Protocol member is required for structural compatibility, so declaring
+    them would reject every store that does not implement them. Nothing in this
+    module calls either — they exist for the delivery transport to push updates
+    through, and for a consumer such as ``watch_skills`` to stop receiving them.
+    A store that implements ``add_listener`` should implement ``remove_listener``
+    too; consumers probe for it and skip detaching when it is absent, so an
+    older store keeps working at the cost of a listener that lives as long as
+    the store does. ``remove_listener`` removes one occurrence of *fn* under
+    *kind* and is a no-op when *fn* is not registered.
 
     The raw objects a store serves are wire-shaped, with camelCase field names
     identical across language implementations::
@@ -692,6 +707,26 @@ def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
 class Resolution:
     """One key resolved against a store: the skill, or why there is none."""
 
+    reason: SkillOutcomeReason
+    """
+    Which of the five public outcomes this resolution is.
+
+    Declared first and **without a default**, so every construction site has to
+    state it. A default would be the wrong shape twice over: a contributor
+    adding a sixth internal outcome would inherit whichever token happened to be
+    the default rather than deciding which public token it maps to, and if that
+    default were ``"ok"`` a failure would publish ``ok`` with no skill attached.
+
+    Carried as a token rather than derived from ``error`` on the way out:
+    ``get_skill_result`` publishes this value, and pattern-matching prose to
+    recover a decision a caller fails closed on is exactly the fragility the
+    typed outcome exists to remove. A reviewer can read the mapping here.
+
+    Distinct from ``unavailable`` on purpose — that flag answers one question
+    (may prune run?) and this token answers a different one (what does the
+    caller learn?) — but the two can only disagree by a bug: ``unavailable`` is
+    ``True`` in exactly the ``store_unavailable`` case.
+    """
     skill: Skill | None = None
     error: str | None = None
     unavailable: bool = False
@@ -725,17 +760,23 @@ def resolve_from_store(
         raw = store.get_object(SKILL_OBJECT_KIND, key, wanted_version)
     except Exception as exc:
         logger.error("Skill store raised while retrieving '%s'", key, exc_info=True)
-        return Resolution(error=store_raised(exc), unavailable=True)
+        return Resolution(
+            reason="store_unavailable",
+            error=store_raised(exc),
+            unavailable=True,
+        )
 
     if not isinstance(raw, dict):
         return Resolution(
-            error=f"skill '{key}' is not available from the configured skill store"
+            reason="absent",
+            error=f"skill '{key}' is not available from the configured skill store",
         )
 
     skill = verify_raw_skill(raw)
     if skill is None:
         return Resolution(
-            error=f"skill '{key}' failed integrity verification and was withheld"
+            reason="integrity_failure",
+            error=f"skill '{key}' failed integrity verification and was withheld",
         )
     if skill.key != key:
         return Resolution(
@@ -746,12 +787,13 @@ def resolve_from_store(
         )
     if wanted_version is not None and skill.version != wanted_version:
         return Resolution(
+            reason="wrong_version",
             error=(
                 f"skill '{key}' version {wanted_version} is not available "
                 f"(the store holds version {skill.version})"
-            )
+            ),
         )
-    return Resolution(skill=skill)
+    return Resolution(reason="ok", skill=skill)
 
 
 def reference_target(item: SkillReference | str) -> tuple[str, int | None]:
