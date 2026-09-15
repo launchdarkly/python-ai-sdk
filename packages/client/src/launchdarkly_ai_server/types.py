@@ -92,7 +92,8 @@ class Message:
 AiConfigRep = dict[str, Any]
 """
 Raw AI config dict as returned by ``parse_ai_config``. Fields include
-``model``, ``provider``, and at least one of ``instructions`` / ``messages``.
+``model``, ``provider``, at least one of ``instructions`` / ``messages``, and an
+optional ``skills`` array of ``{key, version}`` references (see ``skill_refs``).
 """
 
 VariationMeta = dict[str, Any]
@@ -418,6 +419,148 @@ class ProviderGraphResponse:
     """Aggregate token counts across all nodes."""
     judge_results: dict[str, JudgeResult] | None = None
     """Results from a graph-level judge, if configured."""
+
+
+# ---------------------------------------------------------------------------
+# Agent Skills
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SkillReference:
+    """A version-pinned pointer to a skill, as attached to an AI Config variation."""
+
+    key: str
+    """Immutable skill key — ``^[a-z0-9][a-z0-9-]*$``, at most 256 characters."""
+    version: int
+    """Immutable skill version — an integer >= 1."""
+
+
+@dataclass(frozen=True)
+class Skill:
+    """
+    A single verbatim ``SKILL.md`` document.
+
+    Only ever constructed after integrity verification passes, so ``content``
+    holds the exact byte sequence LaunchDarkly delivered and ``content_hash``
+    is its sha256. Instances are immutable.
+    """
+
+    key: str
+    version: int
+    content: bytes
+    """The verified verbatim bytes, exactly as LaunchDarkly delivered and
+    hashed them. Opaque to this SDK: no encoding is claimed and nothing here
+    ever parses or interprets them."""
+    content_hash: str
+    """sha256, lowercase hex, over the verbatim bytes of ``content``."""
+    name: str | None = None
+    """Display name from LaunchDarkly metadata; never parsed from the content."""
+    description: str | None = None
+    """Description from LaunchDarkly metadata; never parsed from the content."""
+
+
+SkillOutcomeReason = Literal[
+    "absent", "integrity_failure", "ok", "store_unavailable", "wrong_version"
+]
+"""
+The closed set of outcomes ``get_skill_result`` reports.
+
+Alphabetical, as ``reason_code`` is in the integrity log record, so the token
+list reads identically in every LaunchDarkly AI SDK. Each token is a distinct
+*decision* a caller can make, which is the point of the type: ``absent`` is a
+skill the store does not hold, ``integrity_failure`` is content that was
+delivered and did not verify, and a caller that wants to fail closed on
+suspected tampering while tolerating a merely-absent skill needs the two to be
+told apart.
+
+- ``ok`` — a verified skill was returned.
+- ``absent`` — the store answered, and does not hold the key.
+- ``integrity_failure`` — content was delivered and failed verification; it was
+  withheld. The one token worth failing closed on.
+- ``store_unavailable`` — the store itself could not answer: it raised.
+  Deliberately distinct from ``absent``, because an outage is not a deletion.
+- ``wrong_version`` — the store answered with a version other than the one
+  asked for, so the answer was withheld.
+"""
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """
+    Why one retrieval returned what it did — the reported form of ``get_skill``.
+
+    ``get_skill`` collapses every failure to ``None``, which is the right shape
+    for a caller that only wants content and cannot act on the difference. This
+    is the shape for a caller that can: ``reason`` names which of the five
+    outcomes happened, so an integrity failure is distinguishable from a skill
+    that simply is not configured. The two accessors differ only in what they
+    report — the retrieval, the verification, and the telemetry are the same
+    code path, run once.
+
+    Instances are immutable.
+    """
+
+    skill: Skill | None
+    """The verified skill, and only ever populated when ``reason == "ok"``."""
+    reason: SkillOutcomeReason
+    """Which outcome happened. A closed set — see ``SkillOutcomeReason``."""
+    detail: str | None
+    """
+    Human-readable detail, set for every reason except ``ok``.
+
+    Safe to log or surface to an operator: it carries the skill key and the
+    failure mode, and never any skill content or filesystem path. Intended for a
+    human, not for matching on — branch on ``reason``.
+    """
+
+
+ReconcileActionKind = Literal[
+    "written", "updated", "skipped_current", "removed", "error"
+]
+"""The closed set of outcomes ``write_skills`` reports."""
+
+
+@dataclass(frozen=True)
+class ReconcileAction:
+    """What ``write_skills`` did — or refused to do — for one skill."""
+
+    key: str
+    """
+    The skill key, or the **empty string** for a failure that belongs to the run
+    rather than to one skill — a corrupt manifest, a manifest that could not be
+    rewritten, a retrieval that failed before any key was known. Callers grouping
+    a report by key need to expect that sentinel; a report may carry both kinds.
+    """
+    action: ReconcileActionKind
+    version: int | None = None
+    path: str | None = None
+    """Canonical resolved path, when one was determined."""
+    error: str | None = None
+    """Failure detail, set only when ``action == "error"``."""
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """The result of a ``write_skills`` run — every outcome is visible here."""
+
+    actions: list[ReconcileAction] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """``True`` iff no action is an ``error``."""
+        return not self.errors
+
+    @property
+    def errors(self) -> list[ReconcileAction]:
+        """
+        The ``error`` actions, in ``actions`` order.
+
+        Exposed so callers never re-derive it — filtering ``actions`` is
+        boilerplate that otherwise reappears in every consumer. ``ok`` is defined
+        in terms of this, so the two can never disagree.
+        """
+        return [a for a in self.actions if a.action == "error"]
 
 
 # ---------------------------------------------------------------------------
