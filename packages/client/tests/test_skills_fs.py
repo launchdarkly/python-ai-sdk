@@ -1314,6 +1314,148 @@ class TestRootSwapRaces:
         assert not (outside / "a" / MANIFEST_NAME).exists()
         assert list(moved_to.iterdir()) == []
 
+    @staticmethod
+    def _swap_after_the_pin(
+        monkeypatch: pytest.MonkeyPatch, root: Path, outside: Path, moved_to: Path
+    ) -> None:
+        """Swaps the root in the window between the pin and the manifest read.
+
+        The three races above intercept a destructive call. This one intercepts
+        the pin itself and swaps the root the instant it returns, which is the
+        earliest point the held descriptor is already in hand — so everything
+        the reconcile *decides*, not just everything it does, happens with a
+        hostile root on the path. The manifest is the first thing read in that
+        window, and it is the only input that says which of the customer's
+        files the SDK may overwrite and delete.
+        """
+        real_pin = skills_fs_module.open_directory_nofollow
+
+        def pin_then_swap(path: Any) -> int | None:
+            fd = real_pin(path)
+            os.rename(root, moved_to)
+            os.symlink(outside, root, target_is_directory=True)
+            return fd
+
+        monkeypatch.setattr(skills_fs_module, "open_directory_nofollow", pin_then_swap)
+
+    @_needs_dir_fd
+    async def test_a_root_swapped_before_the_manifest_read_cannot_supply_the_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The manifest is read through the descriptor, not through the path.
+
+        Read by path, the manifest was the one input to the reconcile that the
+        pin did not cover: the swap redirected the read into the attacker's
+        directory, the run adopted whatever entries it found there, and
+        ``_rewrite_manifest`` then committed them back over the *real* manifest
+        through the held descriptor. Nothing escaped the root — but the
+        ownership record inside it was destroyed, and that record is the only
+        thing standing between the next reconcile and the customer's own files.
+        Note that this is strictly worse than the behavior it replaced: before
+        the root was pinned at all, the manifest write was the one operation
+        that took its own ``O_NOFOLLOW`` descriptor, so a swapped root made the
+        write *fail* and left the real manifest intact.
+
+        The attacker's manifest here is valid and empty, which is the cheapest
+        version to plant and the one that does the most damage: every managed
+        file looks unowned, so the entry recording it is simply dropped on the
+        rewrite. ``prune`` is off so that what this asserts is the entries the
+        run read, uncoupled from what a prune driven by them would then remove
+        — which is the next test.
+
+        The write of the requested skill is refused either way, by the path
+        checks: they resolve ``<root>/other`` into the attacker's tree and see
+        it land outside the managed root. That refusal is what makes this test
+        narrow rather than weaker — with no write and no prune, the manifest
+        rewrite is the only thing left in the run, so the surviving entry can
+        only have come from reading the real manifest. It is also the two
+        layers doing the jobs they are each documented to do: the path checks
+        turn a hostile layout into a reported refusal, and the descriptor is
+        what makes the refusal unnecessary for correctness.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        _place_managed(root, "keep", SKILL_BODY)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        _write_manifest(outside, {"manifestVersion": 1, "entries": {}})
+        moved_to = tmp_path / "skills.real"
+
+        self._swap_after_the_pin(monkeypatch, root, outside, moved_to)
+
+        report = await write_skills([_skill("other")], root, prune=False)
+
+        # The real root is where the rename left it, and its manifest still
+        # records the skill it owned before the run.
+        assert "keep/SKILL.md" in _read_manifest(moved_to)["entries"]
+        # The attacker's manifest is neither the one that was read nor the one
+        # that was written.
+        assert _read_manifest(outside)["entries"] == {}
+        # The refusal named above, asserted so that a future change which
+        # starts writing through the hostile path does not pass this quietly.
+        assert [a.key for a in report.errors] == ["other"], _error_messages(report)
+
+    @_needs_dir_fd
+    async def test_a_root_swapped_before_the_manifest_read_cannot_poison_ownership(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The delayed half of the same window, and the damaging one.
+
+        A populated manifest in the attacker's directory does not get to delete
+        anything *during* the swapped run: the path checks resolve
+        ``<root>/victim`` into the attacker's tree, see it land outside the
+        managed root, and refuse the prune. What they cannot refuse is the
+        record. ``_rewrite_manifest`` commits the entries that were read back
+        into the real root through the held descriptor, so the swapped run ends
+        with the real manifest claiming a file the SDK never wrote.
+
+        The deletion then happens on the *next* reconcile — an ordinary one,
+        with no attacker present and every path check passing, because by then
+        the entry is in the legitimate manifest, the key is well formed, and the
+        path really is inside the real root. That is what makes reading the
+        manifest by path worth fixing rather than noting: the blast radius is
+        not the swapped run, it is every run after it, and the report for the
+        run that did the damage shows only a refusal.
+
+        Both phases run here for that reason. Asserting only that the entry is
+        absent after phase one would leave the consequence implicit, and the
+        consequence is a customer's own file.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        victim = root / "victim" / "SKILL.md"
+        victim.parent.mkdir()
+        victim.write_text("the customer's own file\n", encoding="utf-8")
+        outside = tmp_path / "outside"
+        (outside / "victim").mkdir(parents=True)
+        # Present so the path-based existence probe on the prune path is
+        # satisfied; without it the run would skip the unlink for a reason that
+        # has nothing to do with the defense under test.
+        (outside / "victim" / "SKILL.md").write_text("bait\n", encoding="utf-8")
+        _write_manifest(
+            outside,
+            {
+                "manifestVersion": 1,
+                "entries": {"victim/SKILL.md": _entry("victim", 1, SKILL_BODY)},
+            },
+        )
+        moved_to = tmp_path / "skills.real"
+
+        self._swap_after_the_pin(monkeypatch, root, outside, moved_to)
+        await write_skills([_skill("a")], root)
+        monkeypatch.undo()
+
+        # The attacker withdraws, restoring the root exactly as it was found.
+        os.unlink(root)
+        os.rename(moved_to, root)
+        assert "victim/SKILL.md" not in _read_manifest(root)["entries"]
+
+        # An ordinary reconcile, which is where the planted entry would cash in.
+        report = await write_skills([], root)
+
+        assert [a for a in report.actions if a.action == "removed"] == []
+        assert victim.read_text(encoding="utf-8") == "the customer's own file\n"
+
     @_needs_dir_fd
     async def test_every_destructive_call_runs_relative_to_a_descriptor(
         self, root: Path, monkeypatch: pytest.MonkeyPatch

@@ -170,8 +170,11 @@ async def write_skills(
     The root is opened once, up front, and that descriptor is held until the
     call returns: every directory created, file written and file removed under
     it is resolved relative to the descriptor rather than from the root's path,
-    so a root replaced after validation is refused rather than followed. This
-    guarantee is POSIX-only, for the reasons ``safe_fs`` states at length.
+    so a root replaced after validation is refused rather than followed. The
+    manifest is read through it too, so the record that authorizes those
+    removals comes from inside the pinned root rather than from wherever the
+    root's path led by the time it was read. This guarantee is POSIX-only, for
+    the reasons ``safe_fs`` states at length.
 
     **This call performs synchronous filesystem I/O and does not yield.** It is
     ``async`` for signature parity with the other accessors and with the
@@ -227,7 +230,7 @@ async def write_skills(
         )
 
     try:
-        manifest, manifest_error = _load_manifest(root_path)
+        manifest, manifest_error = _load_manifest(root_path, root_fd)
         entries: dict[str, Any] = manifest.get("entries", {})
 
         actions: list[ReconcileAction] = []
@@ -615,7 +618,9 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     return Path(os.path.realpath(path))
 
 
-def _load_manifest(root: Path) -> tuple[dict[str, Any], str | None]:
+def _load_manifest(
+    root: Path, root_fd: int | None
+) -> tuple[dict[str, Any], str | None]:
     """
     Loads the manifest. Returns ``(manifest, error)``.
 
@@ -627,16 +632,41 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], str | None]:
     mean guessing at which of the customer's files are ours.
 
     An absent manifest is not corrupt — that is simply a fresh root.
+
+    Read relative to the root descriptor the caller holds, for the same reason
+    every destructive step is: this file is what decides which of the
+    customer's files the SDK may overwrite and delete. Read by path it
+    re-resolved the root on the way in, so a root swapped after the pin handed
+    the run somebody else's entries — and every consequence then landed in the
+    *real* root through the descriptor. An empty manifest from the wrong
+    directory made every managed file look unowned; a populated one aimed the
+    prune; and either way ``_rewrite_manifest`` committed the result back over
+    the real manifest, destroying the ownership record that protects the
+    customer's files on the next run. Reading it through the descriptor is what
+    makes the pin cover the decision as well as the actions.
+
+    The single descriptor-relative open also replaces an ``exists()``-then-read
+    pair on the same path, so absence is now ``ENOENT`` on the read itself. It
+    is the same open the skill files get, which additionally means a symlink or
+    a FIFO wearing the manifest's name is refused as corruption rather than
+    followed or waited on.
     """
-    path = root / MANIFEST_FILENAME
     fresh: dict[str, Any] = {"manifestVersion": MANIFEST_VERSION, "entries": {}}
 
-    if not path.exists():
+    try:
+        raw = _read_regular_file(
+            MANIFEST_FILENAME if root_fd is not None else root / MANIFEST_FILENAME,
+            max_bytes=None,
+            dir_fd=root_fd,
+        )
+    except FileNotFoundError:
         return fresh, None
+    except OSError as exc:
+        return {}, f"the skills manifest {MANIFEST_FILENAME} could not be read: {exc}"
 
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
         # UnicodeDecodeError is a ValueError, not an OSError: non-UTF-8 bytes in
         # the manifest are corruption, and must fail closed like any other.
         return {}, f"the skills manifest {MANIFEST_FILENAME} could not be read: {exc}"
@@ -867,7 +897,9 @@ def _write_one(
     )
 
 
-def _read_regular_file(target: Path, *, max_bytes: int) -> bytes:
+def _read_regular_file(
+    target: Path | str, *, max_bytes: int | None, dir_fd: int | None = None
+) -> bytes:
     """
     Reads *target*, refusing anything that is not a regular file.
 
@@ -882,11 +914,21 @@ def _read_regular_file(target: Path, *, max_bytes: int) -> bytes:
     without it translates CRLF on read, which would fail the hash comparison
     against content that is actually current.
 
-    Reads at most ``max_bytes + 1`` bytes. The only consumer compares a hash, and
-    anything longer than the resolved content cannot match it, so the one extra
-    byte is enough to prove inequality — which is what keeps a foreign file of
-    arbitrary size from being pulled into memory now that adoption reads files
-    the manifest does not list.
+    With *dir_fd*, *target* is a bare component resolved against that
+    descriptor rather than a path the kernel walks from the root down. The
+    manifest read passes the root descriptor, because the manifest is what
+    decides which of the customer's files the SDK may touch. ``_write_one``'s
+    comparison read still resolves a path: what it names is
+    ``<key>/SKILL.md``, so covering it the same way needs a descriptor for the
+    skill directory rather than for the root.
+
+    ``max_bytes`` bounds the read at ``max_bytes + 1`` bytes: the comparison
+    consumer only ever hashes the result, and anything longer than the resolved
+    content cannot match it, so the one extra byte is enough to prove
+    inequality — which is what keeps a foreign file of arbitrary size from being
+    pulled into memory now that adoption reads files the manifest does not
+    list. ``None`` reads to EOF, for the manifest, whose length no caller can
+    predict and which is parsed rather than compared.
     """
     flags = (
         os.O_RDONLY
@@ -894,18 +936,19 @@ def _read_regular_file(target: Path, *, max_bytes: int) -> bytes:
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_BINARY", 0)
     )
-    fd = os.open(target, flags)
+    fd = os.open(target, flags, dir_fd=dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError("the target file is not a regular file")
         chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining > 0:
-            chunk = os.read(fd, min(remaining, 65536))
+        remaining = None if max_bytes is None else max_bytes + 1
+        while remaining is None or remaining > 0:
+            chunk = os.read(fd, 65536 if remaining is None else min(remaining, 65536))
             if not chunk:
                 break
             chunks.append(chunk)
-            remaining -= len(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
         return b"".join(chunks)
     finally:
         os.close(fd)
