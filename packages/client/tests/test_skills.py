@@ -548,6 +548,35 @@ class TestInMemorySkillStore:
 
         assert seen == []
 
+    def test_remove_listener_stops_put_notifying_it(self, make_raw_skill: Any) -> None:
+        s = InMemorySkillStore()
+        seen: list[dict[str, Any]] = []
+        s.add_listener("skill", seen.append)
+        s.remove_listener("skill", seen.append)
+
+        s.put(make_raw_skill(key="a"))
+
+        assert seen == []
+
+    def test_remove_listener_removes_one_occurrence(self, make_raw_skill: Any) -> None:
+        s = InMemorySkillStore()
+        seen: list[dict[str, Any]] = []
+        s.add_listener("skill", seen.append)
+        s.add_listener("skill", seen.append)
+        s.remove_listener("skill", seen.append)
+
+        s.put(make_raw_skill(key="a"))
+
+        assert len(seen) == 1
+
+    def test_remove_listener_of_an_unregistered_callable_is_a_no_op(self) -> None:
+        s = InMemorySkillStore()
+        s.remove_listener("skill", print)
+        s.add_listener("skill", print)
+        s.remove_listener("flag", print)
+        s.remove_listener("skill", print)
+        s.remove_listener("skill", print)
+
 
 class TestStoreConfiguration:
     """Store wiring on the lifecycle layer."""
@@ -573,6 +602,18 @@ class TestStoreConfiguration:
     async def test_all_skills_raises_actionably_when_no_store(self) -> None:
         with pytest.raises(RuntimeError, match="skill store"):
             await all_skills()
+
+    async def test_the_no_store_message_names_the_delivery_store_first(self) -> None:
+        """
+        A deployment that hits this message must be pointed at the store that
+        receives content from LaunchDarkly, not only at the development one.
+        """
+        with pytest.raises(RuntimeError) as reported:
+            await get_skill("a")
+        message = str(reported.value)
+        assert "FDv2SkillStore" in message
+        assert "InMemorySkillStore" in message
+        assert message.index("FDv2SkillStore") < message.index("InMemorySkillStore")
 
     async def test_shutdown_clears_the_store(
         self, make_raw_skill: Any, mock_ld_client: Any

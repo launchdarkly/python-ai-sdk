@@ -167,6 +167,22 @@ class InMemorySkillStore:
         """
         self._listeners.setdefault(kind, []).append(fn)
 
+    def remove_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:
+        """
+        Unregisters *fn* from *kind*, so a subsequent ``put`` no longer calls it.
+
+        Removes one occurrence: a callable registered twice must be removed twice.
+        Removing a callable that is not registered is a no-op, not an error, so a
+        consumer that detaches on close can do so unconditionally.
+        """
+        listeners = self._listeners.get(kind)
+        if listeners is None:
+            return
+        try:
+            listeners.remove(fn)
+        except ValueError:
+            return
+
 
 # ---------------------------------------------------------------------------
 # Reference discovery
