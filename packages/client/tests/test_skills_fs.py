@@ -19,6 +19,7 @@ import pytest
 
 import launchdarkly_ai_server.safe_fs as safe_fs_module
 import launchdarkly_ai_server.skills as skills_module
+import launchdarkly_ai_server.skills_core as skills_core_module
 import launchdarkly_ai_server.skills_fs as skills_fs_module
 from launchdarkly_ai_server import (
     InMemorySkillStore,
@@ -288,6 +289,30 @@ def _skill(
         content=content.encode("utf-8"),
         content_hash=_hash(content),
     )
+
+
+@pytest.fixture(scope="session")
+def oversize_content() -> tuple[str, str]:
+    """Content one byte past the cap, with its hash — ``(content, sha256)``.
+
+    Derived from ``MAX_SKILL_CONTENT_BYTES`` rather than written as a literal,
+    because a literal is how this went wrong: both consumers were pinned at the
+    old 64 KiB bound and stayed there when the cap moved to 10 MiB, which put
+    them *under* the limit and left them asserting that oversize content is
+    written and reported clean. Derived, they are one byte past whatever the
+    bound currently is, and moving it again cannot silently invert them.
+
+    The bound's *value* is asserted once, in ``TestPackageExports``, which
+    spells the literal out on purpose — reading it from the module there would
+    make that assertion circular. These tests are about enforcement rather than
+    the number, so reading it here is the non-circular direction.
+
+    Session-scoped: the string is cap-sized, so it is built and hashed once for
+    the run instead of per test. ``x`` encodes to one byte, so the character
+    count is the byte count.
+    """
+    content = "x" * (skills_core_module.MAX_SKILL_CONTENT_BYTES + 1)
+    return content, _hash(content)
 
 
 def _manifest_path(root: Path) -> Path:
@@ -909,8 +934,10 @@ class TestVerifyThenWrite:
         assert not (root / "a" / "SKILL.md").exists()
         assert len(recording_emitter.signals(INTEGRITY_SIGNAL)) == 1
 
-    async def test_oversize_skill_aborts_the_write(self, root: Path) -> None:
-        oversize = "x" * (64 * 1024 + 1)
+    async def test_oversize_skill_aborts_the_write(
+        self, root: Path, oversize_content: tuple[str, str]
+    ) -> None:
+        oversize, _ = oversize_content
         report = await write_skills([_skill("a", 1, oversize)], root)
         assert report.ok is False
         assert not (root / "a" / "SKILL.md").exists()
@@ -2244,7 +2271,7 @@ class TestWriteSkillsTelemetry:
         assert (root / "a" / "SKILL.md").read_text(encoding="utf-8") == SKILL_BODY
 
     async def test_integrity_signal_property_keys_match_across_layers(
-        self, root: Path, recording_emitter: Any
+        self, root: Path, recording_emitter: Any, oversize_content: tuple[str, str]
     ) -> None:
         """The same defect, caught at either layer, records
         the same property keys.
@@ -2258,8 +2285,7 @@ class TestWriteSkillsTelemetry:
         hand throughout.
         """
         skills_module._set_emitter_for_testing(recording_emitter)
-        oversize = "x" * (64 * 1024 + 1)
-        content_hash = _hash(oversize)
+        oversize, content_hash = oversize_content
 
         # Layer 1 — the accessor boundary.
         store = InMemorySkillStore()
