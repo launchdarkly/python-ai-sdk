@@ -8,6 +8,13 @@ takes already-verified content and reconciles it against a managed root, while
 filesystem. The dependency runs one way only, and the descriptor-pinned
 primitives every destructive step goes through live in ``safe_fs.py``.
 
+The managed root is pinned to a descriptor once per reconcile and every
+destructive operation runs relative to it, so no ancestor of the root is ever
+re-resolved from its path mid-run. The path checks are still there and still
+run, but they are defense in depth rather than the boundary: a check on a path
+is only as good as the last resolution of that path after it, and the descriptor
+is what makes there be no later resolution.
+
 The reconcile is manifest-driven and fails closed: destructive operations only
 ever touch paths ``<root>/.launchdarkly-skills.json`` records under a matching
 key, a corrupt manifest suppresses every destructive action, and an incomplete
@@ -32,8 +39,8 @@ from typing import Any, Literal
 from .safe_fs import (
     SymlinkRefused,
     atomic_write,
-    atomic_write_in,
     is_temp_name,
+    open_directory_nofollow,
     pinned_directory,
     unlink_file,
 )
@@ -160,6 +167,15 @@ async def write_skills(
     Returns a ``ReconcileReport`` in which every outcome is visible; raises
     ``ValueError`` for a caller error such as an unusable root.
 
+    The root is opened once, up front, and that descriptor is held until the
+    call returns: every directory created, file written and file removed under
+    it is resolved relative to the descriptor rather than from the root's path,
+    so a root replaced after validation is refused rather than followed. The
+    manifest is read through it too, so the record that authorizes those
+    removals comes from inside the pinned root rather than from wherever the
+    root's path led by the time it was read. This guarantee is POSIX-only, for
+    the reasons ``safe_fs`` states at length.
+
     **This call performs synchronous filesystem I/O and does not yield.** It is
     ``async`` for signature parity with the other accessors and with the
     TypeScript SDK, not because it awaits anything: every read, write, ``fsync``
@@ -186,38 +202,73 @@ async def write_skills(
 
     deadline = time.monotonic() + timeout
     root_path = _resolve_root(root)
-    manifest, manifest_error = _load_manifest(root_path)
-    entries: dict[str, Any] = manifest.get("entries", {})
 
-    actions: list[ReconcileAction] = []
-    if manifest_error is not None:
-        # Run-level failure: there is no single skill key to hang it off.
-        actions.append(_run_error(manifest_error))
-
-    requests, incomplete = _resolve_requests(skills, deadline, on_unavailable)
-
-    written, write_timed_out = _write_all(root_path, requests, entries, deadline)
-    actions.extend(written)
-    incomplete = incomplete or write_timed_out
-
-    # Pruning is destructive, so it needs a trustworthy picture of both sides: a
-    # corrupt manifest means we do not know what we own, and an incomplete run —
-    # a retrieval that failed, or a deadline that expired mid-write — means we do
-    # not know what is still current. Either way, deleting would be a guess.
-    if prune and manifest_error is None and not incomplete:
-        actions.extend(
-            _prune(
-                root_path,
-                entries,
-                {request.key for request in requests},
-                deadline,
-            )
+    # The root is pinned once, here, and held for the whole reconcile. Every
+    # destructive step below runs relative to this descriptor, which is what
+    # makes _resolve_root's validation mean something afterwards: O_NOFOLLOW on
+    # a per-operation open of <root>/<key> guards only that final component, so
+    # the root and its ancestors were re-resolved on every such open and a root
+    # renamed aside and replaced with a symlink after validation redirected the
+    # open — and every descriptor-relative step behind it — out of the root.
+    # A descriptor names the inode that was checked, so there is nothing left to
+    # re-resolve and nothing left to swap. On a platform with no *at() family
+    # this is None and the per-component lstat floor applies instead, as it does
+    # throughout safe_fs.
+    try:
+        root_fd = open_directory_nofollow(root_path)
+    except ValueError as exc:
+        # Not a caller error: the root passed _resolve_root a moment ago, so
+        # this is the swap itself being refused. It belongs to the run, and
+        # nothing has been touched.
+        return ReconcileReport(
+            actions=[
+                _run_error(
+                    f"the skills root {root_path} could not be pinned for the "
+                    f"reconcile: {exc}; no action was taken"
+                )
+            ]
         )
 
-    if manifest_error is None:
-        actions.extend(_rewrite_manifest(root_path, manifest, entries))
+    try:
+        manifest, manifest_error = _load_manifest(root_path, root_fd)
+        entries: dict[str, Any] = manifest.get("entries", {})
 
-    return ReconcileReport(actions=actions)
+        actions: list[ReconcileAction] = []
+        if manifest_error is not None:
+            # Run-level failure: there is no single skill key to hang it off.
+            actions.append(_run_error(manifest_error))
+
+        requests, incomplete = _resolve_requests(skills, deadline, on_unavailable)
+
+        written, write_timed_out = _write_all(
+            root_path, root_fd, requests, entries, deadline
+        )
+        actions.extend(written)
+        incomplete = incomplete or write_timed_out
+
+        # Pruning is destructive, so it needs a trustworthy picture of both
+        # sides: a corrupt manifest means we do not know what we own, and an
+        # incomplete run — a retrieval that failed, or a deadline that expired
+        # mid-write — means we do not know what is still current. Either way,
+        # deleting would be a guess.
+        if prune and manifest_error is None and not incomplete:
+            actions.extend(
+                _prune(
+                    root_path,
+                    root_fd,
+                    entries,
+                    {request.key for request in requests},
+                    deadline,
+                )
+            )
+
+        if manifest_error is None:
+            actions.extend(_rewrite_manifest(root_path, root_fd, manifest, entries))
+
+        return ReconcileReport(actions=actions)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 _RUN_LEVEL_KEY = ""
@@ -240,6 +291,7 @@ def _run_error(message: str) -> ReconcileAction:
 
 def _write_all(
     root: Path,
+    root_fd: int | None,
     requests: list[_PendingWrite],
     entries: dict[str, Any],
     deadline: float,
@@ -279,7 +331,7 @@ def _write_all(
             )
             continue
         try:
-            actions.append(_write_one(root, request.skill, entries))
+            actions.append(_write_one(root, root_fd, request.skill, entries))
         except OSError as exc:
             # A safety net, not the primary defense. pathlib's stat probes swallow
             # only ENOENT/ENOTDIR/EBADF/ELOOP and re-raise every other errno, so an
@@ -297,9 +349,19 @@ def _write_all(
 
 
 def _rewrite_manifest(
-    root: Path, manifest: dict[str, Any], entries: dict[str, Any]
+    root: Path,
+    root_fd: int | None,
+    manifest: dict[str, Any],
+    entries: dict[str, Any],
 ) -> list[ReconcileAction]:
-    """Writes the updated manifest. Returns an error action, or nothing."""
+    """
+    Writes the updated manifest. Returns an error action, or nothing.
+
+    Relative to the root descriptor the caller has held all along, rather than
+    re-opening the root by path: this used to be the one operation that pinned
+    the root, and it pinned it too late to matter, since every skill file was
+    already written by the time it ran.
+    """
     manifest["manifestVersion"] = MANIFEST_VERSION
     manifest["entries"] = entries
     try:
@@ -308,7 +370,7 @@ def _rewrite_manifest(
         # planted field can raise RecursionError here — after every skill file is
         # already on disk.
         serialized = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
-        atomic_write_in(root, MANIFEST_FILENAME, serialized)
+        atomic_write(root, MANIFEST_FILENAME, serialized, dir_fd=root_fd)
     except Exception as exc:
         return [_run_error(f"the skills manifest could not be written: {exc}")]
     return []
@@ -508,6 +570,12 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     An unusable root is a caller error rather than a per-skill outcome, so this
     raises. Only the leaf directory is ever created — recursively creating
     missing ancestors would let a typo scatter a directory tree.
+
+    What this establishes is that the root was usable *at this instant*, which
+    is a caller-error check and not a security boundary — the path it returns
+    can be replaced the moment it returns. ``write_skills`` pins the returned
+    path to a descriptor immediately afterwards, and that is what carries the
+    guarantee for the rest of the run.
     """
     path = Path(os.fspath(root))
 
@@ -550,7 +618,9 @@ def _resolve_root(root: str | os.PathLike[str]) -> Path:
     return Path(os.path.realpath(path))
 
 
-def _load_manifest(root: Path) -> tuple[dict[str, Any], str | None]:
+def _load_manifest(
+    root: Path, root_fd: int | None
+) -> tuple[dict[str, Any], str | None]:
     """
     Loads the manifest. Returns ``(manifest, error)``.
 
@@ -562,16 +632,41 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], str | None]:
     mean guessing at which of the customer's files are ours.
 
     An absent manifest is not corrupt — that is simply a fresh root.
+
+    Read relative to the root descriptor the caller holds, for the same reason
+    every destructive step is: this file is what decides which of the
+    customer's files the SDK may overwrite and delete. Read by path it
+    re-resolved the root on the way in, so a root swapped after the pin handed
+    the run somebody else's entries — and every consequence then landed in the
+    *real* root through the descriptor. An empty manifest from the wrong
+    directory made every managed file look unowned; a populated one aimed the
+    prune; and either way ``_rewrite_manifest`` committed the result back over
+    the real manifest, destroying the ownership record that protects the
+    customer's files on the next run. Reading it through the descriptor is what
+    makes the pin cover the decision as well as the actions.
+
+    The single descriptor-relative open also replaces an ``exists()``-then-read
+    pair on the same path, so absence is now ``ENOENT`` on the read itself. It
+    is the same open the skill files get, which additionally means a symlink or
+    a FIFO wearing the manifest's name is refused as corruption rather than
+    followed or waited on.
     """
-    path = root / MANIFEST_FILENAME
     fresh: dict[str, Any] = {"manifestVersion": MANIFEST_VERSION, "entries": {}}
 
-    if not path.exists():
+    try:
+        raw = _read_regular_file(
+            MANIFEST_FILENAME if root_fd is not None else root / MANIFEST_FILENAME,
+            max_bytes=None,
+            dir_fd=root_fd,
+        )
+    except FileNotFoundError:
         return fresh, None
+    except OSError as exc:
+        return {}, f"the skills manifest {MANIFEST_FILENAME} could not be read: {exc}"
 
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
         # UnicodeDecodeError is a ValueError, not an OSError: non-UTF-8 bytes in
         # the manifest are corruption, and must fail closed like any other.
         return {}, f"the skills manifest {MANIFEST_FILENAME} could not be read: {exc}"
@@ -625,6 +720,13 @@ def _unsafe_path_reason(
     Returns why ``<root>/<key>/SKILL.md`` must not be touched, or ``None``.
     Shared by the write and prune paths: ``agents.md`` marks these checks
     non-relaxable, and maintaining them twice is how they drift.
+
+    These are defense in depth and not the boundary. Every one of them inspects
+    a path, so each is a check-then-use against anything that can rename a
+    component of that path — which is precisely why the destructive steps below
+    run relative to the root descriptor instead. They stay because they turn a
+    hostile layout into a reported refusal rather than a failed syscall, and
+    because they are the whole defense on a platform with no ``*at()`` family.
 
     *require_directory* is the one genuine difference between the two callers. A
     write needs a real directory to write into. A prune only needs to not follow
@@ -686,7 +788,9 @@ def _key_rejection_reason(key: Any) -> str | None:
     return None
 
 
-def _write_one(root: Path, skill: Skill, entries: dict[str, Any]) -> ReconcileAction:
+def _write_one(
+    root: Path, root_fd: int | None, skill: Skill, entries: dict[str, Any]
+) -> ReconcileAction:
     """Reconciles one verified skill against the managed root."""
     key = skill.key
 
@@ -724,7 +828,7 @@ def _write_one(root: Path, skill: Skill, entries: dict[str, Any]) -> ReconcileAc
 
     # Sweep before writing rather than after, so a temp file this run is about
     # to create can never be a candidate.
-    _sweep_orphan_temp_files(root, key)
+    _sweep_orphan_temp_files(root, root_fd, key)
 
     # Overwrite only what the manifest records as ours under this key.
     entry = entries.get(relative)
@@ -780,7 +884,9 @@ def _write_one(root: Path, skill: Skill, entries: dict[str, Any]) -> ReconcileAc
     else:
         action = "written"
 
-    write_error = _write_through_descriptor(skill_dir, encoded, key, relative)
+    write_error = _write_through_descriptor(
+        skill_dir, encoded, key, relative, root_fd=root_fd
+    )
     if write_error is not None:
         return failed(write_error)
 
@@ -791,7 +897,9 @@ def _write_one(root: Path, skill: Skill, entries: dict[str, Any]) -> ReconcileAc
     )
 
 
-def _read_regular_file(target: Path, *, max_bytes: int) -> bytes:
+def _read_regular_file(
+    target: Path | str, *, max_bytes: int | None, dir_fd: int | None = None
+) -> bytes:
     """
     Reads *target*, refusing anything that is not a regular file.
 
@@ -806,11 +914,21 @@ def _read_regular_file(target: Path, *, max_bytes: int) -> bytes:
     without it translates CRLF on read, which would fail the hash comparison
     against content that is actually current.
 
-    Reads at most ``max_bytes + 1`` bytes. The only consumer compares a hash, and
-    anything longer than the resolved content cannot match it, so the one extra
-    byte is enough to prove inequality — which is what keeps a foreign file of
-    arbitrary size from being pulled into memory now that adoption reads files
-    the manifest does not list.
+    With *dir_fd*, *target* is a bare component resolved against that
+    descriptor rather than a path the kernel walks from the root down. The
+    manifest read passes the root descriptor, because the manifest is what
+    decides which of the customer's files the SDK may touch. ``_write_one``'s
+    comparison read still resolves a path: what it names is
+    ``<key>/SKILL.md``, so covering it the same way needs a descriptor for the
+    skill directory rather than for the root.
+
+    ``max_bytes`` bounds the read at ``max_bytes + 1`` bytes: the comparison
+    consumer only ever hashes the result, and anything longer than the resolved
+    content cannot match it, so the one extra byte is enough to prove
+    inequality — which is what keeps a foreign file of arbitrary size from being
+    pulled into memory now that adoption reads files the manifest does not
+    list. ``None`` reads to EOF, for the manifest, whose length no caller can
+    predict and which is parsed rather than compared.
     """
     flags = (
         os.O_RDONLY
@@ -818,24 +936,25 @@ def _read_regular_file(target: Path, *, max_bytes: int) -> bytes:
         | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_BINARY", 0)
     )
-    fd = os.open(target, flags)
+    fd = os.open(target, flags, dir_fd=dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError("the target file is not a regular file")
         chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining > 0:
-            chunk = os.read(fd, min(remaining, 65536))
+        remaining = None if max_bytes is None else max_bytes + 1
+        while remaining is None or remaining > 0:
+            chunk = os.read(fd, 65536 if remaining is None else min(remaining, 65536))
             if not chunk:
                 break
             chunks.append(chunk)
-            remaining -= len(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
         return b"".join(chunks)
     finally:
         os.close(fd)
 
 
-def _sweep_orphan_temp_files(root: Path, key: str) -> None:
+def _sweep_orphan_temp_files(root: Path, root_fd: int | None, key: str) -> None:
     """
     Removes temp files a killed reconcile left behind under ``<root>/<key>/``.
 
@@ -852,7 +971,9 @@ def _sweep_orphan_temp_files(root: Path, key: str) -> None:
     its own temp naming for ``SKILL.md``, anchored at both ends, and asked of
     ``safe_fs`` rather than re-spelled here so the recognizer cannot drift from
     the writer; only regular files; and every removal relative to a descriptor
-    pinned with ``O_NOFOLLOW``. It never raises and never aborts the run: the
+    pinned with ``O_NOFOLLOW`` which is itself opened relative to the root
+    descriptor, so neither the root nor the skill directory can be swapped for
+    somewhere else to delete from. It never raises and never aborts the run: the
     reconcile itself has succeeded either way, so a sweep that cannot happen is
     a warning.
     """
@@ -863,7 +984,7 @@ def _sweep_orphan_temp_files(root: Path, key: str) -> None:
         return
 
     try:
-        with pinned_directory(skill_dir) as dir_fd:
+        with pinned_directory(skill_dir, dir_fd=root_fd) as dir_fd:
             # Listing by path is safe even though the removals are
             # descriptor-relative: a name reaches the unlink only if it matches
             # the anchored temp pattern, and the unlink resolves it inside the
@@ -900,7 +1021,12 @@ def _remove_orphan_temp_file(skill_dir: Path, name: str, dir_fd: int | None) -> 
 
 
 def _write_through_descriptor(
-    skill_dir: Path, encoded: bytes, key: str, relative: str
+    skill_dir: Path,
+    encoded: bytes,
+    key: str,
+    relative: str,
+    *,
+    root_fd: int | None,
 ) -> str | None:
     """
     Performs the write itself. Returns a failure reason, or ``None`` on success.
@@ -909,9 +1035,14 @@ def _write_through_descriptor(
     write and this decides nothing: the directory is pinned to a descriptor and
     every remaining step is relative to it, so none of the checks above can be
     invalidated by a swap between here and the rename.
+
+    The skill directory is created and opened relative to *root_fd*, so the
+    ``mkdir`` cannot be redirected either — ``mkdir`` follows a symlink at its
+    parent, which made a root swapped before this point enough to have the
+    directory, and then the file, created outside the root.
     """
     try:
-        with pinned_directory(skill_dir, create=True) as dir_fd:
+        with pinned_directory(skill_dir, create=True, dir_fd=root_fd) as dir_fd:
             try:
                 atomic_write(skill_dir, SKILL_FILENAME, encoded, dir_fd=dir_fd)
             except OSError as exc:
@@ -970,7 +1101,11 @@ def _prune_error(key: str, message: str, version: Any = None) -> ReconcileAction
 
 
 def _prune(
-    root: Path, entries: dict[str, Any], requested: set[str], deadline: float
+    root: Path,
+    root_fd: int | None,
+    entries: dict[str, Any],
+    requested: set[str],
+    deadline: float,
 ) -> list[ReconcileAction]:
     """
     Removes managed skills that are no longer requested.
@@ -1019,7 +1154,7 @@ def _prune(
             continue
 
         try:
-            actions.append(_prune_one(root, relative, key, entries))
+            actions.append(_prune_one(root, root_fd, relative, key, entries))
         except OSError as exc:
             actions.append(
                 _prune_error(
@@ -1032,7 +1167,9 @@ def _prune(
     return actions
 
 
-def _unlink_through_descriptor(skill_dir: Path, relative: str) -> str | None:
+def _unlink_through_descriptor(
+    skill_dir: Path, relative: str, *, root_fd: int | None
+) -> str | None:
     """
     Performs the removal itself. Returns a failure reason, or ``None`` on success.
 
@@ -1041,10 +1178,12 @@ def _unlink_through_descriptor(skill_dir: Path, relative: str) -> str | None:
     nothing. The directory is pinned before the unlink because unlink never
     follows a trailing symlink but does resolve the directory above it, so a
     ``<root>/<key>`` swapped for a symlink between the checks and here would
-    otherwise delete a file outside the root.
+    otherwise delete a file outside the root — and the pin is taken relative to
+    *root_fd* for the same reason one level up, since opening ``<root>/<key>``
+    by path re-resolves ``<root>`` and a swap there redirects the whole removal.
     """
     try:
-        with pinned_directory(skill_dir) as dir_fd:
+        with pinned_directory(skill_dir, dir_fd=root_fd) as dir_fd:
             try:
                 unlink_file(skill_dir, SKILL_FILENAME, dir_fd=dir_fd)
             except SymlinkRefused:
@@ -1057,7 +1196,11 @@ def _unlink_through_descriptor(skill_dir: Path, relative: str) -> str | None:
 
 
 def _prune_one(
-    root: Path, relative: str, key: str, entries: dict[str, Any]
+    root: Path,
+    root_fd: int | None,
+    relative: str,
+    key: str,
+    entries: dict[str, Any],
 ) -> ReconcileAction:
     """Removes one managed skill file, and its directory when that empties it."""
     skill_dir = root / key
@@ -1070,19 +1213,24 @@ def _prune_one(
 
     # Before the removal, so the ``rmdir`` below is not defeated by an orphaned
     # temp file that nothing else on disk records.
-    _sweep_orphan_temp_files(root, key)
+    _sweep_orphan_temp_files(root, root_fd, key)
 
     removed_from_disk = False
     if target.exists():
-        failure = _unlink_through_descriptor(skill_dir, relative)
+        failure = _unlink_through_descriptor(skill_dir, relative, root_fd=root_fd)
         if failure is not None:
             return _prune_error(key, failure, version)
         removed_from_disk = True
         try:
-            # Path-based, and safe that way: rmdir never follows a trailing
+            # Relative to the root descriptor. rmdir never follows a trailing
             # symlink (it fails ENOTDIR) and only ever succeeds on an empty
-            # directory.
-            skill_dir.rmdir()
+            # directory, so the *key* was never the exposure here — the root
+            # above it was, since a path-based rmdir re-resolves it and would
+            # remove an attacker-chosen directory that happened to be empty.
+            if root_fd is not None:
+                os.rmdir(key, dir_fd=root_fd)
+            else:
+                skill_dir.rmdir()
         except OSError:
             pass  # the customer keeps their own files here too
 
