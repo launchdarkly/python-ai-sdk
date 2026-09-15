@@ -103,7 +103,7 @@ result = await init_evaluations().run(
     handler=create_openai_messages_handler(),
     generation={"provider": "OpenAI", "model": "gpt-4o"},
     criteria=[
-        Judge(key="$ld:ai:judge:accuracy", threshold=0.8),
+        Judge(key="accuracy-judge", threshold=0.8),
         Scorer(name="mentions-policy", fn=mentions_policy),
     ],
     # Needed only because this judge is served by a different provider than

@@ -67,7 +67,7 @@ result = await evals.run(
     handler=my_handler,
     generation={"provider": "OpenAI", "model": "gpt-4o"},
     criteria=[
-        Judge(key="$ld:ai:judge:accuracy"),
+        Judge(key="accuracy-judge"),
         Scorer(name="mentions-policy", fn=lambda row, output: "policy" in (output or "")),
     ],
 )
