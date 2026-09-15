@@ -64,6 +64,11 @@ The mypy config uses `strict = true`, which enforces:
 
 When adding new functions or methods, always include full type annotations. Run `make typecheck` to verify before pushing.
 
+`make typecheck` checks `packages/*/src` — the same invocation CI runs. Do not change it to bare
+`mypy .`: the per-package `tests/conftest.py` files all resolve to the module name `conftest`, and
+mypy aborts on that clash before checking anything. Test suites are not type-checked today; making
+them mypy-clean under `strict` is a separate piece of work.
+
 #### `Generic[T]` syntax is intentionally kept (UP046 is ignored)
 
 The `UP046` rule (PEP 695 `type` statement syntax for generic classes) is **ignored** in `pyproject.toml`. Do not convert `class Foo(Generic[T]):` to PEP 695 syntax — it is a deliberate migration decision.
