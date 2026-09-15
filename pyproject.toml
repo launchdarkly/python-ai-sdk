@@ -33,6 +33,7 @@ pythonpath = ["."]
 [tool.mypy]
 strict = true
 python_version = "3.12"
+exclude = "(^|/)(tests|examples)/"
 
 [tool.ruff]
 target-version = "py312"
@@ -59,6 +60,8 @@ ignore = [
 known-first-party = [
   "launchdarkly_ai_python",
   "launchdarkly_ai_server",
+  "launchdarkly_ai_bedrock_agents",
+  "launchdarkly_ai_bedrock_messages",
   "launchdarkly_ai_claude_agents",
   "launchdarkly_ai_claude_messages",
   "launchdarkly_ai_langchain_agents",

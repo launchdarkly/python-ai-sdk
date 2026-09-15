@@ -1,11 +1,11 @@
-"""Cross-handler invariants: the six handlers must agree with each other.
+"""Cross-handler invariants: all handlers must agree with each other.
 
-Every handler package tests its own spans. Nothing tested that the six agree, and that is exactly
+Every handler package tests its own spans. Nothing tested that they agree, and that is exactly
 how they drifted apart: each was correct on its own terms while a single run emitted `chat` spans
 that disagreed about what a finish reason or a cached token was.
 
 These tests are the oracle for that. They live outside the packages because no package can own an
-invariant about all six.
+invariant about every handler.
 
 There are two kinds of check here.
 
@@ -41,6 +41,8 @@ HANDLERS: dict[str, str] = {
     "openai-agents": "launchdarkly_ai_openai_agents.spans",
     "langchain-messages": "launchdarkly_ai_langchain_messages.spans",
     "langchain-agents": "launchdarkly_ai_langchain_agents.spans",
+    "bedrock-messages": "launchdarkly_ai_bedrock_messages.spans",
+    "bedrock-agents": "launchdarkly_ai_bedrock_agents.spans",
 }
 
 #: `claude-agents` builds its `chat` span inside an inference tracker rather than in a standalone
@@ -510,6 +512,7 @@ class TestOpenLLMetryCarrier:
 #: The handlers whose streaming path dispatches tools inline, in the generator itself. Each holds the
 #: open `execute_tool` span in a local, so each needs that local in its `finally`.
 INLINE_TOOL_LOOP_HANDLERS: dict[str, str] = {
+    "bedrock-messages": "launchdarkly_ai_bedrock_messages.handler",
     "claude-messages": "launchdarkly_ai_claude_messages.handler",
     "openai-messages": "launchdarkly_ai_openai_messages.handler",
     "langchain-messages": "launchdarkly_ai_langchain_messages.handler",
@@ -518,6 +521,7 @@ INLINE_TOOL_LOOP_HANDLERS: dict[str, str] = {
 #: The handlers that dispatch tools through the vendor's own hook or callback object. The open spans
 #: live in that object, so the same duty is discharged by an `abandon_open_spans`-style method.
 HOOK_BASED_TOOL_HANDLERS: dict[str, str] = {
+    "bedrock-agents": "launchdarkly_ai_bedrock_agents.handler",
     "claude-agents": "launchdarkly_ai_claude_agents.handler",
     "openai-agents": "launchdarkly_ai_openai_agents.handler",
     "langchain-agents": "launchdarkly_ai_langchain_agents.handler",
@@ -615,12 +619,12 @@ class TestStreamingTeardownClosesToolSpans:
 
     `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so the tool loop's own
     handler never runs for those, and the streaming `finally` is the only code left that can end the
-    span. Four of the six handlers once held the open tool span in a local that `finally` never read,
+    span. Several handlers once held the open tool span in a local that `finally` never read,
     which exported a closed parent above a child that never arrived.
 
     Structural rather than behavioural on purpose: the leak is a property of which variables the
     teardown reads, and a behavioural test would need a cancellable tool per handler to say the same
-    thing six times.
+    thing for every handler.
     """
 
     @pytest.mark.parametrize("name", sorted(INLINE_TOOL_LOOP_HANDLERS))
