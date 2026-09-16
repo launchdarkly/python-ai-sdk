@@ -294,11 +294,15 @@ async def _build_graph(
             target_key = edge.target_key
             tool_name = f"__handoff_{_sanitize_name(target_key)}"
             target_node = nodes.get(target_key)
-            description = (
-                (edge.handoff or {}).get("description")
-                or (target_node and target_node.config.get("instructions", "")[:120])
-                or f"Transfer control to {target_key}"
+            # The prefix is unconditional: without it, a description sourced from the target's
+            # own instructions reads as a tool that does the target's work, and the model calls
+            # it instead of the node's real tools.
+            detail = (edge.handoff or {}).get("description") or (
+                target_node.config.get("instructions", "")[:120] if target_node else ""
             )
+            description = f"Transfer control to {target_key}."
+            if detail:
+                description = f"{description} {detail}"
             handoff_tools[tool_name] = {
                 "name": tool_name,
                 "type": "function",
@@ -314,7 +318,13 @@ async def _build_graph(
                 def _fn(*a: Any, **kw: Any) -> str:
                     if not chosen:
                         chosen.append(t)
-                    return f"Transferring to {t}"
+                    # Selecting an edge does not end the turn; execution continues until the
+                    # model produces its final text. A "transferring now" reply reads as though
+                    # control has already left, and the model stops short of its own work.
+                    return (
+                        f"Handoff to {t} recorded. "
+                        "Finish your own work and provide your final response."
+                    )
 
                 return _fn
 
@@ -322,10 +332,20 @@ async def _build_graph(
 
         route_config: AiConfigRep = {
             **node.config,
-            "instructions": (node.config.get("instructions") or "")
-            + "\n\nSelect exactly one transfer tool to route to the next agent.",
-            "tools": {**(node.config.get("tools") or {}), **handoff_tools},
+            "instructions": (
+                (node.config.get("instructions") or "")
+                + (
+                    "\n\nComplete your task using your available tools first. "
+                    "Only once you have your final answer, call exactly one transfer "
+                    "tool to route to the next agent."
+                )
+            ),
+            "tools": {
+                **(node.config.get("tools") or {}),
+                **handoff_tools,
+            },
         }
+
         merged_tool_handlers = {**(tool_handlers or {}), **handoff_handlers}
 
         try:
