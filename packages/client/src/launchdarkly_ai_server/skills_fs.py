@@ -517,7 +517,9 @@ def _pending_for_raw(object_key: str, raw: Any) -> _PendingWrite:
     key = raw_key if is_valid_skill_key(raw_key) else object_key
     if not is_valid_skill_key(key):
         # Neither key is usable, so this failure cannot be attributed to a skill
-        # — the run-level sentinel is the honest report.
+        # — the run-level sentinel is the honest report. ``_resolve_all`` reads
+        # that sentinel back as an incomplete run, because a failure with no key
+        # cannot protect its copy on disk the way the branch below does.
         return _PendingWrite(
             key=_RUN_LEVEL_KEY,
             error="the skill store served an object under an invalid key; "
@@ -555,7 +557,15 @@ def _resolve_all(
         len(requests),
         sum(1 for request in requests if request.skill is not None),
     )
-    return requests, False
+    # A withholding that could not be attributed to a key leaves the run
+    # incomplete. Every other failure keeps its key in the requested set, which
+    # is what holds prune off the copy on disk; a run-level failure has no key to
+    # do that with, so suppressing prune wholesale is the only thing left that
+    # stops an unreadable object reading as a revocation.
+    unattributed = any(
+        request.skill is None and request.key == _RUN_LEVEL_KEY for request in requests
+    )
+    return requests, unattributed
 
 
 # -------------------------------------------------------------------------
@@ -686,10 +696,13 @@ def _load_manifest(
         )
 
     version = data.get("manifestVersion")
+    # Bounded at both ends. No release ever wrote a version below 1, so 0 or a
+    # negative is not an older schema this release could still read — it is a
+    # schema that never existed, and acting on its entries would be a guess.
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version > MANIFEST_VERSION
+        or not 1 <= version <= MANIFEST_VERSION
     ):
         return {}, (
             f"the skills manifest {MANIFEST_FILENAME} declares manifestVersion "

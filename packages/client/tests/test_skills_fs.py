@@ -445,6 +445,33 @@ class TestManifest:
         assert "\\" not in keys[0]
         assert not keys[0].startswith("/")
 
+    @pytest.mark.parametrize("declared", [0, -1])
+    async def test_manifest_version_below_one_is_corrupt(
+        self, root: Path, declared: int
+    ) -> None:
+        """The version gate is bounded below as well as above.
+
+        No release ever wrote a version under 1, so one is not an older schema
+        this release can still read. Treating it as readable would run the
+        destructive steps against entries of unknown shape.
+        """
+        target = _place_managed(root, "a", SKILL_BODY)
+        _write_manifest(
+            root,
+            {
+                "manifestVersion": declared,
+                "entries": {"a/SKILL.md": _entry("a", 1, SKILL_BODY)},
+            },
+        )
+
+        report = await write_skills([], root)
+
+        assert report.ok is False
+        assert any("manifestVersion" in m for m in _error_messages(report))
+        assert target.exists(), "pruned against a manifest schema that never existed"
+        # The manifest itself is left alone, as with any other corruption.
+        assert _read_manifest(root)["manifestVersion"] == declared
+
     async def test_unknown_fields_are_preserved_on_rewrite(self, root: Path) -> None:
         entry = _entry("a", 1, SKILL_BODY)
         entry["futureEntryField"] = "keep-me"
@@ -900,6 +927,37 @@ class TestResilience:
         assert existing.read_text(encoding="utf-8") == SKILL_BODY
         assert _actions_by_key(report)["requested-key"].action == "error"
         assert _actions_by_key(report)["other-key"].action == "skipped_current"
+
+    async def test_an_unattributable_failure_never_prunes(self, root: Path) -> None:
+        """A withholding with no usable key at all still must not prune.
+
+        The sibling case above recovers the object's own key and keeps it in the
+        requested set. When neither the object's key nor the store's is usable
+        the failure is run-level, so there is no key to hold the on-disk copy
+        with — reporting the run incomplete is the only thing left that stops
+        prune reading an unreadable object as a revocation.
+        """
+        existing = _place_managed(root, "pdf-extraction", SKILL_BODY)
+        # The shipped store keys ``all_objects`` as "<key>:<version>", which is
+        # never a valid skill key, so a missing 'key' field leaves no fallback.
+        skills_module._set_store(
+            InMemorySkillStore(
+                {
+                    "pdf-extraction:1": {
+                        "version": 1,
+                        "content": SKILL_BODY,
+                        "contentHash": _hash(SKILL_BODY),
+                    }
+                }
+            )
+        )
+
+        report = await write_skills("*", root)
+
+        assert report.ok is False
+        assert existing.read_text(encoding="utf-8") == SKILL_BODY
+        assert [a.action for a in report.actions] == ["error"]
+        assert "pdf-extraction/SKILL.md" in _read_manifest(root)["entries"]
 
     async def test_unavailable_run_does_not_corrupt_manifest(self, root: Path) -> None:
         _place_managed(root, "a", SKILL_BODY)
