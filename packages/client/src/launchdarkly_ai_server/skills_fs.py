@@ -7,10 +7,14 @@ and verification and knows nothing about the filesystem. The descriptor-pinned
 primitives every destructive step goes through live in ``safe_fs.py``.
 
 **The invariants.** The managed root is pinned to a descriptor once per
-reconcile and every destructive operation runs relative to it. Destructive
-operations only ever touch paths ``<root>/.launchdarkly-skills.json`` records
-under a matching key. A corrupt manifest suppresses every destructive action,
-and an incomplete retrieval suppresses pruning. Content is re-verified
+reconcile, and every operation under it — the destructive ones and the reads
+that decide them — runs relative to that descriptor or to a skill directory
+pinned relative to it. The existence probe, the compare read and the orphan
+listing are pinned before they are consulted, so a directory swapped after the
+pin cannot change which branch runs, only what a path check reports.
+Destructive operations only ever touch paths ``<root>/.launchdarkly-skills.json``
+records under a matching key. A corrupt manifest suppresses every destructive
+action, and an incomplete retrieval suppresses pruning. Content is re-verified
 immediately before the write. The path checks still run, but as defense in
 depth rather than as the boundary.
 
@@ -34,6 +38,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .safe_fs import (
+    DirectoryMissing,
     SymlinkRefused,
     atomic_write,
     is_temp_name,
@@ -649,10 +654,11 @@ def _load_manifest(
     An absent manifest is not corrupt — that is simply a fresh root.
 
     Read relative to the root descriptor, because this file decides which files
-    the SDK may overwrite and delete: the pin has to cover the decision as well
-    as the actions. That single open also makes absence ``ENOENT`` on the read
-    itself, and refuses a symlink or FIFO wearing the manifest's name as
-    corruption rather than following or waiting on it.
+    the SDK may overwrite and delete: the pin covers the decision as well as the
+    actions, here as for every other read under the root. That single open also
+    makes absence ``ENOENT`` on the read itself, and refuses a symlink or FIFO
+    wearing the manifest's name as corruption rather than following or waiting
+    on it.
     """
     fresh: dict[str, Any] = {"manifestVersion": MANIFEST_VERSION, "entries": {}}
 
@@ -839,64 +845,120 @@ def _write_one(
     # Overwrite only what the manifest records as the SDK's under this key.
     entry = entries.get(relative)
     managed = isinstance(entry, dict) and entry.get("key") == key
-    exists = target.exists()
 
-    if exists:
-        # Hash first, and decide from the bytes. The manifest check below is
-        # what protects a file the SDK did not write, but on its own it also
-        # refuses one the SDK wrote and was killed before recording it, wedging
-        # every later reconcile. Comparing the bytes separates those two cases,
-        # and only content byte-identical to what LaunchDarkly resolved is
-        # adopted. This exception must not be widened — see agents.md.
-        try:
-            on_disk = _read_regular_file(target, max_bytes=len(encoded))
-        except OSError as exc:
-            if not managed:
-                # A read that failed proves nothing, and must never become an
-                # overwrite: it is the comparison below that would authorize one.
-                return failed(
-                    f"'{relative}' exists, the manifest does not record it as "
-                    f"managed under key '{key}', and it could not be read to "
-                    f"compare against the resolved content: {exc}; refusing to "
-                    "overwrite a file this SDK may not have written"
+    # The directory is pinned here, before anything is decided, and the pin is
+    # held through the write: the existence probe, the compare read and the
+    # rename all resolve against the same descriptor, so nothing swapped in
+    # between can change which branch runs or where the write lands. Created
+    # relative to *root_fd* for the same reason — ``mkdir`` follows a symlink at
+    # its parent. A directory that does not exist yet is created now rather than
+    # after the decision; that only ever happens when there is no file to
+    # compare against, so the write that follows is the one that fills it.
+    try:
+        with pinned_directory(skill_dir, create=True, dir_fd=root_fd) as skill_fd:
+            try:
+                on_disk = _read_skill_file(skill_dir, skill_fd, max_bytes=len(encoded))
+            except OSError as exc:
+                if not managed:
+                    # A read that failed proves nothing, and must never become
+                    # an overwrite: it is the comparison below that would
+                    # authorize one.
+                    return failed(
+                        f"'{relative}' exists, the manifest does not record it as "
+                        f"managed under key '{key}', and it could not be read to "
+                        f"compare against the resolved content: {exc}; refusing to "
+                        "overwrite a file this SDK may not have written"
+                    )
+                return failed(f"'{relative}' could not be read: {exc}")
+
+            if on_disk is None:
+                action: ReconcileActionKind = "written"
+            elif hashlib.sha256(on_disk).hexdigest() == content_hash:
+                # Hash first, and decide from the bytes. The manifest check
+                # below is what protects a file the SDK did not write, but on
+                # its own it also refuses one the SDK wrote and was killed
+                # before recording it, wedging every later reconcile. Comparing
+                # the bytes separates those two cases, and only content
+                # byte-identical to what LaunchDarkly resolved is adopted. This
+                # exception must not be widened — see agents.md.
+                #
+                # ``skipped_current`` rather than a new action kind: the bytes
+                # on disk already are the resolved content, as true for an
+                # adopted file as for one the SDK wrote. Adoption records a
+                # manifest entry, so the file becomes prunable later.
+                _update_entry(entries, relative, skill, content_hash)
+                record_materialized(key, len(encoded), content_hash, "skipped_current")
+                return ReconcileAction(
+                    key=key,
+                    action="skipped_current",
+                    version=skill.version,
+                    path=str(target),
                 )
-            return failed(f"'{relative}' could not be read: {exc}")
+            elif not managed:
+                return failed(
+                    f"'{relative}' exists but the manifest does not record it as "
+                    f"managed under key '{key}'; refusing to overwrite a file this "
+                    "SDK did not write"
+                )
+            else:
+                # Stale version or local tampering — LD-resolved content wins.
+                action = "updated"
 
-        if hashlib.sha256(on_disk).hexdigest() == content_hash:
-            # ``skipped_current`` rather than a new action kind: the bytes on
-            # disk already are the resolved content, as true for an adopted file
-            # as for one the SDK wrote. Adoption records a manifest entry, so
-            # the file becomes prunable later.
-            _update_entry(entries, relative, skill, content_hash)
-            record_materialized(key, len(encoded), content_hash, "skipped_current")
-            return ReconcileAction(
-                key=key,
-                action="skipped_current",
-                version=skill.version,
-                path=str(target),
-            )
-
-        if not managed:
-            return failed(
-                f"'{relative}' exists but the manifest does not record it as managed "
-                f"under key '{key}'; refusing to overwrite a file this SDK did not write"
-            )
-        # Stale version or local tampering — LD-resolved content wins.
-        action: ReconcileActionKind = "updated"
-    else:
-        action = "written"
-
-    write_error = _write_through_descriptor(
-        skill_dir, encoded, key, relative, root_fd=root_fd
-    )
-    if write_error is not None:
-        return failed(write_error)
+            try:
+                atomic_write(skill_dir, SKILL_FILENAME, encoded, dir_fd=skill_fd)
+            except OSError as exc:
+                return failed(f"'{relative}' could not be written: {exc}")
+    except OSError as exc:
+        return failed(f"the directory for skill '{key}' could not be created: {exc}")
+    except ValueError as exc:
+        return failed(f"'{relative}' was refused: {exc}")
 
     _update_entry(entries, relative, skill, content_hash)
     record_materialized(key, len(encoded), content_hash, action)
     return ReconcileAction(
         key=key, action=action, version=skill.version, path=str(target)
     )
+
+
+def _skill_file_present(skill_dir: Path, skill_fd: int | None) -> bool:
+    """
+    Whether ``SKILL.md`` is present in the pinned *skill_dir*.
+
+    Probed relative to the descriptor, ``follow_symlinks=False``, so the answer
+    is about the directory that was pinned and not about wherever its path leads
+    now. Only ``ENOENT`` means absent: any other failure reports present, so the
+    step that follows — the read or the unlink — is the one that fails and says
+    why, rather than a probe deciding silently that there was nothing to do.
+    Path-based on the ``lstat`` floor, where there is no descriptor.
+    """
+    if skill_fd is None:
+        return (skill_dir / SKILL_FILENAME).exists()
+    try:
+        os.stat(SKILL_FILENAME, dir_fd=skill_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _read_skill_file(
+    skill_dir: Path, skill_fd: int | None, *, max_bytes: int
+) -> bytes | None:
+    """
+    The compare read: the bytes at ``SKILL.md`` in the pinned *skill_dir*, or
+    ``None`` when there is no file there.
+
+    Both the probe and the read resolve against *skill_fd*, so the bytes that
+    decide adoption, update or refusal are the ones in the directory that was
+    pinned. Any other failure propagates as the ``OSError`` it was, for the
+    caller to report.
+    """
+    if not _skill_file_present(skill_dir, skill_fd):
+        return None
+    if skill_fd is None:
+        return _read_regular_file(skill_dir / SKILL_FILENAME, max_bytes=max_bytes)
+    return _read_regular_file(SKILL_FILENAME, max_bytes=max_bytes, dir_fd=skill_fd)
 
 
 def _read_regular_file(
@@ -915,6 +977,11 @@ def _read_regular_file(
     ``max_bytes`` is required, not optional, so a new call site cannot pull an
     arbitrary file into memory by omission. The read stops at ``max_bytes + 1``,
     the extra byte distinguishing "at the cap" from "over it".
+
+    Given a *dir_fd*, *target* is a bare filename resolved inside that
+    descriptor. Every read under the managed root — the manifest and each
+    compare read — passes one wherever the platform has descriptors, so the
+    bytes a decision is made from come from the directory that was pinned.
     """
     flags = (
         os.O_RDONLY
@@ -952,27 +1019,29 @@ def _sweep_orphan_temp_files(root: Path, root_fd: int | None, key: str) -> None:
     it is bounded on every axis: inside ``<root>/<key>/`` only, for a key that
     passes ``_key_rejection_reason``; only names ``safe_fs`` recognizes, asked
     of ``safe_fs`` so the recognizer cannot drift from the writer; only regular
-    files; every removal descriptor-relative. Never widen these — see agents.md.
+    files; the listing read off the pinned descriptor, and every removal
+    relative to it. Never widen these — see agents.md.
 
     Never raises and never aborts the run: the reconcile has succeeded either
-    way, so a sweep that cannot happen is a warning.
+    way, so a sweep that cannot happen is a warning. A directory that does not
+    exist is not a failure — there is nothing to sweep, and it is the pin that
+    says so rather than a separate probe of the path.
     """
     if _key_rejection_reason(key) is not None:
         return
     skill_dir = root / key
-    if not skill_dir.is_dir():
-        return
 
     try:
         with pinned_directory(skill_dir, dir_fd=root_fd) as dir_fd:
-            # Listing by path is safe even though the removals are
-            # descriptor-relative: a name reaches the unlink only if it matches
-            # the anchored temp pattern, and the unlink resolves it inside the
-            # pinned directory, so a listing redirected between the pin and here
-            # can at worst name a file that is not in it.
-            for name in sorted(os.listdir(skill_dir)):
+            # ``os.listdir`` accepts the descriptor itself on POSIX, so the
+            # names come from the directory that was pinned; on the lstat floor
+            # there is no descriptor and the path is all there is.
+            listed = os.listdir(skill_dir if dir_fd is None else dir_fd)
+            for name in sorted(listed):
                 if is_temp_name(name, SKILL_FILENAME):
                     _remove_orphan_temp_file(skill_dir, name, dir_fd)
+    except DirectoryMissing:
+        return
     except (OSError, ValueError) as exc:
         logger.warning(
             "orphaned temp files under skill '%s' could not be swept: %s", key, exc
@@ -998,36 +1067,6 @@ def _remove_orphan_temp_file(skill_dir: Path, name: str, dir_fd: int | None) -> 
         unlink_file(skill_dir, name, dir_fd=dir_fd)
     except (OSError, ValueError) as exc:
         logger.warning("an orphaned temp file could not be removed: %s", exc)
-
-
-def _write_through_descriptor(
-    skill_dir: Path,
-    encoded: bytes,
-    key: str,
-    relative: str,
-    *,
-    root_fd: int | None,
-) -> str | None:
-    """
-    Performs the write itself. Returns a failure reason, or ``None`` on success.
-
-    Split out of ``_write_one`` because everything above it decides *whether* to
-    write and this decides nothing: the directory is pinned and every remaining
-    step is relative to that descriptor, so no check above can be invalidated by
-    a swap between here and the rename. The ``mkdir`` is relative to *root_fd*
-    for the same reason — it follows a symlink at its parent.
-    """
-    try:
-        with pinned_directory(skill_dir, create=True, dir_fd=root_fd) as dir_fd:
-            try:
-                atomic_write(skill_dir, SKILL_FILENAME, encoded, dir_fd=dir_fd)
-            except OSError as exc:
-                return f"'{relative}' could not be written: {exc}"
-    except OSError as exc:
-        return f"the directory for skill '{key}' could not be created: {exc}"
-    except ValueError as exc:
-        return f"'{relative}' was refused: {exc}"
-    return None
 
 
 def _update_entry(
@@ -1141,28 +1180,24 @@ def _prune(
     return actions
 
 
-def _unlink_through_descriptor(
-    skill_dir: Path, relative: str, *, root_fd: int | None
+def _unlink_skill_file(
+    skill_dir: Path, skill_fd: int | None, relative: str
 ) -> str | None:
     """
     Performs the removal itself. Returns a failure reason, or ``None`` on success.
 
-    The mirror of ``_write_through_descriptor``, split out for the same reason.
-    The directory is pinned before the unlink because unlink never follows a
-    trailing symlink but does resolve the directory above it, and the pin is
-    taken relative to *root_fd* because opening ``<root>/<key>`` by path
-    re-resolves ``<root>``.
+    *skill_fd* is the descriptor ``_prune_one`` already holds for the directory,
+    the same one the existence probe was answered from — so the file the probe
+    found is the file this removes. ``unlink`` never follows a trailing symlink
+    but does resolve the directory above it, which is why it must not be given
+    a path here.
     """
     try:
-        with pinned_directory(skill_dir, dir_fd=root_fd) as dir_fd:
-            try:
-                unlink_file(skill_dir, SKILL_FILENAME, dir_fd=dir_fd)
-            except SymlinkRefused:
-                return f"'{relative}' was not removed: the target file is a symlink"
-            except OSError as exc:
-                return f"'{relative}' could not be removed: {exc}"
-    except ValueError as exc:
-        return f"'{relative}' was not removed: {exc}"
+        unlink_file(skill_dir, SKILL_FILENAME, dir_fd=skill_fd)
+    except SymlinkRefused:
+        return f"'{relative}' was not removed: the target file is a symlink"
+    except OSError as exc:
+        return f"'{relative}' could not be removed: {exc}"
     return None
 
 
@@ -1186,12 +1221,26 @@ def _prune_one(
     # temp file that nothing else on disk records.
     _sweep_orphan_temp_files(root, root_fd, key)
 
+    # Pinned relative to the root before the existence probe, and held through
+    # the unlink: a directory swapped after the pin cannot make the probe report
+    # a file that is not there — or, worse, report nothing where the SDK's file
+    # still is, which would drop the manifest entry and leave a revoked skill on
+    # disk with a report that says it was removed. A directory that is not there
+    # at all is the ordinary case for a file that is already gone.
     removed_from_disk = False
-    if target.exists():
-        failure = _unlink_through_descriptor(skill_dir, relative, root_fd=root_fd)
-        if failure is not None:
-            return _prune_error(key, failure, version)
-        removed_from_disk = True
+    try:
+        with pinned_directory(skill_dir, dir_fd=root_fd) as skill_fd:
+            if _skill_file_present(skill_dir, skill_fd):
+                failure = _unlink_skill_file(skill_dir, skill_fd, relative)
+                if failure is not None:
+                    return _prune_error(key, failure, version)
+                removed_from_disk = True
+    except DirectoryMissing:
+        pass
+    except ValueError as exc:
+        return _prune_error(key, f"'{relative}' was not removed: {exc}", version)
+
+    if removed_from_disk:
         try:
             # Relative to the root descriptor: rmdir is safe at the key (it
             # fails ENOTDIR on a symlink and needs an empty directory), but a

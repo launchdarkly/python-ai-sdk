@@ -34,7 +34,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `FDv2SkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
 | `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
-| `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
+| `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, `DirectoryMissing`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
@@ -445,8 +445,9 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   manifest does not list, and it is bounded on every axis: inside `<root>/<key>/` only, for a
   key that passes `_key_rejection_reason`; only names `safe_fs.is_temp_name` recognizes,
   anchored at both ends and asked of `safe_fs` rather than re-spelled (a copy would drift
-  from the writer); only regular files, with the type read off the descriptor; unlinked
-  through the pinned descriptor. It never raises and never aborts a run.
+  from the writer); only regular files, with the type read off the descriptor; listed off
+  the pinned descriptor (`os.listdir(fd)`), so the names come from the directory that was
+  pinned; unlinked through that same descriptor. It never raises and never aborts a run.
 - **A corrupt manifest fails closed**: unreadable, unparseable, not an object, malformed
   `entries`, larger than `_MAX_MANIFEST_BYTES`, or a `manifestVersion` outside
   `1 <= v <= MANIFEST_VERSION` means no overwrites and no prunes, brand-new paths may still
@@ -464,9 +465,13 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   mode `0644` set explicitly (never inherited from the umask, never executable), write,
   fsync, `os.replace`, fsync the directory. `os.replace` is the single rename call site
   and must not be swapped for `os.rename`.
-- **Every operation under the root goes through a pinned descriptor, not a path.** See
-  "Descriptor-pinned filesystem access" below. Re-resolving `<root>/<key>` from its path at
-  write or unlink time reopens a swap window that the checks above cannot cover.
+- **Every operation under the root goes through a pinned descriptor, not a path — the
+  reads that decide an action included.** See "Descriptor-pinned filesystem access" below.
+  Re-resolving `<root>/<key>` from its path at write or unlink time reopens a swap window
+  that the checks above cannot cover; re-resolving it for the existence probe, the compare
+  read or the orphan listing lets a swap choose the *branch* instead — most seriously, a
+  prune whose probe is answered "absent" from a swapped directory skips its unlink, drops
+  the manifest entry, and reports `removed` while the revoked skill stays on disk.
 - **A key valid to the data model may still be unrepresentable on disk.** The model allows
   256 characters; `NAME_MAX` is 255 bytes. Windows additionally reserves 22 MS-DOS device
   names, none of which can be a directory name there: `con`, `prn`, `aux`, `nul`,
@@ -615,13 +620,32 @@ primitives live in `safe_fs.py`, which knows nothing about skills:
   removal into a delete of an attacker-chosen file. A symlink found where this SDK expects
   its own file raises `SymlinkRefused` rather than being tidied away: the state on disk is
   not what the caller believes, and that is the caller's to report. `_prune_one` goes
-  through it; `rmdir` stays path-based and is safe that way, since it fails `ENOTDIR` on a
-  symlink and only ever succeeds on an empty directory.
+  through it; `rmdir` is issued relative to the root descriptor, and is safe at the key
+  since it fails `ENOTDIR` on a symlink and only ever succeeds on an empty directory.
+- `open_directory_nofollow` raises `DirectoryMissing` — a `ValueError` subclass — when
+  nothing at the path is a directory (`ENOENT`, `ENOTDIR`). That is how the skills side
+  learns a skill directory is absent *from the pin itself*, rather than from a separate
+  `exists()` on the path that a swap could answer differently: a prune of a file that is
+  already gone and a sweep of a directory never created both take that branch.
+
+The reads that decide an action are pinned the same way, in `skills_fs`. Each of `_write_one`
+and `_prune_one` pins `<root>/<key>` relative to the root descriptor *before* it decides
+anything and holds the pin through the action: the existence probe is
+`os.stat(SKILL_FILENAME, dir_fd=skill_fd, follow_symlinks=False)`, the compare read is
+`_read_regular_file(SKILL_FILENAME, dir_fd=skill_fd)`, and the orphan sweep lists
+`os.listdir(skill_fd)`. So a swap after the pin cannot choose the branch — it cannot have
+a prune skip its unlink and still report `removed`, cannot have a compare read adopt or
+refuse over a file outside the root, and cannot feed the sweep names from elsewhere. Where
+`dir_fd` is `None` (the `lstat` floor) each of these stays path-based, which is the
+documented Windows bound. The manifest read was already pinned; nothing under the root is
+read by path any more.
 
 Every `lstat`, `realpath` and containment check on the skills side lives in one shared
 `_unsafe_path_reason`, so the write and prune paths cannot drift apart on what counts as
-unsafe. `skills_fs._prune_one` spells its symlink check `os.stat(..., follow_symlinks=False)`
-rather than `os.lstat`, matching the name the capability probe advertises.
+unsafe. Those checks stay, ahead of the pin, as defense in depth — they are not the boundary
+and must not be removed. Symlink probes on the descriptor side are spelled
+`os.stat(..., follow_symlinks=False)` rather than `os.lstat`, matching the name the
+capability probe advertises.
 
 `safe_fs.SUPPORTS_DIR_FD` gates all of it, and the probe is not the obvious one.
 `os.supports_dir_fd` is populated per underlying syscall, and CPython registers `renameat`

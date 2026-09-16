@@ -455,12 +455,16 @@ a skill from a variation is how revocation works — the next reconcile prunes i
 
 **Platform bound: the descriptor-pinned guarantee is POSIX-only.** On POSIX the managed root
 is opened once per reconcile — `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, checked with `fstat`, and
-held until the call returns — and every destructive step under it runs relative to that
-descriptor: the per-skill directory is created and opened relative to the root, the unlink and
-the `rmdir` relative to the directory, and the manifest write relative to the root. So a
-directory swapped for a symlink *after* its checks cannot redirect a write or a delete: the
-descriptor names the inode that was checked, which closes the swap window rather than
-narrowing it. Because the root itself is pinned this holds for the root and its ancestors too,
+held until the call returns — and every step under it runs relative to that descriptor, the
+reads that decide an action as much as the action itself: the per-skill directory is created
+and opened relative to the root; the manifest read, the check for an existing `SKILL.md`, the
+byte comparison against it and the listing for orphaned temp files are all answered from the
+pinned directory; and the unlink and the `rmdir` run relative to the directory, the manifest
+write relative to the root. So a directory swapped for a symlink *after* its checks cannot
+redirect a write or a delete, and cannot change *which* of them happens either — a prune
+cannot be talked into skipping its unlink, and a compare cannot be shown a file from outside
+the root: the descriptor names the inode that was checked, which closes the swap window rather
+than narrowing it. Because the root itself is pinned this holds for the root and its ancestors too,
 not only for `<root>/<key>` — but only from the instant the root is opened, which is why the
 checklist below denies the agent write access to every ancestor. Windows has no
 `*at()` syscall family, so there `write_skills` falls back to a per-component `lstat` check

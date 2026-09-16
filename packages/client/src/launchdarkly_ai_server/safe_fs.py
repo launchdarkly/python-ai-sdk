@@ -62,6 +62,21 @@ populated per underlying syscall, and CPython registers ``renameat`` under
 """
 
 
+class DirectoryMissing(ValueError):
+    """
+    Raised by ``open_directory_nofollow`` when nothing at the path is a
+    directory: the name is absent (``ENOENT``) or names a non-directory
+    (``ENOTDIR``).
+
+    A ``ValueError`` subclass so a caller that treats every unpinnable directory
+    alike keeps its single ``except``; a distinct type so one for which "not
+    there" is an ordinary outcome — a prune whose file is already gone, a sweep
+    of a directory that was never created — can tell it from a refusal without
+    matching on a message or an errno. A symlink is never this: it is refused
+    as a symlink.
+    """
+
+
 def _at(directory: Path, dir_fd: int | None) -> str | Path:
     """
     What to name *directory* by, given a descriptor for its parent.
@@ -91,22 +106,29 @@ def open_directory_nofollow(
     would fail every operation rather than fall back.
 
     Raises ``ValueError`` when the path will not open, or inspect, as a real
-    directory.
+    directory — ``DirectoryMissing`` when that is because nothing is there or
+    what is there is not a directory, so a caller can treat absence as an
+    outcome rather than a failure. Both are decided by the open itself (or the
+    ``lstat`` on the floor), never by a separate existence probe on the path.
     """
     if not SUPPORTS_DIR_FD:
         try:
             mode = os.lstat(directory).st_mode
+        except FileNotFoundError as exc:
+            raise DirectoryMissing(f"the directory does not exist: {exc}") from exc
         except OSError as exc:
             raise ValueError(f"the directory could not be inspected: {exc}") from exc
         if stat.S_ISLNK(mode):
             raise ValueError("the directory is a symlink")
         if not stat.S_ISDIR(mode):
-            raise ValueError("the path is not a directory")
+            raise DirectoryMissing("the path is not a directory")
         return None
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(_at(directory, dir_fd), flags, dir_fd=dir_fd)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise DirectoryMissing(f"the directory does not exist: {exc}") from exc
     except OSError as exc:
         raise ValueError(
             f"the directory could not be opened without following links: {exc}"

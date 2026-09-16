@@ -259,6 +259,95 @@ class _SwapRootDuring:
         return self
 
 
+class _SwapRootBefore:
+    """Fires the *root*-swap race the instant before one decision read.
+
+    ``_SwapRootDuring`` intercepts a destructive call. This intercepts a read
+    that decides whether a destructive call happens at all — the existence
+    probe before a prune, the compare read before a write, the listing before
+    the orphan sweep — and swaps the root the moment before it runs, once. Those
+    reads all come *after* the skill directory is pinned, so a swap here is the
+    latest possible one: every path check has already passed against the real
+    root, and the only thing left that could go wrong is the read itself
+    resolving through the link.
+
+    *trigger* decides which call fires it, and must match both spellings — the
+    absolute path a path-based read passes and the bare name (or descriptor) a
+    pinned one passes — for the reason ``_SwapRootDuring`` gives: a trigger
+    that matched only the path would stop firing the moment the read was
+    pinned, and these tests would pass while asserting nothing.
+    """
+
+    def __init__(
+        self,
+        attribute: str,
+        root: Path,
+        outside: Path,
+        trigger: Any,
+    ) -> None:
+        self.attribute = attribute
+        self.root = Path(os.path.realpath(root))
+        self.moved_to = self.root.parent / f"{self.root.name}.real"
+        self.outside = outside
+        self.trigger = trigger
+        self.swapped = False
+        self._real = getattr(os, attribute)
+
+    def __call__(self, first: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self.swapped and self.trigger(first, kwargs):
+            os.rename(self.root, self.moved_to)
+            os.symlink(self.outside, self.root, target_is_directory=True)
+            self.swapped = True
+        return self._real(first, *args, **kwargs)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _SwapRootBefore:
+        monkeypatch.setattr(skills_fs_module.os, self.attribute, self)
+        return self
+
+
+def _names_the_skill_file(skill_dir: Path) -> Any:
+    """A ``_SwapRootBefore`` trigger for a ``stat`` or ``open`` of ``SKILL.md``.
+
+    The bare name is only accepted with a ``dir_fd``: a bare name without one
+    would resolve against the working directory, which is not a call this SDK
+    makes, and matching it would fire the swap on some unrelated read.
+
+    The absolute form is only accepted when it follows symlinks. The path
+    check's ``is_symlink`` also stats the absolute ``SKILL.md``, as an
+    ``lstat``, and that runs *before* the pin as defense in depth — firing on
+    it would swap the root under the path checks themselves, which refuse, and
+    the decision read under test would never be reached.
+    """
+
+    def trigger(first: Any, kwargs: dict[str, Any]) -> bool:
+        if not isinstance(first, (str, os.PathLike)):
+            return False
+        named = os.fspath(first)
+        if named == "SKILL.md":
+            return kwargs.get("dir_fd") is not None
+        return (
+            Path(named) == skill_dir / "SKILL.md"
+            and kwargs.get("follow_symlinks", True) is not False
+        )
+
+    return trigger
+
+
+def _lists_the_skill_directory(skill_dir: Path) -> Any:
+    """A ``_SwapRootBefore`` trigger for the orphan sweep's ``listdir``.
+
+    A pinned listing passes the descriptor itself; a path-based one passes
+    ``<root>/<key>``.
+    """
+
+    def trigger(first: Any, kwargs: dict[str, Any]) -> bool:
+        if isinstance(first, int):
+            return True
+        return isinstance(first, (str, os.PathLike)) and Path(first) == skill_dir
+
+    return trigger
+
+
 _needs_dir_fd = pytest.mark.skipif(
     not safe_fs_module.SUPPORTS_DIR_FD,
     reason="no *at() family on this platform; the per-component lstat floor applies",
@@ -1766,9 +1855,10 @@ class TestRootSwapRaces:
         victim.write_text("the customer's own file\n", encoding="utf-8")
         outside = tmp_path / "outside"
         (outside / "victim").mkdir(parents=True)
-        # Present so the path-based existence probe on the prune path is
-        # satisfied; without it the run would skip the unlink for a reason that
-        # has nothing to do with the defense under test.
+        # Present so that a path-based existence probe, were one to return,
+        # would be satisfied; without it a run whose probe resolved through the
+        # swapped root would skip the unlink for a reason that has nothing to
+        # do with the defense under test.
         (outside / "victim" / "SKILL.md").write_text("bait\n", encoding="utf-8")
         _write_manifest(
             outside,
@@ -1795,6 +1885,154 @@ class TestRootSwapRaces:
         assert victim.read_text(encoding="utf-8") == "the customer's own file\n"
 
     @_needs_dir_fd
+    async def test_a_root_swapped_before_the_prune_probe_still_removes_the_real_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The existence probe before a prune is answered from the pinned
+        directory, not from the path.
+
+        Answered from the path, a swap landing between the pin and the probe
+        made the probe look into the attacker's tree, find nothing, and skip
+        the unlink — while the prune still dropped the manifest entry and still
+        reported ``removed``. The revoked skill stayed on disk, now unmanaged,
+        under a report that said it was gone: the one outcome a revocation must
+        never have. The attacker's directory is empty here for exactly that
+        reason — it is the "nothing to remove" answer, planted.
+
+        Pinned, the probe sees the real file, the unlink removes it, and the
+        report is true.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        (outside / "a").mkdir(parents=True)
+        _place_managed(root, "a", SKILL_BODY)
+        race = _SwapRootBefore(
+            "stat", root, outside, _names_the_skill_file(root / "a")
+        ).install(monkeypatch)
+
+        report = await write_skills([], root)
+
+        assert race.swapped is True, "the race never fired; the test proves nothing"
+        assert [a.action for a in report.actions if a.key == "a"] == ["removed"]
+        # ``removed`` is true: the real file is gone, and so is its entry.
+        assert not (race.moved_to / "a" / "SKILL.md").exists()
+        assert "a/SKILL.md" not in _read_manifest(race.moved_to)["entries"]
+        # And nothing happened in the attacker's tree.
+        assert list((outside / "a").iterdir()) == []
+
+    @_needs_dir_fd
+    async def test_a_root_swapped_before_the_compare_read_cannot_adopt_an_outside_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adoption is decided from the bytes in the pinned directory.
+
+        The real root holds a customer-authored file at the managed path with
+        no manifest entry; the attacker's tree holds a byte-identical copy of
+        the resolved content at the same relative path. Read by path, the
+        compare read landed on the attacker's copy, matched, and adopted — and
+        the entry it recorded was then written into the *real* manifest through
+        the held descriptor, claiming the customer's file for the next reconcile
+        to overwrite or delete. Read through the pin, the bytes are the
+        customer's, they differ, and the write is refused for the reason the
+        real root warrants.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        target = _place_unmanaged(root, "a", "user authored\n")
+        outside = tmp_path / "outside"
+        _place_unmanaged(outside, "a", SKILL_BODY)
+        race = _SwapRootBefore(
+            "stat", root, outside, _names_the_skill_file(root / "a")
+        ).install(monkeypatch)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert race.swapped is True, "the race never fired; the test proves nothing"
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert "refusing to overwrite a file this SDK did not write" in (
+            action.error or ""
+        )
+        real = race.moved_to / "a" / "SKILL.md"
+        assert real == Path(str(target).replace(str(root), str(race.moved_to)))
+        assert real.read_text(encoding="utf-8") == "user authored\n"
+        assert "a/SKILL.md" not in _read_manifest(race.moved_to)["entries"]
+        assert (outside / "a" / "SKILL.md").read_text(encoding="utf-8") == SKILL_BODY
+
+    @_needs_dir_fd
+    async def test_a_root_swapped_before_the_compare_read_cannot_refuse_over_an_outside_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mirror image: the real root's file *is* the resolved content,
+        left unrecorded by a reconcile killed before its manifest rewrite, and
+        the attacker's tree holds something else at the same path. Read by
+        path, the compare read saw the attacker's bytes, they differed, and the
+        SDK refused to adopt its own file — wedging that skill on every later
+        run, on the strength of a file that was never inside the root. Read
+        through the pin, the file is adopted as ``skipped_current``, which is
+        what the real root's contents call for.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        _place_unmanaged(root, "a", SKILL_BODY)
+        outside = tmp_path / "outside"
+        _place_unmanaged(outside, "a", "user authored\n")
+        race = _SwapRootBefore(
+            "stat", root, outside, _names_the_skill_file(root / "a")
+        ).install(monkeypatch)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert race.swapped is True, "the race never fired; the test proves nothing"
+        assert _actions_by_key(report)["a"].action == "skipped_current", (
+            _error_messages(report)
+        )
+        assert "a/SKILL.md" in _read_manifest(race.moved_to)["entries"]
+        assert (race.moved_to / "a" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == SKILL_BODY
+        assert (outside / "a" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == "user authored\n"
+        assert not (outside / MANIFEST_NAME).exists()
+
+    @_needs_dir_fd
+    async def test_a_root_swapped_before_the_orphan_listing_cannot_reach_outside(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The orphan sweep lists the pinned directory, not the path.
+
+        The removals were already descriptor-relative, so a listing redirected
+        into the attacker's tree could never have unlinked anything there; what
+        it could do is come back with the wrong names — the attacker's, which
+        the pinned unlink then fails to find — so the real orphan is never
+        swept and keeps its directory pinned forever. Listed off the descriptor,
+        the real orphan is found and removed, and the attacker's temp file is
+        neither listed nor touched.
+        """
+        root = tmp_path / "skills"
+        root.mkdir()
+        _place_managed(root, "a", SKILL_BODY)
+        real_orphan = root / "a" / _temp_name("0123456789abcdef")
+        real_orphan.write_text("half-written body", encoding="utf-8")
+        outside = tmp_path / "outside"
+        (outside / "a").mkdir(parents=True)
+        planted = outside / "a" / _temp_name("fedcba9876543210")
+        planted.write_text("bait", encoding="utf-8")
+        race = _SwapRootBefore(
+            "listdir", root, outside, _lists_the_skill_directory(root / "a")
+        ).install(monkeypatch)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert race.swapped is True, "the race never fired; the test proves nothing"
+        assert report.ok is True, _error_messages(report)
+        assert not (race.moved_to / "a" / real_orphan.name).exists()
+        assert planted.read_text(encoding="utf-8") == "bait"
+        assert sorted(p.name for p in (outside / "a").iterdir()) == [planted.name]
+
+    @_needs_dir_fd
     async def test_every_destructive_call_runs_relative_to_a_descriptor(
         self, root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1812,9 +2050,23 @@ class TestRootSwapRaces:
         a new call site, not a new attack: one operation added on the full path
         would reopen the window for that operation alone, and no swap test aimed
         at the existing sequences would notice.
+
+        The reads that *decide* those calls are held to the same bar. The
+        existence probe and the compare read name ``SKILL.md``, the manifest
+        read names the manifest, and each must pass the bare name and a
+        descriptor; the orphan listing must be handed the descriptor itself.
+        ``_unsafe_path_reason`` is stubbed out for the run: its checks stat
+        absolute paths on purpose, as defense in depth ahead of the pin, and
+        they are not what this audit is about. With them out of the way, every
+        remaining read that names the skill file or the manifest is a decision
+        read, and must be pinned.
         """
+        monkeypatch.setattr(
+            skills_fs_module, "_unsafe_path_reason", lambda *args, **kwargs: None
+        )
         destructive = ("mkdir", "rmdir", "unlink", "replace")
-        recorded: list[tuple[str, str, bool]] = []
+        deciding = ("stat", "open", "listdir")
+        recorded: list[tuple[str, Any, bool]] = []
 
         def recorder(name: str) -> Any:
             real = getattr(os, name)
@@ -1825,7 +2077,7 @@ class TestRootSwapRaces:
                         name,
                         os.fspath(first)
                         if isinstance(first, (str, os.PathLike))
-                        else repr(first),
+                        else first,
                         # replace takes src_dir_fd/dst_dir_fd rather than dir_fd.
                         any("dir_fd" in keyword for keyword in kwargs),
                     )
@@ -1834,7 +2086,7 @@ class TestRootSwapRaces:
 
             return wrapper
 
-        for name in destructive:
+        for name in destructive + deciding:
             monkeypatch.setattr(safe_fs_module.os, name, recorder(name))
 
         written = await write_skills([_skill("a")], root)
@@ -1845,10 +2097,33 @@ class TestRootSwapRaces:
         # mkdir, replace (the skill file), replace (the manifest), unlink,
         # rmdir, replace (the manifest again) — the sequence must have run, or
         # the audit below is vacuous.
-        assert {entry[0] for entry in recorded} == set(destructive), recorded
+        assert {entry[0] for entry in recorded} >= set(destructive), recorded
         assert [
-            entry for entry in recorded if os.path.isabs(entry[1]) or not entry[2]
+            entry
+            for entry in recorded
+            if entry[0] in destructive
+            and (
+                not isinstance(entry[1], str) or os.path.isabs(entry[1]) or not entry[2]
+            )
         ] == []
+
+        # The decision reads. The prune run's probe found the file and the
+        # write run's found none, so both answers were given through a
+        # descriptor; the sweep listed on both runs.
+        about_a_file = [
+            entry
+            for entry in recorded
+            if entry[0] in ("stat", "open")
+            and isinstance(entry[1], str)
+            and entry[1].endswith(("SKILL.md", MANIFEST_NAME))
+        ]
+        assert about_a_file != [], recorded
+        assert [
+            entry for entry in about_a_file if os.path.isabs(entry[1]) or not entry[2]
+        ] == []
+        listings = [entry for entry in recorded if entry[0] == "listdir"]
+        assert listings != [], recorded
+        assert [entry for entry in listings if not isinstance(entry[1], int)] == []
 
 
 class TestWithoutDirFd:
@@ -2746,8 +3021,16 @@ class TestCrashMidReconcileRecovery:
         real_open = os.open
 
         def refuse_the_target(path: Any, *args: Any, **kwargs: Any) -> int:
-            if isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(target):
-                raise PermissionError(13, "Permission denied")
+            # Both spellings, for the same reason ``_SwapRootDuring`` matches
+            # both: the compare read names the file as the bare ``SKILL.md``
+            # relative to the pinned skill directory wherever the platform has
+            # descriptors, and as the full path on the lstat floor.
+            if isinstance(path, (str, os.PathLike)):
+                named = os.fspath(path)
+                if named == str(target) or (
+                    named == "SKILL.md" and kwargs.get("dir_fd") is not None
+                ):
+                    raise PermissionError(13, "Permission denied")
             return real_open(path, *args, **kwargs)
 
         monkeypatch.setattr(skills_fs_module.os, "open", refuse_the_target)
