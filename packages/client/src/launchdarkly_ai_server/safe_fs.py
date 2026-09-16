@@ -52,6 +52,16 @@ _FILE_MODE = 0o644
 """Mode set explicitly on every written file — never inherited from the umask,
 and never executable."""
 
+_SUPPORTS_FCHMOD = hasattr(os, "fchmod")
+"""
+Whether the mode can be set on the descriptor rather than on a path.
+
+POSIX always has ``os.fchmod``; Windows only gained it in CPython 3.13, and this
+package supports 3.12. Probing for it rather than assuming it is what keeps the
+documented Windows fallback a fallback instead of an ``AttributeError`` raised
+after the temp file is already open.
+"""
+
 SUPPORTS_DIR_FD = os.supports_dir_fd.issuperset(
     # renameat, openat, unlinkat, fstatat, mkdirat, and unlinkat's AT_REMOVEDIR
     # form — the six this module and its caller need.
@@ -377,7 +387,18 @@ def atomic_write(
             # fchmod, not chmod: operating on the descriptor cannot be redirected
             # by anything that swaps the temp path underneath us, and it makes the
             # mode independent of the process umask (both creation paths open 0600).
-            os.fchmod(fd, _FILE_MODE)
+            if _SUPPORTS_FCHMOD:
+                os.fchmod(fd, _FILE_MODE)
+            elif at_fd is None:
+                # Windows before 3.13 has no fchmod — and no ``*at()`` family
+                # either, so ``temp`` is a full path here and the mode goes on it.
+                # That concedes nothing this platform was getting: it is already
+                # on the path-based floor, the temp name is unguessable, and the
+                # only bit Windows takes from a POSIX mode is read-only. A
+                # platform with descriptors but no fchmod does not exist; were
+                # there one it would keep the 0600 the exclusive open already set,
+                # rather than have a bare name chmoded relative to the cwd.
+                os.chmod(temp, _FILE_MODE)
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view) :]

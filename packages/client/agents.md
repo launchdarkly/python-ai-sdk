@@ -561,7 +561,8 @@ primitives live in `safe_fs.py`, which knows nothing about skills:
   platform split once as `if dir_fd is not None` and cannot forget the `os.close`.
 - `atomic_write` creates the temp file with `O_CREAT | O_EXCL | O_NOFOLLOW` **at** that
   descriptor (`_mkstemp_at`, since `tempfile` has no `dir_fd` form), `fchmod`s the
-  descriptor rather than `chmod`ing a path, writes, fsyncs, and renames with
+  descriptor rather than `chmod`ing a path — probed, because Windows has no `os.fchmod`
+  before 3.13 and 3.12 is supported — writes, fsyncs, and renames with
   `os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)`, then fsyncs the directory so the
   rename survives a crash. `atomic_write_in` is the same against a directory the caller does
   not already hold open. `os.replace` is the single rename call site, reached by attribute

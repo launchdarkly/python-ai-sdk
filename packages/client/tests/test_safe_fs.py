@@ -170,6 +170,21 @@ class TestAtomicWrite:
         assert stat.S_IMODE((tmp_path / "f.txt").stat().st_mode) == 0o644
         assert [p.name for p in tmp_path.iterdir()] == ["f.txt"]
 
+    def test_the_fallback_works_without_fchmod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows before CPython 3.13 has no ``os.fchmod``, and 3.12 is supported.
+
+        The mode goes on the temp path there instead; what must not happen is an
+        ``AttributeError`` out of the branch every Windows write takes.
+        """
+        monkeypatch.delattr(os, "fchmod")
+        monkeypatch.setattr(safe_fs_module, "_SUPPORTS_FCHMOD", False)
+        atomic_write(tmp_path, "f.txt", b"fallback", dir_fd=None)
+        assert (tmp_path / "f.txt").read_bytes() == b"fallback"
+        assert stat.S_IMODE((tmp_path / "f.txt").stat().st_mode) == 0o644
+        assert [p.name for p in tmp_path.iterdir()] == ["f.txt"]
+
     def test_write_in_pins_the_directory_itself(self, tmp_path: Path) -> None:
         atomic_write_in(tmp_path, "f.txt", b"x")
         assert (tmp_path / "f.txt").read_bytes() == b"x"
