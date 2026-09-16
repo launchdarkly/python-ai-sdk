@@ -99,6 +99,21 @@ DEFAULT_STREAM_READ_TIMEOUT = 300.0
 """Default ``read_timeout`` in ``"stream"`` mode: the longest gap tolerated
 between two reads. LaunchDarkly's heartbeats arrive well inside this."""
 
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+"""The most the transport will hold in memory from one response.
+
+A memory backstop, not a content limit. Verification caps each skill's content
+at 10 MiB in ``skills_core``; this bound is on what one poll body, or one
+streamed event, may accumulate *before* verification can run against it, and
+it is deliberately far above any payload LaunchDarkly legitimately serves. The
+two bound different things and are set independently. A body or event that
+crosses it is dropped unread as a recoverable transport failure: nothing from
+it is committed, the store keeps serving what it last held, and the delivery
+loop retries on its usual backoff."""
+
+_READ_CHUNK_BYTES = 64 * 1024
+"""How much of a poll body is read per call while checking it against the bound."""
+
 _EVENT_SERVER_INTENT = "server-intent"
 _EVENT_PUT_OBJECT = "put-object"
 _EVENT_DELETE_OBJECT = "delete-object"
@@ -1086,7 +1101,7 @@ class _Requester:
                     status = getattr(response, "status", None) or response.getcode()
                     if status == 304:
                         return _PollResult(not_modified=True, events=[], etag=etag)
-                    body = response.read()
+                    body = _read_bounded(response, MAX_RESPONSE_BYTES)
                     new_etag = response.headers.get("ETag") or etag
                 finally:
                     with self._lock:
@@ -1097,6 +1112,8 @@ class _Requester:
                 # answer here, not a redirect, and is handled before classifying.
                 return _PollResult(not_modified=True, events=[], etag=etag)
             raise _classify_status(exc.code, exc.headers) from exc
+        except _RecoverableTransportError:
+            raise
         except Exception as exc:
             raise _RecoverableTransportError(
                 f"polling request failed: {type(exc).__name__}: {exc}"
@@ -1124,6 +1141,29 @@ class _Requester:
         return _StreamConnection(response)
 
 
+def _read_bounded(response: Any, limit: int) -> bytes:
+    """
+    Reads a whole poll body, holding no more than *limit* bytes of it.
+
+    Read in chunks rather than all at once so a body that is never going to be
+    accepted is abandoned as soon as it crosses the bound, with at most one
+    byte over it in memory, instead of being buffered whole and measured after.
+    """
+    chunks: list[bytes] = []
+    seen = 0
+    while True:
+        chunk = response.read(min(_READ_CHUNK_BYTES, limit + 1 - seen))
+        if not chunk:
+            return b"".join(chunks)
+        seen += len(chunk)
+        if seen > limit:
+            raise _RecoverableTransportError(
+                f"polling response exceeded the {limit}-byte transport bound "
+                f"(at least {seen} bytes received); nothing from it was applied"
+            )
+        chunks.append(chunk)
+
+
 def _decode_poll_body(body: bytes) -> list[tuple[str, Any]]:
     """
     Unwraps ``{"events": [...]}``. Polling and streaming carry identical event
@@ -1147,9 +1187,10 @@ def _decode_poll_body(body: bytes) -> list[tuple[str, Any]]:
     return events
 
 
-def _iter_stream_lines(response: Any) -> Any:
+def _iter_stream_lines(response: Any, limit: int) -> Any:
     """
-    Yields a streaming body's raw lines, presenting a read failure as retryable.
+    Yields a streaming body's raw lines, presenting a read failure as retryable
+    and refusing any single line longer than *limit* bytes.
 
     A live stream dies mid-body far more often than it refuses to open: a read
     timeout on a stream that went quiet, a reset, a truncated chunk. Each of
@@ -1157,9 +1198,25 @@ def _iter_stream_lines(response: Any) -> Any:
     only the transport errors this module defines — anything else it reads as a
     bug and stops for the process lifetime. Connecting is already wrapped in
     ``_Requester.stream``; this is the same promise for the body.
+
+    Lines are read with a size argument rather than by iterating the response,
+    because an unbounded ``readline`` buffers until it finds a newline, and a
+    line that never ends would be held whole before anything here saw it.
     """
     try:
-        yield from response
+        while True:
+            line = response.readline(limit + 1)
+            if not line:
+                return
+            if len(line) > limit:
+                raise _RecoverableTransportError(
+                    f"an FDv2 stream line exceeded the {limit}-byte transport "
+                    "bound; the connection was dropped and nothing from the "
+                    "in-flight payload was applied"
+                )
+            yield line
+    except _RecoverableTransportError:
+        raise
     except Exception as exc:
         raise _RecoverableTransportError(
             f"reading the FDv2 stream failed: {type(exc).__name__}: {exc}"
@@ -1172,11 +1229,18 @@ def _iter_sse(response: Any) -> Any:
 
     Minimal on purpose: ``event:``/``data:`` fields, multi-line ``data`` joined
     with newlines, a blank line dispatching, and ``:`` comments skipped.
+
+    One event may accumulate at most ``MAX_RESPONSE_BYTES`` across its lines.
+    Past that it is a recoverable transport failure: the generator raises, the
+    delivery loop drops the connection and retries, and the payload in flight
+    is abandoned rather than committed.
     """
+    limit = MAX_RESPONSE_BYTES
     try:
         name: str | None = None
         data_lines: list[str] = []
-        for raw_line in _iter_stream_lines(response):
+        event_bytes = 0
+        for raw_line in _iter_stream_lines(response, limit):
             line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
             if line == "":
                 if name is not None:
@@ -1192,9 +1256,18 @@ def _iter_sse(response: Any) -> Any:
                         yield name, parsed
                 name = None
                 data_lines = []
+                event_bytes = 0
                 continue
             if line.startswith(":"):
                 continue
+            event_bytes += len(raw_line)
+            if event_bytes > limit:
+                raise _RecoverableTransportError(
+                    f"an FDv2 stream event exceeded the {limit}-byte transport "
+                    f"bound (at least {event_bytes} bytes received); the "
+                    "connection was dropped and nothing from the in-flight "
+                    "payload was applied"
+                )
             field_name, _, value = line.partition(":")
             value = value[1:] if value.startswith(" ") else value
             if field_name == "event":
@@ -1273,6 +1346,11 @@ class FDv2SkillStore:
     the store and never makes ``get_object`` raise, which is what makes
     ``write_skills(on_unavailable="keep")`` correct. ``diagnostics`` and
     ``failed`` report the degradation.
+
+    **Reads are memory-bounded.** No poll body or streamed event is held past
+    ``MAX_RESPONSE_BYTES``; one that crosses it is dropped unapplied as a
+    recoverable failure, the store keeps serving what it last held, and
+    delivery retries.
 
     **What arrives is untrusted.** Raw wire objects are held verbatim and
     verified at the accessor boundary, not here. In particular an object with no
@@ -1595,6 +1673,9 @@ class FDv2SkillStore:
                     # misleading ``last_error`` on a healthy store.
                     return
                 with self._lock:
+                    # Whatever the dropped connection had transferred so far is
+                    # not a payload; the next connection starts one afresh.
+                    self._reader._abandon_in_flight()
                     self._failures += 1
                     failures = self._failures
                     answered = self._attempt_answered

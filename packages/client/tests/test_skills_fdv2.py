@@ -37,6 +37,7 @@ from launchdarkly_ai_server import (
     get_skill,
     get_skill_result,
     init_client,
+    skills_fdv2,
     watch_skills,
 )
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
@@ -45,9 +46,11 @@ from launchdarkly_ai_server.skills_fdv2 import (
     DEFAULT_STREAM_READ_TIMEOUT,
     FDV2_KEY_DELIMITER,
     FDV2_OBJECT_KIND,
+    MAX_RESPONSE_BYTES,
     _backoff_delay,
     _FatalTransportError,
     _is_skill_event,
+    _iter_sse,
     _ProtocolReader,
     _RecoverableTransportError,
     _Requester,
@@ -1334,12 +1337,15 @@ class _DyingResponse:
 
     def __init__(self, exc: BaseException) -> None:
         self._exc = exc
-
-    def __iter__(self) -> Any:
+        self._lines: list[bytes] = []
         for event in full_payload(("put-object", put_skill())):
-            yield f"event: {event['event']}\n".encode()
-            yield f"data: {json.dumps(event['data'])}\n".encode()
-            yield b"\n"
+            self._lines.append(f"event: {event['event']}\n".encode())
+            self._lines.append(f"data: {json.dumps(event['data'])}\n".encode())
+            self._lines.append(b"\n")
+
+    def readline(self, size: int = -1) -> bytes:
+        if self._lines:
+            return self._lines.pop(0)
         raise self._exc
 
     def close(self) -> None:
@@ -1872,6 +1878,157 @@ class TestFailureHandling:
 # ---------------------------------------------------------------------------
 # Redirects are refused
 # ---------------------------------------------------------------------------
+
+
+class _LineSource:
+    """A streaming body served from bytes, with the ``readline`` the parser uses."""
+
+    def __init__(self, data: bytes) -> None:
+        self._buf = data
+        self.closed = False
+
+    def readline(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._buf)
+        newline = self._buf.find(b"\n", 0, size)
+        end = size if newline < 0 else newline + 1
+        line, self._buf = self._buf[:end], self._buf[end:]
+        return line
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestTransportMemoryBound:
+    """
+    ``MAX_RESPONSE_BYTES`` bounds what one response may put in memory before
+    verification's per-skill content cap can see any of it. Disk was already
+    bounded; this is what bounds memory. The cap is patched small here so the
+    suite does not have to move 64 MiB to prove it.
+    """
+
+    def test_the_bound_is_far_above_any_legitimate_payload(self) -> None:
+        assert MAX_RESPONSE_BYTES == 64 * 1024 * 1024
+
+    def test_an_over_cap_poll_body_is_not_applied_and_is_retried(
+        self, endpoint: Any, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 2048)
+        endpoint.queue_poll(full_payload(("put-object", put_skill(content="x" * 8192))))
+        # A long enough backoff to observe the failure before the retry lands.
+        with poll_store(endpoint, initial_backoff=0.3, max_backoff=0.3) as store:
+            assert wait_until(lambda: store.diagnostics.connection_failures == 1)
+            assert "2048-byte transport bound" in (store.diagnostics.last_error or "")
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is None
+            assert store.diagnostics.payloads_transferred == 0
+            assert store.diagnostics.skill_objects_received == 0
+            assert store.failed is None
+            # The retry is an ordinary poll; the endpoint answers it 304.
+            assert wait_until(lambda: len(endpoint.requests) >= 2)
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: store.diagnostics.connection_failures == 0)
+            assert "2048-byte transport bound" in (store.diagnostics.last_error or "")
+        assert all(r["path"] == "/sdk/poll" for r in endpoint.requests)
+
+    def test_a_poll_body_exactly_at_the_cap_is_accepted(
+        self, endpoint: Any, monkeypatch: Any
+    ) -> None:
+        payload = full_payload(("put-object", put_skill()))
+        body = json.dumps({"events": payload}).encode("utf-8")
+        monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", len(body))
+        endpoint.queue_poll(payload)
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+            assert store.diagnostics.connection_failures == 0
+            assert store.diagnostics.last_error is None
+
+    def test_a_poll_body_one_byte_over_the_cap_is_refused(
+        self, endpoint: Any, monkeypatch: Any
+    ) -> None:
+        payload = full_payload(("put-object", put_skill()))
+        body = json.dumps({"events": payload}).encode("utf-8")
+        monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", len(body) - 1)
+        endpoint.queue_poll(payload)
+        with poll_store(endpoint, max_consecutive_failures=0) as store:
+            assert wait_until(lambda: store.failed is not None)
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is None
+        assert f"{len(body) - 1}-byte transport bound" in store.failed
+        assert f"at least {len(body)} bytes received" in store.failed
+
+    def test_the_default_cap_leaves_ordinary_payloads_alone(
+        self, endpoint: Any
+    ) -> None:
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+            assert store.diagnostics.connection_failures == 0
+            assert store.diagnostics.last_error is None
+
+    def test_an_over_cap_stream_event_abandons_the_payload_in_flight(
+        self, endpoint: Any, monkeypatch: Any
+    ) -> None:
+        """
+        The first payload commits. The second starts, then carries an event
+        over the cap: that connection is dropped, the half-received payload is
+        never committed, and the reconnect finds the committed set intact.
+        """
+        monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 2048)
+        endpoint.queue_stream(
+            full_payload(("put-object", put_skill()))
+            + events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("put-object", put_skill("oversized", content="x" * 8192)),
+                ("payload-transferred", transferred("basis-2")),
+            )
+        )
+        endpoint.hold_stream_open = True
+        endpoint.queue_stream(events(("server-intent", server_intent("none"))))
+        store = FDv2SkillStore(
+            SDK_KEY,
+            base_uri=endpoint.base_uri,
+            mode="stream",
+            initial_backoff=0.01,
+            max_backoff=0.02,
+        )
+        try:
+            store.start()
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(
+                lambda: "transport bound" in (store.diagnostics.last_error or "")
+            )
+            assert wait_until(lambda: len(endpoint.requests) >= 2)
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+            assert store.get_object(SKILL_OBJECT_KIND, "oversized") is None
+            assert store.diagnostics.payloads_transferred == 1
+            assert store.diagnostics.skill_objects_received == 1
+            assert store.failed is None
+            assert endpoint.requests[1]["query"].get("basis") == "basis-1"
+        finally:
+            store.close()
+
+    def test_a_stream_line_that_never_ends_is_refused_and_the_body_closed(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 1024)
+        source = _LineSource(b"data: " + b"x" * 4096)
+        with pytest.raises(_RecoverableTransportError, match="1024-byte"):
+            list(_iter_sse(source))
+        assert source.closed
+
+    def test_an_event_is_measured_across_its_data_lines(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 1024)
+        lines = b"".join(b"data: " + b"x" * 500 + b"\n" for _ in range(3))
+        source = _LineSource(b"event: put-object\n" + lines + b"\n")
+        with pytest.raises(_RecoverableTransportError, match="1024-byte"):
+            list(_iter_sse(source))
+        assert source.closed
+
+    def test_multi_line_data_under_the_cap_still_decodes(self) -> None:
+        source = _LineSource(b'event: put-object\ndata: {"a":\ndata: 1}\n\n')
+        assert list(_iter_sse(source)) == [("put-object", {"a": 1})]
+        assert source.closed
 
 
 @pytest.fixture

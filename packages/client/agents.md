@@ -264,6 +264,15 @@ redirect handler copies `Authorization` onto the redirected request, so any 3xx 
 which is a poll's not-modified answer) surfaces as an `HTTPError` that `_classify_status` maps
 to a fatal, non-retried failure instead of a request carrying the key to the `Location` host.
 
+**Reads are memory-bounded.** `_read_bounded` reads a poll body in chunks, and
+`_iter_stream_lines`/`_iter_sse` read each line with a size argument and total each event, all
+against `MAX_RESPONSE_BYTES` (64 MiB): crossing it raises `_RecoverableTransportError`, so
+nothing from that body or event is applied, the delivery loop abandons the reader's in-flight
+payload, records the failure in `connection_failures`/`last_error`, and retries on the usual
+backoff while the committed set stays served. The bound is a memory backstop for the transport
+and is independent of `skills_core.MAX_SKILL_CONTENT_BYTES`, which caps one skill's content at
+verification; do not derive one from the other.
+
 **The skill's version is in the object's `key`. `version` is the payload's.** Each version
 of a skill is its own object on the wire, identified as `<key>:<version>`:
 

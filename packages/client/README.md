@@ -539,6 +539,10 @@ is refused, except to a loopback host for a local test double), and redirects ar
 followed, so a 3xx from a proxy or a misconfigured private instance stops delivery rather than
 forwarding the key to whatever host the `Location` header names.
 
+**Reads are memory-bounded.** No poll body or streamed event is held past `MAX_RESPONSE_BYTES`
+(64 MiB, far above any real payload); one that crosses it is dropped without being applied, the
+store keeps serving what it last held, and delivery retries on its normal backoff.
+
 **Streaming is the default, and it is what makes revocation fast.** A `delete-object` reaches
 a live stream in seconds; with `mode="poll"` it arrives within one `poll_interval`. Paired
 with `watch_skills`, a revoked skill's `SKILL.md` leaves the disk without a restart. During an
