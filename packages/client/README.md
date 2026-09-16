@@ -534,6 +534,11 @@ objects through the `SkillStore` interface and cannot tell which store produced 
 customer-confidential. A mobile key (`mob-…`) or a client-side environment ID raises from the
 constructor.
 
+**The SDK key goes only where you pointed it.** `base_uri` must be `https://` (plain `http://`
+is refused, except to a loopback host for a local test double), and redirects are never
+followed, so a 3xx from a proxy or a misconfigured private instance stops delivery rather than
+forwarding the key to whatever host the `Location` header names.
+
 **Streaming is the default, and it is what makes revocation fast.** A `delete-object` reaches
 a live stream in seconds; with `mode="poll"` it arrives within one `poll_interval`. Paired
 with `watch_skills`, a revoked skill's `SKILL.md` leaves the disk without a restart. During an

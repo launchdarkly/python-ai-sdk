@@ -46,6 +46,7 @@ from launchdarkly_ai_server.skills_fdv2 import (
     FDV2_KEY_DELIMITER,
     FDV2_OBJECT_KIND,
     _backoff_delay,
+    _FatalTransportError,
     _is_skill_event,
     _ProtocolReader,
     _RecoverableTransportError,
@@ -198,6 +199,9 @@ class _FakeFDv2Endpoint:
         self._streams: list[list[dict[str, Any]]] = []
         self._lock = threading.Lock()
         self.hold_stream_open = False
+        # When set, every ``/sdk/stream`` answers 307 to this URL instead of
+        # streaming, so a test can check that the store refuses to follow it.
+        self.redirect_stream_to: str | None = None
         self._release = threading.Event()
 
         endpoint = self
@@ -257,6 +261,7 @@ class _FakeFDv2Endpoint:
         status: int = 200,
         etag: str | None = None,
         retry_after: str | None = None,
+        location: str | None = None,
     ) -> None:
         with self._lock:
             self._polls.append(
@@ -265,6 +270,7 @@ class _FakeFDv2Endpoint:
                     "events": payload_events or [],
                     "etag": etag,
                     "retry_after": retry_after,
+                    "location": location,
                 }
             )
 
@@ -285,6 +291,8 @@ class _FakeFDv2Endpoint:
             handler.send_header("ETag", response["etag"])
         if response.get("retry_after"):
             handler.send_header("Retry-After", response["retry_after"])
+        if response.get("location"):
+            handler.send_header("Location", response["location"])
         if status in (200,):
             body = json.dumps({"events": response["events"]}).encode("utf-8")
             handler.send_header("Content-Type", "application/json")
@@ -298,6 +306,12 @@ class _FakeFDv2Endpoint:
     def _serve_stream(self, handler: BaseHTTPRequestHandler) -> None:
         with self._lock:
             payload_events = self._streams.pop(0) if self._streams else []
+        if self.redirect_stream_to:
+            handler.send_response(307)
+            handler.send_header("Location", self.redirect_stream_to)
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+            return
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream")
         handler.send_header("Cache-Control", "no-cache")
@@ -1855,6 +1869,108 @@ class TestFailureHandling:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Redirects are refused
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def second_endpoint() -> Any:
+    """A second host, to stand for wherever a ``Location`` header points."""
+    server = _FakeFDv2Endpoint()
+    yield server
+    server.close()
+
+
+class TestRedirectsAreRefused:
+    """
+    ``urllib``'s standard redirect handler copies every request header onto the
+    redirected request, ``Authorization`` included. The transport's opener
+    declines every redirect instead, so a 3xx is a fatal, non-retried failure
+    and the SDK key never reaches the host ``Location`` names.
+    """
+
+    @pytest.mark.parametrize("status", [301, 302, 307, 308])
+    def test_a_poll_redirect_is_fatal_and_not_followed(
+        self, endpoint: Any, second_endpoint: Any, status: int
+    ) -> None:
+        target = second_endpoint.base_uri + "/sdk/poll"
+        endpoint.queue_poll(status=status, location=target)
+        requester = _Requester(SDK_KEY, endpoint.base_uri, read_timeout=5.0)
+        with pytest.raises(_FatalTransportError) as excinfo:
+            requester.poll(None, None)
+        assert str(status) in str(excinfo.value)
+        assert "not followed" in str(excinfo.value)
+        assert second_endpoint.requests == []
+
+    def test_a_stream_redirect_is_fatal_and_not_followed(
+        self, endpoint: Any, second_endpoint: Any
+    ) -> None:
+        endpoint.redirect_stream_to = second_endpoint.base_uri + "/sdk/stream"
+        requester = _Requester(SDK_KEY, endpoint.base_uri, read_timeout=5.0)
+        with pytest.raises(_FatalTransportError) as excinfo:
+            requester.stream(None)
+        assert "307" in str(excinfo.value)
+        assert second_endpoint.requests == []
+
+    def test_a_same_host_redirect_is_refused_too(self, endpoint: Any) -> None:
+        """The endpoints do not redirect, so there is nothing legitimate to follow."""
+        endpoint.queue_poll(status=302, location=endpoint.base_uri + "/sdk/poll")
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        requester = _Requester(SDK_KEY, endpoint.base_uri, read_timeout=5.0)
+        with pytest.raises(_FatalTransportError):
+            requester.poll(None, None)
+        assert len(endpoint.requests) == 1
+
+    def test_the_sdk_key_never_reaches_the_second_host(
+        self, endpoint: Any, second_endpoint: Any
+    ) -> None:
+        """
+        End to end through the store: the redirect stops delivery for good,
+        with no retry spent on it, and the second host sees no request at all —
+        so no ``Authorization`` header, since that is what following would
+        have forwarded.
+        """
+        endpoint.queue_poll(status=301, location=second_endpoint.base_uri + "/sdk/poll")
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+            assert store.wait_for_skills(timeout=5) is False
+        assert store.failed is not None
+        assert "301" in store.failed
+        assert "never forwarded" in store.failed
+        assert store.diagnostics.connection_failures == 0
+        assert len(endpoint.requests) == 1
+        assert [r["authorization"] for r in second_endpoint.requests] == []
+
+    def test_a_redirect_in_stream_mode_stops_delivery(
+        self, endpoint: Any, second_endpoint: Any
+    ) -> None:
+        endpoint.redirect_stream_to = second_endpoint.base_uri + "/sdk/stream"
+        store = FDv2SkillStore(
+            SDK_KEY, base_uri=endpoint.base_uri, mode="stream", initial_backoff=0.01
+        )
+        with store:
+            assert wait_until(lambda: store.failed is not None)
+        assert store.failed is not None
+        assert "307" in store.failed
+        assert second_endpoint.requests == []
+
+    def test_a_redirect_with_no_location_is_still_fatal(self, endpoint: Any) -> None:
+        endpoint.queue_poll(status=302)
+        requester = _Requester(SDK_KEY, endpoint.base_uri, read_timeout=5.0)
+        with pytest.raises(_FatalTransportError):
+            requester.poll(None, None)
+
+    def test_a_304_is_not_a_redirect(self, endpoint: Any) -> None:
+        """The refusal must leave the poll's not-modified path exactly as it was."""
+        endpoint.queue_poll(status=304)
+        requester = _Requester(SDK_KEY, endpoint.base_uri, read_timeout=5.0)
+        result = requester.poll(None, "etag-1")
+        assert result.not_modified is True
+        assert result.etag == "etag-1"
+
+
 def _per_object_hashless_errors(caplog: Any) -> list[Any]:
     """The per-object ERROR, as distinct from the whole-payload summary."""
     return [
@@ -2152,6 +2268,62 @@ class TestServerSideOnly:
     def test_an_unknown_mode_is_refused(self) -> None:
         with pytest.raises(ValueError, match="stream"):
             FDv2SkillStore(SDK_KEY, mode="mobile")  # type: ignore[arg-type]
+
+
+class TestBaseUriScheme:
+    """
+    Every request carries the SDK key in ``Authorization``, so the base URI is
+    ``https://`` only. Plain ``http://`` is allowed to a loopback host and
+    nowhere else: that is what this suite's own endpoints listen on, and it
+    never leaves the machine.
+    """
+
+    def test_a_plain_http_base_uri_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="cleartext") as excinfo:
+            FDv2SkillStore(SDK_KEY, base_uri="http://sdk.launchdarkly.com")
+        assert "https://" in str(excinfo.value)
+
+    def test_a_plain_http_base_uri_is_refused_even_with_a_requester_injected(
+        self,
+    ) -> None:
+        """The check is on the store, not on the socket it happens to open."""
+        with pytest.raises(ValueError, match="cleartext"):
+            FDv2SkillStore(
+                SDK_KEY,
+                base_uri="http://relay.internal:8030",
+                _requester=_FakeRequester(),
+            )
+
+    @pytest.mark.parametrize(
+        "base_uri",
+        [
+            "http://localhost:8030",
+            "http://127.0.0.1:8030",
+            "http://[::1]:8030",
+            "http://LOCALHOST/",
+        ],
+    )
+    def test_plain_http_to_a_loopback_host_is_allowed(self, base_uri: str) -> None:
+        assert FDv2SkillStore(SDK_KEY, base_uri=base_uri) is not None
+
+    def test_a_private_address_is_not_loopback(self) -> None:
+        """Only the machine itself is exempt; the LAN is not."""
+        with pytest.raises(ValueError, match="cleartext"):
+            FDv2SkillStore(SDK_KEY, base_uri="http://10.0.0.5:8030")
+
+    @pytest.mark.parametrize(
+        "base_uri",
+        ["", "   ", "sdk.launchdarkly.com", "ftp://sdk.launchdarkly.com", "https://"],
+    )
+    def test_anything_but_an_https_url_with_a_host_is_refused(
+        self, base_uri: str
+    ) -> None:
+        with pytest.raises(ValueError, match="https://"):
+            FDv2SkillStore(SDK_KEY, base_uri=base_uri)
+
+    def test_https_is_accepted(self) -> None:
+        assert FDv2SkillStore(SDK_KEY, base_uri="https://sdk.example.com/") is not None
+        assert FDv2SkillStore(SDK_KEY) is not None
 
 
 # ---------------------------------------------------------------------------

@@ -256,6 +256,14 @@ shape `skills_core.SkillStore` documents; **nothing above that interface knows i
 change ever seems to require editing an accessor, verification, or `write_skills`, the adapter
 boundary is wrong.
 
+**The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
+plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a
+loopback exemption (`localhost`, `127.0.0.1`, `::1`) because the test suite's fake endpoints
+listen there; and the opener is built with `_RefuseRedirects`, because `urllib`'s standard
+redirect handler copies `Authorization` onto the redirected request, so any 3xx (304 aside,
+which is a poll's not-modified answer) surfaces as an `HTTPError` that `_classify_status` maps
+to a fatal, non-retried failure instead of a request carrying the key to the `Location` host.
+
 **The skill's version is in the object's `key`. `version` is the payload's.** Each version
 of a skill is its own object on the wire, identified as `<key>:<version>`:
 

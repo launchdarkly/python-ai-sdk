@@ -183,6 +183,44 @@ def _require_server_side_credential(sdk_key: str) -> None:
         )
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+"""The only hosts a plain ``http://`` base URI may name: a local test double."""
+
+
+def _require_https_base_uri(base_uri: str) -> None:
+    """
+    Refuses a base URI that would send the SDK key in cleartext.
+
+    Every request carries the environment's server-side SDK key in
+    ``Authorization``, so the transport is ``https://`` only. The one exception
+    is ``http://`` to a loopback host (``localhost``, ``127.0.0.1``, ``::1``),
+    which never leaves the machine and is what a local test double listens on.
+    Raises rather than logs, for the same reason the credential check does: a
+    store that would leak its key should not exist.
+    """
+    if not isinstance(base_uri, str) or not base_uri.strip():
+        raise ValueError(
+            "FDv2SkillStore requires an https:// base URI; none was given."
+        )
+    parts = urllib.parse.urlsplit(base_uri.strip())
+    if parts.scheme == "https" and parts.hostname:
+        return
+    if parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS:
+        return
+    if parts.scheme == "http":
+        raise ValueError(
+            f"FDv2SkillStore refuses base_uri {base_uri!r}: a plain http:// URI "
+            "would send the server-side SDK key in cleartext. Use https:// "
+            "(the default is https://sdk.launchdarkly.com). Plain http:// is "
+            "allowed only for a loopback host (localhost, 127.0.0.1, ::1) "
+            "serving a local test double."
+        )
+    raise ValueError(
+        f"FDv2SkillStore refuses base_uri {base_uri!r}: expected an https:// URI "
+        "with a host, such as https://sdk.launchdarkly.com."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics
 # ---------------------------------------------------------------------------
@@ -869,6 +907,14 @@ def _classify_status(status: int, headers: Any) -> Exception:
         return _FatalTransportError(
             f"LaunchDarkly returned HTTP 403. {_FORBIDDEN_ADVICE}"
         )
+    if 300 <= status < 400 and status != 304:
+        return _FatalTransportError(
+            f"LaunchDarkly returned HTTP {status}, a redirect. Redirects are not "
+            "followed, so the SDK key is never forwarded to a host other than the "
+            "base URI. The SDK-facing FDv2 endpoints do not redirect; check the "
+            "base URI, and any proxy in between, for the address being redirected "
+            "to."
+        )
     if status in (400, 405, 406, 414, 501):
         return _FatalTransportError(
             f"LaunchDarkly returned HTTP {status}, which retrying will not fix. "
@@ -924,6 +970,36 @@ class _StreamConnection:
             pass
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """
+    A redirect handler that follows nothing.
+
+    The standard handler copies every request header onto the redirected
+    request, ``Authorization`` included, so a 3xx from a proxy or a misconfigured
+    private instance would hand the SDK key to whatever host ``Location`` names.
+    Declining here makes ``urllib`` surface the 3xx as an ``HTTPError``, which
+    ``_classify_status`` turns into a fatal, non-retried failure. Same-host
+    redirects are refused too: the endpoints this module calls do not redirect,
+    and a 304 is not a redirect and never reaches this handler.
+    """
+
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: Any,
+        msg: Any,
+        headers: Any,
+        newurl: Any,
+    ) -> None:
+        return None
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """The default opener with its redirect handler replaced by a refusing one."""
+    return urllib.request.build_opener(_RefuseRedirects)
+
+
 @dataclass(frozen=True)
 class _PollResult:
     not_modified: bool
@@ -952,8 +1028,9 @@ class _Requester:
         self._sdk_key = sdk_key
         self._base_uri = base_uri.rstrip("/")
         self._read_timeout = read_timeout
-        # Injectable, so an alternative transport can be supplied.
-        self._opener = opener or urllib.request.build_opener()
+        # Injectable, so an alternative transport can be supplied. The default
+        # never follows a redirect; see ``_RefuseRedirects``.
+        self._opener = opener or _build_opener()
         self._lock = threading.Lock()
         # The response of a poll in flight, so ``interrupt`` can reach its
         # socket from another thread. Polling only: a stream's response is
@@ -1016,7 +1093,8 @@ class _Requester:
                         self._in_flight = None
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
-                # urllib raises on 304 when no redirect handler swallows it.
+                # urllib raises on any non-2xx, 304 included; it is a current
+                # answer here, not a redirect, and is handled before classifying.
                 return _PollResult(not_modified=True, events=[], etag=etag)
             raise _classify_status(exc.code, exc.headers) from exc
         except Exception as exc:
@@ -1177,6 +1255,12 @@ class FDv2SkillStore:
     **Server-side only.** A mobile key or a client-side environment ID is
     refused in the constructor.
 
+    **The SDK key goes only where it was pointed.** *base_uri* must be
+    ``https://`` — plain ``http://`` is refused except to a loopback host, for
+    local test doubles — and redirects are never followed, so a 3xx from a proxy
+    or a private instance is a fatal failure rather than a request carrying the
+    key to whatever host ``Location`` named.
+
     **Delivery is in the background; retrieval is not.** A daemon thread owns
     the connection and fills memory, and ``get_object`` only ever reads what has
     already arrived. A process that calls ``get_skill`` immediately after
@@ -1210,6 +1294,9 @@ class FDv2SkillStore:
         _requester: Any = None,
     ) -> None:
         """
+        *base_uri* must be ``https://``; ``http://`` is accepted only for
+        ``localhost``, ``127.0.0.1`` or ``::1``. Raises ``ValueError`` otherwise.
+
         *mode* is ``"stream"`` by default. Prefer it: a ``delete-object`` reaches
         a live stream in seconds. ``"poll"`` exists for environments that cannot
         hold a long-lived connection, and revocation there is one
@@ -1230,6 +1317,7 @@ class FDv2SkillStore:
         payload resets the count.
         """
         _require_server_side_credential(sdk_key)
+        _require_https_base_uri(base_uri)
         if mode not in ("stream", "poll"):
             raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
         if poll_interval <= 0:
