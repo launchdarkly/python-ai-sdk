@@ -1466,8 +1466,17 @@ class FDv2SkillStore:
         Does not block: use ``wait_for_skills`` when boot ordering matters.
         """
         with self._lock:
+            # Read before the rearm clears it: a thread inside ``_give_up`` is
+            # still alive and no longer delivering, so ``is_alive`` on its own
+            # would have this call adopt a run that is about to return and
+            # leave a store reporting no failure and never delivering again.
+            delivering = (
+                self._failed_reason is None
+                and self._thread is not None
+                and self._thread.is_alive()
+            )
             self._rearm_waiters()
-            if self._thread is not None and self._thread.is_alive():
+            if delivering:
                 # A ``close`` whose join timed out leaves the previous thread
                 # running with the stop flag still set. Clearing it lets that
                 # thread carry on delivering, rather than leaving a store that
@@ -1494,6 +1503,10 @@ class FDv2SkillStore:
         """
         self._delivery_ended.clear()
         self._failed_reason = None
+        # The retry budget belongs to the run that spent it. Carrying it over
+        # would have a store that gave up after its failure limit give up again
+        # on the restarted run's first recoverable failure.
+        self._failures = 0
         if not self._first_payload.is_set():
             self._released.clear()
 
@@ -1733,14 +1746,18 @@ class FDv2SkillStore:
         with self._lock:
             self._failed_reason = reason
             self._reader.diagnostics.last_error = reason
+            # Let go of anyone waiting on a first payload that is never coming.
+            # Recorded beside the reason and under the lock so the two are
+            # published together: a ``start`` that landed between them would
+            # re-arm the waiters and then have this dying thread end delivery
+            # on the fresh run, releasing its waiters before it had answered.
+            self._end_delivery()
         logger.error(
             "Skill delivery has stopped and will not retry: %s. The store keeps "
             "serving the last content it received; skills will not update until "
             "the process restarts with a working connection.",
             reason,
         )
-        # Let go of anyone waiting on a first payload that is never coming.
-        self._end_delivery()
 
     def _apply(self, name: str, data: Any) -> None:
         """

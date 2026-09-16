@@ -1552,6 +1552,67 @@ class TestFailureHandling:
             assert store.wait_for_skills(timeout=5) is True
             assert store.failed is None
 
+    def test_a_restart_during_the_give_up_still_delivers(
+        self, endpoint: Any, monkeypatch: Any
+    ) -> None:
+        """A restart that races the dying thread must not adopt it.
+
+        ``failed`` becomes readable while the delivery thread is still alive and
+        winding down. A ``start`` in that window has to spawn a replacement: a
+        live thread is not by itself a delivering one, and treating it as one
+        leaves a store reporting no failure with nothing left to deliver.
+
+        The window is held open by blocking the give-up log line, which the
+        dying thread emits after publishing the reason.
+        """
+        giving_up = threading.Event()
+        may_finish = threading.Event()
+        real_error = skills_fdv2.logger.error
+
+        def blocking_error(msg: Any, *args: Any, **kwargs: Any) -> None:
+            if isinstance(msg, str) and msg.startswith("Skill delivery has stopped"):
+                giving_up.set()
+                may_finish.wait(timeout=5)
+            real_error(msg, *args, **kwargs)
+
+        monkeypatch.setattr(skills_fdv2.logger, "error", blocking_error)
+
+        endpoint.queue_poll(status=401)
+        with poll_store(endpoint) as store:
+            assert giving_up.wait(timeout=5)
+            # The premise of the test: the reason is readable and the thread
+            # that published it has not returned yet.
+            assert store.failed is not None
+            assert store._thread is not None
+            assert store._thread.is_alive()
+
+            endpoint.queue_poll(full_payload(("put-object", put_skill())))
+            store.start()
+            may_finish.set()
+
+            assert store.wait_for_skills(timeout=5) is True
+            assert store.failed is None
+
+    def test_a_restart_returns_the_retry_budget(self, endpoint: Any) -> None:
+        """The retry budget belongs to the run that spent it.
+
+        A store that gave up at its failure limit would otherwise carry the
+        spent count into the restarted run and give up again on its first
+        recoverable failure, without retrying once.
+        """
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        # One over the limit, so the first run retries once and then gives up.
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(status=500)
+        with store:
+            assert wait_until(lambda: store.failed is not None)
+
+            endpoint.queue_poll(status=500)
+            endpoint.queue_poll(full_payload(("put-object", put_skill())))
+            store.start()
+            assert store.wait_for_skills(timeout=5) is True
+            assert store.failed is None
+
     def test_a_401_stops_delivery(self, endpoint: Any) -> None:
         endpoint.queue_poll(status=401)
         with poll_store(endpoint) as store:
