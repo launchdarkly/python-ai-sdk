@@ -15,6 +15,7 @@ Examples:
     python main.py claude-agents            launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py openai-agents            launch-darkly-documentation-summarizer-open-ai-only "What is the LaunchDarkly AI SDK?"
     python main.py langchain-agents         launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
+    python main.py langchain-thinking       launch-darkly-documentation-summarizer-messages-claude "Reason it out yourself without any tools: what is 17 times 23?"
     python main.py native-graph             travel-agent-flow "Book me a flight to Paris"
     python main.py native-graph-langchain   travel-agent-flow "Book me a flight to Paris"
 """
@@ -45,6 +46,7 @@ EXAMPLES: dict[str, str] = {
     "streaming": "examples.streaming",
     "graph": "examples.graph_example",
     "graph-history": "examples.graph_history",
+    "conversation": "examples.conversation",
     "history": "examples.history",
     "judge": "examples.judge_example",
     "claude-agents": "examples.claude_agents_example",
@@ -55,6 +57,7 @@ EXAMPLES: dict[str, str] = {
     "langchain": "examples.langchain_example",
     "langchain-agents": "examples.langchain_agents_example",
     "langchain-messages": "examples.langchain_messages_example",
+    "langchain-thinking": "examples.langchain_thinking",
     "native-graph": "examples.native_graph",
     "native-graph-langchain": "examples.native_graph_langchain",
 }

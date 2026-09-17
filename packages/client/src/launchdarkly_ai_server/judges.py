@@ -5,23 +5,29 @@ import random
 from collections.abc import Callable
 from typing import Any
 
+from .conversation import with_judge_evaluation
+from .judge_scoring import (
+    FORMATTING_INSTRUCTIONS,
+    numeric_score,
+    parse_judge_response,
+)
 from .types import (
     AiConfigRep,
+    JudgeResult,
     JudgeRunResult,
     JudgeTask,
     LDContext,
     NativeTool,
     ProviderHandler,
     TrackData,
-    UsageDict,
 )
 from .utils import (
     collapse_messages_to_instructions as _collapse_messages_to_instructions,
 )
 from .utils import (
     normalize_mode,
-    parse_json_with_possible_fences,
     to_ld_context,
+    to_usage_dict,
 )
 
 
@@ -35,17 +41,6 @@ def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
 
 logger = logging.getLogger(__name__)
 
-_FORMATTING_INSTRUCTIONS = "\n".join(
-    [
-        "Your response MUST be in valid JSON format with the following structure:",
-        '{ "score": <number, 0-1>, "reasoning": <string> }',
-        "The output must be valid, parseable JSON. Do not include additional tags, comments, "
-        "formatting, or newlines.",
-        "It should be returned in a format that is immediately parseable by a JSON parsing "
-        "function. Do not include ```json tags.",
-    ]
-)
-
 
 async def run_judges(
     *,
@@ -58,7 +53,7 @@ async def run_judges(
     base_track_data: TrackData,
     tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
     graph_key: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JudgeResult]:
     """
     Runs any judges configured on ``config['judgeConfiguration']`` against the
     produced output. Each judge is itself a tracked AI call.
@@ -66,7 +61,7 @@ async def run_judges(
     from .lifecycle import extract_variation
     from .tracking import execute_and_track
 
-    judge_results: dict[str, Any] = {}
+    judge_results: dict[str, JudgeResult] = {}
 
     judge_config = (
         config.get("judgeConfiguration") or {} if isinstance(config, dict) else {}
@@ -151,54 +146,53 @@ async def run_judges(
             )
 
             message_history = "\n\n".join(
-                filter(None, [user_input, llm_response, _FORMATTING_INSTRUCTIONS])
+                filter(None, [user_input, llm_response, FORMATTING_INSTRUCTIONS])
             )
 
-            result = await execute_and_track(
-                config_key=judge_key,
-                config=effective_judge_config,
-                meta=judge_meta,
-                user_context=user_context,
-                handler=judge_handler,
-                user_input=llm_response,
-                tool_handlers=None,
-                graph_key=graph_key,
-                variables={
-                    "message_history": message_history,
-                    "response_to_evaluate": llm_response,
-                },
-            )
-
-            raw = result["response"]
-            judge_response = raw if isinstance(raw, str) else str(raw)
-
-            parsed = parse_json_with_possible_fences(judge_response)
-            if not parsed:
-                raise ValueError("Invalid JSON from judge")
-
-            score = parsed.get("score")
-            reasoning = parsed.get("reasoning", "")
-            judge_results[judge_key] = {
-                "usage": result["usage"],
-                "response": reasoning,
-                "score": score,
-            }
-
-            evaluation_metric_key = (
-                judge_ai_config.get("evaluationMetricKey")
-                if isinstance(judge_ai_config, dict)
-                else None
-            )
-            if evaluation_metric_key and score is not None:
-                from .lifecycle import get_client
-
-                client = get_client()
-                client.track(
-                    evaluation_metric_key,
-                    to_ld_context(client, user_context),
-                    {**base_track_data, "judgeConfigKey": judge_key},
-                    score,
+            async with with_judge_evaluation(judge_key) as record_evaluation:
+                result = await execute_and_track(
+                    config_key=judge_key,
+                    config=effective_judge_config,
+                    meta=judge_meta,
+                    user_context=user_context,
+                    handler=judge_handler,
+                    user_input=llm_response,
+                    tool_handlers=None,
+                    graph_key=graph_key,
+                    variables={
+                        "message_history": message_history,
+                        "response_to_evaluate": llm_response,
+                    },
                 )
+
+                score, reasoning = parse_judge_response(result["response"])
+                judge_results[judge_key] = JudgeResult(
+                    usage=to_usage_dict(result["usage"]),
+                    response=reasoning,
+                    score=score,
+                )
+                metric_score = numeric_score(score)
+                if metric_score is not None:
+                    record_evaluation(
+                        metric_score,
+                        reasoning if judge_handler.capture_content else None,
+                    )
+
+                evaluation_metric_key = (
+                    judge_ai_config.get("evaluationMetricKey")
+                    if isinstance(judge_ai_config, dict)
+                    else None
+                )
+                if evaluation_metric_key and score is not None:
+                    from .lifecycle import get_client
+
+                    client = get_client()
+                    client.track(
+                        evaluation_metric_key,
+                        to_ld_context(client, user_context),
+                        {**base_track_data, "judgeConfigKey": judge_key},
+                        score,
+                    )
 
         except Exception as exc:
             logger.error("Judge '%s' failed: %s", judge_key, exc)
@@ -381,46 +375,50 @@ async def run_judge(
     )
 
     message_history = "\n\n".join(
-        filter(None, [task.actual_output, _FORMATTING_INSTRUCTIONS])
+        filter(None, [task.actual_output, FORMATTING_INSTRUCTIONS])
     )
 
-    result = await execute_and_track(
-        config_key=task.config_key,
-        config=effective_config,
-        meta=task.judge_meta,
-        user_context=task.user_context,
-        handler=judge_handler,
-        user_input=task.actual_output,
-        tool_handlers=None,
-        variables={
-            **(task.variables or {}),
-            "message_history": message_history,
-            "response_to_evaluate": task.actual_output,
-        },
-    )
+    async with with_judge_evaluation(task.config_key) as record_evaluation:
+        result = await execute_and_track(
+            config_key=task.config_key,
+            config=effective_config,
+            meta=task.judge_meta,
+            user_context=task.user_context,
+            handler=judge_handler,
+            user_input=task.actual_output,
+            tool_handlers=None,
+            variables={
+                **(task.variables or {}),
+                "message_history": message_history,
+                "response_to_evaluate": task.actual_output,
+            },
+        )
 
-    raw = result["response"]
-    judge_response = raw if isinstance(raw, str) else str(raw)
-    parsed = parse_json_with_possible_fences(judge_response)
-    if not parsed:
-        return None
+        try:
+            score, reasoning = parse_judge_response(result["response"])
+        except ValueError:
+            return None
 
-    score = parsed.get("score", 0.0)
-    reasoning = parsed.get("reasoning", "")
-    raw_usage = result["usage"]
+        # The score is reported as the judge gave it. A missing or null score
+        # is not a zero: coercing it would record a gen_ai.evaluation of 0 --
+        # indistinguishable from a judge that scored the output a hard fail --
+        # where every other non-numeric judge output skips the metric instead.
+        metric_score = numeric_score(score)
+        if metric_score is not None:
+            record_evaluation(
+                metric_score,
+                reasoning if judge_handler.capture_content else None,
+            )
+        raw_usage = result["usage"]
 
-    usage = UsageDict(
-        input=raw_usage.get("input", 0),
-        output=raw_usage.get("output", 0),
-        total=raw_usage.get("total", 0),
-    )
+        usage = to_usage_dict(raw_usage)
 
-    merged_track_data: TrackData = {
-        **task.parent_track_data,
-        **result["track_data"],
-        "judgeConfigKey": task.config_key,
-    }
+        merged_track_data: TrackData = {
+            **task.parent_track_data,
+            **result["track_data"],
+            "judgeConfigKey": task.config_key,
+        }
 
-    return JudgeRunResult(
-        score=score, response=reasoning, usage=usage, track_data=merged_track_data
-    )
+        return JudgeRunResult(
+            score=score, response=reasoning, usage=usage, track_data=merged_track_data
+        )

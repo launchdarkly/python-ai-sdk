@@ -146,19 +146,27 @@ class ProviderHandler:
     - ``__call__`` — blocking invocation
     - ``stream``   — optional async-generator streaming (may be ``None``)
     - ``provides_for`` — ``(provider_name, mode)`` tuple or ``None``
+    - ``capture_content`` — whether this handler was built with content capture on
+
+    ``capture_content`` is declared here so the client core can apply the handler's own content
+    decision to content it writes on the handler's behalf — notably the judge's reasoning —
+    without reaching into the factory's closure.
     """
 
     provides_for: tuple[str, Literal["agent", "messages"]] | None
+    capture_content: bool
 
     def __init__(
         self,
         fn: _HandlerFn,
         provides_for: tuple[str, Literal["agent", "messages"]] | None = None,
         stream_fn: _StreamFn | None = None,
+        capture_content: bool = False,
     ) -> None:
         self._fn = fn
         self.provides_for = provides_for
         self._stream_fn = stream_fn
+        self.capture_content = capture_content
 
     async def __call__(
         self,
@@ -193,10 +201,25 @@ class ProviderHandler:
 
 
 @dataclass
+class InputTokenDetails:
+    """The cache breakdown behind an inclusive ``input`` figure.
+
+    Present only when the provider reported at least one cache field. ``uncached + cache_read +
+    cache_creation`` equals :attr:`UsageDict.input`.
+    """
+
+    uncached: int = 0
+    cache_read: int = 0
+    cache_creation: int = 0
+
+
+@dataclass
 class UsageDict:
     input: int = 0
     output: int = 0
     total: int = 0
+    #: Cache breakdown, when the provider reported one. See :class:`InputTokenDetails`.
+    input_details: InputTokenDetails | None = None
 
 
 @dataclass

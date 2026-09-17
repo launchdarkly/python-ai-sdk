@@ -1,6 +1,11 @@
-"""LaunchDarkly AI SDK - integration for Claude agents."""
+"""LaunchDarkly AI SDK - integration for Claude agents.
 
-__version__ = "0.1.4"  # x-release-please-version
+See https://launchdarkly.com/docs for usage.
+"""
+
+__version__ = "0.2.2"  # x-release-please-version
+
+from launchdarkly_ai_server import register_ai_sdk_package
 
 from . import native_graph  # noqa: F401
 from .builtins import (
@@ -44,3 +49,5 @@ __all__ = [
     "partition_tools",
     "to_claude_agents",
 ]
+
+register_ai_sdk_package("launchdarkly-ai-claude-agents", __version__)
