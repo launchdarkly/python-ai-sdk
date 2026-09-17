@@ -26,6 +26,7 @@ from .utils import (
 )
 from .utils import (
     normalize_mode,
+    omit_model_stamps,
     to_ld_context,
     to_usage_dict,
 )
@@ -413,8 +414,11 @@ async def run_judge(
 
         usage = to_usage_dict(raw_usage)
 
+        # A judge without a pinned model config must not inherit the parent's
+        # modelKey / modelVersion; every other parent-only key (graphKey, ...)
+        # is still carried over.
         merged_track_data: TrackData = {
-            **task.parent_track_data,
+            **omit_model_stamps(task.parent_track_data),
             **result["track_data"],
             "judgeConfigKey": task.config_key,
         }

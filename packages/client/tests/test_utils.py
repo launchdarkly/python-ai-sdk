@@ -11,7 +11,9 @@ import pytest
 from launchdarkly_ai_server import (
     create_handler,
     make_track_data,
+    model_stamps_from_meta,
     normalize_mode,
+    omit_model_stamps,
     parse_json_with_possible_fences,
     parse_template,
     parse_usage,
@@ -302,3 +304,40 @@ class TestMakeTrackData:
         )
         assert "modelKey" not in td
         assert "modelVersion" not in td
+
+
+class TestModelStampsFromMeta:
+    """§3.10 model stamps — malformed ``modelVersion`` is omitted, never raises."""
+
+    def test_copies_int_version_and_non_empty_key(self) -> None:
+        assert model_stamps_from_meta({"modelKey": "m", "modelVersion": 3}) == {
+            "modelKey": "m",
+            "modelVersion": 3,
+        }
+
+    @pytest.mark.parametrize("value", ["3", 3.0])
+    def test_coerces_integral_string_and_float(self, value: Any) -> None:
+        assert model_stamps_from_meta({"modelVersion": value}) == {"modelVersion": 3}
+
+    @pytest.mark.parametrize(
+        "value", ["abc", "1.5", 1.5, {}, [], None, True, False, float("nan")]
+    )
+    def test_omits_malformed_version_without_raising(self, value: Any) -> None:
+        stamps = model_stamps_from_meta({"modelVersion": value, "modelKey": "m"})
+        assert "modelVersion" not in stamps
+        assert stamps["modelKey"] == "m"
+
+    def test_non_dict_meta_returns_empty(self) -> None:
+        assert model_stamps_from_meta(None) == {}
+        assert model_stamps_from_meta("nope") == {}
+
+
+class TestOmitModelStamps:
+    def test_removes_only_the_two_stamp_keys(self) -> None:
+        td = {"runId": "r", "graphKey": "g", "modelKey": "m", "modelVersion": 1}
+        assert omit_model_stamps(td) == {"runId": "r", "graphKey": "g"}
+
+    def test_does_not_mutate_input(self) -> None:
+        td = {"runId": "r", "modelKey": "m"}
+        omit_model_stamps(td)
+        assert td == {"runId": "r", "modelKey": "m"}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -553,10 +554,42 @@ def model_stamps_from_meta(meta: Any) -> dict[str, Any]:
     model_key = meta.get("modelKey")
     if model_key:
         stamps["modelKey"] = model_key
-    model_version = meta.get("modelVersion")
+    model_version = _coerce_model_version(meta.get("modelVersion"))
     if model_version is not None:
-        stamps["modelVersion"] = int(model_version)
+        stamps["modelVersion"] = model_version
     return stamps
+
+
+def _coerce_model_version(value: Any) -> int | None:
+    """
+    Coerces an ``_ldMeta.modelVersion`` value to ``int``. Accepts ``int``
+    (but not ``bool``), integral ``float`` and integer-looking ``str``;
+    returns ``None`` for anything else. ``_ldMeta`` is an untyped flag payload,
+    so a malformed value must be dropped rather than abort the invocation.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def omit_model_stamps(track_data: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Returns a copy of ``track_data`` without ``modelKey`` / ``modelVersion``.
+    Used when overlaying a judge's ``track_data`` on its parent's so a judge
+    without a pinned model config does not inherit the parent's identity.
+    """
+    return {
+        k: v for k, v in track_data.items() if k not in ("modelKey", "modelVersion")
+    }
 
 
 def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, Any]:
