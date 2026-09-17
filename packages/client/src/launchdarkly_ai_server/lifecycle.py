@@ -8,6 +8,7 @@ from typing import Any
 
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .types import InitClientOptions
+from .utils import model_stamps_from_meta
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +354,9 @@ async def extract_variation(
         "variationKey": ld_meta.get("variationKey", ""),
         "version": ld_meta.get("version", 1),
         "mode": ld_meta.get("mode"),
+        # Pinned model-config identity; keys are omitted when absent so that
+        # tracking payloads never carry ``None`` values.
+        **model_stamps_from_meta(ld_meta),
     }
 
     # Strip _ldMeta for config parsing

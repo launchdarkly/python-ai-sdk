@@ -109,6 +109,7 @@ from .utils import (
     end_unfinished_spans,
     lang_chain_span_usage,
     make_track_data,
+    model_stamps_from_meta,
     normalize_mode,
     number_or_zero,
     parse_json_with_possible_fences,
@@ -195,6 +196,7 @@ __all__ = [  # noqa: RUF022
     # utils
     "create_handler",
     "make_track_data",
+    "model_stamps_from_meta",
     "normalize_mode",
     "parse_json_with_possible_fences",
     "parse_template",

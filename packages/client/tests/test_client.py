@@ -112,6 +112,74 @@ class TestConfigSingleHandler:
         result = await m.invoke("q", CONTEXT)
         assert result.response == "answer"
 
+    async def test_track_data_copies_model_key_and_version_from_ld_meta(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        raw = await mock_ld_client.variation("flag", CONTEXT, None)
+        raw = {
+            **raw,
+            "_ldMeta": {**raw["_ldMeta"], "modelKey": "my-model", "modelVersion": 3},
+        }
+        mock_ld_client.variation = AsyncMock(return_value=raw)
+        m = config(key="flag", handler=_make_handler())
+        result = await m.invoke("q", CONTEXT)
+        assert result.track_data is not None
+        assert result.track_data["modelKey"] == "my-model"
+        assert result.track_data["modelVersion"] == 3
+        assert isinstance(result.track_data["modelVersion"], int)
+        assert mock_ld_client.track.call_args_list
+        for call in mock_ld_client.track.call_args_list:
+            payload = call[0][2]
+            assert payload["modelKey"] == "my-model"
+            assert payload["modelVersion"] == 3
+
+    async def test_track_data_omits_model_key_and_version_when_absent(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        m = config(key="flag", handler=_make_handler())
+        result = await m.invoke("q", CONTEXT)
+        assert result.track_data is not None
+        assert "modelKey" not in result.track_data
+        assert "modelVersion" not in result.track_data
+        for call in mock_ld_client.track.call_args_list:
+            payload = call[0][2]
+            assert "modelKey" not in payload
+            assert "modelVersion" not in payload
+
+    async def test_track_data_treats_empty_model_key_as_absent(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        raw = await mock_ld_client.variation("flag", CONTEXT, None)
+        raw = {
+            **raw,
+            "_ldMeta": {**raw["_ldMeta"], "modelKey": "", "modelVersion": "2"},
+        }
+        mock_ld_client.variation = AsyncMock(return_value=raw)
+        m = config(key="flag", handler=_make_handler())
+        result = await m.invoke("q", CONTEXT)
+        assert result.track_data is not None
+        assert "modelKey" not in result.track_data
+        assert result.track_data["modelVersion"] == 2
+        assert isinstance(result.track_data["modelVersion"], int)
+
+    async def test_stream_track_data_copies_model_key_and_version(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        raw = await mock_ld_client.variation("flag", CONTEXT, None)
+        raw = {
+            **raw,
+            "_ldMeta": {**raw["_ldMeta"], "modelKey": "my-model", "modelVersion": 3},
+        }
+        mock_ld_client.variation = AsyncMock(return_value=raw)
+        m = config(key="flag", handler=_make_handler(stream_chunks=["a", "b"]))
+        async for _ in m.stream("q", CONTEXT):
+            pass
+        assert mock_ld_client.track.call_args_list
+        for call in mock_ld_client.track.call_args_list:
+            payload = call[0][2]
+            assert payload["modelKey"] == "my-model"
+            assert payload["modelVersion"] == 3
+
     async def test_generation_success_on_success(
         self, mock_ld_client: MagicMock
     ) -> None:

@@ -4,10 +4,13 @@ parse_usage, normalize_mode, create_handler.
 Reference: TESTING.md s3.1-3.4, s3.15
 """
 
+from typing import Any
+
 import pytest
 
 from launchdarkly_ai_server import (
     create_handler,
+    make_track_data,
     normalize_mode,
     parse_json_with_possible_fences,
     parse_template,
@@ -262,3 +265,40 @@ class TestCreateHandler:
         assert callable(h)
         # The original function is accessible via _fn attribute
         assert h._fn is fn
+
+
+class TestMakeTrackData:
+    """§3.10 model stamps — shared node-trackData builder for native graph adapters."""
+
+    def _node(self, meta: dict) -> Any:
+        from launchdarkly_ai_server.types import GraphNode
+
+        return GraphNode(
+            key="node-a",
+            config={"model": {"name": "gpt-4"}, "provider": {"name": "OpenAI"}},
+            meta=meta,
+        )
+
+    def test_copies_model_key_and_version_from_meta(self) -> None:
+        td = make_track_data(
+            self._node(
+                {
+                    "variationKey": "v1",
+                    "version": 1,
+                    "modelKey": "my-model",
+                    "modelVersion": 3,
+                }
+            ),
+            "graph-key",
+            "run-1",
+        )
+        assert td["modelKey"] == "my-model"
+        assert td["modelVersion"] == 3
+        assert td["graphKey"] == "graph-key"
+
+    def test_omits_model_key_and_version_when_absent(self) -> None:
+        td = make_track_data(
+            self._node({"variationKey": "v1", "version": 1}), "graph-key", "run-1"
+        )
+        assert "modelKey" not in td
+        assert "modelVersion" not in td

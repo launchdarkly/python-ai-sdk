@@ -240,6 +240,8 @@ Payload attached to every LaunchDarkly tracking event.
 | `version` | `int` | Variation version number. |
 | `modelName` | `str` | Model name from the config. |
 | `providerName` | `str` | Provider name from the config. |
+| `modelKey` | `str?` | Stable key of the pinned model config, read from `_ldMeta.modelKey`. Omitted when the variation has no pinned model config. |
+| `modelVersion` | `int?` | Pinned model config version, read from `_ldMeta.modelVersion`. Omitted when absent. |
 | `graphKey` | `str?` | Present when the event was produced inside an agent graph. |
 | `toolKey` | `str?` | Present when the event is for a tool call. |
 | `judgeConfigKey` | `str?` | Present when the event is from a judge execution. |

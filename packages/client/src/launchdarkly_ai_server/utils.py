@@ -538,6 +538,27 @@ def select_handler(
     raise ValueError(f"Handler for provider {provider} not found")
 
 
+def model_stamps_from_meta(meta: Any) -> dict[str, Any]:
+    """
+    Copies the pinned model-config identity (``modelKey``, ``modelVersion``)
+    from a variation's ``_ldMeta`` into a dict that can be merged into
+    ``TrackData``. Keys are omitted (never set to ``None``) when absent; an
+    empty ``modelKey`` is treated as absent and ``modelVersion`` is coerced to
+    ``int``. Gonfalon's cost attribution reads these two fields from every
+    ``$ld:ai:*`` event payload.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    stamps: dict[str, Any] = {}
+    model_key = meta.get("modelKey")
+    if model_key:
+        stamps["modelKey"] = model_key
+    model_version = meta.get("modelVersion")
+    if model_version is not None:
+        stamps["modelVersion"] = int(model_version)
+    return stamps
+
+
 def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, Any]:
     """
     Builds the standard tracking payload for a graph node event.
@@ -552,6 +573,7 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
         "version": meta.get("version", 1),
         "modelName": config.get("model", {}).get("name", ""),
         "providerName": config.get("provider", {}).get("name", ""),
+        **model_stamps_from_meta(meta),
         "graphKey": graph_key,
     }
 

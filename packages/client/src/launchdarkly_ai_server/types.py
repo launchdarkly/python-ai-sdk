@@ -97,7 +97,9 @@ Raw AI config dict as returned by ``parse_ai_config``. Fields include
 
 VariationMeta = dict[str, Any]
 """
-Variation metadata: ``enabled``, ``variation_key``, ``version``, ``mode``.
+Variation metadata: ``enabled``, ``variationKey``, ``version``, ``mode``, and
+the pinned model-config identity ``modelKey`` / ``modelVersion`` (delivered in
+``_ldMeta``; absent when no model config is pinned).
 """
 
 # ---------------------------------------------------------------------------

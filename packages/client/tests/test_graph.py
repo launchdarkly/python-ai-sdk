@@ -192,6 +192,55 @@ class TestGraphInvoke:
         result = await g.invoke("hi", CONTEXT)
         assert result.response is not None
 
+    async def test_graph_events_copy_model_key_and_version_from_ld_meta(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        graph_var = {
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "gv1",
+                "version": 2,
+                "modelKey": "graph-model",
+                "modelVersion": 5,
+            },
+            "root": "root-node",
+            "edges": {"root-node": [{"key": "leaf-node"}]},
+        }
+        original = mock_ld_client.variation
+
+        async def side_effect(key: str, ctx: dict, default: Any) -> Any:
+            if key == "graph-key":
+                return graph_var
+            return await original(key, ctx, default)
+
+        mock_ld_client.variation = AsyncMock(side_effect=side_effect)
+        g = graph("graph-key", handlers=[_make_handler()])
+        await g.invoke("hi", CONTEXT)
+        graph_calls = [
+            c
+            for c in mock_ld_client.track.call_args_list
+            if str(c[0][0]).startswith("$ld:ai:graph:")
+        ]
+        assert graph_calls
+        for c in graph_calls:
+            assert c[0][2]["modelKey"] == "graph-model"
+            assert c[0][2]["modelVersion"] == 5
+
+    async def test_graph_events_omit_model_key_and_version_when_absent(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        g = graph("graph-key", handlers=[_make_handler()])
+        await g.invoke("hi", CONTEXT)
+        graph_calls = [
+            c
+            for c in mock_ld_client.track.call_args_list
+            if str(c[0][0]).startswith("$ld:ai:graph:")
+        ]
+        assert graph_calls
+        for c in graph_calls:
+            assert "modelKey" not in c[0][2]
+            assert "modelVersion" not in c[0][2]
+
     async def test_graph_duration_total_tracked(
         self, mock_ld_client: MagicMock
     ) -> None:
