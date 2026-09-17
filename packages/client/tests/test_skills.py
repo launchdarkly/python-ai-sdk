@@ -1348,6 +1348,47 @@ class TestVersionPinning:
         skills = await all_skills()
         assert sorted((s.key, s.version) for s in skills) == [("a", 2), ("b", 5)]
 
+    async def test_a_listed_object_is_filed_under_its_own_key(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        make_raw_skill: Any,
+        recording_emitter: Any,
+    ) -> None:
+        """The counterpart to the pinned path's ``key_mismatch``.
+
+        The asymmetry is deliberate rather than a gap. A listing carries no
+        requested key, so there is nothing for the object's key to disagree
+        *with*: identity comes off the object, and the store's map key is used
+        for one thing only — attributing a failure when the object's own key is
+        unusable.
+
+        The seam never promised a map key spells a skill key, either: a store
+        holding several versions of one key has reason to spell it
+        ``key:version``, which is exactly what ``FDv2SkillStore`` does. Pinned
+        because the asymmetry with the pinned path is surprising enough to
+        invite a "fix" that would break every multi-version store.
+        """
+        caplog.set_level("ERROR", logger="launchdarkly_ai_server.skills_core")
+
+        class _MisfiledStore:
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return None
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {"filed-under-this": make_raw_skill(key="its-own-key")}
+
+        skills_module._set_store(_MisfiledStore())
+        skills_module._set_emitter_for_testing(recording_emitter)
+
+        skills = await all_skills()
+
+        assert [s.key for s in skills] == ["its-own-key"]
+        # Neither surface fires: nothing failed.
+        assert recording_emitter.records == []
+        assert _integrity_records(caplog) == []
+
     async def test_a_store_answering_with_the_wrong_version_is_withheld(
         self, make_raw_skill: Any
     ) -> None:
@@ -1759,16 +1800,114 @@ class TestIntegrityFailureLogRecord:
     def test_the_case_table_exhausts_the_vocabulary(self) -> None:
         """The vocabulary is closed, and every token in it is reachable.
 
-        Both directions matter. A ninth token added to the source without a call
-        site fails here, and so does a ninth call site that invented a token the
+        Both directions matter. A tenth token added to the source without a call
+        site fails here, and so does a tenth call site that invented a token the
         table does not cover — which is what keeps the Python and TypeScript
         vocabularies from drifting apart one edit at a time.
+
+        ``key_mismatch`` is added in rather than living in the table because it
+        is the one token that is *not* a verification failure: it is decided at
+        the retrieval boundary, after ``verify_raw_skill`` has already passed, so
+        it is unreachable through ``all_skills`` and cannot join a table that is
+        uniformly driven through it. Its own coverage is
+        ``test_key_mismatch_records_the_log_but_not_the_signal``.
         """
         from launchdarkly_ai_server import skills_core
 
-        covered = {case.values[1] for case in REASON_CODE_CASES}
+        covered = {case.values[1] for case in REASON_CODE_CASES} | {"key_mismatch"}
         assert covered == skills_core.INTEGRITY_REASON_CODES
-        assert len(covered) == 8
+        assert len(covered) == 9
+
+    async def test_key_mismatch_records_the_log_but_not_the_signal(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        make_raw_skill: Any,
+        recording_emitter: Any,
+    ) -> None:
+        """The one-directional exception to "the two surfaces agree".
+
+        The log record fires because a substituting store is a genuine tampering
+        indicator and the record is the customer-owned detection path — the only
+        one that works with telemetry off. Reusing the event identity is
+        deliberate: a customer's existing SIEM rule catches this case without
+        being rewritten, and ``reason_code`` is what distinguishes it.
+
+        The product signal stays out of it because the overwhelmingly common
+        cause of a key mismatch is not an attacker but a broken store adapter —
+        a stale cache entry, a colliding key, a wrong index lookup — and
+        LaunchDarkly's own counter must not fill up with customers' adapter
+        bugs. That is the same false positive the pinned-non-dict path refuses
+        for the same reason.
+        """
+
+        class _AliasingStore:
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return make_raw_skill(key="served-key")
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {}
+
+        skills_module._set_store(_AliasingStore())
+        skills_module._set_emitter_for_testing(recording_emitter)
+
+        assert await get_skill("asked-for") is None
+
+        # The signal surface saw nothing at all, not merely no integrity signal.
+        assert recording_emitter.records == []
+
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        record = records[0]
+        assert record["reason_code"] == "key_mismatch"
+        assert record["event"] == INTEGRITY_EVENT
+        assert record["action"] == "withheld"
+        assert record["language"] == "python"
+        assert record["reason"]
+
+        # Both keys are named, and ``skill_key`` keeps the meaning it has on
+        # every other record — the key the *caller asked for* — so a rule
+        # grouping by it still works. The key the store actually answered under
+        # is what makes a broken adapter diagnosable, so it is a parseable field
+        # rather than prose buried in ``reason``.
+        assert record["skill_key"] == "asked-for"
+        assert record["served_key"] == "served-key"
+
+        # Verification passed, so there is no hash disagreement to report and
+        # the two hash fields stay absent rather than being emitted as null.
+        assert "expected_hash" not in record
+        assert "observed_hash" not in record
+        assert None not in record.values()
+
+        # Sorted, like every other record, so the line stays byte-comparable
+        # across SDKs. ``served_key`` has to land in its alphabetical place.
+        assert list(record) == sorted(record)
+
+        # The structured mirror is required alongside the text.
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert errors[0].__dict__["ld_skills"] == record
+
+    async def test_a_hostile_served_key_is_redacted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Unreachable today, asserted anyway.
+
+        Verification accepts the served key before this path runs, so the value
+        is well-formed by construction — but that is a property of the current
+        call order rather than of the recorder, and the guard is what keeps a
+        future reordering from publishing a body here. Called directly, since no
+        store can currently drive it.
+        """
+        from launchdarkly_ai_server import skills_core
+
+        skills_core.record_key_mismatch("asked-for", LOGGED_BODY)
+
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        assert records[0]["served_key"] == "<invalid-key>"
+        assert LOGGED_BODY not in json.dumps(records[0])
 
     async def test_the_event_name_is_in_the_message_text(
         self, caplog: pytest.LogCaptureFixture
