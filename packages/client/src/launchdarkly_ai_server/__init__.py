@@ -1,8 +1,42 @@
-"""LaunchDarkly AI SDK - core client for Python."""
+"""LaunchDarkly AI SDK - core client for Python.
 
-__version__ = "0.1.3"  # x-release-please-version
+See https://launchdarkly.com/docs for usage.
+"""
+
+__version__ = "0.2.2"  # x-release-please-version
 
 from .client import ConfigInstance, config
+from .content import (
+    SpanMessage,
+    SpanMessagePart,
+    ToolDefinitionInput,
+    lang_chain_content_text,
+    lang_chain_finish_reasons,
+    lang_chain_span_messages,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    set_tool_call_content_attributes,
+    set_tool_definition_attributes,
+    text_message,
+    to_semconv_finish_reason,
+)
+from .conversation import (
+    ConversationIdSpanProcessor,
+    conversation_id,
+    set_conversation_id_if_absent,
+)
+from .evaluations import (
+    Criterion,
+    DatasetRow,
+    EvalRunResult,
+    EvaluationsError,
+    EvaluationsModule,
+    GenerationConfig,
+    Judge,
+    RunSummary,
+    Scorer,
+    init_evaluations,
+)
 from .graph import GraphInstance, graph, resolve_graph
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
@@ -19,6 +53,7 @@ from .registry import (
     resolve_handlers,
     resolve_tools,
 )
+from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -34,6 +69,7 @@ from .types import (
     HandlerResult,
     HandlerStreamEvent,
     InitClientOptions,
+    InputTokenDetails,
     JudgeResult,
     JudgeRunResult,
     JudgeTask,
@@ -56,16 +92,27 @@ from .types import (
 )
 from .types_validation import parse_ai_config
 from .utils import (
+    RunUsage,
+    SpanUsage,
+    add_cached_tokens_to_input,
     create_handler,
+    create_run_usage,
+    end_span_once,
+    end_unfinished_spans,
+    lang_chain_span_usage,
     make_track_data,
     normalize_mode,
+    number_or_zero,
     parse_json_with_possible_fences,
     parse_template,
     parse_usage,
     set_ld_span_attributes,
+    set_model_identity_attributes,
     set_openllmetry_completion,
     set_openllmetry_prompt,
+    set_usage_span_attributes,
     to_ld_context,
+    to_usage_dict,
 )
 
 __all__ = [  # noqa: RUF022
@@ -100,8 +147,43 @@ __all__ = [  # noqa: RUF022
     "StreamDoneEvent",
     "StreamEvent",
     "TrackData",
+    "InputTokenDetails",
+    "RunUsage",
+    "SpanMessage",
+    "SpanMessagePart",
+    "SpanUsage",
+    "ToolDefinitionInput",
     "UsageDict",
+    "add_cached_tokens_to_input",
+    "create_run_usage",
+    "end_span_once",
+    "end_unfinished_spans",
+    "lang_chain_content_text",
+    "lang_chain_finish_reasons",
+    "lang_chain_span_messages",
+    "lang_chain_span_usage",
+    "number_or_zero",
+    "set_input_content_attributes",
+    "set_model_identity_attributes",
+    "set_output_content_attributes",
+    "set_tool_call_content_attributes",
+    "set_tool_definition_attributes",
+    "set_usage_span_attributes",
+    "to_usage_dict",
+    "text_message",
+    "to_semconv_finish_reason",
     "VariationMeta",
+    # evaluations
+    "EvalRunResult",
+    "Criterion",
+    "DatasetRow",
+    "EvaluationsError",
+    "EvaluationsModule",
+    "GenerationConfig",
+    "Judge",
+    "RunSummary",
+    "Scorer",
+    "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",
@@ -131,6 +213,9 @@ __all__ = [  # noqa: RUF022
     "shutdown",
     "extract_variation",
     "inspect_config",
+    "SDK_INFO_CONTEXT",
+    "SDK_INFO_EVENT",
+    "register_ai_sdk_package",
     # judges
     "build_judge_tasks",
     "run_judge",
@@ -138,8 +223,14 @@ __all__ = [  # noqa: RUF022
     # client
     "config",
     "ConfigInstance",
+    # conversation
+    "ConversationIdSpanProcessor",
+    "conversation_id",
+    "set_conversation_id_if_absent",
     # graph
     "graph",
     "resolve_graph",
     "GraphInstance",
 ]
+
+register_ai_sdk_package("launchdarkly-ai-server", __version__)

@@ -42,7 +42,7 @@ class TestWrapToolHandlers:
             await wrapped["my_tool"]()
         call_args = mock_client.track.call_args
         assert call_args[0][0] == "$ld:ai:tool_call"
-        assert call_args[0][2]["toolName"] == "my_tool"
+        assert call_args[0][2]["toolKey"] == "my_tool"
 
     async def test_return_value_is_preserved(self) -> None:
         mock_client = _make_mock_client()

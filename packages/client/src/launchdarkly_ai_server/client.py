@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .conversation import bind_conversation_id
 from .judges import build_judge_tasks, run_judges
 from .lifecycle import extract_variation
 from .registry import resolve_handlers, resolve_tools
@@ -15,12 +16,12 @@ from .types import (
     ProviderHandler,
     ProviderResponse,
     StreamEvent,
-    UsageDict,
     VariationMeta,
 )
 from .utils import (
     parse_json_with_possible_fences,
     select_handler,
+    to_usage_dict,
 )
 
 
@@ -112,11 +113,7 @@ class ConfigInstance:
             else json.dumps(parsed_response)
         )
 
-        usage_obj = UsageDict(
-            input=usage.get("input", 0),
-            output=usage.get("output", 0),
-            total=usage.get("total", 0),
-        )
+        usage_obj = to_usage_dict(usage)
 
         if self._skip_judges:
             judge_tasks = await build_judge_tasks(
@@ -151,7 +148,25 @@ class ConfigInstance:
             track_data=track_data,
         )
 
-    async def stream(
+    def stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Stream events for this config.
+
+        Deliberately not an ``async def`` with ``yield``: a generator body does not run until the
+        first ``__anext__``, by which point a :func:`conversation_id` block wrapped around this
+        call has already exited. Binding here — at call time — is what lets a caller hand the
+        generator off and iterate it later.
+        """
+        return bind_conversation_id(
+            self._stream_events(user_input, context, variables, history)
+        )
+
+    async def _stream_events(
         self,
         user_input: str | None,
         context: LDContext,

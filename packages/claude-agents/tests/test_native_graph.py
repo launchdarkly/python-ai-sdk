@@ -652,3 +652,62 @@ class TestToClaudeAgentsAnthropicSpecific:
             handlers: dict[str, Any] = {}
             await build_tool_mcp(config_tools, handlers)
             # The actual error is raised when the fn is *called*, not when mcp is built
+
+
+class TestNativeGraphConversationId:
+    """The telemetry contract claims the conversation id reaches ``ld.ai.graph`` spans.
+
+    The span is opened after an ``await`` on the graph definition, so this pins that the binding
+    survives the await chain rather than only covering spans started synchronously in the block.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stamps_conversation_id_on_graph_span(self) -> None:
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        import launchdarkly_ai_claude_agents.native_graph as ng_mod
+        from launchdarkly_ai_server.conversation import (
+            GEN_AI_CONVERSATION_ID,
+            ConversationIdSpanProcessor,
+            conversation_id,
+        )
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(ConversationIdSpanProcessor())
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+        # A real tracer behind the module's `trace` lookup: the span and the processor are real,
+        # only the global-provider registration is bypassed (it is process-wide and set once).
+        real_trace = MagicMock()
+        real_trace.get_tracer.return_value = provider.get_tracer(
+            "@launchdarkly/ai-claude-agents"
+        )
+
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(ng_mod, "trace", real_trace):
+                with patch.object(ng_mod, "_HAS_OTEL", True):
+                    with conversation_id("thread-graph"):
+                        await to_claude_agents(_make_def_promise(graph_def)).invoke(
+                            "hi"
+                        )
+
+        graph_spans = [
+            s for s in exporter.get_finished_spans() if s.name == "ld.ai.graph"
+        ]
+        assert len(graph_spans) == 1
+        assert (graph_spans[0].attributes or {}).get(
+            GEN_AI_CONVERSATION_ID
+        ) == "thread-graph"

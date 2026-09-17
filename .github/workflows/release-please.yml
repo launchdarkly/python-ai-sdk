@@ -94,7 +94,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/client/dist/
@@ -125,7 +125,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/ai/dist/
@@ -156,7 +156,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/claude-agents/dist/
@@ -187,7 +187,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/claude-messages/dist/
@@ -218,7 +218,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/openai-agents/dist/
@@ -249,7 +249,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/openai-messages/dist/
@@ -280,7 +280,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/langchain-agents/dist/
@@ -311,7 +311,7 @@ jobs:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/langchain-messages/dist/
@@ -340,7 +340,7 @@ jobs:
           ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
       - name: Publish to PyPI
         if: ${{ format('{0}', inputs.dry_run) != 'true' }}
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: ${{ inputs.workspace_path }}/dist/

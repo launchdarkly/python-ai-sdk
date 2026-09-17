@@ -1,5 +1,11 @@
 # Agent Guide — `launchdarkly-ai-claude-agents`
 
+> **Span shape.** This package emits `invoke_agent` → `chat {model}` → `execute_tool {name}`, with
+> tool spans as siblings of `chat`. Span construction lives in `spans.py` beside the handler.
+> Conversation content is off unless the caller passes `capture_content=True`.
+> `TELEMETRY-CONTRACT.md` at the repo root is the authority; read it before changing span code.
+
+
 This document tells an agent exactly how this package is implemented so it can be correctly modified, debugged, or used as a reference when building a new handler.
 
 ---
@@ -129,6 +135,11 @@ Span event after the call:
 - `gen_ai.content.completion` with attribute `gen_ai.completion` = the result string
 
 On error: `span.record_exception(exc)`, status set to ERROR, span ended, error re-raised.
+
+`gen_ai.conversation.id` is a caller-supplied id from `conversation_id(...)`, or the CLI
+`session_id` from the `init` message when the caller supplied none. Write-if-absent: the caller
+id wins. An app that opens a fresh CLI session per turn and re-feeds history must pass its own
+conversation id, or each turn becomes its own conversation.
 
 ---
 

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import ProviderHandler, run_judges
+from launchdarkly_ai_server import JudgeResult, ProviderHandler, run_judges
 
 CONTEXT = {"kind": "user", "key": "u1"}
 
@@ -319,6 +319,54 @@ class TestRunJudges:
 
         assert called_handlers == ["messages"]
 
+    async def test_returns_judge_result_objects_with_score_and_reasoning(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """Inline results must be ``JudgeResult`` instances.
+
+        The conversation example (and ``ProviderResponse.judge_results``) read
+        ``.score`` / ``.response`` as attributes. A plain dict makes those always
+        ``None`` even when a judge ran.
+        """
+        judge_variation = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "judge",
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            result = await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=_make_handler(),
+                user_input="q",
+                llm_response="r",
+                base_track_data={"runId": "x"},
+            )
+
+        assert "judge-1" in result
+        judge = result["judge-1"]
+        assert isinstance(judge, JudgeResult)
+        # Attribute access — the pattern the conversation example uses.
+        assert getattr(judge, "score", None) == 0.9
+        assert getattr(judge, "response", None) == "good"
+
     async def test_returns_empty_dict_when_judges_array_is_empty(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -337,3 +385,96 @@ class TestRunJudges:
             base_track_data={},
         )
         assert result == {}
+
+
+class TestScoreGuard:
+    """`float(score)` used to sit ahead of the evaluation-metric track, so a junk score killed it."""
+
+    def test_rejects_non_numeric_scores_without_raising(self) -> None:
+        from launchdarkly_ai_server.judge_scoring import numeric_score
+
+        for junk in ("0.9 (high)", "85%", None, {"v": 1}, [], True, False):
+            assert numeric_score(junk) is None
+
+    def test_accepts_finite_numbers(self) -> None:
+        from math import inf, nan
+
+        from launchdarkly_ai_server.judge_scoring import numeric_score
+
+        assert numeric_score(0.9) == 0.9
+        assert numeric_score(1) == 1.0
+        assert numeric_score(0) == 0.0
+        assert numeric_score(inf) is None
+        assert numeric_score(nan) is None
+
+
+class TestRunJudgeScoreReporting:
+    """A judge that returns no score has not scored the output a zero."""
+
+    @pytest.mark.asyncio
+    async def test_null_score_skips_the_metric_instead_of_recording_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from contextlib import asynccontextmanager
+
+        import launchdarkly_ai_server.judges as judges_module
+        import launchdarkly_ai_server.tracking as tracking_module
+        from launchdarkly_ai_server import JudgeTask, run_judge
+
+        recorded: list[tuple[float, str | None]] = []
+
+        @asynccontextmanager
+        async def fake_with_judge_evaluation(name: str) -> Any:
+            def record(score: float, explanation: str | None = None) -> None:
+                recorded.append((score, explanation))
+
+            yield record
+
+        monkeypatch.setattr(
+            judges_module, "with_judge_evaluation", fake_with_judge_evaluation
+        )
+
+        async def fake_execute_and_track(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "response": '{"score": null, "reasoning": "cannot tell"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "track_data": {"runId": "run-1"},
+            }
+
+        monkeypatch.setattr(
+            tracking_module, "execute_and_track", fake_execute_and_track
+        )
+
+        async def judge_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            raise AssertionError("execute_and_track is stubbed")
+
+        handler = ProviderHandler(
+            fn=judge_fn, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+
+        task = JudgeTask(
+            config_key="judge-key",
+            judge_config={
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+            },
+            judge_meta={"enabled": True, "variationKey": "j1", "version": 1},
+            actual_output="response",
+            user_context=CONTEXT,
+            judge_provider="TestProvider",
+            judge_mode="messages",
+            collapse_messages=False,
+            parent_track_data={"runId": "run-1"},
+        )
+
+        result = await run_judge(task, [handler])
+
+        assert result is not None
+        # A gen_ai.evaluation of 0 is indistinguishable from a judge that
+        # scored the output a hard fail, so no metric is recorded at all.
+        assert recorded == []
+        assert result.score is None
+        assert result.response == "cannot tell"
