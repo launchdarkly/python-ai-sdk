@@ -2960,6 +2960,7 @@ async def test_inline_rows_run_with_judge_emits_criterion_event_without_dataset_
     assert judge_event["score"] == 1
     assert judge_event["reason"] == "accurate"
 
+
 def no_request_evals(transport: SequencedTransport) -> Any:
     return init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
 
