@@ -555,16 +555,20 @@ class TestInMemorySkillStore:
 
         assert seen == [raw]
 
-    def test_put_does_not_notify_other_kind_listeners(
-        self, make_raw_skill: Any
-    ) -> None:
+    def test_add_listener_for_a_non_skill_kind_raises(self) -> None:
+        """A listener that can never fire is refused, not recorded.
+
+        ``put`` only accepts skill objects, so nothing else is ever delivered:
+        a recorded listener on another kind would silently never fire, and that
+        is indistinguishable from one whose objects never changed. It is the
+        same failure §3.26 refuses when the store has no ``add_listener`` at
+        all, so it gets the same loud answer.
+        """
         s = InMemorySkillStore()
-        seen: list[dict[str, Any]] = []
-        s.add_listener("flag", seen.append)
-
-        s.put(make_raw_skill(key="a"))
-
-        assert seen == []
+        with pytest.raises(ValueError, match="would never fire") as excinfo:
+            s.add_listener("flag", print)
+        assert "skill" in str(excinfo.value)
+        assert s._listeners == {}
 
     def test_remove_listener_stops_put_notifying_it(self, make_raw_skill: Any) -> None:
         s = InMemorySkillStore()

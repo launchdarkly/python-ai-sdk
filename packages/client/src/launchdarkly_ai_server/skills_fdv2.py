@@ -1743,7 +1743,21 @@ class FDv2SkillStore:
         *fn* runs on the delivery thread. Keep it cheap and non-blocking. An
         exception it raises is logged and swallowed, because a broken listener
         must not be able to kill delivery.
+
+        Only ``SKILL_OBJECT_KIND`` is ever delivered, so a registration for any
+        other kind **raises** rather than being recorded and silently never
+        firing. ``InMemorySkillStore.add_listener`` refuses the same way, for
+        the reason ``watch_skills`` refuses a store with no ``add_listener`` at
+        all: a listener that never fires looks exactly like one whose objects
+        never changed, and a store that accepted the registration has promised
+        something it cannot keep.
         """
+        if kind != SKILL_OBJECT_KIND:
+            raise ValueError(
+                f"FDv2SkillStore notifies only {SKILL_OBJECT_KIND!r} changes, so "
+                f"a listener on {kind!r} would never fire. Register it on "
+                f"{SKILL_OBJECT_KIND!r}."
+            )
         with self._lock:
             self._listeners.setdefault(kind, []).append(fn)
 

@@ -2868,6 +2868,19 @@ class TestListenerRegistration:
     def _skill_listeners(store: Any) -> list[Any]:
         return list(store._listeners.get(SKILL_OBJECT_KIND, []))
 
+    def test_fdv2_add_listener_for_a_non_skill_kind_raises(self, endpoint: Any) -> None:
+        """The transport refuses the same registration the in-memory store does.
+
+        Only skill objects are ever delivered here, so a listener on any other
+        kind would never fire — and a store that accepted it has promised
+        something it cannot keep.
+        """
+        with poll_store(endpoint) as store:
+            with pytest.raises(ValueError, match="would never fire") as excinfo:
+                store.add_listener("flag", print)
+            assert SKILL_OBJECT_KIND in str(excinfo.value)
+            assert store._listeners == {}
+
     def test_fdv2_remove_listener_of_an_unregistered_callable_is_a_no_op(
         self, endpoint: Any
     ) -> None:
