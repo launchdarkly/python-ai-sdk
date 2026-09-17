@@ -52,8 +52,10 @@ be built after evaluation:
 ```python
 handler = create_langchain_agents_handler(
     lambda config: ChatAnthropic(
-        model=config["model"]["name"],
-        **(config["model"].get("parameters") or {}),
+        **{
+            **(config["model"].get("parameters") or {}),
+            "model": config["model"]["name"],
+        }
     )
 )
 ```
