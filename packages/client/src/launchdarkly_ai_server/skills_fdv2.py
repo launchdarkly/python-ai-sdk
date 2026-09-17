@@ -572,6 +572,57 @@ class _TransferOutcome:
     """
 
 
+def _identity_of(raw: dict[str, Any]) -> tuple[str, Any]:
+    """
+    One object's ``(key, version)`` identity, as something comparable.
+
+    An object with no usable version compares alike to any other of its key,
+    which is what holding it under its key alone already means.
+    """
+    version = raw.get("version")
+    return (raw["key"], version if is_valid_skill_version(version) else None)
+
+
+def _revocations_between(
+    current: _SkillObjectSet, pending: _SkillObjectSet
+) -> list[dict[str, Any]]:
+    """
+    Tombstones for every object *pending* no longer holds.
+
+    A full transfer states the whole payload, so its revocations arrive as an
+    absence rather than as an event; this recovers them. At ``(key, version)``
+    granularity to match ``delete-object``, so a key whose version moved yields
+    both a put for the arrival and a tombstone for the departure — what a
+    listener that reads versions needs, and harmless to one that only needs
+    "something changed".
+    """
+    surviving = {_identity_of(raw) for raw in pending.all_raw()}
+    return [
+        {"key": key, "version": version}
+        for key, version in (_identity_of(raw) for raw in current.all_raw())
+        if (key, version) not in surviving
+    ]
+
+
+def _keys_fully_revoked(revoked: list[dict[str, Any]], pending: _SkillObjectSet) -> int:
+    """
+    How many of *revoked* are true revocations rather than version moves.
+
+    Counted per key, not per tombstone: a key *pending* still holds under some
+    other version has moved, and only a key that left the payload entirely is
+    gone. That is what ``objects_revoked`` counts, the same rule
+    ``_delete_object`` applies when it counts only a tombstone that took
+    something away. ``changes`` carries every tombstone regardless.
+    """
+    return len(
+        {
+            tombstone["key"]
+            for tombstone in revoked
+            if pending.get(tombstone["key"], None) is None
+        }
+    )
+
+
 class _ProtocolReader:
     """
     Applies FDv2 events to an object set. Pure — no sockets, no threads, no
@@ -730,6 +781,20 @@ class _ProtocolReader:
             self.diagnostics.payloads_ignored += 1
             self._changes = []
         elif self._pending is not None:
+            if self._intent == _INTENT_TRANSFER_FULL:
+                # A full transfer revokes by omission: whatever it did not carry
+                # is gone, and no ``delete-object`` ever says so. Diffed before
+                # the swap, so those departures reach listeners as tombstones
+                # like any other revocation — without which the one case pruning
+                # exists for, an environment's last skill being revoked, would
+                # empty the store and wake nobody.
+                revoked = _revocations_between(self._committed, self._pending)
+                self._changes.extend(revoked)
+                # Every departure is reported; only a key that left counts as
+                # revoked.
+                self.diagnostics.objects_revoked += _keys_fully_revoked(
+                    revoked, self._pending
+                )
             self._committed.replace_with(self._pending)
             _warn_if_nothing_can_verify(self._committed)
             if self._skills_in_payload and payload_id is not None:
@@ -1738,7 +1803,9 @@ class FDv2SkillStore:
 
         A put notifies with the raw skill object. A revocation notifies with a
         ``{"key", "version"}`` tombstone carrying no content, so a listener that
-        reads content must check for ``content`` rather than assume it.
+        reads content must check for ``content`` rather than assume it. Both
+        ways of stating a revocation arrive that way: a ``delete-object``, and a
+        full transfer that simply stopped carrying the object.
 
         *fn* runs on the delivery thread. Keep it cheap and non-blocking. An
         exception it raises is logged and swallowed, because a broken listener
