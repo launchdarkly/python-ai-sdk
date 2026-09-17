@@ -156,9 +156,15 @@ def parse_ai_config(raw: Any) -> ParseResult:
             error={"message": "outputFormat must be an object (JSON Schema)"},
         )
 
-    skills = raw.get("skills")
-    if skills is not None:
-        err = _parse_skills(skills)
+    # ``in`` rather than ``is not None``: an explicit ``skills: null`` must fail
+    # the parse, not read as absent. Read as absent it makes ``skill_refs``
+    # return ``[]``, and a ``prune=True`` reconcile then *deletes* previously
+    # materialized skill files on the strength of a field the SDK could not
+    # parse — the hazard the store path already refuses, where reading a
+    # malformed object as absent would let prune delete the last known-good
+    # copy on disk. Failing the whole parse is the louder and safer outcome.
+    if "skills" in raw:
+        err = _parse_skills(raw["skills"])
         if err:
             return ParseFailure(success=False, error={"message": err})
 
