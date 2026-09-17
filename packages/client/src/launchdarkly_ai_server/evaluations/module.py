@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
@@ -22,10 +23,17 @@ from .runner import (
     EvalHandler,
     EvaluationsRunner,
     ToolImplementation,
+    _normalize_inline_rows,
     _provides_for,
     _segment,
 )
-from .types import EvalRunResult, GenerationConfig, RunSummary
+from .types import (
+    DatasetRef,
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    RunSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,15 @@ def _can_emit_events(client: Any) -> bool:
     return callable(getattr(client, "track", None)) and callable(
         getattr(client, "flush", None)
     )
+
+
+def _require_json_serializable(value: Any, description: str) -> None:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise EvaluationsError(
+            f"{description} must be JSON-serializable: {error}"
+        ) from error
 
 
 def _is_terminal_summary(summary: RunSummary) -> bool:
@@ -96,7 +113,8 @@ class EvaluationsModule:
         *,
         project_key: str,
         key: str,
-        dataset: str,
+        dataset: str | None = None,
+        rows: list[DatasetRow] | None = None,
         handler: EvalHandler,
         generation: GenerationConfig,
         tools: Mapping[str, ToolImplementation] | None = None,
@@ -109,11 +127,16 @@ class EvaluationsModule:
         """
         Create and run an evaluation in the caller's process.
 
-        Each dataset row is generated with ``handler``; every entry in
-        ``criteria`` — LaunchDarkly :class:`Judge` references and local
-        deterministic :class:`Scorer` functions — is then run against each
-        generated row, and one evaluation event is emitted per
-        ``(row, criterion)`` result.
+        Rows come from exactly one of two sources. Pass ``dataset`` — the *key*
+        of a LaunchDarkly-hosted dataset — to have the harness read its rows,
+        or pass ``rows`` to supply them from code, in which case no dataset is
+        read or referenced at all. Supplying both, or neither, is an error
+        raised before any network I/O.
+
+        Each row is generated with ``handler``; every entry in ``criteria`` —
+        LaunchDarkly :class:`Judge` references and local deterministic
+        :class:`Scorer` functions — is then run against each generated row, and
+        one evaluation event is emitted per ``(row, criterion)`` result.
 
         A :class:`Judge` is an independent AI Config and may be served by a
         different provider or mode than ``generation``. ``handler`` runs a judge
@@ -135,6 +158,7 @@ class EvaluationsModule:
             project_key=project_key,
             key=key,
             dataset=dataset,
+            rows=rows,
             handler=handler,
             generation=generation,
             concurrency=concurrency,
@@ -160,12 +184,17 @@ class EvaluationsModule:
         resolved_judges = await self._runner._resolve_judges(
             project_key, ld_judges, handler, run_judge_handlers
         )
-        dataset_ref = await asyncio.to_thread(
-            self._runner._fetch_dataset, project_key, dataset
-        )
-        rows = await asyncio.to_thread(
-            self._runner._get_dataset_rows, project_key, dataset
-        )
+        dataset_ref: DatasetRef | None
+        if dataset is not None:
+            dataset_ref = await asyncio.to_thread(
+                self._runner._fetch_dataset, project_key, dataset
+            )
+            run_rows = await asyncio.to_thread(
+                self._runner._get_dataset_rows, project_key, dataset
+            )
+        else:
+            dataset_ref = None
+            run_rows = await asyncio.to_thread(_normalize_inline_rows, rows or [])
         evaluation = await asyncio.to_thread(
             self._runner._create_evaluation,
             project_key,
@@ -178,11 +207,11 @@ class EvaluationsModule:
             self._runner._create_evaluation_run,
             project_key,
             evaluation.id,
-            dataset_ref.id,
+            dataset_ref.id if dataset_ref is not None else None,
         )
         config = self._runner._build_handler_config(generation, resolved_tools)
         results = await self._runner._run_rows(
-            rows,
+            run_rows,
             handler,
             config,
             run_tools,
@@ -349,11 +378,82 @@ class EvaluationsModule:
                 )
 
     @staticmethod
+    def _validate_rows(rows: list[DatasetRow]) -> None:
+        """
+        Check caller-supplied rows before any record exists.
+
+        Stricter than the hosted path on purpose. ``_row_from_api_item`` coerces
+        bad server data rather than failing a run already in flight; a bad inline
+        row is a caller bug, and every check here runs with zero requests issued
+        — where the hosted empty-dataset rule only fires after two GETs.
+        """
+        if not rows:
+            raise EvaluationsError("rows must not be empty")
+        seen: dict[int, int] = {}
+        for index, row in enumerate(rows):
+            if not isinstance(row, DatasetRow):
+                raise EvaluationsError(
+                    f"rows[{index}] must be a DatasetRow, got {type(row).__name__}"
+                )
+            row_index = row.row_index
+            # bool is an int subclass, so True would otherwise pass as 1 and go
+            # on the wire as `rowIndex: true`, which ingest drops.
+            if (
+                isinstance(row_index, bool)
+                or not isinstance(row_index, int)
+                or row_index < 0
+            ):
+                raise EvaluationsError(
+                    f"rows[{index}].row_index must be a non-negative integer, "
+                    f"got {row_index!r}"
+                )
+            if row_index in seen:
+                raise EvaluationsError(
+                    f"rows[{index}].row_index {row_index} duplicates "
+                    f"rows[{seen[row_index]}]. LaunchDarkly identifies an inline "
+                    "row by (run, row_index), so duplicates collapse into one "
+                    "stored row and the run never accounts for every row."
+                )
+            seen[row_index] = index
+            for name, value in (
+                ("input", row.input),
+                ("expected_output", row.expected_output),
+            ):
+                # A hosted row renders a non-string as None (it is the API's data
+                # to tolerate); inline, that would silently run the whole
+                # evaluation on empty inputs at full generation cost.
+                if value is not None and not isinstance(value, str):
+                    raise EvaluationsError(
+                        f"rows[{index}].{name} must be a string or None, got "
+                        f"{type(value).__name__}"
+                    )
+            for field_name, mapping_value in (
+                ("variables", row.variables),
+                ("metadata", row.metadata),
+            ):
+                if mapping_value is None:
+                    continue
+                if not isinstance(mapping_value, Mapping):
+                    raise EvaluationsError(
+                        f"rows[{index}].{field_name} must be a mapping, got "
+                        f"{type(mapping_value).__name__}"
+                    )
+                # Serializability is checked on the copy, not the caller's
+                # container, because the copy is what reaches the wire -- any
+                # Mapping is accepted here and normalized to a dict. The copy is
+                # shallow in both places, so a nested mapping the serializer
+                # cannot encode is correctly still an error.
+                _require_json_serializable(
+                    dict(mapping_value), f"rows[{index}].{field_name}"
+                )
+
+    @staticmethod
     def _validate_run_args(
         *,
         project_key: str,
         key: str,
-        dataset: str,
+        dataset: str | None,
+        rows: list[DatasetRow] | None,
         handler: EvalHandler,
         generation: GenerationConfig,
         concurrency: int,
@@ -363,10 +463,23 @@ class EvaluationsModule:
         for name, value in (
             ("project_key", project_key),
             ("key", key),
-            ("dataset", dataset),
         ):
-            if not value.strip():
+            if not isinstance(value, str) or not value.strip():
                 raise EvaluationsError(f"{name} must not be blank")
+        if dataset is None and rows is None:
+            raise EvaluationsError(
+                "one of dataset or rows is required: pass dataset to read a "
+                "LaunchDarkly-hosted dataset, or rows to supply them from code"
+            )
+        if dataset is not None and rows is not None:
+            raise EvaluationsError(
+                "dataset and rows are mutually exclusive: pass exactly one"
+            )
+        if dataset is not None:
+            if not isinstance(dataset, str) or not dataset.strip():
+                raise EvaluationsError("dataset must not be blank")
+        else:
+            EvaluationsModule._validate_rows(rows or [])
         if not callable(handler):
             raise EvaluationsError("handler must be callable")
         provider = generation.get("provider")

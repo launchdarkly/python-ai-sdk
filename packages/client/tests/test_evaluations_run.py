@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 from collections.abc import Callable
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2249,3 +2252,918 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
 
     assert result.passed is True
     assert max_in_flight == 2
+
+
+def inline_run_transport(
+    *,
+    with_tool: bool = False,
+    summary: dict[str, Any] | None = None,
+    evaluation_version: int = 3,
+) -> SequencedTransport:
+    responses = []
+    if with_tool:
+        responses.append(
+            response(
+                200,
+                {
+                    "key": "lookup_order",
+                    "version": 7,
+                    "description": "Look up an order",
+                    "schema": {"type": "object"},
+                },
+            )
+        )
+    responses.extend(
+        [
+            response(
+                201,
+                {
+                    "id": "evaluation-id",
+                    "name": "support-qa",
+                    "version": evaluation_version,
+                },
+            ),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                summary
+                or {
+                    "statusCounts": {
+                        "total": 1,
+                        "passed": 1,
+                        "failed": 0,
+                        "error": 0,
+                        "pending": 0,
+                    }
+                },
+            ),
+        ]
+    )
+    return SequencedTransport(responses)
+
+
+async def echo_handler(
+    config: dict[str, Any],
+    user_input: str | None,
+    tool_handlers: dict[str, Callable[..., Any]],
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "output": f"generated: {user_input}",
+        "usage": {"input_tokens": 10, "output_tokens": 4},
+    }
+
+
+def digest(identity: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_inline_rows_run_skips_dataset_requests_entirely(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = inline_run_transport(with_tool=True)
+    evals = init_evaluations(
+        api_token="token",
+        sdk_key="sdk-key",
+        ui_base_uri="https://ui.example.com",
+        transport=transport,
+    )
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[DatasetRow(row_index=0, input="Order A19")],
+        handler=successful_handler,
+        tools={"lookup_order": lookup_order},
+        generation={
+            "provider": "OpenAI",
+            "model": "gpt-4o",
+            "parameters": {"temperature": 0.2},
+            "instructions": "Help the user.",
+        },
+    )
+
+    assert [request["method"] for request in transport.requests] == [
+        "GET",
+        "POST",
+        "POST",
+        "GET",
+    ]
+    # The transport raises on a request past the end of its list, so a surviving
+    # _fetch_dataset would already have failed -- but it tolerates surplus
+    # responses, so assert the absence outright.
+    assert not any("/datasets" in request["url"] for request in transport.requests)
+    assert transport.requests[0]["url"].endswith(
+        "/api/v2/projects/proj/ai-tools/lookup_order"
+    )
+    # The evaluation body is unchanged by the row source.
+    assert transport.requests[1]["body"] == {
+        "name": "support-qa",
+        "generationProvider": "OpenAI",
+        "generationModel": "gpt-4o",
+        "parameters": {"temperature": 0.2},
+        "messages": [{"role": "system", "content": "Help the user."}],
+        "tools": [{"key": "lookup_order", "version": 7}],
+    }
+    # Equality, not a subset check: no datasetId, and no row count either.
+    assert transport.requests[2]["body"] == {"source": "api"}
+    assert result.passed is True
+    assert result.run_id == "run-id"
+    assert result.url == (
+        "https://ui.example.com/projects/proj/ai/evaluations/evaluation-id/runs/run-id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inline_rows_without_tools_issues_no_get_before_creation() -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[DatasetRow(row_index=0, input="Order A19")],
+        handler=echo_handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert [request["method"] for request in transport.requests] == [
+        "POST",
+        "POST",
+        "GET",
+    ]
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_inline_generation_event_carries_row_data_and_no_dataset_identifiers(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[
+            DatasetRow(
+                row_index=4,
+                input="Order {{order_id}}",
+                expected_output="Found {{order_id}}",
+                variables={"order_id": "A19"},
+                metadata={"suite": "orders"},
+            )
+        ],
+        handler=echo_handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    event = stub_sdk_client.track.call_args_list[0].args[2]
+    assert "datasetId" not in event
+    assert "datasetKey" not in event
+    # The row the dataset would otherwise own, rendered.
+    assert event["input"] == "Order A19"
+    assert event["expectedOutput"] == "Found A19"
+    assert event["variables"] == {
+        "order_id": "A19",
+        "input": "Order A19",
+        "expected_output": "Found A19",
+    }
+    assert event["metadata"] == {"suite": "orders"}
+    # Everything else about the event is unchanged.
+    assert event["projectKey"] == "proj"
+    assert event["rowIndex"] == 4
+    assert event["evaluationKey"] == "support-qa"
+    assert event["evaluationVersion"] == 3
+    assert event["status"] == "COMPLETE"
+    assert event["output"] == "generated: Order A19"
+    assert event["usage"] == {"inputTokens": 10, "outputTokens": 4}
+    assert len(event["eventId"]) == len(event["contentHash"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_inline_generation_event_id_covers_five_identity_fields(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[DatasetRow(row_index=4, input="Order A19")],
+        handler=echo_handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    event = stub_sdk_client.track.call_args_list[0].args[2]
+    assert event["eventId"] == digest(
+        {
+            "projectKey": "proj",
+            "evaluationId": "evaluation-id",
+            "evaluationRunId": "run-id",
+            "runId": "run-id",
+            "rowIndex": 4,
+        }
+    )
+    # A null-valued datasetId is not the same thing as an absent one.
+    assert event["eventId"] != digest(
+        {
+            "projectKey": "proj",
+            "evaluationId": "evaluation-id",
+            "evaluationRunId": "run-id",
+            "runId": "run-id",
+            "rowIndex": 4,
+            "datasetId": None,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_inline_content_hash_ignores_row_data(
+    stub_sdk_client: MagicMock,
+) -> None:
+    hashes = []
+    for variables, metadata in (
+        ({"a": "1"}, {"suite": "one"}),
+        ({"b": "2"}, {"suite": "two"}),
+    ):
+        transport = inline_run_transport()
+        evals = init_evaluations(
+            api_token="token", sdk_key="sdk-key", transport=transport
+        )
+        client = MagicMock()
+        client.flush = AsyncMock()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                "launchdarkly_ai_server.evaluations.module.init_client",
+                AsyncMock(return_value=client),
+            )
+            await evals.run(
+                project_key="proj",
+                key="support-qa",
+                rows=[
+                    DatasetRow(
+                        row_index=4,
+                        input="fixed",
+                        variables=variables,
+                        metadata=metadata,
+                    )
+                ],
+                handler=echo_handler,
+                generation={"provider": "OpenAI", "model": "gpt-4o"},
+            )
+        hashes.append(client.track.call_args_list[0].args[2]["contentHash"])
+
+    assert hashes[0] == hashes[1]
+
+
+@pytest.mark.asyncio
+async def test_inline_criterion_event_omits_dataset_and_row_data(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    def check_refund(row: DatasetRow, output: Any) -> bool:
+        assert row.row_index == 42
+        assert row.input == "Ticket A"
+        return "refund" in str(output)
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[
+            DatasetRow(
+                row_index=42,
+                input="Ticket {{id}}",
+                expected_output="refund row",
+                variables={"id": "A"},
+                metadata={"suite": "orders"},
+            )
+        ],
+        handler=refund_handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="refund-exists", fn=check_refund)],
+    )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert "datasetId" not in scorer_event
+    assert "datasetKey" not in scorer_event
+    assert {"input", "expectedOutput", "variables", "metadata", "output"}.isdisjoint(
+        scorer_event
+    )
+    assert scorer_event["criterionType"] == "refund-exists"
+    assert scorer_event["rowIndex"] == 42
+    assert scorer_event["score"] == 1
+    assert scorer_event["eventId"] == digest(
+        {
+            "projectKey": "proj",
+            "evaluationId": "evaluation-id",
+            "evaluationRunId": "run-id",
+            "runId": "run-id",
+            "rowIndex": 42,
+            "criterionType": "refund-exists",
+        }
+    )
+    # The generation event for the same row still carries the row data.
+    generation_event = next(
+        event for event in events if event.get("status") and "kind" not in event
+    )
+    assert generation_event["input"] == "Ticket A"
+
+
+async def refund_handler(*args: object) -> dict[str, Any]:
+    return {"output": "refund exists"}
+
+
+@pytest.mark.asyncio
+async def test_inline_rows_render_templates_and_inject_variables() -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, Any] = {}
+
+    async def capture(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["user_input"] = user_input
+        seen["variables"] = variables
+        return {"output": "ok"}
+
+    def scorer(row: DatasetRow, output: Any) -> float:
+        seen["row"] = row
+        return 1.0
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[
+            DatasetRow(
+                row_index=0,
+                input="Order {{order_id}}",
+                expected_output="Found {{order_id}}",
+                variables={"order_id": "A19"},
+            )
+        ],
+        handler=capture,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="always", fn=scorer)],
+    )
+
+    assert seen["user_input"] == "Order A19"
+    assert seen["variables"] == {
+        "order_id": "A19",
+        "input": "Order A19",
+        "expected_output": "Found A19",
+    }
+    assert seen["row"].input == "Order A19"
+    assert seen["row"].expected_output == "Found A19"
+
+
+@pytest.mark.asyncio
+async def test_inline_unresolved_placeholder_is_left_literal() -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, Any] = {}
+
+    async def capture(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["user_input"] = user_input
+        return {"output": "ok"}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[DatasetRow(row_index=0, input="Order {{missing}}")],
+        handler=capture,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert seen["user_input"] == "Order {{missing}}"
+
+
+@pytest.mark.asyncio
+async def test_inline_row_without_input_or_expected_output_injects_none(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, Any] = {}
+
+    async def capture(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["user_input"] = user_input
+        seen["variables"] = variables
+        return {"output": "ok"}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[DatasetRow(row_index=0)],
+        handler=capture,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert seen["user_input"] is None
+    assert seen["variables"]["input"] is None
+    assert seen["variables"]["expected_output"] is None
+    # Null-valued fields are omitted from the payload rather than serialized.
+    event = stub_sdk_client.track.call_args_list[0].args[2]
+    assert "input" not in event
+    assert "expectedOutput" not in event
+    assert "metadata" not in event
+
+
+@pytest.mark.asyncio
+async def test_inline_variables_accept_a_non_dict_mapping() -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, Any] = {}
+
+    async def capture(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["user_input"] = user_input
+        return {"output": "ok"}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[
+            DatasetRow(
+                row_index=0,
+                input="Order {{order_id}}",
+                variables=MappingProxyType({"order_id": "A19"}),  # type: ignore[arg-type]
+            )
+        ],
+        handler=capture,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert seen["user_input"] == "Order A19"
+
+
+@pytest.mark.asyncio
+async def test_inline_rows_are_not_mutated_by_the_run() -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    variables = {"order_id": "A19"}
+    metadata = {"suite": "orders"}
+    rows = [
+        DatasetRow(
+            row_index=0,
+            input="Order {{order_id}}",
+            expected_output="Found {{order_id}}",
+            variables=variables,
+            metadata=metadata,
+        )
+    ]
+
+    def mutating_scorer(row: DatasetRow, output: Any) -> float:
+        row.variables["injected-by-scorer"] = True
+        if row.metadata is not None:
+            row.metadata["injected-by-scorer"] = True
+        return 1.0
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=rows,
+        handler=echo_handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="mutates", fn=mutating_scorer)],
+    )
+
+    assert rows[0].input == "Order {{order_id}}"
+    assert rows[0].expected_output == "Found {{order_id}}"
+    assert rows[0].variables == {"order_id": "A19"}
+    assert rows[0].metadata == {"suite": "orders"}
+    assert variables == {"order_id": "A19"}
+    assert metadata == {"suite": "orders"}
+
+
+@pytest.mark.asyncio
+async def test_inline_rows_can_be_reused_across_two_runs() -> None:
+    rows = [
+        DatasetRow(
+            row_index=0, input="Order {{order_id}}", variables={"order_id": "A19"}
+        )
+    ]
+    rendered = []
+    for _ in range(2):
+        transport = inline_run_transport()
+        evals = init_evaluations(
+            api_token="token", sdk_key="sdk-key", transport=transport
+        )
+        client = MagicMock()
+        client.flush = AsyncMock()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                "launchdarkly_ai_server.evaluations.module.init_client",
+                AsyncMock(return_value=client),
+            )
+            await evals.run(
+                project_key="proj",
+                key="support-qa",
+                rows=rows,
+                handler=echo_handler,
+                generation={"provider": "OpenAI", "model": "gpt-4o"},
+            )
+        rendered.append(client.track.call_args_list[0].args[2]["input"])
+
+    assert rendered == ["Order A19", "Order A19"]
+
+
+@pytest.mark.asyncio
+async def test_inline_metadata_mapping_is_copied_before_the_scorer_sees_it() -> None:
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    metadata = MappingProxyType({"suite": "orders"})
+    seen: dict[str, Any] = {}
+
+    def scorer(row: DatasetRow, output: Any) -> float:
+        seen["metadata"] = row.metadata
+        return 1.0
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[
+            DatasetRow(row_index=0, input="x", metadata=metadata),  # type: ignore[arg-type]
+        ],
+        handler=echo_handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="always", fn=scorer)],
+    )
+
+    assert seen["metadata"] == {"suite": "orders"}
+    assert isinstance(seen["metadata"], dict)
+
+
+@pytest.mark.asyncio
+async def test_inline_error_row_emits_row_data_without_dataset_identifiers(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = inline_run_transport(
+        summary={
+            "statusCounts": {
+                "total": 1,
+                "passed": 0,
+                "failed": 0,
+                "error": 1,
+                "pending": 0,
+            }
+        }
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def failing(*args: object) -> dict[str, Any]:
+        raise RuntimeError("provider exploded")
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[
+            DatasetRow(
+                row_index=4,
+                input="Order {{order_id}}",
+                variables={"order_id": "A19"},
+                metadata={"suite": "orders"},
+            )
+        ],
+        handler=failing,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert result.passed is False
+    event = stub_sdk_client.track.call_args_list[0].args[2]
+    assert event["status"] == "ERROR"
+    assert event["error"] == {
+        "code": 5001,
+        "message": "handler raised: provider exploded",
+    }
+    assert event["errorMessage"] == "handler raised: provider exploded"
+    assert "datasetId" not in event
+    assert "datasetKey" not in event
+    assert event["input"] == "Order A19"
+    assert event["metadata"] == {"suite": "orders"}
+
+
+@pytest.mark.asyncio
+async def test_inline_rows_respect_the_concurrency_bound() -> None:
+    transport = inline_run_transport(
+        summary={
+            "statusCounts": {
+                "total": 5,
+                "passed": 5,
+                "failed": 0,
+                "error": 0,
+                "pending": 0,
+            }
+        }
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    in_flight = 0
+    max_in_flight = 0
+
+    async def handler(*args: object) -> dict[str, Any]:
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return {"output": "ok"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[DatasetRow(row_index=index, input="x") for index in range(5)],
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        concurrency=2,
+    )
+
+    assert result.passed is True
+    assert max_in_flight == 2
+
+
+@pytest.mark.asyncio
+async def test_inline_rows_run_with_judge_emits_criterion_event_without_dataset_id(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    from launchdarkly_ai_server import parse_template
+
+    accuracy_judge_variation(monkeypatch)
+    transport = inline_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    judge_prompts: list[str] = []
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        instructions = config.get("instructions", "")
+        if "Judge" in instructions:
+            judge_prompts.append(parse_template(instructions, variables))
+            return {"output": '{"score": 1, "reasoning": "accurate"}'}
+        return {"output": "generated"}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        rows=[
+            DatasetRow(
+                row_index=7,
+                input="Question {{id}}",
+                expected_output="Answer {{id}}",
+                variables={"id": "A"},
+            )
+        ],
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    # The judge prompt renders against the inline row's injected variables.
+    assert judge_prompts == ["Judge generated against Answer A"]
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    judge_event = next(event for event in events if event.get("kind") == "judge")
+    assert "datasetId" not in judge_event
+    assert "datasetKey" not in judge_event
+    assert judge_event["judgeKey"] == "$ld:ai:judge:accuracy"
+    assert judge_event["variationKey"] == "default"
+    assert judge_event["version"] == 12
+    assert judge_event["score"] == 1
+    assert judge_event["reason"] == "accurate"
+
+def no_request_evals(transport: SequencedTransport) -> Any:
+    return init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+
+@pytest.mark.asyncio
+async def test_run_requires_dataset_or_rows() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+
+    with pytest.raises(EvaluationsError) as error:
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert "dataset" in str(error.value)
+    assert "rows" in str(error.value)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_both_dataset_and_rows() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+
+    with pytest.raises(EvaluationsError, match="mutually exclusive"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            rows=[DatasetRow(row_index=0, input="x")],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_blank_dataset_when_rows_omitted() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+
+    with pytest.raises(EvaluationsError, match="dataset must not be blank"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="   ",
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_empty_rows_list() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+
+    with pytest.raises(EvaluationsError, match="rows must not be empty"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_non_dataset_row_entries() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+
+    with pytest.raises(EvaluationsError, match=r"rows\[0\] must be a DatasetRow"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[{"row_index": 0, "input": "x"}],  # type: ignore[list-item]
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("row_index", [-1, 1.5, "0", True])
+@pytest.mark.asyncio
+async def test_run_rejects_invalid_row_index(row_index: Any) -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+
+    with pytest.raises(
+        EvaluationsError, match=r"rows\[0\].row_index must be a non-negative integer"
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[DatasetRow(row_index=row_index, input="x")],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_duplicate_row_index() -> None:
+    """
+    Load-bearing, not tidiness: ingest keys an inline row off (run, rowIndex)
+    alone, so a duplicate collapses two rows into one stored row and the run can
+    never account for its total -- surfacing only as a polling timeout.
+    """
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+
+    with pytest.raises(EvaluationsError, match=r"rows\[1\].row_index 3 duplicates"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[
+                DatasetRow(row_index=3, input="first"),
+                DatasetRow(row_index=3, input="second"),
+            ],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        datetime(2026, 9, 17),
+        {1, 2},
+        float("nan"),
+        float("inf"),
+        object(),
+    ],
+)
+@pytest.mark.parametrize("field", ["variables", "metadata"])
+@pytest.mark.asyncio
+async def test_run_rejects_unserializable_row_values(
+    field: str, bad_value: Any
+) -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    row = DatasetRow(row_index=0, input="x", **{field: {"bad": bad_value}})
+
+    with pytest.raises(
+        EvaluationsError, match=rf"rows\[0\].{field} must be JSON-serializable"
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[row],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("field", ["variables", "metadata"])
+@pytest.mark.asyncio
+async def test_run_rejects_non_mapping_row_values(field: str) -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    row = DatasetRow(row_index=0, input="x", **{field: ["not", "a", "mapping"]})
+
+    with pytest.raises(EvaluationsError, match=rf"rows\[0\].{field} must be a mapping"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[row],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("field", ["input", "expected_output"])
+@pytest.mark.asyncio
+async def test_run_rejects_non_string_inline_input(field: str) -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    row = DatasetRow(row_index=0, **{field: 42})
+
+    with pytest.raises(
+        EvaluationsError, match=rf"rows\[0\].{field} must be a string or None"
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[row],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
