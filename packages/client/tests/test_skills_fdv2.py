@@ -639,6 +639,33 @@ class TestProtocolReader:
         assert held.get("pdf-extraction", None) is None
         assert reader.diagnostics.objects_revoked == 1
 
+    def test_a_delete_for_a_key_never_held_is_not_counted_as_a_revocation(
+        self,
+    ) -> None:
+        """``objects_revoked`` counts what went away, not tombstones seen.
+
+        The counter is operator-facing, and it is read precisely when somebody
+        is working out whether a revocation landed. A delete for a key the store
+        never held revoked nothing, so counting it inflates the one number that
+        answers that question. The tombstone still reaches listeners through
+        ``changes``, which is where "every revocation the server stated" lives.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(key="kept"))))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("delete-object", delete_skill(key="never-delivered")),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert reader.diagnostics.objects_revoked == 0
+        assert held.get("kept", None) is not None
+        # Reported, just not counted.
+        assert outcomes[-1].changes == [{"key": "never-delivered", "version": 3}]
+
     def test_a_delete_notifies_with_a_tombstone_carrying_no_content(self) -> None:
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -1814,31 +1841,68 @@ class TestFailureHandling:
 
     def test_a_retry_after_header_is_honoured(self) -> None:
         requester = _ScriptedRequester(
-            _RecoverableTransportError("slow down", retry_after=0.25),
+            _RecoverableTransportError("slow down", retry_after=0.5),
         )
         store = FDv2SkillStore(
             SDK_KEY,
             mode="poll",
             poll_interval=10.0,
-            initial_backoff=5.0,
+            initial_backoff=0.01,
+            max_backoff=5.0,
             _requester=requester,
         )
         try:
             started = time.monotonic()
             store.start()
-            assert wait_until(lambda: len(requester.calls) >= 2, timeout=3)
+            assert wait_until(lambda: len(requester.calls) >= 2, timeout=5)
             elapsed = time.monotonic() - started
-            # The server asked for 0.25s; our own backoff would have been 5s.
-            assert 0.2 <= elapsed < 3.0
+            # The server asked for 0.5s and our own backoff would have been
+            # 0.01s, so waiting is the only way the header could have been read.
+            # Asked *longer* rather than shorter on purpose: a shorter request
+            # is floored at ``initial_backoff``, so it cannot discriminate.
+            assert elapsed >= 0.4
+        finally:
+            store.close()
+
+    def test_a_retry_after_of_zero_still_waits_the_initial_backoff(self) -> None:
+        """``Retry-After: 0`` is floored, not taken literally.
+
+        A server — or an intermediate proxy — answering ``0`` would otherwise
+        have the loop reconnect as fast as it can schedule, spending the whole
+        bounded retry budget in milliseconds and hammering the endpoint on the
+        way. The floor is ``initial_backoff``, the same floor our own backoff
+        starts from.
+        """
+        requester = _ScriptedRequester(
+            _RecoverableTransportError("slow down", retry_after=0.0),
+        )
+        store = FDv2SkillStore(
+            SDK_KEY,
+            mode="poll",
+            poll_interval=10.0,
+            initial_backoff=0.5,
+            max_backoff=5.0,
+            _requester=requester,
+        )
+        try:
+            started = time.monotonic()
+            store.start()
+            assert wait_until(lambda: len(requester.calls) >= 2, timeout=5)
+            assert time.monotonic() - started >= 0.4
         finally:
             store.close()
 
     def test_a_retry_after_header_is_parsed_off_the_wire(self, endpoint: Any) -> None:
-        endpoint.queue_poll(status=429, retry_after="0")
+        endpoint.queue_poll(status=429, retry_after="0.5")
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        with poll_store(endpoint, initial_backoff=5.0) as store:
-            # If Retry-After were ignored the 5s backoff would blow the timeout.
-            assert store.wait_for_skills(timeout=3) is True
+        started = time.monotonic()
+        with poll_store(
+            endpoint, initial_backoff=0.01, max_backoff=5.0, poll_interval=10.0
+        ) as store:
+            assert store.wait_for_skills(timeout=5) is True
+        # 0.5s is only obtainable from the header: our own backoff here is 0.01s
+        # and the cap is 5s, so neither could have produced this wait.
+        assert time.monotonic() - started >= 0.4
 
     @pytest.mark.parametrize("raw", ["inf", "Infinity", "-inf", "nan", "1e309"])
     def test_a_non_finite_retry_after_is_ignored(self, raw: str) -> None:

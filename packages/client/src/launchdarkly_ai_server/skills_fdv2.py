@@ -704,8 +704,14 @@ class _ProtocolReader:
         tombstone = _tombstone_from_delete(data)
         if tombstone is None:
             return _TransferOutcome()
-        target.delete(tombstone)
-        self.diagnostics.objects_revoked += 1
+        removed = target.delete(tombstone)
+        if removed:
+            # Only a tombstone that took something away is a revocation. A
+            # delete for a key the store never held revoked nothing, and
+            # counting it inflates the one counter an operator reads to work
+            # out whether a revocation actually landed. ``changes`` below
+            # carries the tombstone either way, so a listener still sees it.
+            self.diagnostics.objects_revoked += 1
         # A revocation identifies the skill payload just as a put does.
         self._skills_in_payload += 1
         # A tombstone carries identity and no content; see
@@ -1753,6 +1759,14 @@ class FDv2SkillStore:
                     delay = _backoff_delay(
                         failures, base=self._initial_backoff, maximum=self._max_backoff
                     )
+                else:
+                    # A server asking for no delay still gets one: honouring
+                    # ``Retry-After: 0`` literally would reconnect as fast as
+                    # the loop allows and burn the whole retry bound in
+                    # milliseconds, hammering the endpoint on the way. The
+                    # floor is ``initial_backoff``, the same floor our own
+                    # backoff starts from.
+                    delay = max(delay, self._initial_backoff)
                 # ``Retry-After`` is a request and ``max_backoff`` is a promise.
                 # The header may come from a proxy rather than LaunchDarkly, and
                 # a value in the hours would park revocation for that long.
