@@ -7,6 +7,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .trajectory import TrajectoryRecorder, render_trajectory
 from .types import (
     NATIVE_TOOL_KEY,
     AiConfigRep,
@@ -138,7 +139,16 @@ async def execute_and_track(
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
 
-    tracked_tool_handlers = wrap_tool_handlers(tool_handlers, ld_ctx, track_data)
+    # Recording is composed *inside* the tracking wrapper, on the original map,
+    # so the recorder still sees a NativeTool as a NativeTool and skips it. If
+    # it wrapped the tracked map instead it would see the callable stub
+    # wrap_tool_handlers substitutes for a native tool, and would show a judge
+    # a tool call with an empty result while the provider's real result stayed
+    # invisible. One recorder per invocation, since invocations run concurrently.
+    recorder = TrajectoryRecorder()
+    tracked_tool_handlers = wrap_tool_handlers(
+        recorder.wrap(tool_handlers or {}), ld_ctx, track_data
+    )
     merged_variables: dict[str, Any] = {
         **(variables or {}),
         "ldContext": {**user_context},
@@ -172,7 +182,19 @@ async def execute_and_track(
 
     raw_output = result.get("output")
     response = raw_output if raw_output is not None else ""
-    return {"usage": usage, "response": response, "track_data": track_data}
+    return {
+        "usage": usage,
+        "response": response,
+        "track_data": track_data,
+        # Rendered here rather than returned structurally: the one consumer is
+        # message_history, and a JudgeTask has to stay picklable for the
+        # background path.
+        "trajectory": render_trajectory(
+            recorder.invocations,
+            observable_tools=recorder.observable_tools,
+            omitted=recorder.omitted,
+        ),
+    }
 
 
 async def execute_and_stream(
@@ -219,7 +241,10 @@ async def execute_and_stream(
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
 
-    tracked_tool_handlers = wrap_tool_handlers(tool_handlers, ld_ctx, track_data)
+    recorder = TrajectoryRecorder()
+    tracked_tool_handlers = wrap_tool_handlers(
+        recorder.wrap(tool_handlers or {}), ld_ctx, track_data
+    )
     merged_variables: dict[str, Any] = {
         **(variables or {}),
         "ldContext": {**user_context},
@@ -275,4 +300,9 @@ async def execute_and_stream(
         "response": full_text,
         "usage": usage,
         "track_data": track_data,
+        "trajectory": render_trajectory(
+            recorder.invocations,
+            observable_tools=recorder.observable_tools,
+            omitted=recorder.omitted,
+        ),
     }

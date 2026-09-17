@@ -225,6 +225,7 @@ async def _build_graph(
                 base_track_data=result["track_data"],
                 tool_handlers=tool_handlers,
                 graph_key=key,
+                trajectory=result.get("trajectory", ""),
             )
 
             if from_node:
@@ -379,6 +380,7 @@ async def _build_graph(
                 base_track_data=result["track_data"],
                 tool_handlers=tool_handlers,
                 graph_key=key,
+                trajectory=result.get("trajectory", ""),
             )
 
             next_node = nodes.get(chosen[0]) if chosen else None
