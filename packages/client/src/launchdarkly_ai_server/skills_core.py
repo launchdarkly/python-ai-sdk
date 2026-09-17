@@ -421,7 +421,15 @@ def verified_bytes(
     key: str, content: str | bytes, expected_hash: str, version: int
 ) -> VerifiedContent | VerificationFailure:
     """
-    The whole content half of integrity verification: encode, size, hash.
+    The whole content half of integrity verification: size, encoding, hash.
+
+    The order is fixed, so content failing two classes reports one determined
+    code: **size** before **encoding** before **hash**. Size first is what makes
+    over-cap content carrying a lone surrogate report ``over_size_cap`` rather
+    than ``not_utf8`` — without a fixed order that input's code is whichever
+    check the implementation happens to reach first, and §3.21's "one code per
+    failure class" rule cannot be tested against it. The shape checks that
+    precede all three are in ``verify_raw_skill``.
 
     Accepts either shape content arrives in. A wire-shaped ``str`` is UTF-8
     encoded here, once — the only place that encode happens. ``bytes`` is an
@@ -439,6 +447,7 @@ def verified_bytes(
     first one's verdict forward: that puts a "trust the value computed upstream"
     branch inside the one function whose job is not to.
     """
+    encodable = True
     if isinstance(content, bytes):
         encoded = content
     else:
@@ -447,17 +456,18 @@ def verified_bytes(
         except UnicodeEncodeError:
             # json.loads turns a "\ud800" escape into an unpaired surrogate,
             # which has no UTF-8 encoding — so there are no bytes the server
-            # could have hashed. Never reach for errors="surrogatepass": it
-            # would fabricate bytes that could satisfy the hash comparison.
-            reason = "content is not encodable as UTF-8"
-            record_integrity_failure(
-                key,
-                reason,
-                reason_code="not_utf8",
-                version=version,
-                expected_hash=expected_hash,
-            )
-            return VerificationFailure(reason)
+            # could have hashed.
+            #
+            # These replacement bytes exist only to measure the content against
+            # the size cap, so that the *reported* failure follows the fixed
+            # order above. They are never hashed and never returned: the
+            # ``not_utf8`` branch below returns before the hash comparison, and
+            # nothing else reads ``encoded`` on this path. That is the whole
+            # reason ``errors="replace"`` is safe here and
+            # ``errors="surrogatepass"`` would not be anywhere — fabricated
+            # bytes that reached the comparison could satisfy it.
+            encodable = False
+            encoded = content.encode("utf-8", errors="replace")
 
     if len(encoded) > MAX_SKILL_CONTENT_BYTES:
         reason = (
@@ -468,6 +478,17 @@ def verified_bytes(
             key,
             reason,
             reason_code="over_size_cap",
+            version=version,
+            expected_hash=expected_hash,
+        )
+        return VerificationFailure(reason)
+
+    if not encodable:
+        reason = "content is not encodable as UTF-8"
+        record_integrity_failure(
+            key,
+            reason,
+            reason_code="not_utf8",
             version=version,
             expected_hash=expected_hash,
         )

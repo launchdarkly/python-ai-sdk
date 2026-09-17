@@ -555,16 +555,20 @@ class TestInMemorySkillStore:
 
         assert seen == [raw]
 
-    def test_put_does_not_notify_other_kind_listeners(
-        self, make_raw_skill: Any
-    ) -> None:
+    def test_add_listener_for_a_non_skill_kind_raises(self) -> None:
+        """A listener that can never fire is refused, not recorded.
+
+        ``put`` only accepts skill objects, so nothing else is ever delivered:
+        a recorded listener on another kind would silently never fire, and that
+        is indistinguishable from one whose objects never changed. It is the
+        same failure §3.26 refuses when the store has no ``add_listener`` at
+        all, so it gets the same loud answer.
+        """
         s = InMemorySkillStore()
-        seen: list[dict[str, Any]] = []
-        s.add_listener("flag", seen.append)
-
-        s.put(make_raw_skill(key="a"))
-
-        assert seen == []
+        with pytest.raises(ValueError, match="would never fire") as excinfo:
+            s.add_listener("flag", print)
+        assert "skill" in str(excinfo.value)
+        assert s._listeners == {}
 
     def test_remove_listener_stops_put_notifying_it(self, make_raw_skill: Any) -> None:
         s = InMemorySkillStore()
@@ -1726,6 +1730,31 @@ class TestIntegrityFailureLogRecord:
         # the two cases below are the ones that make the rule observable, since
         # a well-formed key and digest never enter a redaction branch.
         assert "Do the thing." not in json.dumps(record)
+
+    async def test_over_cap_content_with_a_lone_surrogate_reports_the_size(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The one input on which the check order is observable.
+
+        Content that is both over the cap and unencodable fails two classes, so
+        without a fixed order its code is whichever check the implementation
+        reaches first — and the "one code per failure class" rule above cannot
+        be tested against it. The order is shape, then **size**, then
+        **encoding**, then hash: size is the cheap check, and running an
+        encoding pass over a 10 MiB body before rejecting it for being 10 MiB
+        is a DoS foothold rather than a nicety.
+        """
+        from launchdarkly_ai_server import skills_core
+
+        body = _OVERSIZE + json.loads(r'"\ud800"')
+        await self._withhold({"a": _raw_object(content=body)})
+
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        assert records[0]["reason_code"] == "over_size_cap"
+        # The cap is named, interpolated from the constant rather than restated,
+        # so raising it cannot leave a stale figure in the message.
+        assert str(skills_core.MAX_SKILL_CONTENT_BYTES) in records[0]["reason"]
 
     def test_the_case_table_exhausts_the_vocabulary(self) -> None:
         """The vocabulary is closed, and every token in it is reachable.

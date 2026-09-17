@@ -153,10 +153,21 @@ class InMemorySkillStore:
         """
         Registers *fn* to be called with each raw object ``put`` under *kind*.
 
-        Only ``kind == SKILL_OBJECT_KIND`` is ever notified, because ``put`` only
-        accepts skill objects; a listener registered under any other kind is
-        recorded and never fires.
+        Only ``kind == SKILL_OBJECT_KIND`` is ever notified, because ``put``
+        only accepts skill objects — so a registration for any other kind
+        **raises** rather than being recorded and silently never firing. This is
+        the reason ``watch_skills`` refuses a store with no ``add_listener`` at
+        all: a listener that never fires looks exactly like one whose objects
+        never changed, and a store that accepted the registration has promised
+        something it cannot keep. ``FDv2SkillStore.add_listener`` refuses the
+        same way.
         """
+        if kind != SKILL_OBJECT_KIND:
+            raise ValueError(
+                f"InMemorySkillStore notifies only {SKILL_OBJECT_KIND!r} "
+                f"changes, so a listener on {kind!r} would never fire. Register "
+                f"it on {SKILL_OBJECT_KIND!r}."
+            )
         self._listeners.setdefault(kind, []).append(fn)
 
     def remove_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:

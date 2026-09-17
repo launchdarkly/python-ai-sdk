@@ -538,10 +538,21 @@ objects through the `SkillStore` interface and cannot tell which store produced 
 customer-confidential. A mobile key (`mob-…`) or a client-side environment ID raises from the
 constructor.
 
-**The SDK key goes only where you pointed it.** `base_uri` must be `https://` (plain `http://`
-is refused, except to a loopback host for a local test double), and redirects are never
-followed, so a 3xx from a proxy or a misconfigured private instance stops delivery rather than
-forwarding the key to whatever host the `Location` header names.
+**The SDK key goes only where you pointed it.** `base_uri` and `stream_uri` must each be
+`https://` (plain `http://` is refused, except to a loopback host for a local test double),
+and redirects are never followed, so a 3xx from a proxy or a misconfigured private instance
+stops delivery rather than forwarding the key to whatever host the `Location` header names.
+
+**Polling and streaming have separate hosts.** LaunchDarkly serves `/sdk/poll` from
+`https://sdk.launchdarkly.com` and `/sdk/stream` from `https://stream.launchdarkly.com`, so
+the defaults are a pair. Pass `base_uri` on its own and it applies to both — what a relay or a
+private instance serving both endpoints from one host needs — or pass `stream_uri` as well to
+override them independently.
+
+**`close()` is final.** A closed store still answers from the content it received, but
+delivery cannot be resumed: `start()` afterwards raises. That is what gives `close()` a
+postcondition you can rely on — delivery has stopped — even when its join times out.
+Construct a new store to resume.
 
 **Reads are memory-bounded.** No poll body or streamed event is held past `MAX_RESPONSE_BYTES`
 (64 MiB, far above any real payload); one that crosses it is dropped without being applied, the
@@ -582,16 +593,16 @@ Windows.
 
 | Export | Description |
 |---|---|
-| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when absent. |
+| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent. A `skills` field that is present but not an array — including an explicit `null` — fails the config parse instead, so a field the SDK could not read never reaches a pruning reconcile as "no skills". |
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
 | `get_skill_result(key, *, version=None)` | The same retrieval, reporting **why**: a frozen `SkillOutcome` with `.skill`, `.reason` (`ok` / `absent` / `integrity_failure` / `store_unavailable` / `wrong_version`), and `.detail`. Use it to fail closed on tampering — see *Failing closed on tampering* above. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative `timeout`, or an unrecognised `on_unavailable`. **Performs synchronous filesystem I/O — see the note below.** |
-| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `is_initialized()`, `add_listener(kind, fn)` / `remove_listener(kind, fn)`. A store without `is_initialized()` is treated as initialized. |
+| `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `is_initialized()`, `add_listener(kind, fn)` / `remove_listener(kind, fn)`. A store without `is_initialized()` is treated as initialized. Both shipped stores deliver only the skill kind, so `add_listener` on any other kind raises rather than being recorded and silently never firing. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
-| `FDv2SkillStore(sdk_key, *, base_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
-| `watch_skills(skills, root, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. |
+| `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `base_uri` and `stream_uri` are separate hosts, defaulting to LaunchDarkly's polling and streaming origins; `base_uri` alone covers both. `close()` is **final** — `start()` afterwards raises. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
+| `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. `debounce` is in **seconds** and must be non-negative and finite; `on_reconcile` is called with each *subsequent* report, the initial one being returned directly. One watcher per root. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,

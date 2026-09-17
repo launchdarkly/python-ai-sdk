@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import threading
 from collections.abc import Callable, Sequence
@@ -267,6 +268,10 @@ async def watch_skills(
     never changed. The optional ``remove_listener`` lets ``SkillWatcher.close``
     detach from the store; a store without it still works, but each closed
     watcher then stays registered for the store's lifetime.
+
+    *debounce* must be a non-negative finite number of seconds. ``NaN`` raises
+    alongside a negative value: it would pass a bare ``< 0`` guard and then
+    collapse the coalescing window to nothing.
     """
     store = get_store()
     if store is None:
@@ -282,8 +287,16 @@ async def watch_skills(
             "observed. Use write_skills for a one-shot reconcile, or configure a "
             "store with a delivery transport (FDv2SkillStore)."
         )
-    if debounce < 0:
-        raise ValueError(f"debounce must not be negative, got {debounce!r}")
+    # ``NaN`` is the case a bare ``< 0`` guard misses: ``nan < 0`` is ``False``,
+    # so it passes validation and then collapses the window to nothing, because
+    # ``Event.wait(nan)`` returns immediately. Every delivered object would
+    # reconcile on its own with no coalescing at all — the opposite of what the
+    # option is for. ``write_skills`` already guards its ``timeout`` this way.
+    if not math.isfinite(debounce) or debounce < 0:
+        raise ValueError(
+            f"debounce must be a non-negative finite number of seconds, got "
+            f"{debounce!r}"
+        )
 
     # The watcher attaches its listener before the initial reconcile, not after.
     # The reconcile snapshots the store as its first step and then spends the
