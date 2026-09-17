@@ -1693,6 +1693,49 @@ class TestFailureHandling:
         # Last known good survives both.
         assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
 
+    def test_a_400_still_reconnects_from_scratch_on_a_spent_budget(
+        self, endpoint: Any
+    ) -> None:
+        """The one repair available does not compete with the retry bound.
+
+        A 400 arriving on a budget an outage has already spent would otherwise
+        give up while holding the one request known to fix it, and delivery
+        would stop for the process lifetime over state the store was about to
+        drop. Exempting that request cannot unbound the loop: it carries no
+        state, so a second 400 is fatal on its own.
+        """
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with store:
+            assert store.wait_for_skills(timeout=5) is True
+            # The premise: the budget is spent by the time the 400 arrives.
+            assert wait_until(lambda: len(endpoint.requests) == 4)
+            assert store.failed is None
+        # The repair went out from scratch rather than never going out at all.
+        repair = endpoint.requests[3]
+        assert repair["query"] == {}
+        assert repair["if_none_match"] is None
+
+    def test_a_non_400_after_the_repair_meets_the_spent_budget(
+        self, endpoint: Any
+    ) -> None:
+        """The exemption is for the repair, not for the run that follows it."""
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: store.failed is not None)
+        assert "gave up after 3 consecutive failures" in store.failed
+        # The fifth queued payload is never asked for.
+        assert len(endpoint.requests) == 4
+
     def test_a_400_carrying_no_client_state_is_fatal_at_once(
         self, endpoint: Any
     ) -> None:
