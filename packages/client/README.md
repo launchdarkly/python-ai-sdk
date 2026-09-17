@@ -4,7 +4,7 @@ The core package for the LaunchDarkly AI Python SDK. It owns the LaunchDarkly cl
 
 All handler packages (`launchdarkly-ai-*`) depend on this package.
 
-> **Tip:** for the simplest install, use [`launchdarkly-ai`](../ai/README.md) instead. It re-exports this package's full API and is the recommended default for most applications.
+> **Tip:** for the simplest install, use [`launchdarkly-ai-python`](../ai/README.md) instead. It re-exports this package's full API and is the recommended default for most applications.
 
 ## Installation
 
