@@ -552,7 +552,7 @@ def model_stamps_from_meta(meta: Any) -> dict[str, Any]:
         return {}
     stamps: dict[str, Any] = {}
     model_key = meta.get("modelKey")
-    if model_key:
+    if isinstance(model_key, str) and model_key:
         stamps["modelKey"] = model_key
     model_version = _coerce_model_version(meta.get("modelVersion"))
     if model_version is not None:

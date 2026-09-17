@@ -320,12 +320,19 @@ class TestModelStampsFromMeta:
         assert model_stamps_from_meta({"modelVersion": value}) == {"modelVersion": 3}
 
     @pytest.mark.parametrize(
-        "value", ["abc", "1.5", 1.5, {}, [], None, True, False, float("nan")]
+        "value",
+        ["abc", "1.5", 1.5, {}, [], None, True, False, float("nan"), "", "   "],
     )
     def test_omits_malformed_version_without_raising(self, value: Any) -> None:
         stamps = model_stamps_from_meta({"modelVersion": value, "modelKey": "m"})
         assert "modelVersion" not in stamps
         assert stamps["modelKey"] == "m"
+
+    @pytest.mark.parametrize("value", [123, {}, ["a"], True, ""])
+    def test_omits_non_string_or_empty_model_key(self, value: Any) -> None:
+        stamps = model_stamps_from_meta({"modelKey": value, "modelVersion": 1})
+        assert "modelKey" not in stamps
+        assert stamps["modelVersion"] == 1
 
     def test_non_dict_meta_returns_empty(self) -> None:
         assert model_stamps_from_meta(None) == {}
