@@ -122,6 +122,8 @@ A judge is shown the tool calls the row made on the way to its output, so a rubr
 
 The harness records this itself: it wraps your tool implementations once per row before handing them to the handler, so every handler package is covered without changes and your tools still return and raise exactly what they did before.
 
+**This is not specific to offline evaluations.** Online judges — both the inline ones sampled by `config().invoke()` and the deferred ones you run from a `JudgeTask` on a background thread — are shown the same trajectory, built by the same function. See [Judges see one conversation](#judges-see-one-conversation).
+
 The trajectory is rendered into **`{{message_history}}`** — the row input, then the trajectory, then the generated output, then the formatting instructions, in that order. There is no separate trajectory variable: `message_history` is already the transcript variable every judge reads, and judges built from the AI Library's default templates reference it, so a trajectory rubric can be written against an existing judge template with no new placeholder.
 
 ```
@@ -136,6 +138,24 @@ Tool calls made while producing the response, in order:
 ```
 
 A row with tools that called none of them says so explicitly, which is the finding a tool-selection rubric most needs. A run with no tools adds no block at all, so judges written before trajectories existed read exactly the history they read before.
+
+#### Judges see one conversation
+
+All three judge paths build `{{message_history}}` through a single function, `judge_scoring.build_message_history`:
+
+| Path | Entry point |
+| --- | --- |
+| Online, inline | `config().invoke()` → `run_judges` |
+| Online, deferred | `config(skip_judges=True).invoke()` → `run_judge(task, handlers)` on your own thread |
+| Offline | `init_evaluations().run(criteria=[Judge(...)])` |
+
+Each one is the input, then the tool trajectory, then the output, then the `{score, reasoning}` format block, with empty parts skipped. A judge therefore grades the same conversation wherever it runs, which is what makes a rubric portable between a production sample and a dataset replay.
+
+They did not always agree, and that is why this is a single function now: each path used to join its own history. The offline one carried the row input, the inline one carried the user input, and the deferred one carried **neither** — so a deferred judge graded a response with no request beside it. `JudgeTask` gained `user_input` and `trajectory` to close that.
+
+For the deferred path those two fields travel on the task, which stays picklable — the trajectory crosses as the rendered string, not the structured record.
+
+A **graph-level** judge (`graph_judge`) gets no trajectory: it grades a final answer produced across several nodes, and splicing their trajectories together would describe a conversation that never happened. Per-node judges inside a graph do get their own node's.
 
 Two limits keep a trajectory from spending the judge's context window: at most 50 recorded calls per row and 2000 characters per rendered argument bag or result, with anything beyond either reported as a count or marked truncated. Calls past the limit still execute — truncation drops the record, never the work. A `NativeTool` runs inside the provider, so no local wrapper sees it; such a tool is left out of the trajectory and out of the "Tools available" line, since naming a tool whose use cannot be shown would invite a judge to conclude the model ignored it.
 
