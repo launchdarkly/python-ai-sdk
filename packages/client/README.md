@@ -42,7 +42,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_API_TOKEN` | For evaluations | API access token used by the evaluations management API |
 | `LD_SDK_KEY` | For evaluations | SDK key whose event transport carries generation results to LaunchDarkly |
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
-| `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`; staging: `https://ld-stg.launchdarkly.com`) |
+| `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
 
 ### Run an evaluation from code
 
