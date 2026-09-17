@@ -1516,33 +1516,84 @@ class TestHistory:
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
 
-    def test_history_appended_to_system_prompt(self) -> None:
+    def test_history_not_stuffed_into_system_prompt(self) -> None:
         config = _make_config(instructions="Be concise.")
-        system = _extract_system_prompt(config, {}, self.SAMPLE_HISTORY)
+        system = _extract_system_prompt(config, {})
         assert system is not None
-        assert "Conversation History:" in system
         assert "Be concise." in system
-
-    def test_history_format_is_correct(self) -> None:
-        config = _make_config(instructions="Be helpful.")
-        system = _extract_system_prompt(config, {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "user: What is feature flagging?" in system
-        assert "assistant: Feature flagging is a technique..." in system
+        assert "Conversation History:" not in system
 
     def test_empty_history_treated_like_no_history(self) -> None:
         config = _make_config(instructions="Be concise.")
-        system_with_empty = _extract_system_prompt(config, {}, [])
+        system_with_empty = _extract_system_prompt(config, {})
         system_without = _extract_system_prompt(config, {})
         assert system_with_empty == system_without
         assert "Conversation History:" not in (system_with_empty or "")
 
-    def test_history_without_prior_system_prompt(self) -> None:
+    def test_history_without_instructions_keeps_system_none(self) -> None:
         config = _make_config()
-        system = _extract_system_prompt(config, {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "Conversation History:" in system
-        assert "user: What is feature flagging?" in system
+        system = _extract_system_prompt(config, {})
+        assert system is None or "Conversation History:" not in system
+
+    @staticmethod
+    def _build(
+        config: dict[str, Any],
+        user_input: str | None,
+        history: list[dict[str, Any]] | None,
+    ) -> list[Any]:
+        lc_msgs = MagicMock()
+        lc_msgs.HumanMessage = MagicMock(
+            side_effect=lambda c: MagicMock(content=c, type="human")
+        )
+        lc_msgs.AIMessage = MagicMock(
+            side_effect=lambda c: MagicMock(content=c, type="ai")
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                lc_msgs if n == "langchain_core.messages" else __import__(n)
+            ),
+        ):
+            return _build_initial_messages(config, user_input, {}, history)
+
+    def test_history_becomes_structured_messages_before_user_input(self) -> None:
+        msgs = self._build(
+            _make_config(instructions="Be concise."), "and now?", self.SAMPLE_HISTORY
+        )
+        assert [m.type for m in msgs] == ["human", "ai", "human"]
+        assert msgs[0].content == "What is feature flagging?"
+        assert msgs[-1].content == "and now?"
+
+    def test_image_history_maps_to_langchain_image_url_parts(self) -> None:
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    },
+                ],
+            }
+        ]
+        msgs = self._build(_make_config(instructions="Be concise."), "", history)
+        assert {"type": "text", "text": "what is this?"} in msgs[0].content
+        assert {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,abc123"},
+        } in msgs[0].content
+
+    def test_config_messages_precede_history(self) -> None:
+        config = _make_config(messages=[{"role": "user", "content": "config turn"}])
+        msgs = self._build(config, "q", self.SAMPLE_HISTORY)
+        assert msgs[0].content == "config turn"
+        assert msgs[1].content == "What is feature flagging?"
+        assert msgs[-1].content == "q"
 
 
 class TestAbandonOpenSpans:

@@ -32,6 +32,7 @@ except ImportError:
 from launchdarkly_ai_claude_agents.handler import (
     _build_hooks,
     build_prompt,
+    build_query_prompt,
     build_tool_mcp,
     partition_tools,
 )
@@ -103,6 +104,7 @@ async def _run_query(
     graph_key: str,
     run_id: str,
     child_subagent_tools: list[Any],
+    history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     import importlib
 
@@ -116,6 +118,9 @@ async def _run_query(
     wrapped = _wrap_native_tools(tool_handlers, ld_context, track_data)
 
     prompt, system_prompt = build_prompt(node.config, input_text, variables)
+    query_prompt = build_query_prompt(
+        node.config, input_text, variables, history, prompt
+    )
     native_tool_map, user_config_tools, native_tool_names = partition_tools(
         node.config.get("tools"), wrapped
     )
@@ -170,7 +175,7 @@ async def _run_query(
     # Bare `return` inside `async for` abandons the generator — Python's asyncio
     # finalizer later tries to aclose() it and may raise RuntimeError if the
     # generator is suspended inside a real await in the SDK (AIC-2950).
-    gen = query_fn(prompt=prompt, options=options)
+    gen = query_fn(prompt=query_prompt, options=options)
     try:
         async for message in gen:
             if isinstance(message, ResultMessage):
@@ -207,6 +212,7 @@ def to_claude_agents(
     async def invoke(
         input_text: str = "",
         variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         import importlib
 
@@ -335,6 +341,7 @@ def to_claude_agents(
                     def_obj.key,
                     run_id,
                     root_child_tools,
+                    history,
                 )
             except Exception as exc:
                 if span:

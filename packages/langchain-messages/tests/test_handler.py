@@ -5,6 +5,7 @@ Covers §1.1-1.10 (generic handler tests) plus TELEMETRY-CONTRACT.md sections 1-
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import AsyncGenerator
 from typing import Any, ClassVar
@@ -1449,6 +1450,22 @@ class TestHistory:
         {"role": "user", "content": "What is feature flagging?"},
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
+    IMAGE_HISTORY: ClassVar[list[dict[str, Any]]] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc123",
+                    },
+                },
+                {"type": "text", "text": "What is in this image?"},
+            ],
+        }
+    ]
 
     async def test_history_inserted_between_config_messages_and_user_input(
         self,
@@ -1505,6 +1522,28 @@ class TestHistory:
         call_args = llm.ainvoke.call_args[0][0]
         contents = [str(getattr(m, "content", "")) for m in call_args]
         assert "ignored" not in contents
+
+    async def test_multimodal_image_history_preserved_on_the_wire(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+        h = create_langchain_messages_handler(llm=llm)
+        await h(CONFIG, "", {}, {}, self.IMAGE_HISTORY)
+        call_args = llm.ainvoke.call_args[0][0]
+        serialized = json.dumps([getattr(m, "content", "") for m in call_args])
+        assert "image_url" in serialized
+        assert "abc123" in serialized
+
+    async def test_empty_user_input_with_history_ending_in_user(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+        h = create_langchain_messages_handler(llm=llm)
+        await h(CONFIG, "", {}, {}, [{"role": "user", "content": "Only turn"}])
+        call_args = llm.ainvoke.call_args[0][0]
+        humans = [m for m in call_args if getattr(m, "type", None) == "human"]
+        assert len(humans) == 1
+        assert humans[0].content == "Only turn"
 
 
 # ---------------------------------------------------------------------------

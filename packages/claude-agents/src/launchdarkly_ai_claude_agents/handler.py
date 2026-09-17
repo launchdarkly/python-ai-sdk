@@ -35,7 +35,9 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    compose_history,
     config,
+    content_to_text,
     create_handler,
     end_span_once,
     end_unfinished_spans,
@@ -320,17 +322,6 @@ def build_tool_hooks(
 # ---------------------------------------------------------------------------
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
-
-
 def build_prompt(
     config: AiConfigRep,
     user_input: str | None,
@@ -362,13 +353,98 @@ def build_prompt(
             f"{config_history}\n\n{safe_input}" if config_history else safe_input
         )
 
-    history_text = _format_history(history)
-    if history_text:
-        system_prompt = (
-            f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
-        )
-
     return safe_input, system_prompt
+
+
+def _parse_message_content(content: Any, variables: dict[str, Any]) -> Any:
+    return parse_template(content, variables) if isinstance(content, str) else content
+
+
+def _config_conversation_turns(
+    config: AiConfigRep, variables: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": message.get("role"),
+            "content": _parse_message_content(message.get("content", ""), variables),
+        }
+        for message in (config.get("messages") or [])
+        if message.get("role") != "system"
+    ]
+
+
+def _to_anthropic_user_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            source = block.get("source", {})
+            if source.get("type") == "url":
+                mapped_source = {"type": "url", "url": source.get("url", "")}
+            else:
+                mapped_source = {
+                    "type": "base64",
+                    "media_type": source.get("media_type", ""),
+                    "data": source.get("data", ""),
+                }
+            blocks.append({"type": "image", "source": mapped_source})
+    return blocks
+
+
+async def _to_streamed_prompt(
+    turns: list[dict[str, Any]],
+) -> AsyncGenerator[dict[str, Any], None]:
+    # The envelope ``type`` has to agree with the message role. The CLI reading this stream
+    # accepts an "assistant" envelope as a replayed turn, but every other envelope type is
+    # required to carry role "user" — an assistant turn sent as ``type: "user"`` is rejected
+    # outright with "Expected message role 'user', got 'assistant'".
+    for turn in turns:
+        role = turn.get("role")
+        content = turn.get("content", "")
+        if role == "assistant":
+            yield {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": content_to_text(content)}],
+                },
+                "parent_tool_use_id": None,
+            }
+        else:
+            yield {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": _to_anthropic_user_content(content),
+                },
+                "parent_tool_use_id": None,
+            }
+
+
+def build_query_prompt(
+    config: AiConfigRep,
+    user_input: str | None,
+    variables: dict[str, Any],
+    history: list[dict[str, Any]] | None,
+    fallback_prompt: str,
+) -> str | AsyncGenerator[dict[str, Any], None]:
+    if not history:
+        return fallback_prompt
+
+    turns = compose_history(
+        history=history,
+        user_input=user_input,
+        config_messages=(
+            []
+            if config.get("instructions")
+            else _config_conversation_turns(config, variables)
+        ),
+    )
+    return _to_streamed_prompt(turns)
 
 
 def _opening_of(prompt: str, system_prompt: str | None) -> Opening:
@@ -451,6 +527,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
         open_root_span: Any = span
 
         prompt, system_prompt = build_prompt(config, user_input, vs, history)
+        query_prompt = build_query_prompt(config, user_input, vs, history, prompt)
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
             system_prompt = (
@@ -510,7 +587,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             # Held in a variable so the finally below can aclose() it. A bare `return` inside
             # `async for` abandons the generator, and asyncio's finalizer then raises RuntimeError
             # when the generator is suspended inside a real await in the SDK.
-            gen = query(prompt=prompt, options=options)
+            gen = query(prompt=query_prompt, options=options)
             try:
                 async for message in gen:
                     record_conversation_id(span, message)
@@ -647,6 +724,7 @@ async def _stream_gen(
     parent = parent_context_of(span)
 
     prompt, system_prompt = build_prompt(config, user_input, variables, history)
+    query_prompt = build_query_prompt(config, user_input, variables, history, prompt)
     opening = _opening_of(prompt, system_prompt)
 
     native_tool_map, user_config_tools, native_tool_names = partition_tools(
@@ -699,7 +777,7 @@ async def _stream_gen(
         )
 
         full_output = ""
-        gen = query(prompt=prompt, options=options)
+        gen = query(prompt=query_prompt, options=options)
         async for message in gen:
             record_conversation_id(span, message)
             record_native_tools(span, message, capture_content, catalog)

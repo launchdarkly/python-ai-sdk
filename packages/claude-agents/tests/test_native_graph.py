@@ -277,6 +277,58 @@ class TestToClaudeAgentsTopology:
         assert result["response"] == "final-output"
 
     @pytest.mark.asyncio
+    async def test_multimodal_history_uses_native_root_prompt(self) -> None:
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+        captured_prompts: list[Any] = []
+        result_msg = _make_result_msg("done")
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured_prompts.append(kwargs.get("prompt"))
+            yield result_msg
+
+        mock_sdk.query = _query
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke(
+                "describe", {}, history
+            )
+
+        assert captured_prompts
+        prompt = captured_prompts[0]
+        assert not isinstance(prompt, str)
+        chunks = [chunk async for chunk in prompt]
+        image = chunks[0]["message"]["content"][0]
+        assert image == {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "abc123",
+            },
+        }
+
+    @pytest.mark.asyncio
     async def test_config_tools_converted_and_passed(self) -> None:
         mock_sdk = _make_sdk_mock("done")
         root_node = {

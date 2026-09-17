@@ -16,6 +16,7 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    compose_history,
     config,
     create_handler,
     create_run_usage,
@@ -29,6 +30,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
 )
 
+from .messages import to_lang_chain_messages
 from .spans import (
     build_span_callbacks,
     fail_span,
@@ -71,21 +73,9 @@ def _build_agent_tools(
     return result
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
-
-
 def _extract_system_prompt(
     config: AiConfigRep,
     variables: dict[str, Any],
-    history: list[dict[str, Any]] | None = None,
 ) -> str | None:
     system_prompt: str | None = None
     if config.get("instructions"):
@@ -97,20 +87,43 @@ def _extract_system_prompt(
                 "\n".join(m["content"] for m in sys_msgs), variables
             )
 
-    history_text = _format_history(history)
-    if history_text:
-        system_prompt = (
-            f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
-        )
-
     return system_prompt
+
+
+def _config_conversation_turns(
+    config: AiConfigRep, variables: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": message.get("role"),
+            "content": parse_template(message.get("content", ""), variables)
+            if isinstance(message.get("content", ""), str)
+            else message.get("content", ""),
+        }
+        for message in (config.get("messages") or [])
+        if message.get("role") != "system"
+    ]
 
 
 def _build_initial_messages(
     config: AiConfigRep,
     user_input: str,
     variables: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
 ) -> list[Any]:
+    if history:
+        return to_lang_chain_messages(
+            compose_history(
+                history=history,
+                user_input=user_input,
+                config_messages=(
+                    []
+                    if config.get("instructions")
+                    else _config_conversation_turns(config, variables)
+                ),
+            )
+        )
+
     import importlib
 
     msgs_mod = importlib.import_module("langchain_core.messages")
@@ -231,14 +244,14 @@ def create_langchain_agents_handler(
         # truthily, and the test suite is built on mock spans.
         open_root_span: Any = span
 
-        system_prompt = _extract_system_prompt(config, vs, history)
+        system_prompt = _extract_system_prompt(config, vs)
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
             system_prompt = (
                 f"{system_prompt}\n\n{schema_instr}" if system_prompt else schema_instr
             )
 
-        initial_messages = _build_initial_messages(config, user_input, vs)
+        initial_messages = _build_initial_messages(config, user_input, vs, history)
 
         span_callbacks = build_span_callbacks(
             config,
@@ -391,8 +404,8 @@ async def _stream_gen(
     span = start_root_span(config, variables)
     parent = parent_context_of(span)
 
-    system_prompt = _extract_system_prompt(config, variables, history)
-    initial_messages = _build_initial_messages(config, user_input, variables)
+    system_prompt = _extract_system_prompt(config, variables)
+    initial_messages = _build_initial_messages(config, user_input, variables, history)
 
     span_callbacks = build_span_callbacks(
         config, parent, capture_content, to_tool_definitions(config.get("tools") or {})

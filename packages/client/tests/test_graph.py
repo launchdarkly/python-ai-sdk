@@ -423,3 +423,107 @@ class TestGraphInvoke:
 
         assert gd.enabled is False
         mock_logger.error.assert_called()
+
+    async def test_history_forwarded_to_root_handler_only(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc",
+                        },
+                    }
+                ],
+            }
+        ]
+        await graph("graph-key", handlers=[handler]).invoke(
+            "hi", CONTEXT, history=history
+        )
+        assert len(received) >= 2
+        assert received[0] == history
+        assert all(h is None for h in received[1:])
+
+    async def test_image_block_reaches_the_root_node_unstringified(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        # Guards the shape, not just presence: a root handler that received the image as a
+        # repr'd string instead of a block would still "contain" the data. History is
+        # root-only by design, so later nodes are expected to see none of it.
+        image_block = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "IMGDATA123",
+            },
+        }
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        await graph("graph-key", handlers=[handler]).invoke(
+            "what colour?",
+            CONTEXT,
+            history=[{"role": "user", "content": [image_block]}],
+        )
+
+        assert len(received) >= 2
+        root_content = received[0][0]["content"]
+        assert isinstance(root_content, list), (
+            f"content was stringified: {root_content!r}"
+        )
+        assert root_content == [image_block]
+        assert all(h is None for h in received[1:])
+
+    async def test_omitted_history_leaves_root_handler_history_none(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        await graph("graph-key", handlers=[handler]).invoke("hi", CONTEXT)
+        assert received[0] is None

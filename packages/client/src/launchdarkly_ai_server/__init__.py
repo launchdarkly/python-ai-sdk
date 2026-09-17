@@ -38,6 +38,14 @@ from .evaluations import (
     init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
+from .history import (
+    any_multimodal,
+    compose_history,
+    content_to_text,
+    has_multimodal_content,
+    image_block_to_url,
+    is_content_blocks,
+)
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
     extract_variation,
@@ -195,6 +203,13 @@ __all__ = [  # noqa: RUF022
     "set_openllmetry_completion",
     "set_openllmetry_prompt",
     "to_ld_context",
+    # history
+    "compose_history",
+    "content_to_text",
+    "image_block_to_url",
+    "is_content_blocks",
+    "has_multimodal_content",
+    "any_multimodal",
     # validation
     "parse_ai_config",
     # registry

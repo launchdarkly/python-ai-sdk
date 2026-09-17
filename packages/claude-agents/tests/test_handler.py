@@ -318,10 +318,10 @@ class TestPromptConstruction:
         assert "context line" in prompt
         assert prompt.endswith("final question")
 
-    def test_history_appended_to_system_prompt(self) -> None:
+    def test_history_not_appended_to_system_prompt(self) -> None:
         history = [{"role": "user", "content": "earlier"}]
         _, system = build_prompt(BASE_CONFIG, "hi", {}, history=history)
-        assert "earlier" in (system or "")
+        assert system == "You are helpful."
         assert "You are helpful." in (system or "")
 
     def test_no_user_input_defaults_to_empty_string(self) -> None:
@@ -1399,20 +1399,24 @@ class TestToolSpanFailure:
 
 
 class TestHistoryAndVariables:
-    async def test_history_reaches_the_query_as_part_of_the_system_prompt(
+    async def test_history_reaches_query_as_structured_input(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         captured: dict[str, Any] = {}
 
         async def _query(**kwargs: Any) -> AsyncIterator[Any]:
             captured["options"] = kwargs["options"]
+            captured["prompt"] = kwargs["prompt"]
             yield assistant_message()
             yield result_message()
 
         monkeypatch.setattr(handler_mod, "query", _query)
         history = [{"role": "user", "content": "earlier turn"}]
         await create_claude_agents_handler()(BASE_CONFIG, "q", history=history)
-        assert "earlier turn" in captured["options"].system_prompt
+        assert captured["options"].system_prompt == "You are helpful."
+        turns = [turn async for turn in captured["prompt"]]
+        assert turns[0]["message"]["content"] == "earlier turn"
+        assert turns[-1]["message"]["content"] == "q"
 
     async def test_ld_span_attributes_land_on_root_only(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1713,12 +1717,12 @@ class TestHistory:
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
 
-    def test_history_format_is_correct(self) -> None:
-        config = _make_config(instructions="Be helpful.")
+    def test_history_not_stuffed_into_system_prompt(self) -> None:
+        config = _make_config(instructions="Be concise.")
         _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
         assert system is not None
-        assert "user: What is feature flagging?" in system
-        assert "assistant: Feature flagging is a technique..." in system
+        assert "Be concise." in system
+        assert "Conversation History:" not in system
 
     def test_empty_history_treated_like_no_history(self) -> None:
         config = _make_config(instructions="Be concise.")
@@ -1727,12 +1731,135 @@ class TestHistory:
         assert system_with_empty == system_without
         assert "Conversation History:" not in (system_with_empty or "")
 
-    def test_history_without_prior_system_prompt(self) -> None:
+    def test_history_without_instructions_keeps_system_none(self) -> None:
         config = _make_config()
         _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "Conversation History:" in system
-        assert "user: What is feature flagging?" in system
+        assert system is None or "Conversation History:" not in system
+
+
+IMAGE_BLOCK: dict[str, Any] = {
+    "type": "image",
+    "source": {"type": "base64", "media_type": "image/png", "data": "IMGDATA123"},
+}
+
+
+async def _capture_streamed_turns(
+    monkeypatch: pytest.MonkeyPatch,
+    user_input: str,
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Runs the handler and returns the turns actually written to the SDK."""
+    captured: dict[str, Any] = {}
+
+    async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+        prompt = kwargs["prompt"]
+        captured["turns"] = (
+            prompt if isinstance(prompt, str) else [turn async for turn in prompt]
+        )
+        yield result_message()
+
+    monkeypatch.setattr(handler_mod, "query", _query)
+    await create_claude_agents_handler()(BASE_CONFIG, user_input, history=history)
+    return captured["turns"]
+
+
+class TestMultimodalHistoryReachesTheProvider:
+    """The image has to arrive as a block, and the envelope has to be one the CLI accepts.
+
+    Asserting only that the run succeeded, or that the base64 payload appears somewhere in
+    the prompt, passes just as happily when the block has been flattened to a string on the
+    way out. These check the structure.
+    """
+
+    async def test_image_block_is_sent_as_a_block_not_stringified(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "What colour is the square?",
+            [{"role": "user", "content": [IMAGE_BLOCK]}],
+        )
+
+        assert not isinstance(turns, str), "history collapsed to a single prompt string"
+        content = turns[0]["message"]["content"]
+        assert isinstance(content, list), f"content was stringified: {content!r}"
+        assert content == [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "IMGDATA123",
+                },
+            }
+        ]
+
+    async def test_every_envelope_satisfies_the_cli_role_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The CLI reading this stream accepts an "assistant" envelope as a replayed turn and
+        # rejects every other envelope whose role is not "user", with
+        # "Expected message role 'user', got 'assistant'".
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "",
+            [
+                {"role": "user", "content": "I am going to share an image."},
+                {"role": "assistant", "content": "Sure — go ahead."},
+                {
+                    "role": "user",
+                    "content": [IMAGE_BLOCK, {"type": "text", "text": "What colour?"}],
+                },
+            ],
+        )
+
+        assert not isinstance(turns, str)
+        for turn in turns:
+            role = turn["message"]["role"]
+            assert turn["type"] == "assistant" or role == "user", (
+                f"envelope type {turn['type']!r} with role {role!r} is rejected by the CLI"
+            )
+            assert turn["type"] == role
+
+    async def test_assistant_turn_is_replayed_as_an_assistant_envelope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        )
+
+        assert turns[1] == {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}],
+            },
+            "parent_tool_use_id": None,
+        }
+
+    async def test_empty_user_input_appends_no_trailing_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # History that already ends with the user turn is sent as-is; an empty user_input
+        # must not be appended as a second, blank user turn.
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [IMAGE_BLOCK]},
+            ],
+        )
+
+        assert len(turns) == 3
+        assert turns[-1]["message"]["role"] == "user"
+        assert turns[-1]["message"]["content"] == [IMAGE_BLOCK]
 
 
 class TestBuiltinsSurviveAnEmptyToolList:

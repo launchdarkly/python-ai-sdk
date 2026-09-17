@@ -13,11 +13,14 @@ from launchdarkly_ai_server import (
     SpanMessage,
     SpanMessagePart,
     SpanUsage,
+    compose_history,
     config,
     create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    image_block_to_url,
+    is_content_blocks,
     lang_chain_content_text,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
@@ -61,6 +64,23 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _to_langchain_content(content: Any) -> Any:
+    """Maps LD-canonical content blocks to LangChain multimodal content parts.
+    String content passes through so text-only callers keep plain strings."""
+    if not is_content_blocks(content):
+        return content if content is not None else ""
+
+    parts: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            parts.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            parts.append(
+                {"type": "image_url", "image_url": {"url": image_block_to_url(block)}}
+            )
+    return parts
+
+
 def _build_messages(
     config: AiConfigRep,
     user_input: str,
@@ -76,7 +96,7 @@ def _build_messages(
     AIMessage = msgs_mod.AIMessage
 
     messages: list[Any] = []
-    last_role: str | None = None
+    config_messages: list[dict[str, Any]] = []
 
     if config.get("messages"):
         system_msgs = [m for m in config["messages"] if m.get("role") == "system"]
@@ -90,28 +110,40 @@ def _build_messages(
                 )
             )
         for msg in conv_msgs:
-            content = parse_template(msg["content"], variables)
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content))
-            last_role = msg["role"]
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                content = parse_template(content, variables)
+            if msg.get("role") in ("user", "assistant"):
+                config_messages.append({"role": msg["role"], "content": content})
     elif config.get("instructions"):
         messages.append(
             SystemMessage(parse_template(config["instructions"], variables))
         )
 
-    if history:
-        for msg in history:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "user":
-                messages.append(HumanMessage(content))
-            elif role == "assistant":
-                messages.append(AIMessage(content))
-            last_role = role
+    def append_turn(turn: dict[str, Any]) -> None:
+        content = _to_langchain_content(turn.get("content"))
+        if turn.get("role") == "user":
+            messages.append(HumanMessage(content=content))
+        else:
+            messages.append(AIMessage(content=content))
 
-    if last_role != "user":
+    if history:
+        for turn in compose_history(
+            history=history, user_input=user_input, config_messages=config_messages
+        ):
+            append_turn(turn)
+        return messages
+
+    for turn in config_messages:
+        append_turn(turn)
+
+    # Preserve the no-history behaviour: an empty input still produces a human
+    # message when the config carries no trailing user turn, so an empty history
+    # array stays identical to omitting history entirely.
+    last_non_system = next(
+        (m for m in reversed(messages) if getattr(m, "type", "") != "system"), None
+    )
+    if getattr(last_non_system, "type", "") != "human":
         messages.append(HumanMessage(user_input or ""))
     return messages
 
