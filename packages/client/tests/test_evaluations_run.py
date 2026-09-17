@@ -1486,11 +1486,12 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
             "usage": {"input_tokens": 10, "output_tokens": 4},
         }
 
-    def check_refund(row: DatasetRow, output: Any) -> bool:
+    def check_refund(row: DatasetRow, output: Any) -> float:
         assert row.row_index == 42
         assert row.input == "Ticket A"
         assert output == "refund exists"
-        return "refund" in str(output)
+        # A yes/no scorer returns the score itself: the SDK coerces nothing.
+        return 1.0 if "refund" in str(output) else 0.0
 
     result = await evals.run(
         project_key="proj",
@@ -1747,7 +1748,7 @@ async def test_duplicate_criteria_rejected_before_any_request() -> None:
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[
                 Judge(key="accuracy"),
-                Scorer(name="accuracy", fn=lambda row, output: True),
+                Scorer(name="accuracy", fn=lambda row, output: 1.0),
             ],
         )
 
@@ -1775,7 +1776,7 @@ async def test_duplicate_criteria_rejected_case_insensitively() -> None:
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[
                 Judge(key="Accuracy"),
-                Scorer(name="accuracy", fn=lambda row, output: True),
+                Scorer(name="accuracy", fn=lambda row, output: 1.0),
             ],
         )
 
@@ -1863,7 +1864,7 @@ async def test_failed_evaluation_event_tracking_raises_after_attempting_every_re
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[
                 Judge(key="$ld:ai:judge:accuracy"),
-                Scorer(name="nonempty", fn=lambda row, output: bool(output)),
+                Scorer(name="nonempty", fn=lambda row, output: 1.0 if output else 0.0),
             ],
         )
 
@@ -1888,7 +1889,7 @@ def test_criteria_reject_thresholds_outside_zero_to_one(
     with pytest.raises(ValueError, match=f"{field} must be a number between 0 and 1"):
         Judge(key="$ld:ai:judge:accuracy", **{field: value})
     with pytest.raises(ValueError, match=f"{field} must be a number between 0 and 1"):
-        Scorer(name="nonempty", fn=lambda row, output: True, **{field: value})
+        Scorer(name="nonempty", fn=lambda row, output: 1.0, **{field: value})
 
 
 def judge_variation(
@@ -2249,3 +2250,139 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
 
     assert result.passed is True
     assert max_in_flight == 2
+
+
+def scorer_run_transport() -> SequencedTransport:
+    """Transport for a one-row scorer-only run."""
+    return SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page([{"rowIndex": 7, "input": "Question"}], total=1),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(3, id="above-range"),
+        pytest.param(-1, id="below-range"),
+        pytest.param("high", id="string"),
+        pytest.param(None, id="none"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_scorer_must_return_a_finite_number_in_range(
+    stub_sdk_client: MagicMock,
+    returned: Any,
+) -> None:
+    """A bool is an invalid score, not a shortcut for 1.0/0.0.
+
+    Coercing booleans sent two score types to ingest and made the threshold
+    comparison mean different things for binary and graded scorers. It also hid
+    bugs: every non-empty value is truthy, so a scorer that returned "high"
+    scored a pass.
+    """
+    transport = scorer_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="binary", fn=lambda row, output: returned)],
+    )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert scorer_event["status"] == "ERROR"
+    assert scorer_event["error"]["code"] == "invalid_score"
+    # The message names the offending value, so a caller can see what came back.
+    assert repr(returned) in scorer_event["error"]["message"]
+    assert scorer_event["errorMessage"] == scorer_event["error"]["message"]
+    assert "score" not in scorer_event
+    # A rejected score is a per-criterion ERROR, never a raised exception: the
+    # row's generation has already been paid for.
+    assert result.run_id == "run-id"
+    stub_sdk_client.flush.assert_awaited()
+
+
+@pytest.mark.parametrize(
+    ("returned", "expected"),
+    [(1.0, 1.0), (0.0, 0.0), (0, 0.0), (1, 1.0), (0.25, 0.25)],
+)
+@pytest.mark.asyncio
+async def test_scorer_accepts_the_range_boundaries_and_integers(
+    stub_sdk_client: MagicMock,
+    returned: Any,
+    expected: float,
+) -> None:
+    """0 and 1 stay valid, as ints too -- only bool is excluded."""
+    transport = scorer_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="graded", fn=lambda row, output: returned)],
+    )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert scorer_event["status"] == "COMPLETE"
+    assert scorer_event["score"] == expected
+
+
+@pytest.mark.asyncio
+async def test_async_scorer_score_is_awaited_before_validation(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = scorer_run_transport()
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    async def graded(row: DatasetRow, output: Any) -> float:
+        return 0.5
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Scorer(name="graded", fn=graded)],
+    )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert scorer_event["status"] == "COMPLETE"
+    assert scorer_event["score"] == 0.5

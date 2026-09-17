@@ -775,25 +775,21 @@ class EvaluationsRunner:
             return self._criterion_error_result(
                 base, started_clock, "scorer_raised", f"scorer fn raised: {error}"
             )
-        if isinstance(score_value, bool):
-            score: float = 1.0 if score_value else 0.0
-        else:
-            maybe_score = numeric_score(score_value)
-            if maybe_score is None:
-                return self._criterion_error_result(
-                    base,
-                    started_clock,
-                    "invalid_score",
-                    "scorer fn must return a bool or a finite number, "
-                    f"got {score_value!r}",
-                )
-            score = maybe_score
-        if score < 0 or score > 1:
+        # A bool is rejected rather than read as 1.0/0.0. numeric_score already
+        # excludes it, so the whole return contract is "a finite number in
+        # 0-1": a scorer answering a yes/no question returns 1.0 or 0.0 itself.
+        # Coercing on the caller's behalf sent two score types to ingest and
+        # made the threshold comparison mean different things for binary and
+        # graded scorers -- and silently scored `return "high"`-style bugs as a
+        # pass, since every non-empty value is truthy.
+        score = numeric_score(score_value)
+        if score is None or score < 0 or score > 1:
             return self._criterion_error_result(
                 base,
                 started_clock,
                 "invalid_score",
-                f"scorer fn score must be between 0 and 1, got {score_value!r}",
+                "scorer fn must return a finite number between 0 and 1, "
+                f"got {score_value!r}",
             )
         completed = datetime.now(UTC)
         return {
