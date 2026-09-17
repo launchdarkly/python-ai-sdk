@@ -673,11 +673,25 @@ it as soon as the write returns.
 **The platform bound is POSIX-only, and that is a decision — do not quietly "fix" it.**
 Windows reparse-point checks (`GetFileAttributesW`, `FILE_FLAG_OPEN_REPARSE_POINT`) are not
 implemented because Windows is not a supported or tested platform for this release: there is
-no Windows CI runner in either repository, so the checks would ship unverified, and the
-TypeScript SDK could not match them at all — Node exposes no `*at()` family on *any*
-platform, so its racy floor is universal rather than Windows-only. Implementing them in
-Python alone would break cross-language parity and trade a documented bound for an unverified
-one. Two follow-on facts: on Windows write permission on the managed root is the only
+no Windows CI runner in either repository, so the checks would ship unverified, and there is
+no second implementation to check them against — the TypeScript SDK has no Windows story
+either. Implementing them in Python alone would trade a documented bound for an unverified
+one.
+
+The parity argument used to be stronger than that, and the correction matters because the
+old wording is now wrong. It read: Node exposes no `*at()` family on *any* platform, so its
+racy floor is universal rather than Windows-only. The first half is still true and the
+second is not. `*at()` is not the only way to address a child relative to a pinned inode:
+TypeScript commit `0a15b10` added a `SUPPORTS_PROC_FD` probe and `/proc/self/fd/<fd>/<name>`
+addressing, which the Linux kernel resolves from the inode the descriptor holds rather than
+from the name it was opened under. That **closes** the swap window on Linux exactly as
+`*at()` does here, so TypeScript's `lstat` floor now applies on macOS and Windows only —
+the same shape as this side's, not a universal one.
+
+None of which reopens the decision above. It never rested on TypeScript being equally
+exposed; it rests on there being no Windows CI runner to verify the checks against, which is
+still the case in both repositories. Two follow-on facts: on Windows write permission on the
+managed root is the only
 boundary, which is why the privilege-separated deployment is documented as the mitigation
 rather than as advice; and this bound retroactively lowers the priority of the reserved-device-name
 work above — keep that code, but do not read it as evidence that Windows is hardened. If
