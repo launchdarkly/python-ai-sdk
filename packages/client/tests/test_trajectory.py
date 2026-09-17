@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from launchdarkly_ai_server.evaluations.trajectory import (
+from launchdarkly_ai_server.trajectory import (
     MAX_RECORDED_VALUE_CHARS,
     ToolInvocation,
     TrajectoryRecorder,

@@ -14,10 +14,16 @@ from typing import Any, Literal
 
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
+    build_message_history,
     numeric_score,
     parse_judge_response,
 )
 from ..lifecycle import extract_variation
+from ..trajectory import (
+    TrajectoryRecorder,
+    render_row_trajectory,
+    row_fields,
+)
 from ..types import NativeTool
 from ..utils import (
     collapse_messages_to_instructions,
@@ -35,7 +41,6 @@ from .events import (
     LDJudgeCriterionEventPayload,
     TokenUsage,
 )
-from .trajectory import TrajectoryRecorder, render_row_trajectory, row_fields
 from .types import (
     DatasetRef,
     DatasetRow,
@@ -712,32 +717,21 @@ class EvaluationsRunner:
         # reading the history sees the request, what the agent did about it, and
         # what it finally answered, in order.
         trajectory = render_row_trajectory(row_result)
-        # message_history carries FORMATTING_INSTRUCTIONS the same way the
-        # online path builds it (judges.run_judges), because that -- not the
-        # standalone formatting_instructions variable below -- is what every
-        # judge built from the AI Library's default templates (accuracy,
-        # relevance, toxicity, and any judge cloned from them) actually
-        # references. A judge authored before this variable existed must keep
-        # getting scored without edits.
-        #
-        # The trajectory goes here and nowhere else. It was briefly also
-        # exposed as a standalone tool_trajectory variable, which bought
-        # nothing: this is already the transcript variable every judge reads,
-        # and two overlapping variables only invited a rubric to interpolate
-        # both and pay for the trajectory twice.
+        # Built by the shared builder, not inline here: this path and both
+        # online paths must show a judge the same conversation, and they did
+        # not while each one joined its own. The trajectory goes into
+        # message_history and nowhere else -- it is already the transcript
+        # variable every judge cloned from the AI Library's default templates
+        # reads, so a second overlapping variable only invited a rubric to
+        # interpolate both and pay for the trajectory twice.
         variables.update(
             {
                 "input": row_result.get("input") or "",
                 "response_to_evaluate": output if output is not None else "",
-                "message_history": "\n\n".join(
-                    str(value)
-                    for value in (
-                        row_result.get("input"),
-                        trajectory,
-                        output,
-                        FORMATTING_INSTRUCTIONS,
-                    )
-                    if value
+                "message_history": build_message_history(
+                    user_input=row_result.get("input"),
+                    trajectory=trajectory,
+                    output=output,
                 ),
                 "expected_output": expected if expected is not None else "",
                 "ground_truth_context": (

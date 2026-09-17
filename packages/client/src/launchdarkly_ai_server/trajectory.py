@@ -1,4 +1,4 @@
-"""Tool-call trajectory capture for the generation phase of an SDK-run evaluation.
+"""Tool-call trajectory capture, shared by both judge paths.
 
 A judge can only grade what it is shown. Handler packages record tool traffic
 onto OpenTelemetry spans and return only ``{output, usage}``, so by the time a
@@ -7,10 +7,16 @@ which made "did the agent call the right tools, in the right order, with the
 right arguments?" an unaskable question of an SDK-run evaluation, even though
 the evaluation had just run the agent that answered it.
 
-The runner therefore records the trajectory itself, by wrapping the caller's
-tool implementations once per row before handing them to the handler. Wrapping
-is what makes this work with every handler package without changing any of
-them: a handler looks a tool up by its key and calls it, exactly as before.
+Both judge paths therefore record the trajectory themselves, by wrapping the
+caller's tool implementations before handing them to the handler: once per row
+in the offline evaluations runner, and once per invocation in
+``tracking.execute_and_track``. Wrapping is what makes this work with every
+handler package without changing any of them: a handler looks a tool up by its
+key and calls it, exactly as before.
+
+The recorded trajectory reaches a judge through ``message_history``, built by
+:func:`judge_scoring.build_message_history` -- one function for both paths, so
+an online judge and an offline one are shown the same shape.
 
 Three properties are load-bearing.
 
@@ -20,16 +26,24 @@ hits :data:`MAX_RECORDED_TOOL_CALLS` still executes every remaining call --
 truncation drops the *record*, never the work, because an evaluation that
 changed the agent's behavior would no longer be evaluating the agent.
 
-**A recorder belongs to one row.** ``_run_rows`` runs rows concurrently against
-one shared tool map, so a single shared recorder would splice one row's calls
-into another row's trajectory and hand the judge a conversation that never
-happened.
+**A recorder belongs to one invocation.** The offline runner generates rows
+concurrently against one shared tool map, so a single shared recorder would
+splice one row's calls into another row's trajectory and hand the judge a
+conversation that never happened. The same holds for concurrent online
+invocations, which is why ``execute_and_track`` builds its own per call.
 
 **Only observable tools are described.** A ``NativeTool`` is executed inside the
 provider, so no local wrapper ever sees it and its calls cannot appear in the
 trajectory. Such a tool is therefore left out of the rendered "tools available"
 line as well: naming a tool whose use is invisible would let a judge conclude
 the model ignored a tool it may well have called.
+
+Online, ``tracking.wrap_tool_handlers`` does turn a ``NativeTool`` into a
+callable tracking stub, so a native call *is* locally observable there -- but it
+is still skipped, and deliberately. The stub returns nothing, so recording it
+would show a judge a tool call with an empty result while the provider's real
+result stayed invisible. Recording is therefore composed *inside* that wrapper,
+on the original map, so both paths see natives identically.
 """
 
 from __future__ import annotations
@@ -40,7 +54,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from ..types import NativeTool
+from .types import NativeTool
 
 #: How many tool calls one row's trajectory records. A trajectory is
 #: interpolated into a judge prompt, so an agent that loops over a large tool
