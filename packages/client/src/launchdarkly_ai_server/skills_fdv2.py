@@ -93,13 +93,8 @@ DEFAULT_STREAM_URI = "https://stream.launchdarkly.com"
 """
 Where ``GET /sdk/stream`` is served.
 
-LaunchDarkly serves streaming from a **different host** than polling, which is
-why this is a second default rather than a path under ``DEFAULT_BASE_URI``. Both
-base server-side SDKs ship the pair: ``ldclient.config.Config`` defaults
-``stream_uri`` to ``https://stream.launchdarkly.com`` alongside its own polling
-host, and ``@launchdarkly/js-server-sdk-common`` does the same. ``mode="stream"``
-is this store's default, so a single-host default would have the default
-configuration connect to the wrong host on first contact with a real environment.
+LaunchDarkly serves streaming from a different host than polling, which is
+why this is a second default rather than a path under ``DEFAULT_BASE_URI``.
 
 A *base_uri* given on its own applies to both endpoints, because a relay or a
 private instance serving both from one host should need only one option; see
