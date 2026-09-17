@@ -1,10 +1,11 @@
 """
 Example: langchain_messages() against a Claude model with extended thinking turned on.
 
-With thinking on, Anthropic returns ``content`` as a list of blocks — a ``thinking`` block followed
-by a ``text`` block — instead of a plain string. A handler that only reads string content reports
-an empty response for these runs while the tokens are still spent, so this example fails loudly
-when no text comes back.
+Point this at a flag whose ``model.parameters`` enable thinking (and whose ``max_tokens``
+exceeds the thinking budget). Anthropic then returns ``content`` as a list of blocks — a
+``thinking`` block followed by a ``text`` block — instead of a plain string. A handler that
+only reads string content reports an empty response for these runs while the tokens are still
+spent, so this example fails loudly when no text comes back.
 
 Anthropic omits thinking from the turn that follows a tool result, so give this a prompt the model
 can answer on its own — a run that goes through the tool loop ends on a plain string and never
@@ -28,10 +29,6 @@ from examples.utils import new_context, write_output
 from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 from launchdarkly_ai_server import config
 
-# Anthropic requires max_tokens to exceed the thinking budget.
-_THINKING_BUDGET_TOKENS = 1024
-_MAX_TOKENS = 4096
-
 
 async def run(key: str, user_input: str) -> None:
     from langchain_anthropic import ChatAnthropic
@@ -39,15 +36,9 @@ async def run(key: str, user_input: str) -> None:
     def build_model(ai_config: Any) -> Any:
         model = ai_config.get("model") or {}
         raw = model.get("parameters")
-        parameters: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
-        return ChatAnthropic(
-            timeout=None,
-            stop=None,
-            **parameters,
-            model_name=str(model.get("name") or "claude-sonnet-4-5"),
-            thinking={"type": "enabled", "budget_tokens": _THINKING_BUDGET_TOKENS},
-            max_tokens_to_sample=_MAX_TOKENS,
-        )
+        kwargs: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+        kwargs["model"] = str(model.get("name") or "claude-sonnet-4-5")
+        return ChatAnthropic(**kwargs)
 
     response = await config(
         key=key,
