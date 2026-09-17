@@ -993,6 +993,7 @@ class EvaluationsRunner:
         self,
         row: Mapping[str, Any],
         scorer: Scorer,
+        warned_scorers: set[str],
     ) -> dict[str, Any]:
         started = datetime.now(UTC)
         started_clock = time.perf_counter()
@@ -1017,25 +1018,21 @@ class EvaluationsRunner:
             return self._criterion_error_result(
                 base, started_clock, "scorer_raised", f"scorer fn raised: {error}"
             )
-        if isinstance(score_value, bool):
-            score: float = 1.0 if score_value else 0.0
-        else:
-            maybe_score = numeric_score(score_value)
-            if maybe_score is None:
-                return self._criterion_error_result(
-                    base,
-                    started_clock,
-                    "invalid_score",
-                    "scorer fn must return a bool or a finite number, "
-                    f"got {_describe_value(score_value)}",
+        # A scorer must return a finite number from 0 to 1. numeric_score
+        # rejects a bool, so a bool is an invalid score.
+        score = numeric_score(score_value)
+        if score is None or score < 0 or score > 1:
+            message = (
+                "scorer fn must return a finite number between 0 and 1, "
+                f"got {_describe_value(score_value)}"
+            )
+            if scorer.name not in warned_scorers:
+                warned_scorers.add(scorer.name)
+                logger.warning(
+                    "scorer %r returned an invalid score: %s", scorer.name, message
                 )
-            score = maybe_score
-        if score < 0 or score > 1:
             return self._criterion_error_result(
-                base,
-                started_clock,
-                "invalid_score",
-                f"scorer fn score must be between 0 and 1, got {_describe_value(score_value)}",
+                base, started_clock, "invalid_score", message
             )
         completed = datetime.now(UTC)
         return {
@@ -1173,10 +1170,11 @@ class EvaluationsRunner:
         Each ``evaluate`` span parents under its row's span in ``row_spans``.
         """
         controller = ConcurrencyController(concurrency)
+        warned_scorers: set[str] = set()
 
         async def score(row: Mapping[str, Any], criterion: Criterion) -> dict[str, Any]:
             if isinstance(criterion, Scorer):
-                return await self._run_scorer_for_result(row, criterion)
+                return await self._run_scorer_for_result(row, criterion, warned_scorers)
             return await self._run_ld_judge_for_result(
                 row,
                 criterion,
