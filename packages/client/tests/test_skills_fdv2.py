@@ -50,6 +50,7 @@ from launchdarkly_ai_server.skills_fdv2 import (
     FDV2_OBJECT_KIND,
     MAX_RESPONSE_BYTES,
     _backoff_delay,
+    _classify_status,
     _FatalTransportError,
     _is_skill_event,
     _iter_sse,
@@ -58,6 +59,7 @@ from launchdarkly_ai_server.skills_fdv2 import (
     _Requester,
     _retry_after_seconds,
     _SkillObjectSet,
+    _StaleRequestStateError,
     _store_object_from_put,
     _StreamConnection,
     _tombstone_from_delete,
@@ -1642,6 +1644,83 @@ class TestFailureHandling:
             assert store.wait_for_skills(timeout=5) is True
             assert store.failed is None
 
+    def test_a_404_stops_delivery_immediately(self, endpoint: Any) -> None:
+        """A 404 means the endpoint does not exist for this credential.
+
+        A mistyped base URI, typically, or an instance that does not serve the
+        FDv2 endpoints. No reconnect produces one, so it is fatal rather than
+        retried — and it is the exception to the shape the recoverable-by-default
+        rule would suggest.
+        """
+        endpoint.queue_poll(status=404)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+            assert store.wait_for_skills(timeout=1) is False
+        assert "404" in store.failed
+        assert "/sdk/poll" in store.failed
+        # Fatal means one request, not a retry that happened to find the payload.
+        assert len(endpoint.requests) == 1
+        assert store.diagnostics.connection_failures == 0
+
+    def test_a_400_reconnects_once_from_scratch_and_is_then_fatal(
+        self, endpoint: Any
+    ) -> None:
+        """A 400 is what a stale ``basis`` selector looks like.
+
+        The selector and the etag are the only client state the request carries,
+        so a fresh connection built from nothing is the one repair available.
+        It gets exactly one: the retry bound is what keeps this from being
+        "400 is recoverable".
+        """
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: store.failed is not None)
+        assert "400" in store.failed
+        # The first payload, then the retried request, then the fatal one. The
+        # fourth queued payload is never asked for.
+        assert len(endpoint.requests) == 3
+        # The premise: the rejected request did carry client state to drop.
+        assert "basis" in endpoint.requests[1]["query"]
+        # The retry was from scratch: no selector and no etag on the way back.
+        retried = endpoint.requests[2]
+        assert retried["query"] == {}
+        assert retried["if_none_match"] is None
+        # Last known good survives both.
+        assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+
+    def test_a_400_carrying_no_client_state_is_fatal_at_once(
+        self, endpoint: Any
+    ) -> None:
+        """There is nothing to drop on a first connection, so nothing to repair.
+
+        A request that carried neither a selector nor an etag and was still
+        refused was refused on its own terms.
+        """
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+        assert "400" in store.failed
+        assert len(endpoint.requests) == 1
+
+    def test_the_two_exceptional_statuses_are_classified_apart(self) -> None:
+        # The classification is the contract; the end-to-end tests above are
+        # what prove the loop honours it.
+        assert isinstance(_classify_status(404, None), _FatalTransportError)
+        assert isinstance(_classify_status(400, None), _StaleRequestStateError)
+        # A stale-state error is still a recoverable one, so the retry path
+        # reaches it at all.
+        assert isinstance(_classify_status(400, None), _RecoverableTransportError)
+        for status in (405, 406, 414, 501):
+            assert isinstance(_classify_status(status, None), _FatalTransportError)
+        assert isinstance(_classify_status(503, None), _RecoverableTransportError)
+        assert not isinstance(_classify_status(503, None), _StaleRequestStateError)
+
     def test_a_401_stops_delivery(self, endpoint: Any) -> None:
         endpoint.queue_poll(status=401)
         with poll_store(endpoint) as store:
@@ -2823,6 +2902,42 @@ class TestLifecycle:
         store.close()
         store.close()
 
+    def test_a_closed_store_does_not_restart(self, endpoint: Any) -> None:
+        """``close`` is final, and a restart raises rather than resuming.
+
+        Finality is what gives ``close`` a postcondition a caller can rely on —
+        delivery has stopped — including when the join timed out. A store that
+        could be restarted from there leaves the caller unable to tell whether
+        delivery stopped, and a restart that silently never delivered again is
+        the failure this forecloses. To resume, construct a new store.
+        """
+        store = poll_store(endpoint)
+        store.start()
+        store.close()
+        with pytest.raises(RuntimeError, match="close\\(\\) is final") as excinfo:
+            store.start()
+        # The remedy is in the message, not only in the docs.
+        assert "Construct a new FDv2SkillStore" in str(excinfo.value)
+
+    def test_a_store_closed_before_it_started_also_refuses_to_start(
+        self, endpoint: Any
+    ) -> None:
+        store = poll_store(endpoint)
+        store.close()
+        with pytest.raises(RuntimeError, match="close\\(\\) is final"):
+            store.start()
+
+    def test_reentering_a_closed_store_as_a_context_manager_raises(
+        self, endpoint: Any
+    ) -> None:
+        # ``__enter__`` is ``start``, so finality reaches the ``with`` form too.
+        store = poll_store(endpoint)
+        with store:
+            pass
+        with pytest.raises(RuntimeError, match="close\\(\\) is final"):
+            with store:
+                pass
+
     def test_close_during_a_slow_connect_returns_promptly(self) -> None:
         # Before the connect returns there is no connection for close() to
         # interrupt. If the delivery thread then enters the read anyway, close()
@@ -3115,19 +3230,36 @@ class TestWaitingForSkills:
             store.close()
         assert store.wait_for_skills(timeout=5) is True
 
-    def test_a_restarted_store_waits_again(self) -> None:
-        # The released flag is sticky by design, so a store closed before any
-        # payload and then started again has to re-arm: otherwise the next
-        # waiter is let go before delivery has had a chance to begin.
-        store = stream_store(_requester=_SilentStreamRequester())
+    def test_a_store_restarted_after_giving_up_waits_again(self) -> None:
+        # The released flag is sticky by design, so a store that gave up before
+        # any payload and is then started again has to re-arm: otherwise the
+        # next waiter is let go before delivery has had a chance to begin.
+        # Restarting after a *close* is not available — see
+        # ``TestCloseIsFinal`` — so the give-up path is what exercises this.
+        class _FailsThenGoesQuiet(_FakeRequester):
+            """One failure, enough to give up; silent on every run after."""
+
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def stream(self, basis: str | None) -> Any:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise _RecoverableTransportError("x")
+                return _BlockingConnection()
+
+        store = stream_store(
+            max_consecutive_failures=0, _requester=_FailsThenGoesQuiet()
+        )
         store.start()
-        store.close()
+        assert wait_until(lambda: store.failed is not None)
         assert store.wait_for_skills(timeout=0.1) is False
+
         store.start()
         try:
             started = time.monotonic()
             assert store.wait_for_skills(timeout=0.5) is False
-            # Waited, rather than being released by the previous close.
+            # Waited, rather than being released by the previous give-up.
             assert time.monotonic() - started >= 0.4
         finally:
             store.close()
@@ -3206,11 +3338,12 @@ class TestPollShutdown:
         assert store.diagnostics.last_error is None
         assert store.failed is None
 
-    def test_a_close_that_timed_out_leaves_the_store_restartable(self) -> None:
+    def test_a_close_that_timed_out_is_still_final(self) -> None:
         # A request blocked inside its connect is beyond any interrupt, so
-        # ``close`` can still return with the thread alive. ``start`` must not
-        # then find that thread and return with the stop flag set: the store
-        # would report itself started and never deliver again.
+        # ``close`` can still return with the thread alive. This is the case
+        # finality exists for: the caller cannot tell whether delivery stopped,
+        # and a ``start`` that adopted the dying thread would leave a store
+        # reporting itself started and never delivering. Raising says so.
         requester = _SlowPollRequester()
         store = FDv2SkillStore(
             SDK_KEY, mode="poll", poll_interval=0.01, _requester=requester
@@ -3220,8 +3353,8 @@ class TestPollShutdown:
             assert requester.entered.wait(timeout=5)
             store.close(timeout=0.2)
             assert store._thread is not None and store._thread.is_alive()
-            store.start()
-            assert store._stop.is_set() is False
+            with pytest.raises(RuntimeError, match="close\\(\\) is final"):
+                store.start()
         finally:
             requester.release.set()
             store.close(timeout=2)

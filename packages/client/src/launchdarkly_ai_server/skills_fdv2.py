@@ -903,6 +903,25 @@ class _RecoverableTransportError(Exception):
         self.retry_after = retry_after
 
 
+class _StaleRequestStateError(_RecoverableTransportError):
+    """
+    An HTTP 400 for a request carrying client state — the ``basis`` selector, or
+    an ``If-None-Match`` etag.
+
+    That state is the one part of the request that can go stale, so it is
+    dropped and a full transfer asked for **once** before the status is treated
+    as fatal. The bound is what keeps a 400 from being plain "recoverable": a
+    request carrying no state at all was itself refused, and no reconnect fixes
+    that.
+    """
+
+
+_REQUEST_ADVICE = (
+    "The request this adapter sent was not understood. It carries only the SDK "
+    "key and, after the first payload, a 'basis' selector, so check the base "
+    "URI and that the endpoint speaks FDv2."
+)
+
 _FORBIDDEN_ADVICE = (
     "The FDv2 protocol is opt-in per LaunchDarkly account and is served as HTTP "
     "403 while it is off. Skill delivery needs it enabled; contact LaunchDarkly "
@@ -954,12 +973,24 @@ def _classify_status(status: int, headers: Any) -> Exception:
             "base URI, and any proxy in between, for the address being redirected "
             "to."
         )
-    if status in (400, 405, 406, 414, 501):
+    if status == 404:
+        # The endpoint does not exist for this credential or instance — a
+        # mistyped base URI, typically. No reconnect produces one.
+        return _FatalTransportError(
+            "LaunchDarkly returned HTTP 404 for the FDv2 endpoint. Check the "
+            "base URI, and that this instance serves /sdk/poll and /sdk/stream."
+        )
+    if status == 400:
+        # The one rejection this adapter can act on: the selector it sent may be
+        # one the server no longer accepts. Recoverable so the state can be
+        # dropped and a full transfer requested; fatal once that has been tried.
+        return _StaleRequestStateError(
+            f"LaunchDarkly returned HTTP 400. {_REQUEST_ADVICE}"
+        )
+    if status in (405, 406, 414, 501):
         return _FatalTransportError(
             f"LaunchDarkly returned HTTP {status}, which retrying will not fix. "
-            "The request this adapter sent was not understood. It carries only "
-            "the SDK key and, after the first payload, a 'basis' selector, so "
-            "check the base URI and that the endpoint speaks FDv2."
+            f"{_REQUEST_ADVICE}"
         )
     return _RecoverableTransportError(
         f"LaunchDarkly returned HTTP {status}", _retry_after_seconds(headers)
@@ -1373,6 +1404,10 @@ class FDv2SkillStore:
     which is what a relay or a private instance serving both endpoints from one
     host needs.
 
+    **``close`` is final.** A closed store still answers from what it received,
+    but delivery cannot be resumed: ``start`` afterwards raises. Construct a new
+    store instead.
+
     **Delivery is in the background; retrieval is not.** A daemon thread owns
     the connection and fills memory, and ``get_object`` only ever reads what has
     already arrived. A process that calls ``get_skill`` immediately after
@@ -1483,6 +1518,16 @@ class FDv2SkillStore:
             stream_uri=stream_uri,
         )
 
+        self._closed = False
+        """
+        ``close`` has been called. Final: ``start`` raises afterwards.
+
+        What gives ``close`` a postcondition a caller can rely on — "delivery
+        has stopped" — including when the join timed out. A store that could be
+        restarted after a timed-out close leaves the caller unable to tell
+        whether delivery stopped, and a restart that silently never delivers
+        again is the failure this forecloses. To resume, construct a new store.
+        """
         self._stop = threading.Event()
         self._first_payload = threading.Event()
         """A payload has committed. The fact ``wait_for_skills`` reports."""
@@ -1518,8 +1563,21 @@ class FDv2SkillStore:
         Starts the delivery thread. Idempotent; returns ``self`` so it chains.
 
         Does not block: use ``wait_for_skills`` when boot ordering matters.
+
+        Raises ``RuntimeError`` on a **closed** store: ``close`` is final, so
+        there is no resuming it. A store that gave up at its failure bound is
+        not closed and can be started again — the retry budget and the terminal
+        reason both belong to the run that spent them.
         """
         with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    "This FDv2SkillStore has been closed, and close() is final: "
+                    "delivery cannot be resumed, so a restarted store would "
+                    "report itself started and never deliver. Construct a new "
+                    "FDv2SkillStore to resume delivery. Held content is still "
+                    "readable from the closed store."
+                )
             # Read before the rearm clears it: a thread inside ``_give_up`` is
             # still alive and no longer delivering, so ``is_alive`` on its own
             # would have this call adopt a run that is about to return and
@@ -1531,13 +1589,9 @@ class FDv2SkillStore:
             )
             self._rearm_waiters()
             if delivering:
-                # A ``close`` whose join timed out leaves the previous thread
-                # running with the stop flag still set. Clearing it lets that
-                # thread carry on delivering, rather than leaving a store that
-                # reports itself started and never delivers again.
-                self._stop.clear()
                 return self
-            self._stop.clear()
+            # Only ``close`` sets the stop flag, and a closed store never gets
+            # here, so there is nothing to clear.
             self._thread = threading.Thread(
                 target=self._run, name="ld-ai-skills-fdv2", daemon=True
             )
@@ -1546,9 +1600,9 @@ class FDv2SkillStore:
 
     def _rearm_waiters(self) -> None:
         """
-        Re-arms ``wait_for_skills`` for a store being started again after a
-        ``close``. A payload already held stays an answer; an ended delivery
-        does not, or the next waiter would be released before it began.
+        Re-arms ``wait_for_skills`` for a store being started again after it
+        gave up. A payload already held stays an answer; an ended delivery does
+        not, or the next waiter would be released before it began.
 
         A terminal ``failed`` reason is dropped for the same reason: it says why
         delivery stopped for good, and delivery is about to run again. Leaving
@@ -1566,12 +1620,21 @@ class FDv2SkillStore:
 
     def close(self, timeout: float = 5.0) -> None:
         """
-        Stops delivery. Idempotent, and safe to call from any thread.
+        Stops delivery. Idempotent, safe to call from any thread, and **final**:
+        a subsequent ``start`` raises rather than resuming. Construct a new
+        store to resume delivery.
+
+        Finality is what gives this call a postcondition — delivery has
+        stopped — even when the join below times out on a thread parked
+        somewhere no interrupt reaches. A store that could be restarted from
+        there would leave the caller unable to tell whether delivery stopped.
 
         Held content is *not* dropped: a closed store still answers from what it
         received. Detaching the store from the accessors is the job of the
         package-level ``launchdarkly_ai_server.shutdown()`` coroutine.
         """
+        with self._lock:
+            self._closed = True
         self._stop.set()
         # A waiter parked in ``wait_for_skills`` is owed an answer now rather
         # than at the end of its timeout; delivery is over either way.
@@ -1739,6 +1802,20 @@ class FDv2SkillStore:
                     # would spend a retry from the bounded budget and leave a
                     # misleading ``last_error`` on a healthy store.
                     return
+                if isinstance(exc, _StaleRequestStateError):
+                    # The selector and the etag are the only client state in the
+                    # request, so a rejection of a request carrying neither is
+                    # the request itself being refused, and reconnecting cannot
+                    # fix it. Carrying one, the state may be stale: drop it, ask
+                    # for a full transfer, and let the next 400 be the fatal one.
+                    with self._lock:
+                        exhausted = self._basis is None and self._etag is None
+                        if not exhausted:
+                            self._basis = None
+                            self._etag = None
+                    if exhausted:
+                        self._give_up(str(exc))
+                        return
                 with self._lock:
                     # Whatever the dropped connection had transferred so far is
                     # not a payload; the next connection starts one afresh.
