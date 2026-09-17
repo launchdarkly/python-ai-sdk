@@ -86,8 +86,25 @@ has exactly one.
 """
 
 DEFAULT_BASE_URI = "https://sdk.launchdarkly.com"
-"""Where the SDK-facing FDv2 endpoints live. Overridable for Federal and private
-instances."""
+"""Where ``GET /sdk/poll`` is served. Overridable for Federal instances, private
+instances, and relay deployments."""
+
+DEFAULT_STREAM_URI = "https://stream.launchdarkly.com"
+"""
+Where ``GET /sdk/stream`` is served.
+
+LaunchDarkly serves streaming from a **different host** than polling, which is
+why this is a second default rather than a path under ``DEFAULT_BASE_URI``. Both
+base server-side SDKs ship the pair: ``ldclient.config.Config`` defaults
+``stream_uri`` to ``https://stream.launchdarkly.com`` alongside its own polling
+host, and ``@launchdarkly/js-server-sdk-common`` does the same. ``mode="stream"``
+is this store's default, so a single-host default would have the default
+configuration connect to the wrong host on first contact with a real environment.
+
+A *base_uri* given on its own applies to both endpoints, because a relay or a
+private instance serving both from one host should need only one option; see
+``FDv2SkillStore.__init__``.
+"""
 
 POLL_PATH = "/sdk/poll"
 STREAM_PATH = "/sdk/stream"
@@ -202,9 +219,9 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 """The only hosts a plain ``http://`` base URI may name: a local test double."""
 
 
-def _require_https_base_uri(base_uri: str) -> None:
+def _require_https_uri(base_uri: str, option: str = "base_uri") -> None:
     """
-    Refuses a base URI that would send the SDK key in cleartext.
+    Refuses a URI that would send the SDK key in cleartext.
 
     Every request carries the environment's server-side SDK key in
     ``Authorization``, so the transport is ``https://`` only. The one exception
@@ -215,7 +232,7 @@ def _require_https_base_uri(base_uri: str) -> None:
     """
     if not isinstance(base_uri, str) or not base_uri.strip():
         raise ValueError(
-            "FDv2SkillStore requires an https:// base URI; none was given."
+            f"FDv2SkillStore requires an https:// URI for {option}; none was given."
         )
     parts = urllib.parse.urlsplit(base_uri.strip())
     if parts.scheme == "https" and parts.hostname:
@@ -224,14 +241,15 @@ def _require_https_base_uri(base_uri: str) -> None:
         return
     if parts.scheme == "http":
         raise ValueError(
-            f"FDv2SkillStore refuses base_uri {base_uri!r}: a plain http:// URI "
+            f"FDv2SkillStore refuses {option} {base_uri!r}: a plain http:// URI "
             "would send the server-side SDK key in cleartext. Use https:// "
-            "(the default is https://sdk.launchdarkly.com). Plain http:// is "
+            "(the defaults are https://sdk.launchdarkly.com for polling and "
+            "https://stream.launchdarkly.com for streaming). Plain http:// is "
             "allowed only for a loopback host (localhost, 127.0.0.1, ::1) "
             "serving a local test double."
         )
     raise ValueError(
-        f"FDv2SkillStore refuses base_uri {base_uri!r}: expected an https:// URI "
+        f"FDv2SkillStore refuses {option} {base_uri!r}: expected an https:// URI "
         "with a host, such as https://sdk.launchdarkly.com."
     )
 
@@ -1038,10 +1056,15 @@ class _Requester:
         base_uri: str,
         *,
         read_timeout: float,
+        stream_uri: str | None = None,
         opener: Any = None,
     ) -> None:
         self._sdk_key = sdk_key
         self._base_uri = base_uri.rstrip("/")
+        # Streaming and polling are served from different hosts by LaunchDarkly;
+        # a caller that names only one host means both, which is a relay or a
+        # private instance. ``FDv2SkillStore`` resolves the two-default case.
+        self._stream_uri = (stream_uri or base_uri).rstrip("/")
         self._read_timeout = read_timeout
         # Injectable, so an alternative transport can be supplied. The default
         # never follows a redirect; see ``_RefuseRedirects``.
@@ -1066,9 +1089,12 @@ class _Requester:
         if response is not None:
             _interrupt_read(response)
 
-    def _url(self, path: str, basis: str | None) -> str:
+    def _url(self, origin: str, path: str, basis: str | None) -> str:
         """
         The request URL: the path, plus ``basis`` once a payload has committed.
+
+        *origin* is the host for this path — polling and streaming have one
+        each.
 
         Deliberately no ``mv`` (data model version). That parameter selects the
         *flag* data model and the connection rejects any value but the flag
@@ -1076,15 +1102,15 @@ class _Requester:
         and has no model version of its own to ask for.
         """
         if not basis:
-            return f"{self._base_uri}{path}"
-        return f"{self._base_uri}{path}?{urllib.parse.urlencode({'basis': basis})}"
+            return f"{origin}{path}"
+        return f"{origin}{path}?{urllib.parse.urlencode({'basis': basis})}"
 
     def _request(
-        self, path: str, basis: str | None, headers: dict[str, str]
+        self, origin: str, path: str, basis: str | None, headers: dict[str, str]
     ) -> urllib.request.Request:
         all_headers = {"Authorization": self._sdk_key, **headers}
         return urllib.request.Request(
-            self._url(path, basis), headers=all_headers, method="GET"
+            self._url(origin, path, basis), headers=all_headers, method="GET"
         )
 
     def poll(self, basis: str | None, etag: str | None) -> _PollResult:
@@ -1092,7 +1118,7 @@ class _Requester:
         headers = {"Accept": "application/json"}
         if etag:
             headers["If-None-Match"] = etag
-        request = self._request(POLL_PATH, basis, headers)
+        request = self._request(self._base_uri, POLL_PATH, basis, headers)
         try:
             with self._opener.open(request, timeout=self._read_timeout) as response:
                 with self._lock:
@@ -1126,6 +1152,7 @@ class _Requester:
     def stream(self, basis: str | None) -> _StreamConnection:
         """Opens ``GET /sdk/stream``."""
         request = self._request(
+            self._stream_uri,
             STREAM_PATH,
             basis,
             {"Accept": "text/event-stream", "Cache-Control": "no-cache"},
@@ -1328,11 +1355,17 @@ class FDv2SkillStore:
     **Server-side only.** A mobile key or a client-side environment ID is
     refused in the constructor.
 
-    **The SDK key goes only where it was pointed.** *base_uri* must be
-    ``https://`` — plain ``http://`` is refused except to a loopback host, for
-    local test doubles — and redirects are never followed, so a 3xx from a proxy
-    or a private instance is a fatal failure rather than a request carrying the
-    key to whatever host ``Location`` named.
+    **The SDK key goes only where it was pointed.** *base_uri* and *stream_uri*
+    must each be ``https://`` — plain ``http://`` is refused except to a
+    loopback host, for local test doubles — and redirects are never followed, so
+    a 3xx from a proxy or a private instance is a fatal failure rather than a
+    request carrying the key to whatever host ``Location`` named.
+
+    **Polling and streaming have separate hosts.** LaunchDarkly serves them from
+    different origins, so the defaults are a pair (``DEFAULT_BASE_URI`` and
+    ``DEFAULT_STREAM_URI``). A *base_uri* given on its own applies to both,
+    which is what a relay or a private instance serving both endpoints from one
+    host needs.
 
     **Delivery is in the background; retrieval is not.** A daemon thread owns
     the connection and fills memory, and ``get_object`` only ever reads what has
@@ -1362,7 +1395,8 @@ class FDv2SkillStore:
         self,
         sdk_key: str,
         *,
-        base_uri: str = DEFAULT_BASE_URI,
+        base_uri: str | None = None,
+        stream_uri: str | None = None,
         mode: Mode = "stream",
         poll_interval: float = 30.0,
         read_timeout: float | None = None,
@@ -1372,8 +1406,14 @@ class FDv2SkillStore:
         _requester: Any = None,
     ) -> None:
         """
-        *base_uri* must be ``https://``; ``http://`` is accepted only for
-        ``localhost``, ``127.0.0.1`` or ``::1``. Raises ``ValueError`` otherwise.
+        *base_uri* is where ``GET /sdk/poll`` is sent (``DEFAULT_BASE_URI``) and
+        *stream_uri* where ``GET /sdk/stream`` is sent (``DEFAULT_STREAM_URI``),
+        because LaunchDarkly serves the two from different hosts. A *base_uri*
+        given **without** a *stream_uri* is used for both, which is what a relay
+        or a private instance serving both endpoints from one host needs; naming
+        both overrides them independently. Each must be ``https://``;
+        ``http://`` is accepted only for ``localhost``, ``127.0.0.1`` or
+        ``::1``. Raises ``ValueError`` otherwise.
 
         *mode* is ``"stream"`` by default. Prefer it: a ``delete-object`` reaches
         a live stream in seconds. ``"poll"`` exists for environments that cannot
@@ -1395,7 +1435,14 @@ class FDv2SkillStore:
         payload resets the count.
         """
         _require_server_side_credential(sdk_key)
-        _require_https_base_uri(base_uri)
+        # A lone ``base_uri`` means "both endpoints are here"; the two-host
+        # default applies only when neither was named.
+        if stream_uri is None:
+            stream_uri = DEFAULT_STREAM_URI if base_uri is None else base_uri
+        if base_uri is None:
+            base_uri = DEFAULT_BASE_URI
+        _require_https_uri(base_uri)
+        _require_https_uri(stream_uri, "stream_uri")
         if mode not in ("stream", "poll"):
             raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
         if poll_interval <= 0:
@@ -1427,6 +1474,7 @@ class FDv2SkillStore:
             sdk_key.strip(),
             base_uri,
             read_timeout=read_timeout,
+            stream_uri=stream_uri,
         )
 
         self._stop = threading.Event()

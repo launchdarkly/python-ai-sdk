@@ -42,8 +42,10 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
+    DEFAULT_BASE_URI,
     DEFAULT_POLL_TIMEOUT,
     DEFAULT_STREAM_READ_TIMEOUT,
+    DEFAULT_STREAM_URI,
     FDV2_KEY_DELIMITER,
     FDV2_OBJECT_KIND,
     MAX_RESPONSE_BYTES,
@@ -2542,6 +2544,80 @@ class TestBaseUriScheme:
     def test_https_is_accepted(self) -> None:
         assert FDv2SkillStore(SDK_KEY, base_uri="https://sdk.example.com/") is not None
         assert FDv2SkillStore(SDK_KEY) is not None
+
+    def test_a_plain_http_stream_uri_is_refused_by_name(self) -> None:
+        """The streaming host is checked too, and the message names it."""
+        with pytest.raises(ValueError, match="cleartext") as excinfo:
+            FDv2SkillStore(
+                SDK_KEY,
+                base_uri="https://sdk.example.com",
+                stream_uri="http://stream.example.com",
+            )
+        assert "stream_uri" in str(excinfo.value)
+
+
+class TestStreamHostDefaults:
+    """
+    LaunchDarkly serves ``/sdk/stream`` from a different host than ``/sdk/poll``,
+    and ``mode="stream"`` is the default — so a single-host default would have
+    the *default* configuration talk to the wrong host on first contact with a
+    real environment. Both base server-side SDKs ship the hosts as a pair
+    (``ldclient.Config``'s ``stream_uri``, ``js-server-sdk-common``'s
+    ``streamUri``), which is what these defaults follow.
+    """
+
+    @staticmethod
+    def _origins(store: FDv2SkillStore) -> tuple[str, str]:
+        requester = store._requester
+        return requester._base_uri, requester._stream_uri
+
+    def test_the_two_defaults_are_different_hosts(self) -> None:
+        assert DEFAULT_BASE_URI == "https://sdk.launchdarkly.com"
+        assert DEFAULT_STREAM_URI == "https://stream.launchdarkly.com"
+        assert self._origins(FDv2SkillStore(SDK_KEY)) == (
+            DEFAULT_BASE_URI,
+            DEFAULT_STREAM_URI,
+        )
+
+    def test_a_base_uri_alone_serves_both_endpoints(self) -> None:
+        # A relay or a private instance serving both from one host needs one
+        # option, not two.
+        assert self._origins(
+            FDv2SkillStore(SDK_KEY, base_uri="https://relay.example.com")
+        ) == ("https://relay.example.com", "https://relay.example.com")
+
+    def test_naming_both_overrides_them_independently(self) -> None:
+        assert self._origins(
+            FDv2SkillStore(
+                SDK_KEY,
+                base_uri="https://sdk.example.com/",
+                stream_uri="https://stream.example.com/",
+            )
+        ) == ("https://sdk.example.com", "https://stream.example.com")
+
+    def test_a_stream_uri_alone_leaves_polling_on_its_default(self) -> None:
+        assert self._origins(
+            FDv2SkillStore(SDK_KEY, stream_uri="https://stream.example.com")
+        ) == (DEFAULT_BASE_URI, "https://stream.example.com")
+
+    def test_the_stream_request_goes_to_the_stream_host(
+        self, endpoint: Any, second_endpoint: Any
+    ) -> None:
+        """The split is on the wire, not only in the attributes.
+
+        Polling at one host and streaming at another is the whole point, so
+        assert it where it is observable: the streaming request arrives at the
+        streaming endpoint and nothing arrives at the polling one.
+        """
+        requester = _Requester(
+            SDK_KEY,
+            endpoint.base_uri,
+            read_timeout=5.0,
+            stream_uri=second_endpoint.base_uri,
+        )
+        requester.stream(None).close()
+        assert [r["path"] for r in second_endpoint.requests] == ["/sdk/stream"]
+        assert endpoint.requests == []
 
 
 # ---------------------------------------------------------------------------
