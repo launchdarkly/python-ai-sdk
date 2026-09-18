@@ -198,6 +198,15 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
         return lc_anthropic.ChatAnthropic(
             **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
         )
+    if provider == "bedrock":
+        try:
+            lc_aws = importlib.import_module("langchain_aws")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Bedrock models requires langchain-aws. "
+                "Install it with: pip install langchain-aws"
+            ) from exc
+        return lc_aws.ChatBedrockConverse(**_model_constructor_kwargs(config, ""))
     lc_openai = importlib.import_module("langchain_openai")
     return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
 

@@ -2254,10 +2254,16 @@ class TestModelSource:
         }
         with (
             ctx,
-            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
         ):
             await create_langchain_agents_handler()(cfg, "q")
-        assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "model": "us.anthropic.claude-sonnet-4-5",
+        }
         assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
 
     @pytest.mark.asyncio
@@ -2275,7 +2281,10 @@ class TestModelSource:
         }
         with (
             ctx,
-            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
         ):
             await create_langchain_agents_handler()(cfg, "q")
         assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
@@ -2292,10 +2301,29 @@ class TestModelSource:
         }
         with (
             ctx,
-            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
         ):
             await create_langchain_agents_handler()(cfg, "q")
         assert ctor.call_args.kwargs["model"] == "anthropic.claude-sonnet-4-5"
+
+    def test_bedrock_without_langchain_aws_has_a_clear_error(self) -> None:
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        with patch(
+            "importlib.import_module",
+            side_effect=ModuleNotFoundError("No module named 'langchain_aws'"),
+        ):
+            with pytest.raises(
+                ImportError,
+                match=r"pip install langchain-aws",
+            ):
+                handler_mod._make_default_chat_model(cfg)
 
     @pytest.mark.asyncio
     async def test_non_bedrock_ignores_model_region(self) -> None:
