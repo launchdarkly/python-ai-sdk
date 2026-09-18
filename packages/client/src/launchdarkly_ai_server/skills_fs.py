@@ -1,0 +1,1269 @@
+"""
+Agent Skills — filesystem materialization.
+
+This is the part that writes to disk. Everything here takes already-verified
+content and reconciles it against a managed root; ``skills.py`` owns retrieval
+and verification and knows nothing about the filesystem. The descriptor-pinned
+primitives every destructive step goes through live in ``safe_fs.py``.
+
+**The invariants.** The managed root is pinned to a descriptor once per
+reconcile, and every operation under it — the destructive ones and the reads
+that decide them — runs relative to that descriptor or to a skill directory
+pinned relative to it. The existence probe, the compare read and the orphan
+listing are pinned before they are consulted, so a directory swapped after the
+pin cannot change which branch runs, only what a path check reports.
+Destructive operations only ever touch paths ``<root>/.launchdarkly-skills.json``
+records under a matching key. A corrupt manifest suppresses every destructive
+action, and an incomplete retrieval suppresses pruning. Content is re-verified
+immediately before the write. The path checks still run, but as defense in
+depth rather than as the boundary.
+
+None of these may be relaxed. The threat model behind each — and what breaks if
+one moves — is in ``agents.md`` under *Security posture* and *Descriptor-pinned
+filesystem access*.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import stat
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
+
+from .safe_fs import (
+    DirectoryMissing,
+    SymlinkRefused,
+    atomic_write,
+    is_temp_name,
+    open_directory_nofollow,
+    pinned_directory,
+    unlink_file,
+)
+from .skills_core import (
+    NO_STORE_MESSAGE,
+    Resolution,
+    SkillStore,
+    VerificationFailure,
+    get_store,
+    list_raw_objects,
+    log_withholding_summary,
+    newest_by_key,
+    record_materialized,
+    record_revoked,
+    reference_target,
+    resolve_from_store,
+    store_is_initialized,
+    verified_bytes,
+    verify_raw_skill,
+)
+from .types import (
+    ReconcileAction,
+    ReconcileActionKind,
+    ReconcileReport,
+    Skill,
+    SkillReference,
+)
+from .types_validation import (
+    is_valid_skill_key,
+    is_valid_skill_version,
+    skill_key_rejection_reason,
+)
+
+logger = logging.getLogger(__name__)
+
+MANIFEST_FILENAME = ".launchdarkly-skills.json"
+"""The SDK's record of what it has written under a managed root."""
+
+MANIFEST_VERSION = 1
+"""Manifest schema version this release writes, and the highest it can read."""
+
+_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+"""
+Hard cap on the manifest, so a reconcile cannot be made to read an arbitrary
+amount into memory.
+
+Set far above any real manifest: an entry is a path, a key, a version, a digest
+and a timestamp, so even tens of thousands of skills land a couple of orders of
+magnitude below this. Anything larger is treated as corruption, which is what
+every other unreadable manifest is — the file lives in a directory the SDK does
+not own exclusively, and a reconcile must not be the thing that exhausts the
+process.
+"""
+
+SKILL_FILENAME = "SKILL.md"
+"""The single file each skill materializes to, under ``<root>/<key>/``."""
+
+OnUnavailable = Literal["keep", "raise"]
+"""How ``write_skills`` reacts to content it could not retrieve."""
+
+_UNAVAILABLE_PREFIX = "skill retrieval unavailable: "
+"""
+Prefix on every error describing content that could not be retrieved. Callers
+assert on it, so it lives in one place.
+"""
+
+_MAX_PATH_COMPONENT_BYTES = 255
+"""
+NAME_MAX on Linux and macOS, and the component limit on Windows. The data model
+permits keys one byte longer than any of those can represent, so an over-long
+key is rejected before any filesystem call — a reported action rather than an
+ENAMETOOLONG from a stat deep inside the reconcile.
+"""
+
+
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{digit}" for digit in range(1, 10)}
+    | {f"lpt{digit}" for digit in range(1, 10)}
+)
+"""
+The 22 MS-DOS device names Windows reserves, which cannot be directory names
+there. Rejected on every platform, so the on-disk result never depends on which
+OS ran the write.
+
+The bare names are the whole set: the key grammar admits no ``.`` or ``$`` and
+is lowercase-only, so ``con.txt`` and ``CONIN$`` are unreachable and no suffix
+stripping or case folding is needed. ``com0`` and ``lpt0`` are deliberately
+absent — those are not reserved.
+"""
+
+
+# -------------------------------------------------------------------------
+# The reconcile entry point
+# -------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _PendingWrite:
+    """One skill queued for the reconcile: resolved content, or why there is none."""
+
+    key: str
+    skill: Skill | None = None
+    error: str | None = None
+
+
+async def write_skills(
+    skills: Sequence[Skill | SkillReference | str] | str,
+    root: str | os.PathLike[str],
+    *,
+    prune: bool = True,
+    timeout: float = 10.0,
+    on_unavailable: OnUnavailable = "keep",
+) -> ReconcileReport:
+    """
+    Materializes skills under a managed root at ``<root>/<key>/SKILL.md``.
+
+    *skills* is a sequence of ``Skill`` / ``SkillReference`` / key strings, or
+    the literal ``"*"`` meaning everything ``all_skills()`` returns. ``Skill``
+    values are used as-is; references and strings resolve through the accessors,
+    so they need a configured store.
+
+    The reconcile is manifest-driven (``<root>/.launchdarkly-skills.json``):
+    destructive operations only ever touch paths the manifest records under a
+    matching key, so a file the SDK did not write is never overwritten or
+    deleted. ``prune`` removes formerly-managed skills that are no longer in the
+    requested set — which is also how revocation takes effect. ``timeout``
+    bounds retrieval, the writes, and pruning; the final manifest rewrite
+    always runs, so files already written are never orphaned. ``on_unavailable``
+    chooses between reporting a failed retrieval (``"keep"``, leaving existing
+    managed files alone) and raising (``"raise"``).
+
+    Returns a ``ReconcileReport`` in which every outcome is visible; raises
+    ``ValueError`` for a caller error such as an unusable root.
+
+    The root is opened once, up front, and that descriptor is held until the
+    call returns — including for the manifest read, so the record that
+    authorizes a removal comes from inside the pinned root. A root replaced
+    after validation is refused rather than followed. POSIX only; see
+    ``safe_fs``.
+
+    **This call performs synchronous filesystem I/O and does not yield.** It is
+    ``async`` for signature parity with the other accessors, not because it
+    awaits anything: every read, write, ``fsync`` and rename runs inline, so a
+    large reconcile blocks the event loop for its duration. Wrap it in
+    ``asyncio.to_thread`` if that matters on your loop. ``timeout`` is checked
+    between steps rather than interrupting one in progress, for the same
+    reason.
+
+    **One root, one reconcile at a time.** Because nothing here yields, a
+    reconcile is atomic against every other task on the loop. Wrapping it to run
+    concurrently makes that the caller's problem: two runs against the same root
+    interleave on the manifest, the loser's entries are lost, and a later
+    reconcile then refuses the files it wrote as files the SDK did not write.
+    """
+    # Both of these are annotated as closed sets, but the values can still arrive
+    # from untyped code, so they are checked rather than assumed.
+    if on_unavailable not in ("keep", "raise"):
+        raise ValueError(
+            f'on_unavailable must be "keep" or "raise", got {on_unavailable!r}'
+        )
+    if timeout < 0:
+        raise ValueError(f"timeout must not be negative, got {timeout!r}")
+
+    deadline = time.monotonic() + timeout
+    root_path = _resolve_root(root)
+
+    # Pinned once and held for the whole reconcile, which is what makes
+    # _resolve_root's validation mean anything afterwards. None where the *at()
+    # family is absent, and the lstat floor applies instead.
+    try:
+        root_fd = open_directory_nofollow(root_path)
+    except ValueError as exc:
+        # Not a caller error: the root passed _resolve_root a moment ago, so
+        # this is the swap itself being refused. It belongs to the run, and
+        # nothing has been touched.
+        return ReconcileReport(
+            actions=[
+                _run_error(
+                    f"the skills root {root_path} could not be pinned for the "
+                    f"reconcile: {exc}; no action was taken"
+                )
+            ]
+        )
+
+    try:
+        manifest, manifest_error = _load_manifest(root_path, root_fd)
+        entries: dict[str, Any] = manifest.get("entries", {})
+
+        actions: list[ReconcileAction] = []
+        if manifest_error is not None:
+            # Run-level failure: there is no single skill key to hang it off.
+            actions.append(_run_error(manifest_error))
+
+        requests, incomplete = _resolve_requests(skills, deadline, on_unavailable)
+
+        written, write_timed_out = _write_all(
+            root_path, root_fd, requests, entries, deadline
+        )
+        actions.extend(written)
+        incomplete = incomplete or write_timed_out
+
+        # Pruning is destructive, so it needs a trustworthy picture of both
+        # sides: a corrupt manifest leaves the SDK unsure what it owns, and an
+        # incomplete run — a retrieval that failed, or a deadline that expired
+        # mid-write — leaves it unsure what is still current. Either way,
+        # deleting would be a guess.
+        if prune and manifest_error is None and not incomplete:
+            actions.extend(
+                _prune(
+                    root_path,
+                    root_fd,
+                    entries,
+                    {request.key for request in requests},
+                    deadline,
+                )
+            )
+
+        if manifest_error is None:
+            actions.extend(_rewrite_manifest(root_path, root_fd, manifest, entries))
+
+        return ReconcileReport(actions=actions)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+_RUN_LEVEL_KEY = ""
+"""
+The documented sentinel for a failure that belongs to no single skill (see
+``ReconcileAction``). Spelled once so every path that cannot attribute a
+failure to a key agrees with the others.
+"""
+
+
+def _run_error(message: str) -> ReconcileAction:
+    """
+    A failure belonging to the run rather than to one skill.
+
+    Uses the run-level sentinel key; it is constructed here so every run-level
+    error agrees.
+    """
+    return ReconcileAction(key=_RUN_LEVEL_KEY, action="error", error=message)
+
+
+def _write_all(
+    root: Path,
+    root_fd: int | None,
+    requests: list[_PendingWrite],
+    entries: dict[str, Any],
+    deadline: float,
+) -> tuple[list[ReconcileAction], bool]:
+    """
+    Reconciles every pending write. Returns ``(actions, timed out mid-run)``.
+
+    The loop never aborts: a per-skill failure becomes an ``error`` action and the
+    next skill is attempted, because returning early would skip the caller's
+    manifest rewrite and orphan every file already written in this run.
+    """
+    actions: list[ReconcileAction] = []
+    timed_out = False
+
+    for request in requests:
+        if request.skill is None:
+            actions.append(
+                ReconcileAction(
+                    key=request.key,
+                    action="error",
+                    error=request.error
+                    or f"skill '{request.key}' could not be resolved",
+                )
+            )
+            continue
+        if time.monotonic() >= deadline:
+            timed_out = True
+            actions.append(
+                ReconcileAction(
+                    key=request.key,
+                    action="error",
+                    error=(
+                        "the timeout was exhausted before skill "
+                        f"'{request.key}' could be written"
+                    ),
+                )
+            )
+            continue
+        try:
+            actions.append(_write_one(root, root_fd, request.skill, entries))
+        except OSError as exc:
+            # A safety net, not the primary defense. pathlib's stat probes swallow
+            # only ENOENT/ENOTDIR/EBADF/ELOOP and re-raise every other errno, so an
+            # unexpected filesystem condition must not abort the loop.
+            actions.append(
+                ReconcileAction(
+                    key=request.skill.key,
+                    action="error",
+                    version=request.skill.version,
+                    error=f"skill '{request.skill.key}' could not be reconciled: {exc}",
+                )
+            )
+
+    return actions, timed_out
+
+
+def _rewrite_manifest(
+    root: Path,
+    root_fd: int | None,
+    manifest: dict[str, Any],
+    entries: dict[str, Any],
+) -> list[ReconcileAction]:
+    """
+    Writes the updated manifest. Returns an error action, or nothing.
+
+    Written relative to the root descriptor the caller holds, rather than
+    re-opening the root by path — the same reason every other step here is.
+    """
+    manifest["manifestVersion"] = MANIFEST_VERSION
+    manifest["entries"] = entries
+    try:
+        # json.dumps is inside the guard: indent= selects the pure-Python encoder,
+        # and unknown fields must be round-tripped, so a deeply nested
+        # planted field can raise RecursionError here — after every skill file is
+        # already on disk.
+        serialized = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+        atomic_write(root, MANIFEST_FILENAME, serialized, dir_fd=root_fd)
+    except Exception as exc:
+        return [_run_error(f"the skills manifest could not be written: {exc}")]
+    return []
+
+
+# -------------------------------------------------------------------------
+# Request resolution — content in, or a reason there is none
+# -------------------------------------------------------------------------
+
+
+def _unavailable(reason: str) -> str:
+    """Wraps *reason* as a retrieval-unavailable message."""
+    return f"{_UNAVAILABLE_PREFIX}{reason}"
+
+
+@dataclass(frozen=True)
+class _RetrievalBlocked:
+    """Why retrieval must not be attempted. The reason is caller-facing."""
+
+    reason: str
+
+
+def _available_store(deadline: float, subject: str) -> SkillStore | _RetrievalBlocked:
+    """
+    The configured store, or why retrieval must not be attempted.
+
+    Written once because this gate is what sets ``unavailable`` and therefore
+    suppresses pruning. Maintained in two places, a condition added to one and
+    not the other would not merely produce a wrong message — it would delete
+    the application's files.
+    """
+    if time.monotonic() >= deadline:
+        return _RetrievalBlocked(
+            _unavailable(
+                f"the timeout was exhausted before {subject} could be retrieved"
+            )
+        )
+    store = get_store()
+    if store is None:
+        return _RetrievalBlocked(_unavailable(NO_STORE_MESSAGE))
+    if not store_is_initialized(store):
+        # A store still waiting for its first delivery answers every read with
+        # "nothing", which is indistinguishable from an environment that holds
+        # no skills — and the "*" form reads that as every skill having been
+        # revoked. Blocking here reports the run incomplete, which is what
+        # suppresses the prune.
+        return _RetrievalBlocked(
+            _unavailable(
+                "the skill store has not received its initial data, so "
+                f"{subject} could not be retrieved and nothing on disk was "
+                "changed. Wait for delivery before reconciling: "
+                "FDv2SkillStore.wait_for_skills(timeout) returns True once the "
+                "first payload has arrived."
+            )
+        )
+    return store
+
+
+def _resolve_requests(
+    skills: Sequence[Skill | SkillReference | str] | str,
+    deadline: float,
+    on_unavailable: OnUnavailable,
+) -> tuple[list[_PendingWrite], bool]:
+    """
+    Turns the caller's input into one request per skill.
+
+    Returns the requests plus whether any retrieval was left incomplete — an
+    absent store, a raising store, or an exhausted timeout. That flag suppresses
+    pruning: deleting managed files because retrieval failed would turn a
+    transport outage into data loss.
+    """
+    if isinstance(skills, str):
+        if skills != "*":
+            raise ValueError(
+                'write_skills takes a sequence of skills or the literal "*"; '
+                f"got {skills!r}"
+            )
+        return _resolve_all(deadline, on_unavailable)
+
+    requests: list[_PendingWrite] = []
+    incomplete = False
+    for item in skills:
+        if isinstance(item, Skill):
+            requests.append(_PendingWrite(key=item.key, skill=item))
+            continue
+
+        key, wanted = reference_target(item)
+        resolved = _resolve_reference(key, wanted, deadline)
+        if resolved.unavailable:
+            incomplete = True
+            if on_unavailable == "raise":
+                raise RuntimeError(resolved.error)
+        requests.append(
+            _PendingWrite(key=key, skill=resolved.skill, error=resolved.error)
+        )
+
+    return requests, incomplete
+
+
+def _resolve_reference(
+    key: str, wanted_version: int | None, deadline: float
+) -> Resolution:
+    """
+    Resolves one reference for the materialization path.
+
+    Same core as the accessors, plus the two conditions only this path treats as
+    data rather than as an exception: an exhausted deadline and an absent store.
+    """
+    store = _available_store(deadline, f"'{key}'")
+    if isinstance(store, _RetrievalBlocked):
+        return Resolution(
+            reason="store_unavailable", error=store.reason, unavailable=True
+        )
+
+    resolved = resolve_from_store(store, key, wanted_version)
+    if resolved.unavailable and resolved.error is not None:
+        return Resolution(
+            reason="store_unavailable",
+            error=_unavailable(resolved.error),
+            unavailable=True,
+        )
+    return resolved
+
+
+def _unavailable_run(
+    error: str, on_unavailable: OnUnavailable
+) -> tuple[list[_PendingWrite], bool]:
+    """
+    One run-level retrieval failure — raised, or reported against the empty key.
+
+    Always reports the run incomplete, which is what suppresses pruning: nothing
+    was retrieved, so every managed file on disk has to be assumed current.
+    """
+    if on_unavailable == "raise":
+        raise RuntimeError(error)
+    return [_PendingWrite(key="", error=error)], True
+
+
+def _pending_for_raw(object_key: str, raw: Any) -> _PendingWrite:
+    """
+    One raw store object as a pending write — verified, or reported as failed.
+
+    Present but unverifiable is NOT the same as revoked. Dropping it silently
+    would leave the key out of the requested set, so prune would delete the last
+    known-good copy already on disk and report a routine "removed" with
+    report.ok still true. A failed request instead gets the same treatment the
+    reference path already gives (see ``_resolve_reference``): the outcome is
+    surfaced, and the key stays in the requested set so nothing is pruned.
+    """
+    skill = verify_raw_skill(raw)
+    if skill is not None:
+        return _PendingWrite(key=skill.key, skill=skill)
+    # The on-disk copy lives under the object's *own* key, which a custom store
+    # may key differently in ``all_objects``. The failure must be recorded under
+    # the object's key, or the copy written under it on an earlier run would
+    # fall out of the requested set and be pruned — the very deletion this
+    # function exists to prevent.
+    raw_key = raw.get("key") if isinstance(raw, dict) else None
+    key = raw_key if is_valid_skill_key(raw_key) else object_key
+    if not is_valid_skill_key(key):
+        # Neither key is usable, so this failure cannot be attributed to a skill
+        # — the run-level sentinel is the honest report. ``_resolve_all`` reads
+        # that sentinel back as an incomplete run, because a failure with no key
+        # cannot protect its copy on disk the way the branch below does.
+        return _PendingWrite(
+            key=_RUN_LEVEL_KEY,
+            error="the skill store served an object under an invalid key; "
+            "it was withheld",
+        )
+    return _PendingWrite(
+        key=key,
+        error=f"skill '{key}' failed integrity verification and was "
+        "withheld; the copy already on disk was left alone",
+    )
+
+
+def _resolve_all(
+    deadline: float, on_unavailable: OnUnavailable
+) -> tuple[list[_PendingWrite], bool]:
+    """Resolves the ``"*"`` form — everything the store currently holds."""
+    store = _available_store(deadline, "the skill set")
+    if isinstance(store, _RetrievalBlocked):
+        return _unavailable_run(store.reason, on_unavailable)
+
+    # Deliberately not via all_skills(), which reports a raising store as an
+    # empty result — that would look like "every skill was revoked" and let
+    # prune delete the lot.
+    objects, error = list_raw_objects(store)
+    if error is not None:
+        return _unavailable_run(_unavailable(error), on_unavailable)
+
+    # One object per key, at its newest version. ``all_objects`` may hold several
+    # versions of one key, and <root>/<key>/SKILL.md is a single path — writing it
+    # twice in one run is a bug rather than a policy.
+    candidates = newest_by_key(objects)
+    requests = [_pending_for_raw(key, raw) for key, raw in candidates]
+    log_withholding_summary(
+        "skills held by the store",
+        len(requests),
+        sum(1 for request in requests if request.skill is not None),
+    )
+    # A withholding that could not be attributed to a key leaves the run
+    # incomplete. Every other failure keeps its key in the requested set, which
+    # is what holds prune off the copy on disk; a run-level failure has no key to
+    # do that with, so suppressing prune wholesale is the only thing left that
+    # stops an unreadable object reading as a revocation.
+    unattributed = any(
+        request.skill is None and request.key == _RUN_LEVEL_KEY for request in requests
+    )
+    return requests, unattributed
+
+
+# -------------------------------------------------------------------------
+# The managed root and its manifest
+# -------------------------------------------------------------------------
+
+
+def _resolve_root(root: str | os.PathLike[str]) -> Path:
+    """
+    Resolves the managed root once, up front.
+
+    An unusable root is a caller error rather than a per-skill outcome, so this
+    raises. Only the leaf directory is ever created: recursively creating
+    missing ancestors would let a typo scatter a directory tree.
+
+    This is a caller-error check, not a security boundary — it establishes only
+    that the root was usable at this instant. ``write_skills`` pins the returned
+    path immediately afterwards, and that is what carries the guarantee.
+    """
+    path = Path(os.fspath(root))
+
+    # pathlib re-raises any errno outside ENOENT/ENOTDIR/EBADF/ELOOP, so an
+    # unreadable parent would surface as PermissionError where the docs
+    # promise ValueError.
+    try:
+        is_symlink = path.is_symlink()
+        exists = path.exists()
+        is_dir = path.is_dir()
+    except OSError as exc:
+        raise ValueError(f"the skills root could not be inspected: {exc}") from exc
+
+    if is_symlink:
+        raise ValueError(
+            f"the skills root must be a real directory, not a symlink: {path}"
+        )
+
+    if exists:
+        if not is_dir:
+            raise ValueError(f"the skills root is not a directory: {path}")
+    else:
+        parent = path.parent
+        try:
+            parent_is_dir = parent.is_dir()
+        except OSError as exc:
+            raise ValueError(
+                f"the parent of the skills root could not be inspected: {exc}"
+            ) from exc
+        if not parent_is_dir:
+            raise ValueError(
+                f"the parent of the skills root does not exist: {parent}. "
+                "write_skills creates only the leaf directory."
+            )
+        try:
+            path.mkdir()
+        except OSError as exc:
+            raise ValueError(f"the skills root could not be created: {exc}") from exc
+
+    return Path(os.path.realpath(path))
+
+
+def _load_manifest(
+    root: Path, root_fd: int | None
+) -> tuple[dict[str, Any], str | None]:
+    """
+    Loads the manifest. Returns ``(manifest, error)``.
+
+    A manifest that cannot be read, cannot be parsed, is not an object, carries a
+    ``manifestVersion`` this release does not understand, is larger than the
+    read cap, or has a malformed ``entries`` map is **corrupt**. The caller then
+    performs no destructive action and leaves the file itself alone: rewriting it
+    would destroy the only record of what the SDK owns, and acting on a manifest
+    it cannot read would mean guessing at which files those are.
+
+    An absent manifest is not corrupt — that is simply a fresh root.
+
+    Read relative to the root descriptor, because this file decides which files
+    the SDK may overwrite and delete: the pin covers the decision as well as the
+    actions, here as for every other read under the root. That single open also
+    makes absence ``ENOENT`` on the read itself, and refuses a symlink or FIFO
+    wearing the manifest's name as corruption rather than following or waiting
+    on it.
+    """
+    fresh: dict[str, Any] = {"manifestVersion": MANIFEST_VERSION, "entries": {}}
+
+    try:
+        raw = _read_regular_file(
+            MANIFEST_FILENAME if root_fd is not None else root / MANIFEST_FILENAME,
+            max_bytes=_MAX_MANIFEST_BYTES,
+            dir_fd=root_fd,
+        )
+    except FileNotFoundError:
+        return fresh, None
+    except OSError as exc:
+        return {}, f"the skills manifest {MANIFEST_FILENAME} could not be read: {exc}"
+
+    # ``_read_regular_file`` stops one byte past the cap, which is the byte that
+    # proves the overage without reading the rest of the file.
+    if len(raw) > _MAX_MANIFEST_BYTES:
+        return {}, (
+            f"the skills manifest {MANIFEST_FILENAME} is larger than the "
+            f"{_MAX_MANIFEST_BYTES} byte cap; refusing every destructive action"
+        )
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # UnicodeDecodeError is a ValueError, not an OSError: non-UTF-8 bytes in
+        # the manifest are corruption, and must fail closed like any other.
+        return {}, f"the skills manifest {MANIFEST_FILENAME} could not be read: {exc}"
+
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        return {}, (
+            f"the skills manifest {MANIFEST_FILENAME} is not valid JSON ({exc}); "
+            "refusing every destructive action"
+        )
+
+    if not isinstance(data, dict):
+        return {}, (
+            f"the skills manifest {MANIFEST_FILENAME} is not a JSON object; "
+            "refusing every destructive action"
+        )
+
+    version = data.get("manifestVersion")
+    # Bounded at both ends. Above, because a manifest from a future release may
+    # record fields whose meaning this one would guess at. Below, because 1 is
+    # the first version ever written, so 0 or a negative is not an older schema
+    # this release could still read — it is a schema that never existed, and
+    # acting on its entries would be a guess.
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or not 1 <= version <= MANIFEST_VERSION
+    ):
+        return {}, (
+            f"the skills manifest {MANIFEST_FILENAME} declares manifestVersion "
+            f"{version!r}, which this SDK cannot read; refusing every destructive "
+            "action"
+        )
+
+    if not isinstance(data.get("entries"), dict):
+        return {}, (
+            f"the skills manifest {MANIFEST_FILENAME} has a malformed 'entries' "
+            "map; refusing every destructive action"
+        )
+
+    return data, None
+
+
+# -------------------------------------------------------------------------
+# Per-skill reconcile
+# -------------------------------------------------------------------------
+
+
+def _unsafe_path_reason(
+    root: Path, skill_dir: Path, target: Path, key: str, *, require_directory: bool
+) -> str | None:
+    """
+    The path defenses, in one place.
+
+    Returns why ``<root>/<key>/SKILL.md`` must not be touched, or ``None``.
+    Shared by the write and prune paths so the two cannot drift, and not to be
+    relaxed in either.
+
+    Defense in depth rather than the boundary: each of these inspects a path, so
+    each is a check-then-use. They stay because they turn a hostile layout into
+    a reported refusal rather than a failed syscall, and because they are the
+    whole defense where the ``*at()`` family is absent.
+
+    *require_directory* is the only difference between the two callers: a write
+    needs a real directory to write into, while a prune only needs to not follow
+    a link. The containment check is unconditional even when ``skill_dir`` does
+    not exist yet — ``realpath`` resolves the existing prefix and appends the
+    rest, so a fresh key under a valid root passes.
+    """
+    if skill_dir.is_symlink():
+        return f"{key} is a symlink"
+    if require_directory and skill_dir.exists() and not skill_dir.is_dir():
+        return f"{key} exists and is not a directory"
+    if target.is_symlink():
+        return "the target file is a symlink"
+    if Path(os.path.realpath(skill_dir)).parent != root:
+        return f"it resolves outside the managed root {root}"
+    return None
+
+
+def _key_rejection_reason(key: Any) -> str | None:
+    """
+    Why *key* must not become a directory name under the managed root, or ``None``.
+
+    Re-validated locally whatever any upstream layer already did, and before any
+    filesystem call, because a key becomes a path component. Shared by the write
+    and prune paths, and not to be relaxed in either.
+
+    ``key.encode`` below is safe only because it runs *after* the pattern check,
+    which admits no surrogate. Do not reorder the two.
+    """
+    if not is_valid_skill_key(key):
+        return f"{key!r} is not a valid skill key: it {skill_key_rejection_reason(key)}"
+    # The data model allows 256 characters; no mainstream filesystem allows a
+    # 256-byte path component. Catch it here so it is a reported action rather
+    # than an ENAMETOOLONG raised from the first stat in the caller.
+    key_bytes = len(key.encode("utf-8"))
+    if key_bytes > _MAX_PATH_COMPONENT_BYTES:
+        return (
+            f"skill key '{key[:32]}...' is {key_bytes} bytes, over the "
+            f"{_MAX_PATH_COMPONENT_BYTES}-byte limit for a single directory name"
+        )
+    # Checked here rather than in the grammar, for the same reason as the byte
+    # bound above. See agents.md: a grammar-level rejection would fail a whole
+    # AI Config over one skill, and would shrink skill_refs, which is what
+    # authorizes a prune.
+    if key in _WINDOWS_RESERVED_NAMES:
+        return (
+            f"skill key '{key}' is a name Windows reserves for a device and "
+            "cannot be a directory name there; it is rejected on every platform "
+            "so a managed root written on one OS is usable on the other"
+        )
+    return None
+
+
+def _write_one(
+    root: Path, root_fd: int | None, skill: Skill, entries: dict[str, Any]
+) -> ReconcileAction:
+    """Reconciles one verified skill against the managed root."""
+    key = skill.key
+
+    def failed(message: str) -> ReconcileAction:
+        return ReconcileAction(
+            key=key, action="error", version=skill.version, error=message
+        )
+
+    rejection = _key_rejection_reason(key)
+    if rejection is not None:
+        return failed(f"{rejection}; nothing was written")
+    if not is_valid_skill_version(skill.version):
+        return failed(
+            f"skill '{key}' has version {skill.version!r}, which is not an "
+            "integer >= 1; nothing was written"
+        )
+
+    skill_dir = root / key
+    target = skill_dir / SKILL_FILENAME
+    relative = f"{key}/{SKILL_FILENAME}"
+
+    unsafe = _unsafe_path_reason(root, skill_dir, target, key, require_directory=True)
+    if unsafe is not None:
+        return failed(f"'{relative}' was refused: {unsafe}; nothing was written")
+
+    # Re-verify immediately before writing, through the same core the accessors
+    # use: a Skill can also be constructed directly by a caller.
+    verified = verified_bytes(key, skill.content, skill.content_hash, skill.version)
+    if isinstance(verified, VerificationFailure):
+        return failed(
+            f"skill '{key}' failed verification immediately before writing: "
+            f"{verified.reason}; nothing was written"
+        )
+    encoded, content_hash = verified.encoded, verified.content_hash
+
+    # Sweep before writing rather than after, so a temp file this run is about
+    # to create can never be a candidate.
+    _sweep_orphan_temp_files(root, root_fd, key)
+
+    # Overwrite only what the manifest records as the SDK's under this key.
+    entry = entries.get(relative)
+    managed = isinstance(entry, dict) and entry.get("key") == key
+
+    # The directory is pinned here, before anything is decided, and the pin is
+    # held through the write: the existence probe, the compare read and the
+    # rename all resolve against the same descriptor, so nothing swapped in
+    # between can change which branch runs or where the write lands. Created
+    # relative to *root_fd* for the same reason — ``mkdir`` follows a symlink at
+    # its parent. A directory that does not exist yet is created now rather than
+    # after the decision; that only ever happens when there is no file to
+    # compare against, so the write that follows is the one that fills it.
+    try:
+        with pinned_directory(skill_dir, create=True, dir_fd=root_fd) as skill_fd:
+            try:
+                on_disk = _read_skill_file(skill_dir, skill_fd, max_bytes=len(encoded))
+            except OSError as exc:
+                if not managed:
+                    # A read that failed proves nothing, and must never become
+                    # an overwrite: it is the comparison below that would
+                    # authorize one.
+                    return failed(
+                        f"'{relative}' exists, the manifest does not record it as "
+                        f"managed under key '{key}', and it could not be read to "
+                        f"compare against the resolved content: {exc}; refusing to "
+                        "overwrite a file this SDK may not have written"
+                    )
+                return failed(f"'{relative}' could not be read: {exc}")
+
+            if on_disk is None:
+                action: ReconcileActionKind = "written"
+            elif hashlib.sha256(on_disk).hexdigest() == content_hash:
+                # Hash first, and decide from the bytes. The manifest check
+                # below is what protects a file the SDK did not write, but on
+                # its own it also refuses one the SDK wrote and was killed
+                # before recording it, wedging every later reconcile. Comparing
+                # the bytes separates those two cases, and only content
+                # byte-identical to what LaunchDarkly resolved is adopted. This
+                # exception must not be widened — see agents.md.
+                #
+                # ``skipped_current`` rather than a new action kind: the bytes
+                # on disk already are the resolved content, as true for an
+                # adopted file as for one the SDK wrote. Adoption records a
+                # manifest entry, so the file becomes prunable later.
+                _update_entry(entries, relative, skill, content_hash)
+                record_materialized(key, len(encoded), content_hash, "skipped_current")
+                return ReconcileAction(
+                    key=key,
+                    action="skipped_current",
+                    version=skill.version,
+                    path=str(target),
+                )
+            elif not managed:
+                return failed(
+                    f"'{relative}' exists but the manifest does not record it as "
+                    f"managed under key '{key}'; refusing to overwrite a file this "
+                    "SDK did not write"
+                )
+            else:
+                # Stale version or local tampering — LD-resolved content wins.
+                action = "updated"
+
+            try:
+                atomic_write(skill_dir, SKILL_FILENAME, encoded, dir_fd=skill_fd)
+            except OSError as exc:
+                return failed(f"'{relative}' could not be written: {exc}")
+    except OSError as exc:
+        return failed(f"the directory for skill '{key}' could not be created: {exc}")
+    except ValueError as exc:
+        return failed(f"'{relative}' was refused: {exc}")
+
+    _update_entry(entries, relative, skill, content_hash)
+    record_materialized(key, len(encoded), content_hash, action)
+    return ReconcileAction(
+        key=key, action=action, version=skill.version, path=str(target)
+    )
+
+
+def _skill_file_present(skill_dir: Path, skill_fd: int | None) -> bool:
+    """
+    Whether ``SKILL.md`` is present in the pinned *skill_dir*.
+
+    Probed relative to the descriptor, ``follow_symlinks=False``, so the answer
+    is about the directory that was pinned and not about wherever its path leads
+    now. Only ``ENOENT`` means absent: any other failure reports present, so the
+    step that follows — the read or the unlink — is the one that fails and says
+    why, rather than a probe deciding silently that there was nothing to do.
+    Path-based on the ``lstat`` floor, where there is no descriptor.
+    """
+    if skill_fd is None:
+        return (skill_dir / SKILL_FILENAME).exists()
+    try:
+        os.stat(SKILL_FILENAME, dir_fd=skill_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _read_skill_file(
+    skill_dir: Path, skill_fd: int | None, *, max_bytes: int
+) -> bytes | None:
+    """
+    The compare read: the bytes at ``SKILL.md`` in the pinned *skill_dir*, or
+    ``None`` when there is no file there.
+
+    Both the probe and the read resolve against *skill_fd*, so the bytes that
+    decide adoption, update or refusal are the ones in the directory that was
+    pinned. Any other failure propagates as the ``OSError`` it was, for the
+    caller to report.
+    """
+    if not _skill_file_present(skill_dir, skill_fd):
+        return None
+    if skill_fd is None:
+        return _read_regular_file(skill_dir / SKILL_FILENAME, max_bytes=max_bytes)
+    return _read_regular_file(SKILL_FILENAME, max_bytes=max_bytes, dir_fd=skill_fd)
+
+
+def _read_regular_file(
+    target: Path | str, *, max_bytes: int, dir_fd: int | None = None
+) -> bytes:
+    """
+    Reads *target*, refusing anything that is not a regular file.
+
+    Each flag earns its place. ``O_NONBLOCK``: opening a FIFO with no writer
+    blocks forever, so a managed file swapped for one would hang the reconcile
+    and the event loop with it (a no-op for regular files). ``O_NOFOLLOW``: no
+    trailing symlink. ``O_BINARY``: 0 on POSIX, but without it a Windows
+    descriptor translates CRLF and the bytes stop being verbatim. The type check
+    reads ``fstat`` on the descriptor, never the path.
+
+    ``max_bytes`` is required, not optional, so a new call site cannot pull an
+    arbitrary file into memory by omission. The read stops at ``max_bytes + 1``,
+    the extra byte distinguishing "at the cap" from "over it".
+
+    Given a *dir_fd*, *target* is a bare filename resolved inside that
+    descriptor. Every read under the managed root — the manifest and each
+    compare read — passes one wherever the platform has descriptors, so the
+    bytes a decision is made from come from the directory that was pinned.
+    """
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    fd = os.open(target, flags, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("the target file is not a regular file")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _sweep_orphan_temp_files(root: Path, root_fd: int | None, key: str) -> None:
+    """
+    Removes temp files a killed reconcile left behind under ``<root>/<key>/``.
+
+    ``atomic_write`` unlinks its own temp file on any exception, but a
+    ``SIGKILL`` between the create and the rename leaves one behind that no
+    manifest entry records — and ``_prune_one``'s ``rmdir`` only succeeds on an
+    empty directory, so one orphan pins a skill's directory permanently.
+
+    This is the one place the SDK removes a file the manifest does not list, so
+    it is bounded on every axis: inside ``<root>/<key>/`` only, for a key that
+    passes ``_key_rejection_reason``; only names ``safe_fs`` recognizes, asked
+    of ``safe_fs`` so the recognizer cannot drift from the writer; only regular
+    files; the listing read off the pinned descriptor, and every removal
+    relative to it. Never widen these — see agents.md.
+
+    Never raises and never aborts the run: the reconcile has succeeded either
+    way, so a sweep that cannot happen is a warning. A directory that does not
+    exist is not a failure — there is nothing to sweep, and it is the pin that
+    says so rather than a separate probe of the path.
+    """
+    if _key_rejection_reason(key) is not None:
+        return
+    skill_dir = root / key
+
+    try:
+        with pinned_directory(skill_dir, dir_fd=root_fd) as dir_fd:
+            # ``os.listdir`` accepts the descriptor itself on POSIX, so the
+            # names come from the directory that was pinned; on the lstat floor
+            # there is no descriptor and the path is all there is.
+            listed = os.listdir(skill_dir if dir_fd is None else dir_fd)
+            for name in sorted(listed):
+                if is_temp_name(name, SKILL_FILENAME):
+                    _remove_orphan_temp_file(skill_dir, name, dir_fd)
+    except DirectoryMissing:
+        return
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "orphaned temp files under skill '%s' could not be swept: %s", key, exc
+        )
+
+
+def _remove_orphan_temp_file(skill_dir: Path, name: str, dir_fd: int | None) -> None:
+    """
+    Removes one recognized orphan. A per-file failure warns and moves on.
+
+    The type check is what keeps the temp naming from being a way to have this
+    SDK delete something it did not write: a symlink or a FIFO wearing that name
+    is not a file ``atomic_write`` left behind, so it is not this function's to
+    remove. It is read off the descriptor, not the path, wherever there is one.
+    """
+    try:
+        if dir_fd is not None:
+            mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+        else:
+            mode = os.lstat(skill_dir / name).st_mode
+        if not stat.S_ISREG(mode):
+            return
+        unlink_file(skill_dir, name, dir_fd=dir_fd)
+    except (OSError, ValueError) as exc:
+        logger.warning("an orphaned temp file could not be removed: %s", exc)
+
+
+def _update_entry(
+    entries: dict[str, Any], relative: str, skill: Skill, content_hash: str
+) -> None:
+    """
+    Records a managed path in the manifest.
+
+    Merges into any existing entry rather than replacing it, so fields written by
+    a future SDK release survive this one's rewrite.
+
+    ``sha256`` and ``writtenAt`` are recorded for forensics only. The reconcile
+    decides currency by hashing the bytes on disk, precisely because the manifest
+    is untrusted, so neither field is ever read back as a decision input.
+    """
+    existing = entries.get(relative)
+    entry = dict(existing) if isinstance(existing, dict) else {}
+    entry["key"] = skill.key
+    entry["version"] = skill.version
+    entry["sha256"] = content_hash
+    entry["writtenAt"] = _utc_timestamp()
+    entries[relative] = entry
+
+
+# -------------------------------------------------------------------------
+# Pruning — how revocation takes effect
+# -------------------------------------------------------------------------
+
+
+def _prune_error(key: str, message: str, version: Any = None) -> ReconcileAction:
+    """
+    A prune refusal. Mirrors ``_write_one``'s local ``failed`` helper.
+
+    *version* comes off the manifest, which is untrusted, so it is validated
+    here rather than at each call site — the same guard the ``removed`` action
+    applies, so a refusal and a removal report the field identically. A caller
+    that does not know a version passes nothing rather than inventing one.
+    """
+    return ReconcileAction(
+        key=key,
+        action="error",
+        version=version if is_valid_skill_version(version) else None,
+        error=message,
+    )
+
+
+def _prune(
+    root: Path,
+    root_fd: int | None,
+    entries: dict[str, Any],
+    requested: set[str],
+    deadline: float,
+) -> list[ReconcileAction]:
+    """
+    Removes managed skills that are no longer requested.
+
+    This is also how revocation takes effect: a revoked skill is simply absent
+    from the resolved set, so the next reconcile removes it. There is
+    deliberately no opt-out.
+
+    The deadline applies here just as it does to the writes: a skill left
+    unpruned is reported as an error and stays in the manifest, so the next
+    reconcile picks it up.
+    """
+    actions: list[ReconcileAction] = []
+
+    for relative, entry in list(entries.items()):
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str) or key in requested:
+            continue
+
+        if time.monotonic() >= deadline:
+            actions.append(
+                _prune_error(
+                    key,
+                    f"the timeout was exhausted before '{relative}' could be "
+                    "pruned; it was left in place",
+                    entry.get("version"),
+                )
+            )
+            continue
+
+        # Only a manifest path this SDK could have written is removable.
+        if (
+            _key_rejection_reason(key) is not None
+            or relative != f"{key}/{SKILL_FILENAME}"
+        ):
+            actions.append(
+                _prune_error(
+                    key,
+                    f"manifest entry '{relative}' does not name a path this SDK "
+                    f"could own under key '{key}'; it was left in place",
+                    entry.get("version"),
+                )
+            )
+            continue
+
+        try:
+            actions.append(_prune_one(root, root_fd, relative, key, entries))
+        except OSError as exc:
+            actions.append(
+                _prune_error(
+                    key,
+                    f"'{relative}' could not be removed: {exc}",
+                    entry.get("version"),
+                )
+            )
+
+    return actions
+
+
+def _unlink_skill_file(
+    skill_dir: Path, skill_fd: int | None, relative: str
+) -> str | None:
+    """
+    Performs the removal itself. Returns a failure reason, or ``None`` on success.
+
+    *skill_fd* is the descriptor ``_prune_one`` already holds for the directory,
+    the same one the existence probe was answered from — so the file the probe
+    found is the file this removes. ``unlink`` never follows a trailing symlink
+    but does resolve the directory above it, which is why it must not be given
+    a path here.
+    """
+    try:
+        unlink_file(skill_dir, SKILL_FILENAME, dir_fd=skill_fd)
+    except SymlinkRefused:
+        return f"'{relative}' was not removed: the target file is a symlink"
+    except OSError as exc:
+        return f"'{relative}' could not be removed: {exc}"
+    return None
+
+
+def _prune_one(
+    root: Path,
+    root_fd: int | None,
+    relative: str,
+    key: str,
+    entries: dict[str, Any],
+) -> ReconcileAction:
+    """Removes one managed skill file, and its directory when that empties it."""
+    skill_dir = root / key
+    target = skill_dir / SKILL_FILENAME
+    version = entries[relative].get("version")
+
+    unsafe = _unsafe_path_reason(root, skill_dir, target, key, require_directory=False)
+    if unsafe is not None:
+        return _prune_error(key, f"'{relative}' was not removed: {unsafe}", version)
+
+    # Before the removal, so the ``rmdir`` below is not defeated by an orphaned
+    # temp file that nothing else on disk records.
+    _sweep_orphan_temp_files(root, root_fd, key)
+
+    # Pinned relative to the root before the existence probe, and held through
+    # the unlink: a directory swapped after the pin cannot make the probe report
+    # a file that is not there — or, worse, report nothing where the SDK's file
+    # still is, which would drop the manifest entry and leave a revoked skill on
+    # disk with a report that says it was removed. A directory that is not there
+    # at all is the ordinary case for a file that is already gone.
+    removed_from_disk = False
+    try:
+        with pinned_directory(skill_dir, dir_fd=root_fd) as skill_fd:
+            if _skill_file_present(skill_dir, skill_fd):
+                failure = _unlink_skill_file(skill_dir, skill_fd, relative)
+                if failure is not None:
+                    return _prune_error(key, failure, version)
+                removed_from_disk = True
+    except DirectoryMissing:
+        pass
+    except ValueError as exc:
+        return _prune_error(key, f"'{relative}' was not removed: {exc}", version)
+
+    if removed_from_disk:
+        try:
+            # Relative to the root descriptor: rmdir is safe at the key (it
+            # fails ENOTDIR on a symlink and needs an empty directory), but a
+            # path-based call re-resolves the root above it.
+            if root_fd is not None:
+                os.rmdir(key, dir_fd=root_fd)
+            else:
+                skill_dir.rmdir()
+        except OSError:
+            pass  # the directory is not empty: other files live here too
+
+    entries.pop(relative, None)
+
+    if removed_from_disk:
+        record_revoked(key, version)
+
+    return ReconcileAction(
+        key=key,
+        action="removed",
+        version=version if is_valid_skill_version(version) else None,
+        path=str(target),
+    )
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
