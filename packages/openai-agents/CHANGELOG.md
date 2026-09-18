@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-agents-0.2.2...launchdarkly-ai-openai-agents-0.2.3) (2026-09-18)
+
+
+### Features
+
+* **AIC-3106:** add multimodal history support to graph().invoke() ([#26](https://github.com/launchdarkly/python-ai-sdk/issues/26)) ([c91132d](https://github.com/launchdarkly/python-ai-sdk/commit/c91132de81f846326457c6d397be609b7a510e35))
+
+
+### Documentation
+
+* replace stale launchdarkly-ai package name with launchdarkly-ai-python ([#40](https://github.com/launchdarkly/python-ai-sdk/issues/40)) ([3256db7](https://github.com/launchdarkly/python-ai-sdk/commit/3256db77a8f3e54c08635ea3a8157e60e5aa0f8b))
+
 ## [0.2.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-agents-0.2.1...launchdarkly-ai-openai-agents-0.2.2) (2026-09-08)
 
 

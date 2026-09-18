@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.7](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.6...launchdarkly-ai-python-0.1.7) (2026-09-18)
+
+
+### Features
+
+* **evaluations:** add LD judge event support ([#63](https://github.com/launchdarkly/python-ai-sdk/issues/63)) ([ce61644](https://github.com/launchdarkly/python-ai-sdk/commit/ce616444ba39ba3c1fc4954410357ccf744d4bf9))
+
+
+### Documentation
+
+* **evaluations:** document criteria, judge handlers, and scoring policy ([5f5a626](https://github.com/launchdarkly/python-ai-sdk/commit/5f5a626a2406774010485a070546ab27cc5d86fb))
+* **evaluations:** use a customer-style judge key in examples ([ceca049](https://github.com/launchdarkly/python-ai-sdk/commit/ceca049617b1cac362789aafbe7465759aed0762))
+* replace stale launchdarkly-ai package name with launchdarkly-ai-python ([#40](https://github.com/launchdarkly/python-ai-sdk/issues/40)) ([3256db7](https://github.com/launchdarkly/python-ai-sdk/commit/3256db77a8f3e54c08635ea3a8157e60e5aa0f8b))
+
 ## [0.1.6](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.5...launchdarkly-ai-python-0.1.6) (2026-09-08)
 
 

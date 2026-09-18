@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.2...launchdarkly-ai-server-0.2.3) (2026-09-18)
+
+
+### Features
+
+* **AIC-3106:** add multimodal history support to graph().invoke() ([#26](https://github.com/launchdarkly/python-ai-sdk/issues/26)) ([c91132d](https://github.com/launchdarkly/python-ai-sdk/commit/c91132de81f846326457c6d397be609b7a510e35))
+* **client:** stamp modelKey and modelVersion from _ldMeta on tracking events ([ef103d3](https://github.com/launchdarkly/python-ai-sdk/commit/ef103d313cdf65b1bce2f30782f5825a6b63df18))
+* **client:** stamp modelKey and modelVersion from _ldMeta on tracking events ([#97](https://github.com/launchdarkly/python-ai-sdk/issues/97)) ([4e6998a](https://github.com/launchdarkly/python-ai-sdk/commit/4e6998ae720d96706a4563031af58f9d794565d9))
+* **evaluations:** add LD judge event support ([#63](https://github.com/launchdarkly/python-ai-sdk/issues/63)) ([ce61644](https://github.com/launchdarkly/python-ai-sdk/commit/ce616444ba39ba3c1fc4954410357ccf744d4bf9))
+
+
+### Bug Fixes
+
+* **client:** harden model stamps and keep judge results from inheriting parent model identity ([5d1e678](https://github.com/launchdarkly/python-ai-sdk/commit/5d1e6787748bb8b8119ca2e7631bbabf1689a547))
+* **client:** only stamp a non-empty string modelKey ([8424452](https://github.com/launchdarkly/python-ai-sdk/commit/842445207b1d8031b6976e77147236ee4f2f398e))
+* **evaluations:** dedup criteria case-insensitively, matching the API ([4126d7b](https://github.com/launchdarkly/python-ai-sdk/commit/4126d7b8bc33adf848663ea1789ff7a36abff37b))
+* **evaluations:** offline judge message_history must carry FORMATTING_INSTRUCTIONS ([0b81f4e](https://github.com/launchdarkly/python-ai-sdk/commit/0b81f4e3c6eda8ed84888d376f8c86d9eb522d93))
+* **evaluations:** prefer an exact-provider judge handler over a wildcard ([c61b3a5](https://github.com/launchdarkly/python-ai-sdk/commit/c61b3a545b48265c7942f1344307b883fdd5ffef))
+* **evaluations:** route judge configs to a compatible handler ([1a5e099](https://github.com/launchdarkly/python-ai-sdk/commit/1a5e0999c3b772d377110c4fa93c2494b6a9041f))
+* extract LangChain content-block text and apply model parameters after eval ([#80](https://github.com/launchdarkly/python-ai-sdk/issues/80)) ([a4e1aad](https://github.com/launchdarkly/python-ai-sdk/commit/a4e1aade8adea9f9dcf18c38b374d2de089a7cc1))
+* **graph:** prefer node tools before synthetic handoff routing ([#90](https://github.com/launchdarkly/python-ai-sdk/issues/90)) ([f830b2c](https://github.com/launchdarkly/python-ai-sdk/commit/f830b2c99c96c5de00750d82087bedbfe087ad40))
+
+
+### Documentation
+
+* **evaluations:** document criteria, judge handlers, and scoring policy ([5f5a626](https://github.com/launchdarkly/python-ai-sdk/commit/5f5a626a2406774010485a070546ab27cc5d86fb))
+* **evaluations:** use a customer-style judge key in examples ([ceca049](https://github.com/launchdarkly/python-ai-sdk/commit/ceca049617b1cac362789aafbe7465759aed0762))
+* replace stale launchdarkly-ai package name with launchdarkly-ai-python ([#40](https://github.com/launchdarkly/python-ai-sdk/issues/40)) ([3256db7](https://github.com/launchdarkly/python-ai-sdk/commit/3256db77a8f3e54c08635ea3a8157e60e5aa0f8b))
+
 ## [0.2.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.1...launchdarkly-ai-server-0.2.2) (2026-09-08)
 
 
