@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from .types import DatasetRow
 
-type ScorerFn = Callable[[DatasetRow, Any], float | bool | Awaitable[float | bool]]
+type ScorerFn = Callable[[DatasetRow, Any], float | Awaitable[float]]
 
 type SuccessDirection = Literal["higher_is_better", "lower_is_better"]
 
@@ -70,12 +70,19 @@ class Scorer:
     ``fn`` may be sync or async and receives ``(row, output)``, where ``row``
     is the :class:`~launchdarkly_ai_server.evaluations.types.DatasetRow` the
     output was generated from and ``output`` is the generated output. It must
-    return a boolean or a numeric score from 0 to 1. Boolean results are
-    converted to 1.0 or 0.0 before being emitted as evaluation events.
+    return a **finite number from 0 to 1** -- that is the whole contract.
+    Nothing is coerced on the caller's behalf, so a scorer answering a yes/no
+    question returns ``1.0`` or ``0.0`` itself; a ``bool`` is an
+    ``invalid_score`` result, as is a non-finite or out-of-range number.
+
+    Returning one score type keeps the ``threshold`` comparison below meaning
+    the same thing for binary and graded scorers. It also keeps a scorer that
+    accidentally returns a non-score from passing silently: every non-empty
+    value is truthy, so ``return "high"`` scored 1.0 under the old coercion.
 
     ``threshold`` defaults to 1.0: a row passes only on a perfect score, which
-    matches the common case of boolean scorers. Pass a lower threshold for
-    graded numeric scorers.
+    is what a scorer answering a yes/no question wants. Pass a lower threshold
+    for a graded scorer.
 
     ``success_direction`` says which way the score points, and defaults to
     higher-is-better. Unlike a judge, a scorer has no LaunchDarkly-side config
