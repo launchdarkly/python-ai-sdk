@@ -3220,9 +3220,13 @@ async def test_run_rejects_oversized_inline_text(field: str) -> None:
         **{field: _sized_field_value(field, _sized_field_text(field, oversize))},
     )
 
+    # variables is measured with the injected input and expected_output keys
+    # present, so its rendered size is larger than the caller's own mapping.
+    expected_bytes = r"\d+" if field == "variables" else str(oversize)
+
     with pytest.raises(
         EvaluationsError,
-        match=rf"rows\[0\].{field} is {oversize} bytes, over the "
+        match=rf"rows\[0\].{field} is {expected_bytes} bytes rendered, over the "
         rf"{MAX_INLINE_TEXT_BYTES} byte limit",
     ):
         await evals.run(
@@ -3248,7 +3252,7 @@ async def test_run_rejects_oversized_multibyte_inline_text(field: str) -> None:
     row = DatasetRow(row_index=0, **{field: _sized_field_value(field, text)})
 
     with pytest.raises(
-        EvaluationsError, match=rf"rows\[0\].{field} is \d+ bytes, over the"
+        EvaluationsError, match=rf"rows\[0\].{field} is \d+ bytes rendered, over the"
     ):
         await evals.run(
             project_key="proj",
@@ -3261,12 +3265,95 @@ async def test_run_rejects_oversized_multibyte_inline_text(field: str) -> None:
     assert transport.requests == []
 
 
-@pytest.mark.parametrize("field", ["input", "expected_output", "variables", "metadata"])
-def test_validate_rows_accepts_the_limits_exactly(field: str) -> None:
+def test_inline_rows_accept_the_rendered_limits_exactly() -> None:
     EvaluationsModule._validate_rows(
         [DatasetRow(row_index=index, input="x") for index in range(MAX_ROWS)]
     )
-    at_limit = _sized_field_value(
-        field, _sized_field_text(field, MAX_INLINE_TEXT_BYTES)
+
+    # metadata is carried through untouched, so it may sit exactly at the cap.
+    metadata_text = _sized_field_text("metadata", MAX_INLINE_TEXT_BYTES)
+    EvaluationsModule._prepare_inline_rows(
+        [DatasetRow(row_index=0, metadata={"k": metadata_text})]
     )
-    EvaluationsModule._validate_rows([DatasetRow(row_index=0, **{field: at_limit})])
+
+    # variables is measured with the injected input and expected_output keys, so
+    # the caller's own entries have to leave room for them -- None here, as a row
+    # this close to the cap has neither.
+    injected_nulls = len(json.dumps({"k": "", "input": None, "expected_output": None}))
+    EvaluationsModule._prepare_inline_rows(
+        [
+            DatasetRow(
+                row_index=0,
+                variables={"k": "a" * (MAX_INLINE_TEXT_BYTES - injected_nulls)},
+            )
+        ]
+    )
+
+    # input and expected_output are each measured twice: as themselves, and again
+    # inside variables, which rendering injects both of them into. The injected
+    # copies are the binding constraint -- the two strings share one cap, so
+    # neither field can reach the cap on its own.
+    room = MAX_INLINE_TEXT_BYTES - len(json.dumps({"input": "", "expected_output": ""}))
+    at_limit = DatasetRow(
+        row_index=0,
+        input="a" * (room // 2),
+        expected_output="a" * (room - room // 2),
+    )
+    EvaluationsModule._prepare_inline_rows([at_limit])
+
+    one_over = DatasetRow(
+        row_index=0,
+        input=f"{at_limit.input}a",
+        expected_output=at_limit.expected_output,
+    )
+    with pytest.raises(EvaluationsError, match=r"rows\[0\].variables is \d+ bytes"):
+        EvaluationsModule._prepare_inline_rows([one_over])
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_inline_input_that_renders_over_the_limit() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    half = "a" * (MAX_INLINE_TEXT_BYTES // 2 + 1)
+    row = DatasetRow(row_index=0, input="{{half}}{{half}}", variables={"half": half})
+    assert len(row.input.encode("utf-8")) < MAX_INLINE_TEXT_BYTES
+    assert len(json.dumps(row.variables).encode("utf-8")) < MAX_INLINE_TEXT_BYTES
+
+    with pytest.raises(
+        EvaluationsError,
+        match=rf"rows\[0\].input is {len(half) * 2} bytes rendered, over the "
+        rf"{MAX_INLINE_TEXT_BYTES} byte limit",
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[row],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_inline_variables_the_injected_keys_push_over() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    text = "a" * (MAX_INLINE_TEXT_BYTES - len(json.dumps({"k": ""})))
+    row = DatasetRow(row_index=0, variables={"k": text})
+    assert len(json.dumps(row.variables).encode("utf-8")) == MAX_INLINE_TEXT_BYTES
+
+    with pytest.raises(
+        EvaluationsError,
+        match=rf"rows\[0\].variables is \d+ bytes rendered, over the "
+        rf"{MAX_INLINE_TEXT_BYTES} byte limit",
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[row],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []

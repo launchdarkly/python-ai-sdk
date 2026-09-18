@@ -73,6 +73,48 @@ def _require_json_serializable(value: Any, description: str) -> None:
         ) from error
 
 
+def _require_within_inline_limit(size: int, index: int, field_name: str) -> None:
+    if size <= MAX_INLINE_TEXT_BYTES:
+        return
+    raise EvaluationsError(
+        f"rows[{index}].{field_name} is {size} bytes rendered, over the "
+        f"{MAX_INLINE_TEXT_BYTES} byte limit for an inline row field. The size "
+        "is measured on the rendered value the generation event carries: "
+        "{{...}} placeholders are expanded, and variables additionally carries "
+        "the rendered input and expected_output."
+    )
+
+
+def _check_rendered_row_size(row: DatasetRow, index: int) -> None:
+    """
+    Enforce the inline byte cap on the values the generation event will carry.
+
+    Measured after ``_render_row`` rather than on the caller's row, because the
+    two differ in size in both directions: expanding a ``{{...}}`` placeholder
+    can grow ``input`` or ``expected_output`` past the cap, and the injected
+    ``input``/``expected_output`` keys always grow ``variables``. Measuring the
+    unrendered row would pass a row whose event is oversized -- and an
+    oversized event is rejected on the SDK's background flush thread, where
+    nothing can report it back, so the run ends in a polling timeout with no
+    cause. Callers therefore need headroom under the cap, not equality with it.
+    """
+    for name, value in (
+        ("input", row.input),
+        ("expected_output", row.expected_output),
+    ):
+        if value is None:
+            continue
+        _require_within_inline_limit(len(value.encode("utf-8")), index, name)
+    for field_name, mapping_value in (
+        ("variables", row.variables),
+        ("metadata", row.metadata),
+    ):
+        if mapping_value is None:
+            continue
+        size = len(json.dumps(dict(mapping_value), ensure_ascii=False).encode("utf-8"))
+        _require_within_inline_limit(size, index, field_name)
+
+
 def _is_terminal_summary(summary: RunSummary) -> bool:
     accounted_rows = summary.passed_rows + summary.failed_rows + summary.error_rows
     return (
@@ -135,8 +177,11 @@ class EvaluationsModule:
         read or referenced at all. Supplying both, or neither, is an error
         raised before any network I/O. Inline rows are capped at ``MAX_ROWS``,
         and each row field is capped at ``MAX_INLINE_TEXT_BYTES`` encoded bytes
-        (a mapping field is measured as its JSON form); both are checked before
-        any request is issued.
+        *as the generation event will carry it* — templates expanded, and
+        ``variables`` holding the injected ``input``/``expected_output`` — so a
+        field needs headroom under the cap rather than exactly the cap. A
+        mapping field is measured as its JSON form. Both caps are checked
+        before any request is issued.
 
         Each row is generated with ``handler``; every entry in ``criteria`` —
         LaunchDarkly :class:`Judge` references and local deterministic
@@ -178,6 +223,11 @@ class EvaluationsModule:
         ld_judges = [
             criterion for criterion in run_criteria if isinstance(criterion, Judge)
         ]
+        inline_rows: list[DatasetRow] = (
+            []
+            if dataset is not None
+            else await asyncio.to_thread(self._prepare_inline_rows, rows or [])
+        )
         client = await self._resolve_client()
 
         # The management API client is synchronous; running it in a worker thread
@@ -199,7 +249,7 @@ class EvaluationsModule:
             )
         else:
             dataset_ref = None
-            run_rows = await asyncio.to_thread(_normalize_inline_rows, rows or [])
+            run_rows = inline_rows
         evaluation = await asyncio.to_thread(
             self._runner._create_evaluation,
             project_key,
@@ -383,6 +433,13 @@ class EvaluationsModule:
                 )
 
     @staticmethod
+    def _prepare_inline_rows(rows: list[DatasetRow]) -> list[DatasetRow]:
+        prepared = _normalize_inline_rows(rows)
+        for index, row in enumerate(prepared):
+            _check_rendered_row_size(row, index)
+        return prepared
+
+    @staticmethod
     def _validate_rows(rows: list[DatasetRow]) -> None:
         """
         Check caller-supplied rows before any record exists.
@@ -390,10 +447,15 @@ class EvaluationsModule:
         Stricter than the hosted path on purpose. ``_row_from_api_item`` coerces
         bad server data rather than failing a run already in flight; a bad inline
         row is a caller bug, and every check here runs with zero requests issued
-        (the ``MAX_ROWS`` and ``MAX_INLINE_TEXT_BYTES`` ceilings included: a hosted
-        dataset is LaunchDarkly's to bound, and a caller could not fix an oversized
-        one from their own process anyway)
+        (the ``MAX_ROWS`` ceiling included: a hosted dataset is LaunchDarkly's to
+        bound, and a caller could not shrink an oversized one from their own
+        process anyway)
         — where the hosted empty-dataset rule only fires after two GETs.
+
+        Shape only. The ``MAX_INLINE_TEXT_BYTES`` ceiling is inline-only for the
+        same reason ``MAX_ROWS`` is, but has to be measured on the rendered row
+        rather than this one; ``_prepare_inline_rows`` applies it, still with
+        zero requests issued.
         """
         if not rows:
             raise EvaluationsError("rows must not be empty")
@@ -445,16 +507,6 @@ class EvaluationsModule:
                         f"rows[{index}].{name} must be a string or None, got "
                         f"{type(value).__name__}"
                     )
-                # Encoded length, not len(): the field travels as UTF-8 JSON inside
-                # the generation event, so a shorter string of non-ASCII text can
-                # still be over the limit that ingest applies.
-                size = len(value.encode("utf-8"))
-                if size > MAX_INLINE_TEXT_BYTES:
-                    raise EvaluationsError(
-                        f"rows[{index}].{name} is {size} bytes, over the "
-                        f"{MAX_INLINE_TEXT_BYTES} byte limit for an inline row "
-                        "field."
-                    )
             for field_name, mapping_value in (
                 ("variables", row.variables),
                 ("metadata", row.metadata),
@@ -466,21 +518,15 @@ class EvaluationsModule:
                         f"rows[{index}].{field_name} must be a mapping, got "
                         f"{type(mapping_value).__name__}"
                     )
-                # Serializability and size are both checked on the copy, not the
-                # caller's container, because the copy is what reaches the wire --
-                # any Mapping is accepted here and normalized to a dict, and the
+                # Serializability is checked on the copy, not the caller's
+                # container, because the copy is what reaches the wire -- any
+                # Mapping is accepted here and normalized to a dict, and the
                 # serializer only encodes dict. The copy is shallow in both
                 # places, so a nested mapping the serializer cannot encode is
                 # correctly still an error.
-                normalized = dict(mapping_value)
-                _require_json_serializable(normalized, f"rows[{index}].{field_name}")
-                size = len(json.dumps(normalized, ensure_ascii=False).encode("utf-8"))
-                if size > MAX_INLINE_TEXT_BYTES:
-                    raise EvaluationsError(
-                        f"rows[{index}].{field_name} is {size} bytes, over the "
-                        f"{MAX_INLINE_TEXT_BYTES} byte limit for an inline row "
-                        "field."
-                    )
+                _require_json_serializable(
+                    dict(mapping_value), f"rows[{index}].{field_name}"
+                )
 
     @staticmethod
     def _validate_run_args(
