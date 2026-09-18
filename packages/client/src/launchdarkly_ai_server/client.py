@@ -123,6 +123,8 @@ class ConfigInstance:
                 handlers=resolved_handler_list,
                 llm_response=llm_str,
                 base_track_data=track_data,
+                user_input=user_input,
+                trajectory=result.get("trajectory", ""),
             )
             return ProviderResponse(
                 response=parsed_response,
@@ -137,6 +139,7 @@ class ConfigInstance:
             handler=handler,
             handlers=resolved_handler_list,
             user_input=user_input,
+            trajectory=result.get("trajectory", ""),
             llm_response=llm_str,
             base_track_data=track_data,
             tool_handlers=resolved_tools,
@@ -215,6 +218,7 @@ class ConfigInstance:
                     handler=handler,
                     handlers=resolved_handler_list,
                     user_input=user_input,
+                    trajectory=done_event.get("trajectory", ""),
                     llm_response=done_event.get("response", ""),
                     base_track_data=track_data,
                     tool_handlers=resolved_tools,

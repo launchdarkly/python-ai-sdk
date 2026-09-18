@@ -1,10 +1,19 @@
-"""Shared scoring contract for LaunchDarkly AI Judge invocations.
+"""Shared contract for LaunchDarkly AI Judge invocations.
 
-Both judge execution paths — the online path (``judges.run_judges``, sampled
-per invocation) and the offline evaluations path (``evaluations.runner``) —
-prompt a judge model for the same ``{"score": <0-1>, "reasoning": <string>}``
-JSON shape and must parse it the same way. This module owns that contract so
-the two paths cannot drift.
+Three judge execution paths exist — the online inline path
+(``judges.run_judges``, sampled per invocation), the online deferred path
+(``judges.run_judge``, from a ``JudgeTask`` on a background thread), and the
+offline evaluations path (``evaluations.runner``). All three prompt a judge
+model for the same ``{"score": <0-1>, "reasoning": <string>}`` JSON shape, and
+all three must show the judge the same conversation. This module owns both
+halves of that contract so the paths cannot drift.
+
+They did drift. Each path built ``message_history`` with its own inline join:
+the offline one carried the row input, the inline online one carried the user
+input, and the deferred one carried neither -- a judge grading the same
+response saw a different conversation depending on which path reached it. The
+trajectory landing in only one of the three is what made that visible.
+:func:`build_message_history` is now the only place it is built.
 """
 
 from __future__ import annotations
@@ -25,6 +34,32 @@ FORMATTING_INSTRUCTIONS = "\n".join(
         "function. Do not include ```json tags.",
     ]
 )
+
+
+def build_message_history(
+    *,
+    user_input: Any = None,
+    trajectory: Any = None,
+    output: Any = None,
+) -> str:
+    """The conversation a judge is shown, as the ``message_history`` variable.
+
+    Ordered the way it happened: what was asked, what the agent did about it,
+    what it answered, and finally how to format the verdict. Empty parts are
+    skipped, so a run with no tools produces exactly the history it produced
+    before trajectories existed and a judge authored against it is unaffected.
+
+    ``FORMATTING_INSTRUCTIONS`` is appended here rather than by each caller,
+    because every judge built from the AI Library's default templates
+    references ``{{message_history}}`` and not ``{{formatting_instructions}}``
+    -- a judge that stopped being told the JSON shape would start returning
+    prose, and every one of its results would become an invalid-output error.
+    """
+    return "\n\n".join(
+        str(part)
+        for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
+        if part
+    )
 
 
 def numeric_score(score: Any) -> float | None:
