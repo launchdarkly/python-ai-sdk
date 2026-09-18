@@ -31,13 +31,17 @@ async def run(key: str, user_input: str) -> None:
             registry=global_registry,
         ).stream(user_input, new_context())
 
+    wrote_chunk = False
     async for event in stream:
         if event["type"] == "chunk":
             sys.stdout.write(event.get("text", ""))
             sys.stdout.flush()
+            wrote_chunk = True
         else:
             # Final event — full response + normalised usage
-            sys.stdout.write("\n")
+            if not wrote_chunk:
+                sys.stdout.write(str(event.get("response") or ""))
+            sys.stdout.write("\n\n")
             print("Usage:", json_pretty(event.get("usage")))
             if event.get("judgeResults"):
                 print("Judge results:", json_pretty(event["judgeResults"]))
