@@ -1585,6 +1585,12 @@ class FDv2SkillStore:
 
         self._basis: str | None = None
         self._etag: str | None = None
+        # The basis ``_etag`` was issued against. An ETag validates one
+        # representation of one resource, and the basis is part of the request
+        # that names it; holding the pair is what lets ``_poll_once`` tell an
+        # etag that still answers the question it is about to ask from one that
+        # answers a question it has stopped asking.
+        self._etag_basis: str | None = None
 
         self._requester = _requester or _Requester(
             sdk_key.strip(),
@@ -1904,6 +1910,7 @@ class FDv2SkillStore:
                         if not exhausted:
                             self._basis = None
                             self._etag = None
+                            self._etag_basis = None
                     if exhausted:
                         self._give_up(str(exc))
                         return
@@ -2017,18 +2024,33 @@ class FDv2SkillStore:
 
     def _poll_once(self) -> None:
         with self._lock:
-            basis, etag = self._basis, self._etag
+            basis = self._basis
+            # Offered only while the pair still holds. The basis is part of the
+            # request, so an etag issued before the basis moved validates a
+            # payload this store has stopped asking for, and a server answering
+            # it ``304`` would be answering the previous question. One
+            # unconditional request after each commit is the whole cost: a
+            # payload that changed was never going to be a 304 anyway.
+            etag = self._etag if self._etag_basis == basis else None
         result = self._requester.poll(basis, etag)
-        with self._lock:
-            self._etag = result.etag
         if result.not_modified:
             logger.debug("Skill payload unchanged (HTTP 304)")
             # A 304 counts as a first payload, so a boot that reconnects with a
-            # cached basis is not blocked on a transfer the server will not send.
+            # cached basis is not blocked on a transfer the server will not
+            # send. It is a current answer because the etag that asked for it
+            # was issued for a body this store applied in full.
             self._publish_first_payload()
             return
         for name, data in result.events:
             self._apply(name, data)
+        with self._lock:
+            # Adopted only once the whole body has been applied. A body that
+            # broke off partway — an ``error`` or ``goodbye`` after an announced
+            # transfer — left the payload it described unapplied, and keeping
+            # its etag would let the next 304 report a store that is missing
+            # that payload as current and healthy.
+            self._etag = result.etag
+            self._etag_basis = basis
 
     def _stream_once(self) -> None:
         with self._lock:

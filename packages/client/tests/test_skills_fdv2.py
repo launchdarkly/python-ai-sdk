@@ -1298,13 +1298,55 @@ class TestPollingAgainstTheEndpoint:
         bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
         assert bases == [None, "skills-basis", "skills-basis"]
 
-    def test_an_etag_is_returned_as_if_none_match(self, endpoint: Any) -> None:
-        endpoint.queue_poll(full_payload(("put-object", put_skill())), etag='W/"v1"')
+    def test_an_etag_is_returned_for_the_basis_it_was_issued_against(
+        self, endpoint: Any
+    ) -> None:
+        """
+        An ETag validates one representation of one resource, and the basis is
+        part of the request that names it. ``W/"v1"`` answers the request that
+        carried no basis at all, so it is not offered once the payload it came
+        with moved the basis on; ``W/"v2"`` answers a request from ``basis-1``,
+        which is still the question being asked, so it is.
+        """
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="basis-1"), etag='W/"v1"'
+        )
+        endpoint.queue_poll(
+            events(("server-intent", server_intent("none"))), etag='W/"v2"'
+        )
         endpoint.queue_poll(status=304)
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            assert wait_until(lambda: len(endpoint.requests) >= 2)
-        assert endpoint.requests[1]["if_none_match"] == 'W/"v1"'
+            assert wait_until(lambda: len(endpoint.requests) >= 3)
+        bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
+        assert bases == [None, "basis-1", "basis-1"]
+        offered = [r["if_none_match"] for r in endpoint.requests[:3]]
+        assert offered == [None, None, 'W/"v2"']
+
+    def test_the_etag_of_a_body_never_applied_is_not_offered(
+        self, endpoint: Any
+    ) -> None:
+        """
+        The body announced a transfer and then broke off, so the payload it
+        described was never committed. Offering its etag would invite a 304 that
+        reports a store still missing that payload as current and healthy — and
+        unlike the 200 it replaces, a 304 carries nothing to notice that on.
+        """
+        endpoint.queue_poll(
+            events(
+                ("server-intent", server_intent("xfer-full")),
+                ("put-object", put_skill()),
+                ("error", {"reason": "cut off mid-payload"}),
+            ),
+            etag='W/"v1"',
+        )
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="basis-1"), etag='W/"v2"'
+        )
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert endpoint.requests[1]["if_none_match"] is None
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
 
     def test_a_304_keeps_the_held_content(self, endpoint: Any) -> None:
         endpoint.queue_poll(full_payload(("put-object", put_skill())), etag='W/"v1"')
