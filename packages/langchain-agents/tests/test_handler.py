@@ -2169,12 +2169,20 @@ class TestModelSource:
             **BASE_CONFIG,
             "model": {
                 "name": "gpt-4o",
-                "parameters": {"temperature": 0.2, "max_tokens": 512},
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 512,
+                    "tools": [{"name": "openai-tool"}],
+                },
             },
         }
         with ctx:
             result = await create_langchain_agents_handler(factory)(cfg, "q")
-        assert seen[0]["model"]["parameters"] == {"temperature": 0.2, "max_tokens": 512}
+        assert seen[0]["model"]["parameters"] == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "tools": [{"name": "openai-tool"}],
+        }
         assert result["output"] == "from-factory"
 
     @pytest.mark.asyncio
@@ -2200,7 +2208,11 @@ class TestModelSource:
             **BASE_CONFIG,
             "model": {
                 "name": "gpt-4o",
-                "parameters": {"temperature": 0.2, "max_tokens": 512},
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 512,
+                    "tools": [{"name": "openai-tool"}],
+                },
             },
         }
         with (
@@ -2211,6 +2223,7 @@ class TestModelSource:
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "max_tokens": 512,
+            "tools": [{"name": "openai-tool"}],
             "model": "gpt-4o",
         }
 
@@ -2246,10 +2259,14 @@ class TestModelSource:
         cfg = {
             **BASE_CONFIG,
             "provider": {"name": "Bedrock"},
+            "tools": TOOL_CONFIG["tools"],
             "model": {
                 "name": "anthropic.claude-sonnet-4-5",
                 "region": "us",
-                "parameters": {"temperature": 0.2},
+                "parameters": {
+                    "temperature": 0.2,
+                    "tools": [{"name": "duplicated-search"}],
+                },
             },
         }
         with (
@@ -2259,11 +2276,14 @@ class TestModelSource:
                 {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
             ),
         ):
-            await create_langchain_agents_handler()(cfg, "q")
+            await create_langchain_agents_handler()(
+                cfg, "q", {"search": AsyncMock(return_value="result")}
+            )
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "model": "us.anthropic.claude-sonnet-4-5",
         }
+        assert cfg["model"]["parameters"]["tools"] == [{"name": "duplicated-search"}]
         assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
 
     @pytest.mark.asyncio

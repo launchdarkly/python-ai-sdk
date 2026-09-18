@@ -174,6 +174,9 @@ def _model_constructor_kwargs(
 ) -> dict[str, Any]:
     raw = (config.get("model") or {}).get("parameters")
     parameters = dict(raw) if isinstance(raw, dict) else {}
+    provider = str((config.get("provider") or {}).get("name") or "").lower()
+    if provider == "bedrock":
+        parameters.pop("tools", None)
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
 
