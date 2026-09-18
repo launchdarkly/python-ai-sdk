@@ -288,19 +288,17 @@ class TestModelIdentity:
         assert attrs["gen_ai.system"] == "langchain"
         assert attrs["gen_ai.provider.name"] == "anthropic"
 
-    def test_the_langchain_provider_name_is_binary_not_a_passthrough(
+    def test_the_langchain_provider_name_is_the_configured_name(
         self, handler_spans: Any
     ) -> None:
-        # Anything that is not Anthropic is served by the OpenAI client, so the attribute follows the
-        # client actually instantiated rather than whatever the config happens to name.
         package, module, _ = handler_spans
         if not package.startswith("langchain-"):
-            pytest.skip("only the LangChain handlers make this choice")
+            pytest.skip("only the LangChain handlers pass through provider.name")
         for configured, expected in (
             ("Anthropic", "anthropic"),
             ("OpenAI", "openai"),
-            ("Bedrock", "openai"),
-            ("Azure", "openai"),
+            ("Bedrock", "bedrock"),
+            ("Azure", "azure"),
             ("", "openai"),
         ):
             config = {**CONFIG, "provider": {"name": configured}}

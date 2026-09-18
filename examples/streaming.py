@@ -37,10 +37,11 @@ async def run(key: str, user_input: str) -> None:
             sys.stdout.flush()
         else:
             # Final event — full response + normalised usage
-            sys.stdout.write("\n\n")
+            sys.stdout.write("\n")
             print("Usage:", json_pretty(event.get("usage")))
             if event.get("judgeResults"):
                 print("Judge results:", json_pretty(event["judgeResults"]))
+            sys.stdout.write("\n")
 
 
 def json_pretty(obj: object) -> str:

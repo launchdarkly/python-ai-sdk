@@ -778,18 +778,27 @@ class TestRootSpanAttributes:
         assert rec.root.attributes["gen_ai.provider.name"] == "anthropic"
         assert rec.root.attributes["gen_ai.system"] == "langchain"
 
+    @pytest.mark.parametrize(
+        ("provider_name", "expected"),
+        [
+            ("OpenAI", "openai"),
+            ("Bedrock", "bedrock"),
+            ("Azure", "azure"),
+            ("Cohere", "cohere"),
+            ("Typo", "typo"),
+            ("", "openai"),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_gen_ai_provider_name_falls_back_to_openai_for_anything_else(
-        self,
+    async def test_gen_ai_provider_name_is_the_configured_name(
+        self, provider_name: str, expected: str
     ) -> None:
-        # A binary choice, not a passthrough: Bedrock, Azure, Cohere, a typo, or nothing at all all
-        # report `openai`, because that mirrors which chat model class is really instantiated.
         ctx, rec = _recording()
-        cfg = {**BASE_CONFIG, "provider": {"name": "Bedrock"}}
+        cfg = {**BASE_CONFIG, "provider": {"name": provider_name}}
         llm = _FakeToolModel(replies=[_ai_message("hi")])
         with ctx:
             await create_langchain_agents_handler(llm)(cfg, "q")
-        assert rec.root.attributes["gen_ai.provider.name"] == "openai"
+        assert rec.root.attributes["gen_ai.provider.name"] == expected
 
     @pytest.mark.asyncio
     async def test_response_model_is_the_requested_name(self) -> None:
@@ -2226,6 +2235,111 @@ class TestModelSource:
             "temperature": 0.1,
             "model": "claude-sonnet-4-5",
         }
+
+    @pytest.mark.asyncio
+    async def test_bedrock_region_is_prepended_to_the_default_constructor(
+        self,
+    ) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "anthropic.claude-sonnet-4-5",
+                "region": "us",
+                "parameters": {"temperature": 0.2},
+            },
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
+        assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_bedrock_region_prefix_is_idempotent(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "us.anthropic.claude-sonnet-4-5",
+                "region": "us",
+            },
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_bedrock_without_region_keeps_the_model_name(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_non_bedrock_ignores_model_region(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("openai")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "OpenAI"},
+            "model": {"name": "gpt-4o", "region": "us"},
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_factory_receives_prefixed_bedrock_name_without_mutating_config(
+        self,
+    ) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("from-factory")])
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "anthropic.claude-sonnet-4-5",
+                "region": "us",
+                "parameters": {"temperature": 0.2},
+            },
+        }
+        with ctx:
+            await create_langchain_agents_handler(factory)(cfg, "q")
+        assert seen[0]["model"]["name"] == "us.anthropic.claude-sonnet-4-5"
+        assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
+        assert seen[0] is not cfg
 
     @pytest.mark.asyncio
     async def test_factory_is_resolved_on_the_streaming_path(self) -> None:

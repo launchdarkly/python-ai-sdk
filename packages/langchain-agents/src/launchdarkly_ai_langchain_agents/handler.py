@@ -147,12 +147,34 @@ def _build_initial_messages(
     return messages
 
 
+def _resolved_model_name(config: AiConfigRep, fallback_name: str = "") -> str:
+    """Bedrock ``model.region`` is an inference-profile prefix, prepended once."""
+    model = config.get("model") or {}
+    name = str(model.get("name") or fallback_name)
+    provider = str((config.get("provider") or {}).get("name") or "").lower()
+    if provider != "bedrock":
+        return name
+    prefix = str(model.get("region") or "")
+    if not prefix or name.startswith(f"{prefix}."):
+        return name
+    return f"{prefix}.{name}"
+
+
+def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
+    """Shallow copy with a resolved Bedrock model name. Does not mutate *config*."""
+    resolved = _resolved_model_name(config)
+    model = dict(config.get("model") or {})
+    if model.get("name") == resolved:
+        return config
+    return {**config, "model": {**model, "name": resolved}}
+
+
 def _model_constructor_kwargs(
     config: AiConfigRep, fallback_name: str
 ) -> dict[str, Any]:
     raw = (config.get("model") or {}).get("parameters")
     parameters = dict(raw) if isinstance(raw, dict) else {}
-    parameters["model"] = (config.get("model") or {}).get("name") or fallback_name
+    parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
 
 
@@ -181,10 +203,11 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
 
 
 async def _resolve_base_model(config: AiConfigRep, llm: Any) -> Any:
+    invocation = _config_for_model_call(config)
     if llm is None:
-        return _make_default_chat_model(config)
+        return _make_default_chat_model(invocation)
     if _is_model_factory(llm):
-        model = llm(config)
+        model = llm(invocation)
         if asyncio.iscoroutine(model):
             return await model
         return model
