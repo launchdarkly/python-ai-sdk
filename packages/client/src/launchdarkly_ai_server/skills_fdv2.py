@@ -776,7 +776,12 @@ class _ProtocolReader:
         state = data.get("state") if isinstance(data, dict) else None
         version = data.get("version") if isinstance(data, dict) else None
         payload_id = self._intent_payload_id or _payload_id_from_selector(state)
-        if self._pending is not None and self._is_foreign_payload(payload_id):
+        # Asked regardless of whether a pending set exists: a ``none`` intent
+        # builds none, and the transfer that completes it still names a payload
+        # whose selector must not become the resume point if it is not the
+        # payload skills arrive on.
+        foreign = self._is_foreign_payload(payload_id)
+        if foreign:
             self._warn_foreign_payload(payload_id)
             self.diagnostics.payloads_ignored += 1
             self._changes = []
@@ -817,7 +822,12 @@ class _ProtocolReader:
         return _TransferOutcome(
             committed=True,
             changes=changes,
-            basis=state if isinstance(state, str) and state else None,
+            # A declined payload must not move the resume point. Adopting the
+            # selector of a transfer whose contents this layer just threw away
+            # would ask the next poll or stream to resume from someone else's
+            # payload, and skill updates could stop arriving while every
+            # diagnostic still read healthy.
+            basis=state if not foreign and isinstance(state, str) and state else None,
         )
 
     def _abandon_in_flight(self) -> None:

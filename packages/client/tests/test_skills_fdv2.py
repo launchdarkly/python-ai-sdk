@@ -1006,6 +1006,48 @@ class TestPayloadIdentity:
         assert len(_payload_warnings(caplog, "was not applied")) == 1
         assert reader.diagnostics.payloads_ignored == 2
 
+    def test_a_declined_transfer_does_not_move_the_resume_point(self) -> None:
+        """
+        Ignoring a foreign payload's contents while adopting its resume point
+        would ask the next poll or stream to resume from someone else's
+        payload: skill updates could stop arriving while every diagnostic read
+        healthy.
+        """
+        reader = _ProtocolReader(_SkillObjectSet())
+        ours = drive(
+            reader, skill_payload(("put-object", put_skill()), state="skills-basis")
+        )
+        assert ours[-1].basis == "skills-basis"
+        outcomes = drive(
+            reader,
+            skill_payload(
+                ("put-object", put_flag()), payload_id="env-flags", state="flag-basis"
+            ),
+        )
+        assert outcomes[-1].basis is None
+        assert reader.diagnostics.payloads_ignored == 1
+
+    def test_a_none_intent_for_another_payload_moves_nothing(self) -> None:
+        """
+        A ``none`` intent builds no pending set, and the foreign check must not
+        be gated on one: the transfer that follows still names a payload, and
+        adopting its selector would resume the next connection from someone
+        else's payload with every diagnostic reading healthy.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill()), state="basis-skills"))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("none", "env-flags")),
+                ("payload-transferred", transferred("basis-flags")),
+            ),
+        )
+        assert outcomes[-1].basis is None
+        assert reader.diagnostics.payloads_ignored == 1
+        assert held.get("pdf-extraction", None) is not None
+
     def test_a_full_transfer_of_the_skill_payload_still_empties_it(self) -> None:
         """Every skill deleted is a real state, and the guard must not mask it."""
         held = _SkillObjectSet()
@@ -1234,6 +1276,27 @@ class TestPollingAgainstTheEndpoint:
             assert wait_until(lambda: len(endpoint.requests) >= 3)
         bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
         assert bases == [None, "basis-1", "basis-2"]
+
+    def test_the_basis_stays_on_the_skill_payload_when_another_transfers(
+        self, endpoint: Any
+    ) -> None:
+        """The wire half of the declined-payload case: the store must resume from
+        the payload skills arrive on, not from the one it just threw away."""
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="skills-basis")
+        )
+        endpoint.queue_poll(
+            events(
+                ("server-intent", server_intent("xfer-full", "env-flags")),
+                ("put-object", put_flag()),
+                ("payload-transferred", transferred("flag-basis")),
+            )
+        )
+        endpoint.queue_poll(status=304)
+        with poll_store(endpoint):
+            assert wait_until(lambda: len(endpoint.requests) >= 3)
+        bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
+        assert bases == [None, "skills-basis", "skills-basis"]
 
     def test_an_etag_is_returned_as_if_none_match(self, endpoint: Any) -> None:
         endpoint.queue_poll(full_payload(("put-object", put_skill())), etag='W/"v1"')
