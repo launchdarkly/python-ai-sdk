@@ -567,6 +567,57 @@ class _TransferOutcome:
     """
 
 
+def _identity_of(raw: dict[str, Any]) -> tuple[str, Any]:
+    """
+    One object's ``(key, version)`` identity, as something comparable.
+
+    An object with no usable version compares alike to any other of its key,
+    which is what holding it under its key alone already means.
+    """
+    version = raw.get("version")
+    return (raw["key"], version if is_valid_skill_version(version) else None)
+
+
+def _revocations_between(
+    current: _SkillObjectSet, pending: _SkillObjectSet
+) -> list[dict[str, Any]]:
+    """
+    Tombstones for every object *pending* no longer holds.
+
+    A full transfer states the whole payload, so its revocations arrive as an
+    absence rather than as an event; this recovers them. At ``(key, version)``
+    granularity to match ``delete-object``, so a key whose version moved yields
+    both a put for the arrival and a tombstone for the departure — what a
+    listener that reads versions needs, and harmless to one that only needs
+    "something changed".
+    """
+    surviving = {_identity_of(raw) for raw in pending.all_raw()}
+    return [
+        {"key": key, "version": version}
+        for key, version in (_identity_of(raw) for raw in current.all_raw())
+        if (key, version) not in surviving
+    ]
+
+
+def _keys_fully_revoked(revoked: list[dict[str, Any]], pending: _SkillObjectSet) -> int:
+    """
+    How many of *revoked* are true revocations rather than version moves.
+
+    Counted per key, not per tombstone: a key *pending* still holds under some
+    other version has moved, and only a key that left the payload entirely is
+    gone. That is what ``objects_revoked`` counts, the same rule
+    ``_delete_object`` applies when it counts only a tombstone that took
+    something away. ``changes`` carries every tombstone regardless.
+    """
+    return len(
+        {
+            tombstone["key"]
+            for tombstone in revoked
+            if pending.get(tombstone["key"], None) is None
+        }
+    )
+
+
 class _ProtocolReader:
     """
     Applies FDv2 events to an object set. Pure — no sockets, no threads, no
@@ -720,11 +771,30 @@ class _ProtocolReader:
         state = data.get("state") if isinstance(data, dict) else None
         version = data.get("version") if isinstance(data, dict) else None
         payload_id = self._intent_payload_id or _payload_id_from_selector(state)
-        if self._pending is not None and self._is_foreign_payload(payload_id):
+        # Asked regardless of whether a pending set exists: a ``none`` intent
+        # builds none, and the transfer that completes it still names a payload
+        # whose selector must not become the resume point if it is not the
+        # payload skills arrive on.
+        foreign = self._is_foreign_payload(payload_id)
+        if foreign:
             self._warn_foreign_payload(payload_id)
             self.diagnostics.payloads_ignored += 1
             self._changes = []
         elif self._pending is not None:
+            if self._intent == _INTENT_TRANSFER_FULL:
+                # A full transfer revokes by omission: whatever it did not carry
+                # is gone, and no ``delete-object`` ever says so. Diffed before
+                # the swap, so those departures reach listeners as tombstones
+                # like any other revocation — without which the one case pruning
+                # exists for, an environment's last skill being revoked, would
+                # empty the store and wake nobody.
+                revoked = _revocations_between(self._committed, self._pending)
+                self._changes.extend(revoked)
+                # Every departure is reported; only a key that left counts as
+                # revoked.
+                self.diagnostics.objects_revoked += _keys_fully_revoked(
+                    revoked, self._pending
+                )
             self._committed.replace_with(self._pending)
             _warn_if_nothing_can_verify(self._committed)
             if self._skills_in_payload and payload_id is not None:
@@ -747,7 +817,12 @@ class _ProtocolReader:
         return _TransferOutcome(
             committed=True,
             changes=changes,
-            basis=state if isinstance(state, str) and state else None,
+            # A declined payload must not move the resume point. Adopting the
+            # selector of a transfer whose contents this layer just threw away
+            # would ask the next poll or stream to resume from someone else's
+            # payload, and skill updates could stop arriving while every
+            # diagnostic still read healthy.
+            basis=state if not foreign and isinstance(state, str) and state else None,
         )
 
     def _abandon_in_flight(self) -> None:
@@ -1507,6 +1582,12 @@ class FDv2SkillStore:
 
         self._basis: str | None = None
         self._etag: str | None = None
+        # The basis ``_etag`` was issued against. An ETag validates one
+        # representation of one resource, and the basis is part of the request
+        # that names it; holding the pair is what lets ``_poll_once`` tell an
+        # etag that still answers the question it is about to ask from one that
+        # answers a question it has stopped asking.
+        self._etag_basis: str | None = None
 
         self._requester = _requester or _Requester(
             sdk_key.strip(),
@@ -1735,7 +1816,9 @@ class FDv2SkillStore:
 
         A put notifies with the raw skill object. A revocation notifies with a
         ``{"key", "version"}`` tombstone carrying no content, so a listener that
-        reads content must check for ``content`` rather than assume it.
+        reads content must check for ``content`` rather than assume it. Both
+        ways of stating a revocation arrive that way: a ``delete-object``, and a
+        full transfer that simply stopped carrying the object.
 
         *fn* runs on the delivery thread. Keep it cheap and non-blocking. An
         exception it raises is logged and swallowed, because a broken listener
@@ -1825,6 +1908,7 @@ class FDv2SkillStore:
                         if not exhausted:
                             self._basis = None
                             self._etag = None
+                            self._etag_basis = None
                             repairing_state = True
                     if exhausted:
                         self._give_up(str(exc))
@@ -1945,18 +2029,33 @@ class FDv2SkillStore:
 
     def _poll_once(self) -> None:
         with self._lock:
-            basis, etag = self._basis, self._etag
+            basis = self._basis
+            # Offered only while the pair still holds. The basis is part of the
+            # request, so an etag issued before the basis moved validates a
+            # payload this store has stopped asking for, and a server answering
+            # it ``304`` would be answering the previous question. One
+            # unconditional request after each commit is the whole cost: a
+            # payload that changed was never going to be a 304 anyway.
+            etag = self._etag if self._etag_basis == basis else None
         result = self._requester.poll(basis, etag)
-        with self._lock:
-            self._etag = result.etag
         if result.not_modified:
             logger.debug("Skill payload unchanged (HTTP 304)")
             # A 304 counts as a first payload, so a boot that reconnects with a
-            # cached basis is not blocked on a transfer the server will not send.
+            # cached basis is not blocked on a transfer the server will not
+            # send. It is a current answer because the etag that asked for it
+            # was issued for a body this store applied in full.
             self._publish_first_payload()
             return
         for name, data in result.events:
             self._apply(name, data)
+        with self._lock:
+            # Adopted only once the whole body has been applied. A body that
+            # broke off partway — an ``error`` or ``goodbye`` after an announced
+            # transfer — left the payload it described unapplied, and keeping
+            # its etag would let the next 304 report a store that is missing
+            # that payload as current and healthy.
+            self._etag = result.etag
+            self._etag_basis = basis
 
     def _stream_once(self) -> None:
         with self._lock:

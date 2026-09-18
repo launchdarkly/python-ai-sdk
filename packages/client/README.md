@@ -356,8 +356,9 @@ LaunchDarkly's AI SDKs for the same input.
 |---|---|
 | `event` | Always `ld.skills.integrity_failure`. |
 | `action` | Always `withheld` — the content was not returned to your code. |
-| `skill_key` | The skill key, or `<invalid-key>` when the delivered key was itself malformed. |
-| `version` | The delivered version. Omitted when it was not a valid version. |
+| `skill_key` | The skill key **requested**, or `<invalid-key>` when the key was itself malformed. |
+| `served_key` | Only on `key_mismatch`: the key the store actually answered under. Same redaction as `skill_key`. Omitted on every other failure mode. |
+| `version` | The delivered version. Omitted when it was not a valid version, and on `key_mismatch`. |
 | `expected_hash` | The delivered `contentHash`, or `<not-a-sha256-digest>` when it was not one. Omitted when none was delivered. |
 | `observed_hash` | The sha256 the SDK computed. Omitted when the failure happened before anything was hashed. |
 | `reason_code` | A stable token naming the failure mode — see below. |
@@ -378,11 +379,21 @@ could carry it, never appears in the record; neither does any filesystem path.
 | `not_utf8` | The content string had no UTF-8 encoding, so there are no bytes that could have been hashed. |
 | `over_size_cap` | The content exceeded the SDK's local size cap. |
 | `hash_mismatch` | The computed sha256 did not match the delivered `contentHash`. |
+| `key_mismatch` | The store answered under a different key than the one requested. Carries an extra `served_key` field naming the key it answered under, and — uniquely — records **no** `AgentControl Skill Integrity Failure` signal. |
 
-**`hash_mismatch` is the one worth paging on.** The other seven describe a malformed or
+**`hash_mismatch` is the one worth paging on.** The other eight describe a malformed or
 truncated payload; a mismatch means content was delivered whose bytes are not the bytes
 LaunchDarkly hashed, which is a possible **active-tampering** signal. Alert on it, and
 treat `expected_hash` / `observed_hash` as the evidence pair.
+
+**`key_mismatch` is the one code that reaches this record without the product signal.** It
+is decided after verification has passed, and its usual cause is a bug in a custom
+`SkillStore` adapter — a stale cache entry, a colliding key, a wrong index lookup — rather
+than tampering, so it does not inflate LaunchDarkly's own integrity counter. It still
+reaches this record, because a store substituting one skill for another is worth seeing,
+and a rule on `ld.skills.integrity_failure` catches it without modification. Treat it like
+`hash_mismatch` if `FDv2SkillStore` is your only store; behind a custom adapter, suspect
+the adapter first.
 
 #### Failing closed on tampering
 

@@ -611,6 +611,72 @@ class TestProtocolReader:
         assert held.get("first", None) is None
         assert held.get("second", None) is not None
 
+    def test_a_full_transfer_that_omits_a_skill_publishes_a_tombstone(self) -> None:
+        """
+        A full transfer states the whole payload, so it revokes by omission and
+        no ``delete-object`` ever says so. Without the diff the store empties
+        while ``changes`` stays empty, and the case pruning exists for — the
+        environment's last skill revoked — wakes no listener at all.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=3))))
+        outcomes = drive(reader, full_payload(state="basis-2"))
+        assert len(held) == 0
+        assert outcomes[-1].changes == [{"key": "pdf-extraction", "version": 3}]
+        assert reader.diagnostics.objects_revoked == 1
+
+    def test_an_omitted_version_less_object_is_reported_as_departed(self) -> None:
+        """
+        An object too malformed to carry a version is held under its key alone,
+        and leaves the same way: as a tombstone with no version, which is what a
+        ``delete-object`` naming no version spells too.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=None))))
+        outcomes = drive(reader, full_payload(state="basis-2"))
+        assert outcomes[-1].changes == [{"key": "pdf-extraction", "version": None}]
+        assert reader.diagnostics.objects_revoked == 1
+
+    def test_a_version_move_reports_both_ends_and_counts_no_revocation(self) -> None:
+        """
+        The diff runs at ``(key, version)``, so a key whose version moved yields
+        a put for the arrival and a tombstone for the departure — what a
+        listener that reads versions needs. ``objects_revoked`` counts per key,
+        though, and this key never left the payload: counting it would tell an
+        operator a revocation landed when a publish did.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=3))))
+        outcomes = drive(
+            reader,
+            full_payload(("put-object", put_skill(object_version=4)), state="basis-2"),
+        )
+        arrived, departed = outcomes[-1].changes
+        assert (arrived["key"], arrived["version"]) == ("pdf-extraction", 4)
+        assert departed == {"key": "pdf-extraction", "version": 3}
+        assert reader.diagnostics.objects_revoked == 0
+
+    def test_a_change_transfer_revokes_nothing_by_omission(self) -> None:
+        """Only a full transfer states the whole payload. A delta that carries
+        no tombstone revoked nothing, and diffing one would drop every skill it
+        simply had no reason to mention."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill())))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert held.get("pdf-extraction", None) is not None
+        assert outcomes[-1].changes == []
+        assert reader.diagnostics.objects_revoked == 0
+
     def test_a_change_transfer_applies_deltas_over_what_is_held(self) -> None:
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -940,6 +1006,48 @@ class TestPayloadIdentity:
         assert len(_payload_warnings(caplog, "was not applied")) == 1
         assert reader.diagnostics.payloads_ignored == 2
 
+    def test_a_declined_transfer_does_not_move_the_resume_point(self) -> None:
+        """
+        Ignoring a foreign payload's contents while adopting its resume point
+        would ask the next poll or stream to resume from someone else's
+        payload: skill updates could stop arriving while every diagnostic read
+        healthy.
+        """
+        reader = _ProtocolReader(_SkillObjectSet())
+        ours = drive(
+            reader, skill_payload(("put-object", put_skill()), state="skills-basis")
+        )
+        assert ours[-1].basis == "skills-basis"
+        outcomes = drive(
+            reader,
+            skill_payload(
+                ("put-object", put_flag()), payload_id="env-flags", state="flag-basis"
+            ),
+        )
+        assert outcomes[-1].basis is None
+        assert reader.diagnostics.payloads_ignored == 1
+
+    def test_a_none_intent_for_another_payload_moves_nothing(self) -> None:
+        """
+        A ``none`` intent builds no pending set, and the foreign check must not
+        be gated on one: the transfer that follows still names a payload, and
+        adopting its selector would resume the next connection from someone
+        else's payload with every diagnostic reading healthy.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill()), state="basis-skills"))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("none", "env-flags")),
+                ("payload-transferred", transferred("basis-flags")),
+            ),
+        )
+        assert outcomes[-1].basis is None
+        assert reader.diagnostics.payloads_ignored == 1
+        assert held.get("pdf-extraction", None) is not None
+
     def test_a_full_transfer_of_the_skill_payload_still_empties_it(self) -> None:
         """Every skill deleted is a real state, and the guard must not mask it."""
         held = _SkillObjectSet()
@@ -1169,13 +1277,76 @@ class TestPollingAgainstTheEndpoint:
         bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
         assert bases == [None, "basis-1", "basis-2"]
 
-    def test_an_etag_is_returned_as_if_none_match(self, endpoint: Any) -> None:
-        endpoint.queue_poll(full_payload(("put-object", put_skill())), etag='W/"v1"')
+    def test_the_basis_stays_on_the_skill_payload_when_another_transfers(
+        self, endpoint: Any
+    ) -> None:
+        """The wire half of the declined-payload case: the store must resume from
+        the payload skills arrive on, not from the one it just threw away."""
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="skills-basis")
+        )
+        endpoint.queue_poll(
+            events(
+                ("server-intent", server_intent("xfer-full", "env-flags")),
+                ("put-object", put_flag()),
+                ("payload-transferred", transferred("flag-basis")),
+            )
+        )
+        endpoint.queue_poll(status=304)
+        with poll_store(endpoint):
+            assert wait_until(lambda: len(endpoint.requests) >= 3)
+        bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
+        assert bases == [None, "skills-basis", "skills-basis"]
+
+    def test_an_etag_is_returned_for_the_basis_it_was_issued_against(
+        self, endpoint: Any
+    ) -> None:
+        """
+        An ETag validates one representation of one resource, and the basis is
+        part of the request that names it. ``W/"v1"`` answers the request that
+        carried no basis at all, so it is not offered once the payload it came
+        with moved the basis on; ``W/"v2"`` answers a request from ``basis-1``,
+        which is still the question being asked, so it is.
+        """
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="basis-1"), etag='W/"v1"'
+        )
+        endpoint.queue_poll(
+            events(("server-intent", server_intent("none"))), etag='W/"v2"'
+        )
         endpoint.queue_poll(status=304)
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            assert wait_until(lambda: len(endpoint.requests) >= 2)
-        assert endpoint.requests[1]["if_none_match"] == 'W/"v1"'
+            assert wait_until(lambda: len(endpoint.requests) >= 3)
+        bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
+        assert bases == [None, "basis-1", "basis-1"]
+        offered = [r["if_none_match"] for r in endpoint.requests[:3]]
+        assert offered == [None, None, 'W/"v2"']
+
+    def test_the_etag_of_a_body_never_applied_is_not_offered(
+        self, endpoint: Any
+    ) -> None:
+        """
+        The body announced a transfer and then broke off, so the payload it
+        described was never committed. Offering its etag would invite a 304 that
+        reports a store still missing that payload as current and healthy — and
+        unlike the 200 it replaces, a 304 carries nothing to notice that on.
+        """
+        endpoint.queue_poll(
+            events(
+                ("server-intent", server_intent("xfer-full")),
+                ("put-object", put_skill()),
+                ("error", {"reason": "cut off mid-payload"}),
+            ),
+            etag='W/"v1"',
+        )
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="basis-1"), etag='W/"v2"'
+        )
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert endpoint.requests[1]["if_none_match"] is None
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
 
     def test_a_304_keeps_the_held_content(self, endpoint: Any) -> None:
         endpoint.queue_poll(full_payload(("put-object", put_skill())), etag='W/"v1"')
@@ -2848,6 +3019,33 @@ class TestWatchSkillsOverTheTransport:
                 assert written.exists()
                 assert any(a.action == "written" for a in report.actions)
                 assert wait_until(lambda: not written.exists(), timeout=10)
+            finally:
+                watcher.close()
+
+    async def test_a_full_transfer_that_omits_every_skill_prunes(
+        self, endpoint: Any, tmp_path: Any
+    ) -> None:
+        """
+        The environment's last skill revoked. The full transfer that follows
+        carries nothing at all, so the only thing that can wake the watcher is
+        the revocation the transfer states by omission.
+        """
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(full_payload(state="basis-2"))
+        endpoint.queue_poll(status=304)
+
+        with poll_store(endpoint, poll_interval=0.2) as store:
+            store.wait_for_skills(timeout=5)
+            await init_client(options={"skillStore": store}, client=object())
+            report, watcher = await watch_skills(
+                "*", tmp_path / "skills", debounce=0.05
+            )
+            try:
+                written = tmp_path / "skills" / "pdf-extraction" / "SKILL.md"
+                assert written.exists()
+                assert any(a.action == "written" for a in report.actions)
+                assert wait_until(lambda: not written.exists(), timeout=10)
+                assert store.diagnostics.objects_revoked == 1
             finally:
                 watcher.close()
 
