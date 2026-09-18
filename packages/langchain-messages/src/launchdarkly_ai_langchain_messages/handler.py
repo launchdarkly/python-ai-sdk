@@ -203,13 +203,38 @@ def _is_coroutine(fn: Any) -> bool:
 _MAX_STEPS = 10
 
 
+def _resolved_model_name(config: AiConfigRep, fallback_name: str = "") -> str:
+    """Bedrock ``model.region`` is an inference-profile prefix, prepended once."""
+    model = config.get("model") or {}
+    name = str(model.get("name") or fallback_name)
+    provider = str((config.get("provider") or {}).get("name") or "").lower()
+    if provider != "bedrock":
+        return name
+    prefix = str(model.get("region") or "")
+    if not prefix or name.startswith(f"{prefix}."):
+        return name
+    return f"{prefix}.{name}"
+
+
+def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
+    """Shallow copy with a resolved Bedrock model name. Does not mutate *config*."""
+    resolved = _resolved_model_name(config)
+    model = dict(config.get("model") or {})
+    if model.get("name") == resolved:
+        return config
+    return {**config, "model": {**model, "name": resolved}}
+
+
 def _model_constructor_kwargs(
     config: AiConfigRep, fallback_name: str
 ) -> dict[str, Any]:
     raw = (config.get("model") or {}).get("parameters")
     parameters = dict(raw) if isinstance(raw, dict) else {}
+    provider = str((config.get("provider") or {}).get("name") or "").lower()
+    if provider == "bedrock":
+        parameters.pop("tools", None)
     # Name from the config always wins over a colliding ``model`` key in the parameter bag.
-    parameters["model"] = (config.get("model") or {}).get("name") or fallback_name
+    parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
 
 
@@ -231,15 +256,25 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
         return lc_anthropic.ChatAnthropic(
             **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
         )
+    if provider == "bedrock":
+        try:
+            lc_aws = importlib.import_module("langchain_aws")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Bedrock models requires langchain-aws. "
+                "Install it with: pip install langchain-aws"
+            ) from exc
+        return lc_aws.ChatBedrockConverse(**_model_constructor_kwargs(config, ""))
     lc_openai = importlib.import_module("langchain_openai")
     return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
 
 
 async def _resolve_base_model(config: AiConfigRep, llm: Any, importlib: Any) -> Any:
+    invocation = _config_for_model_call(config)
     if llm is None:
-        return _make_default_chat_model(config, importlib)
+        return _make_default_chat_model(invocation, importlib)
     if _is_model_factory(llm):
-        model = llm(config)
+        model = llm(invocation)
         if asyncio.iscoroutine(model):
             return await model
         return model

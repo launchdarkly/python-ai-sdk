@@ -597,20 +597,26 @@ class TestRootSpanAttributes:
         assert rec.root.attributes["gen_ai.provider.name"] == "anthropic"
 
     @pytest.mark.parametrize(
-        "provider_name", ["OpenAI", "Bedrock", "Azure", "Cohere", "Typo", ""]
+        ("provider_name", "expected"),
+        [
+            ("OpenAI", "openai"),
+            ("Bedrock", "bedrock"),
+            ("Azure", "azure"),
+            ("Cohere", "cohere"),
+            ("Typo", "typo"),
+            ("", "openai"),
+        ],
     )
-    async def test_gen_ai_provider_name_is_openai_for_everything_else(
-        self, provider_name: str
+    async def test_gen_ai_provider_name_is_the_configured_name(
+        self, provider_name: str, expected: str
     ) -> None:
-        # Not a passthrough. Bedrock, Azure, Cohere, a typo and an unset value all report `openai`,
-        # mirroring the chat model class the handler actually instantiates. Section 9.
         ctx, rec = _recording()
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 
         cfg = {**CONFIG, "provider": {"name": provider_name}}
         with ctx:
             await create_langchain_messages_handler(llm=_make_llm())(cfg, "q", {}, {})
-        assert rec.root.attributes["gen_ai.provider.name"] == "openai"
+        assert rec.root.attributes["gen_ai.provider.name"] == expected
 
     async def test_writes_the_requested_model(self) -> None:
         ctx, rec = _recording()
@@ -2311,14 +2317,22 @@ class TestModelSource:
             **CONFIG,
             "model": {
                 "name": "gpt-4o",
-                "parameters": {"temperature": 0.2, "max_tokens": 512},
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 512,
+                    "tools": [{"name": "openai-tool"}],
+                },
             },
         }
         with ctx:
             result = await create_langchain_messages_handler(llm=factory)(
                 cfg, "q", {}, {}
             )
-        assert seen[0]["model"]["parameters"] == {"temperature": 0.2, "max_tokens": 512}
+        assert seen[0]["model"]["parameters"] == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "tools": [{"name": "openai-tool"}],
+        }
         assert result["output"] == "from-factory"
         llm.ainvoke.assert_awaited()
 
@@ -2352,7 +2366,11 @@ class TestModelSource:
             **CONFIG,
             "model": {
                 "name": "gpt-4o",
-                "parameters": {"temperature": 0.2, "max_tokens": 512},
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 512,
+                    "tools": [{"name": "openai-tool"}],
+                },
             },
         }
         with (
@@ -2363,6 +2381,7 @@ class TestModelSource:
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "max_tokens": 512,
+            "tools": [{"name": "openai-tool"}],
             "model": "gpt-4o",
         }
 
@@ -2393,6 +2412,152 @@ class TestModelSource:
             "thinking": {"type": "enabled"},
             "model": "claude-sonnet-4-5",
         }
+
+    @pytest.mark.asyncio
+    async def test_bedrock_region_is_prepended_to_the_default_constructor(
+        self,
+    ) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("bedrock")
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "anthropic.claude-sonnet-4-5",
+                "region": "us",
+                "parameters": {
+                    "temperature": 0.2,
+                    "tools": [{"name": "duplicated-search"}],
+                },
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                sys.modules,
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "model": "us.anthropic.claude-sonnet-4-5",
+        }
+        assert cfg["model"]["parameters"]["tools"] == [{"name": "duplicated-search"}]
+        assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_bedrock_region_prefix_is_idempotent(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("bedrock")
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "us.anthropic.claude-sonnet-4-5",
+                "region": "us",
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                sys.modules,
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_bedrock_without_region_keeps_the_model_name(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("bedrock")
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        with (
+            ctx,
+            patch.dict(
+                sys.modules,
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs["model"] == "anthropic.claude-sonnet-4-5"
+
+    def test_bedrock_without_langchain_aws_has_a_clear_error(self) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        imports = MagicMock()
+        imports.import_module.side_effect = ModuleNotFoundError(
+            "No module named 'langchain_aws'"
+        )
+        with pytest.raises(ImportError, match=r"pip install langchain-aws"):
+            handler_mod._make_default_chat_model(cfg, imports)
+
+    @pytest.mark.asyncio
+    async def test_non_bedrock_ignores_model_region(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("openai")
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "OpenAI"},
+            "model": {"name": "gpt-4o", "region": "us"},
+        }
+        with (
+            ctx,
+            patch.dict(sys.modules, {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_factory_receives_prefixed_bedrock_name_without_mutating_config(
+        self,
+    ) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("from-factory")
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "anthropic.claude-sonnet-4-5",
+                "region": "us",
+                "parameters": {"temperature": 0.2},
+            },
+        }
+        with ctx:
+            await create_langchain_messages_handler(llm=factory)(cfg, "q", {}, {})
+        assert seen[0]["model"]["name"] == "us.anthropic.claude-sonnet-4-5"
+        assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
+        assert seen[0] is not cfg
 
     @pytest.mark.asyncio
     async def test_factory_is_resolved_on_the_streaming_path(self) -> None:
