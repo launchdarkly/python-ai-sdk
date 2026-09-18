@@ -24,7 +24,7 @@ from .types import (
     UsageDict,
     VariationMeta,
 )
-from .utils import select_handler, to_ld_context
+from .utils import model_stamps_from_meta, select_handler, to_ld_context
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,7 @@ async def _build_graph(
         "version": meta.get("version", 1) if isinstance(meta, dict) else 1,
         "modelName": "",
         "providerName": "",
+        **model_stamps_from_meta(meta),
         "graphKey": key,
     }
 

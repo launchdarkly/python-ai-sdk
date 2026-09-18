@@ -17,7 +17,7 @@ from .types import (
     TrackData,
     VariationMeta,
 )
-from .utils import parse_usage, to_ld_context
+from .utils import model_stamps_from_meta, parse_usage, to_ld_context
 
 
 def _try_get_environment_id() -> str | None:
@@ -129,6 +129,7 @@ async def execute_and_track(
         "providerName": config.get("provider", {}).get("name", "")
         if isinstance(config, dict)
         else "",
+        **model_stamps_from_meta(meta),
     }
     if graph_key:
         track_data["graphKey"] = graph_key
@@ -210,6 +211,7 @@ async def execute_and_stream(
         "providerName": config.get("provider", {}).get("name", "")
         if isinstance(config, dict)
         else "",
+        **model_stamps_from_meta(meta),
     }
     if graph_key:
         track_data["graphKey"] = graph_key

@@ -4,11 +4,16 @@ parse_usage, normalize_mode, create_handler.
 Reference: TESTING.md s3.1-3.4, s3.15
 """
 
+from typing import Any
+
 import pytest
 
 from launchdarkly_ai_server import (
     create_handler,
+    make_track_data,
+    model_stamps_from_meta,
     normalize_mode,
+    omit_model_stamps,
     parse_json_with_possible_fences,
     parse_template,
     parse_usage,
@@ -262,3 +267,84 @@ class TestCreateHandler:
         assert callable(h)
         # The original function is accessible via _fn attribute
         assert h._fn is fn
+
+
+class TestMakeTrackData:
+    """§3.10 model stamps — shared node-trackData builder for native graph adapters."""
+
+    def _node(self, meta: dict) -> Any:
+        from launchdarkly_ai_server.types import GraphNode
+
+        return GraphNode(
+            key="node-a",
+            config={"model": {"name": "gpt-4"}, "provider": {"name": "OpenAI"}},
+            meta=meta,
+        )
+
+    def test_copies_model_key_and_version_from_meta(self) -> None:
+        td = make_track_data(
+            self._node(
+                {
+                    "variationKey": "v1",
+                    "version": 1,
+                    "modelKey": "my-model",
+                    "modelVersion": 3,
+                }
+            ),
+            "graph-key",
+            "run-1",
+        )
+        assert td["modelKey"] == "my-model"
+        assert td["modelVersion"] == 3
+        assert td["graphKey"] == "graph-key"
+
+    def test_omits_model_key_and_version_when_absent(self) -> None:
+        td = make_track_data(
+            self._node({"variationKey": "v1", "version": 1}), "graph-key", "run-1"
+        )
+        assert "modelKey" not in td
+        assert "modelVersion" not in td
+
+
+class TestModelStampsFromMeta:
+    """§3.10 model stamps — malformed ``modelVersion`` is omitted, never raises."""
+
+    def test_copies_int_version_and_non_empty_key(self) -> None:
+        assert model_stamps_from_meta({"modelKey": "m", "modelVersion": 3}) == {
+            "modelKey": "m",
+            "modelVersion": 3,
+        }
+
+    @pytest.mark.parametrize("value", ["3", 3.0])
+    def test_coerces_integral_string_and_float(self, value: Any) -> None:
+        assert model_stamps_from_meta({"modelVersion": value}) == {"modelVersion": 3}
+
+    @pytest.mark.parametrize(
+        "value",
+        ["abc", "1.5", 1.5, {}, [], None, True, False, float("nan"), "", "   "],
+    )
+    def test_omits_malformed_version_without_raising(self, value: Any) -> None:
+        stamps = model_stamps_from_meta({"modelVersion": value, "modelKey": "m"})
+        assert "modelVersion" not in stamps
+        assert stamps["modelKey"] == "m"
+
+    @pytest.mark.parametrize("value", [123, {}, ["a"], True, ""])
+    def test_omits_non_string_or_empty_model_key(self, value: Any) -> None:
+        stamps = model_stamps_from_meta({"modelKey": value, "modelVersion": 1})
+        assert "modelKey" not in stamps
+        assert stamps["modelVersion"] == 1
+
+    def test_non_dict_meta_returns_empty(self) -> None:
+        assert model_stamps_from_meta(None) == {}
+        assert model_stamps_from_meta("nope") == {}
+
+
+class TestOmitModelStamps:
+    def test_removes_only_the_two_stamp_keys(self) -> None:
+        td = {"runId": "r", "graphKey": "g", "modelKey": "m", "modelVersion": 1}
+        assert omit_model_stamps(td) == {"runId": "r", "graphKey": "g"}
+
+    def test_does_not_mutate_input(self) -> None:
+        td = {"runId": "r", "modelKey": "m"}
+        omit_model_stamps(td)
+        assert td == {"runId": "r", "modelKey": "m"}
