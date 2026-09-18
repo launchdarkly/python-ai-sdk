@@ -48,7 +48,17 @@ class DatasetRef:
 
 @dataclass
 class DatasetRow:
-    """A rendered dataset row ready for handler invocation and ingest."""
+    """
+    One row of an evaluation dataset.
+
+    Serves both directions. As an *input* to ``run(rows=[...])`` the caller sets
+    ``input`` and ``expected_output`` to unrendered ``{{variable}}`` templates,
+    and owns ``row_index`` -- LaunchDarkly keys an inline row off
+    ``(run, row_index)``, so the values must be unique across the list. As an
+    *output* -- the row a ``Scorer`` receives -- the templates have been rendered
+    and ``variables`` has been augmented with the rendered ``input`` and
+    ``expected_output``. A run never mutates the instances a caller passed in.
+    """
 
     row_index: int
     input: str | None = None

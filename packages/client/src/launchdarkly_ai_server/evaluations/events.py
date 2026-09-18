@@ -37,15 +37,15 @@ class CriterionEventPayload:
     evaluation_id: str
     evaluation_run_id: str
     run_id: str
-    dataset_id: str
     row_index: int
     criterion_type: str
     kind: CriterionEventKind
     event_id: str
     emitted_at: str
     evaluation_key: str
-    dataset_key: str
     status: CriterionStatus
+    dataset_id: str | None = None
+    dataset_key: str | None = None
     started_at: str
     evaluated_at: str
     latency_ms: int
