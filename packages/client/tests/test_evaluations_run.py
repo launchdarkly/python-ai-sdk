@@ -20,6 +20,11 @@ from launchdarkly_ai_server.evaluations import (
     Scorer,
     init_evaluations,
 )
+from launchdarkly_ai_server.evaluations.module import (
+    MAX_INLINE_TEXT_BYTES,
+    MAX_ROWS,
+    EvaluationsModule,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -3168,3 +3173,100 @@ async def test_run_rejects_non_string_inline_input(field: str) -> None:
         )
 
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_more_rows_than_the_limit() -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    rows = [DatasetRow(row_index=index, input="x") for index in range(MAX_ROWS + 1)]
+
+    with pytest.raises(
+        EvaluationsError, match=rf"rows has {MAX_ROWS + 1} entries, over the {MAX_ROWS}"
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=rows,
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+def _sized_field_value(field: str, text: str) -> Any:
+    return {"k": text} if field in {"variables", "metadata"} else text
+
+
+def _sized_field_text(field: str, total_bytes: int) -> str:
+    """ASCII text that makes ``field`` encode to exactly ``total_bytes``."""
+    if field not in {"variables", "metadata"}:
+        return "a" * total_bytes
+    # Derived rather than hardcoded so the wrapper in sized_field_value stays
+    # free to change: the mapping's braces, quotes and key are measured too.
+    overhead = len(json.dumps(_sized_field_value(field, ""), ensure_ascii=False))
+    return "a" * (total_bytes - overhead)
+
+
+@pytest.mark.parametrize("field", ["input", "expected_output", "variables", "metadata"])
+@pytest.mark.asyncio
+async def test_run_rejects_oversized_inline_text(field: str) -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    oversize = MAX_INLINE_TEXT_BYTES + 1
+    row = DatasetRow(
+        row_index=0,
+        **{field: _sized_field_value(field, _sized_field_text(field, oversize))},
+    )
+
+    with pytest.raises(
+        EvaluationsError,
+        match=rf"rows\[0\].{field} is {oversize} bytes, over the "
+        rf"{MAX_INLINE_TEXT_BYTES} byte limit",
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[row],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("field", ["input", "expected_output", "variables", "metadata"])
+@pytest.mark.asyncio
+async def test_run_rejects_oversized_multibyte_inline_text(field: str) -> None:
+    transport = SequencedTransport([])
+    evals = no_request_evals(transport)
+    # Two bytes per character, so half as many characters as the byte limit. The
+    # mapping wrapper only adds ASCII, so a mapping field is over on the same text.
+    text = "é" * (MAX_INLINE_TEXT_BYTES // 2 + 1)
+    assert len(text) < MAX_INLINE_TEXT_BYTES
+    row = DatasetRow(row_index=0, **{field: _sized_field_value(field, text)})
+
+    with pytest.raises(
+        EvaluationsError, match=rf"rows\[0\].{field} is \d+ bytes, over the"
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            rows=[row],
+            handler=echo_handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("field", ["input", "expected_output", "variables", "metadata"])
+def test_validate_rows_accepts_the_limits_exactly(field: str) -> None:
+    EvaluationsModule._validate_rows(
+        [DatasetRow(row_index=index, input="x") for index in range(MAX_ROWS)]
+    )
+    at_limit = _sized_field_value(
+        field, _sized_field_text(field, MAX_INLINE_TEXT_BYTES)
+    )
+    EvaluationsModule._validate_rows([DatasetRow(row_index=0, **{field: at_limit})])

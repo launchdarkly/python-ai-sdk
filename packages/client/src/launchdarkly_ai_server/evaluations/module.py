@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
 SUMMARY_POLL_INTERVAL_SECONDS = 2.0
 SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
+MAX_INLINE_TEXT_BYTES = 1_048_576
+MAX_ROWS = 10000
 
 
 def _env(name: str) -> str | None:
@@ -131,7 +133,10 @@ class EvaluationsModule:
         of a LaunchDarkly-hosted dataset — to have the harness read its rows,
         or pass ``rows`` to supply them from code, in which case no dataset is
         read or referenced at all. Supplying both, or neither, is an error
-        raised before any network I/O.
+        raised before any network I/O. Inline rows are capped at ``MAX_ROWS``,
+        and each row field is capped at ``MAX_INLINE_TEXT_BYTES`` encoded bytes
+        (a mapping field is measured as its JSON form); both are checked before
+        any request is issued.
 
         Each row is generated with ``handler``; every entry in ``criteria`` —
         LaunchDarkly :class:`Judge` references and local deterministic
@@ -385,10 +390,21 @@ class EvaluationsModule:
         Stricter than the hosted path on purpose. ``_row_from_api_item`` coerces
         bad server data rather than failing a run already in flight; a bad inline
         row is a caller bug, and every check here runs with zero requests issued
+        (the ``MAX_ROWS`` and ``MAX_INLINE_TEXT_BYTES`` ceilings included: a hosted
+        dataset is LaunchDarkly's to bound, and a caller could not fix an oversized
+        one from their own process anyway)
         — where the hosted empty-dataset rule only fires after two GETs.
         """
         if not rows:
             raise EvaluationsError("rows must not be empty")
+        # Ahead of the per-row loop so a runaway list fails on one len() rather than
+        # after a serializability check per row.
+        if len(rows) > MAX_ROWS:
+            raise EvaluationsError(
+                f"rows has {len(rows)} entries, over the {MAX_ROWS} row limit for "
+                "inline rows. Upload the dataset to LaunchDarkly and pass dataset= "
+                "instead."
+            )
         seen: dict[int, int] = {}
         for index, row in enumerate(rows):
             if not isinstance(row, DatasetRow):
@@ -419,13 +435,25 @@ class EvaluationsModule:
                 ("input", row.input),
                 ("expected_output", row.expected_output),
             ):
+                if value is None:
+                    continue
                 # A hosted row renders a non-string as None (it is the API's data
                 # to tolerate); inline, that would silently run the whole
                 # evaluation on empty inputs at full generation cost.
-                if value is not None and not isinstance(value, str):
+                if not isinstance(value, str):
                     raise EvaluationsError(
                         f"rows[{index}].{name} must be a string or None, got "
                         f"{type(value).__name__}"
+                    )
+                # Encoded length, not len(): the field travels as UTF-8 JSON inside
+                # the generation event, so a shorter string of non-ASCII text can
+                # still be over the limit that ingest applies.
+                size = len(value.encode("utf-8"))
+                if size > MAX_INLINE_TEXT_BYTES:
+                    raise EvaluationsError(
+                        f"rows[{index}].{name} is {size} bytes, over the "
+                        f"{MAX_INLINE_TEXT_BYTES} byte limit for an inline row "
+                        "field."
                     )
             for field_name, mapping_value in (
                 ("variables", row.variables),
@@ -438,14 +466,21 @@ class EvaluationsModule:
                         f"rows[{index}].{field_name} must be a mapping, got "
                         f"{type(mapping_value).__name__}"
                     )
-                # Serializability is checked on the copy, not the caller's
-                # container, because the copy is what reaches the wire -- any
-                # Mapping is accepted here and normalized to a dict. The copy is
-                # shallow in both places, so a nested mapping the serializer
-                # cannot encode is correctly still an error.
-                _require_json_serializable(
-                    dict(mapping_value), f"rows[{index}].{field_name}"
-                )
+                # Serializability and size are both checked on the copy, not the
+                # caller's container, because the copy is what reaches the wire --
+                # any Mapping is accepted here and normalized to a dict, and the
+                # serializer only encodes dict. The copy is shallow in both
+                # places, so a nested mapping the serializer cannot encode is
+                # correctly still an error.
+                normalized = dict(mapping_value)
+                _require_json_serializable(normalized, f"rows[{index}].{field_name}")
+                size = len(json.dumps(normalized, ensure_ascii=False).encode("utf-8"))
+                if size > MAX_INLINE_TEXT_BYTES:
+                    raise EvaluationsError(
+                        f"rows[{index}].{field_name} is {size} bytes, over the "
+                        f"{MAX_INLINE_TEXT_BYTES} byte limit for an inline row "
+                        "field."
+                    )
 
     @staticmethod
     def _validate_run_args(
