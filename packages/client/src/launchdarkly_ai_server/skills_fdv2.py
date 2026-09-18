@@ -93,13 +93,8 @@ DEFAULT_STREAM_URI = "https://stream.launchdarkly.com"
 """
 Where ``GET /sdk/stream`` is served.
 
-LaunchDarkly serves streaming from a **different host** than polling, which is
-why this is a second default rather than a path under ``DEFAULT_BASE_URI``. Both
-base server-side SDKs ship the pair: ``ldclient.config.Config`` defaults
-``stream_uri`` to ``https://stream.launchdarkly.com`` alongside its own polling
-host, and ``@launchdarkly/js-server-sdk-common`` does the same. ``mode="stream"``
-is this store's default, so a single-host default would have the default
-configuration connect to the wrong host on first contact with a real environment.
+LaunchDarkly serves streaming from a different host than polling, which is
+why this is a second default rather than a path under ``DEFAULT_BASE_URI``.
 
 A *base_uri* given on its own applies to both endpoints, because a relay or a
 private instance serving both from one host should need only one option; see
@@ -1548,7 +1543,9 @@ class FDv2SkillStore:
         *max_consecutive_failures* bounds the retry loop. On exceeding it the
         transport stops, logs an error, and the store keeps serving last known
         good; ``failed`` reports it. Only failures in a row count: a committed
-        payload resets the count.
+        payload resets the count. The one request built from nothing after a
+        stale selector is refused is exempt, so an outage that has already
+        spent the budget cannot swallow the one repair available.
         """
         _require_server_side_credential(sdk_key)
         # A lone ``base_uri`` means "both endpoints are here"; the two-host
@@ -1899,6 +1896,7 @@ class FDv2SkillStore:
                     # would spend a retry from the bounded budget and leave a
                     # misleading ``last_error`` on a healthy store.
                     return
+                repairing_state = False
                 if isinstance(exc, _StaleRequestStateError):
                     # The selector and the etag are the only client state in the
                     # request, so a rejection of a request carrying neither is
@@ -1911,6 +1909,7 @@ class FDv2SkillStore:
                             self._basis = None
                             self._etag = None
                             self._etag_basis = None
+                            repairing_state = True
                     if exhausted:
                         self._give_up(str(exc))
                         return
@@ -1923,7 +1922,13 @@ class FDv2SkillStore:
                     answered = self._attempt_answered
                     self._reader.diagnostics.connection_failures = failures
                     self._reader.diagnostics.last_error = str(exc)
-                if failures > self._max_consecutive_failures:
+                if failures > self._max_consecutive_failures and not repairing_state:
+                    # The one-shot request built from nothing is exempt from the
+                    # bound, so an outage that has already spent the budget
+                    # cannot swallow the repair a stale selector is asking for.
+                    # It cannot unbound the loop either: the repaired request
+                    # carries no state, so a second 400 is fatal on its own and
+                    # any other failure meets a budget still over the bound.
                     self._give_up(
                         f"gave up after {failures} consecutive failures; "
                         f"last error: {exc}"
