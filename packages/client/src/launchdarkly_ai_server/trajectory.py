@@ -258,7 +258,21 @@ def _render_value(value: Any) -> str:
     if isinstance(value, str):
         return _truncate(value)
     try:
-        rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        # ensure_ascii=False, because this string is read by a model. The
+        # default escapes every non-ASCII character, so a tool that returned
+        # "café" or "東京" reached the judge as "caf\u00e9" / "\u6771\u4eac" --
+        # noise that the judge then has to grade a tool result through, and a
+        # gratuitous difference from what any other SDK would show for the
+        # same call. Key order stays sorted so one language's own output is
+        # deterministic; matching another language's byte-for-byte is not the
+        # goal, but showing the judge the actual characters is.
+        rendered = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+            ensure_ascii=False,
+        )
     except (TypeError, ValueError):
         rendered = str(value)
     return _truncate(rendered)

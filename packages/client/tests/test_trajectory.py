@@ -205,3 +205,38 @@ def test_render_serializes_unserializable_values_without_raising() -> None:
     )
 
     assert "<opaque>" in rendered
+
+
+def test_render_does_not_escape_non_ascii() -> None:
+    """A judge reads this string, so it must see the actual characters.
+
+    json.dumps escapes non-ASCII by default, which reached the judge as
+    ``caf\\u00e9`` -- noise it then has to grade a tool result through.
+    """
+    rendered = render_trajectory(
+        [
+            ToolInvocation(
+                name="lookup",
+                arguments={"city": "café", "place": "東京"},
+                result={"note": "naïve"},
+            )
+        ],
+        observable_tools=["lookup"],
+    )
+
+    assert '   arguments: {"city":"café","place":"東京"}' in rendered
+    assert '   result: {"note":"naïve"}' in rendered
+    assert "\\u" not in rendered
+
+
+def test_render_leaves_a_non_ascii_string_result_alone() -> None:
+    """A string result is passed through, not JSON-encoded, so it never was
+    escaped -- this pins that the two paths agree now that the JSON one does
+    not escape either.
+    """
+    rendered = render_trajectory(
+        [ToolInvocation(name="lookup", arguments={}, result="café 東京")],
+        observable_tools=["lookup"],
+    )
+
+    assert "   result: café 東京" in rendered
