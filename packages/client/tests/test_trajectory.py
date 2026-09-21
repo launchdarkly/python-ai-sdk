@@ -15,10 +15,8 @@ from launchdarkly_ai_server.types import NativeTool
 
 
 def test_wrapped_sync_tool_stays_sync() -> None:
-    """A sync tool is still called, and still returns, synchronously.
-
-    Wrapping everything as a coroutine function would hand a caller's own
-    handler a coroutine object where it used to get the tool's value.
+    """A blanket async wrapper would hand a caller's handler a coroutine
+    object where it used to get the tool's value.
     """
 
     def lookup(args: dict[str, Any]) -> str:
@@ -49,11 +47,7 @@ async def test_wrapped_async_tool_is_awaited() -> None:
 
 
 def test_wrapped_tool_reraises_and_records_the_failure() -> None:
-    """The recorder observes; a tool that failed must still fail its caller.
-
-    Swallowing the exception here would turn a broken tool into a silent one and
-    let the agent's error handling go unevaluated.
-    """
+    """A tool that failed must still fail its caller."""
 
     def refund(args: dict[str, Any]) -> str:
         raise RuntimeError("gateway timeout")
@@ -71,11 +65,8 @@ def test_wrapped_tool_reraises_and_records_the_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_calls_keep_their_start_order() -> None:
-    """Order is call order, not completion order.
-
-    A judge asked whether the agent called `search` before `refund` is reading a
-    sequence, so a trajectory reordered by which tool happened to return first
-    would answer a different question than the one asked.
+    """A judge asked whether search came before refund is reading a sequence,
+    so completion order would answer a different question.
     """
     started: dict[str, asyncio.Event] = {"slow": asyncio.Event()}
 
@@ -111,17 +102,15 @@ def test_calls_past_the_limit_still_execute_but_are_only_counted() -> None:
     for n in range(5):
         wrapped["append"]({"n": n})
 
-    # Every call ran: truncation bounds the record, never the agent's behavior.
+    # Every call ran: truncation bounds the record, not the behaviour.
     assert calls == [0, 1, 2, 3, 4]
     assert len(recorder.invocations) == 2
     assert recorder.omitted == 3
 
 
 def test_native_tools_pass_through_unwrapped_and_undescribed() -> None:
-    """A provider-executed tool is invisible, so it is not advertised either.
-
-    Listing it as available while never being able to show a call to it would
-    let a judge conclude the model ignored a tool it may well have used.
+    """Invisible, so not advertised either: listing it would let a judge
+    conclude the model ignored a tool it may well have used.
     """
     native = NativeTool("WebSearch")
     recorder = TrajectoryRecorder()
@@ -233,9 +222,8 @@ def test_render_does_not_escape_non_ascii() -> None:
 
 
 def test_render_leaves_a_non_ascii_string_result_alone() -> None:
-    """A string result is passed through, not JSON-encoded, so it never was
-    escaped -- this pins that the two paths agree now that the JSON one does
-    not escape either.
+    """A string result was never JSON-encoded, so it never escaped. Pins that
+    both paths agree now.
     """
     rendered = render_trajectory(
         [ToolInvocation(name="lookup", arguments={}, result="café 東京")],
@@ -246,11 +234,8 @@ def test_render_leaves_a_non_ascii_string_result_alone() -> None:
 
 
 def test_a_sync_tool_returning_an_awaitable_records_on_completion() -> None:
-    """A sync callable can still hand back an awaitable.
-
-    The record completes when someone awaits it, so a judge never reads the
-    repr of a pending coroutine. A caller who never awaits records nothing,
-    which is accurate: the call never completed.
+    """Records on completion, so a judge never reads a pending coroutine's
+    repr. Never awaited means never recorded -- the call did not complete.
     """
 
     async def inner() -> str:
@@ -272,12 +257,8 @@ def test_a_sync_tool_returning_an_awaitable_records_on_completion() -> None:
 
 
 def test_handoff_tools_are_not_recorded_or_described() -> None:
-    """Synthetic routing tools are not tools the agent was given.
-
-    graph.route injects them onto a multi-edge node and a per-node judge is
-    scored against the node's *original* config, which does not list them --
-    so showing them invites the judge to grade a handoff as tool use. §3.8's
-    tracking wrapper excludes them for the same reason.
+    """Not tools the agent was given, and absent from the config a per-node
+    judge is scored against. wrap_tool_handlers excludes them too.
     """
     recorder = TrajectoryRecorder()
     wrapped = recorder.wrap(
@@ -295,12 +276,8 @@ def test_handoff_tools_are_not_recorded_or_described() -> None:
 
 
 def test_only_tools_the_config_exposed_are_recorded_or_described() -> None:
-    """The implementation map can be wider than what the model was offered.
-
-    Online, config() merges a Registry's tools into the map it hands the
-    handler while the flag variation decides what the model sees. Describing
-    the whole registry made a judge penalise an agent for ignoring tools it
-    was never offered.
+    """The map can be wider than what the model was offered; describing the
+    extras would let a judge penalise an agent for ignoring them.
     """
     recorder = TrajectoryRecorder()
     wrapped = recorder.wrap(
@@ -316,8 +293,8 @@ def test_only_tools_the_config_exposed_are_recorded_or_described() -> None:
 
 
 def test_no_exposed_set_means_every_callable_is_in_scope() -> None:
-    """The offline case: the runner resolves the config's tools from the same
-    map, so the two agree by construction and no filter is needed.
+    """The offline case: the runner resolves the config's tools from this same
+    map, so no filter is needed.
     """
     recorder = TrajectoryRecorder()
     recorder.wrap({"lookup": lambda args: "a", "refund": lambda args: "b"})

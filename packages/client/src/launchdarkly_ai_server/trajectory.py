@@ -1,49 +1,18 @@
 """Tool-call trajectory capture, shared by both judge paths.
 
-A judge can only grade what it is shown. Handler packages record tool traffic
-onto OpenTelemetry spans and return only ``{output, usage}``, so by the time a
-criterion ran, the calls a row made on its way to that output were gone --
-which made "did the agent call the right tools, in the right order, with the
-right arguments?" an unaskable question of an SDK-run evaluation, even though
-the evaluation had just run the agent that answered it.
+Handlers return only ``{output, usage}`` and record tool traffic onto spans, so
+the calls made on the way to an output were unavailable to a judge. Both paths
+therefore record them here, by wrapping the caller's tool implementations
+before the handler is invoked -- which works with every handler package without
+changing any of them, since a handler still looks a tool up by key and calls
+it.
 
-Both judge paths therefore record the trajectory themselves, by wrapping the
-caller's tool implementations before handing them to the handler: once per row
-in the offline evaluations runner, and once per invocation in
-``tracking.execute_and_track``. Wrapping is what makes this work with every
-handler package without changing any of them: a handler looks a tool up by its
-key and calls it, exactly as before.
+The trajectory reaches a judge through ``message_history``, built by
+:func:`judge_scoring.build_message_history` so both paths show the same shape.
 
-The recorded trajectory reaches a judge through ``message_history``, built by
-:func:`judge_scoring.build_message_history` -- one function for both paths, so
-an online judge and an offline one are shown the same shape.
-
-Three properties are load-bearing.
-
-**The recorder observes; it never intervenes.** A wrapped tool returns what the
-original returned and raises what the original raised. A row whose trajectory
-hits :data:`MAX_RECORDED_TOOL_CALLS` still executes every remaining call --
-truncation drops the *record*, never the work, because an evaluation that
-changed the agent's behavior would no longer be evaluating the agent.
-
-**A recorder belongs to one invocation.** The offline runner generates rows
-concurrently against one shared tool map, so a single shared recorder would
-splice one row's calls into another row's trajectory and hand the judge a
-conversation that never happened. The same holds for concurrent online
-invocations, which is why ``execute_and_track`` builds its own per call.
-
-**Only observable tools are described.** A ``NativeTool`` is executed inside the
-provider, so no local wrapper ever sees it and its calls cannot appear in the
-trajectory. Such a tool is therefore left out of the rendered "tools available"
-line as well: naming a tool whose use is invisible would let a judge conclude
-the model ignored a tool it may well have called.
-
-Online, ``tracking.wrap_tool_handlers`` does turn a ``NativeTool`` into a
-callable tracking stub, so a native call *is* locally observable there -- but it
-is still skipped, and deliberately. The stub returns nothing, so recording it
-would show a judge a tool call with an empty result while the provider's real
-result stayed invisible. Recording is therefore composed *inside* that wrapper,
-on the original map, so both paths see natives identically.
+Two rules the rest of this module exists to keep: the recorder never changes
+what a tool does or how it is called, and a recorder belongs to exactly one
+invocation or row, since both run concurrently against one shared tool map.
 """
 
 from __future__ import annotations
@@ -57,25 +26,20 @@ from typing import Any
 
 from .types import NativeTool
 
-#: How many tool calls one row's trajectory records. A trajectory is
-#: interpolated into a judge prompt, so an agent that loops over a large tool
-#: result set would otherwise spend the judge's context window -- and its
-#: budget -- on the tail of a trajectory the judge stopped reading. Calls past
-#: the limit still execute and are reported as a count.
+#: A trajectory goes into a judge prompt, so an agent looping over a large
+#: result set would otherwise spend the judge's context window on a tail it
+#: never reads. Calls past the limit still execute; they are only counted.
 MAX_RECORDED_TOOL_CALLS = 50
 
-#: How many characters one rendered argument bag or tool result contributes.
 #: Bounds a single tool that returns a whole document, for the same reason.
 MAX_RECORDED_VALUE_CHARS = 2000
 
 _TRUNCATION_SUFFIX = "… (truncated)"
 
-#: Synthetic graph-routing tools, injected by ``graph.route`` on a multi-edge
-#: node. Skipped for the same reason §3.8's tracking wrapper skips them: they
-#: are not tools the agent was given, they are how the router asks it to pick a
-#: branch. A per-node judge is scored against the node's *original* config,
-#: which does not list them, so showing them would invite the judge to grade a
-#: handoff as tool use.
+#: Synthetic routing tools ``graph.route`` injects on a multi-edge node. Not
+#: tools the agent was given, and absent from the config a per-node judge is
+#: scored against -- showing them would let a judge grade a handoff as tool
+#: use. ``wrap_tool_handlers`` skips them too.
 HANDOFF_TOOL_PREFIX = "__handoff_"
 
 ToolImplementation = Callable[..., Any] | NativeTool
@@ -83,11 +47,10 @@ ToolImplementation = Callable[..., Any] | NativeTool
 
 @dataclass(frozen=True)
 class ToolInvocation:
-    """One tool call made while generating a row, with how it turned out.
+    """One tool call, with how it turned out.
 
-    ``result`` and ``error`` are mutually exclusive: a call that raised has no
-    result, and a call that returned has no error. Both are ``None`` on a call
-    that is still in flight, which is only observable from inside the wrapper.
+    ``result`` and ``error`` are mutually exclusive; both are ``None`` while
+    the call is still in flight.
     """
 
     name: str
@@ -97,11 +60,10 @@ class ToolInvocation:
 
 
 class TrajectoryRecorder:
-    """Records one row's tool calls, in the order the calls were started.
+    """Records one unit's tool calls, in the order the calls were started.
 
-    A slot is reserved when a call starts and filled in when it finishes, so
-    tools a handler runs concurrently keep their start order rather than being
-    reordered by which of them returned first.
+    A slot is reserved on call and filled in on completion, so concurrent tool
+    calls keep their start order instead of their return order.
     """
 
     def __init__(self, limit: int = MAX_RECORDED_TOOL_CALLS) -> None:
@@ -122,7 +84,7 @@ class TrajectoryRecorder:
 
     @property
     def observable_tools(self) -> list[str]:
-        """Keys of the tools this recorder can actually observe being called."""
+        """Keys of the tools this recorder can observe being called."""
         return list(self._observable)
 
     def wrap(
@@ -133,23 +95,18 @@ class TrajectoryRecorder:
     ) -> dict[str, ToolImplementation]:
         """Return ``tool_handlers`` with each callable recording into this unit.
 
-        Keys are preserved exactly: a handler resolves a tool by the key the
-        model named, so renaming one here would break the lookup.
+        Keys are preserved exactly; a handler resolves a tool by the key the
+        model named.
 
-        ``exposed`` is the set of tool keys the model was actually offered --
-        the keys of the config's ``tools``. Pass it whenever the implementation
-        map can be wider than the config, which online it can: ``config()``
-        merges a ``Registry``'s tools into the map it hands the handler, while
-        the flag variation decides which the model is shown. Without the
-        filter, a registry holding ten tools made every judge read "Tools
-        available" as ten and penalise an agent for ignoring eight it was never
-        offered. ``None`` means every callable is in scope, which is the
-        offline case -- the runner resolves the config's tools from the same
-        map, so the two agree by construction.
+        ``exposed`` is the tool keys the config actually offered the model.
+        Pass it when the implementation map can be wider -- online,
+        ``config()`` merges a ``Registry``'s tools in, and describing those
+        would let a judge penalise an agent for ignoring a tool it never had.
+        ``None`` means every callable is in scope, which is the offline case:
+        the runner resolves the config's tools from this same map.
         """
         wrapped: dict[str, ToolImplementation] = {}
-        # Rebuilt rather than appended to, so re-wrapping a map does not report
-        # the same tool as available twice.
+        # Rebuilt, so re-wrapping a map cannot list a tool twice.
         self._observable = []
         for name, implementation in tool_handlers.items():
             if (
@@ -158,12 +115,10 @@ class TrajectoryRecorder:
                 or name.startswith(HANDOFF_TOOL_PREFIX)
                 or (exposed is not None and name not in exposed)
             ):
-                # Provider-executed; already invalid and reported as such by
-                # tool resolution; synthetic routing; or not offered to the
-                # model. Nothing local to observe, or nothing the agent should
-                # be graded on -- so pass the value through untouched rather
-                # than replacing it with a wrapper the handler would treat
-                # differently, and leave it out of "Tools available".
+                # Provider-executed, invalid, synthetic routing, or never
+                # offered to the model: nothing to observe, or nothing to grade
+                # the agent on. Passed through untouched so the handler treats
+                # it exactly as it would have.
                 wrapped[name] = implementation
                 continue
             self._observable.append(name)
@@ -173,13 +128,11 @@ class TrajectoryRecorder:
     def _record(self, name: str, original: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap ``original`` without changing how it is called.
 
-        A sync tool stays sync. Making everything a coroutine function was the
-        simpler option and matches what §3.8's tracking wrapper does, but
-        offline these implementations used to be passed through untouched: a
-        caller's own handler may invoke a sync tool directly and use the value,
-        which is the natural call for a sync function. Under a blanket async
-        wrapper that handler silently received a coroutine object and finished
-        the row with its repr instead of the tool's result.
+        A sync tool stays sync: offline these are passed straight to the
+        handler, and a caller's own handler may call a sync tool directly and
+        use the value. A blanket async wrapper handed it a coroutine object
+        instead. (Online, ``wrap_tool_handlers`` wraps this again and is always
+        async, so a handler awaits there as it always has.)
         """
         if asyncio.iscoroutinefunction(original):
 
@@ -197,11 +150,9 @@ class TrajectoryRecorder:
                 self._complete(slot, error=f"{error}")
                 raise
             if inspect.isawaitable(result):
-                # A sync callable that returns an awaitable: hand back an
-                # awaitable that records on completion, so whoever awaits it is
-                # still recorded and the repr of a pending coroutine never
-                # reaches a judge. A caller who never awaits it records
-                # nothing, which is accurate -- the call never completed.
+                # Record on completion, so a pending coroutine's repr never
+                # reaches a judge. Never awaited means never recorded, which is
+                # accurate: the call did not complete.
                 return self._await_and_record(slot, result)
             self._complete(slot, result=result)
             return result
@@ -237,10 +188,9 @@ class TrajectoryRecorder:
 def row_fields(recorder: TrajectoryRecorder) -> dict[str, Any]:
     """The trajectory keys a generated-row record carries.
 
-    Paired with :func:`render_row_trajectory` so one module owns both halves of
-    the record's shape: a key renamed here without its reader being updated
-    would silently render every row's trajectory as empty, which reads exactly
-    like an agent that called no tools.
+    Paired with :func:`render_row_trajectory` so one module owns both halves:
+    renaming a key without its reader would render every trajectory empty,
+    which reads exactly like an agent that called no tools.
     """
     return {
         "tool_calls": recorder.invocations,
@@ -264,15 +214,12 @@ def render_trajectory(
     observable_tools: list[str] | None = None,
     omitted: int = 0,
 ) -> str:
-    """Render a row's trajectory as the text a judge reads.
+    """Render a trajectory as the text a judge reads.
 
-    Returns ``""`` when there was nothing observable to report, so the caller
-    can skip the block entirely rather than telling a judge about tools in a
-    run that had none.
-
-    The empty trajectory of a row that *did* have tools is reported explicitly:
-    "this agent called nothing" is the finding a judge grading tool selection
-    most needs, and an omitted block would read as a run without tools.
+    ``""`` when there was nothing observable, so the caller adds no block at
+    all. A unit that *had* tools and called none says so explicitly instead:
+    "called nothing" is the finding a tool-selection judge most needs, and an
+    omitted block would read as a unit with no tools.
     """
     available = list(observable_tools or [])
     if not available and not invocations:
@@ -301,9 +248,9 @@ def render_trajectory(
 def _call_arguments(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     """Normalize how a handler passed a tool its arguments.
 
-    Every handler package in this SDK calls a tool with the model's argument
-    bag as one positional mapping, so that is the shape worth preserving
-    verbatim; the rest are recorded structurally rather than guessed at.
+    Every handler here calls a tool with the model's argument bag as one
+    positional mapping, so that shape is preserved verbatim; anything else is
+    recorded structurally rather than guessed at.
     """
     if len(args) == 1 and not kwargs:
         return args[0]
@@ -320,14 +267,9 @@ def _render_value(value: Any) -> str:
     if isinstance(value, str):
         return _truncate(value)
     try:
-        # ensure_ascii=False, because this string is read by a model. The
-        # default escapes every non-ASCII character, so a tool that returned
-        # "café" or "東京" reached the judge as "caf\u00e9" / "\u6771\u4eac" --
-        # noise that the judge then has to grade a tool result through, and a
-        # gratuitous difference from what any other SDK would show for the
-        # same call. Key order stays sorted so one language's own output is
-        # deterministic; matching another language's byte-for-byte is not the
-        # goal, but showing the judge the actual characters is.
+        # ensure_ascii=False: a model reads this. The default would show the
+        # judge "caf\u00e9" instead of "café". Keys stay sorted for
+        # deterministic output.
         rendered = json.dumps(
             value,
             sort_keys=True,

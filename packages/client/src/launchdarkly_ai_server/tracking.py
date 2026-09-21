@@ -100,11 +100,10 @@ def wrap_tool_handlers(
 
 
 def _exposed_tool_keys(config: AiConfigRep) -> set[str]:
-    """The tool keys the model was actually offered by this config.
+    """The tool keys this config offered the model.
 
-    The implementation map handed to a handler can be wider: ``config()``
-    merges a ``Registry``'s tools into it, while the flag variation decides
-    what the model sees. Only the offered set belongs in a trajectory (§3.27).
+    The map handed to a handler can be wider -- ``config()`` merges a
+    ``Registry``'s tools in -- and only the offered set belongs in a trajectory.
     """
     tools = config.get("tools") if isinstance(config, dict) else None
     return set(tools) if isinstance(tools, dict) else set()
@@ -151,12 +150,10 @@ async def execute_and_track(
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
 
-    # Recording is composed *inside* the tracking wrapper, on the original map,
-    # so the recorder still sees a NativeTool as a NativeTool and skips it. If
-    # it wrapped the tracked map instead it would see the callable stub
-    # wrap_tool_handlers substitutes for a native tool, and would show a judge
-    # a tool call with an empty result while the provider's real result stayed
-    # invisible. One recorder per invocation, since invocations run concurrently.
+    # Recording composes *inside* wrap_tool_handlers, on the original map, so
+    # the recorder still sees a NativeTool and skips it -- wrapping the tracked
+    # map would record the callable stub instead and show a judge a tool call
+    # with an empty result. One recorder per invocation; they run concurrently.
     recorder = TrajectoryRecorder()
     tracked_tool_handlers = wrap_tool_handlers(
         recorder.wrap(tool_handlers or {}, exposed=_exposed_tool_keys(config)),
@@ -200,9 +197,8 @@ async def execute_and_track(
         "usage": usage,
         "response": response,
         "track_data": track_data,
-        # Rendered here rather than returned structurally: the one consumer is
-        # message_history, and a JudgeTask has to stay picklable for the
-        # background path.
+        # Rendered, not structural: message_history is the only consumer, and
+        # a JudgeTask must stay picklable.
         "trajectory": render_trajectory(
             recorder.invocations,
             observable_tools=recorder.observable_tools,

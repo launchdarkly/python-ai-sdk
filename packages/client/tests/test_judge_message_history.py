@@ -1,10 +1,8 @@
 """One message_history for every judge path.
 
-The three paths -- online inline (``run_judges``), online deferred
-(``run_judge`` from a ``JudgeTask``), and offline evaluations -- each used to
-join their own. They disagreed, so a judge grading the same response saw a
-different conversation depending on which path reached it. These tests hold
-them to :func:`judge_scoring.build_message_history`.
+The three paths -- online inline, online deferred, and offline evaluations --
+each joined their own, and disagreed. These tests hold them to
+``build_message_history``.
 """
 
 from __future__ import annotations
@@ -94,10 +92,7 @@ def test_builder_orders_the_conversation_and_appends_the_format_block() -> None:
 
 
 def test_builder_skips_empty_parts() -> None:
-    """A run with no tools produces the history it produced before trajectories.
-
-    This is what keeps a judge authored before this feature scoring unchanged.
-    """
+    """Keeps a judge authored before trajectories existed scoring unchanged."""
     assert build_message_history(user_input="Q", trajectory="", output="A") == (
         f"Q\n\nA\n\n{FORMATTING_INSTRUCTIONS}"
     )
@@ -105,11 +100,7 @@ def test_builder_skips_empty_parts() -> None:
 
 
 def test_builder_always_carries_the_format_block() -> None:
-    """Judges from the AI Library's templates read the JSON shape from here.
-
-    A history that stopped carrying it would make every such judge return prose,
-    turning each result into an invalid-output error.
-    """
+    """Judges from the AI Library's templates read the JSON shape from here."""
     assert FORMATTING_INSTRUCTIONS in build_message_history()
 
 
@@ -182,7 +173,7 @@ def deferred_task(**overrides: Any) -> JudgeTask:
 async def test_deferred_judge_is_shown_the_input_and_the_trajectory(
     mock_ld_client: Any,
 ) -> None:
-    """This path carried neither before, so it graded a response in isolation."""
+    """This path carried neither before, grading a response in isolation."""
     seen: list[dict[str, Any]] = []
     task = deferred_task(
         user_input="Where is order A1?",
@@ -203,7 +194,7 @@ async def test_deferred_judge_is_shown_the_input_and_the_trajectory(
 async def test_deferred_and_inline_agree_on_the_same_row(
     mock_ld_client: Any, judge_variation: None
 ) -> None:
-    """The point of the shared builder: same inputs, byte-identical history."""
+    """The point of the shared builder: same inputs, identical history."""
     inline_seen: list[dict[str, Any]] = []
     deferred_seen: list[dict[str, Any]] = []
     trajectory = "Tools available: lookup\n1. lookup\n   result: shipped"
@@ -226,7 +217,7 @@ async def test_deferred_and_inline_agree_on_the_same_row(
 
 
 def test_judge_task_stays_picklable_with_the_new_fields() -> None:
-    """JudgeTask crosses a thread or IPC boundary, so it must stay primitives."""
+    """JudgeTask crosses a thread boundary, so it must stay primitives."""
     task = deferred_task(user_input="Q", trajectory="T")
 
     assert pickle.loads(pickle.dumps(task)).trajectory == "T"
@@ -247,10 +238,9 @@ async def test_execute_and_track_records_the_trajectory(mock_ld_client: Any) -> 
         variables: Any,
         history: Any = None,
     ) -> dict[str, Any]:
-        # Awaited: online, §3.8's tracking wrapper wraps the recorder's
-        # wrapper in a coroutine function, so the handler always awaits here --
-        # unchanged by trajectory capture. Offline there is no such wrapper, so
-        # a sync tool stays sync (test_trajectory.py).
+        # Awaited: wrap_tool_handlers wraps the recorder's wrapper and is
+        # always async, so an online handler awaits as it always has. Offline
+        # there is no such wrapper -- see test_trajectory.py.
         await tool_handlers["lookup"]({"id": "A1"})
         return {"output": "It shipped.", "usage": {}}
 
@@ -259,7 +249,7 @@ async def test_execute_and_track_records_the_trajectory(mock_ld_client: Any) -> 
         config={
             "model": {"name": "m"},
             "provider": {"name": "TestProvider"},
-            # Only tools the config offers are described (§3.27).
+            # Only tools the config offers are described.
             "tools": {"lookup": {"description": "", "parameters": {}}},
         },
         meta={"variationKey": "v", "version": 1},
@@ -278,10 +268,9 @@ async def test_execute_and_track_records_the_trajectory(mock_ld_client: Any) -> 
 async def test_a_native_tool_is_not_recorded_online_either(
     mock_ld_client: Any,
 ) -> None:
-    """wrap_tool_handlers makes a native tool a callable stub, so it *is*
-    locally observable online -- but the stub returns nothing while the
-    provider's real result stays invisible, so recording it would show a judge
-    a call with an empty result. Both paths skip it identically.
+    """The stub wrap_tool_handlers substitutes for a native tool is callable,
+    so the call *is* observable online -- but it returns nothing, so recording
+    it would show a judge a call with an empty result. Both paths skip it.
     """
     from launchdarkly_ai_server import NativeTool
 
@@ -292,9 +281,8 @@ async def test_a_native_tool_is_not_recorded_online_either(
         variables: Any,
         history: Any = None,
     ) -> dict[str, Any]:
-        # Not awaited: wrap_tool_handlers substitutes a *sync* zero-arg stub
-        # for a native tool (§3.8), unlike the async wrapper it gives a real
-        # callable. That asymmetry is pre-existing.
+        # Not awaited: the native stub is sync, unlike the async wrapper a
+        # real callable gets. Pre-existing asymmetry.
         tool_handlers["web_search"]({"q": "x"})
         return {"output": "done", "usage": {}}
 
@@ -315,7 +303,7 @@ async def test_a_native_tool_is_not_recorded_online_either(
 async def test_tool_tracking_still_fires_under_the_recorder(
     mock_ld_client: Any,
 ) -> None:
-    """Recording is composed inside wrap_tool_handlers, so §3.8 still works."""
+    """Recording composes inside wrap_tool_handlers, which must still fire."""
 
     async def handler(
         config: Any,
@@ -391,10 +379,8 @@ def test_the_recorder_renders_identically_for_both_paths() -> None:
 async def test_a_registry_tool_the_config_omits_is_not_described(
     mock_ld_client: Any,
 ) -> None:
-    """config() merges a Registry's tools into the map it hands the handler.
-
-    The flag variation decides what the model sees, so describing the whole
-    map made a judge penalise an agent for ignoring tools it never had.
+    """Describing a registry tool the variation omits would let a judge
+    penalise an agent for ignoring a tool it never had.
     """
 
     async def handler(
@@ -431,10 +417,8 @@ async def test_a_registry_tool_the_config_omits_is_not_described(
 
 @pytest.mark.asyncio
 async def test_a_handoff_tool_is_not_described_online(mock_ld_client: Any) -> None:
-    """graph.route injects these onto a multi-edge node's config.
-
-    A per-node judge is scored against the node's original config, which does
-    not list them, so a handoff must not read as tool use.
+    """A per-node judge is scored against the node's original config, which
+    lists no handoffs -- so a handoff must not read as tool use.
     """
 
     async def handler(

@@ -8,11 +8,9 @@ model for the same ``{"score": <0-1>, "reasoning": <string>}`` JSON shape, and
 all three must show the judge the same conversation. This module owns both
 halves of that contract so the paths cannot drift.
 
-They did drift. Each path built ``message_history`` with its own inline join:
-the offline one carried the row input, the inline online one carried the user
-input, and the deferred one carried neither -- a judge grading the same
-response saw a different conversation depending on which path reached it. The
-trajectory landing in only one of the three is what made that visible.
+They did drift: each path joined its own, and the deferred one carried neither
+input nor trajectory -- so a judge grading the same response saw a different
+conversation depending on which path reached it.
 :func:`build_message_history` is now the only place it is built.
 """
 
@@ -42,18 +40,16 @@ def build_message_history(
     trajectory: Any = None,
     output: Any = None,
 ) -> str:
-    """The conversation a judge is shown, as the ``message_history`` variable.
+    """The conversation a judge is shown, as its ``message_history`` variable.
 
-    Ordered the way it happened: what was asked, what the agent did about it,
-    what it answered, and finally how to format the verdict. Empty parts are
-    skipped, so a run with no tools produces exactly the history it produced
-    before trajectories existed and a judge authored against it is unaffected.
+    Ordered as it happened: what was asked, what the agent did, what it
+    answered, then how to format the verdict. Empty parts are skipped, so a
+    run with no tools yields the history it did before trajectories existed.
 
-    ``FORMATTING_INSTRUCTIONS`` is appended here rather than by each caller,
-    because every judge built from the AI Library's default templates
-    references ``{{message_history}}`` and not ``{{formatting_instructions}}``
-    -- a judge that stopped being told the JSON shape would start returning
-    prose, and every one of its results would become an invalid-output error.
+    The formatting block is appended here, not by callers: judges built from
+    the AI Library's default templates read the JSON shape from
+    ``{{message_history}}``, and one that stopped being told it would return
+    prose and fail every result as invalid output.
     """
     return "\n\n".join(
         str(part)

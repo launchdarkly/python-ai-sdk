@@ -550,9 +550,8 @@ class EvaluationsRunner:
 
         async def invoke(row: DatasetRow) -> dict[str, Any]:
             await controller.acquire(config["provider"]["name"])
-            # One recorder per row, not one per run: rows are generated
-            # concurrently against the same tool map, so a shared recorder
-            # would splice one row's tool calls into another's trajectory.
+            # One per row, not per run: rows generate concurrently against the
+            # same tool map, so a shared recorder would splice their calls.
             recorder = TrajectoryRecorder()
             row_tool_handlers = recorder.wrap(tool_handlers)
             started = datetime.now(UTC)
@@ -595,8 +594,7 @@ class EvaluationsRunner:
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
                     "status": "ERROR",
                     "error": {"code": 5001, "message": f"handler raised: {error}"},
-                    # The calls that ran before the handler raised are what
-                    # explain why it raised, so an errored row records them too.
+                    # The calls that ran are what explain why it raised.
                     **row_fields(recorder),
                 }
             finally:
@@ -711,18 +709,14 @@ class EvaluationsRunner:
             ground_truth = parse_template(ground_truth, variables)
         elif expected is not None:
             ground_truth = str(expected)
-        # The tool calls the row made on its way to `output`, recorded during
-        # generation (evaluations.trajectory). It sits between the input and the
-        # output in message_history because that is where it happened: a judge
-        # reading the history sees the request, what the agent did about it, and
-        # what it finally answered, in order.
+        # The calls the row made on its way to `output`, recorded during
+        # generation. Sits between input and output in message_history, which
+        # is where it happened.
         trajectory = render_row_trajectory(row_result)
-        # Built by the shared builder, not inline here: this path and both
-        # online paths must show a judge the same conversation, and they did
-        # not while each one joined its own. The trajectory goes into
+        # Shared builder, not an inline join: this path and both online paths
+        # must show a judge the same conversation. The trajectory goes into
         # message_history and nowhere else -- it is already the transcript
-        # variable every judge cloned from the AI Library's default templates
-        # reads, so a second overlapping variable only invited a rubric to
+        # variable judges read, and a second one would just let a rubric
         # interpolate both and pay for the trajectory twice.
         variables.update(
             {

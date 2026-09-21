@@ -304,16 +304,15 @@ class JudgeTask:
     user_input: str | None = None
     """The input that produced ``actual_output``.
 
-    Carried so this path builds the same ``message_history`` as the inline one
-    (:func:`judge_scoring.build_message_history`). It was previously absent,
-    which meant a deferred judge was shown the response with no request beside
-    it.
+    Carried so this path builds the same ``message_history`` as the inline one.
+    Previously absent, which showed a deferred judge a response with no
+    request beside it.
     """
     trajectory: str = ""
-    """The rendered tool-call trajectory of the invocation being judged.
+    """The invocation's rendered tool-call trajectory.
 
-    A plain string, not the structured record, because every field here has to
-    stay picklable for the worker thread.
+    A plain string rather than the structured record, since every field here
+    must stay picklable.
     """
     """LD metric key to track the score against."""
 
