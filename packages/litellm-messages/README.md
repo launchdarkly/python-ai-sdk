@@ -6,7 +6,7 @@ Provider-agnostic LaunchDarkly AI Config handler backed by LiteLLM's in-process
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-litellm-messages
+pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-litellm-messages
 ```
 
 Python uses LiteLLM in-process; no proxy endpoint is required. Set the provider

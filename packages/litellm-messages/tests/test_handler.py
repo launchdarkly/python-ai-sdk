@@ -575,6 +575,25 @@ class TestTelemetryAndConvenience:
         assert "question" in written
         assert "answer" in written
 
+    async def test_stream_capture_content_records_prompt_and_completion_on_root(
+        self,
+    ) -> None:
+        stream = FakeStream([_chunk(text="streamed")])
+        completion = AsyncMock(return_value=stream)
+        span = MagicMock()
+        trace = MagicMock()
+        trace.get_tracer.return_value.start_span.return_value = span
+        with patch.object(handler_mod, "trace", trace):
+            events = await _events(
+                await create_litellm_messages_handler(
+                    completion=completion, capture_content=True
+                ).stream(CONFIG, "question")
+            )
+        written = str(span.set_attribute.call_args_list)
+        assert "question" in written
+        assert "streamed" in written
+        assert events[-1]["type"] == "done"
+
     def test_convenience_wrapper_forwards_all_public_arguments(self) -> None:
         instance = MagicMock()
         instance.invoke.return_value = "result"

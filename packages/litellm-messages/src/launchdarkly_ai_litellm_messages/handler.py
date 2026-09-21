@@ -495,6 +495,15 @@ async def _stream(
     ended: set[int] = set()
     open_model: Any = None
     try:
+        if capture_content:
+            set_input_content_attributes(
+                root,
+                True,
+                messages=[
+                    text_message(str(message["role"]), str(message["content"]))
+                    for message in messages
+                ],
+            )
         for _ in range(_MAX_TOOL_TURNS + 1):
             model_span = _model_span(config_value, parent)
             open_model = model_span
@@ -560,6 +569,10 @@ async def _stream(
             if not fragments:
                 full_output += turn_text
                 completed = True
+                if capture_content:
+                    set_output_content_attributes(
+                        root, True, [text_message("assistant", full_output)]
+                    )
                 _finish_span(root, total, ended, model=_model_name(config_value))
                 yield {
                     "type": "done",

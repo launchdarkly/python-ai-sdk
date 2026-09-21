@@ -330,7 +330,7 @@ from launchdarkly_ai_litellm_agents import to_litellm_agents
 ctx = {"kind": "user", "key": "user-123"}
 result = await to_litellm_agents(
     resolve_graph("support-graph", context=ctx),
-    {"tool_handlers": registry.tools},
+    {"tool_handlers": registry.tools, "context": ctx},
 ).invoke("I was double charged")
 ```
 

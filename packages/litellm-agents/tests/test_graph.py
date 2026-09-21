@@ -14,6 +14,17 @@ from launchdarkly_ai_litellm_agents import litellm_graph, to_litellm_agents
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
 
 
+class _FakeRunHooks:
+    async def on_agent_end(self, *args: Any) -> None:
+        return None
+
+    async def on_handoff(self, *args: Any) -> None:
+        return None
+
+    async def on_agent_start(self, *args: Any) -> None:
+        return None
+
+
 def _definition(*, enabled: bool = True) -> GraphDefinition:
     edge = GraphEdge(
         key="root-child",
@@ -128,6 +139,7 @@ class TestNativeGraphAdapter:
             Runner=runner,
             handoff=MagicMock(side_effect=lambda target: target),
             FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
         )
         real_import = __import__
         with patch(
@@ -169,6 +181,7 @@ class TestNativeGraphAdapter:
             Runner=runner,
             handoff=MagicMock(side_effect=lambda target: target),
             FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
         )
         history = [
             {"role": "system", "content": "ignore this"},
@@ -240,6 +253,7 @@ class TestNativeGraphAdapter:
             ),
             handoff=MagicMock(side_effect=lambda target: target),
             FunctionTool=function_tool,
+            RunHooks=_FakeRunHooks,
         )
         search = AsyncMock(return_value="found")
         real_import = __import__
@@ -289,6 +303,7 @@ class TestNativeGraphAdapter:
             ),
             handoff=MagicMock(side_effect=lambda target: target),
             FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
         )
         real_import = __import__
         with (
@@ -326,6 +341,7 @@ class TestNativeGraphAdapter:
             ),
             handoff=MagicMock(side_effect=lambda target: target),
             FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
         )
         real_import = __import__
         with (
@@ -350,6 +366,93 @@ class TestNativeGraphAdapter:
                 opts={"model_factory": lambda *_: object()},
             ).invoke("hello")
         fallback.assert_not_called()
+
+    async def test_success_path_emits_invocation_success_and_tokens(self) -> None:
+        track_calls: list[str] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append(evt)
+        )
+        agents = SimpleNamespace(
+            Agent=MagicMock(
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    name=kwargs["name"], **kwargs
+                )
+            ),
+            Runner=SimpleNamespace(
+                run=AsyncMock(
+                    return_value=SimpleNamespace(
+                        final_output="done",
+                        context_wrapper=SimpleNamespace(
+                            usage=SimpleNamespace(
+                                input_tokens=4, output_tokens=2, total_tokens=6
+                            )
+                        ),
+                    )
+                )
+            ),
+            handoff=MagicMock(side_effect=lambda target: target),
+            FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
+        )
+        real_import = __import__
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=lambda name: (
+                    agents if name == "agents" else real_import(name)
+                ),
+            ),
+            patch.object(native_graph_mod, "get_client", return_value=mock_ld_client),
+        ):
+            await to_litellm_agents(
+                _definition_awaitable(),
+                opts={
+                    "model_factory": lambda *_: object(),
+                    "context": {"kind": "user", "key": "test"},
+                },
+            ).invoke("hello")
+        assert "$ld:ai:graph:invocation_success" in track_calls
+        assert "$ld:ai:graph:total_tokens" in track_calls
+
+    async def test_error_path_emits_invocation_failure_and_rethrows(self) -> None:
+        track_calls: list[str] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append(evt)
+        )
+        agents = SimpleNamespace(
+            Agent=MagicMock(
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    name=kwargs["name"], **kwargs
+                )
+            ),
+            Runner=SimpleNamespace(
+                run=AsyncMock(side_effect=RuntimeError("provider error"))
+            ),
+            handoff=MagicMock(side_effect=lambda target: target),
+            FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
+        )
+        real_import = __import__
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=lambda name: (
+                    agents if name == "agents" else real_import(name)
+                ),
+            ),
+            patch.object(native_graph_mod, "get_client", return_value=mock_ld_client),
+        ):
+            with pytest.raises(RuntimeError, match="provider error"):
+                await to_litellm_agents(
+                    _definition_awaitable(),
+                    opts={
+                        "model_factory": lambda *_: object(),
+                        "context": {"kind": "user", "key": "test"},
+                    },
+                ).invoke("hello")
+        assert "$ld:ai:graph:invocation_failure" in track_calls
 
     async def test_disabled_graph_fails_before_runner_or_model_creation(self) -> None:
         model_factory = MagicMock()

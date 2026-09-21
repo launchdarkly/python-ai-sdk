@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib
 import re
+import time
 import types
+import uuid
 from typing import Any
 
 from agents.extensions.models.litellm_model import LitellmModel
@@ -13,7 +15,10 @@ from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
     compose_history,
+    get_client,
+    make_track_data,
     parse_template,
+    to_ld_context,
 )
 
 from .handler import (
@@ -23,6 +28,14 @@ from .handler import (
     _model_settings,
     _tools,
 )
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import StatusCode as SpanStatusCode
+
+    _HAS_OTEL = True
+except ImportError:
+    _HAS_OTEL = False
 
 
 def _name(value: str) -> str:
@@ -75,6 +88,24 @@ def to_litellm_agents(
         tool_handlers = options.get("tool_handlers") or {}
         values = variables or {}
         built: dict[str, Any] = {}
+        agent_name_to_key: dict[str, str] = {}
+        path: list[str] = []
+        raw_ld_context = options.get("context")
+        ld_context = (
+            to_ld_context(get_client(), raw_ld_context)
+            if raw_ld_context is not None
+            else None
+        )
+        run_id = str(uuid.uuid4())
+        start_time = time.monotonic()
+
+        if _HAS_OTEL:
+            span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
+                "ld.ai.graph"
+            )
+            span.set_attribute("ld.ai.graph.key", graph.key)
+        else:
+            span = None
 
         async def build(node: GraphNode) -> None:
             if node.key in built:
@@ -111,6 +142,7 @@ def to_litellm_agents(
                 if "multiple values for keyword argument 'name'" not in str(exc):
                     raise
                 built[node.key] = types.SimpleNamespace(**kwargs)
+            agent_name_to_key[_name(node.key)] = node.key
 
         await build(graph.root)
         runner_input: str | list[dict[str, Any]] = input_text
@@ -143,20 +175,90 @@ def to_litellm_agents(
                 }
                 for turn in turns
             ]
-        result = await agents.Runner.run(built[graph.root.key], runner_input)
+
+        class _LDHooks(agents.RunHooks):  # type: ignore[misc, valid-type]
+            async def on_agent_end(self, context: Any, agent: Any, output: Any) -> None:
+                node_key = agent_name_to_key.get(agent.name)
+                if node_key and ld_context:
+                    node = graph.get_node(node_key)
+                    if node:
+                        get_client().track(
+                            "$ld:ai:generation:success",
+                            ld_context,
+                            make_track_data(node, graph.key, run_id),
+                            1,
+                        )
+
+            async def on_handoff(
+                self, context: Any, from_agent: Any, to_agent: Any
+            ) -> None:
+                from_key = agent_name_to_key.get(from_agent.name)
+                if from_key and ld_context:
+                    from_node = graph.get_node(from_key)
+                    if from_node:
+                        get_client().track(
+                            "$ld:ai:graph:handoff_success",
+                            ld_context,
+                            make_track_data(from_node, graph.key, run_id),
+                            1,
+                        )
+                to_key = agent_name_to_key.get(to_agent.name)
+                if to_key and to_key not in path:
+                    path.append(to_key)
+
+            async def on_agent_start(self, context: Any, agent: Any) -> None:
+                node_key = agent_name_to_key.get(agent.name)
+                if node_key and node_key not in path:
+                    path.append(node_key)
+
+        try:
+            result = await agents.Runner.run(
+                built[graph.root.key], runner_input, hooks=_LDHooks()
+            )
+            if span:
+                span.set_status(SpanStatusCode.OK)
+        except Exception as exc:
+            if span:
+                span.record_exception(exc)
+                span.set_status(SpanStatusCode.ERROR, str(exc))
+                span.end()
+            if ld_context:
+                get_client().track(
+                    "$ld:ai:graph:invocation_failure",
+                    ld_context,
+                    make_track_data(graph.root, graph.key, run_id),
+                    1,
+                )
+            raise
+
         wrapper = getattr(result, "context_wrapper", None)
         usage = getattr(wrapper, "usage", None)
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        total_tokens = int(
+            getattr(usage, "total_tokens", input_tokens + output_tokens)
+            or input_tokens + output_tokens
+        )
+        duration = int((time.monotonic() - start_time) * 1000)
+        if span:
+            span.set_attribute("ld.ai.graph.path", "->".join(path))
+            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+            span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
+            span.end()
+        if ld_context:
+            root_td = make_track_data(graph.root, graph.key, run_id)
+            client = get_client()
+            client.track("$ld:ai:graph:duration:total", ld_context, root_td, duration)
+            client.track("$ld:ai:graph:total_tokens", ld_context, root_td, total_tokens)
+            client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
+            client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
         return {
             "response": str(result.final_output or ""),
             "usage": {
                 "input": input_tokens,
                 "output": output_tokens,
-                "total": int(
-                    getattr(usage, "total_tokens", input_tokens + output_tokens)
-                    or input_tokens + output_tokens
-                ),
+                "total": total_tokens,
             },
         }
 
