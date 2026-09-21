@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -453,6 +454,39 @@ class TestNativeGraphAdapter:
                     },
                 ).invoke("hello")
         assert "$ld:ai:graph:invocation_failure" in track_calls
+
+    async def test_cancellation_closes_graph_span(self) -> None:
+        span = MagicMock()
+        tracer = MagicMock()
+        tracer.start_span.return_value = span
+        agents = SimpleNamespace(
+            Agent=MagicMock(
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    name=kwargs["name"], **kwargs
+                )
+            ),
+            Runner=SimpleNamespace(run=AsyncMock(side_effect=asyncio.CancelledError())),
+            handoff=MagicMock(side_effect=lambda target: target),
+            FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
+        )
+        real_import = __import__
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=lambda name: (
+                    agents if name == "agents" else real_import(name)
+                ),
+            ),
+            patch.object(native_graph_mod, "_HAS_OTEL", True),
+            patch.object(native_graph_mod.trace, "get_tracer", return_value=tracer),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await to_litellm_agents(
+                    _definition_awaitable(),
+                    opts={"model_factory": lambda *_: object()},
+                ).invoke("hello")
+        span.end.assert_called_once_with()
 
     async def test_disabled_graph_fails_before_runner_or_model_creation(self) -> None:
         model_factory = MagicMock()

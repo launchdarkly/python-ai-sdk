@@ -99,14 +99,6 @@ def to_litellm_agents(
         run_id = str(uuid.uuid4())
         start_time = time.monotonic()
 
-        if _HAS_OTEL:
-            span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
-                "ld.ai.graph"
-            )
-            span.set_attribute("ld.ai.graph.key", graph.key)
-        else:
-            span = None
-
         async def build(node: GraphNode) -> None:
             if node.key in built:
                 return
@@ -211,18 +203,59 @@ def to_litellm_agents(
                 if node_key and node_key not in path:
                     path.append(node_key)
 
+        if _HAS_OTEL:
+            span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
+                "ld.ai.graph"
+            )
+            span.set_attribute("ld.ai.graph.key", graph.key)
+        else:
+            span = None
+
         try:
             result = await agents.Runner.run(
                 built[graph.root.key], runner_input, hooks=_LDHooks()
             )
             if span:
                 span.set_status(SpanStatusCode.OK)
-        except Exception as exc:
+
+            wrapper = getattr(result, "context_wrapper", None)
+            usage = getattr(wrapper, "usage", None)
+            input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            total_tokens = int(
+                getattr(usage, "total_tokens", input_tokens + output_tokens)
+                or input_tokens + output_tokens
+            )
+            duration = int((time.monotonic() - start_time) * 1000)
             if span:
+                span.set_attribute("ld.ai.graph.path", "->".join(path))
+                span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+                span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
+            if ld_context:
+                root_td = make_track_data(graph.root, graph.key, run_id)
+                client = get_client()
+                client.track(
+                    "$ld:ai:graph:duration:total", ld_context, root_td, duration
+                )
+                client.track(
+                    "$ld:ai:graph:total_tokens", ld_context, root_td, total_tokens
+                )
+                client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
+                client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
+            return {
+                "response": str(result.final_output or ""),
+                "usage": {
+                    "input": input_tokens,
+                    "output": output_tokens,
+                    "total": total_tokens,
+                },
+            }
+        except BaseException as exc:
+            if span and isinstance(exc, Exception):
                 span.record_exception(exc)
                 span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
-            if ld_context:
+            if ld_context and isinstance(exc, Exception):
                 get_client().track(
                     "$ld:ai:graph:invocation_failure",
                     ld_context,
@@ -230,36 +263,8 @@ def to_litellm_agents(
                     1,
                 )
             raise
-
-        wrapper = getattr(result, "context_wrapper", None)
-        usage = getattr(wrapper, "usage", None)
-        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-        total_tokens = int(
-            getattr(usage, "total_tokens", input_tokens + output_tokens)
-            or input_tokens + output_tokens
-        )
-        duration = int((time.monotonic() - start_time) * 1000)
-        if span:
-            span.set_attribute("ld.ai.graph.path", "->".join(path))
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-            span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
-            span.end()
-        if ld_context:
-            root_td = make_track_data(graph.root, graph.key, run_id)
-            client = get_client()
-            client.track("$ld:ai:graph:duration:total", ld_context, root_td, duration)
-            client.track("$ld:ai:graph:total_tokens", ld_context, root_td, total_tokens)
-            client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
-            client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
-        return {
-            "response": str(result.final_output or ""),
-            "usage": {
-                "input": input_tokens,
-                "output": output_tokens,
-                "total": total_tokens,
-            },
-        }
+        finally:
+            if span:
+                span.end()
 
     return types.SimpleNamespace(invoke=invoke)
