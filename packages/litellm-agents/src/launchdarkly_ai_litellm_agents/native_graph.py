@@ -84,6 +84,7 @@ def to_litellm_agents(
             raise ValueError(f'Agent graph "{graph.key}" has no root node')
 
         agents = importlib.import_module("agents")
+        RunHooks = agents.RunHooks
         factory: ModelFactory = options.get("model_factory") or _default_factory
         tool_handlers = options.get("tool_handlers") or {}
         values = variables or {}
@@ -168,7 +169,7 @@ def to_litellm_agents(
                 for turn in turns
             ]
 
-        class _LDHooks(agents.RunHooks):  # type: ignore[misc, valid-type]
+        class _LDHooks(RunHooks):  # type: ignore[misc, valid-type]
             async def on_agent_end(self, context: Any, agent: Any, output: Any) -> None:
                 node_key = agent_name_to_key.get(agent.name)
                 if node_key and ld_context:
