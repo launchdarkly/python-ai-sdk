@@ -46,7 +46,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 ### Run an evaluation from code
 
-The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
+The evaluations harness takes a dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows come from exactly one of two places: pass `dataset` to read an LD-hosted dataset by key, or pass `rows` to supply them from code (see [Supply dataset rows from code](#supply-dataset-rows-from-code)). Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. When rows come from an LD-hosted dataset the event carries the dataset identifiers and omits the row's own input, expected output, metadata, and variables, because the dataset already holds them; when you pass `rows` inline the reverse is true — LaunchDarkly has no copy, so the generation event carries `input`, `expectedOutput`, `variables`, and `metadata` and no dataset identifiers. The criterion event never carries row data in either mode. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
 Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts only. A run passes only when the completed summary has no failed, error, or pending rows. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
@@ -80,6 +80,37 @@ sys.exit(asyncio.run(main()))
 
 `project_key` is supplied per run rather than during initialization. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
 
+### Supply dataset rows from code
+
+Pass `rows` instead of `dataset` to evaluate rows you already have — a CI fixture list, a JSON file, a generated corpus — without creating a hosted dataset first. The run then reads no dataset and issues no dataset requests.
+
+```python
+from launchdarkly_ai_server import DatasetRow, init_evaluations
+
+result = await init_evaluations().run(
+    project_key="my-project",
+    key="support-qa-2026-08-20",
+    rows=[
+        DatasetRow(
+            row_index=0,
+            input="Where is order {{order_id}}?",
+            expected_output="Order {{order_id}} shipped on the 3rd.",
+            variables={"order_id": "A19"},
+            metadata={"suite": "orders"},
+        ),
+        DatasetRow(row_index=1, input="How do I get a refund?"),
+    ],
+    handler=create_openai_messages_handler(),
+    generation={"provider": "OpenAI", "model": "gpt-4o"},
+)
+```
+
+Exactly one of `dataset` and `rows` is required; supplying both, or neither, raises before any request is made. `input` and `expected_output` are `{{variable}}` templates rendered against the row's `variables` exactly as a hosted dataset's are, and a placeholder with no matching variable is left literal — so data that legitimately contains braces survives. The `DatasetRow` objects you pass are never mutated, so the same list is safe to reuse across runs.
+
+You own `row_index`. LaunchDarkly identifies an inline row by `(run, row_index)`, so the values must be unique within the list; a duplicate would collapse two rows into one stored row and the run could never account for every row. `run()` rejects duplicates, negative or non-integer indices, non-string `input`/`expected_output`, and `variables`/`metadata` whose contents the event transport could not serialize (a date, a set, a non-finite number, a bare object) — all before any record exists. That last check is worth knowing about: the SDK's event transport serializes on a background thread and cannot report a failure back to `run()`, so an unencodable value would otherwise become silently lost events and then a polling timeout with nothing to explain it.
+
+Inline rows are also bounded: at most 10,000 rows per run, with all DatasetRow fields each at most 1 MiB (1,048,576 bytes) once UTF-8 encoded — the encoded length, not the character count, because that is what travels in the event. Both are checked before any record exists, so an oversized dataset costs no API requests and no generation calls. Neither bound applies to a hosted `dataset`: LaunchDarkly holds those rows already, and a caller could not fix an oversized one from their own process. Pass `dataset` instead of `rows` for anything larger.
+
 Generation and criterion events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises rather than creating a run that can never complete unless it can resolve an event transport: either an SDK key (`sdk_key` or `LD_SDK_KEY`) or a client already initialized through `init_client(client=...)`. Bringing your own client lets a process emit evaluation events without an SDK key in scope. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
 
 ### Score rows with judges and scorers
@@ -112,7 +143,7 @@ result = await init_evaluations().run(
 )
 ```
 
-`Scorer.fn` receives the `DatasetRow` the output was generated from plus the generated output, may be sync or async, and must return a bool or a number from 0 to 1; booleans become 1.0 or 0.0. `Judge.threshold` defaults to 0.5 and `Scorer.threshold` to 1.0 — a perfect score, which is what a boolean scorer wants — and both accept an optional `pass_rate_threshold`. Judge keys and scorer names share one `criterionType` namespace and must be unique within a run, case-insensitively, because that name is part of each result's deterministic event identity. `Judge.ground_truth_context` overrides what the judge is graded against when the dataset row's expected output is not it.
+`Scorer.fn` receives the `DatasetRow` the output was generated from plus the generated output, may be sync or async, and must return a bool or a number from 0 to 1; booleans become 1.0 or 0.0. That row carries the *rendered* `input` and `expected_output`, and its `variables` has been augmented with those two rendered values under the keys `input` and `expected_output` — the same shape whichever source the row came from. `Judge.threshold` defaults to 0.5 and `Scorer.threshold` to 1.0 — a perfect score, which is what a boolean scorer wants — and both accept an optional `pass_rate_threshold`. Judge keys and scorer names share one `criterionType` namespace and must be unique within a run, case-insensitively, because that name is part of each result's deterministic event identity. `Judge.ground_truth_context` overrides what the judge is graded against when the dataset row's expected output is not it.
 
 **The SDK reports scores and never rules on them.** LaunchDarkly derives each row's verdict at ingest by comparing the score against the criterion's stored threshold and success direction, so pass/fail policy is one server-side implementation that applies to every SDK version and to runs already recorded. A judge's direction lives on its AI Config and is injected server-side, keeping the one input a verdict turns on server-attested; a `Scorer` has no LaunchDarkly-side config to read, so it declares its own `success_direction` (default `"higher_is_better"` — set `"lower_is_better"` for a scorer that counts something unwanted, like a regex hit count).
 

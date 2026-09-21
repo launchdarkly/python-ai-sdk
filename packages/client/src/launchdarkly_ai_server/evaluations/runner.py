@@ -178,6 +178,102 @@ def _required_string(data: Mapping[str, Any], key: str, description: str) -> str
     return value
 
 
+def _render_row(
+    *,
+    row_index: int,
+    input_value: str | None,
+    expected_value: str | None,
+    variables: dict[str, Any],
+    metadata: dict[str, Any] | None,
+) -> DatasetRow:
+    """
+    Render one row's templates and inject the rendered values into its variables.
+
+    The single render step behind both row sources -- an LD-hosted dataset and
+    rows the caller supplied to ``run(rows=[...])``. Forking it would fork every
+    downstream assertion about ``variables``, since ``_judge_variables`` and a
+    criterion's ``ground_truth_context`` both read the injected keys.
+
+    ``input`` and ``expected_output`` are the exact injected key names, and are
+    a cross-language contract: dataset-authored templates reference
+    ``{{input}}`` and ``{{expected_output}}``, so neither is camelCased.
+
+    ``variables`` and ``metadata`` must already be copies owned by the caller of
+    this function -- both front-ends copy before calling, so rendering never
+    writes back into an object the SDK's caller still holds.
+    """
+    rendered_input = (
+        parse_template(input_value, variables) if input_value is not None else None
+    )
+    rendered_expected = (
+        parse_template(expected_value, variables)
+        if expected_value is not None
+        else None
+    )
+    variables["input"] = rendered_input
+    variables["expected_output"] = rendered_expected
+    return DatasetRow(
+        row_index=row_index,
+        input=rendered_input,
+        expected_output=rendered_expected,
+        variables=variables,
+        metadata=metadata,
+    )
+
+
+def _row_from_api_item(item: Mapping[str, Any]) -> DatasetRow:
+    """
+    Normalize one row of an LD-hosted dataset page.
+
+    This front-end *coerces* bad values rather than rejecting them: the data is
+    the API's, not the caller's, so a missing or non-string ``input`` renders as
+    ``None`` instead of failing a run that is already in flight. Inline rows are
+    held to the stricter standard in ``_validate_run_args``.
+    """
+    row_index = item.get("rowIndex")
+    if not isinstance(row_index, int):
+        raise EvaluationsError("A dataset row is missing its integer rowIndex")
+    variables_value = item.get("variables")
+    input_value = item.get("input")
+    expected_value = item.get("expectedOutput")
+    metadata_value = item.get("metadata")
+    return _render_row(
+        row_index=row_index,
+        input_value=input_value if isinstance(input_value, str) else None,
+        expected_value=expected_value if isinstance(expected_value, str) else None,
+        variables=dict(variables_value) if isinstance(variables_value, Mapping) else {},
+        metadata=dict(metadata_value) if isinstance(metadata_value, Mapping) else None,
+    )
+
+
+def _normalize_inline_rows(rows: list[DatasetRow]) -> list[DatasetRow]:
+    """
+    Normalize rows the caller supplied to ``run(rows=[...])``.
+
+    Shape and serializability were already checked by ``_validate_run_args``,
+    so this front-end only copies and renders. Both copies are load-bearing:
+
+    * ``dict(row.variables)`` because ``parse_template`` resolves a placeholder
+      via ``isinstance(value, dict)`` -- hand it a ``MappingProxyType``, a
+      ``ChainMap``, or any other ``Mapping`` and *every* placeholder is left
+      literal, sending raw mustache text to the model and the judge prompt.
+    * fresh ``DatasetRow`` objects because the dataclass is mutable and the
+      caller still holds theirs. Writing the injected keys back would mean a CI
+      script that runs the same row list twice resolves ``{{input}}`` against
+      the first run's already-rendered value.
+    """
+    return [
+        _render_row(
+            row_index=row.row_index,
+            input_value=row.input,
+            expected_value=row.expected_output,
+            variables=dict(row.variables),
+            metadata=dict(row.metadata) if row.metadata is not None else None,
+        )
+        for row in rows
+    ]
+
+
 class ConcurrencyController:
     """Owns row-worker permits."""
 
@@ -372,45 +468,8 @@ class EvaluationsRunner:
             if not items:
                 break
             for item_value in items:
-                item = _mapping(item_value, description="dataset row")
-                row_index = item.get("rowIndex")
-                if not isinstance(row_index, int):
-                    raise EvaluationsError(
-                        "A dataset row is missing its integer rowIndex"
-                    )
-                variables_value = item.get("variables")
-                variables = (
-                    dict(variables_value)
-                    if isinstance(variables_value, Mapping)
-                    else {}
-                )
-                input_value = item.get("input")
-                expected_value = item.get("expectedOutput")
-                rendered_input = (
-                    parse_template(input_value, variables)
-                    if isinstance(input_value, str)
-                    else None
-                )
-                rendered_expected = (
-                    parse_template(expected_value, variables)
-                    if isinstance(expected_value, str)
-                    else None
-                )
-                variables["input"] = rendered_input
-                variables["expected_output"] = rendered_expected
-                metadata_value = item.get("metadata")
                 rows.append(
-                    DatasetRow(
-                        row_index=row_index,
-                        input=rendered_input,
-                        expected_output=rendered_expected,
-                        variables=variables,
-                        metadata=(
-                            dict(metadata_value)
-                            if isinstance(metadata_value, Mapping)
-                            else None
-                        ),
-                    )
+                    _row_from_api_item(_mapping(item_value, description="dataset row"))
                 )
             offset += len(items)
         if not rows:
@@ -468,16 +527,17 @@ class EvaluationsRunner:
         self,
         project_key: str,
         evaluation_id: str,
-        dataset_id: str,
+        dataset_id: str | None = None,
     ) -> EvaluationRunRef:
         path = (
             f"projects/{_segment(project_key)}/evaluations/"
             f"{_segment(evaluation_id)}/runs"
         )
-        body: dict[str, Any] = {
-            "source": "api",
-            "datasetId": dataset_id,
-        }
+        # No row count in either mode: with criteria a row is not accounted for
+        # by a single result, so what completes a row is derived server-side.
+        body: dict[str, Any] = {"source": "api"}
+        if dataset_id is not None:
+            body["datasetId"] = dataset_id
         raw = _mapping(
             self._api.post(path, body=body),
             description="evaluation run",
@@ -596,7 +656,7 @@ class EvaluationsRunner:
         project_key: str,
         evaluation: EvaluationRef,
         evaluation_run: EvaluationRunRef,
-        dataset: DatasetRef,
+        dataset: DatasetRef | None,
         results: list[dict[str, Any]],
     ) -> None:
         """Queue one LD custom event for each executed dataset row."""
@@ -610,14 +670,15 @@ class EvaluationsRunner:
             },
         )
         for result in results:
-            identity = {
+            identity: dict[str, Any] = {
                 "projectKey": project_key,
                 "evaluationId": evaluation.id,
                 "evaluationRunId": evaluation_run.id,
                 "runId": evaluation_run.id,
-                "datasetId": dataset.id,
                 "rowIndex": result["row_index"],
             }
+            if dataset is not None:
+                identity["datasetId"] = dataset.id
             event_id = hashlib.sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
@@ -655,12 +716,22 @@ class EvaluationsRunner:
                 "emittedAt": emitted_at,
                 "evaluationKey": evaluation.key,
                 "evaluationVersion": evaluation.version,
-                "datasetKey": dataset.key,
                 "status": result["status"],
                 "startedAt": result["started_at"],
                 "generatedAt": result["generated_at"],
                 "latencyMs": result["latency_ms"],
             }
+            if dataset is not None:
+                payload["datasetKey"] = dataset.key
+            else:
+                if result.get("input") is not None:
+                    payload["input"] = result["input"]
+                if result.get("expected_output") is not None:
+                    payload["expectedOutput"] = result["expected_output"]
+                if result.get("variables"):
+                    payload["variables"] = result["variables"]
+                if result.get("metadata"):
+                    payload["metadata"] = result["metadata"]
             if generated["output"] is not None:
                 payload["output"] = generated["output"]
             if generated["error"] is not None:
@@ -940,7 +1011,7 @@ class EvaluationsRunner:
         project_key: str,
         evaluation: EvaluationRef,
         evaluation_run: EvaluationRunRef,
-        dataset: DatasetRef,
+        dataset: DatasetRef | None,
         results: list[dict[str, Any]],
     ) -> None:
         context = to_ld_context(
@@ -959,15 +1030,16 @@ class EvaluationsRunner:
             # before it -- so every result is attempted and the failures are
             # raised together once the loop is done.
             try:
-                identity = {
+                identity: dict[str, Any] = {
                     "projectKey": project_key,
                     "evaluationId": evaluation.id,
                     "evaluationRunId": evaluation_run.id,
                     "runId": evaluation_run.id,
-                    "datasetId": dataset.id,
                     "rowIndex": result["row_index"],
                     "criterionType": result["criterion_type"],
                 }
+                if dataset is not None:
+                    identity["datasetId"] = dataset.id
                 event_id = hashlib.sha256(
                     json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()
@@ -993,14 +1065,14 @@ class EvaluationsRunner:
                     "evaluation_id": evaluation.id,
                     "evaluation_run_id": evaluation_run.id,
                     "run_id": evaluation_run.id,
-                    "dataset_id": dataset.id,
+                    "dataset_id": dataset.id if dataset else None,
                     "row_index": result["row_index"],
                     "criterion_type": result["criterion_type"],
                     "event_id": event_id,
                     "emitted_at": emitted_at,
                     "evaluation_key": evaluation.key,
                     "evaluation_version": evaluation.version,
-                    "dataset_key": dataset.key,
+                    "dataset_key": dataset.key if dataset else None,
                     "status": CriterionStatus(result["status"]),
                     "started_at": result["started_at"],
                     "evaluated_at": result["evaluated_at"],

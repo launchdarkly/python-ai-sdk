@@ -73,6 +73,8 @@ result = await evals.run(
 )
 ```
 
+Pass `rows=[DatasetRow(...)]` in place of `dataset` to evaluate rows supplied from code instead of an LD-hosted dataset; `DatasetRow` is re-exported here too, and exactly one of the two arguments is required.
+
 `LD_API_TOKEN` is required. Configure `LD_SDK_KEY` — or initialize your own client with `init_client(client=...)` — to emit one `$ld:ai:offline-evals:generation` event per generated row, plus one `$ld:ai:offline-evals:criterion` event per `(row, criterion)` when `criteria` are supplied, through the standard SDK event transport. The SDK reports scores; LaunchDarkly rules on them at ingest. A judge served by a different provider than `generation` needs a handler for it in `judge_handlers`. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. Evaluation-run links use the explicit `ui_base_uri` option or `LD_UI_BASE_URI` (for example, `https://ld-stg.launchdarkly.com` in staging), defaulting to `https://app.launchdarkly.com`. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
 
 ---
