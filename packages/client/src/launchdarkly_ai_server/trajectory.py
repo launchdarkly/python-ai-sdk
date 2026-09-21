@@ -48,9 +48,10 @@ on the original map, so both paths see natives identically.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -68,6 +69,14 @@ MAX_RECORDED_TOOL_CALLS = 50
 MAX_RECORDED_VALUE_CHARS = 2000
 
 _TRUNCATION_SUFFIX = "… (truncated)"
+
+#: Synthetic graph-routing tools, injected by ``graph.route`` on a multi-edge
+#: node. Skipped for the same reason §3.8's tracking wrapper skips them: they
+#: are not tools the agent was given, they are how the router asks it to pick a
+#: branch. A per-node judge is scored against the node's *original* config,
+#: which does not list them, so showing them would invite the judge to grade a
+#: handoff as tool use.
+HANDOFF_TOOL_PREFIX = "__handoff_"
 
 ToolImplementation = Callable[..., Any] | NativeTool
 
@@ -117,23 +126,44 @@ class TrajectoryRecorder:
         return list(self._observable)
 
     def wrap(
-        self, tool_handlers: Mapping[str, ToolImplementation]
+        self,
+        tool_handlers: Mapping[str, ToolImplementation],
+        *,
+        exposed: Collection[str] | None = None,
     ) -> dict[str, ToolImplementation]:
-        """Return ``tool_handlers`` with each callable recording into this row.
+        """Return ``tool_handlers`` with each callable recording into this unit.
 
         Keys are preserved exactly: a handler resolves a tool by the key the
         model named, so renaming one here would break the lookup.
+
+        ``exposed`` is the set of tool keys the model was actually offered --
+        the keys of the config's ``tools``. Pass it whenever the implementation
+        map can be wider than the config, which online it can: ``config()``
+        merges a ``Registry``'s tools into the map it hands the handler, while
+        the flag variation decides which the model is shown. Without the
+        filter, a registry holding ten tools made every judge read "Tools
+        available" as ten and penalise an agent for ignoring eight it was never
+        offered. ``None`` means every callable is in scope, which is the
+        offline case -- the runner resolves the config's tools from the same
+        map, so the two agree by construction.
         """
         wrapped: dict[str, ToolImplementation] = {}
         # Rebuilt rather than appended to, so re-wrapping a map does not report
         # the same tool as available twice.
         self._observable = []
         for name, implementation in tool_handlers.items():
-            if isinstance(implementation, NativeTool) or not callable(implementation):
-                # Provider-executed, or already invalid and reported as such by
-                # tool resolution. Either way there is nothing local to observe,
-                # so pass the value through rather than replacing it with a
-                # wrapper the handler would treat differently.
+            if (
+                isinstance(implementation, NativeTool)
+                or not callable(implementation)
+                or name.startswith(HANDOFF_TOOL_PREFIX)
+                or (exposed is not None and name not in exposed)
+            ):
+                # Provider-executed; already invalid and reported as such by
+                # tool resolution; synthetic routing; or not offered to the
+                # model. Nothing local to observe, or nothing the agent should
+                # be graded on -- so pass the value through untouched rather
+                # than replacing it with a wrapper the handler would treat
+                # differently, and leave it out of "Tools available".
                 wrapped[name] = implementation
                 continue
             self._observable.append(name)
@@ -141,19 +171,51 @@ class TrajectoryRecorder:
         return wrapped
 
     def _record(self, name: str, original: Callable[..., Any]) -> Callable[..., Any]:
-        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        """Wrap ``original`` without changing how it is called.
+
+        A sync tool stays sync. Making everything a coroutine function was the
+        simpler option and matches what §3.8's tracking wrapper does, but
+        offline these implementations used to be passed through untouched: a
+        caller's own handler may invoke a sync tool directly and use the value,
+        which is the natural call for a sync function. Under a blanket async
+        wrapper that handler silently received a coroutine object and finished
+        the row with its repr instead of the tool's result.
+        """
+        if asyncio.iscoroutinefunction(original):
+
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                slot = self._reserve(name, _call_arguments(args, kwargs))
+                return await self._await_and_record(slot, original(*args, **kwargs))
+
+            return async_wrapper
+
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             slot = self._reserve(name, _call_arguments(args, kwargs))
             try:
                 result = original(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    result = await result
             except Exception as error:
                 self._complete(slot, error=f"{error}")
                 raise
+            if inspect.isawaitable(result):
+                # A sync callable that returns an awaitable: hand back an
+                # awaitable that records on completion, so whoever awaits it is
+                # still recorded and the repr of a pending coroutine never
+                # reaches a judge. A caller who never awaits it records
+                # nothing, which is accurate -- the call never completed.
+                return self._await_and_record(slot, result)
             self._complete(slot, result=result)
             return result
 
-        return wrapper
+        return sync_wrapper
+
+    async def _await_and_record(self, slot: int | None, awaitable: Any) -> Any:
+        try:
+            result = await awaitable
+        except Exception as error:
+            self._complete(slot, error=f"{error}")
+            raise
+        self._complete(slot, result=result)
+        return result
 
     def _reserve(self, name: str, arguments: Any) -> int | None:
         if len(self._invocations) >= self._limit:

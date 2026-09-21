@@ -7,7 +7,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
-from .trajectory import TrajectoryRecorder, render_trajectory
+from .trajectory import HANDOFF_TOOL_PREFIX, TrajectoryRecorder, render_trajectory
 from .types import (
     NATIVE_TOOL_KEY,
     AiConfigRep,
@@ -82,7 +82,7 @@ def wrap_tool_handlers(
                 tool_name: str, original: Callable[..., Any]
             ) -> Callable[..., Any]:
                 async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                    if not tool_name.startswith("__handoff_"):
+                    if not tool_name.startswith(HANDOFF_TOOL_PREFIX):
                         get_client().track(
                             "$ld:ai:tool_call",
                             user_context,
@@ -97,6 +97,17 @@ def wrap_tool_handlers(
             wrapped[name] = _make_regular_wrapper(name, fn)
 
     return wrapped
+
+
+def _exposed_tool_keys(config: AiConfigRep) -> set[str]:
+    """The tool keys the model was actually offered by this config.
+
+    The implementation map handed to a handler can be wider: ``config()``
+    merges a ``Registry``'s tools into it, while the flag variation decides
+    what the model sees. Only the offered set belongs in a trajectory (§3.27).
+    """
+    tools = config.get("tools") if isinstance(config, dict) else None
+    return set(tools) if isinstance(tools, dict) else set()
 
 
 async def execute_and_track(
@@ -148,7 +159,9 @@ async def execute_and_track(
     # invisible. One recorder per invocation, since invocations run concurrently.
     recorder = TrajectoryRecorder()
     tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}), ld_ctx, track_data
+        recorder.wrap(tool_handlers or {}, exposed=_exposed_tool_keys(config)),
+        ld_ctx,
+        track_data,
     )
     merged_variables: dict[str, Any] = {
         **(variables or {}),
@@ -245,7 +258,9 @@ async def execute_and_stream(
 
     recorder = TrajectoryRecorder()
     tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}), ld_ctx, track_data
+        recorder.wrap(tool_handlers or {}, exposed=_exposed_tool_keys(config)),
+        ld_ctx,
+        track_data,
     )
     merged_variables: dict[str, Any] = {
         **(variables or {}),

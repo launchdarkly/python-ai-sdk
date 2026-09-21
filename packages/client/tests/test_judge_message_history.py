@@ -247,12 +247,21 @@ async def test_execute_and_track_records_the_trajectory(mock_ld_client: Any) -> 
         variables: Any,
         history: Any = None,
     ) -> dict[str, Any]:
+        # Awaited: online, §3.8's tracking wrapper wraps the recorder's
+        # wrapper in a coroutine function, so the handler always awaits here --
+        # unchanged by trajectory capture. Offline there is no such wrapper, so
+        # a sync tool stays sync (test_trajectory.py).
         await tool_handlers["lookup"]({"id": "A1"})
         return {"output": "It shipped.", "usage": {}}
 
     result = await execute_and_track(
         config_key="c",
-        config={"model": {"name": "m"}, "provider": {"name": "TestProvider"}},
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            # Only tools the config offers are described (§3.27).
+            "tools": {"lookup": {"description": "", "parameters": {}}},
+        },
         meta={"variationKey": "v", "version": 1},
         user_context=CONTEXT,
         handler=handler,  # type: ignore[arg-type]
@@ -320,7 +329,11 @@ async def test_tool_tracking_still_fires_under_the_recorder(
 
     await execute_and_track(
         config_key="c",
-        config={"model": {"name": "m"}, "provider": {"name": "TestProvider"}},
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            "tools": {"lookup": {"description": "", "parameters": {}}},
+        },
         meta={"variationKey": "v", "version": 1},
         user_context=CONTEXT,
         handler=handler,  # type: ignore[arg-type]
@@ -372,3 +385,80 @@ def test_the_recorder_renders_identically_for_both_paths() -> None:
     ) == (
         "Tools available: lookup\nNo tool calls were made while producing the response."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_registry_tool_the_config_omits_is_not_described(
+    mock_ld_client: Any,
+) -> None:
+    """config() merges a Registry's tools into the map it hands the handler.
+
+    The flag variation decides what the model sees, so describing the whole
+    map made a judge penalise an agent for ignoring tools it never had.
+    """
+
+    async def handler(
+        config: Any,
+        user_input: Any,
+        tool_handlers: Any,
+        variables: Any,
+        history: Any = None,
+    ) -> dict[str, Any]:
+        await tool_handlers["lookup"]({"id": "A1"})
+        return {"output": "ok", "usage": {}}
+
+    result = await execute_and_track(
+        config_key="c",
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            # The variation offers one tool; the map carries two.
+            "tools": {"lookup": {"description": "", "parameters": {}}},
+        },
+        meta={"variationKey": "v", "version": 1},
+        user_context=CONTEXT,
+        handler=handler,  # type: ignore[arg-type]
+        user_input="q",
+        tool_handlers={
+            "lookup": lambda args: "shipped",
+            "registry_only": lambda args: "never offered",
+        },
+    )
+
+    assert "Tools available: lookup" in result["trajectory"]
+    assert "registry_only" not in result["trajectory"]
+
+
+@pytest.mark.asyncio
+async def test_a_handoff_tool_is_not_described_online(mock_ld_client: Any) -> None:
+    """graph.route injects these onto a multi-edge node's config.
+
+    A per-node judge is scored against the node's original config, which does
+    not list them, so a handoff must not read as tool use.
+    """
+
+    async def handler(
+        config: Any,
+        user_input: Any,
+        tool_handlers: Any,
+        variables: Any,
+        history: Any = None,
+    ) -> dict[str, Any]:
+        await tool_handlers["__handoff_billing"]({})
+        return {"output": "ok", "usage": {}}
+
+    result = await execute_and_track(
+        config_key="c",
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            "tools": {"__handoff_billing": {"description": "", "parameters": {}}},
+        },
+        meta={"variationKey": "v", "version": 1},
+        user_context=CONTEXT,
+        handler=handler,  # type: ignore[arg-type]
+        user_input="q",
+        tool_handlers={"__handoff_billing": lambda args: "Handoff recorded"},
+    )
+
+    assert result["trajectory"] == ""

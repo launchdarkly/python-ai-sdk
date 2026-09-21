@@ -14,15 +14,21 @@ from launchdarkly_ai_server.trajectory import (
 from launchdarkly_ai_server.types import NativeTool
 
 
-@pytest.mark.asyncio
-async def test_wrapped_tool_returns_what_the_original_returned() -> None:
+def test_wrapped_sync_tool_stays_sync() -> None:
+    """A sync tool is still called, and still returns, synchronously.
+
+    Wrapping everything as a coroutine function would hand a caller's own
+    handler a coroutine object where it used to get the tool's value.
+    """
+
     def lookup(args: dict[str, Any]) -> str:
         return f"order {args['id']}"
 
     recorder = TrajectoryRecorder()
     wrapped = recorder.wrap({"lookup": lookup})
 
-    assert await wrapped["lookup"]({"id": "A1"}) == "order A1"
+    assert not asyncio.iscoroutinefunction(wrapped["lookup"])
+    assert wrapped["lookup"]({"id": "A1"}) == "order A1"
     assert recorder.invocations == [
         ToolInvocation(name="lookup", arguments={"id": "A1"}, result="order A1")
     ]
@@ -37,12 +43,12 @@ async def test_wrapped_async_tool_is_awaited() -> None:
     recorder = TrajectoryRecorder()
     wrapped = recorder.wrap({"lookup": lookup})
 
+    assert asyncio.iscoroutinefunction(wrapped["lookup"])
     assert await wrapped["lookup"]({"id": "A1"}) == "order A1"
     assert recorder.invocations[0].result == "order A1"
 
 
-@pytest.mark.asyncio
-async def test_wrapped_tool_reraises_and_records_the_failure() -> None:
+def test_wrapped_tool_reraises_and_records_the_failure() -> None:
     """The recorder observes; a tool that failed must still fail its caller.
 
     Swallowing the exception here would turn a broken tool into a silent one and
@@ -56,7 +62,7 @@ async def test_wrapped_tool_reraises_and_records_the_failure() -> None:
     wrapped = recorder.wrap({"refund": refund})
 
     with pytest.raises(RuntimeError, match="gateway timeout"):
-        await wrapped["refund"]({"id": "A1"})
+        wrapped["refund"]({"id": "A1"})
 
     assert recorder.invocations == [
         ToolInvocation(name="refund", arguments={"id": "A1"}, error="gateway timeout")
@@ -93,8 +99,7 @@ async def test_concurrent_calls_keep_their_start_order() -> None:
     assert [invocation.name for invocation in recorder.invocations] == ["slow", "fast"]
 
 
-@pytest.mark.asyncio
-async def test_calls_past_the_limit_still_execute_but_are_only_counted() -> None:
+def test_calls_past_the_limit_still_execute_but_are_only_counted() -> None:
     calls: list[int] = []
 
     def append(args: dict[str, Any]) -> str:
@@ -104,7 +109,7 @@ async def test_calls_past_the_limit_still_execute_but_are_only_counted() -> None
     recorder = TrajectoryRecorder(limit=2)
     wrapped = recorder.wrap({"append": append})
     for n in range(5):
-        await wrapped["append"]({"n": n})
+        wrapped["append"]({"n": n})
 
     # Every call ran: truncation bounds the record, never the agent's behavior.
     assert calls == [0, 1, 2, 3, 4]
@@ -112,8 +117,7 @@ async def test_calls_past_the_limit_still_execute_but_are_only_counted() -> None
     assert recorder.omitted == 3
 
 
-@pytest.mark.asyncio
-async def test_native_tools_pass_through_unwrapped_and_undescribed() -> None:
+def test_native_tools_pass_through_unwrapped_and_undescribed() -> None:
     """A provider-executed tool is invisible, so it is not advertised either.
 
     Listing it as available while never being able to show a call to it would
@@ -127,14 +131,13 @@ async def test_native_tools_pass_through_unwrapped_and_undescribed() -> None:
     assert recorder.observable_tools == ["lookup"]
 
 
-@pytest.mark.asyncio
-async def test_keyword_arguments_are_recorded() -> None:
+def test_keyword_arguments_are_recorded() -> None:
     def lookup(**kwargs: Any) -> str:
         return "ok"
 
     recorder = TrajectoryRecorder()
     wrapped = recorder.wrap({"lookup": lookup})
-    await wrapped["lookup"](id="A1")
+    wrapped["lookup"](id="A1")
 
     assert recorder.invocations[0].arguments == {"id": "A1"}
 
@@ -240,3 +243,83 @@ def test_render_leaves_a_non_ascii_string_result_alone() -> None:
     )
 
     assert "   result: café 東京" in rendered
+
+
+def test_a_sync_tool_returning_an_awaitable_records_on_completion() -> None:
+    """A sync callable can still hand back an awaitable.
+
+    The record completes when someone awaits it, so a judge never reads the
+    repr of a pending coroutine. A caller who never awaits records nothing,
+    which is accurate: the call never completed.
+    """
+
+    async def inner() -> str:
+        return "shipped"
+
+    def lookup(args: dict[str, Any]) -> Any:
+        return inner()
+
+    recorder = TrajectoryRecorder()
+    wrapped = recorder.wrap({"lookup": lookup})
+    pending = wrapped["lookup"]({"id": "A1"})
+
+    assert recorder.invocations[0].result is None
+    assert (
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(pending)
+        == "shipped"
+    )
+    assert recorder.invocations[0].result == "shipped"
+
+
+def test_handoff_tools_are_not_recorded_or_described() -> None:
+    """Synthetic routing tools are not tools the agent was given.
+
+    graph.route injects them onto a multi-edge node and a per-node judge is
+    scored against the node's *original* config, which does not list them --
+    so showing them invites the judge to grade a handoff as tool use. §3.8's
+    tracking wrapper excludes them for the same reason.
+    """
+    recorder = TrajectoryRecorder()
+    wrapped = recorder.wrap(
+        {
+            "lookup": lambda args: "shipped",
+            "__handoff_billing": lambda args: "Handoff to billing recorded",
+        }
+    )
+
+    assert recorder.observable_tools == ["lookup"]
+    # Still passed through, so routing keeps working.
+    assert "__handoff_billing" in wrapped
+    wrapped["__handoff_billing"]({})
+    assert [i.name for i in recorder.invocations] == []
+
+
+def test_only_tools_the_config_exposed_are_recorded_or_described() -> None:
+    """The implementation map can be wider than what the model was offered.
+
+    Online, config() merges a Registry's tools into the map it hands the
+    handler while the flag variation decides what the model sees. Describing
+    the whole registry made a judge penalise an agent for ignoring tools it
+    was never offered.
+    """
+    recorder = TrajectoryRecorder()
+    wrapped = recorder.wrap(
+        {"lookup": lambda args: "shipped", "refund": lambda args: "refunded"},
+        exposed={"lookup"},
+    )
+
+    assert recorder.observable_tools == ["lookup"]
+    wrapped["refund"]({})
+    assert [i.name for i in recorder.invocations] == []
+    wrapped["lookup"]({})
+    assert [i.name for i in recorder.invocations] == ["lookup"]
+
+
+def test_no_exposed_set_means_every_callable_is_in_scope() -> None:
+    """The offline case: the runner resolves the config's tools from the same
+    map, so the two agree by construction and no filter is needed.
+    """
+    recorder = TrajectoryRecorder()
+    recorder.wrap({"lookup": lambda args: "a", "refund": lambda args: "b"})
+
+    assert recorder.observable_tools == ["lookup", "refund"]

@@ -2335,7 +2335,8 @@ async def test_tool_trajectory_reaches_the_judge_via_message_history(
             # trajectory twice.
             assert "tool_trajectory" not in variables
             return {"output": '{"score": 1, "reasoning": "used the right tool"}'}
-        assert await tool_handlers["lookup_order"]({"id": "A1"}) == "order A1 shipped"
+        # Called without await: a sync tool stays sync through the recorder.
+        assert tool_handlers["lookup_order"]({"id": "A1"}) == "order A1 shipped"
         return {"output": "Your order shipped."}
 
     result = await evals.run(
@@ -2397,7 +2398,7 @@ async def test_each_row_gets_only_its_own_tool_trajectory(
         # Interleave the two rows' tool calls so a shared recorder would be
         # caught rather than merely be possible.
         await both_started.wait()
-        await tool_handlers["lookup_order"]({"id": row})
+        tool_handlers["lookup_order"]({"id": row})
         return {"output": f"answered {row}"}
 
     result = await evals.run(
@@ -2539,7 +2540,7 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
             assert "result: {{expected_output}} leaked?" in rendered
             assert "Answer leaked?" not in rendered
             return {"output": '{"score": 1, "reasoning": "ok"}'}
-        await tool_handlers["lookup_order"]({"id": "A1"})
+        tool_handlers["lookup_order"]({"id": "A1"})
         return {"output": "done"}
 
     result = await evals.run(
@@ -2571,7 +2572,7 @@ async def test_a_failed_row_keeps_the_calls_made_before_the_handler_raised() -> 
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        await tool_handlers["lookup_order"]({"id": "A1"})
+        tool_handlers["lookup_order"]({"id": "A1"})
         raise RuntimeError("model refused")
 
     results = await runner._run_rows(
