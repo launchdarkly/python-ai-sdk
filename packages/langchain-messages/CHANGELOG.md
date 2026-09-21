@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-messages-0.2.2...launchdarkly-ai-langchain-messages-0.2.3) (2026-09-21)
+
+
+### Features
+
+* **AIC-3106:** add multimodal history support to graph().invoke() ([#26](https://github.com/launchdarkly/python-ai-sdk/issues/26)) ([c91132d](https://github.com/launchdarkly/python-ai-sdk/commit/c91132de81f846326457c6d397be609b7a510e35))
+
+
+### Bug Fixes
+
+* **AIC-3382:** support Bedrock configs in LangChain handlers ([#101](https://github.com/launchdarkly/python-ai-sdk/issues/101)) ([04a67c7](https://github.com/launchdarkly/python-ai-sdk/commit/04a67c71bf8d21c7ef49a1283044ac1c5d77d219))
+* apply Claude thinking parameters from the evaluated LangChain config ([#99](https://github.com/launchdarkly/python-ai-sdk/issues/99)) ([8be2318](https://github.com/launchdarkly/python-ai-sdk/commit/8be231801575e1071c50aab8e2d7b6a1c20fc16c))
+* extract LangChain content-block text and apply model parameters after eval ([#80](https://github.com/launchdarkly/python-ai-sdk/issues/80)) ([a4e1aad](https://github.com/launchdarkly/python-ai-sdk/commit/a4e1aade8adea9f9dcf18c38b374d2de089a7cc1))
+
+
+### Documentation
+
+* replace stale launchdarkly-ai package name with launchdarkly-ai-python ([#40](https://github.com/launchdarkly/python-ai-sdk/issues/40)) ([3256db7](https://github.com/launchdarkly/python-ai-sdk/commit/3256db77a8f3e54c08635ea3a8157e60e5aa0f8b))
+
 ## [0.2.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-messages-0.2.1...launchdarkly-ai-langchain-messages-0.2.2) (2026-09-08)
 
 
