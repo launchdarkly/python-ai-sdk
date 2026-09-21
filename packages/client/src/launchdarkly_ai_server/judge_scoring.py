@@ -7,11 +7,6 @@ offline evaluations path (``evaluations.runner``). All three prompt a judge
 model for the same ``{"score": <0-1>, "reasoning": <string>}`` JSON shape, and
 all three must show the judge the same conversation. This module owns both
 halves of that contract so the paths cannot drift.
-
-They did drift: each path joined its own, and the deferred one carried neither
-input nor trajectory -- so a judge grading the same response saw a different
-conversation depending on which path reached it.
-:func:`build_message_history` is now the only place it is built.
 """
 
 from __future__ import annotations
