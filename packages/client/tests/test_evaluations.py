@@ -180,7 +180,7 @@ def test_ui_base_uri_precedence_and_api_base_isolation(
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
     monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
-    monkeypatch.setenv("LD_UI_BASE_URI", "https://ld-stg.launchdarkly.com/")
+    monkeypatch.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com/")
 
     from_env = init_evaluations(transport=RecordingTransport())
     explicit = init_evaluations(
@@ -188,7 +188,7 @@ def test_ui_base_uri_precedence_and_api_base_isolation(
     )
 
     assert from_env.api.base_uri == "https://api.staging.example.com"
-    assert from_env.ui_base_uri == "https://ld-stg.launchdarkly.com"
+    assert from_env.ui_base_uri == "https://ui.staging.example.com"
     assert explicit.ui_base_uri == "https://ui.example.com"
 
 
