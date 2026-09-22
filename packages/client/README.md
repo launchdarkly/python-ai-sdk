@@ -576,6 +576,14 @@ outage the store keeps serving the last content it received and `write_skills`' 
 `on_unavailable="keep"` leaves managed files alone — an outage must not read as "everything
 was revoked".
 
+**Without the watcher, the revocation bound is process lifetime.** A deployment that calls
+`write_skills` once at boot and never runs `watch_skills` reconciles exactly once, so a skill
+revoked in LaunchDarkly after boot stays on disk — and in the agent's context — until the
+process reconciles again. For such a deployment, a restart (or an explicit re-run of
+`write_skills`) is the incident-response action when a skill must be pulled immediately.
+Neither path closes the already-loaded window: content an agent has already read stays in
+that conversation regardless, and no layer of this SDK can recall it.
+
 **One network timeout, and its default depends on the mode.** `read_timeout` bounds every
 socket operation of a request, connecting included. In `mode="poll"` it bounds the whole
 request and defaults to 10 seconds; in `mode="stream"` it bounds each wait for the next bytes

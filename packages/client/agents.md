@@ -894,6 +894,13 @@ key out of the requested set, so prune deletes the last known-good copy on disk 
 a routine `removed` with `report.ok` still true. Tampered content must never be able to
 trigger deletion.
 
+### 6. Expecting revocation to reach a boot-only `write_skills` deployment
+
+Without `watch_skills`, the revocation bound is process lifetime: a skill revoked after boot
+stays on disk until the process reconciles again, so a restart (or an explicit re-run of
+`write_skills`) is the incident-response action — and content an agent has already read into
+a conversation is out of reach at this layer either way.
+
 ---
 
 ## Adding a New Export
