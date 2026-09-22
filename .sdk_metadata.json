@@ -102,6 +102,31 @@
         "aiAgentGraph": { "introduced": "0.1" },
         "aiTrackMetrics": { "introduced": "0.1" }
       }
+    },
+    "python-ai-vercel-messages": {
+      "name": "Vercel Messages AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/vercel-messages",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-vercel-messages"],
+      "releases": { "tag-prefix": "launchdarkly-ai-vercel-messages-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-vercel-agents": {
+      "name": "Vercel Agents AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/vercel-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-vercel-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-vercel-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
     }
   }
 }
