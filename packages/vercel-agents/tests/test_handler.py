@@ -235,7 +235,14 @@ class TestNativeAgent:
         await create_vercel_agents_handler()(config, "hello", {"lookup": lookup})
         tools = ai_runtime.Agent.call_args.kwargs["tools"]
         assert [tool.name for tool in tools] == ["lookup"]
-        assert await tools[0].execute(key="x") == "found"
+        tool_span = MagicMock()
+        with patch.object(
+            handler_mod, "start_tool_span", return_value=tool_span
+        ) as start_tool_span:
+            assert await tools[0].execute(key="x") == "found"
+        start_tool_span.assert_called_once()
+        assert start_tool_span.call_args.args[0] == "lookup"
+        tool_span.end.assert_called_once()
         lookup.assert_awaited_once_with({"key": "x"})
 
     @pytest.mark.asyncio

@@ -8,8 +8,6 @@ from typing import Any
 
 import ai
 from ai.types.tools import ToolSpec
-from opentelemetry import trace
-from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, ConfigDict, create_model
 
 from launchdarkly_ai_server import (
@@ -17,14 +15,25 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeTool,
     ProviderHandler,
+    SpanUsage,
     compose_history,
     config,
     create_handler,
     parse_template,
-    set_ld_span_attributes,
 )
 
 from .model_id import gateway_model_id
+from .spans import (
+    fail_span,
+    finish_model_span,
+    finish_root_span,
+    mark_ok,
+    model_name,
+    parent_context_of,
+    start_model_span,
+    start_root_span,
+    start_tool_span,
+)
 
 OWNED_PARAMETERS = {
     "model",
@@ -184,6 +193,8 @@ def build_agent_tools(
     definitions: dict[str, Any] | None,
     handlers: dict[str, Any] | None,
     runtime: Any = None,
+    *,
+    parent: Any = None,
 ) -> list[Any]:
     runtime = runtime or ai
     result: list[Any] = []
@@ -192,8 +203,28 @@ def build_agent_tools(
         if not callable(handler) or isinstance(handler, NativeTool):
             continue
 
-        async def execute(_handler: Callable[..., Any] = handler, **kwargs: Any) -> Any:
-            return await _call_tool(_handler, kwargs)
+        async def execute(
+            _handler: Callable[..., Any] = handler,
+            _name: str = name,
+            **kwargs: Any,
+        ) -> Any:
+            tool_span = (
+                start_tool_span(_name, "", parent) if parent is not None else None
+            )
+            try:
+                value = await _call_tool(_handler, kwargs)
+            except BaseException as exc:
+                if tool_span is not None:
+                    if isinstance(exc, Exception):
+                        fail_span(tool_span, exc)
+                    else:
+                        tool_span.set_attribute("launchdarkly.run.cancelled", True)
+                        tool_span.end()
+                raise
+            if tool_span is not None:
+                mark_ok(tool_span)
+                tool_span.end()
+            return value
 
         spec = ToolSpec(
             description=definition.get("description"),
@@ -304,43 +335,6 @@ def text_delta(event: Any) -> str | None:
     return None
 
 
-def _start_span(cfg: AiConfigRep, variables: dict[str, Any]) -> Any:
-    span = trace.get_tracer("@launchdarkly/ai-vercel-agents").start_span("invoke_agent")
-    provider = str(cfg.get("provider", {}).get("name") or "vercel").lower()
-    model = str(cfg.get("model", {}).get("name") or "")
-    span.set_attribute("gen_ai.operation.name", "invoke_agent")
-    span.set_attribute("gen_ai.system", provider)
-    span.set_attribute("gen_ai.provider.name", provider)
-    span.set_attribute("gen_ai.request.model", model)
-    set_ld_span_attributes(span, variables)
-    return span
-
-
-def _start_model_span(cfg: AiConfigRep, root: Any) -> Any:
-    model = str(cfg.get("model", {}).get("name") or "")
-    provider = str(cfg.get("provider", {}).get("name") or "vercel").lower()
-    span = trace.get_tracer("@launchdarkly/ai-vercel-agents").start_span(
-        f"chat {model}", context=trace.set_span_in_context(root)
-    )
-    span.set_attribute("gen_ai.operation.name", "chat")
-    span.set_attribute("gen_ai.system", provider)
-    span.set_attribute("gen_ai.provider.name", provider)
-    span.set_attribute("gen_ai.request.model", model)
-    return span
-
-
-def _set_usage(span: Any, usage: dict[str, int]) -> None:
-    input_tokens = usage["input_tokens"]
-    output_tokens = usage["output_tokens"]
-    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-    span.set_attribute("gen_ai.usage.total_tokens", input_tokens + output_tokens)
-    span.set_attribute("gen_ai.usage.prompt_tokens", input_tokens)
-    span.set_attribute("gen_ai.usage.completion_tokens", output_tokens)
-    span.set_attribute("gen_ai.usage.cache_read.input_tokens", 0)
-    span.set_attribute("gen_ai.usage.cache_creation.input_tokens", 0)
-
-
 def create_vercel_agents_handler(
     model: ModelSource | None = None,
     *,
@@ -354,10 +348,14 @@ def create_vercel_agents_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         vs = variables or {}
-        span = _start_span(cfg, vs)
-        model_span = _start_model_span(cfg, span)
+        span = start_root_span(cfg, vs)
+        parent = parent_context_of(span)
+        model_span = start_model_span(cfg, parent)
+        failed = False
         try:
-            agent = ai.Agent(tools=build_agent_tools(cfg.get("tools"), tool_handlers))
+            agent = ai.Agent(
+                tools=build_agent_tools(cfg.get("tools"), tool_handlers, parent=parent)
+            )
             run_kwargs: dict[str, Any] = {
                 "model": await resolve_model(model, cfg),
                 "messages": build_messages(cfg, user_input, vs, history),
@@ -370,21 +368,25 @@ def create_vercel_agents_handler(
                     pass
             usage = usage_of(provider_stream)
             output = output_of(provider_stream)
-            _set_usage(model_span, usage)
-            _set_usage(span, usage)
-            model_span.set_status(StatusCode.OK)
-            span.set_status(StatusCode.OK)
+            span_usage = SpanUsage(
+                input=usage["input_tokens"], output=usage["output_tokens"]
+            )
+            response_model = model_name(cfg)
+            finish_model_span(model_span, response_model, span_usage)
+            finish_root_span(span, response_model, span_usage)
+            mark_ok(model_span)
+            mark_ok(span)
             return {"output": output, "usage": usage}
         except BaseException as exc:
             if isinstance(exc, Exception):
-                model_span.record_exception(exc)
-                model_span.set_status(StatusCode.ERROR, str(exc))
-                span.record_exception(exc)
-                span.set_status(StatusCode.ERROR, str(exc))
+                failed = True
+                fail_span(model_span, exc)
+                fail_span(span, exc)
             raise
         finally:
-            model_span.end()
-            span.end()
+            if not failed:
+                model_span.end()
+                span.end()
 
     async def stream(
         cfg: AiConfigRep,
@@ -394,12 +396,16 @@ def create_vercel_agents_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         vs = variables or {}
-        span = _start_span(cfg, vs)
-        model_span = _start_model_span(cfg, span)
+        span = start_root_span(cfg, vs)
+        parent = parent_context_of(span)
+        model_span = start_model_span(cfg, parent)
         completed = False
+        failed = False
         provider_stream: Any = None
         try:
-            agent = ai.Agent(tools=build_agent_tools(cfg.get("tools"), tool_handlers))
+            agent = ai.Agent(
+                tools=build_agent_tools(cfg.get("tools"), tool_handlers, parent=parent)
+            )
             async with agent.run(
                 model=await resolve_model(model, cfg),
                 messages=build_messages(cfg, user_input, vs, history),
@@ -411,10 +417,14 @@ def create_vercel_agents_handler(
                         yield {"type": "chunk", "text": text}
             completed = True
             usage = usage_of(provider_stream)
-            _set_usage(model_span, usage)
-            _set_usage(span, usage)
-            model_span.set_status(StatusCode.OK)
-            span.set_status(StatusCode.OK)
+            span_usage = SpanUsage(
+                input=usage["input_tokens"], output=usage["output_tokens"]
+            )
+            response_model = model_name(cfg)
+            finish_model_span(model_span, response_model, span_usage)
+            finish_root_span(span, response_model, span_usage)
+            mark_ok(model_span)
+            mark_ok(span)
             yield {
                 "type": "done",
                 "output": output_of(provider_stream),
@@ -422,17 +432,17 @@ def create_vercel_agents_handler(
             }
         except BaseException as exc:
             if isinstance(exc, Exception):
-                model_span.record_exception(exc)
-                model_span.set_status(StatusCode.ERROR, str(exc))
-                span.record_exception(exc)
-                span.set_status(StatusCode.ERROR, str(exc))
+                failed = True
+                fail_span(model_span, exc)
+                fail_span(span, exc)
             raise
         finally:
-            if not completed:
+            if not completed and not failed:
                 model_span.set_attribute("launchdarkly.stream.abandoned", True)
                 span.set_attribute("launchdarkly.stream.abandoned", True)
-            model_span.end()
-            span.end()
+            if not failed:
+                model_span.end()
+                span.end()
 
     return create_handler(("*", "agent"), run, stream, capture_content=capture_content)
 

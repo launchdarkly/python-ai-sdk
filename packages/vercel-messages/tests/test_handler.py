@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import launchdarkly_ai_vercel_messages.handler as handler_mod
+import launchdarkly_ai_vercel_messages.spans as spans_mod
 from launchdarkly_ai_vercel_messages import create_vercel_messages_handler
 
 CONFIG: dict[str, Any] = {
@@ -353,12 +354,19 @@ class TestToolsAndOutput:
             FakeStream(text="sunny in Oakland", input_tokens=7, output_tokens=2),
         ]
         weather = AsyncMock(return_value="sunny")
+        tool_span = MagicMock()
 
-        result = await create_vercel_messages_handler()(
-            config, "hello", {"weather": weather}
-        )
+        with patch.object(
+            handler_mod, "start_tool_span", return_value=tool_span
+        ) as start_tool_span:
+            result = await create_vercel_messages_handler()(
+                config, "hello", {"weather": weather}
+            )
 
         weather.assert_awaited_once_with({"city": "Oakland"})
+        start_tool_span.assert_called_once()
+        assert start_tool_span.call_args.args[:2] == ("weather", "tc-1")
+        tool_span.end.assert_called_once()
         assert result["output"] == "sunny in Oakland"
         assert result["usage"] == {"input_tokens": 17, "output_tokens": 6}
         assert ai_runtime.stream.call_count == 2
@@ -419,8 +427,42 @@ class TestToolsAndOutput:
         result = await create_vercel_messages_handler()(
             {**CONFIG, "outputFormat": schema}, "question"
         )
-        assert _stream_kwargs(ai_runtime)["output_type"] is not None
+        output_type = _stream_kwargs(ai_runtime)["output_type"]
+        output_schema = output_type.model_json_schema()
+        assert output_schema["required"] == ["answer"]
+        assert output_schema["additionalProperties"] is False
         assert json.loads(result["output"]) == {"answer": "yes"}
+
+    @pytest.mark.asyncio
+    async def test_structured_output_types_nested_objects_and_array_items(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "sources": {"type": "array", "items": {"type": "string"}},
+                "details": {
+                    "type": "object",
+                    "properties": {"summary": {"type": "string"}},
+                },
+            },
+        }
+        ai_runtime.stream.return_value = FakeStream(
+            text="",
+            output={"sources": ["docs"], "details": {"summary": "answer"}},
+        )
+
+        await create_vercel_messages_handler()(
+            {**CONFIG, "outputFormat": schema}, "question"
+        )
+
+        output_schema = _stream_kwargs(ai_runtime)["output_type"].model_json_schema()
+        assert output_schema["required"] == ["sources", "details"]
+        assert output_schema["additionalProperties"] is False
+        assert output_schema["properties"]["sources"]["items"]["type"] == "string"
+        nested = output_schema["$defs"]["DetailsObject"]
+        assert nested["required"] == ["summary"]
+        assert nested["additionalProperties"] is False
 
     @pytest.mark.asyncio
     async def test_streaming_ignores_output_format(self, ai_runtime: MagicMock) -> None:
@@ -493,7 +535,7 @@ class TestUsageAndStreaming:
         span = MagicMock()
         tracer = MagicMock()
         tracer.start_span.return_value = span
-        with patch.object(handler_mod.trace, "get_tracer", return_value=tracer):
+        with patch.object(spans_mod.trace, "get_tracer", return_value=tracer):
             await create_vercel_messages_handler()(CONFIG, "hello")
         attributes = {
             call.args[0]: call.args[1] for call in span.set_attribute.call_args_list

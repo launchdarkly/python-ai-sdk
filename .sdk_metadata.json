@@ -111,8 +111,7 @@
       "aiSdkNames": ["launchdarkly-ai-vercel-messages"],
       "releases": { "tag-prefix": "launchdarkly-ai-vercel-messages-" },
       "features": {
-        "aiCompletionConfig": { "introduced": "0.1" },
-        "aiTrackMetrics": { "introduced": "0.1" }
+        "aiCompletionConfig": { "introduced": "0.1" }
       }
     },
     "python-ai-vercel-agents": {

@@ -9,8 +9,6 @@ from typing import Any
 
 import ai
 from ai.types.tools import ToolSpec
-from opentelemetry import trace
-from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, ConfigDict, create_model
 
 from launchdarkly_ai_server import (
@@ -18,14 +16,25 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeTool,
     ProviderHandler,
+    SpanUsage,
     compose_history,
     config,
     create_handler,
     parse_template,
-    set_ld_span_attributes,
 )
 
 from .model_id import gateway_model_id
+from .spans import (
+    fail_span,
+    finish_model_span,
+    finish_root_span,
+    mark_ok,
+    model_name,
+    parent_context_of,
+    start_model_span,
+    start_root_span,
+    start_tool_span,
+)
 
 OWNED_PARAMETERS = {
     "model",
@@ -191,7 +200,11 @@ def _tool_args(call: Any) -> dict[str, Any]:
     return args if isinstance(args, dict) else {}
 
 
-async def _tool_result(call: Any, executors: dict[str, Callable[..., Any]]) -> Any:
+async def _tool_result(
+    call: Any,
+    executors: dict[str, Callable[..., Any]],
+    parent: Any,
+) -> Any:
     handler = executors.get(call.tool_name)
     if handler is None:
         return ai.tool_result_part(
@@ -200,15 +213,24 @@ async def _tool_result(call: Any, executors: dict[str, Callable[..., Any]]) -> A
             result=f"No handler registered for tool {call.tool_name!r}",
             is_error=True,
         )
+    tool_span = start_tool_span(call.tool_name, call.tool_call_id, parent)
     try:
         result = await _call_tool(handler, _tool_args(call))
-    except Exception as exc:  # surfaced to the model so it can recover or explain
-        return ai.tool_result_part(
-            call.tool_call_id,
-            tool_name=call.tool_name,
-            result=str(exc),
-            is_error=True,
-        )
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            # Surface ordinary tool failures to the model so it can recover.
+            fail_span(tool_span, exc)
+            return ai.tool_result_part(
+                call.tool_call_id,
+                tool_name=call.tool_name,
+                result=str(exc),
+                is_error=True,
+            )
+        tool_span.set_attribute("launchdarkly.run.cancelled", True)
+        tool_span.end()
+        raise
+    mark_ok(tool_span)
+    tool_span.end()
     return ai.tool_result_part(
         call.tool_call_id, tool_name=call.tool_name, result=result
     )
@@ -251,10 +273,8 @@ def _tools(cfg: AiConfigRep, handlers: dict[str, Any] | None) -> list[Any]:
     return result
 
 
-def _python_type(schema: dict[str, Any]) -> Any:
+def _python_type(schema: dict[str, Any], name: str) -> Any:
     kind = schema.get("type")
-    if kind == "string":
-        return str
     if kind == "integer":
         return int
     if kind == "number":
@@ -262,21 +282,26 @@ def _python_type(schema: dict[str, Any]) -> Any:
     if kind == "boolean":
         return bool
     if kind == "array":
-        return list[Any]
-    return Any
+        items = schema.get("items")
+        item_type = (
+            _python_type(items, f"{name}Item") if isinstance(items, dict) else str
+        )
+        return list[item_type]  # type: ignore[valid-type]
+    if kind == "object" or schema.get("properties"):
+        return _output_type(schema, name=f"{name}Object")
+    # Strict structured output rejects untyped members.
+    return str
 
 
-def _output_type(schema: dict[str, Any]) -> type[BaseModel]:
-    required = set(schema.get("required") or [])
-    fields: dict[str, Any] = {}
-    for name, field_schema in (schema.get("properties") or {}).items():
-        typ = _python_type(field_schema)
-        fields[name] = (typ, ... if name in required else None)
-    return create_model(
-        "VercelStructuredOutput",
-        __config__=ConfigDict(extra="allow"),
-        **fields,
-    )
+def _output_type(
+    schema: dict[str, Any], *, name: str = "VercelStructuredOutput"
+) -> type[BaseModel]:
+    """Build the strict Pydantic model required by structured-output providers."""
+    fields: dict[str, Any] = {
+        field: (_python_type(field_schema, field.title().replace("_", "")), ...)
+        for field, field_schema in (schema.get("properties") or {}).items()
+    }
+    return create_model(name, __config__=ConfigDict(extra="forbid"), **fields)
 
 
 def _usage(stream: Any) -> dict[str, int]:
@@ -298,45 +323,6 @@ def _text_delta(event: Any) -> str | None:
     return None
 
 
-def _start_span(cfg: AiConfigRep, variables: dict[str, Any]) -> Any:
-    span = trace.get_tracer("@launchdarkly/ai-vercel-messages").start_span(
-        "invoke_agent"
-    )
-    provider = str(cfg.get("provider", {}).get("name") or "vercel").lower()
-    model = str(cfg.get("model", {}).get("name") or "")
-    span.set_attribute("gen_ai.operation.name", "invoke_agent")
-    span.set_attribute("gen_ai.system", provider)
-    span.set_attribute("gen_ai.provider.name", provider)
-    span.set_attribute("gen_ai.request.model", model)
-    set_ld_span_attributes(span, variables)
-    return span
-
-
-def _start_model_span(cfg: AiConfigRep, root: Any) -> Any:
-    model = str(cfg.get("model", {}).get("name") or "")
-    provider = str(cfg.get("provider", {}).get("name") or "vercel").lower()
-    span = trace.get_tracer("@launchdarkly/ai-vercel-messages").start_span(
-        f"chat {model}", context=trace.set_span_in_context(root)
-    )
-    span.set_attribute("gen_ai.operation.name", "chat")
-    span.set_attribute("gen_ai.system", provider)
-    span.set_attribute("gen_ai.provider.name", provider)
-    span.set_attribute("gen_ai.request.model", model)
-    return span
-
-
-def _set_usage(span: Any, usage: dict[str, int]) -> None:
-    input_tokens = usage["input_tokens"]
-    output_tokens = usage["output_tokens"]
-    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-    span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-    span.set_attribute("gen_ai.usage.total_tokens", input_tokens + output_tokens)
-    span.set_attribute("gen_ai.usage.prompt_tokens", input_tokens)
-    span.set_attribute("gen_ai.usage.completion_tokens", output_tokens)
-    span.set_attribute("gen_ai.usage.cache_read.input_tokens", 0)
-    span.set_attribute("gen_ai.usage.cache_creation.input_tokens", 0)
-
-
 async def _run_conversation(
     cfg: AiConfigRep,
     model: ModelSource | None,
@@ -344,6 +330,7 @@ async def _run_conversation(
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None,
     tool_handlers: dict[str, Any] | None,
+    parent: Any,
     *,
     structured: bool,
 ) -> AsyncGenerator[dict[str, Any], None]:
@@ -395,7 +382,7 @@ async def _run_conversation(
                 },
             }
             return
-        results = [await _tool_result(call, executors) for call in calls]
+        results = [await _tool_result(call, executors, parent) for call in calls]
         messages = [*messages, message, ai.tool_message(*results)]
     raise RuntimeError(
         f"Vercel messages run did not reach a final response within {MAX_STEPS} steps"
@@ -415,35 +402,48 @@ def create_vercel_messages_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         vs = variables or {}
-        span = _start_span(cfg, vs)
-        model_span = _start_model_span(cfg, span)
+        span = start_root_span(cfg, vs)
+        parent = parent_context_of(span)
+        model_span = start_model_span(cfg, parent)
+        failed = False
         try:
             text = ""
             usage = {"input_tokens": 0, "output_tokens": 0}
             async with aclosing(
                 _run_conversation(
-                    cfg, model, user_input, vs, history, tool_handlers, structured=True
+                    cfg,
+                    model,
+                    user_input,
+                    vs,
+                    history,
+                    tool_handlers,
+                    parent,
+                    structured=True,
                 )
             ) as events:
                 async for event in events:
                     if event["type"] == "done":
                         text = event["output"]
                         usage = event["usage"]
-            _set_usage(model_span, usage)
-            _set_usage(span, usage)
-            model_span.set_status(StatusCode.OK)
-            span.set_status(StatusCode.OK)
+            span_usage = SpanUsage(
+                input=usage["input_tokens"], output=usage["output_tokens"]
+            )
+            response_model = model_name(cfg)
+            finish_model_span(model_span, response_model, span_usage)
+            finish_root_span(span, response_model, span_usage)
+            mark_ok(model_span)
+            mark_ok(span)
             return {"output": text, "usage": usage}
         except BaseException as exc:
             if isinstance(exc, Exception):
-                model_span.record_exception(exc)
-                model_span.set_status(StatusCode.ERROR, str(exc))
-                span.record_exception(exc)
-                span.set_status(StatusCode.ERROR, str(exc))
+                failed = True
+                fail_span(model_span, exc)
+                fail_span(span, exc)
             raise
         finally:
-            model_span.end()
-            span.end()
+            if not failed:
+                model_span.end()
+                span.end()
 
     async def stream(
         cfg: AiConfigRep,
@@ -453,9 +453,11 @@ def create_vercel_messages_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         vs = variables or {}
-        span = _start_span(cfg, vs)
-        model_span = _start_model_span(cfg, span)
+        span = start_root_span(cfg, vs)
+        parent = parent_context_of(span)
+        model_span = start_model_span(cfg, parent)
         completed = False
+        failed = False
         try:
             output = ""
             usage = {"input_tokens": 0, "output_tokens": 0}
@@ -463,7 +465,14 @@ def create_vercel_messages_handler(
             # stream's context rather than leaving it open until finalization.
             async with aclosing(
                 _run_conversation(
-                    cfg, model, user_input, vs, history, tool_handlers, structured=False
+                    cfg,
+                    model,
+                    user_input,
+                    vs,
+                    history,
+                    tool_handlers,
+                    parent,
+                    structured=False,
                 )
             ) as events:
                 async for event in events:
@@ -473,24 +482,28 @@ def create_vercel_messages_handler(
                     completed = True
                     output = event["output"]
                     usage = event["usage"]
-            _set_usage(model_span, usage)
-            _set_usage(span, usage)
-            model_span.set_status(StatusCode.OK)
-            span.set_status(StatusCode.OK)
+            span_usage = SpanUsage(
+                input=usage["input_tokens"], output=usage["output_tokens"]
+            )
+            response_model = model_name(cfg)
+            finish_model_span(model_span, response_model, span_usage)
+            finish_root_span(span, response_model, span_usage)
+            mark_ok(model_span)
+            mark_ok(span)
             yield {"type": "done", "output": output, "usage": usage}
         except BaseException as exc:
             if isinstance(exc, Exception):
-                model_span.record_exception(exc)
-                model_span.set_status(StatusCode.ERROR, str(exc))
-                span.record_exception(exc)
-                span.set_status(StatusCode.ERROR, str(exc))
+                failed = True
+                fail_span(model_span, exc)
+                fail_span(span, exc)
             raise
         finally:
-            if not completed:
+            if not completed and not failed:
                 model_span.set_attribute("launchdarkly.stream.abandoned", True)
                 span.set_attribute("launchdarkly.stream.abandoned", True)
-            model_span.end()
-            span.end()
+            if not failed:
+                model_span.end()
+                span.end()
 
     return create_handler(
         ("*", "messages"),

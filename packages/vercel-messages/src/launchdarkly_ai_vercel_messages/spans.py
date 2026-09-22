@@ -60,6 +60,11 @@ def finish_root_span(span: Any, response_model: str, usage: SpanUsage) -> None:
     set_usage_span_attributes(span, usage)
 
 
+def finish_model_span(span: Any, response_model: str, usage: SpanUsage) -> None:
+    span.set_attribute("gen_ai.response.model", response_model)
+    set_usage_span_attributes(span, usage)
+
+
 def succeed_span(span: Any) -> None:
     span.set_status(StatusCode.OK)
     span.end()
