@@ -29,9 +29,6 @@ _exporter = InMemorySpanExporter()
 _provider = TracerProvider()
 _provider.add_span_processor(ConversationIdSpanProcessor())
 _provider.add_span_processor(SimpleSpanProcessor(_exporter))
-# Same as the JS suite's setGlobalTracerProvider: SDK code uses trace.get_tracer(), so the
-# test provider must be global or ld.ai.graph spans never reach this exporter.
-trace.set_tracer_provider(_provider)
 _tracer = _provider.get_tracer("@launchdarkly/ai-server")
 
 
@@ -187,7 +184,12 @@ def mock_ld_client() -> Iterator[MagicMock]:
 @pytest.fixture(autouse=True)
 def _reset_exporter() -> Iterator[None]:
     _exporter.clear()
-    yield
+    # Hand the SDK this file's tracer without touching the global provider:
+    # set_tracer_provider is process-wide and first-writer-wins, and another package's
+    # suite already claims it at import time, so registering here exports nothing.
+    # graph.py imports `trace` inside its functions, so the seam is get_tracer itself.
+    with patch.object(trace, "get_tracer", return_value=_tracer):
+        yield
     _exporter.clear()
 
 
@@ -352,7 +354,9 @@ class TestGraphStream:
     async def test_tracks_invocation_failure_and_rethrows(
         self, mock_ld_client: MagicMock
     ) -> None:
-        async def fn(config, user_input, tool_handlers, variables, history=None) -> dict:  # type: ignore[override]
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
             return {"output": "x", "usage": {"input_tokens": 1, "output_tokens": 1}}
 
         async def stream_fn(
@@ -485,7 +489,9 @@ class TestGraphStreamMultiEdge:
         sanitized = "agent_a"
         _usage = {"input_tokens": 1, "output_tokens": 1}
 
-        async def fn(config, user_input, tool_handlers, variables, history=None) -> dict:  # type: ignore[override]
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
             return {"output": "ok", "usage": _usage}
 
         async def stream_fn(
@@ -555,14 +561,18 @@ class TestGraphStreamMultiEdge:
         await graph("graph-key", handlers=[invoke_h]).invoke("hi", CONTEXT)
         invoke_cfg, invoke_tools = invoke_received[0]
 
-        assert stream_cfg["tools"]["__handoff_agent_a"]["description"] == invoke_cfg[
-            "tools"
-        ]["__handoff_agent_a"]["description"]
-        assert stream_cfg["tools"]["__handoff_agent_b"]["description"] == invoke_cfg[
-            "tools"
-        ]["__handoff_agent_b"]["description"]
+        assert (
+            stream_cfg["tools"]["__handoff_agent_a"]["description"]
+            == invoke_cfg["tools"]["__handoff_agent_a"]["description"]
+        )
+        assert (
+            stream_cfg["tools"]["__handoff_agent_b"]["description"]
+            == invoke_cfg["tools"]["__handoff_agent_b"]["description"]
+        )
         assert stream_cfg["instructions"] == invoke_cfg["instructions"]
-        assert stream_tools["__handoff_agent_b"]() == invoke_tools["__handoff_agent_b"]()
+        assert (
+            stream_tools["__handoff_agent_b"]() == invoke_tools["__handoff_agent_b"]()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -575,9 +585,9 @@ class TestGraphStreamOtel:
         self, mock_ld_client: MagicMock
     ) -> None:
         with conversation_id("thread-graph-stream"):
-            gen = graph(
-                "graph-key", handlers=[_span_creating_stream_handler()]
-            ).stream("hi", CONTEXT)
+            gen = graph("graph-key", handlers=[_span_creating_stream_handler()]).stream(
+                "hi", CONTEXT
+            )
         await _collect(gen)
 
         graph_spans = [s for s in _finished() if s.name == "ld.ai.graph"]
@@ -611,7 +621,9 @@ class TestGraphStreamOtel:
     async def test_handler_spans_nest_under_graph_on_invoke(
         self, mock_ld_client: MagicMock
     ) -> None:
-        async def fn(config, user_input, tool_handlers, variables, history=None) -> dict:  # type: ignore[override]
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
             root = _tracer.start_span("handler.invoke_agent")
             with trace.use_span(root, end_on_exit=False):
                 chat = _tracer.start_span("handler.chat")
@@ -636,9 +648,9 @@ class TestGraphStreamOtel:
     ) -> None:
         caller = _tracer.start_span("caller")
         with trace.use_span(caller, end_on_exit=False):
-            gen = graph(
-                "graph-key", handlers=[_make_streaming_handler(["ok"])]
-            ).stream("hi", CONTEXT)
+            gen = graph("graph-key", handlers=[_make_streaming_handler(["ok"])]).stream(
+                "hi", CONTEXT
+            )
         caller.end()
         await _collect(gen)
 
@@ -648,9 +660,9 @@ class TestGraphStreamOtel:
         assert graph_spans[0].parent.span_id == caller.get_span_context().span_id
 
     async def test_abandoned_on_consumer_break(self, mock_ld_client: MagicMock) -> None:
-        gen = graph(
-            "graph-key", handlers=[_make_streaming_handler(["a", "b"])]
-        ).stream("hi", CONTEXT)
+        gen = graph("graph-key", handlers=[_make_streaming_handler(["a", "b"])]).stream(
+            "hi", CONTEXT
+        )
         async for event in gen:
             if event["type"] == "chunk":
                 break

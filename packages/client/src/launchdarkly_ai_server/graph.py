@@ -49,12 +49,6 @@ def _disabled_definition(key: str) -> GraphDefinition:
     async def _route_disabled(*args: Any, **kwargs: Any) -> Any:
         raise ValueError(f'Agent graph "{key}" is disabled')
 
-    async def _stream_route_disabled(
-        *args: Any, **kwargs: Any
-    ) -> AsyncGenerator[GraphStreamEvent, None]:
-        raise ValueError(f'Agent graph "{key}" is disabled')
-        yield  # pragma: no cover
-
     return GraphDefinition(
         key=key,
         enabled=False,
@@ -67,10 +61,22 @@ def _disabled_definition(key: str) -> GraphDefinition:
         edges_from=lambda k: [],
         run_node=_run_node_disabled,
         route=_route_disabled,
-        stream_route=_stream_route_disabled,
         traverse=_traverse_noop,
         reverse_traverse=_traverse_noop,
     )
+
+
+def _disabled_stream_route(key: str) -> Callable[..., Any]:
+    """The ``stream_route`` a disabled graph gets. Kept beside the definition it
+    pairs with, but off ``GraphDefinition`` — see ``_build_graph``'s return."""
+
+    async def _stream_route_disabled(
+        *args: Any, **kwargs: Any
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        raise ValueError(f'Agent graph "{key}" is disabled')
+        yield  # pragma: no cover
+
+    return _stream_route_disabled
 
 
 async def _fetch_graph_variation(
@@ -99,7 +105,7 @@ async def _build_graph(
     key: str,
     context: LDContext,
     options: dict[str, Any],
-) -> tuple[GraphDefinition, TrackData]:
+) -> tuple[GraphDefinition, TrackData, Callable[..., Any]]:
     from .judges import run_judges
     from .lifecycle import extract_variation, get_client
     from .tracking import execute_and_track
@@ -123,7 +129,11 @@ async def _build_graph(
     }
 
     if not enabled or not topology:
-        return _disabled_definition(key), graph_track_data
+        return (
+            _disabled_definition(key),
+            graph_track_data,
+            _disabled_stream_route(key),
+        )
 
     raw_edges_map: dict[str, list[dict[str, Any]]] = topology.get("edges") or {}
     edges: list[GraphEdge] = []
@@ -162,7 +172,11 @@ async def _build_graph(
             )
     except Exception as exc:
         logger.error("Graph node variation failed: %s", exc)
-        return _disabled_definition(key), graph_track_data
+        return (
+            _disabled_definition(key),
+            graph_track_data,
+            _disabled_stream_route(key),
+        )
 
     root_node = nodes.get(topology["root"])
 
@@ -792,12 +806,11 @@ async def _build_graph(
         edges_from=edges_from,
         run_node=run_node,
         route=route,
-        stream_route=stream_route,
         traverse=traverse,
         reverse_traverse=reverse_traverse,
     )
 
-    return graph_def, graph_track_data
+    return graph_def, graph_track_data, stream_route
 
 
 async def resolve_graph(
@@ -822,7 +835,7 @@ async def resolve_graph(
         "tool_handlers": resolved_tools,
         "registry": registry,
     }
-    graph_def, _ = await _build_graph(key, context, options)
+    graph_def, _, _ = await _build_graph(key, context, options)
     return graph_def
 
 
@@ -836,7 +849,9 @@ class GraphInstance:
     ) -> None:
         self._key = key
         self._options = options
-        self._cache: dict[str, tuple[GraphDefinition, TrackData]] = {}
+        self._cache: dict[
+            str, tuple[GraphDefinition, TrackData, Callable[..., Any]]
+        ] = {}
 
     async def invoke(
         self,
@@ -883,7 +898,7 @@ class GraphInstance:
                     # Evict an arbitrary entry to keep the cache bounded.
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[cache_key] = built
-        graph_def, graph_track_data = built
+        graph_def, graph_track_data, _ = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
@@ -1042,9 +1057,7 @@ class GraphInstance:
 
         caller_context = otel_context.get_current()
         return bind_conversation_id(
-            self._stream_events(
-                user_input, context, variables, history, caller_context
-            )
+            self._stream_events(user_input, context, variables, history, caller_context)
         )
 
     async def _stream_events(
@@ -1095,7 +1108,7 @@ class GraphInstance:
                 if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[cache_key] = built
-        graph_def, graph_track_data = built
+        graph_def, graph_track_data, stream_route = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
@@ -1131,9 +1144,7 @@ class GraphInstance:
 
                 outcome: dict[str, Any] = {}
                 async for event in bind_span_context(
-                    graph_def.stream_route(
-                        current, current_input, route_opts, outcome
-                    ),
+                    stream_route(current, current_input, route_opts, outcome),
                     span_context,
                 ):
                     yield event
@@ -1252,7 +1263,6 @@ class GraphInstance:
             raise
         finally:
             end_span_once(span, ended, abandoned=True)
-
 
 
 def graph(

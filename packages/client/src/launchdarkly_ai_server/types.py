@@ -400,7 +400,6 @@ class GraphDefinition:
         edges_from: Callable[[str], list[GraphEdge]],
         run_node: Callable[..., Any],
         route: Callable[..., Any],
-        stream_route: Callable[..., Any],
         traverse: Callable[..., Any],
         reverse_traverse: Callable[..., Any],
     ) -> None:
@@ -415,7 +414,6 @@ class GraphDefinition:
         self.edges_from = edges_from
         self.run_node = run_node
         self.route = route
-        self.stream_route = stream_route
         self.traverse = traverse
         self.reverse_traverse = reverse_traverse
 
