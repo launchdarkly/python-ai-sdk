@@ -120,6 +120,45 @@ result = await init_evaluations().run(
 
 Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge or one no handler covers fails the run up front rather than after the generation spend. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
 
+### Give the evaluation tools
+
+Pass `tools` to `run()` to make tools available to the handler. Each entry is either a tool that already exists in your project's AI library — a bare callable or a `NativeTool`, resolved by key and pinned to its current version in the run record — or an `InlineTool` that carries its own `schema` and `description`, letting you define a tool in code without creating it in LaunchDarkly first. A single map can mix both.
+
+```python
+from launchdarkly_ai_server import InlineTool, init_evaluations
+
+
+def lookup_order(order_id: str) -> str:
+    return f"order {order_id} shipped"
+
+
+result = await init_evaluations().run(
+    project_key="my-project",
+    key="support-qa-2026-08-20",
+    dataset="support-golden",
+    handler=create_openai_messages_handler(),
+    generation={"provider": "OpenAI", "model": "gpt-4o"},
+    tools={
+        # Resolved from the AI library and recorded as v<N>.
+        "search_docs": search_docs,
+        # Defined here and recorded as inline; no ai-tools entry needed.
+        "lookup_order": InlineTool(
+            implementation=lookup_order,
+            schema={
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+            description="Look up an order by id",
+        ),
+    },
+)
+```
+
+An inline definition reads nothing from the tool API, so a key that does not exist in LaunchDarkly is no longer an error. Handlers receive the same `{key: callable}` map whichever source a tool came from — an `InlineTool` is unwrapped before the handler sees it — so handler code needs no changes to use one.
+
+**Inline definitions are checked before any network I/O.** A blank key, a `schema` that is not a JSON object, one that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued, because a bad inline value is a mistake in your code and is cheapest to reject while no evaluation record exists. A library tool's missing key can only fail after its `GET`. A key may name a library tool or an inline definition but not both — the run record badges each tool one way or the other, so one key carrying both identities is rejected. A `NativeTool` may not be paired with an inline definition: the provider implements that tool and it has no schema of its own, so there is nothing for an inline schema to describe.
+
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 
 Call `init_client()` explicitly when you want to:

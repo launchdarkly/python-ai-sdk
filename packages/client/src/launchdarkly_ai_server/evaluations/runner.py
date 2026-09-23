@@ -41,6 +41,7 @@ from .types import (
     EvaluationRef,
     EvaluationRunRef,
     GenerationConfig,
+    InlineTool,
     ResolvedJudge,
     ResolvedTool,
     RunSummary,
@@ -54,6 +55,12 @@ CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
+# What ``run(tools=...)`` accepts. A bare callable or ``NativeTool`` names a tool
+# in the LaunchDarkly AI library, to be resolved by key; an ``InlineTool``
+# carries its own definition. ``ToolImplementation`` stays the narrower
+# handler-facing type: a handler only ever receives executables, never
+# definitions.
+ToolEntry = ToolImplementation | InlineTool
 
 
 @dataclass(frozen=True)
@@ -178,6 +185,111 @@ def _required_string(data: Mapping[str, Any], key: str, description: str) -> str
     return value
 
 
+def _validate_inline_tool(key: str, tool: InlineTool) -> None:
+    """Check one inline tool definition, issuing no requests.
+
+    Held to a stricter standard than the library path on purpose. A library
+    tool's ``description`` and ``schema`` are LaunchDarkly's data, which
+    ``_resolve_tools`` coerces rather than failing a run over; an inline
+    definition is the caller's own, and rejecting a bad one costs nothing here
+    because no evaluation record exists yet. The same value reaching the wire
+    unchecked would instead surface as an opaque create failure, or as a
+    handler receiving a schema no model can use.
+    """
+    if isinstance(tool.implementation, NativeTool):
+        raise EvaluationsError(
+            f"Inline tool {key!r} cannot pair a NativeTool with an inline "
+            "definition. A provider-native tool is implemented by the provider "
+            "and has no schema of its own, so there is nothing for an inline "
+            "schema to describe. Pass the NativeTool on its own to use the "
+            "provider capability, or an InlineTool wrapping your own function."
+        )
+    if not callable(tool.implementation):
+        raise EvaluationsError(
+            f"Inline tool {key!r} implementation must be callable, got "
+            f"{type(tool.implementation).__name__}"
+        )
+    if not isinstance(tool.schema, Mapping):
+        raise EvaluationsError(
+            f"Inline tool {key!r} schema must be a JSON object, got "
+            f"{type(tool.schema).__name__}"
+        )
+    try:
+        # allow_nan=False because the default encoder emits NaN and Infinity,
+        # which are not JSON and which the API rejects -- after the request has
+        # already been issued, where the cause is no longer obvious.
+        json.dumps(dict(tool.schema), allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise EvaluationsError(
+            f"Inline tool {key!r} schema must be JSON-serializable: {error}"
+        ) from error
+    if not isinstance(tool.description, str):
+        raise EvaluationsError(
+            f"Inline tool {key!r} description must be a string, got "
+            f"{type(tool.description).__name__}"
+        )
+
+
+def _validate_tools(tools: Mapping[str, ToolEntry]) -> None:
+    """Check the whole tools map before any request is issued.
+
+    Every check here runs with zero requests recorded, so a mistyped argument
+    never leaves a half-built run behind: the library path's own failure (a 404
+    on the ``ai-tools`` GET) can only fire once a request has gone out, and an
+    inline definition never issues one at all.
+    """
+    keys_by_identity: dict[str, str] = {}
+    inline_identities: set[str] = set()
+    for key, entry in tools.items():
+        if not isinstance(key, str) or not key.strip():
+            raise EvaluationsError("tool keys must not be blank")
+        if isinstance(entry, InlineTool):
+            is_inline = True
+            _validate_inline_tool(key, entry)
+        else:
+            is_inline = False
+            if not callable(entry) and not isinstance(entry, NativeTool):
+                raise EvaluationsError(
+                    f"Tool {key!r} must be callable, a NativeTool instance, or "
+                    "an InlineTool"
+                )
+        # A tool key is one identity per run: it resolves either to a library
+        # tool or to an inline definition, never both. The run record badges
+        # each tool "inline" or "v<N>", so a key carrying both would record one
+        # tool twice under conflicting identities. Compared case-insensitively
+        # only when an inline definition is involved -- two library keys that
+        # differ by case are two library lookups and stay the API's business.
+        identity = key.strip().lower()
+        collision = keys_by_identity.get(identity)
+        if collision is not None and (is_inline or identity in inline_identities):
+            if collision == key:
+                raise EvaluationsError(
+                    f"Tool {key!r} is defined more than once in tools. An "
+                    "inline definition and a library tool cannot share a key."
+                )
+            raise EvaluationsError(
+                f"Tool {key!r} collides with {collision!r}: both name the same "
+                "tool in one run, and one of them is an inline definition. A "
+                "tool key resolves either to a LaunchDarkly AI library tool or "
+                "to an inline definition, never both."
+            )
+        keys_by_identity[identity] = key
+        if is_inline:
+            inline_identities.add(identity)
+
+
+def _tool_handlers(tools: Mapping[str, ToolEntry]) -> dict[str, ToolImplementation]:
+    """Unwrap the tools map into the executables a handler is passed.
+
+    Handlers receive the same ``{key: executable}`` shape whichever source a
+    tool came from, so an inline definition is invisible to them.
+    """
+    return {
+        key: entry.implementation if isinstance(entry, InlineTool) else entry
+        for key, entry in tools.items()
+    }
+
+
 class ConcurrencyController:
     """Owns row-worker permits."""
 
@@ -217,16 +329,30 @@ class EvaluationsRunner:
     def _resolve_tools(
         self,
         project_key: str,
-        tools: Mapping[str, ToolImplementation],
+        tools: Mapping[str, ToolEntry],
     ) -> dict[str, ResolvedTool]:
+        """Resolve each tool in the map to the definition the run will record.
+
+        A library entry is fetched from ``ai-tools`` to pin its version and read
+        its definition. An inline entry already carries its definition, so no
+        request is issued for it at all -- that absence is the whole point of
+        the feature, since it is what lets a caller use a tool that was never
+        created in LaunchDarkly.
+
+        Shape validation belongs to ``_validate_tools``, which ``run()`` calls
+        before any I/O; by the time a request goes out every entry in the map is
+        already known to be well-formed.
+        """
         resolved: dict[str, ResolvedTool] = {}
-        for key, implementation in tools.items():
-            if not callable(implementation) and not isinstance(
-                implementation, NativeTool
-            ):
-                raise EvaluationsError(
-                    f"Tool {key!r} must be callable or a NativeTool instance"
+        for key, entry in tools.items():
+            if isinstance(entry, InlineTool):
+                resolved[key] = ResolvedTool(
+                    key=key,
+                    description=entry.description,
+                    schema=dict(entry.schema),
+                    source="inline",
                 )
+                continue
             path = f"projects/{_segment(project_key)}/ai-tools/{_segment(key)}"
             try:
                 raw = _mapping(self._api.get(path), description=f"tool {key!r}")
@@ -447,9 +573,7 @@ class EvaluationsRunner:
         if "prompt_snippets" in generation:
             body["promptSnippets"] = generation["prompt_snippets"]
         if tools:
-            body["tools"] = [
-                {"key": tool.key, "version": tool.version} for tool in tools.values()
-            ]
+            body["tools"] = [tool.to_create_wire() for tool in tools.values()]
         if criteria:
             body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
 

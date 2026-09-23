@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from launchdarkly_ai_server import create_handler
+from launchdarkly_ai_server import NativeTool, create_handler
 from launchdarkly_ai_server.evaluations import (
     DatasetRow,
     EvaluationsError,
     HttpResponse,
+    InlineTool,
     Judge,
     Scorer,
     init_evaluations,
@@ -116,6 +117,10 @@ async def successful_handler(
 
 def lookup_order(order_id: str) -> str:
     return order_id
+
+
+def refund_order(order_id: str) -> str:
+    return f"refunded {order_id}"
 
 
 @pytest.mark.asyncio
@@ -276,7 +281,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "generationModel": "gpt-4o",
         "parameters": {"temperature": 0.2},
         "messages": [{"role": "system", "content": "Help the user."}],
-        "tools": [{"key": "lookup_order", "version": 7}],
+        "tools": [{"key": "lookup_order", "version": 7, "source": "library"}],
     }
     assert transport.requests[5]["url"].endswith(
         "/api/v2/projects/proj/evaluations/11111111-1111-1111-1111-111111111111/runs"
@@ -908,6 +913,448 @@ async def test_missing_tool_aborts_before_any_mutating_request() -> None:
         )
 
     assert [request["method"] for request in transport.requests] == ["GET"]
+
+
+ORDER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"order_id": {"type": "string"}},
+    "required": ["order_id"],
+}
+
+
+def recorded_paths(transport: SequencedTransport) -> list[tuple[str, str]]:
+    """The recorded requests as ``(method, path)`` pairs, query strings dropped."""
+    return [
+        (
+            request["method"],
+            request["url"].split("/api/v2/", 1)[-1].split("?", 1)[0],
+        )
+        for request in transport.requests
+    ]
+
+
+def hosted_dataset_responses() -> list[HttpResponse]:
+    """Canned responses for a one-row hosted dataset run that passes."""
+    return [
+        response(200, {"id": "dataset-id", "name": "golden"}),
+        response(
+            200,
+            dataset_page(
+                [{"rowIndex": 0, "input": "Order A19", "variables": {}}], total=1
+            ),
+        ),
+        response(201, {"id": "evaluation-id", "name": "eval-key", "version": 3}),
+        response(
+            201,
+            {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+        ),
+        response(
+            200,
+            {
+                "statusCounts": {
+                    "total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "error": 0,
+                    "pending": 0,
+                }
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inline_tool_runs_without_reading_the_tool_api() -> None:
+    transport = SequencedTransport(hosted_dataset_responses())
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, Any] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["config_tools"] = config["tools"]
+        seen["tool_handlers"] = tool_handlers
+        return {"output": "ok"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools={
+            "lookup_order": InlineTool(
+                implementation=lookup_order,
+                schema=ORDER_SCHEMA,
+                description="Look up an order",
+            )
+        },
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert result.passed is True
+    # The full sequence, so a stray request anywhere in the run is visible.
+    assert recorded_paths(transport) == [
+        ("GET", "projects/proj/datasets/golden"),
+        ("GET", "projects/proj/datasets/golden/rows"),
+        ("POST", "projects/proj/evaluations"),
+        ("POST", "projects/proj/evaluations/evaluation-id/runs"),
+        ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
+    ]
+    # Asserted explicitly rather than left to the sequence above: a transport
+    # that tolerated a surplus request would not fail on a stray tool GET, and
+    # skipping that request is the whole point of an inline definition.
+    assert not any("/ai-tools" in request["url"] for request in transport.requests), (
+        "an inline tool must not be looked up in the AI library"
+    )
+
+    assert transport.requests[2]["body"]["tools"] == [
+        {
+            "key": "lookup_order",
+            "schema": ORDER_SCHEMA,
+            "description": "Look up an order",
+            "source": "inline",
+        }
+    ]
+    # Same config shape a library tool produces, fed from the inline body, so a
+    # handler cannot tell the two sources apart.
+    assert seen["config_tools"] == {
+        "lookup_order": {
+            "description": "Look up an order",
+            "parameters": ORDER_SCHEMA,
+        }
+    }
+    # The handler is passed the executable, not the definition wrapping it.
+    assert seen["tool_handlers"] == {"lookup_order": lookup_order}
+
+
+@pytest.mark.asyncio
+async def test_inline_tool_description_defaults_to_empty_string() -> None:
+    transport = SequencedTransport(hosted_dataset_responses())
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools={"lookup_order": InlineTool(lookup_order, ORDER_SCHEMA)},
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert transport.requests[2]["body"]["tools"] == [
+        {
+            "key": "lookup_order",
+            "schema": ORDER_SCHEMA,
+            "description": "",
+            "source": "inline",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> None:
+    transport = SequencedTransport(
+        [
+            response(
+                200,
+                {
+                    "key": "lookup_order",
+                    "version": 7,
+                    "description": "Look up an order",
+                    "schema": {"type": "object"},
+                },
+            ),
+            *hosted_dataset_responses(),
+        ]
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, Any] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["config_tools"] = config["tools"]
+        seen["tool_handlers"] = tool_handlers
+        return {"output": "ok"}
+
+    await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools={
+            "lookup_order": lookup_order,
+            "refund_order": InlineTool(
+                implementation=refund_order,
+                schema=ORDER_SCHEMA,
+                description="Refund an order",
+            ),
+        },
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    # Exactly one tool GET, for the library key only.
+    assert [
+        path for method, path in recorded_paths(transport) if "ai-tools" in path
+    ] == ["projects/proj/ai-tools/lookup_order"]
+    assert transport.requests[3]["body"]["tools"] == [
+        {"key": "lookup_order", "version": 7, "source": "library"},
+        {
+            "key": "refund_order",
+            "schema": ORDER_SCHEMA,
+            "description": "Refund an order",
+            "source": "inline",
+        },
+    ]
+    assert seen["config_tools"] == {
+        "lookup_order": {
+            "description": "Look up an order",
+            "parameters": {"type": "object"},
+        },
+        "refund_order": {
+            "description": "Refund an order",
+            "parameters": ORDER_SCHEMA,
+        },
+    }
+    assert seen["tool_handlers"] == {
+        "lookup_order": lookup_order,
+        "refund_order": refund_order,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "match"),
+    [
+        pytest.param(
+            {"  ": InlineTool(lookup_order, ORDER_SCHEMA)},
+            "must not be blank",
+            id="blank_key",
+        ),
+        pytest.param(
+            {"": lookup_order},
+            "must not be blank",
+            id="blank_library_key",
+        ),
+        pytest.param(
+            {"lookup_order": InlineTool(lookup_order, None)},  # type: ignore[arg-type]
+            "schema must be a JSON object",
+            id="schema_is_none",
+        ),
+        pytest.param(
+            {"lookup_order": InlineTool(lookup_order, [{"type": "object"}])},  # type: ignore[arg-type]
+            "schema must be a JSON object",
+            id="schema_is_a_list",
+        ),
+        pytest.param(
+            {"lookup_order": InlineTool(lookup_order, {"default": object()})},
+            "schema must be JSON-serializable",
+            id="schema_is_not_serializable",
+        ),
+        pytest.param(
+            {"lookup_order": InlineTool(lookup_order, {"default": float("nan")})},
+            "schema must be JSON-serializable",
+            id="schema_holds_nan",
+        ),
+        pytest.param(
+            {"lookup_order": InlineTool(lookup_order, {"default": float("inf")})},
+            "schema must be JSON-serializable",
+            id="schema_holds_infinity",
+        ),
+        pytest.param(
+            {"lookup_order": InlineTool("not a function", ORDER_SCHEMA)},  # type: ignore[arg-type]
+            "implementation must be callable",
+            id="implementation_is_not_callable",
+        ),
+        pytest.param(
+            {"lookup_order": InlineTool(lookup_order, ORDER_SCHEMA, None)},  # type: ignore[arg-type]
+            "description must be a string",
+            id="description_is_not_a_string",
+        ),
+        pytest.param(
+            {"lookup_order": "not a tool"},  # type: ignore[dict-item]
+            "must be callable, a NativeTool instance, or an InlineTool",
+            id="entry_is_neither",
+        ),
+    ],
+)
+async def test_bad_tool_entry_is_rejected_with_zero_requests(
+    tools: dict[str, Any], match: str
+) -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=match):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools=tools,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_native_tool_paired_with_an_inline_definition_is_rejected() -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=r"lookup_order.*NativeTool"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools={
+                "lookup_order": InlineTool(
+                    implementation=NativeTool("WebSearch"),  # type: ignore[arg-type]
+                    schema=ORDER_SCHEMA,
+                )
+            },
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"key": "web_search", "version": 2}),
+            *hosted_dataset_responses(),
+        ]
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools={"web_search": NativeTool("WebSearch")},
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert recorded_paths(transport)[0] == ("GET", "projects/proj/ai-tools/web_search")
+    assert transport.requests[3]["body"]["tools"] == [
+        {"key": "web_search", "version": 2, "source": "library"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inline_key_that_also_names_a_library_tool_is_rejected() -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=r"Lookup_Order.*lookup_order"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools={
+                "lookup_order": lookup_order,
+                "Lookup_Order": InlineTool(lookup_order, ORDER_SCHEMA),
+            },
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_two_library_keys_differing_only_by_case_are_still_two_lookups() -> None:
+    """The collision rule is inline-only; library keys stay the API's business."""
+    transport = SequencedTransport(
+        [
+            response(200, {"key": "lookup_order", "version": 7}),
+            response(200, {"key": "Lookup_Order", "version": 1}),
+            *hosted_dataset_responses(),
+        ]
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools={"lookup_order": lookup_order, "Lookup_Order": refund_order},
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert [
+        path for method, path in recorded_paths(transport) if "ai-tools" in path
+    ] == [
+        "projects/proj/ai-tools/lookup_order",
+        "projects/proj/ai-tools/Lookup_Order",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_key_across_sources_is_rejected_with_zero_requests() -> (
+    None
+):
+    """A Mapping may yield a key twice; collapsing it first would hide that."""
+
+    class DuplicateKeyMapping(Mapping[str, Any]):
+        def __init__(self, entries: list[tuple[str, Any]]) -> None:
+            self._entries = entries
+
+        def __getitem__(self, key: str) -> Any:
+            for candidate, value in self._entries:
+                if candidate == key:
+                    return value
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(key for key, _ in self._entries)
+
+        def __len__(self) -> int:
+            return len(self._entries)
+
+        def items(self) -> Any:  # type: ignore[override]
+            return list(self._entries)
+
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    tools = DuplicateKeyMapping(
+        [
+            ("lookup_order", lookup_order),
+            ("lookup_order", InlineTool(lookup_order, ORDER_SCHEMA)),
+        ]
+    )
+
+    with pytest.raises(EvaluationsError, match="defined more than once"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools=tools,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio
