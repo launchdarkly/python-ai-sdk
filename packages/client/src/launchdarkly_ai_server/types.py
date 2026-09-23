@@ -327,6 +327,14 @@ StreamChunkEvent = dict[str, Any]  # {"type": "chunk", "text": str}
 StreamDoneEvent = dict[str, Any]  # {"type": "done", "response": str, "usage": ..., ...}
 StreamEvent = dict[str, Any]  # StreamChunkEvent | StreamDoneEvent
 
+# Graph stream events (camelCase public fields, matching the TypeScript SDK)
+# node_start: {type, nodeKey}
+# chunk: {type, text, nodeKey}
+# node_done: {type, nodeKey, response, usage}
+# handoff: {type, sourceKey, targetKey}
+# done: {type, response, usage, judgeResults?}
+GraphStreamEvent = dict[str, Any]
+
 # Internal execute stream event that also carries track_data
 ExecuteStreamDoneEvent = dict[str, Any]
 ExecuteStreamEvent = dict[str, Any]
@@ -392,6 +400,7 @@ class GraphDefinition:
         edges_from: Callable[[str], list[GraphEdge]],
         run_node: Callable[..., Any],
         route: Callable[..., Any],
+        stream_route: Callable[..., Any],
         traverse: Callable[..., Any],
         reverse_traverse: Callable[..., Any],
     ) -> None:
@@ -406,6 +415,7 @@ class GraphDefinition:
         self.edges_from = edges_from
         self.run_node = run_node
         self.route = route
+        self.stream_route = stream_route
         self.traverse = traverse
         self.reverse_traverse = reverse_traverse
 

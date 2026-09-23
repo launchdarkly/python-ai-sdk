@@ -6,15 +6,17 @@ import logging
 import re as _re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .conversation import bind_conversation_id, bind_span_context
 from .registry import resolve_handlers, resolve_tools
 from .types import (
     AiConfigRep,
     GraphDefinition,
     GraphEdge,
     GraphNode,
+    GraphStreamEvent,
     JudgeResult,
     LDContext,
     NativeTool,
@@ -24,7 +26,7 @@ from .types import (
     UsageDict,
     VariationMeta,
 )
-from .utils import model_stamps_from_meta, select_handler, to_ld_context
+from .utils import end_span_once, model_stamps_from_meta, select_handler, to_ld_context
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,8 @@ MAX_GRAPH_CACHE_SIZE = 512
 
 
 def _sanitize_name(key: str) -> str:
-    return _re.sub(r"[^a-z0-9_-]", "_", key, flags=_re.IGNORECASE)[:64]
+    # Match TS sanitizeName: hyphens become underscores (tool names must be [a-zA-Z0-9_]).
+    return _re.sub(r"[^a-zA-Z0-9_]", "_", key)[:64]
 
 
 def _disabled_definition(key: str) -> GraphDefinition:
@@ -45,6 +48,12 @@ def _disabled_definition(key: str) -> GraphDefinition:
 
     async def _route_disabled(*args: Any, **kwargs: Any) -> Any:
         raise ValueError(f'Agent graph "{key}" is disabled')
+
+    async def _stream_route_disabled(
+        *args: Any, **kwargs: Any
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        raise ValueError(f'Agent graph "{key}" is disabled')
+        yield  # pragma: no cover
 
     return GraphDefinition(
         key=key,
@@ -58,6 +67,7 @@ def _disabled_definition(key: str) -> GraphDefinition:
         edges_from=lambda k: [],
         run_node=_run_node_disabled,
         route=_route_disabled,
+        stream_route=_stream_route_disabled,
         traverse=_traverse_noop,
         reverse_traverse=_traverse_noop,
     )
@@ -259,35 +269,13 @@ async def _build_graph(
                 )
             raise
 
-    # ── route ─────────────────────────────────────────────────────────────────
-    # For nodes with zero/one outgoing edge, delegates to run_node and returns
-    # the sole successor as `next`. For multi-edge nodes, injects synthetic
-    # handoff tools so the model picks the next agent. Mirrors TS route().
+    # ── build_handoff_routing ─────────────────────────────────────────────────
+    # Shared by route and stream_route so multi-edge descriptions stay identical.
 
-    async def route(
+    def build_handoff_routing(
         node: GraphNode,
-        input: str = "",
-        opts: dict[str, Any] | None = None,
+        out_edges: list[GraphEdge],
     ) -> dict[str, Any]:
-        opts = opts or {}
-        handlers: list[ProviderHandler] = options.get("handlers") or []
-        if not handlers:
-            raise ValueError(
-                "route is not available when no handlers were provided — use a "
-                "framework-native runner (to_openai_agents, to_lang_graph, to_claude_agents) instead."
-            )
-
-        out_edges = edges_from(node.key)
-
-        # Zero/one outgoing edge: run node directly; report sole child as next.
-        if len(out_edges) <= 1:
-            res = await run_node(node, input, opts)
-            next_node = nodes.get(out_edges[0].target_key) if out_edges else None
-            return {**res, "next": next_node}
-
-        handler = select_handler(node.config, node.meta, handlers, strict=False)
-        tool_handlers = opts.get("tool_handlers") or options.get("tool_handlers")
-
         chosen: list[str] = []
         handoff_tools: dict[str, Any] = {}
         handoff_handlers: dict[str, Any] = {}
@@ -332,7 +320,7 @@ async def _build_graph(
 
             handoff_handlers[tool_name] = _make_handoff_fn(target_key)
 
-        route_config: AiConfigRep = {
+        routed_config: AiConfigRep = {
             **node.config,
             "instructions": (
                 (node.config.get("instructions") or "")
@@ -348,12 +336,52 @@ async def _build_graph(
             },
         }
 
+        return {
+            "routed_config": routed_config,
+            "handoff_handlers": handoff_handlers,
+            "chosen": lambda: chosen[0] if chosen else None,
+        }
+
+    # ── route ─────────────────────────────────────────────────────────────────
+    # For nodes with zero/one outgoing edge, delegates to run_node and returns
+    # the sole successor as `next`. For multi-edge nodes, injects synthetic
+    # handoff tools so the model picks the next agent. Mirrors TS route().
+
+    async def route(
+        node: GraphNode,
+        input: str = "",
+        opts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        opts = opts or {}
+        handlers: list[ProviderHandler] = options.get("handlers") or []
+        if not handlers:
+            raise ValueError(
+                "route is not available when no handlers were provided — use a "
+                "framework-native runner (to_openai_agents, to_lang_graph, to_claude_agents) instead."
+            )
+
+        out_edges = edges_from(node.key)
+
+        # Zero/one outgoing edge: run node directly; report sole child as next.
+        if len(out_edges) <= 1:
+            res = await run_node(node, input, opts)
+            next_node = nodes.get(out_edges[0].target_key) if out_edges else None
+            return {**res, "next": next_node}
+
+        handler = select_handler(node.config, node.meta, handlers, strict=False)
+        tool_handlers = opts.get("tool_handlers") or options.get("tool_handlers")
+
+        routing = build_handoff_routing(node, out_edges)
+        routed_config = routing["routed_config"]
+        handoff_handlers = routing["handoff_handlers"]
+        chosen = routing["chosen"]
+
         merged_tool_handlers = {**(tool_handlers or {}), **handoff_handlers}
 
         try:
             result = await execute_and_track(
                 config_key=node.key,
-                config=route_config,
+                config=routed_config,
                 meta=node.meta,
                 user_context=context,
                 handler=handler,
@@ -382,7 +410,8 @@ async def _build_graph(
                 graph_key=key,
             )
 
-            next_node = nodes.get(chosen[0]) if chosen else None
+            chosen_key = chosen()
+            next_node = nodes.get(chosen_key) if chosen_key else None
 
             if next_node:
                 get_client().track(
@@ -403,14 +432,279 @@ async def _build_graph(
                 "next": next_node,
             }
         except Exception:
-            if chosen:
+            chosen_key = chosen()
+            if chosen_key:
                 get_client().track(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
                         **graph_track_data,
                         "sourceKey": node.key,
-                        "targetKey": chosen[0],
+                        "targetKey": chosen_key,
+                    },
+                    1,
+                )
+            raise
+
+    # ── stream_node / stream_route ────────────────────────────────────────────
+    # Streaming counterparts to run_node / route. Python async generators cannot
+    # return a value (unlike JS yield*), so callers pass an ``outcome`` dict that
+    # is populated with the ProviderResponse / RouteResult fields when done.
+
+    async def stream_node(
+        node: GraphNode,
+        input: str = "",
+        opts: dict[str, Any] | None = None,
+        outcome: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        from .tracking import execute_and_stream
+
+        opts = opts or {}
+        handlers: list[ProviderHandler] = options.get("handlers") or []
+        if not handlers:
+            raise ValueError(
+                "stream_node is not available when no handlers were provided — use a "
+                "framework-native runner (to_openai_agents, to_lang_graph, to_claude_agents) instead."
+            )
+        handler = select_handler(node.config, node.meta, handlers, strict=False)
+        tool_handlers = opts.get("tool_handlers") or options.get("tool_handlers")
+        from_node: GraphNode | None = opts.get("from")
+
+        yield {"type": "node_start", "nodeKey": node.key}
+
+        try:
+            response = ""
+            usage: dict[str, Any] = {"input": 0, "output": 0, "total": 0}
+            track_data: TrackData = {
+                "runId": str(uuid.uuid4()),
+                "configKey": node.key,
+                "variationKey": (
+                    node.meta.get("variationKey", "")
+                    if isinstance(node.meta, dict)
+                    else ""
+                ),
+                "version": (
+                    node.meta.get("version", 1) if isinstance(node.meta, dict) else 1
+                ),
+                "modelName": (node.config.get("model") or {}).get("name", ""),
+                "providerName": (node.config.get("provider") or {}).get("name", ""),
+                "graphKey": key,
+            }
+
+            async for event in execute_and_stream(
+                config_key=node.key,
+                config=node.config,
+                meta=node.meta,
+                user_context=context,
+                handler=handler,
+                user_input=input,
+                tool_handlers=tool_handlers,
+                variables=opts.get("variables"),
+                graph_key=key,
+                history=opts.get("history"),
+            ):
+                if event.get("type") == "chunk":
+                    yield {
+                        "type": "chunk",
+                        "text": event["text"],
+                        "nodeKey": node.key,
+                    }
+                else:
+                    response = event.get("response", "")
+                    usage = event.get("usage") or usage
+                    track_data = event.get("track_data") or track_data
+
+            judge_results = await run_judges(
+                config=node.config,
+                user_context=context,
+                handler=handler,
+                handlers=handlers,
+                user_input=input,
+                llm_response=response,
+                base_track_data=track_data,
+                tool_handlers=tool_handlers,
+                graph_key=key,
+            )
+
+            if from_node:
+                get_client().track(
+                    "$ld:ai:graph:handoff_success",
+                    ld_ctx,
+                    {
+                        **graph_track_data,
+                        "sourceKey": from_node.key,
+                        "targetKey": node.key,
+                    },
+                    1,
+                )
+
+            yield {
+                "type": "node_done",
+                "nodeKey": node.key,
+                "response": response,
+                "usage": usage,
+            }
+            if outcome is not None:
+                outcome.clear()
+                outcome.update(
+                    {
+                        "response": response,
+                        "usage": usage,
+                        "judge_results": judge_results,
+                        "track_data": track_data,
+                    }
+                )
+        except Exception:
+            if from_node:
+                get_client().track(
+                    "$ld:ai:graph:handoff_failure",
+                    ld_ctx,
+                    {
+                        **graph_track_data,
+                        "sourceKey": from_node.key,
+                        "targetKey": node.key,
+                    },
+                    1,
+                )
+            raise
+
+    async def stream_route(
+        node: GraphNode,
+        input: str = "",
+        opts: dict[str, Any] | None = None,
+        outcome: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        from .tracking import execute_and_stream
+
+        opts = opts or {}
+        handlers: list[ProviderHandler] = options.get("handlers") or []
+        if not handlers:
+            raise ValueError(
+                "stream_route is not available when no handlers were provided — use a "
+                "framework-native runner (to_openai_agents, to_lang_graph, to_claude_agents) instead."
+            )
+
+        out_edges = edges_from(node.key)
+
+        if len(out_edges) <= 1:
+            node_outcome: dict[str, Any] = {}
+            async for event in stream_node(node, input, opts, node_outcome):
+                yield event
+            next_node = nodes.get(out_edges[0].target_key) if out_edges else None
+            if outcome is not None:
+                outcome.clear()
+                outcome.update({**node_outcome, "next": next_node})
+            return
+
+        handler = select_handler(node.config, node.meta, handlers, strict=False)
+        tool_handlers = opts.get("tool_handlers") or options.get("tool_handlers")
+
+        routing = build_handoff_routing(node, out_edges)
+        routed_config = routing["routed_config"]
+        handoff_handlers = routing["handoff_handlers"]
+        chosen = routing["chosen"]
+
+        yield {"type": "node_start", "nodeKey": node.key}
+
+        try:
+            response = ""
+            usage: dict[str, Any] = {"input": 0, "output": 0, "total": 0}
+            track_data: TrackData = {
+                "runId": str(uuid.uuid4()),
+                "configKey": node.key,
+                "variationKey": (
+                    node.meta.get("variationKey", "")
+                    if isinstance(node.meta, dict)
+                    else ""
+                ),
+                "version": (
+                    node.meta.get("version", 1) if isinstance(node.meta, dict) else 1
+                ),
+                "modelName": (node.config.get("model") or {}).get("name", ""),
+                "providerName": (node.config.get("provider") or {}).get("name", ""),
+                "graphKey": key,
+            }
+
+            merged_tool_handlers = {**(tool_handlers or {}), **handoff_handlers}
+
+            async for event in execute_and_stream(
+                config_key=node.key,
+                config=routed_config,
+                meta=node.meta,
+                user_context=context,
+                handler=handler,
+                user_input=input,
+                tool_handlers=merged_tool_handlers,
+                variables=opts.get("variables"),
+                graph_key=key,
+                history=opts.get("history"),
+            ):
+                if event.get("type") == "chunk":
+                    yield {
+                        "type": "chunk",
+                        "text": event["text"],
+                        "nodeKey": node.key,
+                    }
+                else:
+                    response = event.get("response", "")
+                    usage = event.get("usage") or usage
+                    track_data = event.get("track_data") or track_data
+
+            # Judge against the node's original config, not the routing-augmented one.
+            judge_results = await run_judges(
+                config=node.config,
+                user_context=context,
+                handler=handler,
+                handlers=handlers,
+                user_input=input,
+                llm_response=response,
+                base_track_data=track_data,
+                tool_handlers=tool_handlers,
+                graph_key=key,
+            )
+
+            chosen_key = chosen()
+            next_node = nodes.get(chosen_key) if chosen_key else None
+
+            if next_node:
+                get_client().track(
+                    "$ld:ai:graph:handoff_success",
+                    ld_ctx,
+                    {
+                        **graph_track_data,
+                        "sourceKey": node.key,
+                        "targetKey": next_node.key,
+                    },
+                    1,
+                )
+
+            yield {
+                "type": "node_done",
+                "nodeKey": node.key,
+                "response": response,
+                "usage": usage,
+            }
+            if outcome is not None:
+                outcome.clear()
+                outcome.update(
+                    {
+                        "response": response,
+                        "usage": usage,
+                        "judge_results": judge_results,
+                        "track_data": track_data,
+                        "next": next_node,
+                    }
+                )
+        except Exception:
+            chosen_key = chosen()
+            if chosen_key:
+                get_client().track(
+                    "$ld:ai:graph:handoff_failure",
+                    ld_ctx,
+                    {
+                        **graph_track_data,
+                        "sourceKey": node.key,
+                        "targetKey": chosen_key,
                     },
                     1,
                 )
@@ -498,6 +792,7 @@ async def _build_graph(
         edges_from=edges_from,
         run_node=run_node,
         route=route,
+        stream_route=stream_route,
         traverse=traverse,
         reverse_traverse=reverse_traverse,
     )
@@ -550,6 +845,8 @@ class GraphInstance:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> ProviderGraphResponse:
+        from opentelemetry import trace
+
         from .judges import run_judges
         from .lifecycle import get_client
 
@@ -591,10 +888,227 @@ class GraphInstance:
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
 
+        tracer = trace.get_tracer("@launchdarkly/ai-server")
+        with tracer.start_as_current_span("ld.ai.graph") as span:
+            span.set_attribute("ld.ai.graph.key", self._key)
+
+            start_time = time.monotonic()
+            path: list[str] = []
+            total_usage = {"input": 0, "output": 0, "total": 0}
+            resolved_input = user_input or ""
+
+            try:
+                current: GraphNode | None = graph_def.root
+                previous_node: GraphNode | None = None
+                current_input = resolved_input
+                last: dict[str, Any] | None = None
+                visited: set[str] = set()
+                steps = 0
+
+                while current and steps < MAX_TRAVERSAL_DEPTH:
+                    steps += 1
+                    opts: dict[str, Any] = {"variables": variables}
+                    if previous_node:
+                        opts["from"] = previous_node
+                    # History seeds the entry point only. After the root hop, nodes
+                    # stay oriented through the string threading built below, so
+                    # history is not re-sent to downstream handlers.
+                    elif history:
+                        opts["history"] = history
+
+                    res = await graph_def.route(current, current_input, opts)
+                    path.append(current.key)
+                    total_usage["input"] += (
+                        res["usage"].get("input", 0)
+                        if isinstance(res["usage"], dict)
+                        else 0
+                    )
+                    total_usage["output"] += (
+                        res["usage"].get("output", 0)
+                        if isinstance(res["usage"], dict)
+                        else 0
+                    )
+                    total_usage["total"] += (
+                        res["usage"].get("total", 0)
+                        if isinstance(res["usage"], dict)
+                        else 0
+                    )
+                    last = res
+
+                    next_node = res.get("next")
+                    if not next_node or next_node.key in visited:
+                        break
+                    visited.add(current.key)
+                    previous_node = current
+                    current = next_node
+                    current_input = "\n\n".join(
+                        [
+                            f"[Original request]\n{resolved_input}",
+                            f"[Previous agent response]\n{res['response']}",
+                        ]
+                    )
+
+                final_response = (last or {}).get("response", "")
+
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                client = get_client()
+                client.track(
+                    "$ld:ai:graph:duration:total", ld_ctx, graph_track_data, elapsed_ms
+                )
+                if total_usage["total"] > 0:
+                    client.track(
+                        "$ld:ai:graph:total_tokens",
+                        ld_ctx,
+                        graph_track_data,
+                        total_usage["total"],
+                    )
+                client.track(
+                    "$ld:ai:graph:path",
+                    ld_ctx,
+                    {**graph_track_data, "path": path},
+                    len(path),
+                )
+                client.track(
+                    "$ld:ai:graph:invocation_success", ld_ctx, graph_track_data, 1
+                )
+
+                # Optional graph-level judge run against the final response.
+                judge_results: dict[str, JudgeResult] | None = None
+                graph_judge: str | None = resolved_options.get("graph_judge")
+                root_node = graph_def.root
+                if graph_judge and root_node and resolved_handlers:
+                    judge_handler = select_handler(
+                        root_node.config,
+                        root_node.meta,
+                        resolved_handlers,
+                        strict=False,
+                    )
+                    judge_results = await run_judges(
+                        config={
+                            "judgeConfiguration": {
+                                "judges": [{"key": graph_judge, "samplingRate": 1}]
+                            }
+                        },
+                        user_context=context,
+                        handler=judge_handler,
+                        handlers=resolved_handlers,
+                        user_input=resolved_input,
+                        llm_response=final_response,
+                        base_track_data=graph_track_data,
+                        tool_handlers=resolved_tools,
+                        graph_key=self._key,
+                    )
+
+                return ProviderGraphResponse(
+                    response=final_response,
+                    # Named rather than splatted, so a new UsageDict member cannot silently arrive
+                    # here from a dict that has no business filling it. Graph totals carry no cache
+                    # breakdown: they are a sum across nodes, and the per-node detail is on the node's
+                    # own spans.
+                    usage=UsageDict(
+                        input=total_usage["input"],
+                        output=total_usage["output"],
+                        total=total_usage["total"],
+                    ),
+                    judge_results=judge_results,
+                )
+
+            except Exception:
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                client = get_client()
+                client.track(
+                    "$ld:ai:graph:duration:total", ld_ctx, graph_track_data, elapsed_ms
+                )
+                client.track(
+                    "$ld:ai:graph:invocation_failure", ld_ctx, graph_track_data, 1
+                )
+                raise
+
+    def stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        """Stream graph traversal events.
+
+        Deliberately not an ``async def`` with ``yield``: a generator body does not run until the
+        first ``__anext__``, by which point a ``conversation_id`` / caller span scope wrapped around
+        this call may have already exited. Binding the conversation id and capturing the OTel parent
+        here — at call time — matches ``config().stream()`` and the TypeScript graph stream.
+        """
+        from opentelemetry import context as otel_context
+
+        caller_context = otel_context.get_current()
+        return bind_conversation_id(
+            self._stream_events(
+                user_input, context, variables, history, caller_context
+            )
+        )
+
+    async def _stream_events(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None,
+        history: list[dict[str, Any]] | None,
+        caller_context: Any,
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        from opentelemetry import context as otel_context
+        from opentelemetry import trace
+        from opentelemetry.trace import Status, StatusCode, set_span_in_context
+
+        from .judges import run_judges
+        from .lifecycle import get_client
+
+        resolved_input = user_input or ""
+        ld_ctx = to_ld_context(get_client(), context)
+
+        resolved_handlers = resolve_handlers(
+            self._options.get("registry"), self._options.get("handlers")
+        )
+        resolved_tools = resolve_tools(
+            self._options.get("registry"), self._options.get("tool_handlers")
+        )
+        resolved_options = {
+            **self._options,
+            "handlers": resolved_handlers,
+            "tool_handlers": resolved_tools,
+        }
+
+        if not resolved_handlers:
+            raise ValueError(
+                "graph().stream() requires handlers to be provided. Pass handlers in options, or "
+                "use resolve_graph() with a framework-native runner."
+            )
+
+        try:
+            cache_key: str | None = json.dumps(context, sort_keys=True)
+        except (TypeError, ValueError):
+            cache_key = None
+        if cache_key is not None and cache_key in self._cache:
+            built = self._cache[cache_key]
+        else:
+            built = await _build_graph(self._key, context, resolved_options)
+            if cache_key is not None:
+                if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
+                    self._cache.pop(next(iter(self._cache)))
+                self._cache[cache_key] = built
+        graph_def, graph_track_data = built
+
+        if not graph_def.enabled:
+            raise ValueError(f'Agent graph "{self._key}" is disabled')
+
+        tracer = trace.get_tracer("@launchdarkly/ai-server")
+        span = tracer.start_span("ld.ai.graph", context=caller_context)
+        span.set_attribute("ld.ai.graph.key", self._key)
+        span_context = set_span_in_context(span, caller_context)
+        ended: set[int] = set()
         start_time = time.monotonic()
+
         path: list[str] = []
         total_usage = {"input": 0, "output": 0, "total": 0}
-        resolved_input = user_input or ""
 
         try:
             current: GraphNode | None = graph_def.root
@@ -606,44 +1120,54 @@ class GraphInstance:
 
             while current and steps < MAX_TRAVERSAL_DEPTH:
                 steps += 1
-                opts: dict[str, Any] = {"variables": variables}
+                route_opts: dict[str, Any] = {"variables": variables}
                 if previous_node:
-                    opts["from"] = previous_node
+                    route_opts["from"] = previous_node
                 # History seeds the entry point only. After the root hop, nodes
                 # stay oriented through the string threading built below, so
                 # history is not re-sent to downstream handlers.
                 elif history:
-                    opts["history"] = history
+                    route_opts["history"] = history
 
-                res = await graph_def.route(current, current_input, opts)
+                outcome: dict[str, Any] = {}
+                async for event in bind_span_context(
+                    graph_def.stream_route(
+                        current, current_input, route_opts, outcome
+                    ),
+                    span_context,
+                ):
+                    yield event
+
                 path.append(current.key)
+                usage = outcome.get("usage") or {}
                 total_usage["input"] += (
-                    res["usage"].get("input", 0)
-                    if isinstance(res["usage"], dict)
-                    else 0
+                    usage.get("input", 0) if isinstance(usage, dict) else 0
                 )
                 total_usage["output"] += (
-                    res["usage"].get("output", 0)
-                    if isinstance(res["usage"], dict)
-                    else 0
+                    usage.get("output", 0) if isinstance(usage, dict) else 0
                 )
                 total_usage["total"] += (
-                    res["usage"].get("total", 0)
-                    if isinstance(res["usage"], dict)
-                    else 0
+                    usage.get("total", 0) if isinstance(usage, dict) else 0
                 )
-                last = res
+                last = outcome
 
-                next_node = res.get("next")
+                next_node = outcome.get("next")
                 if not next_node or next_node.key in visited:
                     break
+
+                yield {
+                    "type": "handoff",
+                    "sourceKey": current.key,
+                    "targetKey": next_node.key,
+                }
+
                 visited.add(current.key)
                 previous_node = current
                 current = next_node
                 current_input = "\n\n".join(
                     [
                         f"[Original request]\n{resolved_input}",
-                        f"[Previous agent response]\n{res['response']}",
+                        f"[Previous agent response]\n{outcome.get('response', '')}",
                     ]
                 )
 
@@ -669,55 +1193,66 @@ class GraphInstance:
             )
             client.track("$ld:ai:graph:invocation_success", ld_ctx, graph_track_data, 1)
 
-            # Optional graph-level judge run against the final response.
             judge_results: dict[str, JudgeResult] | None = None
             graph_judge: str | None = resolved_options.get("graph_judge")
             root_node = graph_def.root
             if graph_judge and root_node and resolved_handlers:
-                judge_handler = select_handler(
-                    root_node.config,
-                    root_node.meta,
-                    resolved_handlers,
-                    strict=False,
-                )
-                judge_results = await run_judges(
-                    config={
-                        "judgeConfiguration": {
-                            "judges": [{"key": graph_judge, "samplingRate": 1}]
-                        }
-                    },
-                    user_context=context,
-                    handler=judge_handler,
-                    handlers=resolved_handlers,
-                    user_input=resolved_input,
-                    llm_response=final_response,
-                    base_track_data=graph_track_data,
-                    tool_handlers=resolved_tools,
-                    graph_key=self._key,
-                )
+                # Re-enter the graph span explicitly. bind_span_context only covers the
+                # delegated per-node generator; this call runs in the generator body.
+                token = otel_context.attach(span_context)
+                try:
+                    judge_handler = select_handler(
+                        root_node.config,
+                        root_node.meta,
+                        resolved_handlers,
+                        strict=False,
+                    )
+                    results = await run_judges(
+                        config={
+                            "judgeConfiguration": {
+                                "judges": [{"key": graph_judge, "samplingRate": 1}]
+                            }
+                        },
+                        user_context=context,
+                        handler=judge_handler,
+                        handlers=resolved_handlers,
+                        user_input=resolved_input,
+                        llm_response=final_response,
+                        base_track_data=graph_track_data,
+                        tool_handlers=resolved_tools,
+                        graph_key=self._key,
+                    )
+                finally:
+                    otel_context.detach(token)
+                if results:
+                    judge_results = results
 
-            return ProviderGraphResponse(
-                response=final_response,
-                # Named rather than splatted, so a new UsageDict member cannot silently arrive
-                # here from a dict that has no business filling it. Graph totals carry no cache
-                # breakdown: they are a sum across nodes, and the per-node detail is on the node's
-                # own spans.
-                usage=UsageDict(
-                    input=total_usage["input"],
-                    output=total_usage["output"],
-                    total=total_usage["total"],
-                ),
-                judge_results=judge_results,
-            )
+            span.set_status(Status(StatusCode.OK))
+            end_span_once(span, ended)
 
-        except Exception:
+            done_event: GraphStreamEvent = {
+                "type": "done",
+                "response": final_response,
+                "usage": total_usage,
+            }
+            if judge_results:
+                done_event["judgeResults"] = judge_results
+            yield done_event
+
+        except Exception as err:
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
             client = get_client()
             client.track(
                 "$ld:ai:graph:duration:total", ld_ctx, graph_track_data, elapsed_ms
             )
             client.track("$ld:ai:graph:invocation_failure", ld_ctx, graph_track_data, 1)
+            span.record_exception(err)
+            span.set_status(Status(StatusCode.ERROR, str(err)))
+            end_span_once(span, ended)
             raise
+        finally:
+            end_span_once(span, ended, abandoned=True)
+
 
 
 def graph(
