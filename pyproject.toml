@@ -34,6 +34,14 @@ pythonpath = ["."]
 strict = true
 python_version = "3.12"
 
+# google-adk 2.9.2 caps opentelemetry-sdk<=1.42.1, which this workspace cannot
+# solve next to opentelemetry-exporter-otlp-proto-http>=1.43. The handler
+# imports ADK lazily and unit tests patch those names. Install google-adk in
+# the application environment; typechecking here does not require it.
+[[tool.mypy.overrides]]
+module = ["google", "google.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 target-version = "py312"
 line-length = 88
@@ -61,6 +69,7 @@ known-first-party = [
   "launchdarkly_ai_server",
   "launchdarkly_ai_claude_agents",
   "launchdarkly_ai_claude_messages",
+  "launchdarkly_ai_google_adk_agents",
   "launchdarkly_ai_langchain_agents",
   "launchdarkly_ai_langchain_messages",
   "launchdarkly_ai_openai_agents",
