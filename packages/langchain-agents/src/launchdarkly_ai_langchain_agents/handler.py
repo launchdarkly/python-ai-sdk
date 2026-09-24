@@ -44,6 +44,14 @@ from .spans import (
     to_tool_definitions,
 )
 
+#: Handler-owned, per model class. The handler always sets the model itself, and each
+#: class exposes that one constructor field under two names (the field and its alias), so a
+#: config value for either must never be forwarded: it would collide with the model the
+#: handler resolves, or override it.
+_CHAT_OPENAI_OWNED_KEYS = frozenset({"model", "model_name"})
+_CHAT_ANTHROPIC_OWNED_KEYS = frozenset({"model", "model_name"})
+_CHAT_BEDROCK_CONVERSE_OWNED_KEYS = frozenset({"model", "model_id"})
+
 #: Every key ``ChatOpenAI`` accepts (field names plus pydantic aliases), classified by hand into
 #: exactly one of: forwarded (below), handler-owned (``model``, always overwritten by the
 #: resolved model name, see ``_model_constructor_kwargs``), or excluded. ``TestChatOpenAIAccepts
@@ -81,7 +89,6 @@ _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
         "max_tokens",
         "metadata",
         "model_kwargs",
-        "model_name",
         "n",
         "name",
         "output_version",
@@ -164,7 +171,6 @@ _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
         "mcp_servers",
         "metadata",
         "model_kwargs",
-        "model_name",
         "name",
         "output_config",
         "output_version",
@@ -230,7 +236,6 @@ _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS = frozenset(
         "guardrails",
         "max_tokens",
         "metadata",
-        "model_id",
         "name",
         "output_config",
         "output_version",

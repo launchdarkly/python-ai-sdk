@@ -23,15 +23,15 @@ import pytest
 from launchdarkly_ai_langchain_messages.handler import (
     _CHAT_ANTHROPIC_EXCLUDED_KEYS,
     _CHAT_ANTHROPIC_FORWARDED_KEYS,
+    _CHAT_ANTHROPIC_OWNED_KEYS,
     _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS,
     _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
+    _CHAT_BEDROCK_CONVERSE_OWNED_KEYS,
     _CHAT_OPENAI_EXCLUDED_KEYS,
     _CHAT_OPENAI_FORWARDED_KEYS,
+    _CHAT_OPENAI_OWNED_KEYS,
+    _model_constructor_kwargs,
 )
-
-#: Handler-owned on every model: always overwritten by the resolved model name after the filter
-#: runs, see ``_model_constructor_kwargs``.
-_OWNED_KEYS = frozenset({"model"})
 
 
 def _accepted_keys(cls: Any) -> frozenset[str]:
@@ -58,7 +58,9 @@ class TestChatOpenAIAcceptsExactlyTheseKeys:
     def test_every_accepted_key_is_classified_exactly_once(self) -> None:
         accepted = _accepted_keys(langchain_openai.ChatOpenAI)
         classified = (
-            _CHAT_OPENAI_FORWARDED_KEYS | _OWNED_KEYS | _CHAT_OPENAI_EXCLUDED_KEYS
+            _CHAT_OPENAI_FORWARDED_KEYS
+            | _CHAT_OPENAI_OWNED_KEYS
+            | _CHAT_OPENAI_EXCLUDED_KEYS
         )
 
         unclassified = accepted - classified
@@ -68,16 +70,18 @@ class TestChatOpenAIAcceptsExactlyTheseKeys:
         )
 
         overlap = (
-            (_CHAT_OPENAI_FORWARDED_KEYS & _OWNED_KEYS)
+            (_CHAT_OPENAI_FORWARDED_KEYS & _CHAT_OPENAI_OWNED_KEYS)
             | (_CHAT_OPENAI_FORWARDED_KEYS & _CHAT_OPENAI_EXCLUDED_KEYS)
-            | (_OWNED_KEYS & _CHAT_OPENAI_EXCLUDED_KEYS)
+            | (_CHAT_OPENAI_OWNED_KEYS & _CHAT_OPENAI_EXCLUDED_KEYS)
         )
         assert not overlap, f"keys classified more than once: {sorted(overlap)}"
 
     def test_every_classified_key_is_real(self) -> None:
         accepted = _accepted_keys(langchain_openai.ChatOpenAI)
         stale = (
-            _CHAT_OPENAI_FORWARDED_KEYS | _OWNED_KEYS | _CHAT_OPENAI_EXCLUDED_KEYS
+            _CHAT_OPENAI_FORWARDED_KEYS
+            | _CHAT_OPENAI_OWNED_KEYS
+            | _CHAT_OPENAI_EXCLUDED_KEYS
         ) - accepted
         assert not stale, (
             f"{sorted(stale)} classified in langchain-messages handler.py but "
@@ -89,7 +93,9 @@ class TestChatAnthropicAcceptsExactlyTheseKeys:
     def test_every_accepted_key_is_classified_exactly_once(self) -> None:
         accepted = _accepted_keys(langchain_anthropic.ChatAnthropic)
         classified = (
-            _CHAT_ANTHROPIC_FORWARDED_KEYS | _OWNED_KEYS | _CHAT_ANTHROPIC_EXCLUDED_KEYS
+            _CHAT_ANTHROPIC_FORWARDED_KEYS
+            | _CHAT_ANTHROPIC_OWNED_KEYS
+            | _CHAT_ANTHROPIC_EXCLUDED_KEYS
         )
 
         unclassified = accepted - classified
@@ -101,7 +107,9 @@ class TestChatAnthropicAcceptsExactlyTheseKeys:
     def test_every_classified_key_is_real(self) -> None:
         accepted = _accepted_keys(langchain_anthropic.ChatAnthropic)
         stale = (
-            _CHAT_ANTHROPIC_FORWARDED_KEYS | _OWNED_KEYS | _CHAT_ANTHROPIC_EXCLUDED_KEYS
+            _CHAT_ANTHROPIC_FORWARDED_KEYS
+            | _CHAT_ANTHROPIC_OWNED_KEYS
+            | _CHAT_ANTHROPIC_EXCLUDED_KEYS
         ) - accepted
         assert not stale, (
             f"{sorted(stale)} classified in langchain-messages handler.py but "
@@ -115,7 +123,7 @@ class TestChatBedrockConverseAcceptsExactlyTheseKeys:
         accepted = _accepted_keys(lc_aws.ChatBedrockConverse)
         classified = (
             _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS
-            | _OWNED_KEYS
+            | _CHAT_BEDROCK_CONVERSE_OWNED_KEYS
             | _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS
         )
 
@@ -130,10 +138,45 @@ class TestChatBedrockConverseAcceptsExactlyTheseKeys:
         accepted = _accepted_keys(lc_aws.ChatBedrockConverse)
         stale = (
             _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS
-            | _OWNED_KEYS
+            | _CHAT_BEDROCK_CONVERSE_OWNED_KEYS
             | _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS
         ) - accepted
         assert not stale, (
             f"{sorted(stale)} classified in langchain-messages handler.py but "
             "ChatBedrockConverse does not accept them"
         )
+
+
+class TestModelFieldAliasesAreNeverForwarded:
+    """``model_name`` / ``model_id`` are the same constructor field as ``model``. A config value
+    for them must not be forwarded, or it would collide with the model the handler resolves."""
+
+    def _config(self, provider: str, parameters: dict[str, Any]) -> Any:
+        return {
+            "model": {"name": "configured-model", "parameters": parameters},
+            "provider": {"name": provider},
+        }
+
+    def test_openai_model_name_is_dropped(self) -> None:
+        kwargs = _model_constructor_kwargs(
+            self._config("openai", {"model_name": "other", "temperature": 0.2}),
+            "fallback",
+            _CHAT_OPENAI_FORWARDED_KEYS,
+        )
+        assert kwargs == {"model": "configured-model", "temperature": 0.2}
+
+    def test_anthropic_model_name_is_dropped(self) -> None:
+        kwargs = _model_constructor_kwargs(
+            self._config("anthropic", {"model_name": "other", "temperature": 0.2}),
+            "fallback",
+            _CHAT_ANTHROPIC_FORWARDED_KEYS,
+        )
+        assert kwargs == {"model": "configured-model", "temperature": 0.2}
+
+    def test_bedrock_model_id_is_dropped(self) -> None:
+        kwargs = _model_constructor_kwargs(
+            self._config("bedrock", {"model_id": "other", "temperature": 0.2}),
+            "fallback",
+            _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
+        )
+        assert kwargs == {"model": "configured-model", "temperature": 0.2}
