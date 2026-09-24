@@ -2582,9 +2582,12 @@ async def test_non_string_model_config_key_fails_loudly(
 
 
 @pytest.mark.asyncio
-async def test_variation_without_a_model_config_needs_an_explicit_provider() -> None:
+@pytest.mark.parametrize("model_config_key", [None, ""])
+async def test_variation_without_a_model_config_needs_an_explicit_provider(
+    model_config_key: str | None,
+) -> None:
     transport = SequencedTransport(
-        [response(200, config_variation_page(modelConfigKey=None))]
+        [response(200, config_variation_page(modelConfigKey=model_config_key))]
     )
     evals = init_evaluations(api_token="token", transport=transport)
 

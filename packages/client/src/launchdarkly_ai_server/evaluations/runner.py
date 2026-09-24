@@ -258,12 +258,12 @@ class EvaluationsRunner:
         # Anything other than a string is a response we do not understand.
         model_config: Mapping[str, Any] | None = None
         model_config_key = latest.get("modelConfigKey")
-        if model_config_key is not None:
-            if not isinstance(model_config_key, str):
-                raise EvaluationsError(
-                    f"LaunchDarkly {description} has a non-string modelConfigKey: "
-                    f"{model_config_key!r}"
-                )
+        if model_config_key is not None and not isinstance(model_config_key, str):
+            raise EvaluationsError(
+                f"LaunchDarkly {description} has a non-string modelConfigKey: "
+                f"{model_config_key!r}"
+            )
+        if model_config_key:
             model_config = self._fetch_model_config(
                 project_key, model_config_key, latest.get("modelConfigVersion")
             )
