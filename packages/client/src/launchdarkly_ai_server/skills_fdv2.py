@@ -74,7 +74,7 @@ they remain separate constants, because one is a wire value LaunchDarkly owns an
 the other is what this SDK asks a store for.
 
 Not to be confused with ``FDV2_PAYLOAD_KIND``: this is the kind of the *objects*,
-that is the kind of the *payload* they arrive in.
+that one the kind of the *payload* they arrive in.
 """
 
 FDV2_PAYLOAD_KIND = "agent-skill"
@@ -308,16 +308,13 @@ class StoreDiagnostics:
     """Recoverable transport failures since the last successful transfer."""
     payload_unavailable: int = 0
     """
-    Requests LaunchDarkly answered with "no payload of the kind you asked for"
-    (HTTP 422) -- the answer for a project in which no skill has ever been
-    created.
+    Requests answered with "no payload of the kind you asked for"
+    (``_NoSkillPayloadError``). Cumulative, and never reset.
 
     Deliberately not a ``connection_failures``: nothing is wrong, there is
     nothing to deliver. Nonzero and rising alongside an empty store is the
     difference between "this environment has no skills" and "delivery is
-    broken", which is the pair this whole type exists to separate. It does not
-    reset, so a store that was empty and then received its first payload reads
-    as both, in the order it happened.
+    broken", which is the pair this whole type exists to separate.
     """
     last_error: str | None = None
     """The most recent transport error, if any. Human-readable; do not parse."""
@@ -1009,21 +1006,19 @@ class _NoSkillPayloadError(_RecoverableTransportError):
     """
     An HTTP 422: delivery has no payload of the kind this store declared.
 
-    That is the answer for every environment whose project has never had a
-    skill, because the agent-skill payload is created with the first one and the
-    declaration then matches nothing the credential is assigned. So it is
-    neither a failure nor fatal, and is classed as neither:
+    That is the answer for every project in which no skill has ever been
+    created, since the agent-skill payload row is created with the first one.
+    Neither of the two obvious classifications is right, which is why this is
+    its own class:
 
-    - counting it as a failure would spend ``max_consecutive_failures`` and then
-      give up permanently -- reported as "gave up after N consecutive failures"
-      -- on a configuration that is merely waiting for its first skill;
-    - treating it as fatal would mean the skill created a minute later never
-      arrives, because nothing reopens delivery short of a process restart.
+    - as a failure it would spend ``max_consecutive_failures`` and then give up
+      permanently -- "gave up after N consecutive failures" -- on a
+      configuration that is merely waiting for its first skill;
+    - as fatal, the skill created a minute later would never arrive, because
+      nothing reopens delivery short of a process restart.
 
-    The loop therefore handles it ahead of ``_RecoverableTransportError``: said
-    once, counted under ``diagnostics.payload_unavailable``, kept off
-    ``connection_failures`` and ``last_error``, and retried at the backoff cap
-    for as long as the store is open.
+    ``_run`` handles it ahead of ``_RecoverableTransportError``, which it
+    subclasses.
     """
 
 
@@ -1112,9 +1107,6 @@ def _classify_status(status: int, headers: Any) -> Exception:
             f"LaunchDarkly returned HTTP 400. {_REQUEST_ADVICE}"
         )
     if status == 422:
-        # Not "retrying will not fix it" and not a failure either: the payload
-        # this store asks for does not exist yet. Creating the first skill in
-        # the project is what fixes it, and delivery keeps asking until then.
         return _NoSkillPayloadError(
             "LaunchDarkly has no Agent Skills payload for this environment "
             "(HTTP 422). This is what it answers until the first skill is "
@@ -1704,10 +1696,8 @@ class FDv2SkillStore:
         # A stream only ever ends by being dropped, so this is what separates
         # a recycled healthy connection from one that failed.
         self._attempt_answered = False
-        # Whether the "no skill payload for this environment" line has been
-        # said. Once per store, not once per attempt: the condition persists
-        # until somebody creates a skill, and delivery keeps asking the whole
-        # time.
+        # Said once per store rather than once per attempt: the condition holds
+        # until somebody creates a skill, and delivery keeps asking throughout.
         self._warned_no_skill_payload = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -1967,17 +1957,14 @@ class FDv2SkillStore:
                 self._give_up(str(exc))
                 return
             except _NoSkillPayloadError as exc:
-                # Ahead of ``_RecoverableTransportError``, which it subclasses,
-                # because none of that block applies: there is no failure to
-                # count, no ``last_error`` to leave on a store that is working
-                # fine, and no budget to spend on a project that has simply not
-                # created a skill yet.
+                # Ahead of the recoverable block below, none of which applies:
+                # nothing failed, so there is no count to advance and no
+                # ``last_error`` to leave on a store that is working fine.
                 if self._stop.is_set():
                     return
                 with self._lock:
-                    # Defensive: a 422 refuses the connection before it opens,
-                    # so there is nothing in flight unless an earlier attempt
-                    # left it there.
+                    # A 422 refuses the connection before it opens, so this is
+                    # only for a payload an earlier attempt left in flight.
                     self._reader._abandon_in_flight()
                     self._reader.diagnostics.payload_unavailable += 1
                     say_it = not self._warned_no_skill_payload
@@ -1989,11 +1976,9 @@ class FDv2SkillStore:
                         exc,
                         self._max_backoff,
                     )
-                # Not backing off from a failure, waiting for somebody to create
-                # a skill. ``_failures`` never moved, so the exponential
-                # schedule would hold this at the *initial* delay forever -- the
-                # cap is both the cheapest place to sit and the one that does
-                # not depend on a counter this case deliberately leaves alone.
+                # At the cap rather than on the backoff schedule: ``_failures``
+                # deliberately never moves, so the schedule would hold this at
+                # the *initial* delay forever.
                 if self._stop.wait(self._max_backoff):
                     return
                 continue
