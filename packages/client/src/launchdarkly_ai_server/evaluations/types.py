@@ -68,6 +68,21 @@ class ResolvedTool:
 
 
 @dataclass
+class AIConfigVariation:
+    """An AI Config variation read from the management API as run() defaults.
+
+    ``generation`` holds only the fields the variation defines, so a caller's
+    explicit arguments can be layered over it. ``tool_versions`` maps each
+    attached tool key to the version the variation pins; ``judge_keys`` lists
+    the judges attached to the variation.
+    """
+
+    generation: GenerationConfig
+    tool_versions: dict[str, int] = field(default_factory=dict)
+    judge_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ResolvedJudge:
     """A LaunchDarkly AI Judge config variation resolved for an evaluation run.
 

@@ -36,6 +36,7 @@ from .events import (
     TokenUsage,
 )
 from .types import (
+    AIConfigVariation,
     DatasetRef,
     DatasetRow,
     EvaluationRef,
@@ -213,6 +214,134 @@ class EvaluationsRunner:
 
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
+
+    def _fetch_config_variation(
+        self,
+        project_key: str,
+        config_key: str,
+        variation_key: str,
+    ) -> AIConfigVariation:
+        """Read an AI Config variation by key from the management API.
+
+        Flag delivery cannot select a variation by key -- it serves whichever
+        variation targeting picks for a context -- so this reads the variation
+        definition directly. Provider and base model parameters live on the
+        linked model config, and are layered the way the served flag payload
+        layers them: model-config parameters first, variation parameters over.
+        """
+        description = f"AI Config variation {config_key!r}/{variation_key!r}"
+        path = (
+            f"projects/{_segment(project_key)}/ai-configs/{_segment(config_key)}"
+            f"/variations/{_segment(variation_key)}"
+        )
+        try:
+            raw = _mapping(self._api.get(path), description=description)
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly {description} was not found in project {project_key!r}"
+                ) from error
+            raise
+        # The endpoint returns every version of the variation; evaluate the latest.
+        items = raw.get("items")
+        versions = [
+            item
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, Mapping) and isinstance(item.get("version"), int)
+        ]
+        if not versions:
+            raise EvaluationsError(f"LaunchDarkly {description} has no versions")
+        latest = max(versions, key=lambda item: int(item["version"]))
+
+        model = latest.get("model")
+        model = model if isinstance(model, Mapping) else {}
+        model_name = model.get("modelName")
+        variation_parameters = model.get("parameters")
+        parameters: dict[str, Any] = dict(
+            variation_parameters if isinstance(variation_parameters, Mapping) else {}
+        )
+        provider: Any = None
+        model_config_key = latest.get("modelConfigKey")
+        if isinstance(model_config_key, str) and model_config_key:
+            model_config = self._fetch_model_config(
+                project_key, model_config_key, latest.get("modelConfigVersion")
+            )
+            provider = model_config.get("provider")
+            base_parameters = model_config.get("params")
+            if isinstance(base_parameters, Mapping):
+                parameters = {**base_parameters, **parameters}
+            if not model_name:
+                model_name = model_config.get("id")
+
+        generation = GenerationConfig()
+        if isinstance(provider, str) and provider:
+            generation["provider"] = provider
+        if isinstance(model_name, str) and model_name:
+            generation["model"] = model_name
+        if parameters:
+            generation["parameters"] = parameters
+        instructions = latest.get("instructions")
+        messages = latest.get("messages")
+        if isinstance(instructions, str) and instructions:
+            generation["instructions"] = instructions
+        elif isinstance(messages, list) and messages:
+            generation["messages"] = [
+                dict(message) for message in messages if isinstance(message, Mapping)
+            ]
+        output_format = latest.get("outputFormat")
+        if isinstance(output_format, Mapping):
+            generation["output_format"] = dict(output_format)
+
+        tools = latest.get("tools")
+        tool_versions = {
+            tool["key"]: tool["version"]
+            for tool in (tools if isinstance(tools, list) else [])
+            if isinstance(tool, Mapping)
+            and isinstance(tool.get("key"), str)
+            and isinstance(tool.get("version"), int)
+        }
+        judge_configuration = latest.get("judgeConfiguration")
+        judges = (
+            judge_configuration.get("judges")
+            if isinstance(judge_configuration, Mapping)
+            else None
+        )
+        judge_keys = [
+            judge["judgeConfigKey"]
+            for judge in (judges if isinstance(judges, list) else [])
+            if isinstance(judge, Mapping)
+            and isinstance(judge.get("judgeConfigKey"), str)
+        ]
+        return AIConfigVariation(
+            generation=generation,
+            tool_versions=tool_versions,
+            judge_keys=judge_keys,
+        )
+
+    def _fetch_model_config(
+        self,
+        project_key: str,
+        model_config_key: str,
+        version: Any,
+    ) -> Mapping[str, Any]:
+        path = (
+            f"projects/{_segment(project_key)}/ai-configs/model-configs/"
+            f"{_segment(model_config_key)}"
+        )
+        # A pinned variation names the model-config version it was built against.
+        params = {"version": version} if isinstance(version, int) else None
+        try:
+            return _mapping(
+                self._api.get(path, params=params),
+                description=f"model config {model_config_key!r}",
+            )
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly model config {model_config_key!r} was not found "
+                    f"in project {project_key!r}"
+                ) from error
+            raise
 
     def _resolve_tools(
         self,
