@@ -16,15 +16,15 @@ from launchdarkly_ai_server import (
     GraphNode,
     NativeTool,
     compose_history,
-    filter_forwardable_parameters,
     get_client,
     make_track_data,
     model_parameters,
     parse_template,
+    select_forwarded_parameters,
     to_ld_context,
 )
 
-from .handler import pydantic_accept_keys
+from .handler import _CHAT_OPENAI_FORWARDED_KEYS
 from .messages import to_lang_chain_messages
 
 try:
@@ -206,8 +206,8 @@ def to_lang_graph(
                 model_cfg = node.config.get("model") or {}
                 kwargs = model_parameters(node.config)
                 if kwargs:
-                    kwargs = filter_forwardable_parameters(
-                        kwargs, pydantic_accept_keys(lc_openai.ChatOpenAI)
+                    kwargs = select_forwarded_parameters(
+                        kwargs, _CHAT_OPENAI_FORWARDED_KEYS
                     )
                 kwargs["model"] = model_cfg.get("name") or "gpt-4o"
                 chat_model = lc_openai.ChatOpenAI(**kwargs)

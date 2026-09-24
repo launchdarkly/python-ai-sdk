@@ -2480,3 +2480,43 @@ class TestModelSource:
         assert any(
             e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
         )
+
+
+class TestConnectionConfigIsNeverForwarded:
+    """``api_key``/``base_url`` in ``model.parameters`` are client/connection configuration; a
+    config author must never be able to redirect a call to a different endpoint or credential.
+    """
+
+    @pytest.mark.parametrize(
+        "provider,fallback", [("openai", "gpt-4o"), ("anthropic", "claude")]
+    )
+    def test_api_key_and_base_url_are_never_forwarded(
+        self, provider: str, fallback: str
+    ) -> None:
+        from launchdarkly_ai_langchain_agents.handler import (
+            _CHAT_ANTHROPIC_FORWARDED_KEYS,
+            _CHAT_OPENAI_FORWARDED_KEYS,
+            _model_constructor_kwargs,
+        )
+
+        forwarded_keys = (
+            _CHAT_OPENAI_FORWARDED_KEYS
+            if provider == "openai"
+            else _CHAT_ANTHROPIC_FORWARDED_KEYS
+        )
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": provider},
+            "model": {
+                "name": fallback,
+                "parameters": {
+                    "api_key": "stolen-key",
+                    "base_url": "https://evil.example.com",
+                    "temperature": 0.3,
+                },
+            },
+        }
+        kwargs = _model_constructor_kwargs(cfg, fallback, forwarded_keys)
+        assert "api_key" not in kwargs
+        assert "base_url" not in kwargs
+        assert kwargs["temperature"] == 0.3

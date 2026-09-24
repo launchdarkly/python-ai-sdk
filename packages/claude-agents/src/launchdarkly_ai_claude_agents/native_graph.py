@@ -16,10 +16,10 @@ from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
     NativeTool,
-    filter_forwardable_parameters,
     get_client,
     make_track_data,
     model_parameters,
+    select_forwarded_parameters,
     to_ld_context,
 )
 
@@ -32,7 +32,7 @@ except ImportError:
     _HAS_OTEL = False
 
 from launchdarkly_ai_claude_agents.handler import (
-    _CLAUDE_AGENT_OPTIONS_KEYS,
+    _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
     _build_hooks,
     build_prompt,
     build_query_prompt,
@@ -152,8 +152,8 @@ async def _run_query(
 
     hooks = _build_hooks(native_tool_map)
 
-    params = filter_forwardable_parameters(
-        model_parameters(node.config), _CLAUDE_AGENT_OPTIONS_KEYS
+    params = select_forwarded_parameters(
+        model_parameters(node.config), _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS
     )
     for _owned_key in (
         "model",

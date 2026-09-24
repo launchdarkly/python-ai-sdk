@@ -23,15 +23,12 @@ import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from agents import ModelSettings as _ModelSettings
-
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
     RunUsage,
     SpanUsage,
-    accepted_parameter_keys_from_dataclass,
     compose_history,
     config,
     content_to_text,
@@ -39,10 +36,10 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
-    filter_forwardable_parameters,
     image_block_to_url,
     model_parameters,
     parse_template,
+    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
@@ -76,11 +73,42 @@ try:
 except ImportError:  # pragma: no cover - `agents` is a hard dependency of this package
     _RunHooksBase = object  # type: ignore[assignment,misc]
 
-#: Accepted keys derived once from the real ``agents.ModelSettings`` dataclass, never
-#: hand-maintained. Independent of this handler's per-call, mocked ``importlib.import_module("agents")``
-#: used elsewhere for actually building the ``Agent``/``ModelSettings`` instances: this is the one
-#: place that needs the real SDK type, not a test double.
-_MODEL_SETTINGS_KEYS = accepted_parameter_keys_from_dataclass(_ModelSettings)
+#: Every field ``agents.ModelSettings`` declares, classified by hand into exactly one of: forwarded
+#: (below) or excluded. ``ModelSettings`` has no handler-owned fields: ``model`` and ``max_turns``
+#: live outside it (on ``Agent``/``Runner.run``, see the ``.pop("max_turns", ...)`` below).
+#: ``TestModelSettingsAcceptsExactlyTheseFields`` in this package's tests asserts this
+#: classification stays exhaustive as the SDK's own dataclass changes.
+#:
+#: Excluded, and why: all client/connection configuration, never a config-controlled setting.
+#: * ``retry``: an HTTP retry count.
+#: * ``extra_headers``, ``extra_query``, ``extra_body``, ``extra_args``: raw HTTP/request overrides.
+_MODEL_SETTINGS_FORWARDED_KEYS = frozenset(
+    {
+        "context_management",
+        "frequency_penalty",
+        "include_usage",
+        "max_tokens",
+        "metadata",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "prompt_cache_retention",
+        "reasoning",
+        "response_include",
+        "store",
+        "temperature",
+        "tool_choice",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "verbosity",
+    }
+)
+
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_MODEL_SETTINGS_EXCLUDED_KEYS = frozenset(
+    {"retry", "extra_headers", "extra_query", "extra_body", "extra_args"}
+)
 
 
 def _build_agent_tools(
@@ -224,8 +252,8 @@ def _build_agent_and_prompt(
     model_settings_params = model_parameters(config)
     # `max_turns` is a `Runner.run` option, not a `ModelSettings` field.
     model_settings_params.pop("max_turns", None)
-    model_settings_params = filter_forwardable_parameters(
-        model_settings_params, _MODEL_SETTINGS_KEYS
+    model_settings_params = select_forwarded_parameters(
+        model_settings_params, _MODEL_SETTINGS_FORWARDED_KEYS
     )
     agent = Agent(
         name="assistant",

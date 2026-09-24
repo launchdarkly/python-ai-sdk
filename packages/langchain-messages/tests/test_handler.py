@@ -2660,8 +2660,11 @@ class TestModelParametersReachTheWire:
     """
 
     @pytest.mark.asyncio
-    async def test_top_p_reaches_the_wire(self) -> None:
+    async def test_top_p_reaches_the_wire(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import httpx
+        from langchain_openai.chat_models import base as _chat_openai_base
 
         ctx, _rec = _recording()
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
@@ -2693,18 +2696,65 @@ class TestModelParametersReachTheWire:
             )
 
         transport = httpx.MockTransport(_handler)
+        mock_client = httpx.AsyncClient(
+            transport=transport, base_url="https://api.openai.com/v1"
+        )
+        # ``http_async_client`` in ``model.parameters`` is client/connection configuration and is
+        # never forwarded any more (see ``_CHAT_OPENAI_FORWARDED_KEYS``), so the real ``ChatOpenAI``
+        # is intercepted below its own default httpx client builder instead: the same mock transport,
+        # reached without a config value ever naming an HTTP client. The API key comes from the env
+        # var ``ChatOpenAI`` already falls back to, for the same reason.
+        monkeypatch.setattr(
+            _chat_openai_base,
+            "_get_default_async_httpx_client",
+            lambda *a, **kw: mock_client,
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
         cfg = {
             **CONFIG,
-            "model": {
-                "name": "gpt-4o",
-                "parameters": {
-                    "top_p": 0.5,
-                    "api_key": "test-key",
-                    "http_async_client": httpx.AsyncClient(transport=transport),
-                },
-            },
+            "model": {"name": "gpt-4o", "parameters": {"top_p": 0.5}},
         }
         with ctx:
             result = await create_langchain_messages_handler()(cfg, "q", {}, {})
         assert captured["body"]["top_p"] == 0.5
         assert result["output"] == "hi"
+
+
+class TestConnectionConfigIsNeverForwarded:
+    """``api_key``/``base_url`` in ``model.parameters`` are client/connection configuration; a
+    config author must never be able to redirect a call to a different endpoint or credential.
+    """
+
+    @pytest.mark.parametrize(
+        "provider,fallback", [("openai", "gpt-4o"), ("anthropic", "claude")]
+    )
+    def test_api_key_and_base_url_are_never_forwarded(
+        self, provider: str, fallback: str
+    ) -> None:
+        from launchdarkly_ai_langchain_messages.handler import (
+            _CHAT_ANTHROPIC_FORWARDED_KEYS,
+            _CHAT_OPENAI_FORWARDED_KEYS,
+            _model_constructor_kwargs,
+        )
+
+        forwarded_keys = (
+            _CHAT_OPENAI_FORWARDED_KEYS
+            if provider == "openai"
+            else _CHAT_ANTHROPIC_FORWARDED_KEYS
+        )
+        cfg = {
+            **CONFIG,
+            "provider": {"name": provider},
+            "model": {
+                "name": fallback,
+                "parameters": {
+                    "api_key": "stolen-key",
+                    "base_url": "https://evil.example.com",
+                    "temperature": 0.3,
+                },
+            },
+        }
+        kwargs = _model_constructor_kwargs(cfg, fallback, forwarded_keys)
+        assert "api_key" not in kwargs
+        assert "base_url" not in kwargs
+        assert kwargs["temperature"] == 0.3

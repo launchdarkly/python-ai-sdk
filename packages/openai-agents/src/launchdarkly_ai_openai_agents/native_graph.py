@@ -16,16 +16,16 @@ from launchdarkly_ai_server import (
     GraphNode,
     NativeTool,
     compose_history,
-    filter_forwardable_parameters,
     get_client,
     make_track_data,
     model_parameters,
     parse_template,
+    select_forwarded_parameters,
     to_ld_context,
 )
 
 from .handler import (
-    _MODEL_SETTINGS_KEYS,
+    _MODEL_SETTINGS_FORWARDED_KEYS,
     _parse_message_content,
     _to_openai_agent_items,
 )
@@ -180,8 +180,8 @@ def to_openai_agents(
             node_model_settings_params = model_parameters(node.config)
             # `max_turns` is a `Runner.run` option, not a `ModelSettings` field.
             node_model_settings_params.pop("max_turns", None)
-            node_model_settings_params = filter_forwardable_parameters(
-                node_model_settings_params, _MODEL_SETTINGS_KEYS
+            node_model_settings_params = select_forwarded_parameters(
+                node_model_settings_params, _MODEL_SETTINGS_FORWARDED_KEYS
             )
             agent = Agent(
                 name=agent_name,

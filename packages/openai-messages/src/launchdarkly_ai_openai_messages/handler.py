@@ -5,8 +5,6 @@ import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from openai.resources.responses import AsyncResponses as _AsyncResponses
-
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
@@ -14,7 +12,6 @@ from launchdarkly_ai_server import (
     RunUsage,
     SpanMessage,
     SpanMessagePart,
-    accepted_parameter_keys_from_signature,
     compose_history,
     config,
     content_to_text,
@@ -22,11 +19,11 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
-    filter_forwardable_parameters,
     image_block_to_url,
     is_content_blocks,
     model_parameters,
     parse_template,
+    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
@@ -51,26 +48,76 @@ from .spans import (
     tool_arguments,
 )
 
-#: Accepted keys derived once from ``AsyncResponses.create``/``.stream``'s own signatures, never
-#: hand-maintained. Neither has a ``**kwargs`` catch-all. Confirms the UI offers several keys the
-#: Responses API has never accepted: ``max_tokens``, ``frequency_penalty``, ``presence_penalty``,
-#: ``seed``, ``n``, ``stop``, ``response_format``, ``logit_bias``, ``logprobs``,
-#: ``max_completion_tokens``, ``audio``, ``modalities``, ``prediction``.
-_RESPONSES_CREATE_KEYS = accepted_parameter_keys_from_signature(_AsyncResponses.create)
-_RESPONSES_STREAM_KEYS = accepted_parameter_keys_from_signature(_AsyncResponses.stream)
+#: Every key ``AsyncResponses.create``/``.stream`` accept, classified by hand into exactly one of:
+#: forwarded (below), handler-owned (``model``, ``input``, ``previous_response_id``, ``tools``,
+#: ``text``, popped after the filter runs, at each call site), or excluded.
+#: ``TestResponsesCreateAcceptsExactlyTheseKeys`` / ``TestResponsesStreamAcceptsExactlyTheseKeys``
+#: in this package's tests assert this classification stays exhaustive as the SDK's own signatures
+#: change. Confirms the UI offers several keys the Responses API has never accepted: ``max_tokens``,
+#: ``frequency_penalty``, ``presence_penalty``, ``seed``, ``n``, ``stop``, ``response_format``,
+#: ``logit_bias``, ``logprobs``, ``max_completion_tokens``, ``audio``, ``modalities``,
+#: ``prediction``.
+#:
+#: Excluded, and why:
+#: * ``stream``: the handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``stream_options``: only meaningful together with ``stream=True``, which the handler controls.
+#: * ``background``: returns before the output exists, so the handler would get no result.
+#: * ``conversation``: server-side conversation state conflicts with the input the handler builds.
+#: * ``prompt``: server-side prompt template conflicts with the input the handler builds.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Everything else the API accepts is forwarded, including keys that are not strictly generation
+#: settings (``store``, ``user``, ``safety_identifier``, ``prompt_cache_key``,
+#: ``prompt_cache_retention``, ``include``, ``context_management``, ``metadata``,
+#: ``service_tier``, ``instructions``, ``moderation``, ...).
+_RESPONSES_CREATE_FORWARDED_KEYS = frozenset(
+    {
+        "context_management",
+        "include",
+        "instructions",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "moderation",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "reasoning",
+        "safety_identifier",
+        "service_tier",
+        "store",
+        "temperature",
+        "tool_choice",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
+    }
+)
 
-#: Keys the Responses API signature accepts but that would break this handler if a config set
-#: them, because the handler itself already decides that behaviour. Everything else the API
-#: accepts is forwarded, including keys that are not strictly generation settings (``store``,
-#: ``user``, ``safety_identifier``, ``prompt_cache_key``, ``prompt_cache_retention``, ``include``,
-#: ``context_management``, ``metadata``, ``service_tier``, ``instructions``, ``moderation``, ...).
+#: Same as :data:`_RESPONSES_CREATE_FORWARDED_KEYS`, plus the resumption keys only ``.stream``
+#: accepts: ``response_id``, ``starting_after``, ``text_format``.
+_RESPONSES_STREAM_FORWARDED_KEYS = _RESPONSES_CREATE_FORWARDED_KEYS | {
+    "response_id",
+    "starting_after",
+    "text_format",
+}
+
+#: Named for the drift test and for review, not read at runtime: the forwarded lists above already
+#: leave these out, so nothing needs to subtract them again. See the comment above for why each one
+#: is here rather than forwarded.
 _RESPONSES_EXCLUDED_KEYS = frozenset(
     {
-        "stream",  # the handler chooses blocking vs. streaming itself, not via a kwarg
-        "stream_options",  # only meaningful together with stream=True, which the handler controls
-        "background",  # returns before the output exists, so the handler would get no result
-        "conversation",  # server-side conversation state conflicts with the input the handler builds
-        "prompt",  # server-side prompt template conflicts with the input the handler builds
+        "stream",
+        "stream_options",
+        "background",
+        "conversation",
+        "prompt",
+        "timeout",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
     }
 )
 
@@ -306,10 +353,9 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                 messages=root_messages,
             )
 
-            extra_params = filter_forwardable_parameters(
+            extra_params = select_forwarded_parameters(
                 _apply_max_output_tokens_rename(model_parameters(config)),
-                _RESPONSES_CREATE_KEYS,
-                _RESPONSES_EXCLUDED_KEYS,
+                _RESPONSES_CREATE_FORWARDED_KEYS,
             )
             for _owned_key in (
                 "model",
@@ -549,10 +595,9 @@ async def _stream_gen(
                     tool_definitions=tool_definitions,
                 )
 
-            extra_params = filter_forwardable_parameters(
+            extra_params = select_forwarded_parameters(
                 _apply_max_output_tokens_rename(model_parameters(config)),
-                _RESPONSES_STREAM_KEYS,
-                _RESPONSES_EXCLUDED_KEYS,
+                _RESPONSES_STREAM_FORWARDED_KEYS,
             )
             for _owned_key in (
                 "model",
