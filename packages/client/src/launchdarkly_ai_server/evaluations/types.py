@@ -81,6 +81,81 @@ class AIConfigVariation:
     tool_versions: dict[str, int] = field(default_factory=dict)
     judge_keys: list[str] = field(default_factory=list)
 
+    @classmethod
+    def from_api(
+        cls,
+        data: Mapping[str, Any],
+        model_config: Mapping[str, Any] | None = None,
+    ) -> AIConfigVariation:
+        """Build from one variation version and the model config it links.
+
+        ``model_config`` is the linked model-config response, or ``None`` when
+        the variation links none. Fetching it is the caller's job, so this stays
+        a pure translation of API shapes. Provider and base parameters come from
+        the model config; the variation's own parameters are layered over them,
+        as the served flag payload layers them.
+        """
+        model = data.get("model")
+        model = model if isinstance(model, Mapping) else {}
+        model_name = model.get("modelName")
+        variation_parameters = model.get("parameters")
+        parameters: dict[str, Any] = dict(
+            variation_parameters if isinstance(variation_parameters, Mapping) else {}
+        )
+        provider: Any = None
+        if model_config is not None:
+            provider = model_config.get("provider")
+            base_parameters = model_config.get("params")
+            if isinstance(base_parameters, Mapping):
+                parameters = {**base_parameters, **parameters}
+            if not model_name:
+                model_name = model_config.get("id")
+
+        generation = GenerationConfig()
+        if isinstance(provider, str) and provider:
+            generation["provider"] = provider
+        if isinstance(model_name, str) and model_name:
+            generation["model"] = model_name
+        if parameters:
+            generation["parameters"] = parameters
+        instructions = data.get("instructions")
+        messages = data.get("messages")
+        if isinstance(instructions, str) and instructions:
+            generation["instructions"] = instructions
+        elif isinstance(messages, list) and messages:
+            generation["messages"] = [
+                dict(message) for message in messages if isinstance(message, Mapping)
+            ]
+        output_format = data.get("outputFormat")
+        if isinstance(output_format, Mapping):
+            generation["output_format"] = dict(output_format)
+
+        tools = data.get("tools")
+        tool_versions = {
+            tool["key"]: tool["version"]
+            for tool in (tools if isinstance(tools, list) else [])
+            if isinstance(tool, Mapping)
+            and isinstance(tool.get("key"), str)
+            and isinstance(tool.get("version"), int)
+        }
+        judge_configuration = data.get("judgeConfiguration")
+        judges = (
+            judge_configuration.get("judges")
+            if isinstance(judge_configuration, Mapping)
+            else None
+        )
+        judge_keys = [
+            judge["judgeConfigKey"]
+            for judge in (judges if isinstance(judges, list) else [])
+            if isinstance(judge, Mapping)
+            and isinstance(judge.get("judgeConfigKey"), str)
+        ]
+        return cls(
+            generation=generation,
+            tool_versions=tool_versions,
+            judge_keys=judge_keys,
+        )
+
 
 @dataclass
 class ResolvedJudge:

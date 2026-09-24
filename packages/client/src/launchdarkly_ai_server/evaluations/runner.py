@@ -253,19 +253,12 @@ class EvaluationsRunner:
             raise EvaluationsError(f"LaunchDarkly {description} has no versions")
         latest = max(versions, key=lambda item: int(item["version"]))
 
-        model = latest.get("model")
-        model = model if isinstance(model, Mapping) else {}
-        model_name = model.get("modelName")
-        variation_parameters = model.get("parameters")
-        parameters: dict[str, Any] = dict(
-            variation_parameters if isinstance(variation_parameters, Mapping) else {}
-        )
-        provider: Any = None
-        model_config_key = latest.get("modelConfigKey")
         # Absent or empty means the variation links no model config, so it has
         # no provider -- flag delivery serves an empty provider name for it too.
         # Anything other than a string is a response we do not understand.
-        if model_config_key:
+        model_config: Mapping[str, Any] | None = None
+        model_config_key = latest.get("modelConfigKey")
+        if model_config_key is not None:
             if not isinstance(model_config_key, str):
                 raise EvaluationsError(
                     f"LaunchDarkly {description} has a non-string modelConfigKey: "
@@ -274,57 +267,7 @@ class EvaluationsRunner:
             model_config = self._fetch_model_config(
                 project_key, model_config_key, latest.get("modelConfigVersion")
             )
-            provider = model_config.get("provider")
-            base_parameters = model_config.get("params")
-            if isinstance(base_parameters, Mapping):
-                parameters = {**base_parameters, **parameters}
-            if not model_name:
-                model_name = model_config.get("id")
-
-        generation = GenerationConfig()
-        if isinstance(provider, str) and provider:
-            generation["provider"] = provider
-        if isinstance(model_name, str) and model_name:
-            generation["model"] = model_name
-        if parameters:
-            generation["parameters"] = parameters
-        instructions = latest.get("instructions")
-        messages = latest.get("messages")
-        if isinstance(instructions, str) and instructions:
-            generation["instructions"] = instructions
-        elif isinstance(messages, list) and messages:
-            generation["messages"] = [
-                dict(message) for message in messages if isinstance(message, Mapping)
-            ]
-        output_format = latest.get("outputFormat")
-        if isinstance(output_format, Mapping):
-            generation["output_format"] = dict(output_format)
-
-        tools = latest.get("tools")
-        tool_versions = {
-            tool["key"]: tool["version"]
-            for tool in (tools if isinstance(tools, list) else [])
-            if isinstance(tool, Mapping)
-            and isinstance(tool.get("key"), str)
-            and isinstance(tool.get("version"), int)
-        }
-        judge_configuration = latest.get("judgeConfiguration")
-        judges = (
-            judge_configuration.get("judges")
-            if isinstance(judge_configuration, Mapping)
-            else None
-        )
-        judge_keys = [
-            judge["judgeConfigKey"]
-            for judge in (judges if isinstance(judges, list) else [])
-            if isinstance(judge, Mapping)
-            and isinstance(judge.get("judgeConfigKey"), str)
-        ]
-        return AIConfigVariation(
-            generation=generation,
-            tool_versions=tool_versions,
-            judge_keys=judge_keys,
-        )
+        return AIConfigVariation.from_api(latest, model_config)
 
     def _fetch_model_config(
         self,

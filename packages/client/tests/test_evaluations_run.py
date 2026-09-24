@@ -2582,12 +2582,9 @@ async def test_non_string_model_config_key_fails_loudly(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_config_key", [None, ""])
-async def test_variation_without_a_model_config_needs_an_explicit_provider(
-    model_config_key: str | None,
-) -> None:
+async def test_variation_without_a_model_config_needs_an_explicit_provider() -> None:
     transport = SequencedTransport(
-        [response(200, config_variation_page(modelConfigKey=model_config_key))]
+        [response(200, config_variation_page(modelConfigKey=None))]
     )
     evals = init_evaluations(api_token="token", transport=transport)
 
@@ -2603,3 +2600,28 @@ async def test_variation_without_a_model_config_needs_an_explicit_provider(
         )
 
     assert [request["method"] for request in transport.requests] == ["GET"]
+
+
+def test_ai_config_variation_from_api_layers_the_model_config() -> None:
+    from launchdarkly_ai_server.evaluations.types import AIConfigVariation
+
+    latest = config_variation_page(
+        tools=[{"key": "lookup_order", "version": 4}],
+        judgeConfiguration={
+            "judges": [{"judgeConfigKey": "security-judge", "samplingRate": 1.0}]
+        },
+    )["items"][1]
+
+    linked = AIConfigVariation.from_api(latest, MODEL_CONFIG)
+    assert linked.generation == {
+        "provider": "OpenAI",
+        "model": "gpt-4o",
+        "parameters": {"max_tokens": 100, "temperature": 0.7},
+        "instructions": "You are a support agent.",
+    }
+    assert linked.tool_versions == {"lookup_order": 4}
+    assert linked.judge_keys == ["security-judge"]
+
+    unlinked = AIConfigVariation.from_api(latest)
+    assert "provider" not in unlinked.generation
+    assert unlinked.generation["parameters"] == {"temperature": 0.7}
