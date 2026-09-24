@@ -23,12 +23,15 @@ import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from agents import ModelSettings as _ModelSettings
+
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
     ProviderHandler,
     RunUsage,
     SpanUsage,
+    accepted_parameter_keys_from_dataclass,
     compose_history,
     config,
     content_to_text,
@@ -36,6 +39,7 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    filter_forwardable_parameters,
     image_block_to_url,
     model_parameters,
     parse_template,
@@ -71,6 +75,12 @@ try:
     from agents.lifecycle import RunHooksBase as _RunHooksBase
 except ImportError:  # pragma: no cover - `agents` is a hard dependency of this package
     _RunHooksBase = object  # type: ignore[assignment,misc]
+
+#: Accepted keys derived once from the real ``agents.ModelSettings`` dataclass, never
+#: hand-maintained. Independent of this handler's per-call, mocked ``importlib.import_module("agents")``
+#: used elsewhere for actually building the ``Agent``/``ModelSettings`` instances: this is the one
+#: place that needs the real SDK type, not a test double.
+_MODEL_SETTINGS_KEYS = accepted_parameter_keys_from_dataclass(_ModelSettings)
 
 
 def _build_agent_tools(
@@ -214,6 +224,9 @@ def _build_agent_and_prompt(
     model_settings_params = model_parameters(config)
     # `max_turns` is a `Runner.run` option, not a `ModelSettings` field.
     model_settings_params.pop("max_turns", None)
+    model_settings_params = filter_forwardable_parameters(
+        model_settings_params, _MODEL_SETTINGS_KEYS
+    )
     agent = Agent(
         name="assistant",
         model=config.get("model", {}).get("name", "gpt-4o"),

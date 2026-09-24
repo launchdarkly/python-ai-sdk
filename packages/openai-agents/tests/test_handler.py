@@ -1485,6 +1485,57 @@ class TestModelParametersForwarding:
         assert "model_settings" not in run_kwargs["agent"].kwargs
         assert run_kwargs["kw"].get("max_turns") is None
 
+    async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(self) -> None:
+        """Neither is a field of ``agents.ModelSettings``; forwarding one unfiltered raises
+        ``TypeError`` before this filter existed."""
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {
+                    "top_p": 0.5,
+                    "stop_sequences": ["STOP"],
+                    "seed": 42,
+                },
+            },
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs["top_p"] == 0.5
+        assert "stop_sequences" not in model_settings.kwargs
+        assert "seed" not in model_settings.kwargs
+
+    async def test_transport_key_is_never_forwarded(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {"top_p": 0.5, "extra_body": {"secret": "value"}},
+            },
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs["top_p"] == 0.5
+        assert "extra_body" not in model_settings.kwargs
+
 
 class TestOutputFormat:
     def test_absent_output_format_no_change(self) -> None:

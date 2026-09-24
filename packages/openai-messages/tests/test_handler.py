@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 CONFIG = {
@@ -1197,6 +1198,272 @@ class TestModelParametersForwarding:
         assert events
         stream_kwargs = mock_openai.responses.stream.call_args.kwargs
         assert stream_kwargs["top_p"] == 0.3
+
+    async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(
+        self, mock_openai: MagicMock
+    ) -> None:
+        """None of these are ``responses.create`` parameters (they are Chat-Completions-era
+        keys); forwarding one unfiltered raises ``TypeError`` before this filter existed."""
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "max_tokens": 100,
+                    "frequency_penalty": 0.1,
+                    "presence_penalty": 0.1,
+                    "seed": 42,
+                    "n": 1,
+                    "stop": ["END"],
+                    "response_format": {"type": "text"},
+                    "logit_bias": {"50256": -100},
+                    "logprobs": True,
+                    "max_completion_tokens": 50,
+                    "audio": {"voice": "alloy"},
+                    "modalities": ["text"],
+                    "prediction": {"type": "content", "content": "x"},
+                    "top_p": 0.5,
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["top_p"] == 0.5
+        for rejected in (
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+            "n",
+            "stop",
+            "response_format",
+            "logit_bias",
+            "logprobs",
+            "audio",
+            "modalities",
+            "prediction",
+        ):
+            assert rejected not in kwargs
+
+    async def test_transport_key_is_never_forwarded(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"top_p": 0.5, "extra_body": {"secret": "value"}},
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["top_p"] == 0.5
+        assert "extra_body" not in kwargs
+
+    async def test_stream_key_is_never_forwarded(self, mock_openai: MagicMock) -> None:
+        """The handler picks blocking vs. streaming by which client method it calls; a config
+        setting ``stream`` must not reach ``responses.create``, and other handler-controlled
+        transport keys (``background``, ``conversation``, ``prompt``, ``stream_options``) are
+        likewise dropped."""
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "background": True,
+                    "conversation": "conv_123",
+                    "prompt": {"id": "pmpt_123"},
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        for excluded in (
+            "stream",
+            "stream_options",
+            "background",
+            "conversation",
+            "prompt",
+        ):
+            assert excluded not in kwargs
+
+    async def test_store_and_other_non_generation_keys_are_forwarded(
+        self, mock_openai: MagicMock
+    ) -> None:
+        """Only keys that would break the handler are excluded; everything else the API accepts
+        is forwarded, even keys that are not strictly generation settings."""
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "store": False,
+                    "user": "user-1",
+                    "safety_identifier": "safe-1",
+                    "prompt_cache_key": "cache-1",
+                    "metadata": {"k": "v"},
+                    "service_tier": "auto",
+                    "instructions": "be terse",
+                    "moderation": "auto",
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["store"] is False
+        assert kwargs["user"] == "user-1"
+        assert kwargs["safety_identifier"] == "safe-1"
+        assert kwargs["prompt_cache_key"] == "cache-1"
+        assert kwargs["metadata"] == {"k": "v"}
+        assert kwargs["service_tier"] == "auto"
+        assert kwargs["moderation"] == "auto"
+        # `instructions` is a plain accepted Responses API parameter here, not one this handler
+        # sets itself (it builds the system prompt into `input`, not a top-level `instructions`
+        # field), so a config value forwards through like any other accepted key.
+        assert kwargs["instructions"] == "be terse"
+
+
+class TestMaxOutputTokensRename:
+    async def test_max_tokens_renamed_to_max_output_tokens(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_tokens": 111}},
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 111
+        assert "max_tokens" not in kwargs
+
+    async def test_max_completion_tokens_renamed_to_max_output_tokens(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"max_completion_tokens": 222},
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 222
+        assert "max_completion_tokens" not in kwargs
+
+    async def test_explicit_max_output_tokens_wins_over_both(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "max_output_tokens": 333,
+                    "max_completion_tokens": 222,
+                    "max_tokens": 111,
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 333
+
+    async def test_max_completion_tokens_wins_over_max_tokens_when_both_set(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"max_completion_tokens": 222, "max_tokens": 111},
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 222
+
+
+class TestModelParametersReachTheWire:
+    """Intercepts the real outgoing HTTP request with an httpx MockTransport, rather than
+    asserting only on a mock of our own call, so this proves the renamed key actually leaves the
+    process on the wire the real ``openai`` client builds.
+    """
+
+    async def test_max_output_tokens_reaches_the_wire_for_a_config_max_tokens(
+        self,
+    ) -> None:
+        import openai
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        captured: dict[str, Any] = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_1",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "hi"}],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 2,
+                        "total_tokens": 5,
+                    },
+                },
+            )
+
+        transport = httpx.MockTransport(_handler)
+        real_client = openai.AsyncOpenAI(
+            api_key="test-key", http_client=httpx.AsyncClient(transport=transport)
+        )
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_tokens": 256}},
+        }
+        with patch("openai.AsyncOpenAI", return_value=real_client):
+            h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+
+        assert captured["body"]["max_output_tokens"] == 256
+        assert "max_tokens" not in captured["body"]
 
 
 class TestOutputFormat:

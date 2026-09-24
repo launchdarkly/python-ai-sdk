@@ -16,6 +16,7 @@ from launchdarkly_ai_server import (
     GraphNode,
     NativeTool,
     compose_history,
+    filter_forwardable_parameters,
     get_client,
     make_track_data,
     model_parameters,
@@ -23,7 +24,11 @@ from launchdarkly_ai_server import (
     to_ld_context,
 )
 
-from .handler import _parse_message_content, _to_openai_agent_items
+from .handler import (
+    _MODEL_SETTINGS_KEYS,
+    _parse_message_content,
+    _to_openai_agent_items,
+)
 
 try:
     from opentelemetry import trace
@@ -175,6 +180,9 @@ def to_openai_agents(
             node_model_settings_params = model_parameters(node.config)
             # `max_turns` is a `Runner.run` option, not a `ModelSettings` field.
             node_model_settings_params.pop("max_turns", None)
+            node_model_settings_params = filter_forwardable_parameters(
+                node_model_settings_params, _MODEL_SETTINGS_KEYS
+            )
             agent = Agent(
                 name=agent_name,
                 model=node.config.get("model", {}).get("name", "gpt-4o"),

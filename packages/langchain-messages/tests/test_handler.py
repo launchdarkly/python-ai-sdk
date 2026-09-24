@@ -8,10 +8,21 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_anthropic import ChatAnthropic as _REAL_CHAT_ANTHROPIC
+from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
+
+# ``langchain_aws`` is not a dependency of this package's test environment, so a mocked
+# ``ChatBedrockConverse`` gets a minimal hand-built ``model_fields`` shape (field name -> a
+# duck-typed stand-in exposing ``.alias``/``.validation_alias``, just like a real pydantic
+# ``FieldInfo``) covering the parameters these tests actually forward.
+_FAKE_BEDROCK_FIELDS = {
+    "temperature": SimpleNamespace(alias=None, validation_alias=None),
+}
 
 # ---------------------------------------------------------------------------
 # Fake LangChain message helpers
@@ -2300,6 +2311,55 @@ class TestStreamingRootOutputRespectsTheCaptureFlag:
         assert calls["n"] == 0
 
 
+class TestModelParametersForwarding:
+    @pytest.mark.asyncio
+    async def test_ui_key_the_sdk_rejects_is_dropped_without_raising(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("answer")
+        ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_OPENAI.model_fields
+        cfg = {
+            **CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {"temperature": 0.2, "tools": [{"name": "x"}]},
+            },
+        }
+        with (
+            ctx,
+            patch.dict(sys.modules, {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs == {"temperature": 0.2, "model": "gpt-4o"}
+
+    @pytest.mark.asyncio
+    async def test_transport_key_is_never_forwarded(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("answer")
+        ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_OPENAI.model_fields
+        cfg = {
+            **CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {
+                    "temperature": 0.2,
+                    "extra_body": {"secret": "value"},
+                },
+            },
+        }
+        with (
+            ctx,
+            patch.dict(sys.modules, {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert ctor.call_args.kwargs == {"temperature": 0.2, "model": "gpt-4o"}
+
+
 class TestModelSource:
     @pytest.mark.asyncio
     async def test_factory_receives_config_and_returned_model_is_used(self) -> None:
@@ -2362,6 +2422,7 @@ class TestModelSource:
 
         llm = _make_llm("default-openai")
         ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_OPENAI.model_fields
         cfg = {
             **CONFIG,
             "model": {
@@ -2378,10 +2439,12 @@ class TestModelSource:
             patch.dict(sys.modules, {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
         ):
             await create_langchain_messages_handler()(cfg, "q", {}, {})
+        # ``tools`` is dropped: it is not a ``ChatOpenAI`` constructor field (tools are bound via
+        # ``bind_tools`` at call time), so the UI offering it must be filtered out rather than
+        # forwarded or raising.
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "max_tokens": 512,
-            "tools": [{"name": "openai-tool"}],
             "model": "gpt-4o",
         }
 
@@ -2392,6 +2455,7 @@ class TestModelSource:
 
         llm = _make_llm("default-anthropic")
         ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_ANTHROPIC.model_fields
         cfg = {
             **CONFIG,
             "provider": {"name": "Anthropic"},
@@ -2422,6 +2486,7 @@ class TestModelSource:
 
         llm = _make_llm("bedrock")
         ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _FAKE_BEDROCK_FIELDS
         cfg = {
             **CONFIG,
             "provider": {"name": "Bedrock"},

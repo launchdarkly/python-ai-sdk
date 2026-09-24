@@ -5,6 +5,8 @@ import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from openai.resources.responses import AsyncResponses as _AsyncResponses
+
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
@@ -12,6 +14,7 @@ from launchdarkly_ai_server import (
     RunUsage,
     SpanMessage,
     SpanMessagePart,
+    accepted_parameter_keys_from_signature,
     compose_history,
     config,
     content_to_text,
@@ -19,6 +22,7 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    filter_forwardable_parameters,
     image_block_to_url,
     is_content_blocks,
     model_parameters,
@@ -46,6 +50,46 @@ from .spans import (
     to_tool_definitions,
     tool_arguments,
 )
+
+#: Accepted keys derived once from ``AsyncResponses.create``/``.stream``'s own signatures, never
+#: hand-maintained. Neither has a ``**kwargs`` catch-all. Confirms the UI offers several keys the
+#: Responses API has never accepted: ``max_tokens``, ``frequency_penalty``, ``presence_penalty``,
+#: ``seed``, ``n``, ``stop``, ``response_format``, ``logit_bias``, ``logprobs``,
+#: ``max_completion_tokens``, ``audio``, ``modalities``, ``prediction``.
+_RESPONSES_CREATE_KEYS = accepted_parameter_keys_from_signature(_AsyncResponses.create)
+_RESPONSES_STREAM_KEYS = accepted_parameter_keys_from_signature(_AsyncResponses.stream)
+
+#: Keys the Responses API signature accepts but that would break this handler if a config set
+#: them, because the handler itself already decides that behaviour. Everything else the API
+#: accepts is forwarded, including keys that are not strictly generation settings (``store``,
+#: ``user``, ``safety_identifier``, ``prompt_cache_key``, ``prompt_cache_retention``, ``include``,
+#: ``context_management``, ``metadata``, ``service_tier``, ``instructions``, ``moderation``, ...).
+_RESPONSES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",  # the handler chooses blocking vs. streaming itself, not via a kwarg
+        "stream_options",  # only meaningful together with stream=True, which the handler controls
+        "background",  # returns before the output exists, so the handler would get no result
+        "conversation",  # server-side conversation state conflicts with the input the handler builds
+        "prompt",  # server-side prompt template conflicts with the input the handler builds
+    }
+)
+
+
+def _apply_max_output_tokens_rename(params: dict[str, Any]) -> dict[str, Any]:
+    """Renames the Chat-Completions-era ``max_tokens``/``max_completion_tokens`` to the Responses
+    API's ``max_output_tokens``, the only one of the three the API actually accepts.
+
+    Precedence when more than one is set: an explicit ``max_output_tokens`` wins outright, then
+    ``max_completion_tokens``, then ``max_tokens``.
+    """
+    max_tokens = params.pop("max_tokens", None)
+    max_completion_tokens = params.pop("max_completion_tokens", None)
+    if "max_output_tokens" not in params:
+        if max_completion_tokens is not None:
+            params["max_output_tokens"] = max_completion_tokens
+        elif max_tokens is not None:
+            params["max_output_tokens"] = max_tokens
+    return params
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -262,7 +306,11 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                 messages=root_messages,
             )
 
-            extra_params = model_parameters(config)
+            extra_params = filter_forwardable_parameters(
+                _apply_max_output_tokens_rename(model_parameters(config)),
+                _RESPONSES_CREATE_KEYS,
+                _RESPONSES_EXCLUDED_KEYS,
+            )
             for _owned_key in (
                 "model",
                 "input",
@@ -501,7 +549,11 @@ async def _stream_gen(
                     tool_definitions=tool_definitions,
                 )
 
-            extra_params = model_parameters(config)
+            extra_params = filter_forwardable_parameters(
+                _apply_max_output_tokens_rename(model_parameters(config)),
+                _RESPONSES_STREAM_KEYS,
+                _RESPONSES_EXCLUDED_KEYS,
+            )
             for _owned_key in (
                 "model",
                 "input",

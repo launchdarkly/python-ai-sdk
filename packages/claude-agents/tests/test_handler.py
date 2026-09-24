@@ -1490,6 +1490,72 @@ class TestModelParametersForwarding:
         options = await self._run_and_capture_options(BASE_CONFIG, monkeypatch)
         assert options.max_turns is None
 
+    async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``ClaudeAgentOptions`` has no ``temperature``/``top_p``/``top_k``/``max_tokens``/
+        ``stop_sequences``/``tool_choice``/``metadata`` fields, all of which the LaunchDarkly UI's
+        model parameters panel offers for other providers. Forwarding one unfiltered raises
+        ``TypeError`` before any request is made; the filter must drop them instead.
+        """
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {
+                    "temperature": 0.2,
+                    "top_p": 0.5,
+                    "top_k": 10,
+                    "max_tokens": 256,
+                    "stop_sequences": ["STOP"],
+                    "tool_choice": "auto",
+                    "metadata": {"user_id": "u1"},
+                    "max_turns": 3,
+                },
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 3
+        for rejected in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "stop_sequences",
+            "tool_choice",
+            "metadata",
+        ):
+            assert not hasattr(options, rejected) or getattr(options, rejected) is None
+
+    async def test_transport_key_is_never_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {"extra_body": {"secret": "value"}, "max_turns": 2},
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 2
+        assert not hasattr(options, "extra_body") or options.extra_body is None
+
+    async def test_temperature_top_p_and_max_turns_run_without_type_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A realistic combination of UI-offered keys must not raise, and the one real field
+        (``max_turns``) must still land."""
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {"temperature": 0.3, "top_p": 0.8, "max_turns": 5},
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 5
+
 
 class TestFinishReasonMapping:
     async def test_tool_use_maps_to_tool_calls(

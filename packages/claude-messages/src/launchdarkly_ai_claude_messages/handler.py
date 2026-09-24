@@ -11,12 +11,14 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    accepted_parameter_keys_from_signature,
     compose_history,
     config,
     content_to_text,
     create_handler,
     end_span_once,
     end_unfinished_spans,
+    filter_forwardable_parameters,
     is_content_blocks,
     model_parameters,
     parse_template,
@@ -44,11 +46,54 @@ from .spans import (
 )
 
 try:
-    import anthropic as _anthropic_mod  # noqa: F401
+    import anthropic as _anthropic_mod
 
     _HAS_ANTHROPIC = True
 except ImportError:
     _HAS_ANTHROPIC = False
+
+#: Accepted keys derived once from ``AsyncMessages.create``/``.stream``'s own signatures, never
+#: hand-maintained. Neither has a ``**kwargs`` catch-all. The two differ slightly (``stream`` also
+#: takes ``output_format``), so each call site below filters against the method it actually calls.
+_MESSAGES_CREATE_KEYS = accepted_parameter_keys_from_signature(
+    _anthropic_mod.resources.messages.AsyncMessages.create
+)
+_MESSAGES_STREAM_KEYS = accepted_parameter_keys_from_signature(
+    _anthropic_mod.resources.messages.AsyncMessages.stream
+)
+
+#: Keys the Messages API signature accepts but that would break this handler if a config set
+#: them, because the handler itself already decides that behaviour. Everything else the API
+#: accepts is forwarded, including keys that are not strictly generation settings (``metadata``,
+#: ``service_tier``, ``container``, ``user_profile_id``, ``output_config``, ...).
+_MESSAGES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",  # the handler chooses blocking vs. streaming itself, not via a kwarg
+    }
+)
+
+
+def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
+    """Moves a top-level ``effort`` into ``output_config.effort``, the shape the Anthropic Messages
+    API actually accepts (there is no top-level ``effort`` parameter).
+
+    An ``output_config`` the config itself already set wins: if it carries its own ``effort``, the
+    top-level one is dropped rather than overwriting it. This handler does not itself set
+    ``output_config`` (structured output goes through a system-prompt instruction instead, see
+    ``_build_messages``), so there is nothing here to merge with yet; a future call site that starts
+    setting ``output_config`` must merge so its own keys win and a config's ``effort`` survives.
+    """
+    effort = params.pop("effort", None)
+    if effort is None:
+        return params
+    existing = params.get("output_config")
+    if isinstance(existing, dict) and "effort" in existing:
+        return params
+    params["output_config"] = {
+        **(existing if isinstance(existing, dict) else {}),
+        "effort": effort,
+    }
+    return params
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -202,7 +247,11 @@ async def _run_tool_loop(
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
-    extra_params = model_parameters(config)
+    extra_params = filter_forwardable_parameters(
+        _rename_effort_to_output_config(model_parameters(config)),
+        _MESSAGES_CREATE_KEYS,
+        _MESSAGES_EXCLUDED_KEYS,
+    )
     max_tokens = extra_params.pop("max_tokens", 1024)
     for _owned_key in ("model", "messages", "system", "tools"):
         extra_params.pop(_owned_key, None)
@@ -497,7 +546,11 @@ async def _stream_gen(
 
     tools = _build_tools(config.get("tools") or {})
     tool_definitions = to_tool_definitions(tools)
-    extra_params = model_parameters(config)
+    extra_params = filter_forwardable_parameters(
+        _rename_effort_to_output_config(model_parameters(config)),
+        _MESSAGES_STREAM_KEYS,
+        _MESSAGES_EXCLUDED_KEYS,
+    )
     max_tokens = extra_params.pop("max_tokens", 1024)
     for _owned_key in ("model", "messages", "system", "tools"):
         extra_params.pop(_owned_key, None)

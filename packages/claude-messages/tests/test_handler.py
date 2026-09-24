@@ -506,6 +506,119 @@ class TestModelParametersForwarding:
         assert captured["body"]["top_p"] == 0.4
         assert captured["body"]["max_tokens"] == 256
 
+    async def test_ui_key_the_sdk_rejects_is_dropped_without_raising(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        """``effort`` has no top-level equivalent on ``messages.create``; without the rename it
+        raises ``TypeError`` before this filter existed. Here it is set with no ``output_config``,
+        so the effort rename applies and the call must not raise.
+        """
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"effort": "low"}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {"effort": "low"}
+
+    async def test_transport_key_is_never_forwarded(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"top_p": 0.5, "extra_body": {"secret": "value"}},
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["top_p"] == 0.5
+        assert "extra_body" not in call_kwargs
+
+    async def test_stream_key_is_never_forwarded(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        """The handler picks blocking vs. streaming by which client method it calls, not by a
+        ``stream`` kwarg; a config setting it must not reach ``messages.create``."""
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"stream": True}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert "stream" not in call_kwargs
+
+
+class TestEffortRename:
+    async def test_explicit_output_config_effort_wins_over_top_level_effort(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "effort": "low",
+                    "output_config": {"effort": "high"},
+                },
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {"effort": "high"}
+
+    async def test_top_level_effort_moves_into_output_config_when_absent(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"effort": "medium"}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {"effort": "medium"}
+
+    async def test_top_level_effort_merges_into_an_output_config_without_effort(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        """An ``output_config`` present without its own ``effort`` keeps its other keys and gains
+        the top-level ``effort``."""
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "effort": "low",
+                    "output_config": {"some_other_key": "kept"},
+                },
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {
+            "some_other_key": "kept",
+            "effort": "low",
+        }
+
 
 class TestToolExecutionLoop:
     async def test_single_tool_call_then_done(self, mock_anthropic: MagicMock) -> None:

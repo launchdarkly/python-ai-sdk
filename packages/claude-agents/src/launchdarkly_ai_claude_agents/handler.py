@@ -35,12 +35,14 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    accepted_parameter_keys_from_dataclass,
     compose_history,
     config,
     content_to_text,
     create_handler,
     end_span_once,
     end_unfinished_spans,
+    filter_forwardable_parameters,
     model_parameters,
     parse_template,
     set_conversation_id_if_absent,
@@ -66,6 +68,13 @@ from .spans import (
     succeed_span,
     tool_display_name,
 )
+
+#: Accepted keys derived once from ``ClaudeAgentOptions``'s own fields, never hand-maintained. The
+#: SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
+#: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
+#: for other providers; forwarding one of those unfiltered raised ``TypeError`` before this filter
+#: existed.
+_CLAUDE_AGENT_OPTIONS_KEYS = accepted_parameter_keys_from_dataclass(ClaudeAgentOptions)
 
 # ---------------------------------------------------------------------------
 # Tool wiring
@@ -480,7 +489,9 @@ def _build_query_options(
     **extra: Any,
 ) -> ClaudeAgentOptions:
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
-    params = model_parameters(config)
+    params = filter_forwardable_parameters(
+        model_parameters(config), _CLAUDE_AGENT_OPTIONS_KEYS
+    )
     for _owned_key in (
         "model",
         "allowed_tools",

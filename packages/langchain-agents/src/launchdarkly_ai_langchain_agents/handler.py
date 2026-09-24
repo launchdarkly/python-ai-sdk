@@ -6,6 +6,7 @@ Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -16,12 +17,14 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    accepted_parameter_keys_from_pydantic_model,
     compose_history,
     config,
     create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    filter_forwardable_parameters,
     lang_chain_content_text,
     lang_chain_span_messages,
     lang_chain_span_usage,
@@ -42,6 +45,17 @@ from .spans import (
     succeed_span,
     to_tool_definitions,
 )
+
+
+@functools.cache
+def pydantic_accept_keys(model_cls: Any) -> frozenset[str]:
+    """Caches the accept-set for a LangChain chat model class, keyed by the class object itself.
+
+    Computed once per class rather than per call: ``ChatOpenAI``/``ChatAnthropic``/
+    ``ChatBedrockConverse`` field introspection is cheap but there is no reason to repeat it on
+    every invocation of a hot path.
+    """
+    return accepted_parameter_keys_from_pydantic_model(model_cls)
 
 
 def _build_agent_tools(
@@ -171,12 +185,16 @@ def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
 
 
 def _model_constructor_kwargs(
-    config: AiConfigRep, fallback_name: str
+    config: AiConfigRep, fallback_name: str, model_cls: Any = None
 ) -> dict[str, Any]:
     parameters = model_parameters(config)
     provider = str((config.get("provider") or {}).get("name") or "").lower()
     if provider == "bedrock":
         parameters.pop("tools", None)
+    if model_cls is not None and parameters:
+        parameters = filter_forwardable_parameters(
+            parameters, pydantic_accept_keys(model_cls)
+        )
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
 
@@ -199,7 +217,9 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
+            **_model_constructor_kwargs(
+                config, "claude-3-5-sonnet-20241022", lc_anthropic.ChatAnthropic
+            )
         )
     if provider == "bedrock":
         try:
@@ -209,9 +229,13 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
                 "Using Bedrock models requires langchain-aws. "
                 "Install it with: pip install langchain-aws"
             ) from exc
-        return lc_aws.ChatBedrockConverse(**_model_constructor_kwargs(config, ""))
+        return lc_aws.ChatBedrockConverse(
+            **_model_constructor_kwargs(config, "", lc_aws.ChatBedrockConverse)
+        )
     lc_openai = importlib.import_module("langchain_openai")
-    return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
+    return lc_openai.ChatOpenAI(
+        **_model_constructor_kwargs(config, "gpt-4o", lc_openai.ChatOpenAI)
+    )
 
 
 async def _resolve_base_model(config: AiConfigRep, llm: Any) -> Any:
