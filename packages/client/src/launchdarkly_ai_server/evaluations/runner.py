@@ -55,11 +55,8 @@ CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
-# What ``run(tools=...)`` accepts. A bare callable or ``NativeTool`` names a tool
-# in the LaunchDarkly AI library, to be resolved by key; an ``InlineTool``
-# carries its own definition. ``ToolImplementation`` stays the narrower
-# handler-facing type: a handler only ever receives executables, never
-# definitions.
+# A value accepted by ``run(tools=...)``. A callable or ``NativeTool`` names a
+# tool to resolve by key. An ``InlineTool`` carries its own definition.
 ToolEntry = ToolImplementation | InlineTool
 
 
@@ -186,22 +183,12 @@ def _required_string(data: Mapping[str, Any], key: str, description: str) -> str
 
 
 def _validate_inline_tool(key: str, tool: InlineTool) -> None:
-    """Check one inline tool definition, issuing no requests.
+    """Validate one inline tool definition. Raises ``EvaluationsError``.
 
-    Held to a stricter standard than the library path on purpose. A library
-    tool's ``description`` and ``schema`` are LaunchDarkly's data, which
-    ``_resolve_tools`` coerces rather than failing a run over; an inline
-    definition is the caller's own, and rejecting a bad one costs nothing here
-    because no evaluation record exists yet. The same value reaching the wire
-    unchecked would instead surface as an opaque create failure, or as a
-    handler receiving a schema no model can use.
+    Checks the key, the implementation, the schema, and the description. Issues
+    no requests.
     """
-    # A tool key does not use uppercase letters. The API key pattern is laxer
-    # and still admits one, so this rule is stricter than the server on
-    # purpose. An inline key is the caller's own. run() is the last point where
-    # the caller can correct it. After that point the key goes into a record.
-    # The rule also makes the case-insensitive collision check in
-    # _validate_tools safe. No valid pair can then differ only in case.
+    # Keys are lowercase.
     if key != key.lower():
         raise EvaluationsError(
             f"Inline tool {key!r} key must not use uppercase letters. Use "
@@ -226,9 +213,7 @@ def _validate_inline_tool(key: str, tool: InlineTool) -> None:
             f"{type(tool.schema).__name__}"
         )
     try:
-        # allow_nan=False because the default encoder emits NaN and Infinity,
-        # which are not JSON and which the API rejects -- after the request has
-        # already been issued, where the cause is no longer obvious.
+        # allow_nan=False rejects NaN and Infinity, which are not valid JSON.
         json.dumps(dict(tool.schema), allow_nan=False)
     except (TypeError, ValueError) as error:
         raise EvaluationsError(
@@ -242,12 +227,9 @@ def _validate_inline_tool(key: str, tool: InlineTool) -> None:
 
 
 def _validate_tools(tools: Mapping[str, ToolEntry]) -> None:
-    """Check the whole tools map before any request is issued.
+    """Validate the whole tools map. Raises ``EvaluationsError``.
 
-    Every check here runs with zero requests recorded, so a mistyped argument
-    never leaves a half-built run behind: the library path's own failure (a 404
-    on the ``ai-tools`` GET) can only fire once a request has gone out, and an
-    inline definition never issues one at all.
+    Issues no requests.
     """
     keys_by_identity: dict[str, str] = {}
     inline_identities: set[str] = set()
@@ -264,12 +246,9 @@ def _validate_tools(tools: Mapping[str, ToolEntry]) -> None:
                     f"Tool {key!r} must be callable, a NativeTool instance, or "
                     "an InlineTool"
                 )
-        # A tool key is one identity per run: it resolves either to a library
-        # tool or to an inline definition, never both. The run record badges
-        # each tool "inline" or "v<N>", so a key carrying both would record one
-        # tool twice under conflicting identities. Compared case-insensitively
-        # only when an inline definition is involved -- two library keys that
-        # differ by case are two library lookups and stay the API's business.
+        # A key names either a library tool or an inline definition, not both.
+        # Keys are compared case-insensitively when an inline definition is
+        # involved. Two library keys that differ only by case are two tools.
         identity = key.strip().lower()
         collision = keys_by_identity.get(identity)
         if collision is not None and (is_inline or identity in inline_identities):
@@ -290,11 +269,7 @@ def _validate_tools(tools: Mapping[str, ToolEntry]) -> None:
 
 
 def _tool_handlers(tools: Mapping[str, ToolEntry]) -> dict[str, ToolImplementation]:
-    """Unwrap the tools map into the executables a handler is passed.
-
-    Handlers receive the same ``{key: executable}`` shape whichever source a
-    tool came from, so an inline definition is invisible to them.
-    """
+    """Return the tools map as ``{key: executable}``, unwrapping any ``InlineTool``."""
     return {
         key: entry.implementation if isinstance(entry, InlineTool) else entry
         for key, entry in tools.items()
@@ -342,17 +317,10 @@ class EvaluationsRunner:
         project_key: str,
         tools: Mapping[str, ToolEntry],
     ) -> dict[str, ResolvedTool]:
-        """Resolve each tool in the map to the definition the run will record.
+        """Resolve each tool in the map to a ``ResolvedTool``.
 
-        A library entry is fetched from ``ai-tools`` to pin its version and read
-        its definition. An inline entry already carries its definition, so no
-        request is issued for it at all -- that absence is the whole point of
-        the feature, since it is what lets a caller use a tool that was never
-        created in LaunchDarkly.
-
-        Shape validation belongs to ``_validate_tools``, which ``run()`` calls
-        before any I/O; by the time a request goes out every entry in the map is
-        already known to be well-formed.
+        Fetches a library entry from ``ai-tools`` and pins the version it
+        returns. Takes an inline entry's definition as given, with no request.
         """
         resolved: dict[str, ResolvedTool] = {}
         for key, entry in tools.items():

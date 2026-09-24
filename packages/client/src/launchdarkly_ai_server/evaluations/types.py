@@ -61,17 +61,13 @@ class DatasetRow:
 class InlineTool:
     """A tool defined in code instead of created in LaunchDarkly first.
 
-    Place one as a value in ``run(tools=...)`` to supply the tool's own
-    ``schema`` and ``description`` alongside its executable, so the run needs no
-    ``ai-tools`` entry for that key. A bare callable in the same map still means
-    "a tool in the LaunchDarkly AI library, resolve it by key", so a map may mix
-    the two freely and existing callers are unaffected.
+    Use one as a value in ``run(tools=...)`` to supply a tool's ``schema`` and
+    ``description`` with its executable. A callable in the same map names a
+    tool to resolve by key, so one map may hold both kinds.
 
-    ``implementation`` is the function the handler calls, and is typed as a
-    plain callable on purpose: a :class:`~launchdarkly_ai_server.NativeTool` is
-    a marker for a capability the provider implements, which by definition has
-    no schema of its own, so pairing one with an inline definition has no
-    meaning and is rejected.
+    ``implementation`` is the function the handler calls. Keys must be
+    lowercase. A :class:`~launchdarkly_ai_server.NativeTool` is not accepted as
+    the implementation.
     """
 
     implementation: Callable[..., Any]
@@ -81,12 +77,9 @@ class InlineTool:
 
 @dataclass
 class ResolvedTool:
-    """A run's tool, resolved from the AI library or taken from an inline definition.
+    """A tool a run uses, from the library or from an inline definition.
 
-    ``source`` is the discriminator the evaluation-create body carries, and
-    ``version`` follows from it: a library tool pins the exact revision the run
-    recorded, while an inline definition has no server-side revision to pin and
-    leaves it ``None``.
+    ``version`` is set for a library tool and ``None`` for an inline one.
     """
 
     key: str

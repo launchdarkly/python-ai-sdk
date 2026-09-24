@@ -153,13 +153,10 @@ class EvaluationsModule:
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
-        # Validated on the caller's mapping, before the copy: any Mapping is
-        # accepted here, and collapsing one into a dict first would hide a
-        # repeated key by keeping only its last entry.
+        # Validate the caller's mapping before copying it, so a mapping that
+        # yields a key twice is not collapsed into its last entry.
         _validate_tools(tools or {})
         run_tools = dict(tools or {})
-        # Handlers are passed executables only -- an InlineTool is unwrapped, so
-        # the shape a handler sees does not reveal which source a tool came from.
         run_tool_handlers = _tool_handlers(run_tools)
         run_criteria = list(criteria or [])
         run_judge_handlers = list(judge_handlers or [])

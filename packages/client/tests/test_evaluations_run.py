@@ -1264,13 +1264,9 @@ async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
 
 @pytest.mark.asyncio
 async def test_inline_key_that_also_names_a_library_tool_is_rejected() -> None:
-    """The uppercase half must be the library key.
+    """The uppercase half must be the library key, since inline keys are lowercase.
 
-    An inline key may not carry an uppercase letter at all, so the only pair
-    that can still reach the case-insensitive collision check is a library key
-    with uppercase against a lowercase inline key. The match asserts the
-    collision wording, because the uppercase-key error also names both
-    spellings and would otherwise satisfy a looser pattern.
+    Matches the collision wording, which the uppercase-key error does not use.
     """
     transport = SequencedTransport([])
     evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
