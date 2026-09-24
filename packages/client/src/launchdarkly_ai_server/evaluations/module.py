@@ -21,9 +21,11 @@ from .criteria import Criterion, Judge
 from .runner import (
     EvalHandler,
     EvaluationsRunner,
-    ToolImplementation,
+    ToolEntry,
     _provides_for,
     _segment,
+    _tool_handlers,
+    _validate_tools,
 )
 from .types import EvalRunResult, GenerationConfig, RunSummary
 
@@ -99,7 +101,7 @@ class EvaluationsModule:
         dataset: str,
         handler: EvalHandler,
         generation: GenerationConfig,
-        tools: Mapping[str, ToolImplementation] | None = None,
+        tools: Mapping[str, ToolEntry] | None = None,
         criteria: list[Criterion] | None = None,
         judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
@@ -114,6 +116,16 @@ class EvaluationsModule:
         deterministic :class:`Scorer` functions — is then run against each
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
+
+        Each entry in ``tools`` is either a tool that exists in the
+        LaunchDarkly AI library — a bare callable or a
+        :class:`~launchdarkly_ai_server.NativeTool`, resolved by key and pinned
+        to its current version — or an :class:`InlineTool` carrying its own
+        ``schema`` and ``description``, which needs no LaunchDarkly tool to
+        exist and reads nothing from the tool API. A map may mix the two. An
+        inline definition is checked before any network I/O, so a bad one fails
+        with zero requests issued; handlers receive the same
+        ``{key: executable}`` map either way.
 
         A :class:`Judge` is an independent AI Config and may be served by a
         different provider or mode than ``generation``. ``handler`` runs a judge
@@ -141,7 +153,14 @@ class EvaluationsModule:
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
+        # Validated on the caller's mapping, before the copy: any Mapping is
+        # accepted here, and collapsing one into a dict first would hide a
+        # repeated key by keeping only its last entry.
+        _validate_tools(tools or {})
         run_tools = dict(tools or {})
+        # Handlers are passed executables only -- an InlineTool is unwrapped, so
+        # the shape a handler sees does not reveal which source a tool came from.
+        run_tool_handlers = _tool_handlers(run_tools)
         run_criteria = list(criteria or [])
         run_judge_handlers = list(judge_handlers or [])
         self._validate_criteria(run_criteria)
@@ -185,7 +204,7 @@ class EvaluationsModule:
             rows,
             handler,
             config,
-            run_tools,
+            run_tool_handlers,
             concurrency,
         )
         try:
@@ -200,7 +219,7 @@ class EvaluationsModule:
             if run_criteria:
                 criterion_results = await self._runner._run_criteria_for_results(
                     results,
-                    run_tools,
+                    run_tool_handlers,
                     run_criteria,
                     resolved_judges,
                     concurrency,

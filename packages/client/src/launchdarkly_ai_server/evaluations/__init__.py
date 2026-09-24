@@ -11,7 +11,14 @@ from .api import (
 )
 from .criteria import Criterion, Judge, Scorer, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
-from .types import DatasetRow, EvalRunResult, GenerationConfig, RunSummary, Usage
+from .types import (
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    InlineTool,
+    RunSummary,
+    Usage,
+)
 
 __all__ = [
     "DEFAULT_BASE_URI",
@@ -22,6 +29,7 @@ __all__ = [
     "EvaluationsModule",
     "GenerationConfig",
     "HttpResponse",
+    "InlineTool",
     "Judge",
     "LDApiClient",
     "LDApiError",

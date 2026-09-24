@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
 
@@ -58,13 +58,53 @@ class DatasetRow:
 
 
 @dataclass
+class InlineTool:
+    """A tool defined in code instead of created in LaunchDarkly first.
+
+    Place one as a value in ``run(tools=...)`` to supply the tool's own
+    ``schema`` and ``description`` alongside its executable, so the run needs no
+    ``ai-tools`` entry for that key. A bare callable in the same map still means
+    "a tool in the LaunchDarkly AI library, resolve it by key", so a map may mix
+    the two freely and existing callers are unaffected.
+
+    ``implementation`` is the function the handler calls, and is typed as a
+    plain callable on purpose: a :class:`~launchdarkly_ai_server.NativeTool` is
+    a marker for a capability the provider implements, which by definition has
+    no schema of its own, so pairing one with an inline definition has no
+    meaning and is rejected.
+    """
+
+    implementation: Callable[..., Any]
+    schema: dict[str, Any]
+    description: str = ""
+
+
+@dataclass
 class ResolvedTool:
-    """The schema and pinned version returned by the LaunchDarkly tool API."""
+    """A run's tool, resolved from the AI library or taken from an inline definition.
+
+    ``source`` is the discriminator the evaluation-create body carries, and
+    ``version`` follows from it: a library tool pins the exact revision the run
+    recorded, while an inline definition has no server-side revision to pin and
+    leaves it ``None``.
+    """
 
     key: str
-    version: int
+    version: int | None = None
     description: str = ""
     schema: dict[str, Any] = field(default_factory=dict)
+    source: Literal["library", "inline"] = "library"
+
+    def to_create_wire(self) -> dict[str, Any]:
+        """The entry this tool contributes to the evaluation-create body."""
+        if self.source == "inline":
+            return {
+                "key": self.key,
+                "schema": self.schema,
+                "description": self.description,
+                "source": "inline",
+            }
+        return {"key": self.key, "version": self.version, "source": "library"}
 
 
 @dataclass

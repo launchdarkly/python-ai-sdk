@@ -54,7 +54,7 @@ Never raises. Returns `{"enabled": bool, "config": dict | None, "meta": dict | N
 
 ## Evaluations from code
 
-`init_evaluations`, the criterion types, and the evaluations result types are all re-exported:
+`init_evaluations`, the criterion types, `InlineTool`, and the evaluations result types are all re-exported:
 
 ```python
 from launchdarkly_ai_python import Judge, Scorer, init_evaluations
@@ -73,7 +73,7 @@ result = await evals.run(
 )
 ```
 
-`LD_API_TOKEN` is required. Configure `LD_SDK_KEY` — or initialize your own client with `init_client(client=...)` — to emit one `$ld:ai:offline-evals:generation` event per generated row, plus one `$ld:ai:offline-evals:criterion` event per `(row, criterion)` when `criteria` are supplied, through the standard SDK event transport. The SDK reports scores; LaunchDarkly rules on them at ingest. A judge served by a different provider than `generation` needs a handler for it in `judge_handlers`. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. Evaluation-run links use the explicit `ui_base_uri` option or `LD_UI_BASE_URI`, defaulting to `https://app.launchdarkly.com`; set it when the project is not in production, or a run created elsewhere still links to the production app. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
+`LD_API_TOKEN` is required. `LD_SDK_KEY` is also required, because the harness needs an initialized client to send your results to LaunchDarkly. Supply your own client with `init_client(client=...)` if you prefer. The SDK reports a score for each row and criterion, and LaunchDarkly decides whether each one passes. A judge served by a different provider than `generation` needs a handler for it in `judge_handlers`. Pass an `InlineTool` in `tools` to define a tool in code rather than creating it in LaunchDarkly first. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
 
 ---
 
