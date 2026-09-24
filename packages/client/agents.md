@@ -548,9 +548,11 @@ Each of those choices is load-bearing; do not undo one as a simplification.
 - **`reason_code` is in the record only.** The signal's property set is the allowlist above
   and does not grow; the local record is where the detection vocabulary lives.
 
-`reason_code` is a **closed vocabulary of exactly eight tokens** — `IntegrityReasonCode`, a
-`Literal`, so a typo at a call site is a type error — one per `record_integrity_failure`
-call site, and the same eight in every language implementation:
+`reason_code` is a **closed vocabulary of exactly nine tokens** — `IntegrityReasonCode`, a
+`Literal`, so a typo at a call site is a type error — and the same nine in every language
+implementation. Eight are one per `record_integrity_failure` call site; the ninth,
+`key_mismatch`, comes from `record_key_mismatch` and is the only one that fires the log
+record **without** the product signal:
 
 | `reason_code` | Call site |
 |---|---|
@@ -562,8 +564,17 @@ call site, and the same eight in every language implementation:
 | `not_utf8` | `verified_bytes` — `UnicodeEncodeError` on encode (wire-`str` path only; a `Skill` already holds bytes) |
 | `over_size_cap` | `verified_bytes` — over `MAX_SKILL_CONTENT_BYTES` |
 | `hash_mismatch` | `verified_bytes` — observed sha256 != `contentHash` |
+| `key_mismatch` | `resolve_from_store` — the served object's own `key` is not the key requested. **Log record only, no signal**, and carries a `served_key` field no other record has |
 
-Adding a ninth failure mode means widening `IntegrityReasonCode`, adding a case to
+`key_mismatch` cannot join `REASON_CODE_CASES`: that table is driven uniformly through
+`all_skills`, and this code is decided at the retrieval boundary after `verify_raw_skill`
+has passed, so a listing cannot reach it. It is unioned into the exhaustiveness assertion
+instead, and covered by `test_key_mismatch_records_the_log_but_not_the_signal`. The
+record-without-signal split is deliberate — a mismatch is usually a broken store adapter
+rather than an attacker, and LaunchDarkly's counter must not fill with customers' adapter
+bugs — and tests pin both directions. Do not "fix" it by emitting the signal.
+
+Adding a tenth failure mode means widening `IntegrityReasonCode`, adding a case to
 `REASON_CODE_CASES` in `test_skills.py` (whose exhaustiveness assertion fails otherwise),
 documenting it in the README table, **and** doing the same in the other language SDKs. A
 token added on one side only is a drift bug: a customer's detection rule stops matching
@@ -673,11 +684,25 @@ it as soon as the write returns.
 **The platform bound is POSIX-only, and that is a decision — do not quietly "fix" it.**
 Windows reparse-point checks (`GetFileAttributesW`, `FILE_FLAG_OPEN_REPARSE_POINT`) are not
 implemented because Windows is not a supported or tested platform for this release: there is
-no Windows CI runner in either repository, so the checks would ship unverified, and the
-TypeScript SDK could not match them at all — Node exposes no `*at()` family on *any*
-platform, so its racy floor is universal rather than Windows-only. Implementing them in
-Python alone would break cross-language parity and trade a documented bound for an unverified
-one. Two follow-on facts: on Windows write permission on the managed root is the only
+no Windows CI runner in either repository, so the checks would ship unverified, and there is
+no second implementation to check them against — the TypeScript SDK has no Windows story
+either. Implementing them in Python alone would trade a documented bound for an unverified
+one.
+
+The parity argument used to be stronger than that, and the correction matters because the
+old wording is now wrong. It read: Node exposes no `*at()` family on *any* platform, so its
+racy floor is universal rather than Windows-only. The first half is still true and the
+second is not. `*at()` is not the only way to address a child relative to a pinned inode:
+TypeScript commit `0a15b10` added a `SUPPORTS_PROC_FD` probe and `/proc/self/fd/<fd>/<name>`
+addressing, which the Linux kernel resolves from the inode the descriptor holds rather than
+from the name it was opened under. That **closes** the swap window on Linux exactly as
+`*at()` does here, so TypeScript's `lstat` floor now applies on macOS and Windows only —
+the same shape as this side's, not a universal one.
+
+None of which reopens the decision above. It never rested on TypeScript being equally
+exposed; it rests on there being no Windows CI runner to verify the checks against, which is
+still the case in both repositories. Two follow-on facts: on Windows write permission on the
+managed root is the only
 boundary, which is why the privilege-separated deployment is documented as the mitigation
 rather than as advice; and this bound retroactively lowers the priority of the reserved-device-name
 work above — keep that code, but do not read it as evidence that Windows is hardened. If
@@ -868,6 +893,13 @@ failed `_PendingWrite` for it rather than filtering it out: dropping it silently
 key out of the requested set, so prune deletes the last known-good copy on disk and reports
 a routine `removed` with `report.ok` still true. Tampered content must never be able to
 trigger deletion.
+
+### 6. Expecting revocation to reach a boot-only `write_skills` deployment
+
+Without `watch_skills`, the revocation bound is process lifetime: a skill revoked after boot
+stays on disk until the process reconciles again, so a restart (or an explicit re-run of
+`write_skills`) is the incident-response action — and content an agent has already read into
+a conversation is out of reach at this layer either way.
 
 ---
 

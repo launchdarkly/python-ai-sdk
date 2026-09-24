@@ -42,12 +42,15 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
+    DEFAULT_BASE_URI,
     DEFAULT_POLL_TIMEOUT,
     DEFAULT_STREAM_READ_TIMEOUT,
+    DEFAULT_STREAM_URI,
     FDV2_KEY_DELIMITER,
     FDV2_OBJECT_KIND,
     MAX_RESPONSE_BYTES,
     _backoff_delay,
+    _classify_status,
     _FatalTransportError,
     _is_skill_event,
     _iter_sse,
@@ -56,6 +59,7 @@ from launchdarkly_ai_server.skills_fdv2 import (
     _Requester,
     _retry_after_seconds,
     _SkillObjectSet,
+    _StaleRequestStateError,
     _store_object_from_put,
     _StreamConnection,
     _tombstone_from_delete,
@@ -607,6 +611,72 @@ class TestProtocolReader:
         assert held.get("first", None) is None
         assert held.get("second", None) is not None
 
+    def test_a_full_transfer_that_omits_a_skill_publishes_a_tombstone(self) -> None:
+        """
+        A full transfer states the whole payload, so it revokes by omission and
+        no ``delete-object`` ever says so. Without the diff the store empties
+        while ``changes`` stays empty, and the case pruning exists for — the
+        environment's last skill revoked — wakes no listener at all.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=3))))
+        outcomes = drive(reader, full_payload(state="basis-2"))
+        assert len(held) == 0
+        assert outcomes[-1].changes == [{"key": "pdf-extraction", "version": 3}]
+        assert reader.diagnostics.objects_revoked == 1
+
+    def test_an_omitted_version_less_object_is_reported_as_departed(self) -> None:
+        """
+        An object too malformed to carry a version is held under its key alone,
+        and leaves the same way: as a tombstone with no version, which is what a
+        ``delete-object`` naming no version spells too.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=None))))
+        outcomes = drive(reader, full_payload(state="basis-2"))
+        assert outcomes[-1].changes == [{"key": "pdf-extraction", "version": None}]
+        assert reader.diagnostics.objects_revoked == 1
+
+    def test_a_version_move_reports_both_ends_and_counts_no_revocation(self) -> None:
+        """
+        The diff runs at ``(key, version)``, so a key whose version moved yields
+        a put for the arrival and a tombstone for the departure — what a
+        listener that reads versions needs. ``objects_revoked`` counts per key,
+        though, and this key never left the payload: counting it would tell an
+        operator a revocation landed when a publish did.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(object_version=3))))
+        outcomes = drive(
+            reader,
+            full_payload(("put-object", put_skill(object_version=4)), state="basis-2"),
+        )
+        arrived, departed = outcomes[-1].changes
+        assert (arrived["key"], arrived["version"]) == ("pdf-extraction", 4)
+        assert departed == {"key": "pdf-extraction", "version": 3}
+        assert reader.diagnostics.objects_revoked == 0
+
+    def test_a_change_transfer_revokes_nothing_by_omission(self) -> None:
+        """Only a full transfer states the whole payload. A delta that carries
+        no tombstone revoked nothing, and diffing one would drop every skill it
+        simply had no reason to mention."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill())))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert held.get("pdf-extraction", None) is not None
+        assert outcomes[-1].changes == []
+        assert reader.diagnostics.objects_revoked == 0
+
     def test_a_change_transfer_applies_deltas_over_what_is_held(self) -> None:
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -636,6 +706,33 @@ class TestProtocolReader:
         )
         assert held.get("pdf-extraction", None) is None
         assert reader.diagnostics.objects_revoked == 1
+
+    def test_a_delete_for_a_key_never_held_is_not_counted_as_a_revocation(
+        self,
+    ) -> None:
+        """``objects_revoked`` counts what went away, not tombstones seen.
+
+        The counter is operator-facing, and it is read precisely when somebody
+        is working out whether a revocation landed. A delete for a key the store
+        never held revoked nothing, so counting it inflates the one number that
+        answers that question. The tombstone still reaches listeners through
+        ``changes``, which is where "every revocation the server stated" lives.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill(key="kept"))))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("delete-object", delete_skill(key="never-delivered")),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert reader.diagnostics.objects_revoked == 0
+        assert held.get("kept", None) is not None
+        # Reported, just not counted.
+        assert outcomes[-1].changes == [{"key": "never-delivered", "version": 3}]
 
     def test_a_delete_notifies_with_a_tombstone_carrying_no_content(self) -> None:
         held = _SkillObjectSet()
@@ -909,6 +1006,48 @@ class TestPayloadIdentity:
         assert len(_payload_warnings(caplog, "was not applied")) == 1
         assert reader.diagnostics.payloads_ignored == 2
 
+    def test_a_declined_transfer_does_not_move_the_resume_point(self) -> None:
+        """
+        Ignoring a foreign payload's contents while adopting its resume point
+        would ask the next poll or stream to resume from someone else's
+        payload: skill updates could stop arriving while every diagnostic read
+        healthy.
+        """
+        reader = _ProtocolReader(_SkillObjectSet())
+        ours = drive(
+            reader, skill_payload(("put-object", put_skill()), state="skills-basis")
+        )
+        assert ours[-1].basis == "skills-basis"
+        outcomes = drive(
+            reader,
+            skill_payload(
+                ("put-object", put_flag()), payload_id="env-flags", state="flag-basis"
+            ),
+        )
+        assert outcomes[-1].basis is None
+        assert reader.diagnostics.payloads_ignored == 1
+
+    def test_a_none_intent_for_another_payload_moves_nothing(self) -> None:
+        """
+        A ``none`` intent builds no pending set, and the foreign check must not
+        be gated on one: the transfer that follows still names a payload, and
+        adopting its selector would resume the next connection from someone
+        else's payload with every diagnostic reading healthy.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill()), state="basis-skills"))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("none", "env-flags")),
+                ("payload-transferred", transferred("basis-flags")),
+            ),
+        )
+        assert outcomes[-1].basis is None
+        assert reader.diagnostics.payloads_ignored == 1
+        assert held.get("pdf-extraction", None) is not None
+
     def test_a_full_transfer_of_the_skill_payload_still_empties_it(self) -> None:
         """Every skill deleted is a real state, and the guard must not mask it."""
         held = _SkillObjectSet()
@@ -1138,13 +1277,76 @@ class TestPollingAgainstTheEndpoint:
         bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
         assert bases == [None, "basis-1", "basis-2"]
 
-    def test_an_etag_is_returned_as_if_none_match(self, endpoint: Any) -> None:
-        endpoint.queue_poll(full_payload(("put-object", put_skill())), etag='W/"v1"')
+    def test_the_basis_stays_on_the_skill_payload_when_another_transfers(
+        self, endpoint: Any
+    ) -> None:
+        """The wire half of the declined-payload case: the store must resume from
+        the payload skills arrive on, not from the one it just threw away."""
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="skills-basis")
+        )
+        endpoint.queue_poll(
+            events(
+                ("server-intent", server_intent("xfer-full", "env-flags")),
+                ("put-object", put_flag()),
+                ("payload-transferred", transferred("flag-basis")),
+            )
+        )
+        endpoint.queue_poll(status=304)
+        with poll_store(endpoint):
+            assert wait_until(lambda: len(endpoint.requests) >= 3)
+        bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
+        assert bases == [None, "skills-basis", "skills-basis"]
+
+    def test_an_etag_is_returned_for_the_basis_it_was_issued_against(
+        self, endpoint: Any
+    ) -> None:
+        """
+        An ETag validates one representation of one resource, and the basis is
+        part of the request that names it. ``W/"v1"`` answers the request that
+        carried no basis at all, so it is not offered once the payload it came
+        with moved the basis on; ``W/"v2"`` answers a request from ``basis-1``,
+        which is still the question being asked, so it is.
+        """
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="basis-1"), etag='W/"v1"'
+        )
+        endpoint.queue_poll(
+            events(("server-intent", server_intent("none"))), etag='W/"v2"'
+        )
         endpoint.queue_poll(status=304)
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            assert wait_until(lambda: len(endpoint.requests) >= 2)
-        assert endpoint.requests[1]["if_none_match"] == 'W/"v1"'
+            assert wait_until(lambda: len(endpoint.requests) >= 3)
+        bases = [r["query"].get("basis") for r in endpoint.requests[:3]]
+        assert bases == [None, "basis-1", "basis-1"]
+        offered = [r["if_none_match"] for r in endpoint.requests[:3]]
+        assert offered == [None, None, 'W/"v2"']
+
+    def test_the_etag_of_a_body_never_applied_is_not_offered(
+        self, endpoint: Any
+    ) -> None:
+        """
+        The body announced a transfer and then broke off, so the payload it
+        described was never committed. Offering its etag would invite a 304 that
+        reports a store still missing that payload as current and healthy — and
+        unlike the 200 it replaces, a 304 carries nothing to notice that on.
+        """
+        endpoint.queue_poll(
+            events(
+                ("server-intent", server_intent("xfer-full")),
+                ("put-object", put_skill()),
+                ("error", {"reason": "cut off mid-payload"}),
+            ),
+            etag='W/"v1"',
+        )
+        endpoint.queue_poll(
+            full_payload(("put-object", put_skill()), state="basis-1"), etag='W/"v2"'
+        )
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert endpoint.requests[1]["if_none_match"] is None
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
 
     def test_a_304_keeps_the_held_content(self, endpoint: Any) -> None:
         endpoint.queue_poll(full_payload(("put-object", put_skill())), etag='W/"v1"')
@@ -1613,6 +1815,126 @@ class TestFailureHandling:
             assert store.wait_for_skills(timeout=5) is True
             assert store.failed is None
 
+    def test_a_404_stops_delivery_immediately(self, endpoint: Any) -> None:
+        """A 404 means the endpoint does not exist for this credential.
+
+        A mistyped base URI, typically, or an instance that does not serve the
+        FDv2 endpoints. No reconnect produces one, so it is fatal rather than
+        retried — and it is the exception to the shape the recoverable-by-default
+        rule would suggest.
+        """
+        endpoint.queue_poll(status=404)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+            assert store.wait_for_skills(timeout=1) is False
+        assert "404" in store.failed
+        assert "/sdk/poll" in store.failed
+        # Fatal means one request, not a retry that happened to find the payload.
+        assert len(endpoint.requests) == 1
+        assert store.diagnostics.connection_failures == 0
+
+    def test_a_400_reconnects_once_from_scratch_and_is_then_fatal(
+        self, endpoint: Any
+    ) -> None:
+        """A 400 is what a stale ``basis`` selector looks like.
+
+        The selector and the etag are the only client state the request carries,
+        so a fresh connection built from nothing is the one repair available.
+        It gets exactly one: the retry bound is what keeps this from being
+        "400 is recoverable".
+        """
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: store.failed is not None)
+        assert "400" in store.failed
+        # The first payload, then the retried request, then the fatal one. The
+        # fourth queued payload is never asked for.
+        assert len(endpoint.requests) == 3
+        # The premise: the rejected request did carry client state to drop.
+        assert "basis" in endpoint.requests[1]["query"]
+        # The retry was from scratch: no selector and no etag on the way back.
+        retried = endpoint.requests[2]
+        assert retried["query"] == {}
+        assert retried["if_none_match"] is None
+        # Last known good survives both.
+        assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+
+    def test_a_400_still_reconnects_from_scratch_on_a_spent_budget(
+        self, endpoint: Any
+    ) -> None:
+        """The one repair available does not compete with the retry bound.
+
+        A 400 arriving on a budget an outage has already spent would otherwise
+        give up while holding the one request known to fix it, and delivery
+        would stop for the process lifetime over state the store was about to
+        drop. Exempting that request cannot unbound the loop: it carries no
+        state, so a second 400 is fatal on its own.
+        """
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with store:
+            assert store.wait_for_skills(timeout=5) is True
+            # The premise: the budget is spent by the time the 400 arrives.
+            assert wait_until(lambda: len(endpoint.requests) == 4)
+            assert store.failed is None
+        # The repair went out from scratch rather than never going out at all.
+        repair = endpoint.requests[3]
+        assert repair["query"] == {}
+        assert repair["if_none_match"] is None
+
+    def test_a_non_400_after_the_repair_meets_the_spent_budget(
+        self, endpoint: Any
+    ) -> None:
+        """The exemption is for the repair, not for the run that follows it."""
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: store.failed is not None)
+        assert "gave up after 3 consecutive failures" in store.failed
+        # The fifth queued payload is never asked for.
+        assert len(endpoint.requests) == 4
+
+    def test_a_400_carrying_no_client_state_is_fatal_at_once(
+        self, endpoint: Any
+    ) -> None:
+        """There is nothing to drop on a first connection, so nothing to repair.
+
+        A request that carried neither a selector nor an etag and was still
+        refused was refused on its own terms.
+        """
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+        assert "400" in store.failed
+        assert len(endpoint.requests) == 1
+
+    def test_the_two_exceptional_statuses_are_classified_apart(self) -> None:
+        # The classification is the contract; the end-to-end tests above are
+        # what prove the loop honours it.
+        assert isinstance(_classify_status(404, None), _FatalTransportError)
+        assert isinstance(_classify_status(400, None), _StaleRequestStateError)
+        # A stale-state error is still a recoverable one, so the retry path
+        # reaches it at all.
+        assert isinstance(_classify_status(400, None), _RecoverableTransportError)
+        for status in (405, 406, 414, 501):
+            assert isinstance(_classify_status(status, None), _FatalTransportError)
+        assert isinstance(_classify_status(503, None), _RecoverableTransportError)
+        assert not isinstance(_classify_status(503, None), _StaleRequestStateError)
+
     def test_a_401_stops_delivery(self, endpoint: Any) -> None:
         endpoint.queue_poll(status=401)
         with poll_store(endpoint) as store:
@@ -1812,31 +2134,68 @@ class TestFailureHandling:
 
     def test_a_retry_after_header_is_honoured(self) -> None:
         requester = _ScriptedRequester(
-            _RecoverableTransportError("slow down", retry_after=0.25),
+            _RecoverableTransportError("slow down", retry_after=0.5),
         )
         store = FDv2SkillStore(
             SDK_KEY,
             mode="poll",
             poll_interval=10.0,
-            initial_backoff=5.0,
+            initial_backoff=0.01,
+            max_backoff=5.0,
             _requester=requester,
         )
         try:
             started = time.monotonic()
             store.start()
-            assert wait_until(lambda: len(requester.calls) >= 2, timeout=3)
+            assert wait_until(lambda: len(requester.calls) >= 2, timeout=5)
             elapsed = time.monotonic() - started
-            # The server asked for 0.25s; our own backoff would have been 5s.
-            assert 0.2 <= elapsed < 3.0
+            # The server asked for 0.5s and our own backoff would have been
+            # 0.01s, so waiting is the only way the header could have been read.
+            # Asked *longer* rather than shorter on purpose: a shorter request
+            # is floored at ``initial_backoff``, so it cannot discriminate.
+            assert elapsed >= 0.4
+        finally:
+            store.close()
+
+    def test_a_retry_after_of_zero_still_waits_the_initial_backoff(self) -> None:
+        """``Retry-After: 0`` is floored, not taken literally.
+
+        A server — or an intermediate proxy — answering ``0`` would otherwise
+        have the loop reconnect as fast as it can schedule, spending the whole
+        bounded retry budget in milliseconds and hammering the endpoint on the
+        way. The floor is ``initial_backoff``, the same floor our own backoff
+        starts from.
+        """
+        requester = _ScriptedRequester(
+            _RecoverableTransportError("slow down", retry_after=0.0),
+        )
+        store = FDv2SkillStore(
+            SDK_KEY,
+            mode="poll",
+            poll_interval=10.0,
+            initial_backoff=0.5,
+            max_backoff=5.0,
+            _requester=requester,
+        )
+        try:
+            started = time.monotonic()
+            store.start()
+            assert wait_until(lambda: len(requester.calls) >= 2, timeout=5)
+            assert time.monotonic() - started >= 0.4
         finally:
             store.close()
 
     def test_a_retry_after_header_is_parsed_off_the_wire(self, endpoint: Any) -> None:
-        endpoint.queue_poll(status=429, retry_after="0")
+        endpoint.queue_poll(status=429, retry_after="0.5")
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        with poll_store(endpoint, initial_backoff=5.0) as store:
-            # If Retry-After were ignored the 5s backoff would blow the timeout.
-            assert store.wait_for_skills(timeout=3) is True
+        started = time.monotonic()
+        with poll_store(
+            endpoint, initial_backoff=0.01, max_backoff=5.0, poll_interval=10.0
+        ) as store:
+            assert store.wait_for_skills(timeout=5) is True
+        # 0.5s is only obtainable from the header: our own backoff here is 0.01s
+        # and the cap is 5s, so neither could have produced this wait.
+        assert time.monotonic() - started >= 0.4
 
     @pytest.mark.parametrize("raw", ["inf", "Infinity", "-inf", "nan", "1e309"])
     def test_a_non_finite_retry_after_is_ignored(self, raw: str) -> None:
@@ -2543,6 +2902,80 @@ class TestBaseUriScheme:
         assert FDv2SkillStore(SDK_KEY, base_uri="https://sdk.example.com/") is not None
         assert FDv2SkillStore(SDK_KEY) is not None
 
+    def test_a_plain_http_stream_uri_is_refused_by_name(self) -> None:
+        """The streaming host is checked too, and the message names it."""
+        with pytest.raises(ValueError, match="cleartext") as excinfo:
+            FDv2SkillStore(
+                SDK_KEY,
+                base_uri="https://sdk.example.com",
+                stream_uri="http://stream.example.com",
+            )
+        assert "stream_uri" in str(excinfo.value)
+
+
+class TestStreamHostDefaults:
+    """
+    LaunchDarkly serves ``/sdk/stream`` from a different host than ``/sdk/poll``,
+    and ``mode="stream"`` is the default — so a single-host default would have
+    the *default* configuration talk to the wrong host on first contact with a
+    real environment. Both base server-side SDKs ship the hosts as a pair
+    (``ldclient.Config``'s ``stream_uri``, ``js-server-sdk-common``'s
+    ``streamUri``), which is what these defaults follow.
+    """
+
+    @staticmethod
+    def _origins(store: FDv2SkillStore) -> tuple[str, str]:
+        requester = store._requester
+        return requester._base_uri, requester._stream_uri
+
+    def test_the_two_defaults_are_different_hosts(self) -> None:
+        assert DEFAULT_BASE_URI == "https://sdk.launchdarkly.com"
+        assert DEFAULT_STREAM_URI == "https://stream.launchdarkly.com"
+        assert self._origins(FDv2SkillStore(SDK_KEY)) == (
+            DEFAULT_BASE_URI,
+            DEFAULT_STREAM_URI,
+        )
+
+    def test_a_base_uri_alone_serves_both_endpoints(self) -> None:
+        # A relay or a private instance serving both from one host needs one
+        # option, not two.
+        assert self._origins(
+            FDv2SkillStore(SDK_KEY, base_uri="https://relay.example.com")
+        ) == ("https://relay.example.com", "https://relay.example.com")
+
+    def test_naming_both_overrides_them_independently(self) -> None:
+        assert self._origins(
+            FDv2SkillStore(
+                SDK_KEY,
+                base_uri="https://sdk.example.com/",
+                stream_uri="https://stream.example.com/",
+            )
+        ) == ("https://sdk.example.com", "https://stream.example.com")
+
+    def test_a_stream_uri_alone_leaves_polling_on_its_default(self) -> None:
+        assert self._origins(
+            FDv2SkillStore(SDK_KEY, stream_uri="https://stream.example.com")
+        ) == (DEFAULT_BASE_URI, "https://stream.example.com")
+
+    def test_the_stream_request_goes_to_the_stream_host(
+        self, endpoint: Any, second_endpoint: Any
+    ) -> None:
+        """The split is on the wire, not only in the attributes.
+
+        Polling at one host and streaming at another is the whole point, so
+        assert it where it is observable: the streaming request arrives at the
+        streaming endpoint and nothing arrives at the polling one.
+        """
+        requester = _Requester(
+            SDK_KEY,
+            endpoint.base_uri,
+            read_timeout=5.0,
+            stream_uri=second_endpoint.base_uri,
+        )
+        requester.stream(None).close()
+        assert [r["path"] for r in second_endpoint.requests] == ["/sdk/stream"]
+        assert endpoint.requests == []
+
 
 # ---------------------------------------------------------------------------
 # The eager re-reconcile, end to end over the transport
@@ -2586,6 +3019,33 @@ class TestWatchSkillsOverTheTransport:
                 assert written.exists()
                 assert any(a.action == "written" for a in report.actions)
                 assert wait_until(lambda: not written.exists(), timeout=10)
+            finally:
+                watcher.close()
+
+    async def test_a_full_transfer_that_omits_every_skill_prunes(
+        self, endpoint: Any, tmp_path: Any
+    ) -> None:
+        """
+        The environment's last skill revoked. The full transfer that follows
+        carries nothing at all, so the only thing that can wake the watcher is
+        the revocation the transfer states by omission.
+        """
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(full_payload(state="basis-2"))
+        endpoint.queue_poll(status=304)
+
+        with poll_store(endpoint, poll_interval=0.2) as store:
+            store.wait_for_skills(timeout=5)
+            await init_client(options={"skillStore": store}, client=object())
+            report, watcher = await watch_skills(
+                "*", tmp_path / "skills", debounce=0.05
+            )
+            try:
+                written = tmp_path / "skills" / "pdf-extraction" / "SKILL.md"
+                assert written.exists()
+                assert any(a.action == "written" for a in report.actions)
+                assert wait_until(lambda: not written.exists(), timeout=10)
+                assert store.diagnostics.objects_revoked == 1
             finally:
                 watcher.close()
 
@@ -2649,6 +3109,19 @@ class TestListenerRegistration:
     def _skill_listeners(store: Any) -> list[Any]:
         return list(store._listeners.get(SKILL_OBJECT_KIND, []))
 
+    def test_fdv2_add_listener_for_a_non_skill_kind_raises(self, endpoint: Any) -> None:
+        """The transport refuses the same registration the in-memory store does.
+
+        Only skill objects are ever delivered here, so a listener on any other
+        kind would never fire — and a store that accepted it has promised
+        something it cannot keep.
+        """
+        with poll_store(endpoint) as store:
+            with pytest.raises(ValueError, match="would never fire") as excinfo:
+                store.add_listener("flag", print)
+            assert SKILL_OBJECT_KIND in str(excinfo.value)
+            assert store._listeners == {}
+
     def test_fdv2_remove_listener_of_an_unregistered_callable_is_a_no_op(
         self, endpoint: Any
     ) -> None:
@@ -2682,6 +3155,42 @@ class TestLifecycle:
         store.start()
         store.close()
         store.close()
+
+    def test_a_closed_store_does_not_restart(self, endpoint: Any) -> None:
+        """``close`` is final, and a restart raises rather than resuming.
+
+        Finality is what gives ``close`` a postcondition a caller can rely on —
+        delivery has stopped — including when the join timed out. A store that
+        could be restarted from there leaves the caller unable to tell whether
+        delivery stopped, and a restart that silently never delivered again is
+        the failure this forecloses. To resume, construct a new store.
+        """
+        store = poll_store(endpoint)
+        store.start()
+        store.close()
+        with pytest.raises(RuntimeError, match="close\\(\\) is final") as excinfo:
+            store.start()
+        # The remedy is in the message, not only in the docs.
+        assert "Construct a new FDv2SkillStore" in str(excinfo.value)
+
+    def test_a_store_closed_before_it_started_also_refuses_to_start(
+        self, endpoint: Any
+    ) -> None:
+        store = poll_store(endpoint)
+        store.close()
+        with pytest.raises(RuntimeError, match="close\\(\\) is final"):
+            store.start()
+
+    def test_reentering_a_closed_store_as_a_context_manager_raises(
+        self, endpoint: Any
+    ) -> None:
+        # ``__enter__`` is ``start``, so finality reaches the ``with`` form too.
+        store = poll_store(endpoint)
+        with store:
+            pass
+        with pytest.raises(RuntimeError, match="close\\(\\) is final"):
+            with store:
+                pass
 
     def test_close_during_a_slow_connect_returns_promptly(self) -> None:
         # Before the connect returns there is no connection for close() to
@@ -2975,19 +3484,36 @@ class TestWaitingForSkills:
             store.close()
         assert store.wait_for_skills(timeout=5) is True
 
-    def test_a_restarted_store_waits_again(self) -> None:
-        # The released flag is sticky by design, so a store closed before any
-        # payload and then started again has to re-arm: otherwise the next
-        # waiter is let go before delivery has had a chance to begin.
-        store = stream_store(_requester=_SilentStreamRequester())
+    def test_a_store_restarted_after_giving_up_waits_again(self) -> None:
+        # The released flag is sticky by design, so a store that gave up before
+        # any payload and is then started again has to re-arm: otherwise the
+        # next waiter is let go before delivery has had a chance to begin.
+        # Restarting after a *close* is not available — see
+        # ``TestCloseIsFinal`` — so the give-up path is what exercises this.
+        class _FailsThenGoesQuiet(_FakeRequester):
+            """One failure, enough to give up; silent on every run after."""
+
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def stream(self, basis: str | None) -> Any:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise _RecoverableTransportError("x")
+                return _BlockingConnection()
+
+        store = stream_store(
+            max_consecutive_failures=0, _requester=_FailsThenGoesQuiet()
+        )
         store.start()
-        store.close()
+        assert wait_until(lambda: store.failed is not None)
         assert store.wait_for_skills(timeout=0.1) is False
+
         store.start()
         try:
             started = time.monotonic()
             assert store.wait_for_skills(timeout=0.5) is False
-            # Waited, rather than being released by the previous close.
+            # Waited, rather than being released by the previous give-up.
             assert time.monotonic() - started >= 0.4
         finally:
             store.close()
@@ -3066,11 +3592,12 @@ class TestPollShutdown:
         assert store.diagnostics.last_error is None
         assert store.failed is None
 
-    def test_a_close_that_timed_out_leaves_the_store_restartable(self) -> None:
+    def test_a_close_that_timed_out_is_still_final(self) -> None:
         # A request blocked inside its connect is beyond any interrupt, so
-        # ``close`` can still return with the thread alive. ``start`` must not
-        # then find that thread and return with the stop flag set: the store
-        # would report itself started and never deliver again.
+        # ``close`` can still return with the thread alive. This is the case
+        # finality exists for: the caller cannot tell whether delivery stopped,
+        # and a ``start`` that adopted the dying thread would leave a store
+        # reporting itself started and never delivering. Raising says so.
         requester = _SlowPollRequester()
         store = FDv2SkillStore(
             SDK_KEY, mode="poll", poll_interval=0.01, _requester=requester
@@ -3080,8 +3607,8 @@ class TestPollShutdown:
             assert requester.entered.wait(timeout=5)
             store.close(timeout=0.2)
             assert store._thread is not None and store._thread.is_alive()
-            store.start()
-            assert store._stop.is_set() is False
+            with pytest.raises(RuntimeError, match="close\\(\\) is final"):
+                store.start()
         finally:
             requester.release.set()
             store.close(timeout=2)

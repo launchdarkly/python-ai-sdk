@@ -86,8 +86,20 @@ has exactly one.
 """
 
 DEFAULT_BASE_URI = "https://sdk.launchdarkly.com"
-"""Where the SDK-facing FDv2 endpoints live. Overridable for Federal and private
-instances."""
+"""Where ``GET /sdk/poll`` is served. Overridable for Federal instances, private
+instances, and relay deployments."""
+
+DEFAULT_STREAM_URI = "https://stream.launchdarkly.com"
+"""
+Where ``GET /sdk/stream`` is served.
+
+LaunchDarkly serves streaming from a different host than polling, which is
+why this is a second default rather than a path under ``DEFAULT_BASE_URI``.
+
+A *base_uri* given on its own applies to both endpoints, because a relay or a
+private instance serving both from one host should need only one option; see
+``FDv2SkillStore.__init__``.
+"""
 
 POLL_PATH = "/sdk/poll"
 STREAM_PATH = "/sdk/stream"
@@ -202,9 +214,9 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 """The only hosts a plain ``http://`` base URI may name: a local test double."""
 
 
-def _require_https_base_uri(base_uri: str) -> None:
+def _require_https_uri(base_uri: str, option: str = "base_uri") -> None:
     """
-    Refuses a base URI that would send the SDK key in cleartext.
+    Refuses a URI that would send the SDK key in cleartext.
 
     Every request carries the environment's server-side SDK key in
     ``Authorization``, so the transport is ``https://`` only. The one exception
@@ -215,7 +227,7 @@ def _require_https_base_uri(base_uri: str) -> None:
     """
     if not isinstance(base_uri, str) or not base_uri.strip():
         raise ValueError(
-            "FDv2SkillStore requires an https:// base URI; none was given."
+            f"FDv2SkillStore requires an https:// URI for {option}; none was given."
         )
     parts = urllib.parse.urlsplit(base_uri.strip())
     if parts.scheme == "https" and parts.hostname:
@@ -224,14 +236,15 @@ def _require_https_base_uri(base_uri: str) -> None:
         return
     if parts.scheme == "http":
         raise ValueError(
-            f"FDv2SkillStore refuses base_uri {base_uri!r}: a plain http:// URI "
+            f"FDv2SkillStore refuses {option} {base_uri!r}: a plain http:// URI "
             "would send the server-side SDK key in cleartext. Use https:// "
-            "(the default is https://sdk.launchdarkly.com). Plain http:// is "
+            "(the defaults are https://sdk.launchdarkly.com for polling and "
+            "https://stream.launchdarkly.com for streaming). Plain http:// is "
             "allowed only for a loopback host (localhost, 127.0.0.1, ::1) "
             "serving a local test double."
         )
     raise ValueError(
-        f"FDv2SkillStore refuses base_uri {base_uri!r}: expected an https:// URI "
+        f"FDv2SkillStore refuses {option} {base_uri!r}: expected an https:// URI "
         "with a host, such as https://sdk.launchdarkly.com."
     )
 
@@ -554,6 +567,57 @@ class _TransferOutcome:
     """
 
 
+def _identity_of(raw: dict[str, Any]) -> tuple[str, Any]:
+    """
+    One object's ``(key, version)`` identity, as something comparable.
+
+    An object with no usable version compares alike to any other of its key,
+    which is what holding it under its key alone already means.
+    """
+    version = raw.get("version")
+    return (raw["key"], version if is_valid_skill_version(version) else None)
+
+
+def _revocations_between(
+    current: _SkillObjectSet, pending: _SkillObjectSet
+) -> list[dict[str, Any]]:
+    """
+    Tombstones for every object *pending* no longer holds.
+
+    A full transfer states the whole payload, so its revocations arrive as an
+    absence rather than as an event; this recovers them. At ``(key, version)``
+    granularity to match ``delete-object``, so a key whose version moved yields
+    both a put for the arrival and a tombstone for the departure — what a
+    listener that reads versions needs, and harmless to one that only needs
+    "something changed".
+    """
+    surviving = {_identity_of(raw) for raw in pending.all_raw()}
+    return [
+        {"key": key, "version": version}
+        for key, version in (_identity_of(raw) for raw in current.all_raw())
+        if (key, version) not in surviving
+    ]
+
+
+def _keys_fully_revoked(revoked: list[dict[str, Any]], pending: _SkillObjectSet) -> int:
+    """
+    How many of *revoked* are true revocations rather than version moves.
+
+    Counted per key, not per tombstone: a key *pending* still holds under some
+    other version has moved, and only a key that left the payload entirely is
+    gone. That is what ``objects_revoked`` counts, the same rule
+    ``_delete_object`` applies when it counts only a tombstone that took
+    something away. ``changes`` carries every tombstone regardless.
+    """
+    return len(
+        {
+            tombstone["key"]
+            for tombstone in revoked
+            if pending.get(tombstone["key"], None) is None
+        }
+    )
+
+
 class _ProtocolReader:
     """
     Applies FDv2 events to an object set. Pure — no sockets, no threads, no
@@ -686,8 +750,14 @@ class _ProtocolReader:
         tombstone = _tombstone_from_delete(data)
         if tombstone is None:
             return _TransferOutcome()
-        target.delete(tombstone)
-        self.diagnostics.objects_revoked += 1
+        removed = target.delete(tombstone)
+        if removed:
+            # Only a tombstone that took something away is a revocation. A
+            # delete for a key the store never held revoked nothing, and
+            # counting it inflates the one counter an operator reads to work
+            # out whether a revocation actually landed. ``changes`` below
+            # carries the tombstone either way, so a listener still sees it.
+            self.diagnostics.objects_revoked += 1
         # A revocation identifies the skill payload just as a put does.
         self._skills_in_payload += 1
         # A tombstone carries identity and no content; see
@@ -701,11 +771,30 @@ class _ProtocolReader:
         state = data.get("state") if isinstance(data, dict) else None
         version = data.get("version") if isinstance(data, dict) else None
         payload_id = self._intent_payload_id or _payload_id_from_selector(state)
-        if self._pending is not None and self._is_foreign_payload(payload_id):
+        # Asked regardless of whether a pending set exists: a ``none`` intent
+        # builds none, and the transfer that completes it still names a payload
+        # whose selector must not become the resume point if it is not the
+        # payload skills arrive on.
+        foreign = self._is_foreign_payload(payload_id)
+        if foreign:
             self._warn_foreign_payload(payload_id)
             self.diagnostics.payloads_ignored += 1
             self._changes = []
         elif self._pending is not None:
+            if self._intent == _INTENT_TRANSFER_FULL:
+                # A full transfer revokes by omission: whatever it did not carry
+                # is gone, and no ``delete-object`` ever says so. Diffed before
+                # the swap, so those departures reach listeners as tombstones
+                # like any other revocation — without which the one case pruning
+                # exists for, an environment's last skill being revoked, would
+                # empty the store and wake nobody.
+                revoked = _revocations_between(self._committed, self._pending)
+                self._changes.extend(revoked)
+                # Every departure is reported; only a key that left counts as
+                # revoked.
+                self.diagnostics.objects_revoked += _keys_fully_revoked(
+                    revoked, self._pending
+                )
             self._committed.replace_with(self._pending)
             _warn_if_nothing_can_verify(self._committed)
             if self._skills_in_payload and payload_id is not None:
@@ -728,7 +817,12 @@ class _ProtocolReader:
         return _TransferOutcome(
             committed=True,
             changes=changes,
-            basis=state if isinstance(state, str) and state else None,
+            # A declined payload must not move the resume point. Adopting the
+            # selector of a transfer whose contents this layer just threw away
+            # would ask the next poll or stream to resume from someone else's
+            # payload, and skill updates could stop arriving while every
+            # diagnostic still read healthy.
+            basis=state if not foreign and isinstance(state, str) and state else None,
         )
 
     def _abandon_in_flight(self) -> None:
@@ -879,6 +973,25 @@ class _RecoverableTransportError(Exception):
         self.retry_after = retry_after
 
 
+class _StaleRequestStateError(_RecoverableTransportError):
+    """
+    An HTTP 400 for a request carrying client state — the ``basis`` selector, or
+    an ``If-None-Match`` etag.
+
+    That state is the one part of the request that can go stale, so it is
+    dropped and a full transfer asked for **once** before the status is treated
+    as fatal. The bound is what keeps a 400 from being plain "recoverable": a
+    request carrying no state at all was itself refused, and no reconnect fixes
+    that.
+    """
+
+
+_REQUEST_ADVICE = (
+    "The request this adapter sent was not understood. It carries only the SDK "
+    "key and, after the first payload, a 'basis' selector, so check the base "
+    "URI and that the endpoint speaks FDv2."
+)
+
 _FORBIDDEN_ADVICE = (
     "The FDv2 protocol is opt-in per LaunchDarkly account and is served as HTTP "
     "403 while it is off. Skill delivery needs it enabled; contact LaunchDarkly "
@@ -930,12 +1043,24 @@ def _classify_status(status: int, headers: Any) -> Exception:
             "base URI, and any proxy in between, for the address being redirected "
             "to."
         )
-    if status in (400, 405, 406, 414, 501):
+    if status == 404:
+        # The endpoint does not exist for this credential or instance — a
+        # mistyped base URI, typically. No reconnect produces one.
+        return _FatalTransportError(
+            "LaunchDarkly returned HTTP 404 for the FDv2 endpoint. Check the "
+            "base URI, and that this instance serves /sdk/poll and /sdk/stream."
+        )
+    if status == 400:
+        # The one rejection this adapter can act on: the selector it sent may be
+        # one the server no longer accepts. Recoverable so the state can be
+        # dropped and a full transfer requested; fatal once that has been tried.
+        return _StaleRequestStateError(
+            f"LaunchDarkly returned HTTP 400. {_REQUEST_ADVICE}"
+        )
+    if status in (405, 406, 414, 501):
         return _FatalTransportError(
             f"LaunchDarkly returned HTTP {status}, which retrying will not fix. "
-            "The request this adapter sent was not understood. It carries only "
-            "the SDK key and, after the first payload, a 'basis' selector, so "
-            "check the base URI and that the endpoint speaks FDv2."
+            f"{_REQUEST_ADVICE}"
         )
     return _RecoverableTransportError(
         f"LaunchDarkly returned HTTP {status}", _retry_after_seconds(headers)
@@ -1038,10 +1163,15 @@ class _Requester:
         base_uri: str,
         *,
         read_timeout: float,
+        stream_uri: str | None = None,
         opener: Any = None,
     ) -> None:
         self._sdk_key = sdk_key
         self._base_uri = base_uri.rstrip("/")
+        # Streaming and polling are served from different hosts by LaunchDarkly;
+        # a caller that names only one host means both, which is a relay or a
+        # private instance. ``FDv2SkillStore`` resolves the two-default case.
+        self._stream_uri = (stream_uri or base_uri).rstrip("/")
         self._read_timeout = read_timeout
         # Injectable, so an alternative transport can be supplied. The default
         # never follows a redirect; see ``_RefuseRedirects``.
@@ -1066,9 +1196,12 @@ class _Requester:
         if response is not None:
             _interrupt_read(response)
 
-    def _url(self, path: str, basis: str | None) -> str:
+    def _url(self, origin: str, path: str, basis: str | None) -> str:
         """
         The request URL: the path, plus ``basis`` once a payload has committed.
+
+        *origin* is the host for this path — polling and streaming have one
+        each.
 
         Deliberately no ``mv`` (data model version). That parameter selects the
         *flag* data model and the connection rejects any value but the flag
@@ -1076,15 +1209,15 @@ class _Requester:
         and has no model version of its own to ask for.
         """
         if not basis:
-            return f"{self._base_uri}{path}"
-        return f"{self._base_uri}{path}?{urllib.parse.urlencode({'basis': basis})}"
+            return f"{origin}{path}"
+        return f"{origin}{path}?{urllib.parse.urlencode({'basis': basis})}"
 
     def _request(
-        self, path: str, basis: str | None, headers: dict[str, str]
+        self, origin: str, path: str, basis: str | None, headers: dict[str, str]
     ) -> urllib.request.Request:
         all_headers = {"Authorization": self._sdk_key, **headers}
         return urllib.request.Request(
-            self._url(path, basis), headers=all_headers, method="GET"
+            self._url(origin, path, basis), headers=all_headers, method="GET"
         )
 
     def poll(self, basis: str | None, etag: str | None) -> _PollResult:
@@ -1092,7 +1225,7 @@ class _Requester:
         headers = {"Accept": "application/json"}
         if etag:
             headers["If-None-Match"] = etag
-        request = self._request(POLL_PATH, basis, headers)
+        request = self._request(self._base_uri, POLL_PATH, basis, headers)
         try:
             with self._opener.open(request, timeout=self._read_timeout) as response:
                 with self._lock:
@@ -1126,6 +1259,7 @@ class _Requester:
     def stream(self, basis: str | None) -> _StreamConnection:
         """Opens ``GET /sdk/stream``."""
         request = self._request(
+            self._stream_uri,
             STREAM_PATH,
             basis,
             {"Accept": "text/event-stream", "Cache-Control": "no-cache"},
@@ -1328,11 +1462,21 @@ class FDv2SkillStore:
     **Server-side only.** A mobile key or a client-side environment ID is
     refused in the constructor.
 
-    **The SDK key goes only where it was pointed.** *base_uri* must be
-    ``https://`` — plain ``http://`` is refused except to a loopback host, for
-    local test doubles — and redirects are never followed, so a 3xx from a proxy
-    or a private instance is a fatal failure rather than a request carrying the
-    key to whatever host ``Location`` named.
+    **The SDK key goes only where it was pointed.** *base_uri* and *stream_uri*
+    must each be ``https://`` — plain ``http://`` is refused except to a
+    loopback host, for local test doubles — and redirects are never followed, so
+    a 3xx from a proxy or a private instance is a fatal failure rather than a
+    request carrying the key to whatever host ``Location`` named.
+
+    **Polling and streaming have separate hosts.** LaunchDarkly serves them from
+    different origins, so the defaults are a pair (``DEFAULT_BASE_URI`` and
+    ``DEFAULT_STREAM_URI``). A *base_uri* given on its own applies to both,
+    which is what a relay or a private instance serving both endpoints from one
+    host needs.
+
+    **``close`` is final.** A closed store still answers from what it received,
+    but delivery cannot be resumed: ``start`` afterwards raises. Construct a new
+    store instead.
 
     **Delivery is in the background; retrieval is not.** A daemon thread owns
     the connection and fills memory, and ``get_object`` only ever reads what has
@@ -1362,7 +1506,8 @@ class FDv2SkillStore:
         self,
         sdk_key: str,
         *,
-        base_uri: str = DEFAULT_BASE_URI,
+        base_uri: str | None = None,
+        stream_uri: str | None = None,
         mode: Mode = "stream",
         poll_interval: float = 30.0,
         read_timeout: float | None = None,
@@ -1372,8 +1517,14 @@ class FDv2SkillStore:
         _requester: Any = None,
     ) -> None:
         """
-        *base_uri* must be ``https://``; ``http://`` is accepted only for
-        ``localhost``, ``127.0.0.1`` or ``::1``. Raises ``ValueError`` otherwise.
+        *base_uri* is where ``GET /sdk/poll`` is sent (``DEFAULT_BASE_URI``) and
+        *stream_uri* where ``GET /sdk/stream`` is sent (``DEFAULT_STREAM_URI``),
+        because LaunchDarkly serves the two from different hosts. A *base_uri*
+        given **without** a *stream_uri* is used for both, which is what a relay
+        or a private instance serving both endpoints from one host needs; naming
+        both overrides them independently. Each must be ``https://``;
+        ``http://`` is accepted only for ``localhost``, ``127.0.0.1`` or
+        ``::1``. Raises ``ValueError`` otherwise.
 
         *mode* is ``"stream"`` by default. Prefer it: a ``delete-object`` reaches
         a live stream in seconds. ``"poll"`` exists for environments that cannot
@@ -1392,10 +1543,19 @@ class FDv2SkillStore:
         *max_consecutive_failures* bounds the retry loop. On exceeding it the
         transport stops, logs an error, and the store keeps serving last known
         good; ``failed`` reports it. Only failures in a row count: a committed
-        payload resets the count.
+        payload resets the count. The one request built from nothing after a
+        stale selector is refused is exempt, so an outage that has already
+        spent the budget cannot swallow the one repair available.
         """
         _require_server_side_credential(sdk_key)
-        _require_https_base_uri(base_uri)
+        # A lone ``base_uri`` means "both endpoints are here"; the two-host
+        # default applies only when neither was named.
+        if stream_uri is None:
+            stream_uri = DEFAULT_STREAM_URI if base_uri is None else base_uri
+        if base_uri is None:
+            base_uri = DEFAULT_BASE_URI
+        _require_https_uri(base_uri)
+        _require_https_uri(stream_uri, "stream_uri")
         if mode not in ("stream", "poll"):
             raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
         if poll_interval <= 0:
@@ -1422,13 +1582,30 @@ class FDv2SkillStore:
 
         self._basis: str | None = None
         self._etag: str | None = None
+        # The basis ``_etag`` was issued against. An ETag validates one
+        # representation of one resource, and the basis is part of the request
+        # that names it; holding the pair is what lets ``_poll_once`` tell an
+        # etag that still answers the question it is about to ask from one that
+        # answers a question it has stopped asking.
+        self._etag_basis: str | None = None
 
         self._requester = _requester or _Requester(
             sdk_key.strip(),
             base_uri,
             read_timeout=read_timeout,
+            stream_uri=stream_uri,
         )
 
+        self._closed = False
+        """
+        ``close`` has been called. Final: ``start`` raises afterwards.
+
+        What gives ``close`` a postcondition a caller can rely on — "delivery
+        has stopped" — including when the join timed out. A store that could be
+        restarted after a timed-out close leaves the caller unable to tell
+        whether delivery stopped, and a restart that silently never delivers
+        again is the failure this forecloses. To resume, construct a new store.
+        """
         self._stop = threading.Event()
         self._first_payload = threading.Event()
         """A payload has committed. The fact ``wait_for_skills`` reports."""
@@ -1464,8 +1641,21 @@ class FDv2SkillStore:
         Starts the delivery thread. Idempotent; returns ``self`` so it chains.
 
         Does not block: use ``wait_for_skills`` when boot ordering matters.
+
+        Raises ``RuntimeError`` on a **closed** store: ``close`` is final, so
+        there is no resuming it. A store that gave up at its failure bound is
+        not closed and can be started again — the retry budget and the terminal
+        reason both belong to the run that spent them.
         """
         with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    "This FDv2SkillStore has been closed, and close() is final: "
+                    "delivery cannot be resumed, so a restarted store would "
+                    "report itself started and never deliver. Construct a new "
+                    "FDv2SkillStore to resume delivery. Held content is still "
+                    "readable from the closed store."
+                )
             # Read before the rearm clears it: a thread inside ``_give_up`` is
             # still alive and no longer delivering, so ``is_alive`` on its own
             # would have this call adopt a run that is about to return and
@@ -1477,13 +1667,9 @@ class FDv2SkillStore:
             )
             self._rearm_waiters()
             if delivering:
-                # A ``close`` whose join timed out leaves the previous thread
-                # running with the stop flag still set. Clearing it lets that
-                # thread carry on delivering, rather than leaving a store that
-                # reports itself started and never delivers again.
-                self._stop.clear()
                 return self
-            self._stop.clear()
+            # Only ``close`` sets the stop flag, and a closed store never gets
+            # here, so there is nothing to clear.
             self._thread = threading.Thread(
                 target=self._run, name="ld-ai-skills-fdv2", daemon=True
             )
@@ -1492,9 +1678,9 @@ class FDv2SkillStore:
 
     def _rearm_waiters(self) -> None:
         """
-        Re-arms ``wait_for_skills`` for a store being started again after a
-        ``close``. A payload already held stays an answer; an ended delivery
-        does not, or the next waiter would be released before it began.
+        Re-arms ``wait_for_skills`` for a store being started again after it
+        gave up. A payload already held stays an answer; an ended delivery does
+        not, or the next waiter would be released before it began.
 
         A terminal ``failed`` reason is dropped for the same reason: it says why
         delivery stopped for good, and delivery is about to run again. Leaving
@@ -1512,12 +1698,21 @@ class FDv2SkillStore:
 
     def close(self, timeout: float = 5.0) -> None:
         """
-        Stops delivery. Idempotent, and safe to call from any thread.
+        Stops delivery. Idempotent, safe to call from any thread, and **final**:
+        a subsequent ``start`` raises rather than resuming. Construct a new
+        store to resume delivery.
+
+        Finality is what gives this call a postcondition — delivery has
+        stopped — even when the join below times out on a thread parked
+        somewhere no interrupt reaches. A store that could be restarted from
+        there would leave the caller unable to tell whether delivery stopped.
 
         Held content is *not* dropped: a closed store still answers from what it
         received. Detaching the store from the accessors is the job of the
         package-level ``launchdarkly_ai_server.shutdown()`` coroutine.
         """
+        with self._lock:
+            self._closed = True
         self._stop.set()
         # A waiter parked in ``wait_for_skills`` is owed an answer now rather
         # than at the end of its timeout; delivery is over either way.
@@ -1621,12 +1816,28 @@ class FDv2SkillStore:
 
         A put notifies with the raw skill object. A revocation notifies with a
         ``{"key", "version"}`` tombstone carrying no content, so a listener that
-        reads content must check for ``content`` rather than assume it.
+        reads content must check for ``content`` rather than assume it. Both
+        ways of stating a revocation arrive that way: a ``delete-object``, and a
+        full transfer that simply stopped carrying the object.
 
         *fn* runs on the delivery thread. Keep it cheap and non-blocking. An
         exception it raises is logged and swallowed, because a broken listener
         must not be able to kill delivery.
+
+        Only ``SKILL_OBJECT_KIND`` is ever delivered, so a registration for any
+        other kind **raises** rather than being recorded and silently never
+        firing. ``InMemorySkillStore.add_listener`` refuses the same way, for
+        the reason ``watch_skills`` refuses a store with no ``add_listener`` at
+        all: a listener that never fires looks exactly like one whose objects
+        never changed, and a store that accepted the registration has promised
+        something it cannot keep.
         """
+        if kind != SKILL_OBJECT_KIND:
+            raise ValueError(
+                f"FDv2SkillStore notifies only {SKILL_OBJECT_KIND!r} changes, so "
+                f"a listener on {kind!r} would never fire. Register it on "
+                f"{SKILL_OBJECT_KIND!r}."
+            )
         with self._lock:
             self._listeners.setdefault(kind, []).append(fn)
 
@@ -1685,6 +1896,23 @@ class FDv2SkillStore:
                     # would spend a retry from the bounded budget and leave a
                     # misleading ``last_error`` on a healthy store.
                     return
+                repairing_state = False
+                if isinstance(exc, _StaleRequestStateError):
+                    # The selector and the etag are the only client state in the
+                    # request, so a rejection of a request carrying neither is
+                    # the request itself being refused, and reconnecting cannot
+                    # fix it. Carrying one, the state may be stale: drop it, ask
+                    # for a full transfer, and let the next 400 be the fatal one.
+                    with self._lock:
+                        exhausted = self._basis is None and self._etag is None
+                        if not exhausted:
+                            self._basis = None
+                            self._etag = None
+                            self._etag_basis = None
+                            repairing_state = True
+                    if exhausted:
+                        self._give_up(str(exc))
+                        return
                 with self._lock:
                     # Whatever the dropped connection had transferred so far is
                     # not a payload; the next connection starts one afresh.
@@ -1694,7 +1922,13 @@ class FDv2SkillStore:
                     answered = self._attempt_answered
                     self._reader.diagnostics.connection_failures = failures
                     self._reader.diagnostics.last_error = str(exc)
-                if failures > self._max_consecutive_failures:
+                if failures > self._max_consecutive_failures and not repairing_state:
+                    # The one-shot request built from nothing is exempt from the
+                    # bound, so an outage that has already spent the budget
+                    # cannot swallow the repair a stale selector is asking for.
+                    # It cannot unbound the loop either: the repaired request
+                    # carries no state, so a second 400 is fatal on its own and
+                    # any other failure meets a budget still over the bound.
                     self._give_up(
                         f"gave up after {failures} consecutive failures; "
                         f"last error: {exc}"
@@ -1705,6 +1939,14 @@ class FDv2SkillStore:
                     delay = _backoff_delay(
                         failures, base=self._initial_backoff, maximum=self._max_backoff
                     )
+                else:
+                    # A server asking for no delay still gets one: honouring
+                    # ``Retry-After: 0`` literally would reconnect as fast as
+                    # the loop allows and burn the whole retry bound in
+                    # milliseconds, hammering the endpoint on the way. The
+                    # floor is ``initial_backoff``, the same floor our own
+                    # backoff starts from.
+                    delay = max(delay, self._initial_backoff)
                 # ``Retry-After`` is a request and ``max_backoff`` is a promise.
                 # The header may come from a proxy rather than LaunchDarkly, and
                 # a value in the hours would park revocation for that long.
@@ -1787,18 +2029,33 @@ class FDv2SkillStore:
 
     def _poll_once(self) -> None:
         with self._lock:
-            basis, etag = self._basis, self._etag
+            basis = self._basis
+            # Offered only while the pair still holds. The basis is part of the
+            # request, so an etag issued before the basis moved validates a
+            # payload this store has stopped asking for, and a server answering
+            # it ``304`` would be answering the previous question. One
+            # unconditional request after each commit is the whole cost: a
+            # payload that changed was never going to be a 304 anyway.
+            etag = self._etag if self._etag_basis == basis else None
         result = self._requester.poll(basis, etag)
-        with self._lock:
-            self._etag = result.etag
         if result.not_modified:
             logger.debug("Skill payload unchanged (HTTP 304)")
             # A 304 counts as a first payload, so a boot that reconnects with a
-            # cached basis is not blocked on a transfer the server will not send.
+            # cached basis is not blocked on a transfer the server will not
+            # send. It is a current answer because the etag that asked for it
+            # was issued for a body this store applied in full.
             self._publish_first_payload()
             return
         for name, data in result.events:
             self._apply(name, data)
+        with self._lock:
+            # Adopted only once the whole body has been applied. A body that
+            # broke off partway — an ``error`` or ``goodbye`` after an announced
+            # transfer — left the payload it described unapplied, and keeping
+            # its etag would let the next 304 report a store that is missing
+            # that payload as current and healthy.
+            self._etag = result.etag
+            self._etag_basis = basis
 
     def _stream_once(self) -> None:
         with self._lock:

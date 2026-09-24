@@ -124,6 +124,33 @@ class TestParseAiConfigSkills:
     def test_non_array_skills_fails(self, bad_skills: Any) -> None:
         assert parse_ai_config(self._base(skills=bad_skills)).success is False
 
+    def test_an_explicit_null_skills_fails_rather_than_reading_as_absent(
+        self,
+    ) -> None:
+        """``skills: null`` is the non-array that reads as "no skills".
+
+        It must not be treated that way. Read as absent it makes ``skill_refs``
+        return ``[]``, and a ``prune=True`` reconcile then *deletes* previously
+        materialized skill files on the strength of a field the SDK could not
+        parse — the same hazard the store path refuses, where reading a
+        malformed object as absent would let prune delete the last known-good
+        copy on disk. Failing the whole parse is the louder and safer outcome,
+        and it is why this case is pinned apart from the other non-arrays.
+        """
+        result = parse_ai_config(self._base(skills=None))
+        assert result.success is False
+        assert "skills" in result.error["message"]
+
+    def test_an_absent_skills_key_is_still_valid(self) -> None:
+        """The other half of the bullet above: *absent* is not *null*.
+
+        Rejecting ``null`` must not cost backward compatibility for the
+        configs that simply have no ``skills`` field.
+        """
+        raw = self._base()
+        assert "skills" not in raw
+        assert parse_ai_config(raw).success is True
+
     @pytest.mark.parametrize("entry", ["pdf-extraction", 1, None, ["a", 1]])
     def test_non_object_entry_fails(self, entry: Any) -> None:
         assert parse_ai_config(self._base(skills=[entry])).success is False

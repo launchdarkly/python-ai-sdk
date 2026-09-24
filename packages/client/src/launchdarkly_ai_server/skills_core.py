@@ -94,12 +94,21 @@ IntegrityReasonCode = Literal[
     "not_utf8",
     "over_size_cap",
     "hash_mismatch",
+    "key_mismatch",
 ]
 """
-The closed ``reason_code`` vocabulary — one token per
-``record_integrity_failure`` call site. Stable: a detection rule written against
+The closed ``reason_code`` vocabulary. Stable: a detection rule written against
 these tokens keeps working, so adding one is a deliberate edit here rather than
 a new string invented at the call site that needed it.
+
+Eight of the nine are one token per ``record_integrity_failure`` call site,
+decided inside ``verify_raw_skill`` over a single object, and they fire **both**
+detection surfaces. ``key_mismatch`` is the exception on both counts: it comes
+from ``record_key_mismatch`` at the retrieval boundary, after verification has
+already passed, and it fires the log record only. It shares this vocabulary
+anyway because a customer's detection rule cares that integrity failed, not
+about which layer noticed — see ``record_key_mismatch`` for why the signal
+stays out.
 """
 
 INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode))
@@ -352,6 +361,70 @@ def record_integrity_failure(
     emit(_SIGNAL_INTEGRITY_FAILURE, properties)
 
 
+def record_key_mismatch(requested: Any, served: Any) -> None:
+    """
+    Records a store answering under a key other than the one requested.
+
+    **Log record only — no product signal.** This is the one integrity failure
+    that fires one surface rather than both, and the asymmetry is the decision
+    rather than an oversight.
+
+    The record fires because a substituting store is a genuine tampering
+    indicator, and the record is the customer-owned detection path — the only
+    one that works when telemetry is opt-out or the instance has no telemetry
+    destination at all. It reuses ``INTEGRITY_FAILURE_EVENT`` deliberately: that
+    string is a documented compatibility surface a customer's SIEM matches on,
+    so reusing it means an existing rule catches this case without being
+    rewritten, with ``reason_code`` distinguishing it.
+
+    The signal stays out because the overwhelmingly common cause of a key
+    mismatch is not an attacker but a **broken store adapter** — a stale cache
+    entry, a colliding key, a wrong index lookup. Counting those as integrity
+    failures in LaunchDarkly's own product counter is the same false positive
+    ``resolve_from_store`` already refuses when a pinned ``get_object`` answers
+    with a non-dict: it reads that as ``absent`` rather than inventing a
+    tampering signal from a merely broken adapter.
+
+    Lives here, beside ``record_integrity_failure``, so the single-emission-site
+    rule still holds by reading one module.
+
+    Both keys are shape-checked and redacted on the same rule as every other key
+    that reaches a surface. *served* cannot actually be hostile on the path that
+    calls this — ``verify_raw_skill`` accepted it first — but that is a property
+    of the current call order rather than of this function, and the check is
+    what stops a future reordering from publishing a body here.
+    """
+    record: dict[str, Any] = {
+        "event": INTEGRITY_FAILURE_EVENT,
+        "action": _ACTION_WITHHELD,
+        "reason_code": "key_mismatch",
+        # Named apart from the eight so a reader of the line can tell the
+        # retrieval boundary from a verification failure without the spec.
+        "reason": (
+            "the skill store answered under a different key than the one requested"
+        ),
+        "language": _LANGUAGE,
+        # ``skill_key`` keeps the meaning it has on every other record — the key
+        # the *caller asked for* — so a rule that groups by it keeps working.
+        "skill_key": requested if is_valid_skill_key(requested) else "<invalid-key>",
+        # The key the store answered under: the one datum that makes a broken
+        # adapter diagnosable, so it is a parseable field rather than prose
+        # buried in ``reason``. Record-only, never on the signal's allowlist.
+        "served_key": served if is_valid_skill_key(served) else "<invalid-key>",
+    }
+    # No ``expected_hash``, ``observed_hash`` or ``version``: verification
+    # passed, so there is no hash disagreement to report and the served object's
+    # version is not what disqualified the answer — reporting it beside a
+    # ``skill_key`` that means the requested key would mix the two frames.
+    # Absent fields stay absent rather than being emitted as null.
+    logger.error(
+        "%s %s",
+        INTEGRITY_FAILURE_EVENT,
+        json.dumps(record, sort_keys=True, separators=(",", ":")),
+        extra={"ld_skills": record},
+    )
+
+
 def record_materialized(
     skill_key: str, content_bytes: int, content_hash: str, reconcile_action: str
 ) -> None:
@@ -421,7 +494,15 @@ def verified_bytes(
     key: str, content: str | bytes, expected_hash: str, version: int
 ) -> VerifiedContent | VerificationFailure:
     """
-    The whole content half of integrity verification: encode, size, hash.
+    The whole content half of integrity verification: size, encoding, hash.
+
+    The order is fixed, so content failing two classes reports one determined
+    code: **size** before **encoding** before **hash**. Size first is what makes
+    over-cap content carrying a lone surrogate report ``over_size_cap`` rather
+    than ``not_utf8`` — without a fixed order that input's code is whichever
+    check the implementation happens to reach first, and §3.21's "one code per
+    failure class" rule cannot be tested against it. The shape checks that
+    precede all three are in ``verify_raw_skill``.
 
     Accepts either shape content arrives in. A wire-shaped ``str`` is UTF-8
     encoded here, once — the only place that encode happens. ``bytes`` is an
@@ -439,6 +520,7 @@ def verified_bytes(
     first one's verdict forward: that puts a "trust the value computed upstream"
     branch inside the one function whose job is not to.
     """
+    encodable = True
     if isinstance(content, bytes):
         encoded = content
     else:
@@ -447,17 +529,18 @@ def verified_bytes(
         except UnicodeEncodeError:
             # json.loads turns a "\ud800" escape into an unpaired surrogate,
             # which has no UTF-8 encoding — so there are no bytes the server
-            # could have hashed. Never reach for errors="surrogatepass": it
-            # would fabricate bytes that could satisfy the hash comparison.
-            reason = "content is not encodable as UTF-8"
-            record_integrity_failure(
-                key,
-                reason,
-                reason_code="not_utf8",
-                version=version,
-                expected_hash=expected_hash,
-            )
-            return VerificationFailure(reason)
+            # could have hashed.
+            #
+            # These replacement bytes exist only to measure the content against
+            # the size cap, so that the *reported* failure follows the fixed
+            # order above. They are never hashed and never returned: the
+            # ``not_utf8`` branch below returns before the hash comparison, and
+            # nothing else reads ``encoded`` on this path. That is the whole
+            # reason ``errors="replace"`` is safe here and
+            # ``errors="surrogatepass"`` would not be anywhere — fabricated
+            # bytes that reached the comparison could satisfy it.
+            encodable = False
+            encoded = content.encode("utf-8", errors="replace")
 
     if len(encoded) > MAX_SKILL_CONTENT_BYTES:
         reason = (
@@ -468,6 +551,17 @@ def verified_bytes(
             key,
             reason,
             reason_code="over_size_cap",
+            version=version,
+            expected_hash=expected_hash,
+        )
+        return VerificationFailure(reason)
+
+    if not encodable:
+        reason = "content is not encodable as UTF-8"
+        record_integrity_failure(
+            key,
+            reason,
+            reason_code="not_utf8",
             version=version,
             expected_hash=expected_hash,
         )
@@ -755,6 +849,14 @@ def resolve_from_store(
         # is invited to tolerate. It is not ``wrong_version`` either — that
         # token names a version mismatch specifically, and there is deliberately
         # no ``wrong_key`` to parallel it.
+        #
+        # Records the log surface but not the product signal. ``verify_raw_skill``
+        # has already passed, so this is not a verification failure and does not
+        # go through ``record_integrity_failure``; see ``record_key_mismatch``
+        # for why the two surfaces part company here. The asymmetry is pinned by
+        # a test in both directions, because an implementation that emitted the
+        # signal too would look correct from every other angle.
+        record_key_mismatch(key, skill.key)
         return Resolution(
             reason="integrity_failure",
             error=(
