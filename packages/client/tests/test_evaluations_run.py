@@ -1146,6 +1146,11 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
             id="blank_library_key",
         ),
         pytest.param(
+            {"Lookup_Order": InlineTool(lookup_order, ORDER_SCHEMA)},
+            "must not use uppercase letters",
+            id="uppercase_inline_key",
+        ),
+        pytest.param(
             {"lookup_order": InlineTool(lookup_order, None)},  # type: ignore[arg-type]
             "schema must be a JSON object",
             id="schema_is_none",
@@ -1259,18 +1264,28 @@ async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
 
 @pytest.mark.asyncio
 async def test_inline_key_that_also_names_a_library_tool_is_rejected() -> None:
+    """The uppercase half must be the library key.
+
+    An inline key may not carry an uppercase letter at all, so the only pair
+    that can still reach the case-insensitive collision check is a library key
+    with uppercase against a lowercase inline key. The match asserts the
+    collision wording, because the uppercase-key error also names both
+    spellings and would otherwise satisfy a looser pattern.
+    """
     transport = SequencedTransport([])
     evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
 
-    with pytest.raises(EvaluationsError, match=r"Lookup_Order.*lookup_order"):
+    with pytest.raises(
+        EvaluationsError, match=r"'lookup_order' collides with 'Lookup_Order'"
+    ):
         await evals.run(
             project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
             tools={
-                "lookup_order": lookup_order,
-                "Lookup_Order": InlineTool(lookup_order, ORDER_SCHEMA),
+                "Lookup_Order": lookup_order,
+                "lookup_order": InlineTool(lookup_order, ORDER_SCHEMA),
             },
             generation={"provider": "OpenAI", "model": "gpt-4o"},
         )

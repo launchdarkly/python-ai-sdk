@@ -196,6 +196,17 @@ def _validate_inline_tool(key: str, tool: InlineTool) -> None:
     unchecked would instead surface as an opaque create failure, or as a
     handler receiving a schema no model can use.
     """
+    # A tool key does not use uppercase letters. The API key pattern is laxer
+    # and still admits one, so this rule is stricter than the server on
+    # purpose. An inline key is the caller's own. run() is the last point where
+    # the caller can correct it. After that point the key goes into a record.
+    # The rule also makes the case-insensitive collision check in
+    # _validate_tools safe. No valid pair can then differ only in case.
+    if key != key.lower():
+        raise EvaluationsError(
+            f"Inline tool {key!r} key must not use uppercase letters. Use "
+            f"{key.lower()!r} instead."
+        )
     if isinstance(tool.implementation, NativeTool):
         raise EvaluationsError(
             f"Inline tool {key!r} cannot pair a NativeTool with an inline "
