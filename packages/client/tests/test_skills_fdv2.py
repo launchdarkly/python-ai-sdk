@@ -39,6 +39,7 @@ from launchdarkly_ai_server import (
     init_client,
     skills_fdv2,
     watch_skills,
+    write_skills,
 )
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
@@ -48,12 +49,14 @@ from launchdarkly_ai_server.skills_fdv2 import (
     DEFAULT_STREAM_URI,
     FDV2_KEY_DELIMITER,
     FDV2_OBJECT_KIND,
+    FDV2_PAYLOAD_KIND,
     MAX_RESPONSE_BYTES,
     _backoff_delay,
     _classify_status,
     _FatalTransportError,
     _is_skill_event,
     _iter_sse,
+    _NoSkillPayloadError,
     _ProtocolReader,
     _RecoverableTransportError,
     _Requester,
@@ -206,6 +209,12 @@ class _FakeFDv2Endpoint:
         self._streams: list[list[dict[str, Any]]] = []
         self._lock = threading.Lock()
         self.hold_stream_open = False
+        # What a poll is answered with once the queued script runs out. 304 --
+        # "nothing has changed" -- is the right default for a healthy
+        # environment, but a standing 422 is what an environment with no skill
+        # payload answers *every* request with, and a queue cannot express
+        # "every".
+        self.default_poll_status = 304
         # When set, every ``/sdk/stream`` answers 307 to this URL instead of
         # streaming, so a test can check that the store refuses to follow it.
         self.redirect_stream_to: str | None = None
@@ -290,7 +299,9 @@ class _FakeFDv2Endpoint:
     def _serve_poll(self, handler: BaseHTTPRequestHandler) -> None:
         with self._lock:
             response = (
-                self._polls.pop(0) if self._polls else {"status": 304, "events": []}
+                self._polls.pop(0)
+                if self._polls
+                else {"status": self.default_poll_status, "events": []}
             )
         status = response["status"]
         handler.send_response(status)
@@ -381,11 +392,24 @@ class TestObjectIdentification:
     def test_the_kind_alone_identifies_a_skill(self) -> None:
         assert _is_skill_event(put_skill()) is True
 
+    def test_the_payload_kind_and_the_object_kind_are_separate_constants(
+        self,
+    ) -> None:
+        """
+        Two different things, and neither is derived from the other: the store
+        asks for a payload of kind ``agent-skill`` and reads objects of kind
+        ``skill`` out of it. Held apart so that a rename of either cannot
+        silently move the other.
+        """
+        assert FDV2_PAYLOAD_KIND == "agent-skill"
+        assert FDV2_OBJECT_KIND == "skill"
+        assert FDV2_PAYLOAD_KIND != FDV2_OBJECT_KIND
+
     def test_the_kind_is_the_bare_category_name(self) -> None:
         """
-        Object kinds on the channel are open strings and the agent-skill payload
-        is ``generic``, so a skill arrives under the kind its producer
-        registered — ``skill`` — not under a broader wrapper kind.
+        Object kinds on the channel are open strings, so a skill arrives under
+        the kind its producer registered — ``skill`` — not under a broader
+        wrapper kind, and not under the kind of the payload carrying it.
         """
         assert FDV2_OBJECT_KIND == "skill"
 
@@ -1231,10 +1255,10 @@ class TestPollingAgainstTheEndpoint:
         self, endpoint: Any
     ) -> None:
         """
-        No ``mv``: that parameter selects the *flag* data model, the connection
-        rejects any value but the flag default, and the generic agent-skill
-        payload is served regardless of it. Sending ``mv=1`` — the skill
-        payload's own model version — gets the whole connection refused.
+        No ``mv``: that parameter selects the *flag* data model, and delivery
+        overrides whatever a request asks for with the payload's own default for
+        any non-flagging payload. Sending it would state a preference that is
+        ignored, so the store states none.
         """
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         with poll_store(endpoint) as store:
@@ -1243,6 +1267,28 @@ class TestPollingAgainstTheEndpoint:
         assert first["path"] == "/sdk/poll"
         assert first["authorization"] == SDK_KEY
         assert "mv" not in first["query"]
+
+    def test_every_request_declares_the_agent_skill_payload_kind(
+        self, endpoint: Any
+    ) -> None:
+        """
+        Delivery narrows a connection to the kinds it declares and defaults to
+        flags, so a request without this parameter is served the environment's
+        flag payload and no skills at all. It is on the first request as well as
+        the ones after it: the declaration selects what the connection is served
+        rather than describing what it already holds, so there is no state for
+        it to wait on.
+        """
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=304)
+        with poll_store(endpoint, poll_interval=0.02) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: len(endpoint.requests) >= 2)
+        first, second = endpoint.requests[0], endpoint.requests[1]
+        assert first["query"]["kinds"] == "agent-skill"
+        assert "basis" not in first["query"]
+        assert second["query"]["kinds"] == "agent-skill"
+        assert second["query"]["basis"] == "basis-1"
 
     def test_the_first_request_sends_no_basis(self, endpoint: Any) -> None:
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
@@ -1437,6 +1483,20 @@ class TestStreamingAgainstTheEndpoint:
             store.close()
         assert endpoint.requests[0]["path"] == "/sdk/stream"
         assert endpoint.requests[0]["accept"] == "text/event-stream"
+
+    def test_the_stream_request_declares_the_payload_kind(self, endpoint: Any) -> None:
+        """Asserted separately from polling: the two hosts are different
+        origins, and nothing stops one path from building its URL without the
+        declaration that selects what the connection is served."""
+        endpoint.hold_stream_open = True
+        endpoint.queue_stream(full_payload(("put-object", put_skill())))
+        store = FDv2SkillStore(SDK_KEY, base_uri=endpoint.base_uri, mode="stream")
+        try:
+            store.start()
+            store.wait_for_skills(timeout=5)
+        finally:
+            store.close()
+        assert endpoint.requests[0]["query"]["kinds"] == "agent-skill"
 
     def test_a_streamed_revocation_arrives_without_a_restart(
         self, endpoint: Any
@@ -1723,6 +1783,19 @@ def stream_store(**kwargs: Any) -> FDv2SkillStore:
     )
 
 
+class _NoWaitStop(threading.Event):
+    """A ``_stop`` that answers every wait at once.
+
+    Retrying at the backoff cap is the right production behaviour and the wrong
+    test fixture: a test that only cares what happens *after* the wait should
+    not sit through one. Kept out of ``poll_store`` so the waits stay real
+    everywhere they are part of what is being asserted.
+    """
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return super().wait(0.001)
+
+
 class TestFailureHandling:
     def test_a_403_stops_delivery_and_explains_why(
         self, endpoint: Any, caplog: Any
@@ -1858,8 +1931,10 @@ class TestFailureHandling:
         # The premise: the rejected request did carry client state to drop.
         assert "basis" in endpoint.requests[1]["query"]
         # The retry was from scratch: no selector and no etag on the way back.
+        # The kind declaration stays, since it is not client state — it selects
+        # what the connection is served.
         retried = endpoint.requests[2]
-        assert retried["query"] == {}
+        assert retried["query"] == {"kinds": FDV2_PAYLOAD_KIND}
         assert retried["if_none_match"] is None
         # Last known good survives both.
         assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
@@ -1887,7 +1962,7 @@ class TestFailureHandling:
             assert store.failed is None
         # The repair went out from scratch rather than never going out at all.
         repair = endpoint.requests[3]
-        assert repair["query"] == {}
+        assert repair["query"] == {"kinds": FDV2_PAYLOAD_KIND}
         assert repair["if_none_match"] is None
 
     def test_a_non_400_after_the_repair_meets_the_spent_budget(
@@ -1922,7 +1997,7 @@ class TestFailureHandling:
         assert "400" in store.failed
         assert len(endpoint.requests) == 1
 
-    def test_the_two_exceptional_statuses_are_classified_apart(self) -> None:
+    def test_the_exceptional_statuses_are_classified_apart(self) -> None:
         # The classification is the contract; the end-to-end tests above are
         # what prove the loop honours it.
         assert isinstance(_classify_status(404, None), _FatalTransportError)
@@ -1934,6 +2009,124 @@ class TestFailureHandling:
             assert isinstance(_classify_status(status, None), _FatalTransportError)
         assert isinstance(_classify_status(503, None), _RecoverableTransportError)
         assert not isinstance(_classify_status(503, None), _StaleRequestStateError)
+        # 422 is the third class: recoverable enough to be retried, but its own
+        # type so the loop can keep it off the failure budget.
+        no_payload = _classify_status(422, None)
+        assert isinstance(no_payload, _NoSkillPayloadError)
+        assert isinstance(no_payload, _RecoverableTransportError)
+        assert not isinstance(no_payload, _FatalTransportError)
+        # The message explains the state rather than reciting the status: this
+        # is the line a user reads when their skills never show up.
+        assert "no Agent Skills payload" in str(no_payload)
+
+    def test_a_422_never_stops_delivery_and_is_not_counted_as_a_failure(
+        self, endpoint: Any, caplog: Any
+    ) -> None:
+        """
+        A 422 means the credential is assigned no agent-skill payload, which is
+        every project in which no skill has ever been created. Counting it as a
+        failure would spend the budget and report an ordinary configuration as
+        "gave up after N consecutive failures"; so it is counted, said once, and
+        retried for as long as the store is open.
+        """
+        endpoint.default_poll_status = 422
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        with caplog.at_level("WARNING"):
+            with store:
+                # On the diagnostic rather than the request count: the counter
+                # moves after the response is read, so the fourth request being
+                # logged does not mean the fourth 422 has been handled.
+                assert wait_until(lambda: store.diagnostics.payload_unavailable >= 4)
+                # Well past a bound of one, and still asking.
+                assert store.failed is None
+        assert store.diagnostics.payload_unavailable >= 4
+        # None of it reads as a failure, because none of it is one.
+        assert store.diagnostics.connection_failures == 0
+        assert store.diagnostics.last_error is None
+        # Said once, not once per attempt.
+        idle = [r for r in caplog.records if "Skill delivery is idle" in r.getMessage()]
+        assert len(idle) == 1
+        assert "no Agent Skills payload" in idle[0].getMessage()
+        # And nothing was logged as a failure.
+        assert not any(
+            "Skill delivery failed" in r.getMessage() for r in caplog.records
+        )
+
+    def test_a_422_waits_the_backoff_cap_rather_than_the_initial_delay(
+        self, endpoint: Any
+    ) -> None:
+        """
+        The exponential schedule is a function of the failure count, which this
+        case deliberately never advances — so reusing it would hold a store
+        waiting for its first skill at the *initial* delay forever, polling as
+        fast as a fresh connection retries.
+
+        Reaches into ``_stop`` because the delay is the thing under test: the
+        loop's wait is recorded and then not actually waited out, so the
+        assertion is on the interval asked for rather than on wall-clock timing.
+        """
+        asked: list[float | None] = []
+
+        class RecordingStop(threading.Event):
+            def wait(self, timeout: float | None = None) -> bool:
+                asked.append(timeout)
+                return super().wait(0.001)
+
+        endpoint.default_poll_status = 422
+        store = poll_store(endpoint, initial_backoff=0.01, max_backoff=7.5)
+        store._stop = RecordingStop()
+        with store:
+            assert wait_until(lambda: len(endpoint.requests) >= 3)
+        assert asked, "the loop never waited"
+        assert asked[0] == 7.5
+        assert 0.01 not in asked
+
+    def test_a_skill_payload_arriving_after_a_422_is_picked_up(
+        self, endpoint: Any
+    ) -> None:
+        """
+        The reason this is not fatal. A skill created after the store started is
+        delivered to the store that was already running, with nothing restarted.
+        """
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        endpoint.queue_poll(status=422)
+        endpoint.queue_poll(status=422)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        store._stop = _NoWaitStop()
+        with store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+        # Both readings, in the order they happened.
+        assert store.diagnostics.payload_unavailable == 2
+        assert store.diagnostics.payloads_transferred == 1
+        assert store.failed is None
+
+    async def test_a_422_leaves_the_store_uninitialised_and_prunes_nothing(
+        self, endpoint: Any, tmp_path: Any
+    ) -> None:
+        """
+        "LaunchDarkly has no skill payload for this environment" and "this
+        environment's every skill was revoked" are the two readings of an empty
+        answer, and only the second may delete a customer's files. A 422 commits
+        no payload, so the readiness probe stays false and the wildcard
+        reconcile withholds the prune.
+        """
+        root = tmp_path / "skills"
+        stale = root / "left-behind"
+        stale.mkdir(parents=True)
+        (stale / "SKILL.md").write_text("not ours to delete", encoding="utf-8")
+
+        endpoint.default_poll_status = 422
+        store = poll_store(endpoint, max_consecutive_failures=1)
+        store._stop = _NoWaitStop()
+        with store:
+            assert wait_until(lambda: store.diagnostics.payload_unavailable >= 3)
+            assert store.is_initialized() is False
+            assert store.wait_for_skills(timeout=0.1) is False
+            await init_client(options={"skillStore": store}, client=object())
+            report = await write_skills("*", root)
+        assert (stale / "SKILL.md").exists()
+        assert not any(a.action == "removed" for a in report.actions)
 
     def test_a_401_stops_delivery(self, endpoint: Any) -> None:
         endpoint.queue_poll(status=401)

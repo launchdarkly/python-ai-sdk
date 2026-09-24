@@ -66,12 +66,31 @@ FDV2_OBJECT_KIND = "skill"
 """
 The FDv2 ``kind`` skills are delivered under.
 
-Object kinds on the SDK-facing channel are open strings: the agent-skill payload
-is classified ``generic`` and every object in it carries the kind its producer
-registered, which for skills is the bare category name. Delivery lower-cases the
-kind, so an exact comparison is the whole test. The value happens to equal
-``skills_core.SKILL_OBJECT_KIND``; they remain separate constants, because one is
-a wire value LaunchDarkly owns and the other is what this SDK asks a store for.
+Object kinds on the SDK-facing channel are open strings: every object in the
+agent-skill payload carries the kind its producer registered, which for skills is
+the bare category name. Delivery lower-cases the kind, so an exact comparison is
+the whole test. The value happens to equal ``skills_core.SKILL_OBJECT_KIND``;
+they remain separate constants, because one is a wire value LaunchDarkly owns and
+the other is what this SDK asks a store for.
+
+Not to be confused with ``FDV2_PAYLOAD_KIND``: this is the kind of the *objects*,
+that one the kind of the *payload* they arrive in.
+"""
+
+FDV2_PAYLOAD_KIND = "agent-skill"
+"""
+The kind of the FDv2 payload skills are delivered in, declared on every request
+as ``?kinds=``.
+
+Delivery narrows a connection to the payload kinds it declares and defaults to
+flags, so this is not an optimisation: a request that omits it receives the
+environment's flag payload and no skills at all. Declaring it is also what makes
+the connection carry exactly one payload -- the shape ``_ProtocolReader`` is
+built for -- since a skill-enabled environment assigns both the flag payload and
+this one.
+
+The wire accepts a comma-separated list, but this store wants the skill payload
+and nothing else, so it declares this one kind alone.
 """
 
 FDV2_KEY_DELIMITER = ":"
@@ -287,6 +306,16 @@ class StoreDiagnostics:
     """
     connection_failures: int = 0
     """Recoverable transport failures since the last successful transfer."""
+    payload_unavailable: int = 0
+    """
+    Requests answered with "no payload of the kind you asked for"
+    (``_NoSkillPayloadError``). Cumulative, and never reset.
+
+    Deliberately not a ``connection_failures``: nothing is wrong, there is
+    nothing to deliver. Nonzero and rising alongside an empty store is the
+    difference between "this environment has no skills" and "delivery is
+    broken", which is the pair this whole type exists to separate.
+    """
     last_error: str | None = None
     """The most recent transport error, if any. Human-readable; do not parse."""
 
@@ -973,6 +1002,26 @@ class _RecoverableTransportError(Exception):
         self.retry_after = retry_after
 
 
+class _NoSkillPayloadError(_RecoverableTransportError):
+    """
+    An HTTP 422: delivery has no payload of the kind this store declared.
+
+    That is the answer for every project in which no skill has ever been
+    created, since the agent-skill payload row is created with the first one.
+    Neither of the two obvious classifications is right, which is why this is
+    its own class:
+
+    - as a failure it would spend ``max_consecutive_failures`` and then give up
+      permanently -- "gave up after N consecutive failures" -- on a
+      configuration that is merely waiting for its first skill;
+    - as fatal, the skill created a minute later would never arrive, because
+      nothing reopens delivery short of a process restart.
+
+    ``_run`` handles it ahead of ``_RecoverableTransportError``, which it
+    subclasses.
+    """
+
+
 class _StaleRequestStateError(_RecoverableTransportError):
     """
     An HTTP 400 for a request carrying client state — the ``basis`` selector, or
@@ -1056,6 +1105,14 @@ def _classify_status(status: int, headers: Any) -> Exception:
         # dropped and a full transfer requested; fatal once that has been tried.
         return _StaleRequestStateError(
             f"LaunchDarkly returned HTTP 400. {_REQUEST_ADVICE}"
+        )
+    if status == 422:
+        return _NoSkillPayloadError(
+            "LaunchDarkly has no Agent Skills payload for this environment "
+            "(HTTP 422). This is what it answers until the first skill is "
+            "created in this project, so delivery keeps asking and picks one up "
+            "without a restart. If this environment does have skills, check that "
+            "this SDK key belongs to it."
         )
     if status in (405, 406, 414, 501):
         return _FatalTransportError(
@@ -1198,19 +1255,25 @@ class _Requester:
 
     def _url(self, origin: str, path: str, basis: str | None) -> str:
         """
-        The request URL: the path, plus ``basis`` once a payload has committed.
+        The request URL: the path, the payload kind this store accepts, and
+        ``basis`` once a payload has committed.
 
         *origin* is the host for this path — polling and streaming have one
         each.
 
+        ``kinds`` is on every request, including the first one, because it
+        selects what the connection is served rather than describing what it
+        already holds (see ``FDV2_PAYLOAD_KIND``).
+
         Deliberately no ``mv`` (data model version). That parameter selects the
-        *flag* data model and the connection rejects any value but the flag
-        default; the agent-skill payload is generic, is served regardless of it,
-        and has no model version of its own to ask for.
+        *flag* data model; delivery overrides whatever a request asks for with
+        the payload's own default for any non-flagging payload, so sending it
+        would state a preference that is ignored.
         """
-        if not basis:
-            return f"{origin}{path}"
-        return f"{origin}{path}?{urllib.parse.urlencode({'basis': basis})}"
+        query: dict[str, str] = {"kinds": FDV2_PAYLOAD_KIND}
+        if basis:
+            query["basis"] = basis
+        return f"{origin}{path}?{urllib.parse.urlencode(query)}"
 
     def _request(
         self, origin: str, path: str, basis: str | None, headers: dict[str, str]
@@ -1633,6 +1696,9 @@ class FDv2SkillStore:
         # A stream only ever ends by being dropped, so this is what separates
         # a recycled healthy connection from one that failed.
         self._attempt_answered = False
+        # Said once per store rather than once per attempt: the condition holds
+        # until somebody creates a skill, and delivery keeps asking throughout.
+        self._warned_no_skill_payload = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1890,6 +1956,32 @@ class FDv2SkillStore:
             except _FatalTransportError as exc:
                 self._give_up(str(exc))
                 return
+            except _NoSkillPayloadError as exc:
+                # Ahead of the recoverable block below, none of which applies:
+                # nothing failed, so there is no count to advance and no
+                # ``last_error`` to leave on a store that is working fine.
+                if self._stop.is_set():
+                    return
+                with self._lock:
+                    # A 422 refuses the connection before it opens, so this is
+                    # only for a payload an earlier attempt left in flight.
+                    self._reader._abandon_in_flight()
+                    self._reader.diagnostics.payload_unavailable += 1
+                    say_it = not self._warned_no_skill_payload
+                    self._warned_no_skill_payload = True
+                if say_it:
+                    logger.warning(
+                        "Skill delivery is idle: %s Retrying every %.1fs; this "
+                        "is the only time it will be said.",
+                        exc,
+                        self._max_backoff,
+                    )
+                # At the cap rather than on the backoff schedule: ``_failures``
+                # deliberately never moves, so the schedule would hold this at
+                # the *initial* delay forever.
+                if self._stop.wait(self._max_backoff):
+                    return
+                continue
             except _RecoverableTransportError as exc:
                 if self._stop.is_set():
                     # ``close`` interrupted the request on purpose. Counting it
