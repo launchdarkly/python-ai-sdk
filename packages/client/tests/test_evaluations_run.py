@@ -2556,3 +2556,50 @@ async def test_tool_version_drift_from_the_variation_is_logged(
     assert evaluation_post(transport)["tools"] == [
         {"key": "lookup_order", "version": 7}
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_config_key", [42, ["OpenAI.gpt-4o"], {"key": "x"}])
+async def test_non_string_model_config_key_fails_loudly(
+    model_config_key: object,
+) -> None:
+    transport = SequencedTransport(
+        [response(200, config_variation_page(modelConfigKey=model_config_key))]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="non-string modelConfigKey"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            ai_config="support-agent",
+            variation="control",
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_config_key", [None, ""])
+async def test_variation_without_a_model_config_needs_an_explicit_provider(
+    model_config_key: str | None,
+) -> None:
+    transport = SequencedTransport(
+        [response(200, config_variation_page(modelConfigKey=model_config_key))]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    # No model config is linked, so none is fetched and no provider is known.
+    with pytest.raises(EvaluationsError, match=r"generation\.provider is required"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            ai_config="support-agent",
+            variation="control",
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET"]

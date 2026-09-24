@@ -262,7 +262,15 @@ class EvaluationsRunner:
         )
         provider: Any = None
         model_config_key = latest.get("modelConfigKey")
-        if isinstance(model_config_key, str) and model_config_key:
+        # Absent or empty means the variation links no model config, so it has
+        # no provider -- flag delivery serves an empty provider name for it too.
+        # Anything other than a string is a response we do not understand.
+        if model_config_key:
+            if not isinstance(model_config_key, str):
+                raise EvaluationsError(
+                    f"LaunchDarkly {description} has a non-string modelConfigKey: "
+                    f"{model_config_key!r}"
+                )
             model_config = self._fetch_model_config(
                 project_key, model_config_key, latest.get("modelConfigVersion")
             )
