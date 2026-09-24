@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect as _inspect
 import json
 import logging
@@ -1123,6 +1124,12 @@ class GraphInstance:
         path: list[str] = []
         total_usage = {"input": 0, "output": 0, "total": 0}
 
+        # A consumer that stops reading unwinds as GeneratorExit, and that is abandonment.
+        # A timeout or task.cancel() unwinds as CancelledError. That is a BaseException, so
+        # `except Exception` never sees it, and the finally below would otherwise stamp
+        # launchdarkly.stream.abandoned on a run whose handler spans say
+        # launchdarkly.run.cancelled. cancelled wins inside end_span_once.
+        cancelled = False
         try:
             current: GraphNode | None = graph_def.root
             previous_node: GraphNode | None = None
@@ -1250,6 +1257,9 @@ class GraphInstance:
                 done_event["judgeResults"] = judge_results
             yield done_event
 
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as err:
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
             client = get_client()
@@ -1262,7 +1272,7 @@ class GraphInstance:
             end_span_once(span, ended)
             raise
         finally:
-            end_span_once(span, ended, abandoned=True)
+            end_span_once(span, ended, abandoned=True, cancelled=cancelled)
 
 
 def graph(

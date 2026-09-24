@@ -5,6 +5,7 @@ Reference: TESTING.md §3.15a, Appendix A.4 / A.13.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server import ProviderHandler, graph
@@ -673,6 +675,58 @@ class TestGraphStreamOtel:
         attrs = graph_spans[0].attributes or {}
         assert attrs.get("launchdarkly.stream.abandoned") is True
         assert "$ld:ai:graph:invocation_success" not in _track_names(mock_ld_client)
+
+    async def test_cancelled_stream_marks_run_cancelled_not_abandoned(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        # A consumer that stops reading abandoned the stream. A CancelledError is not that
+        # choice: a timeout or task.cancel() ends the run underneath the consumer. The handler
+        # spans already say launchdarkly.run.cancelled for that unwind, so the graph span has
+        # to say the same thing. Sleeping in the handler, not in the consumer loop, is what
+        # makes the unwind a CancelledError; a break in the loop body is GeneratorExit.
+        parked = asyncio.Event()
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {"output": "a", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        async def stream_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> AsyncGenerator:  # type: ignore[override]
+            yield {"type": "chunk", "text": "a"}
+            parked.set()
+            await asyncio.sleep(3600)
+            yield {
+                "type": "done",
+                "output": "a",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        handler = ProviderHandler(
+            fn=fn, provides_for=("TestProvider", "messages"), stream_fn=stream_fn
+        )
+
+        async def _drain() -> None:
+            gen = graph("graph-key", handlers=[handler]).stream("hi", CONTEXT)
+            async for _event in gen:
+                pass
+
+        task = asyncio.create_task(_drain())
+        await asyncio.wait_for(parked.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        graph_spans = [s for s in _finished() if s.name == "ld.ai.graph"]
+        assert len(graph_spans) == 1
+        attrs = graph_spans[0].attributes or {}
+        assert attrs.get("launchdarkly.run.cancelled") is True
+        assert "launchdarkly.stream.abandoned" not in attrs
+        assert graph_spans[0].status.status_code == StatusCode.UNSET
+        names = _track_names(mock_ld_client)
+        assert "$ld:ai:graph:invocation_success" not in names
+        assert "$ld:ai:graph:invocation_failure" not in names
 
     async def test_graph_judge_spans_nest_under_graph(
         self, mock_ld_client: MagicMock
