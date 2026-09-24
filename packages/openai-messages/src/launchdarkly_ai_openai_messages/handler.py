@@ -21,6 +21,7 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
+    model_parameters,
     parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
@@ -261,7 +262,17 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                 messages=root_messages,
             )
 
+            extra_params = model_parameters(config)
+            for _owned_key in (
+                "model",
+                "input",
+                "previous_response_id",
+                "tools",
+                "text",
+            ):
+                extra_params.pop(_owned_key, None)
             params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": input_messages,
             }
@@ -341,6 +352,7 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                     client,
                     config,
                     {
+                        **extra_params,
                         "model": config["model"]["name"],
                         "previous_response_id": response.id,
                         "input": tool_outputs,
@@ -489,7 +501,17 @@ async def _stream_gen(
                     tool_definitions=tool_definitions,
                 )
 
+            extra_params = model_parameters(config)
+            for _owned_key in (
+                "model",
+                "input",
+                "previous_response_id",
+                "tools",
+                "text",
+            ):
+                extra_params.pop(_owned_key, None)
             stream_params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": current_input,
             }

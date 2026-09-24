@@ -1442,6 +1442,55 @@ class TestHistoryAndVariables:
         assert [e.name for e in root().events] == ["feature_flag"]
 
 
+class TestModelParametersForwarding:
+    async def _run_and_capture_options(
+        self, config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> Any:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        await create_claude_agents_handler()(config, "q")
+        return captured["options"]
+
+    async def test_max_turns_from_config_reaches_options(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "model": {**BASE_CONFIG["model"], "parameters": {"max_turns": 3}},
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 3
+
+    async def test_config_cannot_override_model_or_system_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {
+                    "model": "not-the-real-model",
+                    "system_prompt": "not-the-real-prompt",
+                },
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.model == BASE_CONFIG["model"]["name"]
+        assert options.system_prompt != "not-the-real-prompt"
+
+    async def test_unset_when_no_parameters(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._run_and_capture_options(BASE_CONFIG, monkeypatch)
+        assert options.max_turns is None
+
+
 class TestFinishReasonMapping:
     async def test_tool_use_maps_to_tool_calls(
         self, monkeypatch: pytest.MonkeyPatch

@@ -25,6 +25,7 @@ from launchdarkly_ai_server import (
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     lang_chain_span_usage,
+    model_parameters,
     number_or_zero,
     parse_template,
     set_input_content_attributes,
@@ -228,8 +229,7 @@ def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
 def _model_constructor_kwargs(
     config: AiConfigRep, fallback_name: str
 ) -> dict[str, Any]:
-    raw = (config.get("model") or {}).get("parameters")
-    parameters = dict(raw) if isinstance(raw, dict) else {}
+    parameters = model_parameters(config)
     provider = str((config.get("provider") or {}).get("name") or "").lower()
     if provider == "bedrock":
         parameters.pop("tools", None)

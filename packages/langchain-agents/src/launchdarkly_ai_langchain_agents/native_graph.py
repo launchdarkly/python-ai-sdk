@@ -18,6 +18,7 @@ from launchdarkly_ai_server import (
     compose_history,
     get_client,
     make_track_data,
+    model_parameters,
     parse_template,
     to_ld_context,
 )
@@ -201,8 +202,7 @@ def to_lang_graph(
             else:
                 lc_openai = importlib.import_module("langchain_openai")
                 model_cfg = node.config.get("model") or {}
-                raw = model_cfg.get("parameters")
-                kwargs = dict(raw) if isinstance(raw, dict) else {}
+                kwargs = model_parameters(node.config)
                 kwargs["model"] = model_cfg.get("name") or "gpt-4o"
                 chat_model = lc_openai.ChatOpenAI(**kwargs)
 

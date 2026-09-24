@@ -2586,3 +2586,60 @@ class TestModelSource:
         assert any(
             e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
         )
+
+
+class TestModelParametersReachTheWire:
+    """Intercepts the real outgoing HTTP request with an httpx MockTransport, rather than
+    asserting only on a mock of our own call, so this proves ``top_p`` from ``model.parameters``
+    actually leaves the process on the wire the real ``ChatOpenAI`` client builds.
+    """
+
+    @pytest.mark.asyncio
+    async def test_top_p_reaches_the_wire(self) -> None:
+        import httpx
+
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        captured: dict[str, Any] = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hi"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            )
+
+        transport = httpx.MockTransport(_handler)
+        cfg = {
+            **CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {
+                    "top_p": 0.5,
+                    "api_key": "test-key",
+                    "http_async_client": httpx.AsyncClient(transport=transport),
+                },
+            },
+        }
+        with ctx:
+            result = await create_langchain_messages_handler()(cfg, "q", {}, {})
+        assert captured["body"]["top_p"] == 0.5
+        assert result["output"] == "hi"

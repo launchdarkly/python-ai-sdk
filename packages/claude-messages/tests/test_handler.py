@@ -6,12 +6,14 @@ Reference: TESTING.md §1
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -362,6 +364,147 @@ class TestToolConversion:
 # ---------------------------------------------------------------------------
 # §1.4 Tool execution loop
 # ---------------------------------------------------------------------------
+
+
+class TestModelParametersForwarding:
+    async def test_snake_case_param_reaches_provider(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.5}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["top_p"] == 0.5
+
+    async def test_max_tokens_default_preserved_without_parameters(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        h = create_claude_messages_handler()
+        await h(CONFIG, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 1024
+
+    async def test_config_max_tokens_wins_over_default(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_tokens": 42}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 42
+
+    async def test_config_cannot_override_model_or_messages(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "model": "not-the-real-model",
+                    "messages": "not-the-real-messages",
+                    "system": "not-the-real-system",
+                },
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["model"] == CONFIG["model"]["name"]
+        assert call_kwargs["messages"] != "not-the-real-messages"
+        assert (
+            "system" not in call_kwargs
+            or call_kwargs["system"] != "not-the-real-system"
+        )
+
+    async def test_call_unchanged_when_no_parameters_set(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        h = create_claude_messages_handler()
+        await h(CONFIG, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert set(call_kwargs.keys()) == {"model", "max_tokens", "messages", "system"}
+
+    async def test_streaming_forwards_snake_case_param(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, _ = _make_stream_context(["hi"])
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.3}},
+        }
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_claude_messages_handler()
+        gen = await h.stream(config, "q", {}, {})
+        async for _event in gen:
+            pass
+        call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
+        assert call_kwargs["top_p"] == 0.3
+
+    async def test_top_p_and_max_tokens_reach_the_wire(self) -> None:
+        """Intercepts the real outgoing HTTP request with an httpx MockTransport, rather than
+        asserting only on a mock of our own call, so this proves the values actually leave the
+        process on the wire the real ``anthropic`` client builds.
+        """
+        import anthropic
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        captured: dict[str, Any] = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-sonnet-20240229",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            )
+
+        transport = httpx.MockTransport(_handler)
+        real_client = anthropic.AsyncAnthropic(
+            api_key="test-key", http_client=httpx.AsyncClient(transport=transport)
+        )
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"top_p": 0.4, "max_tokens": 256},
+            },
+        }
+        with patch("anthropic.AsyncAnthropic", return_value=real_client):
+            h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+
+        assert captured["body"]["top_p"] == 0.4
+        assert captured["body"]["max_tokens"] == 256
 
 
 class TestToolExecutionLoop:

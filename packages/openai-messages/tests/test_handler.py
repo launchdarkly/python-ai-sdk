@@ -1132,6 +1132,73 @@ class TestErrorHandling:
 # ---------------------------------------------------------------------------
 
 
+class TestModelParametersForwarding:
+    async def test_snake_case_param_reaches_provider(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.5}},
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["top_p"] == 0.5
+
+    async def test_config_cannot_override_model_or_input(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "model": "not-the-real-model",
+                    "input": "not-the-real-input",
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["model"] == CONFIG["model"]["name"]
+        assert kwargs["input"] != "not-the-real-input"
+
+    async def test_call_unchanged_when_no_parameters_set(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+        await h(CONFIG, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert set(kwargs.keys()) == {"model", "input"}
+
+    async def test_streaming_forwards_snake_case_param(
+        self, mock_openai: MagicMock
+    ) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["hi"])
+        )
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.3}},
+        }
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+            events = [e async for e in await h.stream(config, "q")]
+        assert events
+        stream_kwargs = mock_openai.responses.stream.call_args.kwargs
+        assert stream_kwargs["top_p"] == 0.3
+
+
 class TestOutputFormat:
     async def test_absent_output_format_no_change(self, mock_openai: MagicMock) -> None:
         from launchdarkly_ai_openai_messages import create_openai_messages_handler

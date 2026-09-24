@@ -18,6 +18,7 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
+    model_parameters,
     parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
@@ -201,9 +202,10 @@ async def _run_tool_loop(
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
-    )
+    extra_params = model_parameters(config)
+    max_tokens = extra_params.pop("max_tokens", 1024)
+    for _owned_key in ("model", "messages", "system", "tools"):
+        extra_params.pop(_owned_key, None)
     conversation = list(messages)
     output = ""
     steps = 0
@@ -222,6 +224,7 @@ async def _run_tool_loop(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,
@@ -494,9 +497,10 @@ async def _stream_gen(
 
     tools = _build_tools(config.get("tools") or {})
     tool_definitions = to_tool_definitions(tools)
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
-    )
+    extra_params = model_parameters(config)
+    max_tokens = extra_params.pop("max_tokens", 1024)
+    for _owned_key in ("model", "messages", "system", "tools"):
+        extra_params.pop(_owned_key, None)
     conversation = list(messages)
     full_output = ""
     steps = 0
@@ -528,6 +532,7 @@ async def _stream_gen(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,

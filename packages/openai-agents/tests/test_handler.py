@@ -153,10 +153,16 @@ def _make_run_streamed(turns: list[dict[str, Any]], final_output: str = "done") 
     return run_streamed
 
 
+class FakeModelSettings:
+    def __init__(self, **kw: Any) -> None:
+        self.kwargs = kw
+
+
 def _fake_agents_module(run: Any = None, run_streamed: Any = None) -> Any:
     mod = SimpleNamespace()
     mod.FunctionTool = FakeFunctionTool
     mod.Agent = FakeAgent
+    mod.ModelSettings = FakeModelSettings
 
     class Runner:
         pass
@@ -1387,6 +1393,97 @@ class TestStreaming:
 # ---------------------------------------------------------------------------
 # §1.9 Output format (build_output_type)
 # ---------------------------------------------------------------------------
+
+
+class TestModelParametersForwarding:
+    async def test_snake_case_param_reaches_model_settings(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"top_p": 0.5}},
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs["top_p"] == 0.5
+
+    async def test_max_turns_from_config_reaches_runner_run(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["max_turns"] = kw.get("max_turns")
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"max_turns": 3}},
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        assert captured["max_turns"] == 3
+
+    async def test_max_turns_from_config_reaches_runner_run_streamed(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def run_streamed(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["max_turns"] = kw.get("max_turns")
+            return FakeStreamedResult(
+                agent, prompt, hooks, [{"output": _text_output("hi")}], "done"
+            )
+
+        agents_mod = _fake_agents_module(run_streamed=run_streamed)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"max_turns": 4}},
+        )
+        with _patched_agents(agents_mod):
+            events = []
+            gen = await create_openai_agent_handler().stream(config, "q", {}, {})
+            async for event in gen:
+                events.append(event)
+        assert captured["max_turns"] == 4
+
+    async def test_max_turns_not_owned_by_model_settings(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"max_turns": 3}},
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs.get("model_settings")
+        assert model_settings is None or "max_turns" not in model_settings.kwargs
+
+    async def test_call_unchanged_when_no_parameters_set(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            run_kwargs["kw"] = kw
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+        assert "model_settings" not in run_kwargs["agent"].kwargs
+        assert run_kwargs["kw"].get("max_turns") is None
 
 
 class TestOutputFormat:

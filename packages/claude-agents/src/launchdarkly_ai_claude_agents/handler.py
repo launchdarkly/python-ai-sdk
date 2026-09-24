@@ -41,6 +41,7 @@ from launchdarkly_ai_server import (
     create_handler,
     end_span_once,
     end_unfinished_spans,
+    model_parameters,
     parse_template,
     set_conversation_id_if_absent,
     set_input_content_attributes,
@@ -479,7 +480,18 @@ def _build_query_options(
     **extra: Any,
 ) -> ClaudeAgentOptions:
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
+    params = model_parameters(config)
+    for _owned_key in (
+        "model",
+        "allowed_tools",
+        "mcp_servers",
+        "hooks",
+        "tools",
+        "system_prompt",
+    ):
+        params.pop(_owned_key, None)
     kwargs: dict[str, Any] = {
+        **params,
         "model": config["model"]["name"],
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
