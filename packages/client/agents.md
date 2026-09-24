@@ -548,9 +548,11 @@ Each of those choices is load-bearing; do not undo one as a simplification.
 - **`reason_code` is in the record only.** The signal's property set is the allowlist above
   and does not grow; the local record is where the detection vocabulary lives.
 
-`reason_code` is a **closed vocabulary of exactly eight tokens** — `IntegrityReasonCode`, a
-`Literal`, so a typo at a call site is a type error — one per `record_integrity_failure`
-call site, and the same eight in every language implementation:
+`reason_code` is a **closed vocabulary of exactly nine tokens** — `IntegrityReasonCode`, a
+`Literal`, so a typo at a call site is a type error — and the same nine in every language
+implementation. Eight are one per `record_integrity_failure` call site; the ninth,
+`key_mismatch`, comes from `record_key_mismatch` and is the only one that fires the log
+record **without** the product signal:
 
 | `reason_code` | Call site |
 |---|---|
@@ -562,8 +564,17 @@ call site, and the same eight in every language implementation:
 | `not_utf8` | `verified_bytes` — `UnicodeEncodeError` on encode (wire-`str` path only; a `Skill` already holds bytes) |
 | `over_size_cap` | `verified_bytes` — over `MAX_SKILL_CONTENT_BYTES` |
 | `hash_mismatch` | `verified_bytes` — observed sha256 != `contentHash` |
+| `key_mismatch` | `resolve_from_store` — the served object's own `key` is not the key requested. **Log record only, no signal**, and carries a `served_key` field no other record has |
 
-Adding a ninth failure mode means widening `IntegrityReasonCode`, adding a case to
+`key_mismatch` cannot join `REASON_CODE_CASES`: that table is driven uniformly through
+`all_skills`, and this code is decided at the retrieval boundary after `verify_raw_skill`
+has passed, so a listing cannot reach it. It is unioned into the exhaustiveness assertion
+instead, and covered by `test_key_mismatch_records_the_log_but_not_the_signal`. The
+record-without-signal split is deliberate — a mismatch is usually a broken store adapter
+rather than an attacker, and LaunchDarkly's counter must not fill with customers' adapter
+bugs — and tests pin both directions. Do not "fix" it by emitting the signal.
+
+Adding a tenth failure mode means widening `IntegrityReasonCode`, adding a case to
 `REASON_CODE_CASES` in `test_skills.py` (whose exhaustiveness assertion fails otherwise),
 documenting it in the README table, **and** doing the same in the other language SDKs. A
 token added on one side only is a drift bug: a customer's detection rule stops matching
@@ -882,6 +893,13 @@ failed `_PendingWrite` for it rather than filtering it out: dropping it silently
 key out of the requested set, so prune deletes the last known-good copy on disk and reports
 a routine `removed` with `report.ok` still true. Tampered content must never be able to
 trigger deletion.
+
+### 6. Expecting revocation to reach a boot-only `write_skills` deployment
+
+Without `watch_skills`, the revocation bound is process lifetime: a skill revoked after boot
+stays on disk until the process reconciles again, so a restart (or an explicit re-run of
+`write_skills`) is the incident-response action — and content an agent has already read into
+a conversation is out of reach at this layer either way.
 
 ---
 
