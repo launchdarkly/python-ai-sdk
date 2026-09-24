@@ -250,11 +250,35 @@ deletes the user's files.
 ### The delivery transport, and the one field that will bite you
 
 `FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
-`GET /sdk/stream`, server-side SDK key in `Authorization`, `basis` + `mv` params,
+`GET /sdk/stream`, server-side SDK key in `Authorization`, `kinds` + `basis` params,
 `If-None-Match`/304). It lives below the store interface and produces raw objects in the
 shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**. If a transport
 change ever seems to require editing an accessor, verification, or `write_skills`, the adapter
 boundary is wrong.
+
+**Every request declares `kinds=agent-skill`, and that is load-bearing.** Delivery narrows a
+connection to the payload kinds it declares and defaults to flags, so a request without it is
+served the environment's flag payload and no skills at all — the store would run, report
+healthy, and hold nothing. It also makes the connection carry exactly one payload, which is
+the shape `_ProtocolReader` is built for: without it, a skill-enabled environment assigns two,
+and the reader warns about the second and reads only the first intent. `FDV2_PAYLOAD_KIND` is
+the payload's kind and `FDV2_OBJECT_KIND` the kind of the objects inside it — two different
+strings, held apart on purpose. No `mv`: that parameter selects the *flag* data model, and
+delivery overrides whatever a request asks for with the payload's own default for any
+non-flagging payload, so sending it would state a preference that is ignored.
+
+**HTTP 422 is not a failure.** It is the answer to that declaration when the credential is
+assigned no agent-skill payload, which is every project in which no skill has ever been
+created — gonfalon creates that payload row with the first skill and never lazily. So
+`_classify_status` maps it to `_NoSkillPayloadError`, and `_run` catches that **ahead of**
+`_RecoverableTransportError`: counted under `diagnostics.payload_unavailable`, logged once per
+store, retried at `max_backoff` indefinitely, and kept off `connection_failures`,
+`last_error`, and `failed`. Neither of the two obvious classifications is right — as a
+recoverable failure it spends `max_consecutive_failures` and then gives up permanently on an
+ordinary configuration; as a fatal one, the skill created a minute later never arrives without
+a process restart. The retry is at the *cap* rather than the initial backoff because
+`_failures` deliberately never moves, so the exponential schedule would sit at the initial
+delay forever.
 
 **The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
 plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a
@@ -287,7 +311,7 @@ stored `version`, under the stored key `pdf-extraction`. `version` (42) is the v
 including a flag with nothing to do with skills. Reading it as the skill's version fails
 **silently**: the object verifies, the hash matches, and the caller gets content under a
 version number that means nothing. There is no separate field for the skill's version: the
-agent-skill payload is a *generic* payload, and generic objects carry only `key`, `kind`,
+agent-skill payload is opaque to delivery, and its objects carry only `key`, `kind`,
 `version` and `object`, exactly like a flag. `_split_wire_key` is the only place the wire key
 is read, `_store_object_from_put` and `_tombstone_from_delete` both go through it, and
 `TestVersionTranslation` asserts the translation in both directions. A wire key that will
@@ -297,13 +321,13 @@ recognises; only a key with nothing before the delimiter is dropped, since there
 identity to hold it under.
 
 **Skills are identified by `kind == "skill"`; everything else is ignored, not rejected.**
-Object kinds on the SDK-facing channel are open strings, and the agent-skill payload is
-classified `generic`, so a skill arrives under the kind its producer registered — the bare
-category name — not under a broader wrapper kind with a narrowing field. An environment's
-payload assignment carries its flag payload alongside its agent-skill payload, so flag and
-segment objects arrive as a matter of course. Erroring on an unrecognised kind would turn a
-normal payload into a permanent reconnect loop — a flag-delivery outage caused by a skills
-rollout.
+Object kinds on the SDK-facing channel are open strings, so a skill arrives under the kind its
+producer registered — the bare category name — not under a broader wrapper kind with a
+narrowing field. The `kinds` declaration above means a flag or segment object should no longer
+arrive at all, but the skip stays and stays tested: erroring on an unrecognised kind would
+turn a payload that merely gained a new object kind into a permanent reconnect loop — a
+flag-delivery outage caused by a skills rollout — and an object nobody expected belongs
+outside the skill set rather than in it.
 
 **Changes commit at `payload-transferred`, not as objects arrive.** A payload version is the
 unit of consistency: a half-applied full transfer would publish a state the server never
