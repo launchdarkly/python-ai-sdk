@@ -206,9 +206,9 @@ def to_litellm_agents(
 
         if _HAS_OTEL:
             span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
-                "ld.ai.graph"
+                "launchdarkly.graph"
             )
-            span.set_attribute("ld.ai.graph.key", graph.key)
+            span.set_attribute("launchdarkly.graph.key", graph.key)
         else:
             span = None
 
@@ -229,7 +229,7 @@ def to_litellm_agents(
             )
             duration = int((time.monotonic() - start_time) * 1000)
             if span:
-                span.set_attribute("ld.ai.graph.path", "->".join(path))
+                span.set_attribute("launchdarkly.graph.path", "->".join(path))
                 span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
                 span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
                 span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
