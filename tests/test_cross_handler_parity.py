@@ -386,32 +386,6 @@ EXPECTED_VOCABULARY = {
     "ld.ai.graph.path",
 }
 
-#: Functions kept exported for one release that nothing calls any more.
-#:
-#: Their bodies are cut out before the scan below, rather than their keys being listed as expected.
-#: Listing the keys does not work: `gen_ai.prompt` is written by the live content writer *and* by
-#: dead `set_openllmetry_prompt`, so naming it as expected lets the dead copy satisfy the lock after
-#: the live one is removed. Cutting the dead code out means only live writes can satisfy anything.
-#:
-#: Delete these names when the functions go. The lock will tell you if you miss one.
-SUPERSEDED_FUNCTIONS = (
-    "set_openllmetry_prompt",
-    "set_openllmetry_completion",
-)
-
-
-def _without_superseded(source: str) -> str:
-    """Drops the body of every superseded function, so a dead write cannot satisfy the lock."""
-    for name in SUPERSEDED_FUNCTIONS:
-        start = source.find(f"def {name}(")
-        if start == -1:
-            continue
-        nxt = source.find("\ndef ", start + 1)
-        end = len(source) if nxt == -1 else nxt
-        source = source[:start] + source[end:]
-    return source
-
-
 _KEY_PATTERN = re.compile(
     r'set_attribute\(\s*f?"([^"{]+)"'
     r'|add_event\(\s*"([^"]+)"'
@@ -431,7 +405,7 @@ def _emitted_vocabulary() -> set[str]:
     """Every attribute key, event name and template found in the package sources."""
     found: set[str] = set()
     for path in (REPO_ROOT / "packages").glob("*/src/*/*.py"):
-        for match in _KEY_PATTERN.finditer(_without_superseded(path.read_text())):
+        for match in _KEY_PATTERN.finditer(path.read_text()):
             key = next((g for g in match.groups() if g), None)
             if key and key.split(".")[0] in (
                 "gen_ai",

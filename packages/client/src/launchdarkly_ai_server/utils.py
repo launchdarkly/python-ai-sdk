@@ -737,33 +737,6 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     span.add_event("feature_flag", feature_flag_attrs)
 
 
-def set_openllmetry_prompt(span: Any, messages: list[dict[str, str]]) -> None:
-    """Set OpenLLMetry-style indexed prompt attributes on a span.
-
-    Gonfalon's LLM Summary tab reads ``gen_ai.prompt.N.role`` / ``.content``
-    (attribute-based, takes precedence over span events).
-    """
-    for i, msg in enumerate(messages):
-        span.set_attribute(f"gen_ai.prompt.{i}.role", msg["role"])
-        span.set_attribute(f"gen_ai.prompt.{i}.content", msg["content"])
-
-
-def set_openllmetry_completion(
-    span: Any,
-    completion: str,
-    usage: dict[str, int],
-) -> None:
-    """Set OpenLLMetry-style indexed completion attributes and token usage aliases.
-
-    Gonfalon reads ``gen_ai.completion.0.role`` / ``.content`` and prefers
-    ``gen_ai.usage.prompt_tokens`` / ``completion_tokens``.
-    """
-    span.set_attribute("gen_ai.completion.0.role", "assistant")
-    span.set_attribute("gen_ai.completion.0.content", completion)
-    span.set_attribute("gen_ai.usage.prompt_tokens", usage.get("input_tokens", 0))
-    span.set_attribute("gen_ai.usage.completion_tokens", usage.get("output_tokens", 0))
-
-
 def parse_json_with_possible_fences(raw_text: str) -> Any | None:
     """
     Parses a JSON string that may be wrapped in markdown code fences
