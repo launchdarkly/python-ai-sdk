@@ -89,6 +89,28 @@
         "src/launchdarkly_ai_langchain_messages/__init__.py"
       ],
       "component": "launchdarkly-ai-langchain-messages"
+    },
+    "packages/vercel-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_vercel_agents/__init__.py"
+      ],
+      "component": "launchdarkly-ai-vercel-agents"
+    },
+    "packages/vercel-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_vercel_messages/__init__.py"
+      ],
+      "component": "launchdarkly-ai-vercel-messages"
     }
   }
 }
