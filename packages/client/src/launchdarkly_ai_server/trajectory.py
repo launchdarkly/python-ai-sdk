@@ -18,6 +18,7 @@ invocation or row, since both run concurrently against one shared tool map.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 from collections.abc import Callable, Collection, Mapping
@@ -172,7 +173,9 @@ class TrajectoryRecorder:
         if len(self._invocations) >= self._limit:
             self._omitted += 1
             return None
-        self._invocations.append(ToolInvocation(name=name, arguments=arguments))
+        self._invocations.append(
+            ToolInvocation(name=name, arguments=_snapshot(arguments))
+        )
         return len(self._invocations) - 1
 
     def _complete(
@@ -277,12 +280,29 @@ def _render_value(value: Any) -> str:
             default=str,
             ensure_ascii=False,
         )
-    except (TypeError, ValueError):
-        rendered = str(value)
+    except Exception:
+        # Recording is observational: a value whose own __str__ raises must
+        # not fail a call that already succeeded.
+        try:
+            rendered = str(value)
+        except Exception:
+            rendered = f"<unrenderable {type(value).__name__}>"
     return _truncate(rendered)
 
 
 def _truncate(text: str) -> str:
     if len(text) <= MAX_RECORDED_VALUE_CHARS:
         return text
-    return text[:MAX_RECORDED_VALUE_CHARS] + _TRUNCATION_SUFFIX
+    kept = max(MAX_RECORDED_VALUE_CHARS - len(_TRUNCATION_SUFFIX), 0)
+    return text[:kept] + _TRUNCATION_SUFFIX
+
+
+def _snapshot(value: Any) -> Any:
+    """Copy call arguments so a tool that mutates them can't rewrite what a
+    judge later reads: the recorded call must describe what the model sent,
+    not what the tool did to it afterward.
+    """
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value

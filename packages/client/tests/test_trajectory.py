@@ -178,12 +178,19 @@ def test_render_reports_omitted_calls() -> None:
 
 
 def test_render_truncates_an_oversized_value() -> None:
+    """The rendered value, suffix included, must not exceed the cap -- a
+    trajectory goes into a judge prompt, so appending the suffix on top would
+    quietly break the budget it exists to enforce.
+    """
     rendered = render_trajectory(
         [ToolInvocation(name="fetch", arguments={}, result="x" * 5000)],
         observable_tools=["fetch"],
     )
 
-    assert f"   result: {'x' * MAX_RECORDED_VALUE_CHARS}… (truncated)" in rendered
+    line = next(line for line in rendered.splitlines() if line.startswith("   result:"))
+    value = line.removeprefix("   result: ")
+    assert len(value) == MAX_RECORDED_VALUE_CHARS
+    assert value.endswith("… (truncated)")
 
 
 def test_render_serializes_unserializable_values_without_raising() -> None:
@@ -197,6 +204,23 @@ def test_render_serializes_unserializable_values_without_raising() -> None:
     )
 
     assert "<opaque>" in rendered
+
+
+def test_render_falls_back_to_a_placeholder_when_str_itself_raises() -> None:
+    """Rendering runs after the tool call already succeeded, so a value whose
+    own __str__ raises must not turn a successful call into a failed one.
+    """
+
+    class Unrenderable:
+        def __str__(self) -> str:
+            raise RuntimeError("closed")
+
+    rendered = render_trajectory(
+        [ToolInvocation(name="fetch", arguments={}, result=Unrenderable())],
+        observable_tools=["fetch"],
+    )
+
+    assert "   result: <unrenderable Unrenderable>" in rendered
 
 
 def test_render_does_not_escape_non_ascii() -> None:
@@ -290,6 +314,23 @@ def test_only_tools_the_config_exposed_are_recorded_or_described() -> None:
     assert [i.name for i in recorder.invocations] == []
     wrapped["lookup"]({})
     assert [i.name for i in recorder.invocations] == ["lookup"]
+
+
+def test_recorded_arguments_are_unaffected_by_the_tool_mutating_them() -> None:
+    """A judge grades what the model sent, not what the tool did with it
+    afterward -- the recorded call must describe the call boundary, not the
+    tool's side effects.
+    """
+
+    def pop_id(args: dict[str, Any]) -> str:
+        order_id = args.pop("id")
+        return f"order {order_id}"
+
+    recorder = TrajectoryRecorder()
+    wrapped = recorder.wrap({"lookup": pop_id})
+
+    assert wrapped["lookup"]({"id": "A1"}) == "order A1"
+    assert recorder.invocations[0].arguments == {"id": "A1"}
 
 
 def test_no_exposed_set_means_every_callable_is_in_scope() -> None:
