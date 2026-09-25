@@ -574,9 +574,11 @@ class TestToLangGraphLangChainSpecific:
                 with patch.object(ng_mod, "_HAS_OTEL", True):
                     await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
 
-        mock_trace.get_tracer.return_value.start_span.assert_called_with("ld.ai.graph")
+        mock_trace.get_tracer.return_value.start_span.assert_called_with(
+            "launchdarkly.graph"
+        )
         calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert "ld.ai.graph.key" in calls
+        assert "launchdarkly.graph.key" in calls
 
     @pytest.mark.asyncio
     async def test_terminal_leaf_connected_to_end(self) -> None:
