@@ -67,6 +67,21 @@ class ResolvedTool:
     schema: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class AIConfig:
+    """Identifies an existing AI Config variation to seed an evaluation run.
+
+    ``key`` is the AI Config key and ``variation`` is the variation key. The two
+    are only meaningful together, since a variation key is scoped to its config.
+    ``run()`` reads the variation's latest version from the management API.
+    This is a reference, not the config itself; see ``AiConfigRep`` for the
+    evaluated payload.
+    """
+
+    key: str
+    variation: str
+
+
 @dataclass
 class AIConfigVariation:
     """An AI Config variation read from the management API as run() defaults.
