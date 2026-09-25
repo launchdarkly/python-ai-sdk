@@ -327,6 +327,14 @@ StreamChunkEvent = dict[str, Any]  # {"type": "chunk", "text": str}
 StreamDoneEvent = dict[str, Any]  # {"type": "done", "response": str, "usage": ..., ...}
 StreamEvent = dict[str, Any]  # StreamChunkEvent | StreamDoneEvent
 
+# Graph stream events (camelCase public fields, matching the TypeScript SDK)
+# node_start: {type, nodeKey}
+# chunk: {type, text, nodeKey}
+# node_done: {type, nodeKey, response, usage}
+# handoff: {type, sourceKey, targetKey}
+# done: {type, response, usage, judgeResults?}
+GraphStreamEvent = dict[str, Any]
+
 # Internal execute stream event that also carries track_data
 ExecuteStreamDoneEvent = dict[str, Any]
 ExecuteStreamEvent = dict[str, Any]
