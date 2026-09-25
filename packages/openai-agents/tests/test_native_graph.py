@@ -549,7 +549,7 @@ class TestToOpenAIAgentsOpenAISpecific:
 
     @pytest.mark.asyncio
     async def test_otel_span_has_graph_key_attribute(self) -> None:
-        """OTel span must have ld.ai.graph.key attribute set to the graph key."""
+        """OTel span must have launchdarkly.graph.key attribute set to the graph key."""
         mock_span = MagicMock()
         mock_trace = MagicMock()
         mock_trace.get_tracer.return_value.start_span.return_value = mock_span
@@ -569,8 +569,8 @@ class TestToOpenAIAgentsOpenAISpecific:
         set_attr_calls = {
             c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list
         }
-        assert "ld.ai.graph.key" in set_attr_calls
-        assert set_attr_calls["ld.ai.graph.key"] == "test-graph"
+        assert "launchdarkly.graph.key" in set_attr_calls
+        assert set_attr_calls["launchdarkly.graph.key"] == "test-graph"
 
     @pytest.mark.asyncio
     async def test_agent_end_hook_emits_generation_success(self) -> None:
@@ -667,14 +667,14 @@ class TestToOpenAIAgentsOpenAISpecific:
                 with patch.object(_openai_ng, "_HAS_OTEL", True):
                     await to_openai_agents(_make_def_promise(graph_def)).invoke("hi")
 
-        # Extract the path from the span set_attribute call for "ld.ai.graph.path"
+        # Extract the path from the span set_attribute call for "launchdarkly.graph.path"
         path_val: str | None = None
         for call in mock_span.set_attribute.call_args_list:
-            if call[0][0] == "ld.ai.graph.path":
+            if call[0][0] == "launchdarkly.graph.path":
                 path_val = call[0][1]
                 break
 
-        assert path_val is not None, "ld.ai.graph.path attribute was not set"
+        assert path_val is not None, "launchdarkly.graph.path attribute was not set"
         path_parts = [p for p in path_val.split("->") if p]
         child_occurrences = path_parts.count("child")
         assert child_occurrences <= 1, (
