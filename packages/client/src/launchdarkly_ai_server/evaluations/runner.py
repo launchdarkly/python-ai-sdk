@@ -42,6 +42,7 @@ from .events import (
     TokenUsage,
 )
 from .types import (
+    AIConfigVariation,
     DatasetRef,
     DatasetRow,
     EvaluationRef,
@@ -219,6 +220,85 @@ class EvaluationsRunner:
 
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
+
+    def _fetch_config_variation(
+        self,
+        project_key: str,
+        config_key: str,
+        variation_key: str,
+    ) -> AIConfigVariation:
+        """Read an AI Config variation by key from the management API.
+
+        Flag delivery cannot select a variation by key -- it serves whichever
+        variation targeting picks for a context -- so this reads the variation
+        definition directly. Provider and base model parameters live on the
+        linked model config, and are layered the way the served flag payload
+        layers them: model-config parameters first, variation parameters over.
+        """
+        description = f"AI Config variation {config_key!r}/{variation_key!r}"
+        path = (
+            f"projects/{_segment(project_key)}/ai-configs/{_segment(config_key)}"
+            f"/variations/{_segment(variation_key)}"
+        )
+        try:
+            raw = _mapping(self._api.get(path), description=description)
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly {description} was not found in project {project_key!r}"
+                ) from error
+            raise
+        # The endpoint returns every version of the variation; evaluate the latest.
+        items = raw.get("items")
+        versions = [
+            item
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, Mapping) and isinstance(item.get("version"), int)
+        ]
+        if not versions:
+            raise EvaluationsError(f"LaunchDarkly {description} has no versions")
+        latest = max(versions, key=lambda item: int(item["version"]))
+
+        # Absent or empty means the variation links no model config, so it has
+        # no provider -- flag delivery serves an empty provider name for it too.
+        # Anything other than a string is a response we do not understand.
+        model_config: Mapping[str, Any] | None = None
+        model_config_key = latest.get("modelConfigKey")
+        if model_config_key is not None and not isinstance(model_config_key, str):
+            raise EvaluationsError(
+                f"LaunchDarkly {description} has a non-string modelConfigKey: "
+                f"{model_config_key!r}"
+            )
+        if model_config_key:
+            model_config = self._fetch_model_config(
+                project_key, model_config_key, latest.get("modelConfigVersion")
+            )
+        return AIConfigVariation.from_api(latest, model_config)
+
+    def _fetch_model_config(
+        self,
+        project_key: str,
+        model_config_key: str,
+        version: Any,
+    ) -> Mapping[str, Any]:
+        path = (
+            f"projects/{_segment(project_key)}/ai-configs/model-configs/"
+            f"{_segment(model_config_key)}"
+        )
+        # A pinned variation names the model-config version it was built against.
+        params = {"version": version} if isinstance(version, int) else None
+        try:
+            return _mapping(
+                self._api.get(path, params=params),
+                description=f"model config {model_config_key!r}",
+            )
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly model config {model_config_key!r} was not found "
+                    f"in project {project_key!r}"
+                ) from error
+            raise
 
     def _resolve_tools(
         self,

@@ -428,7 +428,9 @@ async def test_a_handoff_tool_is_not_described_online(mock_ld_client: Any) -> No
         variables: Any,
         history: Any = None,
     ) -> dict[str, Any]:
-        await tool_handlers["__handoff_billing"]({})
+        # Handoff tools stay sync so routing can record the choice with a bare
+        # call, so this must not be awaited either.
+        tool_handlers["__handoff_billing"]({})
         return {"output": "ok", "usage": {}}
 
     result = await execute_and_track(

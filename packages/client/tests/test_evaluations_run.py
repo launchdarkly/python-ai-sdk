@@ -2588,3 +2588,382 @@ async def test_a_failed_row_keeps_the_calls_made_before_the_handler_raised() -> 
         "lookup_order"
     ]
     assert results[0]["tool_calls"][0].result == "shipped"
+
+
+def config_variation_page(**overrides: Any) -> dict[str, Any]:
+    """A getAIConfigVariation response holding two versions of one variation."""
+    latest: dict[str, Any] = {
+        "_id": "variation-id",
+        "key": "control",
+        "name": "Control",
+        "version": 2,
+        "createdAt": 2,
+        "model": {"modelName": "gpt-4o", "parameters": {"temperature": 0.7}},
+        "modelConfigKey": "OpenAI.gpt-4o",
+        "modelConfigVersion": 3,
+        "instructions": "You are a support agent.",
+        **overrides,
+    }
+    stale = {
+        **latest,
+        "version": 1,
+        "createdAt": 1,
+        "instructions": "stale prompt",
+    }
+    return {"items": [stale, latest], "totalCount": 2}
+
+
+MODEL_CONFIG = {
+    "key": "OpenAI.gpt-4o",
+    "id": "gpt-4o",
+    "name": "GPT-4o",
+    "provider": "OpenAI",
+    "params": {"max_tokens": 100, "temperature": 1.0},
+    "version": 3,
+}
+
+
+def fetched_run_responses(variation_page: dict[str, Any]) -> list[HttpResponse]:
+    """Every response a run seeded from an AI Config variation needs, in order."""
+    return [
+        response(200, variation_page),
+        response(200, MODEL_CONFIG),
+        response(200, {"id": "dataset-id", "name": "golden"}),
+        response(
+            200,
+            dataset_page([{"rowIndex": 0, "input": "hello", "variables": {}}], total=1),
+        ),
+        response(201, {"id": "evaluation-id", "name": "eval-key"}),
+        response(
+            201,
+            {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+        ),
+        response(
+            200,
+            {
+                "statusCounts": {
+                    "total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "error": 0,
+                    "pending": 0,
+                }
+            },
+        ),
+    ]
+
+
+def evaluation_post(transport: SequencedTransport) -> dict[str, Any]:
+    posts = [
+        request
+        for request in transport.requests
+        if request["method"] == "POST" and request["url"].endswith("/evaluations")
+    ]
+    assert len(posts) == 1
+    body: dict[str, Any] = posts[0]["body"]
+    return body
+
+
+@pytest.mark.asyncio
+async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> None:
+    transport = SequencedTransport(fetched_run_responses(config_variation_page()))
+    evals = init_evaluations(api_token="token", transport=transport)
+    seen_configs: list[dict[str, Any]] = []
+
+    async def handler(config: dict[str, Any], *args: object) -> dict[str, Any]:
+        seen_configs.append(config)
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        ai_config="support-agent",
+        variation="control",
+    )
+
+    assert result.passed is True
+    assert transport.requests[0]["url"] == (
+        "https://app.launchdarkly.com/api/v2/projects/proj/ai-configs/"
+        "support-agent/variations/control"
+    )
+    # The pinned model-config version is the one read.
+    assert transport.requests[1]["url"].endswith(
+        "/projects/proj/ai-configs/model-configs/OpenAI.gpt-4o?version=3"
+    )
+    body = evaluation_post(transport)
+    assert body["generationProvider"] == "OpenAI"
+    assert body["generationModel"] == "gpt-4o"
+    # Model-config parameters sit under the variation's own, as flag delivery layers them.
+    assert body["parameters"] == {"max_tokens": 100, "temperature": 0.7}
+    assert body["messages"] == [
+        {"role": "system", "content": "You are a support agent."}
+    ]
+    assert seen_configs[0]["provider"] == {"name": "OpenAI"}
+    assert seen_configs[0]["instructions"] == "You are a support agent."
+
+
+@pytest.mark.asyncio
+async def test_explicit_generation_overrides_the_fetched_variation() -> None:
+    transport = SequencedTransport(fetched_run_responses(config_variation_page()))
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        ai_config="support-agent",
+        variation="control",
+        generation={
+            "model": "gpt-4o-mini",
+            "parameters": {"temperature": 0.1},
+            "messages": [{"role": "system", "content": "Candidate prompt"}],
+        },
+    )
+
+    body = evaluation_post(transport)
+    assert body["generationProvider"] == "OpenAI"
+    assert body["generationModel"] == "gpt-4o-mini"
+    # parameters merge key by key rather than replacing the fetched set.
+    assert body["parameters"] == {"max_tokens": 100, "temperature": 0.1}
+    # messages replace the fetched instructions instead of clashing with them.
+    assert body["messages"] == [{"role": "system", "content": "Candidate prompt"}]
+
+
+@pytest.mark.asyncio
+async def test_variation_tools_without_implementations_fail_before_mutating_requests() -> (
+    None
+):
+    transport = SequencedTransport(
+        [
+            response(
+                200,
+                config_variation_page(tools=[{"key": "lookup_order", "version": 4}]),
+            ),
+            response(200, MODEL_CONFIG),
+        ]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="'lookup_order'"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            ai_config="support-agent",
+            variation="control",
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_variation_judges_become_the_default_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(
+                200,
+                config_variation_page(
+                    judgeConfiguration={
+                        "judges": [
+                            {"judgeConfigKey": "security-judge", "samplingRate": 1.0}
+                        ]
+                    }
+                ),
+            ),
+            response(200, MODEL_CONFIG),
+        ]
+    )
+
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        raise RuntimeError("not found")
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    # Resolving the attached judge is what fails, so it was picked up as a criterion.
+    with pytest.raises(EvaluationsError, match="'security-judge'"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=handler,
+            ai_config="support-agent",
+            variation="control",
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_variation_fails_before_any_records_are_created() -> None:
+    transport = SequencedTransport(
+        [response(404, {"code": "not_found", "message": "not found"})]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="was not found"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            ai_config="support-agent",
+            variation="missing",
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ({}, "Pass generation"),
+        ({"variation": "control"}, "variation requires ai_config"),
+        ({"ai_config": "support-agent"}, "ai_config requires variation"),
+        ({"ai_config": " ", "variation": "control"}, "ai_config must not be blank"),
+    ],
+)
+async def test_config_source_is_validated_before_network_io(
+    source: dict[str, str], message: str
+) -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=message):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            **source,  # type: ignore[arg-type]
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_tool_version_drift_from_the_variation_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="launchdarkly_ai_server.evaluations.module")
+    responses = fetched_run_responses(
+        config_variation_page(tools=[{"key": "lookup_order", "version": 4}])
+    )
+    responses.insert(
+        2,
+        response(
+            200,
+            {"key": "lookup_order", "version": 7, "schema": {"type": "object"}},
+        ),
+    )
+    transport = SequencedTransport(responses)
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        ai_config="support-agent",
+        variation="control",
+        tools={"lookup_order": lookup_order},
+    )
+
+    assert "pins tool 'lookup_order' at version 4" in caplog.text
+    assert "latest version 7" in caplog.text
+    assert evaluation_post(transport)["tools"] == [
+        {"key": "lookup_order", "version": 7}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_config_key", [42, ["OpenAI.gpt-4o"], {"key": "x"}])
+async def test_non_string_model_config_key_fails_loudly(
+    model_config_key: object,
+) -> None:
+    transport = SequencedTransport(
+        [response(200, config_variation_page(modelConfigKey=model_config_key))]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="non-string modelConfigKey"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            ai_config="support-agent",
+            variation="control",
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_config_key", [None, ""])
+async def test_variation_without_a_model_config_needs_an_explicit_provider(
+    model_config_key: str | None,
+) -> None:
+    transport = SequencedTransport(
+        [response(200, config_variation_page(modelConfigKey=model_config_key))]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    # No model config is linked, so none is fetched and no provider is known.
+    with pytest.raises(EvaluationsError, match=r"generation\.provider is required"):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            ai_config="support-agent",
+            variation="control",
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET"]
+
+
+def test_ai_config_variation_from_api_layers_the_model_config() -> None:
+    from launchdarkly_ai_server.evaluations.types import AIConfigVariation
+
+    latest = config_variation_page(
+        tools=[{"key": "lookup_order", "version": 4}],
+        judgeConfiguration={
+            "judges": [{"judgeConfigKey": "security-judge", "samplingRate": 1.0}]
+        },
+    )["items"][1]
+
+    linked = AIConfigVariation.from_api(latest, MODEL_CONFIG)
+    assert linked.generation == {
+        "provider": "OpenAI",
+        "model": "gpt-4o",
+        "parameters": {"max_tokens": 100, "temperature": 0.7},
+        "instructions": "You are a support agent.",
+    }
+    assert linked.tool_versions == {"lookup_order": 4}
+    assert linked.judge_keys == ["security-judge"]
+
+    unlinked = AIConfigVariation.from_api(latest)
+    assert "provider" not in unlinked.generation
+    assert unlinked.generation["parameters"] == {"temperature": 0.7}

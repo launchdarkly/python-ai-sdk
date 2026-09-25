@@ -81,14 +81,23 @@ def wrap_tool_handlers(
             def _make_regular_wrapper(
                 tool_name: str, original: Callable[..., Any]
             ) -> Callable[..., Any]:
+                # Synthetic graph handoff tools are sync and skipped for tool_call metrics.
+                # Keep them sync so a bare handoff() records the chosen edge (stream and
+                # invoke share the same surface; an async wrapper would leave `chosen` empty).
+                if tool_name.startswith(HANDOFF_TOOL_PREFIX):
+
+                    def handoff_wrapper(*args: Any, **kwargs: Any) -> Any:
+                        return original(*args, **kwargs)
+
+                    return handoff_wrapper
+
                 async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                    if not tool_name.startswith(HANDOFF_TOOL_PREFIX):
-                        get_client().track(
-                            "$ld:ai:tool_call",
-                            user_context,
-                            {**track_data, "toolKey": tool_name},
-                            1,
-                        )
+                    get_client().track(
+                        "$ld:ai:tool_call",
+                        user_context,
+                        {**track_data, "toolKey": tool_name},
+                        1,
+                    )
                     result = original(*args, **kwargs)
                     return await result if inspect.isawaitable(result) else result
 

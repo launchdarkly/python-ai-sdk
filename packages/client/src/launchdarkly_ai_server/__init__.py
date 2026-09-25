@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.2"  # x-release-please-version
+__version__ = "0.2.3"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .content import (
@@ -73,6 +73,7 @@ from .types import (
     GraphEdge,
     GraphNode,
     GraphOptions,
+    GraphStreamEvent,
     GraphTopology,
     HandlerResult,
     HandlerStreamEvent,
@@ -136,6 +137,7 @@ __all__ = [  # noqa: RUF022
     "GraphEdge",
     "GraphNode",
     "GraphOptions",
+    "GraphStreamEvent",
     "GraphTopology",
     "HandlerResult",
     "HandlerStreamEvent",
