@@ -41,7 +41,9 @@ from launchdarkly_ai_server import (
     create_handler,
     end_span_once,
     end_unfinished_spans,
+    model_parameters,
     parse_template,
+    select_forwarded_parameters,
     set_conversation_id_if_absent,
     set_input_content_attributes,
     set_output_content_attributes,
@@ -65,6 +67,64 @@ from .spans import (
     succeed_span,
     tool_display_name,
 )
+
+#: Every field ``ClaudeAgentOptions`` declares, classified by hand into exactly one of: forwarded
+#: (below), handler-owned (``model``, ``allowed_tools``, ``mcp_servers``, ``hooks``, ``tools``,
+#: ``system_prompt``, popped after the filter runs, at each call site), or excluded
+#: (``extra_args``, a raw CLI-argument escape hatch, is client/connection configuration and is never
+#: forwarded). ``TestClaudeAgentOptionsAcceptsExactlyTheseFields`` in this package's tests asserts
+#: this classification stays exhaustive as the SDK's own dataclass changes.
+#:
+#: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
+#: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
+#: for other providers; forwarding one of those unfiltered raised ``TypeError`` before this filter
+#: existed.
+_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
+    {
+        "add_dirs",
+        "agents",
+        "betas",
+        "can_use_tool",
+        "cli_path",
+        "continue_conversation",
+        "cwd",
+        "debug_stderr",
+        "disallowed_tools",
+        "effort",
+        "enable_file_checkpointing",
+        "env",
+        "fallback_model",
+        "fork_session",
+        "include_hook_events",
+        "include_partial_messages",
+        "load_timeout_ms",
+        "max_budget_usd",
+        "max_buffer_size",
+        "max_thinking_tokens",
+        "max_turns",
+        "output_format",
+        "permission_mode",
+        "permission_prompt_tool_name",
+        "plugins",
+        "resume",
+        "sandbox",
+        "session_id",
+        "session_store",
+        "session_store_flush",
+        "setting_sources",
+        "settings",
+        "skills",
+        "stderr",
+        "strict_mcp_config",
+        "task_budget",
+        "thinking",
+        "user",
+    }
+)
+
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves this out, so nothing needs to subtract it again.
+_CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset({"extra_args"})
 
 # ---------------------------------------------------------------------------
 # Tool wiring
@@ -479,7 +539,20 @@ def _build_query_options(
     **extra: Any,
 ) -> ClaudeAgentOptions:
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
+    params = select_forwarded_parameters(
+        model_parameters(config), _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS
+    )
+    for _owned_key in (
+        "model",
+        "allowed_tools",
+        "mcp_servers",
+        "hooks",
+        "tools",
+        "system_prompt",
+    ):
+        params.pop(_owned_key, None)
     kwargs: dict[str, Any] = {
+        **params,
         "model": config["model"]["name"],
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},

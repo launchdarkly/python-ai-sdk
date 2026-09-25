@@ -18,7 +18,9 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
+    model_parameters,
     parse_template,
+    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
@@ -42,12 +44,77 @@ from .spans import (
     to_tool_definitions,
 )
 
-try:
-    import anthropic as _anthropic_mod  # noqa: F401
+#: Every key ``AsyncMessages.create``/``.stream`` accept, classified by hand into exactly one of:
+#: forwarded (below), handler-owned (``model``, ``messages``, ``system``, ``tools``, popped after
+#: the filter runs, at each call site), or excluded (below). ``TestMessagesCreateAcceptsExactlyThese
+#: Keys`` / ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
+#: classification stays exhaustive as the SDK's own signatures change.
+#:
+#: Everything else the API accepts is forwarded, including keys that are not strictly generation
+#: settings (``metadata``, ``service_tier``, ``container``, ``user_profile_id``, ``output_config``,
+#: ...).
+_MESSAGES_CREATE_FORWARDED_KEYS = frozenset(
+    {
+        "cache_control",
+        "container",
+        "inference_geo",
+        "max_tokens",
+        "metadata",
+        "output_config",
+        "service_tier",
+        "stop_sequences",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "top_k",
+        "top_p",
+        "user_profile_id",
+    }
+)
 
-    _HAS_ANTHROPIC = True
-except ImportError:
-    _HAS_ANTHROPIC = False
+#: Same as :data:`_MESSAGES_CREATE_FORWARDED_KEYS`, plus ``output_format``: ``.stream`` accepts it,
+#: ``.create`` does not.
+_MESSAGES_STREAM_FORWARDED_KEYS = _MESSAGES_CREATE_FORWARDED_KEYS | {"output_format"}
+
+#: Accepted by the API but never forwarded, and why:
+#: * ``stream``: the handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded lists above already
+#: leave these out, so nothing needs to subtract them again.
+_MESSAGES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",
+        "timeout",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+    }
+)
+
+
+def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
+    """Moves a top-level ``effort`` into ``output_config.effort``, the shape the Anthropic Messages
+    API actually accepts (there is no top-level ``effort`` parameter).
+
+    An ``output_config`` the config itself already set wins: if it carries its own ``effort``, the
+    top-level one is dropped rather than overwriting it. This handler does not itself set
+    ``output_config`` (structured output goes through a system-prompt instruction instead, see
+    ``_build_messages``), so there is nothing here to merge with yet; a future call site that starts
+    setting ``output_config`` must merge so its own keys win and a config's ``effort`` survives.
+    """
+    effort = params.pop("effort", None)
+    if effort is None:
+        return params
+    existing = params.get("output_config")
+    if isinstance(existing, dict) and "effort" in existing:
+        return params
+    params["output_config"] = {
+        **(existing if isinstance(existing, dict) else {}),
+        "effort": effort,
+    }
+    return params
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -201,9 +268,13 @@ async def _run_tool_loop(
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
+    extra_params = select_forwarded_parameters(
+        _rename_effort_to_output_config(model_parameters(config)),
+        _MESSAGES_CREATE_FORWARDED_KEYS,
     )
+    max_tokens = extra_params.pop("max_tokens", 1024)
+    for _owned_key in ("model", "messages", "system", "tools"):
+        extra_params.pop(_owned_key, None)
     conversation = list(messages)
     output = ""
     steps = 0
@@ -222,6 +293,7 @@ async def _run_tool_loop(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,
@@ -494,9 +566,13 @@ async def _stream_gen(
 
     tools = _build_tools(config.get("tools") or {})
     tool_definitions = to_tool_definitions(tools)
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
+    extra_params = select_forwarded_parameters(
+        _rename_effort_to_output_config(model_parameters(config)),
+        _MESSAGES_STREAM_FORWARDED_KEYS,
     )
+    max_tokens = extra_params.pop("max_tokens", 1024)
+    for _owned_key in ("model", "messages", "system", "tools"):
+        extra_params.pop(_owned_key, None)
     conversation = list(messages)
     full_output = ""
     steps = 0
@@ -528,6 +604,7 @@ async def _stream_gen(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,

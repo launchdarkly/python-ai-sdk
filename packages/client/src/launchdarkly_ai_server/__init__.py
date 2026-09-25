@@ -54,6 +54,7 @@ from .lifecycle import (
     inspect_config,
     shutdown,
 )
+from .parameter_forwarding import select_forwarded_parameters
 from .registry import (
     Registry,
     compose,
@@ -109,6 +110,7 @@ from .utils import (
     end_unfinished_spans,
     lang_chain_span_usage,
     make_track_data,
+    model_parameters,
     model_stamps_from_meta,
     normalize_mode,
     number_or_zero,
@@ -194,9 +196,12 @@ __all__ = [  # noqa: RUF022
     "RunSummary",
     "Scorer",
     "init_evaluations",
+    # parameter_forwarding
+    "select_forwarded_parameters",
     # utils
     "create_handler",
     "make_track_data",
+    "model_parameters",
     "model_stamps_from_meta",
     "omit_model_stamps",
     "normalize_mode",

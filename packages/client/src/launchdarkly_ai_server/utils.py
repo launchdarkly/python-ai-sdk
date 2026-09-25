@@ -36,6 +36,26 @@ def create_handler(
     )
 
 
+def model_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """
+    Returns ``config['model']['parameters']`` as a fresh dict, or ``{}`` when it
+    is absent or not a usable mapping.
+
+    This is the single place handler packages read provider tuning values from.
+    Values are forwarded to the provider as-is, keyed by whatever name the
+    LaunchDarkly UI wrote (already snake_case for every Python provider SDK
+    here), so no case conversion happens on the way through. Callers must
+    still remove any key the call site sets itself before merging the result
+    into a provider call, so a config value never overrides a handler-owned
+    argument.
+
+    Never reads ``model.custom`` — that field is not forwarded to providers.
+    """
+    model = config.get("model") if isinstance(config, dict) else None
+    parameters = model.get("parameters") if isinstance(model, dict) else None
+    return dict(parameters) if isinstance(parameters, dict) else {}
+
+
 def collapse_messages_to_instructions(config: AiConfigRep) -> AiConfigRep:
     """
     When only an agent handler is available for a messages-mode config, collapse

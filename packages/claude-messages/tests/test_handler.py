@@ -6,12 +6,14 @@ Reference: TESTING.md §1
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -362,6 +364,260 @@ class TestToolConversion:
 # ---------------------------------------------------------------------------
 # §1.4 Tool execution loop
 # ---------------------------------------------------------------------------
+
+
+class TestModelParametersForwarding:
+    async def test_snake_case_param_reaches_provider(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.5}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["top_p"] == 0.5
+
+    async def test_max_tokens_default_preserved_without_parameters(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        h = create_claude_messages_handler()
+        await h(CONFIG, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 1024
+
+    async def test_config_max_tokens_wins_over_default(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_tokens": 42}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 42
+
+    async def test_config_cannot_override_model_or_messages(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "model": "not-the-real-model",
+                    "messages": "not-the-real-messages",
+                    "system": "not-the-real-system",
+                },
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["model"] == CONFIG["model"]["name"]
+        assert call_kwargs["messages"] != "not-the-real-messages"
+        assert (
+            "system" not in call_kwargs
+            or call_kwargs["system"] != "not-the-real-system"
+        )
+
+    async def test_call_unchanged_when_no_parameters_set(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        h = create_claude_messages_handler()
+        await h(CONFIG, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert set(call_kwargs.keys()) == {"model", "max_tokens", "messages", "system"}
+
+    async def test_streaming_forwards_snake_case_param(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, _ = _make_stream_context(["hi"])
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.3}},
+        }
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_claude_messages_handler()
+        gen = await h.stream(config, "q", {}, {})
+        async for _event in gen:
+            pass
+        call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
+        assert call_kwargs["top_p"] == 0.3
+
+    async def test_top_p_and_max_tokens_reach_the_wire(self) -> None:
+        """Intercepts the real outgoing HTTP request with an httpx MockTransport, rather than
+        asserting only on a mock of our own call, so this proves the values actually leave the
+        process on the wire the real ``anthropic`` client builds.
+        """
+        import anthropic
+
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        captured: dict[str, Any] = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-sonnet-20240229",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            )
+
+        transport = httpx.MockTransport(_handler)
+        real_client = anthropic.AsyncAnthropic(
+            api_key="test-key", http_client=httpx.AsyncClient(transport=transport)
+        )
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"top_p": 0.4, "max_tokens": 256},
+            },
+        }
+        with patch("anthropic.AsyncAnthropic", return_value=real_client):
+            h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+
+        assert captured["body"]["top_p"] == 0.4
+        assert captured["body"]["max_tokens"] == 256
+
+    async def test_ui_key_the_sdk_rejects_is_dropped_without_raising(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        """``effort`` has no top-level equivalent on ``messages.create``; without the rename it
+        raises ``TypeError`` before this filter existed. Here it is set with no ``output_config``,
+        so the effort rename applies and the call must not raise.
+        """
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"effort": "low"}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {"effort": "low"}
+
+    async def test_transport_key_is_never_forwarded(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"top_p": 0.5, "extra_body": {"secret": "value"}},
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["top_p"] == 0.5
+        assert "extra_body" not in call_kwargs
+
+    async def test_stream_key_is_never_forwarded(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        """The handler picks blocking vs. streaming by which client method it calls, not by a
+        ``stream`` kwarg; a config setting it must not reach ``messages.create``."""
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"stream": True}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert "stream" not in call_kwargs
+
+
+class TestEffortRename:
+    async def test_explicit_output_config_effort_wins_over_top_level_effort(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "effort": "low",
+                    "output_config": {"effort": "high"},
+                },
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {"effort": "high"}
+
+    async def test_top_level_effort_moves_into_output_config_when_absent(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"effort": "medium"}},
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {"effort": "medium"}
+
+    async def test_top_level_effort_merges_into_an_output_config_without_effort(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        """An ``output_config`` present without its own ``effort`` keeps its other keys and gains
+        the top-level ``effort``."""
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "effort": "low",
+                    "output_config": {"some_other_key": "kept"},
+                },
+            },
+        }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {
+            "some_other_key": "kept",
+            "effort": "low",
+        }
 
 
 class TestToolExecutionLoop:

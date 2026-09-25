@@ -25,8 +25,10 @@ from launchdarkly_ai_server import (
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     lang_chain_span_usage,
+    model_parameters,
     number_or_zero,
     parse_template,
+    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
@@ -43,6 +45,242 @@ from .spans import (
     start_tool_span,
     succeed_span,
     to_tool_definitions,
+)
+
+#: Handler-owned, per model class. The handler always sets the model itself, and each
+#: class exposes that one constructor field under two names (the field and its alias), so a
+#: config value for either must never be forwarded: it would collide with the model the
+#: handler resolves, or override it.
+_CHAT_OPENAI_OWNED_KEYS = frozenset({"model", "model_name"})
+_CHAT_ANTHROPIC_OWNED_KEYS = frozenset({"model", "model_name"})
+_CHAT_BEDROCK_CONVERSE_OWNED_KEYS = frozenset({"model", "model_id"})
+
+#: Every key ``ChatOpenAI`` accepts (field names plus pydantic aliases), classified by hand into
+#: exactly one of: forwarded (below), handler-owned (``model``: always overwritten by the
+#: resolved model name, see ``_model_constructor_kwargs``), or excluded. ``TestChatOpenAIAccepts
+#: ExactlyTheseKeys`` in this package's tests asserts this classification stays exhaustive as the
+#: SDK's own pydantic model changes.
+#:
+#: Excluded, and why: all client/connection configuration, never a config-controlled setting:
+#: * ``api_key``, ``openai_api_key``: the API key.
+#: * ``base_url``, ``openai_api_base``: the API base URL.
+#: * ``organization``, ``openai_organization``: the organization id used for auth.
+#: * ``openai_proxy``: an HTTP proxy.
+#: * ``client``, ``async_client``, ``root_client``, ``root_async_client``, ``http_client``,
+#:   ``http_async_client``, ``http_socket_options``: raw HTTP client objects/settings.
+#: * ``default_headers``, ``default_query``: default request headers/query params.
+#: * ``max_retries``: an HTTP retry count.
+#: * ``request_timeout``, ``timeout``: request timeouts.
+#: * ``extra_body``: a raw request-body override.
+#:
+#: Everything else the model accepts is forwarded, including keys that are not strictly generation
+#: settings (``store``, ``stream_usage``, ``tags``, ``metadata``, ``model_kwargs``, ...).
+_CHAT_OPENAI_FORWARDED_KEYS = frozenset(
+    {
+        "cache",
+        "callbacks",
+        "context_management",
+        "custom_get_token_ids",
+        "disable_streaming",
+        "disabled_params",
+        "frequency_penalty",
+        "include",
+        "include_response_headers",
+        "logit_bias",
+        "logprobs",
+        "max_completion_tokens",
+        "max_tokens",
+        "metadata",
+        "model_kwargs",
+        "n",
+        "name",
+        "output_version",
+        "presence_penalty",
+        "profile",
+        "rate_limiter",
+        "reasoning",
+        "reasoning_effort",
+        "seed",
+        "service_tier",
+        "stop",
+        "stop_sequences",
+        "store",
+        "stream_chunk_timeout",
+        "stream_usage",
+        "streaming",
+        "tags",
+        "temperature",
+        "tiktoken_model_name",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "use_previous_response_id",
+        "use_responses_api",
+        "verbose",
+        "verbosity",
+    }
+)
+
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_CHAT_OPENAI_EXCLUDED_KEYS = frozenset(
+    {
+        "api_key",
+        "openai_api_key",
+        "base_url",
+        "openai_api_base",
+        "organization",
+        "openai_organization",
+        "openai_proxy",
+        "client",
+        "async_client",
+        "root_client",
+        "root_async_client",
+        "http_client",
+        "http_async_client",
+        "http_socket_options",
+        "default_headers",
+        "default_query",
+        "max_retries",
+        "request_timeout",
+        "timeout",
+        "extra_body",
+    }
+)
+
+#: Every key ``ChatAnthropic`` accepts (field names plus pydantic aliases), classified the same way
+#: as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``TestChatAnthropicAcceptsExactlyTheseKeys`` in this
+#: package's tests asserts this classification stays exhaustive.
+#:
+#: Excluded, and why: all client/connection configuration:
+#: * ``anthropic_api_key``, ``api_key``: the API key (field plus alias).
+#: * ``anthropic_api_url``, ``base_url``: the API base URL (field plus alias).
+#: * ``anthropic_proxy``: an HTTP proxy.
+#: * ``default_request_timeout``, ``timeout``: a request timeout (field plus alias).
+#: * ``max_retries``: an HTTP retry count.
+#: * ``default_headers``: default request headers.
+_CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
+    {
+        "betas",
+        "cache",
+        "callbacks",
+        "context_management",
+        "custom_get_token_ids",
+        "disable_streaming",
+        "effort",
+        "inference_geo",
+        "max_tokens",
+        "max_tokens_to_sample",
+        "mcp_servers",
+        "metadata",
+        "model_kwargs",
+        "name",
+        "output_config",
+        "output_version",
+        "profile",
+        "rate_limiter",
+        "reuse_last_container",
+        "stop",
+        "stop_sequences",
+        "stream_usage",
+        "streaming",
+        "tags",
+        "temperature",
+        "thinking",
+        "top_k",
+        "top_p",
+        "verbose",
+    }
+)
+
+#: Named for the drift test and for review, not read at runtime.
+_CHAT_ANTHROPIC_EXCLUDED_KEYS = frozenset(
+    {
+        "anthropic_api_key",
+        "api_key",
+        "anthropic_api_url",
+        "base_url",
+        "anthropic_proxy",
+        "default_request_timeout",
+        "timeout",
+        "max_retries",
+        "default_headers",
+    }
+)
+
+#: Every key ``ChatBedrockConverse`` accepts (field names plus pydantic aliases), classified the
+#: same way as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``langchain-aws`` is not a dependency of this
+#: package (Bedrock support is opt-in, see ``_make_default_chat_model``), so
+#: ``TestChatBedrockConverseAcceptsExactlyTheseKeys`` in this package's tests skips itself when it
+#: is not installed rather than asserting nothing.
+#:
+#: Excluded, and why: all client/connection configuration:
+#: * ``bedrock_api_key``, ``api_key``: the API key (field plus alias).
+#: * ``aws_access_key_id``, ``aws_secret_access_key``, ``aws_session_token``: AWS credentials.
+#: * ``credentials_profile_name``: the AWS credentials profile used for auth.
+#: * ``endpoint_url``, ``base_url``: the API base URL (field plus alias).
+#: * ``client``, ``bedrock_client``: raw HTTP/boto3 client objects.
+#: * ``config``: a raw botocore client config object.
+#: * ``default_headers``: default request headers.
+#: * ``max_retries``: an HTTP retry count.
+#: * ``timeout``: a request timeout.
+_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS = frozenset(
+    {
+        "additional_model_request_fields",
+        "additional_model_response_field_paths",
+        "base_model",
+        "base_model_id",
+        "cache",
+        "callbacks",
+        "custom_get_token_ids",
+        "disable_streaming",
+        "guard_last_turn_only",
+        "guardrail_config",
+        "guardrails",
+        "max_tokens",
+        "metadata",
+        "name",
+        "output_config",
+        "output_version",
+        "performance_config",
+        "profile",
+        "provider",
+        "rate_limiter",
+        "raw_blocks",
+        "reasoning_effort",
+        "region_name",
+        "request_metadata",
+        "service_tier",
+        "stop",
+        "stop_sequences",
+        "streaming",
+        "supports_tool_choice_values",
+        "system",
+        "tags",
+        "temperature",
+        "top_p",
+        "verbose",
+    }
+)
+
+#: Named for the drift test and for review, not read at runtime.
+_CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = frozenset(
+    {
+        "bedrock_api_key",
+        "api_key",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "credentials_profile_name",
+        "endpoint_url",
+        "base_url",
+        "client",
+        "bedrock_client",
+        "config",
+        "default_headers",
+        "max_retries",
+        "timeout",
+    }
 )
 
 
@@ -226,13 +464,16 @@ def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
 
 
 def _model_constructor_kwargs(
-    config: AiConfigRep, fallback_name: str
+    config: AiConfigRep,
+    fallback_name: str,
+    forwarded_keys: frozenset[str] | None = None,
 ) -> dict[str, Any]:
-    raw = (config.get("model") or {}).get("parameters")
-    parameters = dict(raw) if isinstance(raw, dict) else {}
+    parameters = model_parameters(config)
     provider = str((config.get("provider") or {}).get("name") or "").lower()
     if provider == "bedrock":
         parameters.pop("tools", None)
+    if forwarded_keys is not None and parameters:
+        parameters = select_forwarded_parameters(parameters, forwarded_keys)
     # Name from the config always wins over a colliding ``model`` key in the parameter bag.
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
@@ -254,7 +495,9 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
+            **_model_constructor_kwargs(
+                config, "claude-3-5-sonnet-20241022", _CHAT_ANTHROPIC_FORWARDED_KEYS
+            )
         )
     if provider == "bedrock":
         try:
@@ -264,9 +507,15 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
                 "Using Bedrock models requires langchain-aws. "
                 "Install it with: pip install langchain-aws"
             ) from exc
-        return lc_aws.ChatBedrockConverse(**_model_constructor_kwargs(config, ""))
+        return lc_aws.ChatBedrockConverse(
+            **_model_constructor_kwargs(
+                config, "", _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS
+            )
+        )
     lc_openai = importlib.import_module("langchain_openai")
-    return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
+    return lc_openai.ChatOpenAI(
+        **_model_constructor_kwargs(config, "gpt-4o", _CHAT_OPENAI_FORWARDED_KEYS)
+    )
 
 
 async def _resolve_base_model(config: AiConfigRep, llm: Any, importlib: Any) -> Any:

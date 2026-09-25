@@ -18,11 +18,17 @@ from launchdarkly_ai_server import (
     compose_history,
     get_client,
     make_track_data,
+    model_parameters,
     parse_template,
+    select_forwarded_parameters,
     to_ld_context,
 )
 
-from .handler import _parse_message_content, _to_openai_agent_items
+from .handler import (
+    _MODEL_SETTINGS_FORWARDED_KEYS,
+    _parse_message_content,
+    _to_openai_agent_items,
+)
 
 try:
     from opentelemetry import trace
@@ -171,9 +177,24 @@ def to_openai_agents(
             agent_name = _sanitize_name(node.key)
             agent_name_to_key[agent_name] = node.key
 
+            node_model_settings_params = model_parameters(node.config)
+            # `max_turns` is a `Runner.run` option, not a `ModelSettings` field.
+            node_model_settings_params.pop("max_turns", None)
+            node_model_settings_params = select_forwarded_parameters(
+                node_model_settings_params, _MODEL_SETTINGS_FORWARDED_KEYS
+            )
             agent = Agent(
                 name=agent_name,
                 model=node.config.get("model", {}).get("name", "gpt-4o"),
+                **(
+                    {
+                        "model_settings": agents_mod.ModelSettings(
+                            **node_model_settings_params
+                        )
+                    }
+                    if node_model_settings_params
+                    else {}
+                ),
                 **({"instructions": instructions} if instructions else {}),
                 **({"tools": tools} if tools else {}),
                 **({"handoffs": child_handoffs} if child_handoffs else {}),
@@ -247,7 +268,13 @@ def to_openai_agents(
             root_prompt = _to_openai_agent_items(turns)
 
         try:
-            result = await Runner.run(root_agent, root_prompt, hooks=hooks)
+            root_max_turns = model_parameters(root.config).get("max_turns")
+            root_run_kwargs = (
+                {"max_turns": root_max_turns} if root_max_turns is not None else {}
+            )
+            result = await Runner.run(
+                root_agent, root_prompt, hooks=hooks, **root_run_kwargs
+            )
             if span:
                 span.set_status(SpanStatusCode.OK)
         except Exception as exc:
