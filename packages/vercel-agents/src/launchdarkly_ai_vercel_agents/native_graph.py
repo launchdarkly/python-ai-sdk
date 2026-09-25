@@ -127,9 +127,9 @@ def to_vercel_agents(
         await build(definition.root)
 
         span = trace.get_tracer("@launchdarkly/ai-vercel-agents").start_span(
-            "ld.ai.graph"
+            "launchdarkly.graph"
         )
-        span.set_attribute("ld.ai.graph.key", definition.key)
+        span.set_attribute("launchdarkly.graph.key", definition.key)
         context = options.get("context")
         run_id = str(uuid.uuid4())
         start = time.monotonic()
@@ -190,7 +190,7 @@ def to_vercel_agents(
                 current_input = final_text
 
             total = input_tokens + output_tokens
-            span.set_attribute("ld.ai.graph.path", "->".join(path))
+            span.set_attribute("launchdarkly.graph.path", "->".join(path))
             span.set_status(StatusCode.OK)
             if context is not None:
                 _track(

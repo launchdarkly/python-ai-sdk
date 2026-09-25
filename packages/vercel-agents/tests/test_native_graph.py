@@ -347,7 +347,7 @@ class TestInvocation:
         path_values = [
             call.args[1]
             for call in span.set_attribute.call_args_list
-            if call.args[0] == "ld.ai.graph.path"
+            if call.args[0] == "launchdarkly.graph.path"
         ]
         assert path_values
         path = path_values[-1].split("->")
@@ -389,7 +389,7 @@ class TestTelemetryAndCleanup:
         tracer.start_span.return_value = span
         with patch.object(native_graph_mod.trace, "get_tracer", return_value=tracer):
             await to_vercel_agents(_definition(_graph())).invoke("hello")
-        tracer.start_span.assert_called_once_with("ld.ai.graph")
+        tracer.start_span.assert_called_once_with("launchdarkly.graph")
         span.end.assert_called_once()
 
     @pytest.mark.asyncio
