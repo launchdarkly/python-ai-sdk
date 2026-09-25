@@ -118,8 +118,6 @@ from .utils import (
     parse_usage,
     set_ld_span_attributes,
     set_model_identity_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
     set_usage_span_attributes,
     to_ld_context,
     to_usage_dict,
@@ -204,8 +202,6 @@ __all__ = [  # noqa: RUF022
     "parse_template",
     "parse_usage",
     "set_ld_span_attributes",
-    "set_openllmetry_completion",
-    "set_openllmetry_prompt",
     "to_ld_context",
     # history
     "compose_history",
