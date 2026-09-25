@@ -233,7 +233,7 @@ class TestToAdkAgents:
             await to_adk_agents(_graph()).invoke(
                 "hi", context={"kind": "user", "key": "user-1"}
             )
-        assert tracer.start_span.call_args.args[0] == "ld.ai.graph"
+        assert tracer.start_span.call_args.args[0] == "launchdarkly.graph"
         events = [call.args[0] for call in tracker.track.call_args_list]
         assert "$ld:ai:graph:invocation_success" in events
         assert "$ld:ai:graph:duration:total" in events

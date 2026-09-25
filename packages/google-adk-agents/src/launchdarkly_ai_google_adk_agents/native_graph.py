@@ -105,7 +105,7 @@ class _AdkAgents:
                     )
                 current = graph_def.get_node(target) if target else None
             if span is not None:
-                span.set_attribute("ld.ai.graph.path", "->".join(path))
+                span.set_attribute("launchdarkly.graph.path", "->".join(path))
                 if SpanStatusCode is not None:
                     span.set_status(SpanStatusCode.OK)
             if ld_context is not None:
@@ -145,8 +145,8 @@ def to_adk_agents(graph_def: Any, **options: Any) -> _AdkAgents:
 def _graph_span(key: str) -> Any:
     if trace is None:
         return None
-    span = trace.get_tracer(_TRACER).start_span("ld.ai.graph")
-    span.set_attribute("ld.ai.graph.key", key)
+    span = trace.get_tracer(_TRACER).start_span("launchdarkly.graph")
+    span.set_attribute("launchdarkly.graph.key", key)
     return span
 
 
