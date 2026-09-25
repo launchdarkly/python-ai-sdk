@@ -10,6 +10,7 @@ import pytest
 
 from launchdarkly_ai_server import create_handler
 from launchdarkly_ai_server.evaluations import (
+    AIConfig,
     DatasetRow,
     EvaluationsError,
     HttpResponse,
@@ -2340,8 +2341,7 @@ async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> Non
         key="eval-key",
         dataset="golden",
         handler=handler,
-        ai_config="support-agent",
-        variation="control",
+        ai_config=AIConfig(key="support-agent", variation="control"),
     )
 
     assert result.passed is True
@@ -2378,8 +2378,7 @@ async def test_explicit_generation_overrides_the_fetched_variation() -> None:
         key="eval-key",
         dataset="golden",
         handler=handler,
-        ai_config="support-agent",
-        variation="control",
+        ai_config=AIConfig(key="support-agent", variation="control"),
         generation={
             "model": "gpt-4o-mini",
             "parameters": {"temperature": 0.1},
@@ -2417,8 +2416,7 @@ async def test_variation_tools_without_implementations_fail_before_mutating_requ
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
-            ai_config="support-agent",
-            variation="control",
+            ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
     assert [request["method"] for request in transport.requests] == ["GET", "GET"]
@@ -2465,8 +2463,7 @@ async def test_variation_judges_become_the_default_criteria(
             key="eval-key",
             dataset="golden",
             handler=handler,
-            ai_config="support-agent",
-            variation="control",
+            ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
     assert [request["method"] for request in transport.requests] == ["GET", "GET"]
@@ -2485,8 +2482,7 @@ async def test_unknown_variation_fails_before_any_records_are_created() -> None:
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
-            ai_config="support-agent",
-            variation="missing",
+            ai_config=AIConfig(key="support-agent", variation="missing"),
         )
 
     assert [request["method"] for request in transport.requests] == ["GET"]
@@ -2497,13 +2493,18 @@ async def test_unknown_variation_fails_before_any_records_are_created() -> None:
     ("source", "message"),
     [
         ({}, "Pass generation"),
-        ({"variation": "control"}, "variation requires ai_config"),
-        ({"ai_config": "support-agent"}, "ai_config requires variation"),
-        ({"ai_config": " ", "variation": "control"}, "ai_config must not be blank"),
+        (
+            {"ai_config": AIConfig(key=" ", variation="control")},
+            "ai_config.key must not be blank",
+        ),
+        (
+            {"ai_config": AIConfig(key="support-agent", variation="")},
+            "ai_config.variation must not be blank",
+        ),
     ],
 )
 async def test_config_source_is_validated_before_network_io(
-    source: dict[str, str], message: str
+    source: dict[str, AIConfig], message: str
 ) -> None:
     transport = SequencedTransport([])
     evals = init_evaluations(api_token="token", transport=transport)
@@ -2546,8 +2547,7 @@ async def test_tool_version_drift_from_the_variation_is_logged(
         key="eval-key",
         dataset="golden",
         handler=handler,
-        ai_config="support-agent",
-        variation="control",
+        ai_config=AIConfig(key="support-agent", variation="control"),
         tools={"lookup_order": lookup_order},
     )
 
@@ -2574,8 +2574,7 @@ async def test_non_string_model_config_key_fails_loudly(
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
-            ai_config="support-agent",
-            variation="control",
+            ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
     assert [request["method"] for request in transport.requests] == ["GET"]
@@ -2598,8 +2597,7 @@ async def test_variation_without_a_model_config_needs_an_explicit_provider(
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
-            ai_config="support-agent",
-            variation="control",
+            ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
     assert [request["method"] for request in transport.requests] == ["GET"]

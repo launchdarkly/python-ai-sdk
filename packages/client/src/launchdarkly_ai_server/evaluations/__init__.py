@@ -11,10 +11,18 @@ from .api import (
 )
 from .criteria import Criterion, Judge, Scorer, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
-from .types import DatasetRow, EvalRunResult, GenerationConfig, RunSummary, Usage
+from .types import (
+    AIConfig,
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    RunSummary,
+    Usage,
+)
 
 __all__ = [
     "DEFAULT_BASE_URI",
+    "AIConfig",
     "Criterion",
     "DatasetRow",
     "EvalRunResult",
