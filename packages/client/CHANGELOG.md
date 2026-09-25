@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.3...launchdarkly-ai-server-0.2.4) (2026-09-25)
+
+
+### Features
+
+* **AIC-3210:** support graph().stream() in the Python AI SDK ([#104](https://github.com/launchdarkly/python-ai-sdk/issues/104)) ([25a345a](https://github.com/launchdarkly/python-ai-sdk/commit/25a345a7a07f2160d242320fa849abc6b9de3553))
+* **AIC-3449:** Support pulling in configs for evals from code ([#108](https://github.com/launchdarkly/python-ai-sdk/issues/108)) ([fa374e2](https://github.com/launchdarkly/python-ai-sdk/commit/fa374e28c0f8b022c9791c6c31d9870c9625fba3))
+
 ## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.2...launchdarkly-ai-server-0.2.3) (2026-09-21)
 
 
