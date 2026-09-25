@@ -707,7 +707,7 @@ class TestToClaudeAgentsAnthropicSpecific:
 
 
 class TestNativeGraphConversationId:
-    """The telemetry contract claims the conversation id reaches ``ld.ai.graph`` spans.
+    """The telemetry contract claims the conversation id reaches ``launchdarkly.graph`` spans.
 
     The span is opened after an ``await`` on the graph definition, so this pins that the binding
     survives the await chain rather than only covering spans started synchronously in the block.
@@ -757,7 +757,7 @@ class TestNativeGraphConversationId:
                         )
 
         graph_spans = [
-            s for s in exporter.get_finished_spans() if s.name == "ld.ai.graph"
+            s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"
         ]
         assert len(graph_spans) == 1
         assert (graph_spans[0].attributes or {}).get(

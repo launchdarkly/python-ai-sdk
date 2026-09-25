@@ -56,7 +56,7 @@ lost.
 | root | `invoke_agent` | Literal. No interpolation. |
 | model turn | `chat {model}` | For example `chat claude-3-5-sonnet-20241022`. |
 | tool call | `execute_tool {tool_name}` | For example `execute_tool get_weather`. |
-| graph | `ld.ai.graph` | Already correct in Python. Do not touch. See section 8. |
+| graph | `launchdarkly.graph` | LaunchDarkly-owned, so it takes the `launchdarkly.` prefix. See section 10. |
 
 The model goes in the `chat` span name because the semantic conventions name an inference span
 `{gen_ai.operation.name} {gen_ai.request.model}`. A bare `chat` aggregates more neatly but tells a
@@ -130,7 +130,7 @@ An app that opens a fresh CLI session per turn and re-feeds history must pass it
 turn becomes its own conversation. See section 4 for the third place it appears.
 
 When a conversation id is bound, every handler stamps it on root, `chat`, and `execute_tool` (and
-on `ld.ai.graph`) via the shared span processor. No id is invented when the caller supplies none.
+on `launchdarkly.graph`) via the shared span processor. No id is invented when the caller supplies none.
 
 ---
 
@@ -641,12 +641,13 @@ implement this as a passthrough.
 
 ## 10. What not to touch
 
-The graph span is already at parity. `ld.ai.graph` with `ld.ai.graph.key` and `ld.ai.graph.path`
-matches between `client/graph.ts` and `graph.py`, and across all three `native_graph` pairs.
+The graph span is at parity. `launchdarkly.graph` with `launchdarkly.graph.key` and
+`launchdarkly.graph.path` matches across all three `native_graph` pairs.
 
-`js-ai-sdk` PR #16 renames these three to `launchdarkly.graph`, `launchdarkly.graph.key` and
-`launchdarkly.graph.path`. If that PR merges, make the same rename here, in `graph.py` and the
-three `native_graph.py`. If it does not, change nothing.
+These used to be `ld.ai.graph`, `ld.ai.graph.key` and `ld.ai.graph.path`. `js-ai-sdk` #16 renamed
+them so the graph span and the `invoke_agent` root share one name for the graph key, and so
+everything LaunchDarkly owns on a span sits under `launchdarkly.`. `ld.ai.` stays reserved for
+metric and event keys.
 
 Nothing else in `graph.py` or `native_graph.py` needs work.
 
