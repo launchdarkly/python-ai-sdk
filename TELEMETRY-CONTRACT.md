@@ -654,19 +654,14 @@ Nothing else in `graph.py` or `native_graph.py` needs work.
 
 ## 11. Superseded, do not carry forward
 
-`set_openllmetry_prompt` and `set_openllmetry_completion` in `utils.py` are the shape this SDK
-emitted before the span work. In TypeScript they still exist and nothing calls them. The content
-layer replaced them, and it handles any number of messages rather than only index 0.
+`set_openllmetry_prompt` and `set_openllmetry_completion` were the shape this SDK emitted before
+the span work: one flat span per call, with the prompt and only completion index 0 written as
+OpenLLMetry attributes. The content layer replaced them, and it handles any number of messages.
+Every handler now writes content through `content.py`, and both functions have been removed, from
+this SDK and from TypeScript.
 
-Every Python handler calls them today, verified in all six. That is the clearest single statement
-of the gap: Python is built on the layer TypeScript retired.
-
-Move every call site onto the content helpers. Keep the two functions exported for one release,
-then remove them.
-
-Neither function has a test of its own in the client package today, and neither does
-`set_ld_span_attributes`. The only coverage they have is indirect, through the handler tests. Give
-their replacements direct tests.
+Do not bring them back. Content goes through the content helpers, and the token aliases go through
+`set_usage_span_attributes`, so each attribute has one writer.
 
 ---
 
