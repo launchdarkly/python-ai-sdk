@@ -15,6 +15,7 @@ resolution-markers = [
 members = [
     "launchdarkly-ai-claude-agents",
     "launchdarkly-ai-claude-messages",
+    "launchdarkly-ai-google-adk-agents",
     "launchdarkly-ai-langchain-agents",
     "launchdarkly-ai-langchain-messages",
     "launchdarkly-ai-openai-agents",
@@ -790,7 +791,7 @@ wheels = [
 
 [[package]]
 name = "launchdarkly-ai-claude-agents"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "packages/claude-agents" }
 dependencies = [
     { name = "anthropic" },
@@ -809,7 +810,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-claude-messages"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "packages/claude-messages" }
 dependencies = [
     { name = "anthropic" },
@@ -825,8 +826,23 @@ requires-dist = [
 ]
 
 [[package]]
+name = "launchdarkly-ai-google-adk-agents"
+version = "0.1.0"
+source = { editable = "packages/google-adk-agents" }
+dependencies = [
+    { name = "launchdarkly-ai-server" },
+    { name = "opentelemetry-api" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "launchdarkly-ai-server", editable = "packages/client" },
+    { name = "opentelemetry-api", specifier = ">=1.25" },
+]
+
+[[package]]
 name = "launchdarkly-ai-langchain-agents"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "packages/langchain-agents" }
 dependencies = [
     { name = "langchain-core" },
@@ -845,7 +861,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-langchain-messages"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "packages/langchain-messages" }
 dependencies = [
     { name = "langchain-core" },
@@ -862,7 +878,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-openai-agents"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "packages/openai-agents" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -881,7 +897,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-openai-messages"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "packages/openai-messages" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -898,7 +914,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-python"
-version = "0.1.6"
+version = "0.1.7"
 source = { editable = "packages/ai" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -918,7 +934,7 @@ provides-extras = ["otel"]
 
 [[package]]
 name = "launchdarkly-ai-server"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "packages/client" }
 dependencies = [
     { name = "opentelemetry-api" },

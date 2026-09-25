@@ -79,6 +79,17 @@
       ],
       "component": "launchdarkly-ai-langchain-agents"
     },
+    "packages/google-adk-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_google_adk_agents/__init__.py"
+      ],
+      "component": "launchdarkly-ai-google-adk-agents"
+    },
     "packages/langchain-messages": {
       "release-type": "python",
       "versioning": "default",
