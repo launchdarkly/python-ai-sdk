@@ -122,77 +122,45 @@ Judges are resolved through flag delivery, and handlers are matched to them, **b
 
 ### Give the evaluation tools
 
-Pass `tools` to `run()` to make tools available to the handler. Each entry is either a tool that already exists in your project's AI library — a bare callable or a `NativeTool`, resolved by key and pinned to its current version in the run record — or an `InlineTool` that carries its own `schema` and `description`, letting you define a tool in code without creating it in LaunchDarkly first. A single map can mix both.
+Pass `tools` to `run()` as a list of `Tool`. Construct one to define a tool in code. Call `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
 
 ```python
-from launchdarkly_ai_server import InlineTool, init_evaluations
+from launchdarkly_ai_server import Tool, init_evaluations
 
 
 def lookup_order(order_id: str) -> str:
     return f"order {order_id} shipped"
 
 
-result = await init_evaluations().run(
-    project_key="my-project",
+evals = init_evaluations(project_key="my-project")
+
+# Read from the AI library now. Pins the version. Raises now if the tool is absent.
+search_docs_tool = evals.tools.get("search_docs", implementation=search_docs)
+
+# Defined here. Needs no tool in LaunchDarkly.
+lookup_order_tool = Tool(
+    key="lookup_order",
+    implementation=lookup_order,
+    schema={
+        "type": "object",
+        "properties": {"order_id": {"type": "string"}},
+        "required": ["order_id"],
+    },
+    description="Look up an order by id",
+)
+
+result = await evals.run(
     key="support-qa-2026-08-20",
     dataset="support-golden",
     handler=create_openai_messages_handler(),
     generation={"provider": "OpenAI", "model": "gpt-4o"},
-    tools={
-        # Resolved from the AI library and recorded as v<N>.
-        "search_docs": search_docs,
-        # Defined here and recorded as inline; no ai-tools entry needed.
-        "lookup_order": InlineTool(
-            implementation=lookup_order,
-            schema={
-                "type": "object",
-                "properties": {"order_id": {"type": "string"}},
-                "required": ["order_id"],
-            },
-            description="Look up an order by id",
-        ),
-    },
+    tools=[search_docs_tool, lookup_order_tool],
 )
 ```
 
-An inline definition reads nothing from the tool API, so a key that does not exist in LaunchDarkly is no longer an error. Handlers receive the same `{key: callable}` map whichever source a tool came from — an `InlineTool` is unwrapped before the handler sees it — so handler code needs no changes to use one.
+`run()` reads no tool from the API. A constructed `Tool` is always inline, because `source` and `version` are not constructor arguments. Only `tools.get()` produces a library tool. Handlers receive the same `{key: callable}` map whichever kind a tool is, so handler code needs no change.
 
-**Inline definitions are checked before any network I/O.** A blank key, a `schema` that is not a JSON object, one that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued, because a bad inline value is a mistake in your code and is cheapest to reject while no evaluation record exists. A library tool's missing key can only fail after its `GET`. A key may name a library tool or an inline definition but not both — the run record badges each tool one way or the other, so one key carrying both identities is rejected. A `NativeTool` may not be paired with an inline definition: the provider implements that tool and it has no schema of its own, so there is nothing for an inline schema to describe.
-
-The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
-
-Call `init_client()` explicitly when you want to:
-- Pass SDK or telemetry options programmatically (overriding env vars)
-- Initialize at startup before the first AI call (e.g. to avoid latency on the first request)
-- Fail fast at boot if `LD_SDK_KEY` is missing
-
-```python
-import asyncio
-from launchdarkly_ai_server import init_client, shutdown
-
-async def main():
-    # Standard path — auto-discovers launchdarkly-server-sdk.
-    client = await init_client({
-        "sdkKey": "sdk-...",
-        "serviceName": "my-service",
-        "environment": "production",
-    })
-
-    # Or skip init_client() and let the first model/graph call initialize lazily.
-
-    # Flush telemetry, flush LD events, and close the client.
-    await shutdown()
-
-asyncio.run(main())
-```
-
-| Export | Description |
-|---|---|
-| `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. |
-| `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery. |
-| `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
-| `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. |
-| `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
+**The list is checked before any network I/O.** A blank key, an uppercase key, a `schema` that is not a JSON object, a schema that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued. A repeated key fails too, and keys are compared without case. A `NativeTool` is valid only for a library tool, because the provider supplies its schema.
 
 ### `config(**args)`
 

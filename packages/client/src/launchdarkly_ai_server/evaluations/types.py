@@ -58,35 +58,49 @@ class DatasetRow:
 
 
 @dataclass
-class InlineTool:
-    """A tool defined in code instead of created in LaunchDarkly first.
+class Tool:
+    """A tool a run gives to its handler. Pass a list of these to ``run``.
 
-    Use one as a value in ``run(tools=...)`` to supply a tool's ``schema`` and
-    ``description`` with its executable. A callable in the same map names a
-    tool to resolve by key, so one map may hold both kinds.
+    Construct one to define a tool in code. ``source`` is then ``"inline"`` and
+    ``version`` is ``None``. Neither is a constructor argument, so a
+    constructed tool is always inline.
 
-    ``implementation`` is the function the handler calls. Keys must be
-    lowercase. A :class:`~launchdarkly_ai_server.NativeTool` is not accepted as
-    the implementation.
-    """
+    Call ``evals.tools.get(key, implementation=...)`` instead to use a tool
+    from the LaunchDarkly tool library. That returns a tool with ``source``
+    ``"library"`` and the version it pinned.
 
-    implementation: Callable[..., Any]
-    schema: dict[str, Any]
-    description: str = ""
-
-
-@dataclass
-class ResolvedTool:
-    """A tool a run uses, from the library or from an inline definition.
-
-    ``version`` is set for a library tool and ``None`` for an inline one.
+    ``implementation`` is the function the handler calls. A key must be
+    lowercase. A :class:`~launchdarkly_ai_server.NativeTool` is valid only for
+    a library tool, because the provider supplies its schema.
     """
 
     key: str
-    version: int | None = None
-    description: str = ""
+    implementation: Callable[..., Any] | Any
     schema: dict[str, Any] = field(default_factory=dict)
-    source: Literal["library", "inline"] = "library"
+    description: str = ""
+    source: Literal["library", "inline"] = field(default="inline", init=False)
+    version: int | None = field(default=None, init=False)
+
+    @classmethod
+    def _library(
+        cls,
+        key: str,
+        implementation: Callable[..., Any] | Any,
+        *,
+        version: int,
+        schema: dict[str, Any],
+        description: str,
+    ) -> Tool:
+        """Build a library tool. Used by ``evals.tools.get``."""
+        tool = cls(
+            key=key,
+            implementation=implementation,
+            schema=schema,
+            description=description,
+        )
+        tool.source = "library"
+        tool.version = version
+        return tool
 
     def to_create_wire(self) -> dict[str, Any]:
         """The entry this tool contributes to the evaluation-create body."""

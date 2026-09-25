@@ -7,7 +7,7 @@ import json
 import logging
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -41,10 +41,9 @@ from .types import (
     EvaluationRef,
     EvaluationRunRef,
     GenerationConfig,
-    InlineTool,
     ResolvedJudge,
-    ResolvedTool,
     RunSummary,
+    Tool,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,9 +54,6 @@ CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 ToolImplementation = Callable[..., Any] | NativeTool
-# A value accepted by ``run(tools=...)``. A callable or ``NativeTool`` names a
-# tool to resolve by key. An ``InlineTool`` carries its own definition.
-ToolEntry = ToolImplementation | InlineTool
 
 
 @dataclass(frozen=True)
@@ -182,30 +178,26 @@ def _required_string(data: Mapping[str, Any], key: str, description: str) -> str
     return value
 
 
-def _validate_inline_tool(key: str, tool: InlineTool) -> None:
-    """Validate one inline tool definition. Raises ``EvaluationsError``.
-
-    Checks the key, the implementation, the schema, and the description. Issues
-    no requests.
-    """
+def _validate_tool_key(key: str) -> None:
+    """Validate a tool key. Raises ``EvaluationsError``."""
+    if not isinstance(key, str) or not key.strip():
+        raise EvaluationsError("tool keys must not be blank")
     # Keys are lowercase.
     if key != key.lower():
         raise EvaluationsError(
-            f"Inline tool {key!r} key must not use uppercase letters. Use "
+            f"Tool key {key!r} must not use uppercase letters. Use "
             f"{key.lower()!r} instead."
         )
+
+
+def _validate_inline_tool(tool: Tool) -> None:
+    """Validate one inline tool. Raises ``EvaluationsError``."""
+    key = tool.key
     if isinstance(tool.implementation, NativeTool):
         raise EvaluationsError(
-            f"Inline tool {key!r} cannot pair a NativeTool with an inline "
-            "definition. A provider-native tool is implemented by the provider "
-            "and has no schema of its own, so there is nothing for an inline "
-            "schema to describe. Pass the NativeTool on its own to use the "
-            "provider capability, or an InlineTool wrapping your own function."
-        )
-    if not callable(tool.implementation):
-        raise EvaluationsError(
-            f"Inline tool {key!r} implementation must be callable, got "
-            f"{type(tool.implementation).__name__}"
+            f"Inline tool {key!r} must not use a NativeTool. The provider "
+            "supplies the schema of a native tool. Call evals.tools.get() for "
+            "a library tool, or give this tool a function."
         )
     if not isinstance(tool.schema, Mapping):
         raise EvaluationsError(
@@ -219,61 +211,53 @@ def _validate_inline_tool(key: str, tool: InlineTool) -> None:
         raise EvaluationsError(
             f"Inline tool {key!r} schema must be JSON-serializable: {error}"
         ) from error
-    if not isinstance(tool.description, str):
-        raise EvaluationsError(
-            f"Inline tool {key!r} description must be a string, got "
-            f"{type(tool.description).__name__}"
-        )
 
 
-def _validate_tools(tools: Mapping[str, ToolEntry]) -> None:
-    """Validate the whole tools map. Raises ``EvaluationsError``.
+def _validate_tools(tools: Sequence[Tool]) -> None:
+    """Validate the tools list. Raises ``EvaluationsError``.
 
     Issues no requests.
     """
     keys_by_identity: dict[str, str] = {}
-    inline_identities: set[str] = set()
-    for key, entry in tools.items():
-        if not isinstance(key, str) or not key.strip():
-            raise EvaluationsError("tool keys must not be blank")
-        if isinstance(entry, InlineTool):
-            is_inline = True
-            _validate_inline_tool(key, entry)
-        else:
-            is_inline = False
-            if not callable(entry) and not isinstance(entry, NativeTool):
-                raise EvaluationsError(
-                    f"Tool {key!r} must be callable, a NativeTool instance, or "
-                    "an InlineTool"
-                )
-        # A key names either a library tool or an inline definition, not both.
-        # Keys are compared case-insensitively when an inline definition is
-        # involved. Two library keys that differ only by case are two tools.
+    for tool in tools:
+        if not isinstance(tool, Tool):
+            raise EvaluationsError(
+                "each entry in tools must be a Tool. Construct one for an "
+                "inline tool, or call evals.tools.get() for a library tool, "
+                f"got {type(tool).__name__}"
+            )
+        key = tool.key
+        _validate_tool_key(key)
+        if not callable(tool.implementation) and not isinstance(
+            tool.implementation, NativeTool
+        ):
+            raise EvaluationsError(
+                f"Tool {key!r} implementation must be callable or a "
+                f"NativeTool, got {type(tool.implementation).__name__}"
+            )
+        if not isinstance(tool.description, str):
+            raise EvaluationsError(
+                f"Tool {key!r} description must be a string, got "
+                f"{type(tool.description).__name__}"
+            )
+        if tool.source == "inline":
+            _validate_inline_tool(tool)
+        # One key names one tool. Keys are compared case-insensitively.
         identity = key.strip().lower()
         collision = keys_by_identity.get(identity)
-        if collision is not None and (is_inline or identity in inline_identities):
+        if collision is not None:
             if collision == key:
-                raise EvaluationsError(
-                    f"Tool {key!r} is defined more than once in tools. An "
-                    "inline definition and a library tool cannot share a key."
-                )
+                raise EvaluationsError(f"Tool {key!r} appears more than once in tools.")
             raise EvaluationsError(
-                f"Tool {key!r} collides with {collision!r}: both name the same "
-                "tool in one run, and one of them is an inline definition. A "
-                "tool key resolves either to a LaunchDarkly AI library tool or "
-                "to an inline definition, never both."
+                f"Tool {key!r} collides with {collision!r}. Two tools in one "
+                "run must not have keys that differ only by case."
             )
         keys_by_identity[identity] = key
-        if is_inline:
-            inline_identities.add(identity)
 
 
-def _tool_handlers(tools: Mapping[str, ToolEntry]) -> dict[str, ToolImplementation]:
-    """Return the tools map as ``{key: executable}``, unwrapping any ``InlineTool``."""
-    return {
-        key: entry.implementation if isinstance(entry, InlineTool) else entry
-        for key, entry in tools.items()
-    }
+def _tool_handlers(tools: Sequence[Tool]) -> dict[str, ToolImplementation]:
+    """Return the tools list as ``{key: executable}``."""
+    return {tool.key: tool.implementation for tool in tools}
 
 
 class ConcurrencyController:
@@ -312,50 +296,41 @@ class EvaluationsRunner:
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
 
-    def _resolve_tools(
+    def _resolve_library_tool(
         self,
         project_key: str,
-        tools: Mapping[str, ToolEntry],
-    ) -> dict[str, ResolvedTool]:
-        """Resolve each tool in the map to a ``ResolvedTool``.
+        key: str,
+        implementation: ToolImplementation,
+    ) -> Tool:
+        """Fetch a tool from the library and pin the version it returns.
 
-        Fetches a library entry from ``ai-tools`` and pins the version it
-        returns. Takes an inline entry's definition as given, with no request.
+        Raises ``EvaluationsError`` when the tool does not exist.
         """
-        resolved: dict[str, ResolvedTool] = {}
-        for key, entry in tools.items():
-            if isinstance(entry, InlineTool):
-                resolved[key] = ResolvedTool(
-                    key=key,
-                    description=entry.description,
-                    schema=dict(entry.schema),
-                    source="inline",
-                )
-                continue
-            path = f"projects/{_segment(project_key)}/ai-tools/{_segment(key)}"
-            try:
-                raw = _mapping(self._api.get(path), description=f"tool {key!r}")
-            except LDApiError as error:
-                if error.status == 404:
-                    raise EvaluationsError(
-                        f"LaunchDarkly AI tool {key!r} was not found in project {project_key!r}"
-                    ) from error
-                raise
-            version = raw.get("version")
-            if not isinstance(version, int):
+        path = f"projects/{_segment(project_key)}/ai-tools/{_segment(key)}"
+        try:
+            raw = _mapping(self._api.get(path), description=f"tool {key!r}")
+        except LDApiError as error:
+            if error.status == 404:
                 raise EvaluationsError(
-                    f"LaunchDarkly AI tool {key!r} has no integer version"
-                )
-            schema = raw.get("schema")
-            if not isinstance(schema, Mapping):
-                schema = {}
-            resolved[key] = ResolvedTool(
-                key=key,
-                version=version,
-                description=str(raw.get("description") or ""),
-                schema=dict(schema),
+                    f"LaunchDarkly AI tool {key!r} was not found in project "
+                    f"{project_key!r}"
+                ) from error
+            raise
+        version = raw.get("version")
+        if not isinstance(version, int):
+            raise EvaluationsError(
+                f"LaunchDarkly AI tool {key!r} has no integer version"
             )
-        return resolved
+        schema = raw.get("schema")
+        if not isinstance(schema, Mapping):
+            schema = {}
+        return Tool._library(
+            key,
+            implementation,
+            version=version,
+            schema=dict(schema),
+            description=str(raw.get("description") or ""),
+        )
 
     async def _resolve_judges(
         self,
@@ -531,7 +506,7 @@ class EvaluationsRunner:
         project_key: str,
         key: str,
         generation: GenerationConfig,
-        tools: Mapping[str, ResolvedTool],
+        tools: Sequence[Tool],
         criteria: list[Criterion] | None = None,
     ) -> EvaluationRef:
         body: dict[str, Any] = {
@@ -552,7 +527,7 @@ class EvaluationsRunner:
         if "prompt_snippets" in generation:
             body["promptSnippets"] = generation["prompt_snippets"]
         if tools:
-            body["tools"] = [tool.to_create_wire() for tool in tools.values()]
+            body["tools"] = [tool.to_create_wire() for tool in tools]
         if criteria:
             body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
 
@@ -602,18 +577,18 @@ class EvaluationsRunner:
     def _build_handler_config(
         self,
         generation: GenerationConfig,
-        tools: Mapping[str, ResolvedTool],
+        tools: Sequence[Tool],
     ) -> dict[str, Any]:
         parameters = generation.get("parameters")
         config: dict[str, Any] = {
             "provider": {"name": generation["provider"]},
             "model": {"name": generation["model"], "parameters": parameters},
             "tools": {
-                key: {
+                tool.key: {
                     "description": tool.description,
                     "parameters": tool.schema,
                 }
-                for key, tool in tools.items()
+                for tool in tools
             },
         }
         snippet_variables = {"snippet": generation.get("prompt_snippets", {})}

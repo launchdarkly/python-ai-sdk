@@ -54,14 +54,13 @@ Never raises. Returns `{"enabled": bool, "config": dict | None, "meta": dict | N
 
 ## Evaluations from code
 
-`init_evaluations`, the criterion types, `InlineTool`, and the evaluations result types are all re-exported:
+`init_evaluations`, the criterion types, `Tool`, and the evaluations result types are all re-exported:
 
 ```python
 from launchdarkly_ai_python import Judge, Scorer, init_evaluations
 
-evals = init_evaluations()
+evals = init_evaluations(project_key="my-project")
 result = await evals.run(
-    project_key="my-project",
     key="unique-evaluation-key",
     dataset="golden-dataset",
     handler=my_handler,
@@ -73,7 +72,7 @@ result = await evals.run(
 )
 ```
 
-`LD_API_TOKEN` is required. `LD_SDK_KEY` is also required, because the harness needs an initialized client to send your results to LaunchDarkly. Supply your own client with `init_client(client=...)` if you prefer. The SDK reports a score for each row and criterion, and LaunchDarkly decides whether each one passes. A judge served by a different provider than `generation` needs a handler for it in `judge_handlers`. Pass an `InlineTool` in `tools` to define a tool in code rather than creating it in LaunchDarkly first. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
+`LD_API_TOKEN` is required. `LD_SDK_KEY` is also required, because the harness needs an initialized client to send your results to LaunchDarkly. Supply your own client with `init_client(client=...)` if you prefer. The SDK reports a score for each row and criterion, and LaunchDarkly decides whether each one passes. A judge served by a different provider than `generation` needs a handler for it in `judge_handlers`. `tools` is a list of `Tool`. Construct one to define a tool in code, or call `evals.tools.get()` for a tool that already exists in LaunchDarkly. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
 
 ---
 

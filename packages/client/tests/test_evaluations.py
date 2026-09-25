@@ -67,34 +67,37 @@ def failing_transport(
 
 
 def test_init_resolves_credentials_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token-from-env")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key-from-env")
 
     evals = init_evaluations(transport=RecordingTransport())
 
-    assert evals.api.api_token == "api-token-from-env"
+    assert evals.api.api_key == "api-token-from-env"
     assert evals.sdk_key == "sdk-key-from-env"
     assert evals.api.base_uri == DEFAULT_BASE_URI
     assert evals.ui_base_uri == "https://app.launchdarkly.com"
 
 
 def test_init_prefers_explicit_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token-from-env")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key-from-env")
 
     evals = init_evaluations(
-        api_token="explicit-token",
+        api_key="explicit-token",
         sdk_key="explicit-sdk-key",
         transport=RecordingTransport(),
     )
 
-    assert evals.api.api_token == "explicit-token"
+    assert evals.api.api_key == "explicit-token"
     assert evals.sdk_key == "explicit-sdk-key"
 
 
 def test_missing_api_token_raises_before_network_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.delenv("LD_API_TOKEN", raising=False)
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
 
@@ -105,6 +108,7 @@ def test_missing_api_token_raises_before_network_io(
 def test_blank_api_token_env_is_treated_as_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "   ")
 
     with pytest.raises(EvaluationsError):
@@ -114,6 +118,7 @@ def test_blank_api_token_env_is_treated_as_unset(
 def test_missing_sdk_key_raises_before_network_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
 
@@ -124,6 +129,7 @@ def test_missing_sdk_key_raises_before_network_io(
 def test_blank_sdk_key_env_is_treated_as_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "   ")
 
@@ -134,6 +140,7 @@ def test_blank_sdk_key_env_is_treated_as_unset(
 def test_missing_sdk_key_is_allowed_with_a_byoc_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
     byoc_client = MagicMock()
@@ -149,6 +156,7 @@ def test_missing_sdk_key_is_allowed_with_a_byoc_client(
 def test_missing_sdk_key_raises_when_the_byoc_client_cannot_emit_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
     lifecycle_module._set_client_for_testing(object())
@@ -160,6 +168,7 @@ def test_missing_sdk_key_raises_when_the_byoc_client_cannot_emit_events(
 def test_base_uri_override_isolated_from_sdk_delivery_uri(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
     monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com/")
@@ -177,6 +186,7 @@ def test_base_uri_override_isolated_from_sdk_delivery_uri(
 def test_ui_base_uri_precedence_and_api_base_isolation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
     monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
@@ -194,7 +204,7 @@ def test_ui_base_uri_precedence_and_api_base_isolation(
 
 def test_requests_carry_token_auth_and_json_body() -> None:
     transport = RecordingTransport([HttpResponse(status=201, body='{"key": "run-1"}')])
-    client = LDApiClient(api_token="api-token", transport=transport)
+    client = LDApiClient(api_key="api-token", transport=transport)
 
     result = client.post("projects/proj/evaluations", body={"key": "support-qa"})
 
@@ -210,7 +220,7 @@ def test_requests_carry_token_auth_and_json_body() -> None:
 def test_get_encodes_query_params_and_omits_none() -> None:
     transport = RecordingTransport([HttpResponse(status=200, body='{"items": []}')])
     client = LDApiClient(
-        api_token="api-token", base_uri="https://ld.example.com", transport=transport
+        api_key="api-token", base_uri="https://ld.example.com", transport=transport
     )
 
     client.get("projects/proj/datasets/golden", params={"limit": 50, "offset": None})
@@ -236,7 +246,7 @@ def test_rate_limit_retries_and_honors_retry_after() -> None:
     )
     sleeps: list[float] = []
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=transport,
         max_retries=1,
         sleep=sleeps.append,
@@ -254,7 +264,7 @@ def test_server_error_retries_get_but_not_post() -> None:
         [server_error, HttpResponse(200, '{"ok": true}')]
     )
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=get_transport,
         max_retries=2,
         sleep=lambda _: None,
@@ -266,7 +276,7 @@ def test_server_error_retries_get_but_not_post() -> None:
 
     post_transport = RecordingTransport([server_error])
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=post_transport,
         max_retries=2,
         sleep=lambda _: None,
@@ -294,7 +304,7 @@ def test_transport_failure_is_not_replayed_for_post() -> None:
         raise TimeoutError("timed out")
 
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=timing_out_transport,
         max_retries=2,
         sleep=lambda _: None,
@@ -315,7 +325,7 @@ def test_rate_limited_post_is_retried() -> None:
         ]
     )
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=transport,
         max_retries=1,
         sleep=lambda _: None,
@@ -332,7 +342,7 @@ def test_forbidden_response_is_not_retried() -> None:
     transport = RecordingTransport(
         [HttpResponse(status=403, body='{"message": "forbidden"}')]
     )
-    client = LDApiClient(api_token="api-token", transport=transport, max_retries=3)
+    client = LDApiClient(api_key="api-token", transport=transport, max_retries=3)
 
     with pytest.raises(LDApiError) as excinfo:
         client.get("projects/proj/evaluations")
@@ -345,7 +355,7 @@ def test_error_response_raises_ld_api_error() -> None:
     transport = RecordingTransport(
         [HttpResponse(status=404, body='{"message": "nope"}')]
     )
-    client = LDApiClient(api_token="api-token", transport=transport)
+    client = LDApiClient(api_key="api-token", transport=transport)
 
     with pytest.raises(LDApiError) as excinfo:
         client.get("projects/proj/ai-tools/missing")
@@ -356,7 +366,7 @@ def test_error_response_raises_ld_api_error() -> None:
 
 def test_empty_response_body_is_none() -> None:
     transport = RecordingTransport([HttpResponse(status=204, body="")])
-    client = LDApiClient(api_token="api-token", transport=transport)
+    client = LDApiClient(api_key="api-token", transport=transport)
 
     assert client.post("projects/proj/evaluations/support-qa/runs") is None
 
@@ -393,3 +403,32 @@ def test_run_summary_and_result() -> None:
     assert RunSummary.from_wire(None) == RunSummary()
     assert result.passed is False
     assert result.run_id == "run-1"
+
+
+def test_project_key_resolves_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj-from-env")
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
+
+    evals = init_evaluations(transport=RecordingTransport())
+
+    assert evals.project_key == "proj-from-env"
+
+
+def test_explicit_project_key_wins_over_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj-from-env")
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
+
+    evals = init_evaluations(project_key="explicit", transport=RecordingTransport())
+
+    assert evals.project_key == "explicit"
+
+
+def test_missing_project_key_raises_before_network_io(monkeypatch) -> None:
+    monkeypatch.delenv("LD_PROJECT_KEY", raising=False)
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
+
+    with pytest.raises(EvaluationsError, match="LD_PROJECT_KEY"):
+        init_evaluations(transport=failing_transport)

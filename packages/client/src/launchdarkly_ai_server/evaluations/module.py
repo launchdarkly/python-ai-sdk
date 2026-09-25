@@ -6,10 +6,11 @@ import logging
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Sequence
 from typing import Any
 
 from ..lifecycle import get_client, init_client
+from ..types import NativeTool
 from .api import (
     DEFAULT_BASE_URI,
     EvaluationsError,
@@ -21,13 +22,14 @@ from .criteria import Criterion, Judge
 from .runner import (
     EvalHandler,
     EvaluationsRunner,
-    ToolEntry,
+    ToolImplementation,
     _provides_for,
     _segment,
     _tool_handlers,
+    _validate_tool_key,
     _validate_tools,
 )
-from .types import EvalRunResult, GenerationConfig, RunSummary
+from .types import EvalRunResult, GenerationConfig, RunSummary, Tool
 
 logger = logging.getLogger(__name__)
 
@@ -65,23 +67,60 @@ def _is_terminal_summary(summary: RunSummary) -> bool:
     )
 
 
+class ToolsClient:
+    """Reads tools from the LaunchDarkly tool library."""
+
+    def __init__(self, runner: EvaluationsRunner, project_key: str) -> None:
+        self._runner = runner
+        self._project_key = project_key
+
+    def get(self, key: str, *, implementation: ToolImplementation) -> Tool:
+        """Return the library tool ``key``, paired with ``implementation``.
+
+        Reads the tool now and pins the version it returns. Raises
+        ``EvaluationsError`` when the tool does not exist in the project.
+        """
+        _validate_tool_key(key)
+        if not callable(implementation) and not isinstance(implementation, NativeTool):
+            raise EvaluationsError(
+                f"Tool {key!r} implementation must be callable or a NativeTool, "
+                f"got {type(implementation).__name__}"
+            )
+        return self._runner._resolve_library_tool(
+            self._project_key, key, implementation
+        )
+
+
 class EvaluationsModule:
     """Entry point for running LaunchDarkly evaluations from customer code."""
 
     def __init__(
         self,
         api_client: LDApiClient,
+        project_key: str,
         sdk_key: str | None,
         ui_base_uri: str = DEFAULT_UI_BASE_URI,
     ) -> None:
         self._api = api_client
+        self._project_key = project_key
         self._sdk_key = sdk_key
         self._ui_base_uri = ui_base_uri.rstrip("/")
         self._runner = EvaluationsRunner(api_client)
+        self._tools = ToolsClient(self._runner, self._project_key)
 
     @property
     def api(self) -> LDApiClient:
         return self._api
+
+    @property
+    def project_key(self) -> str:
+        """Project that holds this module's evaluations, tools, and datasets."""
+        return self._project_key
+
+    @property
+    def tools(self) -> ToolsClient:
+        """Reader for tools in the LaunchDarkly tool library."""
+        return self._tools
 
     @property
     def sdk_key(self) -> str | None:
@@ -96,12 +135,11 @@ class EvaluationsModule:
     async def run(
         self,
         *,
-        project_key: str,
         key: str,
         dataset: str,
         handler: EvalHandler,
         generation: GenerationConfig,
-        tools: Mapping[str, ToolEntry] | None = None,
+        tools: Sequence[Tool] | None = None,
         criteria: list[Criterion] | None = None,
         judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
@@ -117,15 +155,12 @@ class EvaluationsModule:
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
 
-        Each entry in ``tools`` is either a tool that exists in the
-        LaunchDarkly AI library — a bare callable or a
-        :class:`~launchdarkly_ai_server.NativeTool`, resolved by key and pinned
-        to its current version — or an :class:`InlineTool` carrying its own
-        ``schema`` and ``description``, which needs no LaunchDarkly tool to
-        exist and reads nothing from the tool API. A map may mix the two. An
-        inline definition is checked before any network I/O, so a bad one fails
-        with zero requests issued; handlers receive the same
-        ``{key: executable}`` map either way.
+        ``tools`` is a list of :class:`Tool`. Construct one to define a tool
+        in code. Call ``evals.tools.get(key, implementation=...)`` to use a
+        tool from the LaunchDarkly tool library, which reads the tool and pins
+        its version at that point. One list may hold both kinds. ``run`` reads
+        no tool from the API, and it checks the list before any network I/O.
+        Handlers receive a ``{key: executable}`` map either way.
 
         A :class:`Judge` is an independent AI Config and may be served by a
         different provider or mode than ``generation``. ``handler`` runs a judge
@@ -144,7 +179,6 @@ class EvaluationsModule:
         if poll_timeout_seconds is None:
             poll_timeout_seconds = SUMMARY_POLL_TIMEOUT_SECONDS
         self._validate_run_args(
-            project_key=project_key,
             key=key,
             dataset=dataset,
             handler=handler,
@@ -153,10 +187,8 @@ class EvaluationsModule:
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
-        # Validate the caller's mapping before copying it, so a mapping that
-        # yields a key twice is not collapsed into its last entry.
-        _validate_tools(tools or {})
-        run_tools = dict(tools or {})
+        run_tools = list(tools or [])
+        _validate_tools(run_tools)
         run_tool_handlers = _tool_handlers(run_tools)
         run_criteria = list(criteria or [])
         run_judge_handlers = list(judge_handlers or [])
@@ -169,34 +201,31 @@ class EvaluationsModule:
 
         # The management API client is synchronous; running it in a worker thread
         # keeps the caller's event loop free.
-        # Tool/judge verification is deliberately first: a typo must not create records.
-        resolved_tools = await asyncio.to_thread(
-            self._runner._resolve_tools, project_key, run_tools
-        )
+        # Judge verification is first: a typo must not create records.
         resolved_judges = await self._runner._resolve_judges(
-            project_key, ld_judges, handler, run_judge_handlers
+            self._project_key, ld_judges, handler, run_judge_handlers
         )
         dataset_ref = await asyncio.to_thread(
-            self._runner._fetch_dataset, project_key, dataset
+            self._runner._fetch_dataset, self._project_key, dataset
         )
         rows = await asyncio.to_thread(
-            self._runner._get_dataset_rows, project_key, dataset
+            self._runner._get_dataset_rows, self._project_key, dataset
         )
         evaluation = await asyncio.to_thread(
             self._runner._create_evaluation,
-            project_key,
+            self._project_key,
             key,
             generation,
-            resolved_tools,
+            run_tools,
             run_criteria,
         )
         evaluation_run = await asyncio.to_thread(
             self._runner._create_evaluation_run,
-            project_key,
+            self._project_key,
             evaluation.id,
             dataset_ref.id,
         )
-        config = self._runner._build_handler_config(generation, resolved_tools)
+        config = self._runner._build_handler_config(generation, run_tools)
         results = await self._runner._run_rows(
             rows,
             handler,
@@ -207,7 +236,7 @@ class EvaluationsModule:
         try:
             self._runner._emit_generation_events(
                 client,
-                project_key=project_key,
+                project_key=self._project_key,
                 evaluation=evaluation,
                 evaluation_run=evaluation_run,
                 dataset=dataset_ref,
@@ -223,7 +252,7 @@ class EvaluationsModule:
                 )
                 self._runner._emit_evaluation_events(
                     client,
-                    project_key=project_key,
+                    project_key=self._project_key,
                     evaluation=evaluation,
                     evaluation_run=evaluation_run,
                     dataset=dataset_ref,
@@ -236,14 +265,13 @@ class EvaluationsModule:
             if inspect.isawaitable(flush_result):
                 await flush_result
         summary = await self._poll_summary_until_terminal(
-            project_key,
             evaluation.id,
             evaluation_run.id,
             poll_interval_seconds,
             poll_timeout_seconds,
         )
         url = (
-            f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
+            f"{self._ui_base_uri}/projects/{_segment(self._project_key)}/ai/evaluations/"
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
@@ -264,7 +292,6 @@ class EvaluationsModule:
 
     async def _poll_summary_until_terminal(
         self,
-        project_key: str,
         evaluation_id: str,
         run_id: str,
         poll_interval_seconds: float,
@@ -274,7 +301,7 @@ class EvaluationsModule:
         last_summary = None
         while True:
             last_summary = await asyncio.to_thread(
-                self._runner._get_summary, project_key, evaluation_id, run_id
+                self._runner._get_summary, self._project_key, evaluation_id, run_id
             )
             if _is_terminal_summary(last_summary):
                 return last_summary
@@ -367,7 +394,6 @@ class EvaluationsModule:
     @staticmethod
     def _validate_run_args(
         *,
-        project_key: str,
         key: str,
         dataset: str,
         handler: EvalHandler,
@@ -377,7 +403,6 @@ class EvaluationsModule:
         poll_timeout_seconds: float,
     ) -> None:
         for name, value in (
-            ("project_key", project_key),
             ("key", key),
             ("dataset", dataset),
         ):
@@ -409,18 +434,30 @@ class EvaluationsModule:
 
 
 def init_evaluations(
-    api_token: str | None = None,
+    project_key: str | None = None,
+    api_key: str | None = None,
     sdk_key: str | None = None,
     base_uri: str | None = None,
     ui_base_uri: str | None = None,
     transport: Transport = urllib_transport,
 ) -> EvaluationsModule:
-    """Resolve credentials and construct the evaluations module."""
-    token = api_token or _env("LD_API_TOKEN")
+    """Resolve credentials and construct the evaluations module.
+
+    ``project_key`` names the project that holds the evaluations, the tools,
+    and the datasets this module uses.
+    """
+    resolved_project_key = (project_key or "").strip() or _env("LD_PROJECT_KEY")
+    if not resolved_project_key:
+        raise EvaluationsError(
+            "No LaunchDarkly project key provided. Set the LD_PROJECT_KEY "
+            "environment variable or pass project_key to init_evaluations()."
+        )
+
+    token = api_key or _env("LD_API_TOKEN")
     if not token:
         raise EvaluationsError(
             "No LaunchDarkly API access token provided. Set the LD_API_TOKEN "
-            "environment variable or pass api_token to init_evaluations()."
+            "environment variable or pass api_key to init_evaluations()."
         )
 
     resolved_sdk_key = sdk_key or _env("LD_SDK_KEY")
@@ -437,12 +474,13 @@ def init_evaluations(
             )
 
     api_client = LDApiClient(
-        api_token=token,
+        api_key=token,
         base_uri=base_uri or _env("LD_API_BASE_URI") or DEFAULT_BASE_URI,
         transport=transport,
     )
     return EvaluationsModule(
         api_client=api_client,
+        project_key=resolved_project_key,
         sdk_key=resolved_sdk_key,
         ui_base_uri=ui_base_uri or _env("LD_UI_BASE_URI") or DEFAULT_UI_BASE_URI,
     )

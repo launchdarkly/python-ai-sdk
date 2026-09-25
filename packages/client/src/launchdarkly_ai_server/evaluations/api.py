@@ -84,7 +84,7 @@ class LDApiClient:
 
     def __init__(
         self,
-        api_token: str,
+        api_key: str,
         base_uri: str = DEFAULT_BASE_URI,
         transport: Transport = urllib_transport,
         timeout: float = 30.0,
@@ -92,7 +92,7 @@ class LDApiClient:
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
     ) -> None:
-        self.api_token = api_token
+        self.api_key = api_key
         self.base_uri = base_uri.rstrip("/")
         self._transport = transport
         self._timeout = timeout
@@ -135,7 +135,7 @@ class LDApiClient:
         params: dict[str, Any] | None = None,
     ) -> Any:
         headers = {
-            "Authorization": self.api_token,
+            "Authorization": self.api_key,
             "Accept": "application/json",
             "User-Agent": "launchdarkly-ai-evaluations-python",
         }
