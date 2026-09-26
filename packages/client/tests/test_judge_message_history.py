@@ -300,6 +300,44 @@ async def test_a_native_tool_is_not_recorded_online_either(
 
 
 @pytest.mark.asyncio
+async def test_a_native_tool_declared_in_the_config_is_not_listed_as_available(
+    mock_ld_client: Any,
+) -> None:
+    """A NativeTool's calls can never be recorded locally, so listing it under
+    "Tools available" would read as "the model had this and did not use it"
+    even when the provider ran it -- the same false negative a config with no
+    tools at all avoids by rendering no trajectory block.
+    """
+    from launchdarkly_ai_server import NativeTool
+
+    async def handler(
+        config: Any,
+        user_input: Any,
+        tool_handlers: Any,
+        variables: Any,
+        history: Any = None,
+    ) -> dict[str, Any]:
+        tool_handlers["web_search"]({"q": "x"})
+        return {"output": "done", "usage": {}}
+
+    result = await execute_and_track(
+        config_key="c",
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            "tools": {"web_search": {"description": "", "parameters": {}}},
+        },
+        meta={"variationKey": "v", "version": 1},
+        user_context=CONTEXT,
+        handler=handler,  # type: ignore[arg-type]
+        user_input="q",
+        tool_handlers={"web_search": NativeTool("WebSearch")},
+    )
+
+    assert result["trajectory"] == ""
+
+
+@pytest.mark.asyncio
 async def test_tool_tracking_still_fires_under_the_recorder(
     mock_ld_client: Any,
 ) -> None:
