@@ -492,6 +492,7 @@ async def _build_graph(
         try:
             response = ""
             usage: dict[str, Any] = {"input": 0, "output": 0, "total": 0}
+            trajectory = ""
             track_data: TrackData = {
                 "runId": str(uuid.uuid4()),
                 "configKey": node.key,
@@ -530,6 +531,7 @@ async def _build_graph(
                     response = event.get("response", "")
                     usage = event.get("usage") or usage
                     track_data = event.get("track_data") or track_data
+                    trajectory = event.get("trajectory") or trajectory
 
             judge_results = await run_judges(
                 config=node.config,
@@ -541,6 +543,7 @@ async def _build_graph(
                 base_track_data=track_data,
                 tool_handlers=tool_handlers,
                 graph_key=key,
+                trajectory=trajectory,
             )
 
             if from_node:
@@ -626,6 +629,7 @@ async def _build_graph(
         try:
             response = ""
             usage: dict[str, Any] = {"input": 0, "output": 0, "total": 0}
+            trajectory = ""
             track_data: TrackData = {
                 "runId": str(uuid.uuid4()),
                 "configKey": node.key,
@@ -666,6 +670,7 @@ async def _build_graph(
                     response = event.get("response", "")
                     usage = event.get("usage") or usage
                     track_data = event.get("track_data") or track_data
+                    trajectory = event.get("trajectory") or trajectory
 
             # Judge against the node's original config, not the routing-augmented one.
             judge_results = await run_judges(
@@ -678,6 +683,7 @@ async def _build_graph(
                 base_track_data=track_data,
                 tool_handlers=tool_handlers,
                 graph_key=key,
+                trajectory=trajectory,
             )
 
             chosen_key = chosen()
@@ -907,8 +913,8 @@ class GraphInstance:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
-        with tracer.start_as_current_span("ld.ai.graph") as span:
-            span.set_attribute("ld.ai.graph.key", self._key)
+        with tracer.start_as_current_span("launchdarkly.graph") as span:
+            span.set_attribute("launchdarkly.graph.key", self._key)
 
             start_time = time.monotonic()
             path: list[str] = []
@@ -1117,8 +1123,8 @@ class GraphInstance:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
-        span = tracer.start_span("ld.ai.graph", context=caller_context)
-        span.set_attribute("ld.ai.graph.key", self._key)
+        span = tracer.start_span("launchdarkly.graph", context=caller_context)
+        span.set_attribute("launchdarkly.graph.key", self._key)
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()

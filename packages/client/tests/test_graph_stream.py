@@ -450,6 +450,76 @@ class TestGraphStream:
             )
         assert "judgeResults" not in events[-1]
 
+    async def test_per_node_judge_receives_the_trajectory(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """The non-streaming run_node already passes its trajectory to
+        run_judges; stream_node must do the same instead of discarding the
+        one execute_and_stream renders.
+        """
+        root_config = _node_variation("I am root")
+        root_config["tools"] = {
+            "lookup": {
+                "name": "lookup",
+                "type": "function",
+                "description": "",
+                "parameters": {},
+            }
+        }
+
+        async def variation_side_effect(key: str, ctx: dict, default: Any) -> Any:
+            if key == "graph-key":
+                return {
+                    "root": "root-node",
+                    "edges": {"root-node": [{"key": "leaf-node"}]},
+                }
+            if key == "root-node":
+                return root_config
+            return _node_variation("I am leaf")
+
+        mock_ld_client.variation = AsyncMock(side_effect=variation_side_effect)
+
+        _usage = {"input_tokens": 1, "output_tokens": 1}
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok", "usage": _usage}
+
+        async def stream_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> AsyncGenerator:  # type: ignore[override]
+            await (tool_handlers or {})["lookup"]({"id": "A1"})
+            yield {"type": "chunk", "text": "ok"}
+            yield {"type": "done", "output": "ok", "usage": _usage}
+
+        h = ProviderHandler(
+            fn=fn, provides_for=("TestProvider", "messages"), stream_fn=stream_fn
+        )
+        with patch(
+            "launchdarkly_ai_server.judges.run_judges",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as run_judges:
+            await _collect(
+                graph(
+                    "graph-key",
+                    handlers=[h],
+                    tool_handlers={"lookup": lambda args: "shipped"},
+                ).stream("hi", CONTEXT)
+            )
+
+        root_call = next(
+            (
+                c
+                for c in run_judges.await_args_list
+                if (c.kwargs.get("config") or {}).get("instructions") == "I am root"
+            ),
+            None,
+        )
+        assert root_call is not None
+        assert "lookup" in root_call.kwargs["trajectory"]
+
 
 # ---------------------------------------------------------------------------
 # Multi-edge routing
@@ -539,6 +609,81 @@ class TestGraphStreamMultiEdge:
         assert judged["instructions"] == "I am root"
         assert not any(k.startswith("__handoff_") for k in (judged.get("tools") or {}))
 
+    async def test_routed_judge_receives_the_trajectory(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """stream_route's multi-edge branch calls execute_and_stream directly
+        rather than through stream_node, so it must thread the trajectory
+        through to run_judges itself.
+        """
+        root_config = _node_variation("I am root")
+        root_config["tools"] = {
+            "lookup": {
+                "name": "lookup",
+                "type": "function",
+                "description": "",
+                "parameters": {},
+            }
+        }
+
+        async def variation_side_effect(key: str, ctx: dict, default: Any) -> Any:
+            if key == "graph-key":
+                return {
+                    "root": "root-node",
+                    "edges": {
+                        "root-node": [{"key": "agent-a"}, {"key": "agent-b"}],
+                    },
+                }
+            if key == "root-node":
+                return root_config
+            return _node_variation("Be helpful.")
+
+        mock_ld_client.variation = AsyncMock(side_effect=variation_side_effect)
+
+        _usage = {"input_tokens": 1, "output_tokens": 1}
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok", "usage": _usage}
+
+        async def stream_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> AsyncGenerator:  # type: ignore[override]
+            await (tool_handlers or {})["lookup"]({"id": "A1"})
+            handoff = (tool_handlers or {}).get("__handoff_agent_b")
+            if handoff:
+                handoff()
+            yield {"type": "chunk", "text": "ok"}
+            yield {"type": "done", "output": "ok", "usage": _usage}
+
+        h = ProviderHandler(
+            fn=fn, provides_for=("TestProvider", "messages"), stream_fn=stream_fn
+        )
+        with patch(
+            "launchdarkly_ai_server.judges.run_judges",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as run_judges:
+            await _collect(
+                graph(
+                    "graph-key",
+                    handlers=[h],
+                    tool_handlers={"lookup": lambda args: "shipped"},
+                ).stream("hi", CONTEXT)
+            )
+
+        root_call = next(
+            (
+                c
+                for c in run_judges.await_args_list
+                if (c.kwargs.get("config") or {}).get("instructions") == "I am root"
+            ),
+            None,
+        )
+        assert root_call is not None
+        assert "lookup" in root_call.kwargs["trajectory"]
+
     async def test_handoff_tools_and_instructions_match_invoke(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -592,7 +737,7 @@ class TestGraphStreamOtel:
             )
         await _collect(gen)
 
-        graph_spans = [s for s in _finished() if s.name == "ld.ai.graph"]
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
         assert len(graph_spans) >= 1
         assert graph_spans[0].attributes
         assert (
@@ -609,7 +754,7 @@ class TestGraphStreamOtel:
             )
         )
         spans = _finished()
-        graph_spans = [s for s in spans if s.name == "ld.ai.graph"]
+        graph_spans = [s for s in spans if s.name == "launchdarkly.graph"]
         handler_spans = [s for s in spans if s.name.startswith("handler.")]
         assert len(graph_spans) >= 1
         assert len(handler_spans) >= 1
@@ -637,7 +782,7 @@ class TestGraphStreamOtel:
         await graph("graph-key", handlers=[h]).invoke("hi", CONTEXT)
 
         spans = _finished()
-        graph_spans = [s for s in spans if s.name == "ld.ai.graph"]
+        graph_spans = [s for s in spans if s.name == "launchdarkly.graph"]
         handler_spans = [s for s in spans if s.name.startswith("handler.")]
         assert len(graph_spans) >= 1
         assert len(handler_spans) >= 1
@@ -656,7 +801,7 @@ class TestGraphStreamOtel:
         caller.end()
         await _collect(gen)
 
-        graph_spans = [s for s in _finished() if s.name == "ld.ai.graph"]
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
         assert len(graph_spans) >= 1
         assert graph_spans[0].parent is not None
         assert graph_spans[0].parent.span_id == caller.get_span_context().span_id
@@ -670,7 +815,7 @@ class TestGraphStreamOtel:
                 break
         await gen.aclose()
 
-        graph_spans = [s for s in _finished() if s.name == "ld.ai.graph"]
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
         assert len(graph_spans) >= 1
         attrs = graph_spans[0].attributes or {}
         assert attrs.get("launchdarkly.stream.abandoned") is True
@@ -718,7 +863,7 @@ class TestGraphStreamOtel:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        graph_spans = [s for s in _finished() if s.name == "ld.ai.graph"]
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
         assert len(graph_spans) == 1
         attrs = graph_spans[0].attributes or {}
         assert attrs.get("launchdarkly.run.cancelled") is True
@@ -756,7 +901,7 @@ class TestGraphStreamOtel:
             )
 
         spans = _finished()
-        graph_spans = [s for s in spans if s.name == "ld.ai.graph"]
+        graph_spans = [s for s in spans if s.name == "launchdarkly.graph"]
         judge_spans = [s for s in spans if s.name == "graph.judge"]
         assert len(graph_spans) >= 1
         assert len(judge_spans) >= 1
