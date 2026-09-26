@@ -6,7 +6,7 @@ Model text goes to stdout; node boundaries go to stderr so stdout stays a clean 
 Like ``examples/streaming.py``, the generator is built inside ``conversation_id`` and iterated
 *outside* it. That is the shape a server produces when it hands a stream to a transport, and it
 is what exercises call-time binding: an async generator body does not run until the first
-``__anext__``, so both the conversation id and the ``ld.ai.graph`` span's OTel parent have to be
+``__anext__``, so both the conversation id and the ``launchdarkly.graph`` span's OTel parent have to be
 captured when ``stream()`` is called, not when iteration starts.
 
 Writes no JSON output file, same as the single-config streaming example.
