@@ -416,6 +416,46 @@ async def test_a_registry_tool_the_config_omits_is_not_described(
 
 
 @pytest.mark.asyncio
+async def test_a_config_tool_with_no_implementation_is_still_available(
+    mock_ld_client: Any,
+) -> None:
+    """The config's own tool catalog determines what the model was offered,
+    independent of whether a local implementation was registered for it -- a
+    handler package can build the provider's tool list straight from the
+    config. Omitting an unimplemented tool from "Tools available" would let a
+    judge read an incomplete catalog instead of one the agent chose not to use.
+    """
+
+    async def handler(
+        config: Any,
+        user_input: Any,
+        tool_handlers: Any,
+        variables: Any,
+        history: Any = None,
+    ) -> dict[str, Any]:
+        return {"output": "I do not know.", "usage": {}}
+
+    result = await execute_and_track(
+        config_key="c",
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            "tools": {"lookup_order": {"description": "", "parameters": {}}},
+        },
+        meta={"variationKey": "v", "version": 1},
+        user_context=CONTEXT,
+        handler=handler,  # type: ignore[arg-type]
+        user_input="q",
+        tool_handlers=None,
+    )
+
+    assert (
+        "Tools available: lookup_order\n"
+        "No tool calls were made while producing the response."
+    ) in result["trajectory"]
+
+
+@pytest.mark.asyncio
 async def test_a_handoff_tool_is_not_described_online(mock_ld_client: Any) -> None:
     """A per-node judge is scored against the node's original config, which
     lists no handoffs -- so a handoff must not read as tool use.

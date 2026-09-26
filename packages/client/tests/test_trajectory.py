@@ -28,7 +28,7 @@ def test_wrapped_sync_tool_stays_sync() -> None:
     assert not asyncio.iscoroutinefunction(wrapped["lookup"])
     assert wrapped["lookup"]({"id": "A1"}) == "order A1"
     assert recorder.invocations == [
-        ToolInvocation(name="lookup", arguments={"id": "A1"}, result="order A1")
+        ToolInvocation(name="lookup", arguments='{"id":"A1"}', result="order A1")
     ]
 
 
@@ -59,7 +59,7 @@ def test_wrapped_tool_reraises_and_records_the_failure() -> None:
         wrapped["refund"]({"id": "A1"})
 
     assert recorder.invocations == [
-        ToolInvocation(name="refund", arguments={"id": "A1"}, error="gateway timeout")
+        ToolInvocation(name="refund", arguments='{"id":"A1"}', error="gateway timeout")
     ]
 
 
@@ -128,7 +128,7 @@ def test_keyword_arguments_are_recorded() -> None:
     wrapped = recorder.wrap({"lookup": lookup})
     wrapped["lookup"](id="A1")
 
-    assert recorder.invocations[0].arguments == {"id": "A1"}
+    assert recorder.invocations[0].arguments == '{"id":"A1"}'
 
 
 def test_render_lists_available_tools_calls_arguments_and_results() -> None:
@@ -316,6 +316,24 @@ def test_only_tools_the_config_exposed_are_recorded_or_described() -> None:
     assert [i.name for i in recorder.invocations] == ["lookup"]
 
 
+def test_recorded_values_are_bounded_immediately_not_at_render_time() -> None:
+    """An evaluation holds many rows' recorded calls in memory until scoring.
+    Retaining each raw, unbounded return value until then multiplies memory by
+    row count and call count; the recorder must hold bounded text instead.
+    """
+
+    def fetch(args: dict[str, Any]) -> str:
+        return "x" * (MAX_RECORDED_VALUE_CHARS * 5)
+
+    recorder = TrajectoryRecorder()
+    wrapped = recorder.wrap({"fetch": fetch})
+    wrapped["fetch"]({})
+
+    stored = recorder.invocations[0].result
+    assert isinstance(stored, str)
+    assert len(stored) <= MAX_RECORDED_VALUE_CHARS
+
+
 def test_recorded_arguments_are_unaffected_by_the_tool_mutating_them() -> None:
     """A judge grades what the model sent, not what the tool did with it
     afterward -- the recorded call must describe the call boundary, not the
@@ -330,7 +348,24 @@ def test_recorded_arguments_are_unaffected_by_the_tool_mutating_them() -> None:
     wrapped = recorder.wrap({"lookup": pop_id})
 
     assert wrapped["lookup"]({"id": "A1"}) == "order A1"
-    assert recorder.invocations[0].arguments == {"id": "A1"}
+    assert recorder.invocations[0].arguments == '{"id":"A1"}'
+
+
+def test_recorded_result_is_unaffected_by_the_handler_mutating_it() -> None:
+    """A judge grades what the tool actually returned, not what the calling
+    handler did with that value afterward while preparing its own answer.
+    """
+
+    def lookup(args: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "pending"}
+
+    recorder = TrajectoryRecorder()
+    wrapped = recorder.wrap({"lookup": lookup})
+
+    result = wrapped["lookup"]({})
+    result["status"] = "shipped"  # the handler mutates the value it got back
+
+    assert recorder.invocations[0].result == '{"status":"pending"}'
 
 
 def test_no_exposed_set_means_every_callable_is_in_scope() -> None:

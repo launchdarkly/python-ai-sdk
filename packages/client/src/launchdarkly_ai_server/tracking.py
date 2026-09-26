@@ -108,14 +108,22 @@ def wrap_tool_handlers(
     return wrapped
 
 
-def _exposed_tool_keys(config: AiConfigRep) -> set[str]:
-    """The tool keys this config offered the model.
+def _exposed_tool_keys(config: AiConfigRep) -> list[str]:
+    """The tool keys this config offered the model, in declaration order.
 
     The map handed to a handler can be wider -- ``config()`` merges a
     ``Registry``'s tools in -- and only the offered set belongs in a trajectory.
+    Doubles as the "Tools available" list itself: a tool the config declares
+    but no implementation was registered for is still one the model could
+    call, so it belongs there even though the recorder can never observe it.
+    A routed graph node's config carries synthetic ``__handoff_`` tools too;
+    those are excluded here for the same reason ``TrajectoryRecorder.wrap``
+    excludes them from what it records.
     """
     tools = config.get("tools") if isinstance(config, dict) else None
-    return set(tools) if isinstance(tools, dict) else set()
+    if not isinstance(tools, dict):
+        return []
+    return [key for key in tools if not key.startswith(HANDOFF_TOOL_PREFIX)]
 
 
 async def execute_and_track(
@@ -163,9 +171,10 @@ async def execute_and_track(
     # the recorder still sees a NativeTool and skips it -- wrapping the tracked
     # map would record the callable stub instead and show a judge a tool call
     # with an empty result. One recorder per invocation; they run concurrently.
+    exposed_tool_keys = _exposed_tool_keys(config)
     recorder = TrajectoryRecorder()
     tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}, exposed=_exposed_tool_keys(config)),
+        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
         ld_ctx,
         track_data,
     )
@@ -210,7 +219,7 @@ async def execute_and_track(
         # a JudgeTask must stay picklable.
         "trajectory": render_trajectory(
             recorder.invocations,
-            observable_tools=recorder.observable_tools,
+            observable_tools=exposed_tool_keys,
             omitted=recorder.omitted,
         ),
     }
@@ -261,9 +270,10 @@ async def execute_and_stream(
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
 
+    exposed_tool_keys = _exposed_tool_keys(config)
     recorder = TrajectoryRecorder()
     tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}, exposed=_exposed_tool_keys(config)),
+        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
         ld_ctx,
         track_data,
     )
@@ -324,7 +334,7 @@ async def execute_and_stream(
         "track_data": track_data,
         "trajectory": render_trajectory(
             recorder.invocations,
-            observable_tools=recorder.observable_tools,
+            observable_tools=exposed_tool_keys,
             omitted=recorder.omitted,
         ),
     }

@@ -18,7 +18,6 @@ invocation or row, since both run concurrently against one shared tool map.
 from __future__ import annotations
 
 import asyncio
-import copy
 import inspect
 import json
 from collections.abc import Callable, Collection, Mapping
@@ -173,8 +172,12 @@ class TrajectoryRecorder:
         if len(self._invocations) >= self._limit:
             self._omitted += 1
             return None
+        # Rendered immediately, not stored by reference: a tool that mutates
+        # its argument mapping after reading it must not rewrite what a judge
+        # later sees, and an evaluation holding many rows' calls in memory
+        # until scoring must hold their bounded text, not each raw value.
         self._invocations.append(
-            ToolInvocation(name=name, arguments=_snapshot(arguments))
+            ToolInvocation(name=name, arguments=_render_value(arguments))
         )
         return len(self._invocations) - 1
 
@@ -183,8 +186,12 @@ class TrajectoryRecorder:
     ) -> None:
         if slot is None:
             return
+        # Same reasoning as _reserve: render now, while the call is still on
+        # the stack, rather than keep the raw value alive until render time.
         self._invocations[slot] = replace(
-            self._invocations[slot], result=result, error=error
+            self._invocations[slot],
+            result=None if error is not None else _render_value(result),
+            error=None if error is None else _truncate(error),
         )
 
 
@@ -295,14 +302,3 @@ def _truncate(text: str) -> str:
         return text
     kept = max(MAX_RECORDED_VALUE_CHARS - len(_TRUNCATION_SUFFIX), 0)
     return text[:kept] + _TRUNCATION_SUFFIX
-
-
-def _snapshot(value: Any) -> Any:
-    """Copy call arguments so a tool that mutates them can't rewrite what a
-    judge later reads: the recorded call must describe what the model sent,
-    not what the tool did to it afterward.
-    """
-    try:
-        return copy.deepcopy(value)
-    except Exception:
-        return value
