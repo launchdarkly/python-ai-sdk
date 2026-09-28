@@ -137,6 +137,7 @@ class LDApiClient:
         headers = {
             "Authorization": self.api_token,
             "Accept": "application/json",
+            "LD-API-Version": "20240415",
             "User-Agent": "launchdarkly-ai-evaluations-python",
         }
         payload: bytes | None = None
