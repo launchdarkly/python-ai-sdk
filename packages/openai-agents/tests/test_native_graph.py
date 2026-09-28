@@ -695,7 +695,9 @@ class TestToOpenAIAgentsOpenAISpecific:
             "Each node key must appear at most once (on_agent_start must not re-add keys already in path)."
         )
         node_events = [
-            data for evt, data in track_calls if evt == "$ld:ai:graph:node" and data.get("nodeKey") == "child"
+            data
+            for evt, data in track_calls
+            if evt == "$ld:ai:graph:node" and data.get("nodeKey") == "child"
         ]
         assert len(node_events) == 1
         assert node_events[0]["index"] == 0

@@ -334,7 +334,9 @@ class TestGraphStream:
         )
         assert "$ld:ai:graph:duration:total" in _track_names(mock_ld_client)
 
-    async def test_tracks_node_per_visited_node(self, mock_ld_client: MagicMock) -> None:
+    async def test_tracks_node_per_visited_node(
+        self, mock_ld_client: MagicMock
+    ) -> None:
         await _collect(
             graph("graph-key", handlers=[_make_streaming_handler(["ok"])]).stream(
                 "hi", CONTEXT

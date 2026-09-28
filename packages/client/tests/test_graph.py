@@ -275,7 +275,9 @@ class TestGraphInvoke:
         assert "$ld:ai:graph:invocation_failure" in events
         assert "$ld:ai:graph:path" not in events
         node_events = [
-            c[0] for c in mock_ld_client.track.call_args_list if c[0][0] == "$ld:ai:graph:node"
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
         ]
         assert len(node_events) == 1
         assert node_events[0][2]["nodeKey"] == "root-node"
@@ -292,7 +294,9 @@ class TestGraphInvoke:
         events = [c[0][0] for c in mock_ld_client.track.call_args_list]
         assert "$ld:ai:graph:path" not in events
         node_events = [
-            c[0] for c in mock_ld_client.track.call_args_list if c[0][0] == "$ld:ai:graph:node"
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
         ]
         assert len(node_events) == 2
         assert node_events[0][2]["nodeKey"] == "root-node"
