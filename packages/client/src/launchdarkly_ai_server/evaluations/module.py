@@ -538,7 +538,7 @@ def init_evaluations(
     token = api_key or _env("LD_API_TOKEN")
     if not token:
         raise EvaluationsError(
-            "No LaunchDarkly API access token provided. Set the LD_API_TOKEN "
+            "No LaunchDarkly API key provided. Set the LD_API_TOKEN "
             "environment variable or pass api_key to init_evaluations()."
         )
 

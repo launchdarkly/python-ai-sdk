@@ -39,7 +39,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint override (default: LaunchDarkly Observability backend) |
-| `LD_API_TOKEN` | For evaluations | API access token used by the evaluations management API |
+| `LD_API_TOKEN` | For evaluations | API key used by the evaluations management API |
 | `LD_SDK_KEY` | For evaluations | SDK key whose event transport carries generation results to LaunchDarkly |
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
