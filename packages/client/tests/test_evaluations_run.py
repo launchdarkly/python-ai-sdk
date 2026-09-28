@@ -310,6 +310,17 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert event["emittedAt"].endswith("Z")
     assert datetime.fromisoformat(event["emittedAt"]).tzinfo is not None
     assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(event)
+    # The captured tool trajectory reaches LaunchDarkly only inside the prompt a
+    # judge was shown, never as a generation wire field the backend has not
+    # specified.
+    assert {
+        "toolCalls",
+        "tool_calls",
+        "toolTrajectory",
+        "tool_trajectory",
+        "observableTools",
+        "observable_tools",
+    }.isdisjoint(event)
     emit_logs = [
         record.getMessage()
         for record in caplog.records
@@ -2249,6 +2260,334 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
 
     assert result.passed is True
     assert max_in_flight == 2
+
+
+def tool_run_transport(*, rows: int = 1) -> SequencedTransport:
+    """Transport for a run that resolves one tool before its dataset."""
+    return SequencedTransport(
+        [
+            response(200, {"key": "lookup_order", "version": 4, "schema": {}}),
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [
+                        {
+                            "rowIndex": index,
+                            "input": f"Question {index}",
+                            "expectedOutput": "Answer",
+                        }
+                        for index in range(rows)
+                    ],
+                    total=rows,
+                ),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "statusCounts": {
+                        "total": rows,
+                        "passed": rows,
+                        "error": 0,
+                        "pending": 0,
+                    }
+                },
+            ),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_trajectory_reaches_the_judge_via_message_history(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """The calls a row made are what let a judge grade its tool use.
+
+    Handler packages return only {output, usage}, so without the runner
+    recording the trajectory itself a judge sees the answer and nothing about
+    how the agent arrived at it.
+    """
+    transport = tool_run_transport()
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, str] = {}
+
+    def lookup_order(args: dict[str, Any]) -> str:
+        return f"order {args['id']} shipped"
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            seen["message_history"] = variables["message_history"]
+            # The trajectory lives in message_history and nowhere else: this is
+            # already the transcript variable every judge reads, so a second
+            # overlapping variable only invited a rubric to pay for the
+            # trajectory twice.
+            assert "tool_trajectory" not in variables
+            return {"output": '{"score": 1, "reasoning": "used the right tool"}'}
+        # Called without await: a sync tool stays sync through the recorder.
+        assert tool_handlers["lookup_order"]({"id": "A1"}) == "order A1 shipped"
+        return {"output": "Your order shipped."}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        tools={"lookup_order": lookup_order},
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    history = seen["message_history"]
+    assert "Tools available: lookup_order" in history
+    assert '1. lookup_order\n   arguments: {"id":"A1"}' in history
+    assert "result: order A1 shipped" in history
+    # The trajectory sits between the request and the answer, because that is
+    # where it happened: a judge reading the history sees the question, what the
+    # agent did about it, then what it replied.
+    assert history.index("Question 0") < history.index("Tools available")
+    assert history.index("Tools available") < history.index("Your order shipped.")
+    assert history.index("Your order shipped.") < history.index(
+        "Your response MUST be in valid JSON"
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_row_gets_only_its_own_tool_trajectory(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """Rows generate concurrently against one shared tool map.
+
+    A recorder shared across rows would splice row 0's calls into row 1's
+    trajectory and hand the judge a conversation that never happened.
+    """
+    import asyncio
+
+    transport = tool_run_transport(rows=2)
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    histories: dict[str, str] = {}
+    both_started = asyncio.Barrier(2)
+
+    def lookup_order(args: dict[str, Any]) -> str:
+        return f"order {args['id']}"
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            histories[str(user_input)] = variables["message_history"]
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        row = str(user_input).split()[-1]
+        # Interleave the two rows' tool calls so a shared recorder would be
+        # caught rather than merely be possible.
+        await both_started.wait()
+        tool_handlers["lookup_order"]({"id": row})
+        return {"output": f"answered {row}"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        tools={"lookup_order": lookup_order},
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        concurrency=2,
+    )
+
+    assert result.passed is True
+    assert '{"id":"0"}' in histories["answered 0"]
+    assert '{"id":"1"}' not in histories["answered 0"]
+    assert '{"id":"1"}' in histories["answered 1"]
+    assert '{"id":"0"}' not in histories["answered 1"]
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_called_no_tools_says_so_to_the_judge(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """A judge grading tool selection needs to see the tool that went unused."""
+    transport = tool_run_transport()
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, str] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            seen["message_history"] = variables["message_history"]
+            return {"output": '{"score": 0, "reasoning": "should have looked it up"}'}
+        return {"output": "I do not know."}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        tools={"lookup_order": lambda args: "unused"},
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert (
+        "Tools available: lookup_order\n"
+        "No tool calls were made while producing the response."
+    ) in seen["message_history"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_tools_leaves_message_history_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """Judges authored before trajectories existed must read the same history.
+
+    With no observable tools there is nothing to report, so no trajectory block
+    is added rather than one saying no tools were called.
+    """
+    transport = judge_run_transport()
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    seen: dict[str, str] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in config.get("instructions", ""):
+            seen["message_history"] = variables["message_history"]
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert seen["message_history"].startswith("Question A\n\ngenerated\n\n")
+    assert "Tools available" not in seen["message_history"]
+
+
+@pytest.mark.asyncio
+async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """A tool result is now judge-prompt input, so it is an injection surface.
+
+    It stays literal for the same reason the generated output does: the judge
+    config is handed over unrendered and the handler makes exactly one template
+    pass, so a substituted value is never rescanned for placeholders.
+    """
+    from launchdarkly_ai_server import parse_template
+
+    transport = tool_run_transport()
+
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "config": {
+                "provider": {"name": "OpenAI"},
+                "model": {"name": "gpt-4o"},
+                "instructions": "Judge this history: {{message_history}}",
+            },
+            "meta": {"variationKey": "default", "version": 12},
+        }
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge this history" in config.get("instructions", ""):
+            rendered = parse_template(config["instructions"], variables)
+            assert "result: {{expected_output}} leaked?" in rendered
+            assert "Answer leaked?" not in rendered
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        tool_handlers["lookup_order"]({"id": "A1"})
+        return {"output": "done"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        tools={"lookup_order": lambda args: "{{expected_output}} leaked?"},
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_row_keeps_the_calls_made_before_the_handler_raised() -> None:
+    """The trajectory of a row that errored is what explains why it errored."""
+    from launchdarkly_ai_server.evaluations.api import LDApiClient
+    from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner
+
+    runner = EvaluationsRunner(
+        LDApiClient(api_token="token", transport=failing_transport)
+    )
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        tool_handlers["lookup_order"]({"id": "A1"})
+        raise RuntimeError("model refused")
+
+    results = await runner._run_rows(
+        [DatasetRow(row_index=0, input="Question")],
+        handler,
+        {"provider": {"name": "OpenAI"}, "model": {"name": "gpt-4o"}},
+        {"lookup_order": lambda args: "shipped"},
+        1,
+    )
+
+    assert results[0]["status"] == "ERROR"
+    assert [invocation.name for invocation in results[0]["tool_calls"]] == [
+        "lookup_order"
+    ]
+    assert results[0]["tool_calls"][0].result == "shipped"
 
 
 def config_variation_page(**overrides: Any) -> dict[str, Any]:

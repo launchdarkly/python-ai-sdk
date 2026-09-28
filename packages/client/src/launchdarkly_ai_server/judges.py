@@ -7,7 +7,7 @@ from typing import Any
 
 from .conversation import with_judge_evaluation
 from .judge_scoring import (
-    FORMATTING_INSTRUCTIONS,
+    build_message_history,
     numeric_score,
     parse_judge_response,
 )
@@ -54,10 +54,16 @@ async def run_judges(
     base_track_data: TrackData,
     tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
     graph_key: str | None = None,
+    trajectory: str = "",
 ) -> dict[str, JudgeResult]:
     """
     Runs any judges configured on ``config['judgeConfiguration']`` against the
     produced output. Each judge is itself a tracked AI call.
+
+    ``trajectory`` is the rendered tool-call trajectory of the invocation being
+    judged, from ``execute_and_track``. It defaults to empty so a caller that
+    has none -- a graph-level judge over several nodes, for instance -- is
+    unchanged, and so is a judge for a config with no tools.
     """
     from .lifecycle import extract_variation
     from .tracking import execute_and_track
@@ -146,8 +152,10 @@ async def run_judges(
                 else judge_ai_config
             )
 
-            message_history = "\n\n".join(
-                filter(None, [user_input, llm_response, FORMATTING_INSTRUCTIONS])
+            message_history = build_message_history(
+                user_input=user_input,
+                trajectory=trajectory,
+                output=llm_response,
             )
 
             async with with_judge_evaluation(judge_key) as record_evaluation:
@@ -209,6 +217,8 @@ async def build_judge_tasks(
     handlers: list[ProviderHandler] | None = None,
     llm_response: str,
     base_track_data: TrackData,
+    user_input: str | None = None,
+    trajectory: str = "",
 ) -> list[JudgeTask]:
     """
     Resolves all judges configured on ``config['judgeConfiguration']`` into
@@ -307,6 +317,8 @@ async def build_judge_tasks(
                     judge_config=judge_ai_config,
                     judge_meta=judge_meta,
                     actual_output=llm_response,
+                    user_input=user_input,
+                    trajectory=trajectory,
                     user_context=user_context,
                     judge_provider=judge_provider,
                     judge_mode=judge_mode,
@@ -375,8 +387,13 @@ async def run_judge(
         else task.judge_config
     )
 
-    message_history = "\n\n".join(
-        filter(None, [task.actual_output, FORMATTING_INSTRUCTIONS])
+    # user_input and trajectory come off the task rather than being omitted:
+    # this path used to build a history with neither, so a judge grading the
+    # same response saw a different conversation than the inline path did.
+    message_history = build_message_history(
+        user_input=task.user_input,
+        trajectory=task.trajectory,
+        output=task.actual_output,
     )
 
     async with with_judge_evaluation(task.config_key) as record_evaluation:

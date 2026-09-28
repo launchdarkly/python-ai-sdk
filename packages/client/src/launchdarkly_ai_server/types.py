@@ -301,6 +301,19 @@ class JudgeTask:
     variables: dict[str, Any] | None = None
     """Optional extra template variables for the judge prompt."""
     evaluation_metric_key: str | None = None
+    user_input: str | None = None
+    """The input that produced ``actual_output``.
+
+    Carried so this path builds the same ``message_history`` as the inline one.
+    Previously absent, which showed a deferred judge a response with no
+    request beside it.
+    """
+    trajectory: str = ""
+    """The invocation's rendered tool-call trajectory.
+
+    A plain string rather than the structured record, since every field here
+    must stay picklable.
+    """
     """LD metric key to track the score against."""
 
 
