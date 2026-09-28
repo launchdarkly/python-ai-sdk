@@ -909,7 +909,6 @@ class GraphInstance:
             span.set_attribute("ld.ai.graph.key", self._key)
 
             start_time = time.monotonic()
-            path: list[str] = []
             total_usage = {"input": 0, "output": 0, "total": 0}
             resolved_input = user_input or ""
 
@@ -920,9 +919,23 @@ class GraphInstance:
                 last: dict[str, Any] | None = None
                 visited: set[str] = set()
                 steps = 0
+                entered = 0
 
                 while current and steps < MAX_TRAVERSAL_DEPTH:
                     steps += 1
+                    # Record the node as it is entered, so a later failure still
+                    # has this step. The path is the ordered series of these events.
+                    get_client().track(
+                        "$ld:ai:graph:node",
+                        ld_ctx,
+                        {
+                            **graph_track_data,
+                            "nodeKey": current.key,
+                            "index": entered,
+                        },
+                        1,
+                    )
+                    entered += 1
                     opts: dict[str, Any] = {"variables": variables}
                     if previous_node:
                         opts["from"] = previous_node
@@ -933,7 +946,6 @@ class GraphInstance:
                         opts["history"] = history
 
                     res = await graph_def.route(current, current_input, opts)
-                    path.append(current.key)
                     total_usage["input"] += (
                         res["usage"].get("input", 0)
                         if isinstance(res["usage"], dict)
@@ -978,12 +990,6 @@ class GraphInstance:
                         graph_track_data,
                         total_usage["total"],
                     )
-                client.track(
-                    "$ld:ai:graph:path",
-                    ld_ctx,
-                    {**graph_track_data, "path": path},
-                    len(path),
-                )
                 client.track(
                     "$ld:ai:graph:invocation_success", ld_ctx, graph_track_data, 1
                 )
@@ -1121,7 +1127,6 @@ class GraphInstance:
         ended: set[int] = set()
         start_time = time.monotonic()
 
-        path: list[str] = []
         total_usage = {"input": 0, "output": 0, "total": 0}
 
         # A consumer that stops reading unwinds as GeneratorExit, and that is abandonment.
@@ -1137,9 +1142,17 @@ class GraphInstance:
             last: dict[str, Any] | None = None
             visited: set[str] = set()
             steps = 0
+            entered = 0
 
             while current and steps < MAX_TRAVERSAL_DEPTH:
                 steps += 1
+                get_client().track(
+                    "$ld:ai:graph:node",
+                    ld_ctx,
+                    {**graph_track_data, "nodeKey": current.key, "index": entered},
+                    1,
+                )
+                entered += 1
                 route_opts: dict[str, Any] = {"variables": variables}
                 if previous_node:
                     route_opts["from"] = previous_node
@@ -1156,7 +1169,6 @@ class GraphInstance:
                 ):
                     yield event
 
-                path.append(current.key)
                 usage = outcome.get("usage") or {}
                 total_usage["input"] += (
                     usage.get("input", 0) if isinstance(usage, dict) else 0
@@ -1203,12 +1215,6 @@ class GraphInstance:
                     graph_track_data,
                     total_usage["total"],
                 )
-            client.track(
-                "$ld:ai:graph:path",
-                ld_ctx,
-                {**graph_track_data, "path": path},
-                len(path),
-            )
             client.track("$ld:ai:graph:invocation_success", ld_ctx, graph_track_data, 1)
 
             judge_results: dict[str, JudgeResult] | None = None

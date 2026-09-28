@@ -401,6 +401,7 @@ class TestToOpenAIAgentsOpenAISpecific:
                 ).invoke("hi")
 
         assert "$ld:ai:graph:invocation_success" in track_calls
+        assert "$ld:ai:graph:path" not in track_calls
 
     @pytest.mark.asyncio
     async def test_error_path_emits_invocation_failure_and_rethrows(self) -> None:
@@ -658,6 +659,12 @@ class TestToOpenAIAgentsOpenAISpecific:
         mock_span = MagicMock()
         mock_trace = MagicMock()
         mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+        ld_context = {"kind": "user", "key": "test"}
 
         with patch(
             "importlib.import_module",
@@ -665,7 +672,13 @@ class TestToOpenAIAgentsOpenAISpecific:
         ):
             with patch.object(_openai_ng, "trace", mock_trace):
                 with patch.object(_openai_ng, "_HAS_OTEL", True):
-                    await to_openai_agents(_make_def_promise(graph_def)).invoke("hi")
+                    with patch.object(
+                        _openai_ng, "get_client", return_value=mock_ld_client
+                    ):
+                        await to_openai_agents(
+                            _make_def_promise(graph_def),
+                            opts={"context": ld_context},
+                        ).invoke("hi")
 
         # Extract the path from the span set_attribute call for "launchdarkly.graph.path"
         path_val: str | None = None
@@ -681,6 +694,12 @@ class TestToOpenAIAgentsOpenAISpecific:
             f"'child' appeared {child_occurrences} times in path '{path_val}'. "
             "Each node key must appear at most once (on_agent_start must not re-add keys already in path)."
         )
+        node_events = [
+            data for evt, data in track_calls if evt == "$ld:ai:graph:node" and data.get("nodeKey") == "child"
+        ]
+        assert len(node_events) == 1
+        assert node_events[0]["index"] == 0
+        assert all(evt != "$ld:ai:graph:path" for evt, _ in track_calls)
 
     @pytest.mark.asyncio
     async def test_agent_handoff_hook_emits_handoff_success(self) -> None:

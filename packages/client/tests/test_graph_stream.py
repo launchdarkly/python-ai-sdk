@@ -334,13 +334,28 @@ class TestGraphStream:
         )
         assert "$ld:ai:graph:duration:total" in _track_names(mock_ld_client)
 
-    async def test_tracks_path(self, mock_ld_client: MagicMock) -> None:
+    async def test_tracks_node_per_visited_node(self, mock_ld_client: MagicMock) -> None:
         await _collect(
             graph("graph-key", handlers=[_make_streaming_handler(["ok"])]).stream(
                 "hi", CONTEXT
             )
         )
-        assert "$ld:ai:graph:path" in _track_names(mock_ld_client)
+        assert "$ld:ai:graph:path" not in _track_names(mock_ld_client)
+        node_events = [
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
+        ]
+        assert len(node_events) == 2
+        assert node_events[0][2]["nodeKey"] == "root-node"
+        assert node_events[0][2]["index"] == 0
+        assert node_events[0][3] == 1
+        assert node_events[1][2]["nodeKey"] == "leaf-node"
+        assert node_events[1][2]["index"] == 1
+        assert node_events[1][3] == 1
+        assert node_events[0][2]["runId"] == node_events[1][2]["runId"]
+        assert node_events[0][2]["graphKey"] == "graph-key"
+        assert "path" not in node_events[0][2]
 
     async def test_tracks_handoff_success(self, mock_ld_client: MagicMock) -> None:
         await _collect(
@@ -372,7 +387,18 @@ class TestGraphStream:
         )
         with pytest.raises(RuntimeError, match="stream boom"):
             await _collect(graph("graph-key", handlers=[h]).stream("hi", CONTEXT))
-        assert "$ld:ai:graph:invocation_failure" in _track_names(mock_ld_client)
+        names = _track_names(mock_ld_client)
+        assert "$ld:ai:graph:invocation_failure" in names
+        assert "$ld:ai:graph:path" not in names
+        node_events = [
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
+        ]
+        assert len(node_events) == 1
+        assert node_events[0][2]["nodeKey"] == "root-node"
+        assert node_events[0][2]["index"] == 0
+        assert node_events[0][3] == 1
 
     async def test_generation_success_includes_graph_key(
         self, mock_ld_client: MagicMock
@@ -674,7 +700,18 @@ class TestGraphStreamOtel:
         assert len(graph_spans) >= 1
         attrs = graph_spans[0].attributes or {}
         assert attrs.get("launchdarkly.stream.abandoned") is True
-        assert "$ld:ai:graph:invocation_success" not in _track_names(mock_ld_client)
+        names = _track_names(mock_ld_client)
+        assert "$ld:ai:graph:invocation_success" not in names
+        assert "$ld:ai:graph:path" not in names
+        node_events = [
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
+        ]
+        assert len(node_events) == 1
+        assert node_events[0][2]["nodeKey"] == "root-node"
+        assert node_events[0][2]["index"] == 0
+        assert node_events[0][3] == 1
 
     async def test_cancelled_stream_marks_run_cancelled_not_abandoned(
         self, mock_ld_client: MagicMock
