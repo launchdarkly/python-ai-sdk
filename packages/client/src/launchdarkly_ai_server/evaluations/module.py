@@ -195,7 +195,7 @@ class EvaluationsModule:
         )
         self._validate_config_source(generation=generation, ai_config=ai_config)
         run_tools = list(tools or [])
-        validate_tools(run_tools)
+        validate_tools(run_tools, self._project_key)
         run_tool_handlers = tool_handlers(run_tools)
         pinned_tool_versions: dict[str, int] = {}
         config_label = ""
@@ -208,19 +208,26 @@ class EvaluationsModule:
                 ai_config.variation,
             )
             generation = _merge_generation(ai_config_variation.generation, generation)
-            supplied = {tool.key for tool in run_tools}
-            missing = [
-                name
-                for name in ai_config_variation.tool_versions
-                if name not in supplied
-            ]
-            if missing:
+            if tools is None and ai_config_variation.tool_versions:
                 raise EvaluationsError(
                     f"AI Config variation {config_label} uses tools "
                     "with no implementation: "
-                    + ", ".join(repr(name) for name in missing)
+                    + ", ".join(
+                        repr(name) for name in ai_config_variation.tool_versions
+                    )
                     + ". Pass tools= with a Tool for each."
                 )
+            # A caller who passes tools= replaces the variation's list, so an
+            # empty list runs the variation with no tools.
+            supplied = {tool.key for tool in run_tools}
+            for name in ai_config_variation.tool_versions:
+                if name not in supplied:
+                    logger.warning(
+                        "AI Config variation %s attaches tool %r, which this run "
+                        "does not use.",
+                        config_label,
+                        name,
+                    )
             pinned_tool_versions = ai_config_variation.tool_versions
             if criteria is None:
                 criteria = [

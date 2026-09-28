@@ -203,7 +203,7 @@ result = await evals.run(
 )
 ```
 
-`run()` reads no tool from the API. A constructed `Tool` is always inline, because `source` and `version` are not constructor arguments. Only `tools.get()` produces a library tool. Handlers receive the same `{key: callable}` map whichever kind a tool is, so handler code needs no change.
+`run()` reads no tool from the API. `tools.get()` blocks until its read completes, so call it while you set a run up, not inside a running event loop. A constructed `Tool` is always inline, because `source` and `version` are not constructor arguments. Only `tools.get()` produces a library tool. Handlers receive the same `{key: callable}` map whichever kind a tool is, so handler code needs no change.
 
 **The list is checked before any network I/O.** A blank key, an uppercase key, a `schema` that is not a JSON object, a schema that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued. A repeated key fails too, and keys are compared without case. A `NativeTool` is valid only for a library tool, because the provider supplies its schema.
 
