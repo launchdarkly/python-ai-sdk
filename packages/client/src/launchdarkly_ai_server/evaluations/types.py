@@ -58,15 +58,6 @@ class DatasetRow:
 
 
 @dataclass
-class ResolvedTool:
-    """The schema and pinned version returned by the LaunchDarkly tool API."""
-
-    key: str
-    version: int
-    description: str = ""
-    schema: dict[str, Any] = field(default_factory=dict)
-
-
 @dataclass(frozen=True)
 class AIConfig:
     """Identifies an existing AI Config variation to seed an evaluation run.
