@@ -203,6 +203,7 @@ def test_requests_carry_token_auth_and_json_body() -> None:
     assert request["method"] == "POST"
     assert request["url"] == f"{DEFAULT_BASE_URI}/api/v2/projects/proj/evaluations"
     assert request["headers"]["Authorization"] == "api-token"
+    assert request["headers"]["LD-API-Version"] == "20240415"
     assert request["headers"]["Content-Type"] == "application/json"
     assert request["body"] == {"key": "support-qa"}
 
@@ -220,6 +221,7 @@ def test_get_encodes_query_params_and_omits_none() -> None:
         request["url"]
         == "https://ld.example.com/api/v2/projects/proj/datasets/golden?limit=50"
     )
+    assert request["headers"]["LD-API-Version"] == "20240415"
     assert "Content-Type" not in request["headers"]
 
 
