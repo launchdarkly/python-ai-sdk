@@ -13,7 +13,6 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
 DEFAULT_BASE_URI = "https://app.launchdarkly.com"
-_LD_API_VERSION = "20240415"
 
 # Only these methods are replayed after a 5xx or a transport failure: a POST that
 # timed out may still have created a record server-side.
@@ -138,7 +137,7 @@ class LDApiClient:
         headers = {
             "Authorization": self.api_token,
             "Accept": "application/json",
-            "LD-API-Version": _LD_API_VERSION,
+            "LD-API-Version": "20240415",
             "User-Agent": "launchdarkly-ai-evaluations-python",
         }
         payload: bytes | None = None
