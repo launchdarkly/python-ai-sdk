@@ -42,6 +42,7 @@ class Tool:
     description: str = ""
     source: Literal["library", "inline"] = field(default="inline", init=False)
     version: int | None = field(default=None, init=False)
+    project_key: str | None = field(default=None, init=False)
 
     @classmethod
     def _library(
@@ -52,6 +53,7 @@ class Tool:
         version: int,
         schema: dict[str, Any],
         description: str,
+        project_key: str,
     ) -> Tool:
         """Build a library tool. Used by ``ToolsClient.get``."""
         tool = cls(
@@ -62,6 +64,7 @@ class Tool:
         )
         tool.source = "library"
         tool.version = version
+        tool.project_key = project_key
         return tool
 
     def to_create_wire(self) -> dict[str, Any]:
@@ -120,10 +123,11 @@ def _validate_inline_tool(tool: Tool) -> None:
         ) from error
 
 
-def validate_tools(tools: Sequence[Tool]) -> None:
+def validate_tools(tools: Sequence[Tool], project_key: str | None = None) -> None:
     """Validate the tools list. Raises ``EvaluationsError``.
 
-    Issues no requests.
+    Checks each library tool against ``project_key`` when one is given. Issues
+    no requests.
     """
     keys_by_identity: dict[str, str] = {}
     for tool in tools:
@@ -143,6 +147,16 @@ def validate_tools(tools: Sequence[Tool]) -> None:
             )
         if tool.source == "inline":
             _validate_inline_tool(tool)
+        elif (
+            project_key is not None
+            and tool.project_key is not None
+            and tool.project_key != project_key
+        ):
+            raise EvaluationsError(
+                f"Tool {key!r} was read from project {tool.project_key!r} and "
+                f"cannot run in project {project_key!r}. Read it from "
+                f"{project_key!r} instead."
+            )
         # One key names one tool. Keys are compared case-insensitively.
         identity = key.strip().lower()
         collision = keys_by_identity.get(identity)
@@ -186,6 +200,9 @@ class ToolsClient:
 
         Reads the tool now and pins the version it returns. Raises
         ``EvaluationsError`` when the tool does not exist in the project.
+
+        This call blocks until the read completes. Call it while you set a run
+        up, not inside a running event loop.
         """
         validate_tool_key(key)
         validate_tool_implementation(key, implementation)
@@ -213,4 +230,5 @@ class ToolsClient:
             version=version,
             schema=dict(schema),
             description=str(raw.get("description") or ""),
+            project_key=self._project_key,
         )

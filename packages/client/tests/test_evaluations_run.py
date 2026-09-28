@@ -3493,3 +3493,58 @@ async def test_run_reads_no_tool_from_the_api() -> None:
 
     run_paths = [path for _, path in recorded_paths(transport)[requests_before_run:]]
     assert not any("ai-tools" in path for path in run_paths), run_paths
+
+
+@pytest.mark.asyncio
+async def test_an_empty_tools_list_runs_a_variation_with_no_tools() -> None:
+    """A caller who passes tools= replaces the variation's list."""
+    transport = SequencedTransport(
+        fetched_run_responses(
+            config_variation_page(tools=[{"key": "lookup_order", "version": 4}])
+        )
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        ai_config=AIConfig(key="support-agent", variation="control"),
+        tools=[],
+    )
+
+    assert "tools" not in evaluation_post(transport)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_from_another_project_is_rejected() -> None:
+    transport = SequencedTransport(
+        [response(200, {"key": "lookup_order", "version": 4, "schema": {}})]
+    )
+    other = init_evaluations(
+        project_key="other-proj",
+        api_key="token",
+        sdk_key="sdk-key",
+        transport=transport,
+    )
+    foreign_tool = other.tools.get("lookup_order", implementation=lookup_order)
+    evals = init_evaluations(
+        project_key="proj",
+        api_key="token",
+        sdk_key="sdk-key",
+        transport=SequencedTransport([]),
+    )
+
+    with pytest.raises(EvaluationsError, match="cannot run in project 'proj'"):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools=[foreign_tool],
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
