@@ -358,7 +358,8 @@ LaunchDarkly's AI SDKs for the same input.
 | `action` | Always `withheld` — the content was not returned to your code. |
 | `skill_key` | The skill key **requested**, or `<invalid-key>` when the key was itself malformed. |
 | `served_key` | Only on `key_mismatch`: the key the store actually answered under. Same redaction as `skill_key`. Omitted on every other failure mode. |
-| `version` | The delivered version. Omitted when it was not a valid version, and on `key_mismatch`. |
+| `served_version` | Only on `version_mismatch`: the version the store actually answered with, as an integer. Omitted on every other failure mode. Never appears on the same record as `served_key`. |
+| `version` | The delivered version — or, on `version_mismatch`, the version **requested**. Omitted when it was not a valid version, and on `key_mismatch`. |
 | `expected_hash` | The delivered `contentHash`, or `<not-a-sha256-digest>` when it was not one. Omitted when none was delivered. |
 | `observed_hash` | The sha256 the SDK computed. Omitted when the failure happened before anything was hashed. |
 | `reason_code` | A stable token naming the failure mode — see below. |
@@ -379,21 +380,30 @@ could carry it, never appears in the record; neither does any filesystem path.
 | `not_utf8` | The content string had no UTF-8 encoding, so there are no bytes that could have been hashed. |
 | `over_size_cap` | The content exceeded the SDK's local size cap. |
 | `hash_mismatch` | The computed sha256 did not match the delivered `contentHash`. |
-| `key_mismatch` | The store answered under a different key than the one requested. Carries an extra `served_key` field naming the key it answered under, and — uniquely — records **no** `AgentControl Skill Integrity Failure` signal. |
+| `key_mismatch` | The store answered under a different key than the one requested. Carries an extra `served_key` field naming the key it answered under, and records **no** `AgentControl Skill Integrity Failure` signal. |
+| `version_mismatch` | The store answered a version pin with a different version. Carries an extra `served_version` field naming the version it answered with, beside a `version` naming the one requested, and records **no** `AgentControl Skill Integrity Failure` signal. |
 
-**`hash_mismatch` is the one worth paging on.** The other eight describe a malformed or
-truncated payload; a mismatch means content was delivered whose bytes are not the bytes
+**`hash_mismatch` is the one worth paging on.** The others describe a malformed or
+truncated payload, or a store answering a question other than the one it was asked; a
+mismatch means content was delivered whose bytes are not the bytes
 LaunchDarkly hashed, which is a possible **active-tampering** signal. Alert on it, and
 treat `expected_hash` / `observed_hash` as the evidence pair.
 
-**`key_mismatch` is the one code that reaches this record without the product signal.** It
-is decided after verification has passed, and its usual cause is a bug in a custom
-`SkillStore` adapter — a stale cache entry, a colliding key, a wrong index lookup — rather
-than tampering, so it does not inflate LaunchDarkly's own integrity counter. It still
-reaches this record, because a store substituting one skill for another is worth seeing,
-and a rule on `ld.skills.integrity_failure` catches it without modification. Treat it like
+**`key_mismatch` and `version_mismatch` are the two codes that reach this record without
+the product signal.** Both are decided after verification has passed, and the usual cause
+of either is a bug in a custom `SkillStore` adapter — a stale cache entry, a colliding key,
+a wrong index lookup — rather than tampering, so neither inflates LaunchDarkly's own
+integrity counter. Both still reach this record, because a store that substitutes one skill
+for another, or answers a pin with a version you did not ask for, is worth seeing; a rule on
+`ld.skills.integrity_failure` catches them without modification. Treat them like
 `hash_mismatch` if `FDv2SkillStore` is your only store; behind a custom adapter, suspect
 the adapter first.
+
+`version_mismatch` is worth watching for specifically if you resolve pinned references
+behind a custom store, because `get_skill` reports it the same way it reports every other
+failure — as `None` — so this record is the only place it is visible. `get_skill_result`
+names it as the `wrong_version` outcome (below); the two spellings are deliberate, one per
+surface.
 
 #### Failing closed on tampering
 
@@ -427,7 +437,7 @@ elif outcome.skill is not None:
 | `absent` | The store answered, and does not hold that key. |
 | `integrity_failure` | Content was delivered and failed verification, so it was withheld. **The one to fail closed on.** |
 | `store_unavailable` | The store itself could not answer — it raised. An outage, not a deletion. |
-| `wrong_version` | The store answered with a version other than the one asked for, so the answer was withheld. |
+| `wrong_version` | The store answered with a version other than the one asked for, so the answer was withheld. Also written to the integrity log record above, as `reason_code: version_mismatch`. |
 
 `.detail` is human-readable and safe to log or show an operator — it names the key and the
 failure mode, and never carries skill content or a filesystem path. Branch on `.reason`,

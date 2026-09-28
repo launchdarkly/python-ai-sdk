@@ -1800,23 +1800,28 @@ class TestIntegrityFailureLogRecord:
     def test_the_case_table_exhausts_the_vocabulary(self) -> None:
         """The vocabulary is closed, and every token in it is reachable.
 
-        Both directions matter. A tenth token added to the source without a call
-        site fails here, and so does a tenth call site that invented a token the
-        table does not cover — which is what keeps the Python and TypeScript
+        Both directions matter. An eleventh token added to the source without a
+        call site fails here, and so does an eleventh call site that invented a
+        token the table does not cover — which is what keeps the Python and TypeScript
         vocabularies from drifting apart one edit at a time.
 
-        ``key_mismatch`` is added in rather than living in the table because it
-        is the one token that is *not* a verification failure: it is decided at
-        the retrieval boundary, after ``verify_raw_skill`` has already passed, so
-        it is unreachable through ``all_skills`` and cannot join a table that is
-        uniformly driven through it. Its own coverage is
-        ``test_key_mismatch_records_the_log_but_not_the_signal``.
+        ``key_mismatch`` and ``version_mismatch`` are added in rather than living
+        in the table because they are the two tokens that are *not* verification
+        failures: both are decided at the retrieval boundary, after
+        ``verify_raw_skill`` has already passed, so neither is reachable through
+        ``all_skills`` and neither can join a table that is uniformly driven
+        through it. Their own coverage is
+        ``test_key_mismatch_records_the_log_but_not_the_signal`` and
+        ``test_version_mismatch_records_the_log_but_not_the_signal``.
         """
         from launchdarkly_ai_server import skills_core
 
-        covered = {case.values[1] for case in REASON_CODE_CASES} | {"key_mismatch"}
+        covered = {case.values[1] for case in REASON_CODE_CASES} | {
+            "key_mismatch",
+            "version_mismatch",
+        }
         assert covered == skills_core.INTEGRITY_REASON_CODES
-        assert len(covered) == 9
+        assert len(covered) == 10
 
     async def test_key_mismatch_records_the_log_but_not_the_signal(
         self,
@@ -1908,6 +1913,142 @@ class TestIntegrityFailureLogRecord:
         assert len(records) == 1
         assert records[0]["served_key"] == "<invalid-key>"
         assert LOGGED_BODY not in json.dumps(records[0])
+
+    async def test_version_mismatch_records_the_log_but_not_the_signal(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        make_raw_skill: Any,
+        recording_emitter: Any,
+    ) -> None:
+        """The second one-directional exception to "the two surfaces agree".
+
+        The record fires for the reason the key mismatch's does: the log surface
+        is the customer-owned detection path, and the population that reaches
+        this branch is the same one — a broken custom store adapter. Neither
+        shipped store can produce it, since both answer a pin with exactly that
+        version or with ``None``, so an ordinary pin miss is ``absent``.
+
+        The signal stays out for the same reason too, and that half is asserted
+        in both directions: an implementation that emitted it here would satisfy
+        every other assertion in this class.
+        """
+        skills_module._set_store(_WrongVersionAnsweringStore(make_raw_skill))
+        skills_module._set_emitter_for_testing(recording_emitter)
+
+        outcome = await get_skill_result("asked-for", version=1)
+        assert outcome.reason == "wrong_version"
+        assert outcome.skill is None
+
+        # The signal surface saw nothing at all, not merely no integrity signal.
+        assert recording_emitter.records == []
+
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        record = records[0]
+        assert record["reason_code"] == "version_mismatch"
+        assert record["event"] == INTEGRITY_EVENT
+        assert record["action"] == "withheld"
+        assert record["language"] == "python"
+        assert record["reason"]
+
+        # Both versions are named, and ``version`` keeps the meaning it has on
+        # every other record — the version *requested* — so a rule grouping or
+        # filtering on it still works. The version the store answered with is
+        # what makes a broken adapter diagnosable, so it is a parseable field
+        # rather than prose buried in ``reason``.
+        assert record["skill_key"] == "asked-for"
+        assert record["version"] == 1
+        assert record["served_version"] == 99
+        # Integers, not strings: the sorted-key JSON is compared byte-for-byte
+        # across SDKs, and ``3`` and ``"3"`` are not the same line. ``bool`` is
+        # an ``int`` subclass, so the type is checked exactly.
+        assert type(record["version"]) is int
+        assert type(record["served_version"]) is int
+
+        # Verification passed, so there is no hash disagreement to report and
+        # the two hash fields stay absent rather than being emitted as null.
+        assert "expected_hash" not in record
+        assert "observed_hash" not in record
+        # ``served_key`` belongs to the other boundary code; the two never
+        # appear on one record.
+        assert "served_key" not in record
+        assert None not in record.values()
+
+        # Sorted, like every other record, so the line stays byte-comparable
+        # across SDKs. ``served_version`` has to land in its alphabetical place.
+        assert list(record) == sorted(record)
+
+        # The structured mirror is required alongside the text.
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert errors[0].__dict__["ld_skills"] == record
+
+    async def test_version_mismatch_is_recorded_through_get_skill_too(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        make_raw_skill: Any,
+        recording_emitter: Any,
+    ) -> None:
+        """The accessor the record exists for.
+
+        ``get_skill`` is the documented default and collapses ``wrong_version``
+        to ``None`` exactly as it collapses ``integrity_failure``, so without
+        this record an operator on it has no visibility into a store answering
+        pins with the wrong version at all. Asserted separately from the
+        reported accessor because it is the whole reason the record is written.
+        """
+        skills_module._set_store(_WrongVersionAnsweringStore(make_raw_skill))
+        skills_module._set_emitter_for_testing(recording_emitter)
+
+        assert await get_skill("asked-for", version=1) is None
+
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        assert records[0]["reason_code"] == "version_mismatch"
+        assert records[0]["version"] == 1
+        assert records[0]["served_version"] == 99
+        assert recording_emitter.records == []
+
+    async def test_the_key_check_wins_when_both_key_and_version_disagree(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        make_raw_skill: Any,
+        recording_emitter: Any,
+    ) -> None:
+        """Two boundary codes, one determined answer.
+
+        A store that answers under both a different key and a different version
+        disagrees twice. The key check runs first — an answer that is not the
+        requested skill at all makes its version moot — so this input reports
+        ``key_mismatch`` with outcome ``integrity_failure``, not
+        ``version_mismatch`` with outcome ``wrong_version``. Without a fixed
+        order both the code *and* the caller-visible outcome would be whichever
+        check the implementation happened to reach first, which is why this is
+        pinned rather than left to the reader.
+        """
+
+        class _DoublyDisagreeingStore:
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return make_raw_skill(key="served-key", version=99)
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {}
+
+        skills_module._set_store(_DoublyDisagreeingStore())
+        skills_module._set_emitter_for_testing(recording_emitter)
+
+        outcome = await get_skill_result("asked-for", version=1)
+
+        assert outcome.reason == "integrity_failure"
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        assert records[0]["reason_code"] == "key_mismatch"
+        assert records[0]["served_key"] == "served-key"
+        # The losing check's field is absent, not merely its code.
+        assert "served_version" not in records[0]
+        assert recording_emitter.records == []
 
     async def test_the_event_name_is_in_the_message_text(
         self, caplog: pytest.LogCaptureFixture

@@ -384,15 +384,26 @@ Do not rename one on one side.
 
 Internal `Resolution.reason` maps 1:1 onto it, set explicitly at every construction site:
 
-| `resolve_from_store` outcome | `reason` |
-|---|---|
-| the store raised (`unavailable=True`) | `store_unavailable` |
-| `raw` is not a dict | `absent` |
-| `verify_raw_skill` returned `None` | `integrity_failure` |
-| `skill.version != wanted_version` | `wrong_version` |
-| success | `ok` |
+| `resolve_from_store` outcome | `reason` | Detection surface |
+|---|---|---|
+| the store raised (`unavailable=True`) | `store_unavailable` | an ERROR log line, no integrity record |
+| `raw` is not a dict | `absent` | none — a pinned non-dict tells us nothing about the key, and a tampering signal from a broken adapter would be a false positive |
+| `verify_raw_skill` returned `None` | `integrity_failure` | both: the log record **and** the product signal |
+| `skill.key != key` | `integrity_failure` | the log record only, `reason_code: key_mismatch` |
+| `skill.version != wanted_version` | `wrong_version` | the log record only, `reason_code: version_mismatch` |
+| success | `ok` | none |
 
-**Adding a sixth internal outcome means choosing which public token it maps to.**
+The two record-only rows are deliberate and are **not** a silence to "fix": both are decided
+after `verify_raw_skill` has passed, and the usual cause of either is a broken custom store
+adapter rather than tampered content, so the product signal stays out and LaunchDarkly's
+counter does not fill with customers' adapter bugs. Tests pin both directions for each —
+record present, signal absent — because an implementation that also emitted the signal would
+look correct from every other angle. Note the `reason` and the `reason_code` differ in
+spelling for the version row (`wrong_version` vs `version_mismatch`): one names what the
+caller got, the other names which check failed, and keeping one string out of two closed
+vocabularies is what stops a detection rule being ambiguous about which surface it matches.
+
+**Adding a seventh internal outcome means choosing which public token it maps to.**
 `Resolution.reason` has no default, so the compiler asks the question; answer it rather than
 defaulting to `absent`, which claims the store does not hold the skill. If the new outcome
 is genuinely neither of the five, the token set grows — on both sides, in the same commit.
@@ -550,7 +561,9 @@ aid. `record_integrity_failure` writes both, and is the only place either is con
 One ERROR record per withheld skill, message text = `INTEGRITY_FAILURE_EVENT` + a space +
 `json.dumps(record, sort_keys=True, separators=(",", ":"))`, plus the same mapping under
 `extra={"ld_skills": record}`. Fields: `event`, `action` (always `withheld`), `skill_key`,
-`version?`, `expected_hash?`, `observed_hash?`, `reason_code`, `reason`, `language`.
+`version?`, `expected_hash?`, `observed_hash?`, `reason_code`, `reason`, `language`, plus
+the two record-only fields the boundary codes carry — `served_key?` on a `key_mismatch` and
+`served_version?` on a `version_mismatch`, never both on one record.
 
 Each of those choices is load-bearing; do not undo one as a simplification.
 
@@ -571,11 +584,12 @@ Each of those choices is load-bearing; do not undo one as a simplification.
 - **`reason_code` is in the record only.** The signal's property set is the allowlist above
   and does not grow; the local record is where the detection vocabulary lives.
 
-`reason_code` is a **closed vocabulary of exactly nine tokens** — `IntegrityReasonCode`, a
-`Literal`, so a typo at a call site is a type error — and the same nine in every language
-implementation. Eight are one per `record_integrity_failure` call site; the ninth,
-`key_mismatch`, comes from `record_key_mismatch` and is the only one that fires the log
-record **without** the product signal:
+`reason_code` is a **closed vocabulary of exactly ten tokens** — `IntegrityReasonCode`, a
+`Literal`, so a typo at a call site is a type error — and the same ten in every language
+implementation. It is a finer vocabulary than `SkillOutcomeReason`, which stays five tokens;
+widening one does not widen the other. Eight are one per `record_integrity_failure` call
+site; the other two come from `record_key_mismatch` and `record_version_mismatch` at the
+retrieval boundary and are the ones that fire the log record **without** the product signal:
 
 | `reason_code` | Call site |
 |---|---|
@@ -588,16 +602,28 @@ record **without** the product signal:
 | `over_size_cap` | `verified_bytes` — over `MAX_SKILL_CONTENT_BYTES` |
 | `hash_mismatch` | `verified_bytes` — observed sha256 != `contentHash` |
 | `key_mismatch` | `resolve_from_store` — the served object's own `key` is not the key requested. **Log record only, no signal**, and carries a `served_key` field no other record has |
+| `version_mismatch` | `resolve_from_store` — the served object's `version` is not the pinned version requested. **Log record only, no signal**, and carries a `served_version` field no other record has, beside a `version` that means the version *requested* |
 
-`key_mismatch` cannot join `REASON_CODE_CASES`: that table is driven uniformly through
-`all_skills`, and this code is decided at the retrieval boundary after `verify_raw_skill`
-has passed, so a listing cannot reach it. It is unioned into the exhaustiveness assertion
-instead, and covered by `test_key_mismatch_records_the_log_but_not_the_signal`. The
-record-without-signal split is deliberate — a mismatch is usually a broken store adapter
-rather than an attacker, and LaunchDarkly's counter must not fill with customers' adapter
-bugs — and tests pin both directions. Do not "fix" it by emitting the signal.
+Neither boundary code can join `REASON_CODE_CASES`: that table is driven uniformly through
+`all_skills`, and both codes are decided at the retrieval boundary after `verify_raw_skill`
+has passed, so a listing cannot reach either. A listing has no requested key and no
+requested version to compare against at all, which is why the asymmetry is correct rather
+than a gap. They are unioned into the exhaustiveness assertion instead, and covered by
+`test_key_mismatch_records_the_log_but_not_the_signal` and
+`test_version_mismatch_records_the_log_but_not_the_signal`. The record-without-signal split
+is deliberate — either mismatch is usually a broken store adapter rather than an attacker,
+and LaunchDarkly's counter must not fill with customers' adapter bugs — and tests pin both
+directions for both codes. Do not "fix" it by emitting the signal.
 
-Adding a tenth failure mode means widening `IntegrityReasonCode`, adding a case to
+Both codes are reachable from all four callers of `resolve_from_store` — `get_skill`,
+`get_skills`, `get_skill_result`, and `write_skills`, which resolves each pinned reference
+through the same function. A suite written to the accessors alone leaves the write path
+uncovered. On that path a `wrong_version` is per-skill and not `unavailable`, so it takes
+the narrow protection: the key stays in the requested set carrying an `error` action, the
+copy already on disk is not pruned, and the run is **not** marked incomplete, so a
+genuinely revoked skill in the same run is still removed.
+
+Adding an eleventh failure mode means widening `IntegrityReasonCode`, adding a case to
 `REASON_CODE_CASES` in `test_skills.py` (whose exhaustiveness assertion fails otherwise),
 documenting it in the README table, **and** doing the same in the other language SDKs. A
 token added on one side only is a drift bug: a customer's detection rule stops matching
@@ -942,6 +968,6 @@ a conversation is out of reach at this layer either way.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
 - Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
-- Do not rename `ld.skills.integrity_failure`, and do not add a ninth `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
+- Do not rename `ld.skills.integrity_failure`, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
 - Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.
