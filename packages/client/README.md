@@ -597,10 +597,11 @@ socket operation of a request, connecting included. In `mode="poll"` it bounds t
 request and defaults to 10 seconds; in `mode="stream"` it bounds each wait for the next bytes
 and defaults to 300 seconds, well beyond LaunchDarkly's heartbeat interval.
 
-**The connection also carries your flags.** A client cannot request only the skill payload,
-so a skills-enabled environment delivers flag and segment objects on the same connection.
-They are skipped, not evaluated — this store does no evaluation of any kind — and
-`diagnostics.objects_ignored` counts them.
+**The connection carries only skills.** Every request declares the skill payload, so flag
+and segment objects no longer arrive on it. Anything that is not a skill is still skipped
+rather than rejected — this store does no evaluation of any kind — and
+`diagnostics.objects_ignored` counts those: a nonzero count means the payload gained an
+object kind this version does not recognise, not that something failed.
 
 > **Beta caveats, worth knowing before you deploy.** Payload signing does not exist on this
 > channel yet, so delivery is TLS-only and the content hash establishes self-consistency, not

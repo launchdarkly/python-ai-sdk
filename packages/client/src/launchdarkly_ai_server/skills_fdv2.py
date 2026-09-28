@@ -288,8 +288,10 @@ class StoreDiagnostics:
     skill_objects_received: int = 0
     """``put-object`` events identified as skills, across all payloads."""
     objects_ignored: int = 0
-    """Objects skipped because they were not skills: flags, segments, and any
-    future kind. Skipping is the contract, not a failure."""
+    """Objects skipped because they were not skills. With the skill payload
+    declared on every request, this counts an object kind this version does not
+    recognise rather than the environment's flags. Skipping is the contract,
+    not a failure."""
     objects_revoked: int = 0
     """``delete-object`` events applied to skills."""
     payloads_ignored: int = 0
@@ -308,13 +310,13 @@ class StoreDiagnostics:
     """Recoverable transport failures since the last successful transfer."""
     payload_unavailable: int = 0
     """
-    Requests answered with "no payload of the kind you asked for"
-    (``_NoSkillPayloadError``). Cumulative, and never reset.
+    Requests answered "no payload of the kind you asked for" (HTTP 422), which
+    is the answer until the first skill is created in this project. Cumulative,
+    and never reset.
 
-    Deliberately not a ``connection_failures``: nothing is wrong, there is
-    nothing to deliver. Nonzero and rising alongside an empty store is the
-    difference between "this environment has no skills" and "delivery is
-    broken", which is the pair this whole type exists to separate.
+    Deliberately not counted as a connection failure: nothing is wrong, there is
+    nothing to deliver yet. Nonzero and rising alongside an empty store means
+    this environment has no skills, not that delivery is broken.
     """
     last_error: str | None = None
     """The most recent transport error, if any. Human-readable; do not parse."""
@@ -1037,8 +1039,9 @@ class _StaleRequestStateError(_RecoverableTransportError):
 
 _REQUEST_ADVICE = (
     "The request this adapter sent was not understood. It carries only the SDK "
-    "key and, after the first payload, a 'basis' selector, so check the base "
-    "URI and that the endpoint speaks FDv2."
+    "key, a 'kinds' parameter declaring the skill payload, and, after the first "
+    "payload, a 'basis' selector, so check the base URI and that the endpoint "
+    "speaks FDv2."
 )
 
 _FORBIDDEN_ADVICE = (
@@ -1109,10 +1112,10 @@ def _classify_status(status: int, headers: Any) -> Exception:
     if status == 422:
         return _NoSkillPayloadError(
             "LaunchDarkly has no Agent Skills payload for this environment "
-            "(HTTP 422). This is what it answers until the first skill is "
-            "created in this project, so delivery keeps asking and picks one up "
-            "without a restart. If this environment does have skills, check that "
-            "this SDK key belongs to it."
+            "(HTTP 422). That is the answer until the first skill is created in "
+            "this project; when one is, it reaches this store without a restart. "
+            "If this environment does have skills, check that this SDK key "
+            "belongs to it."
         )
     if status in (405, 406, 414, 501):
         return _FatalTransportError(
@@ -1971,8 +1974,8 @@ class FDv2SkillStore:
                     self._warned_no_skill_payload = True
                 if say_it:
                     logger.warning(
-                        "Skill delivery is idle: %s Retrying every %.1fs; this "
-                        "is the only time it will be said.",
+                        "Skill delivery is idle: %s Retrying every %.1fs. This "
+                        "is logged once.",
                         exc,
                         self._max_backoff,
                     )
