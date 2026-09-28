@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -330,6 +331,52 @@ class TestNativeAgent:
         await stream.aclose()
         assert provider_stream.exited == 1
         assert provider_stream.consumed == 1
+
+    @pytest.mark.asyncio
+    async def test_blocking_cancellation_marks_run_cancelled(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        ai_runtime.Agent.return_value.run.return_value = _CancelledContext()
+        root, model = MagicMock(), MagicMock()
+        with (
+            patch.object(handler_mod, "start_root_span", return_value=root),
+            patch.object(handler_mod, "start_model_span", return_value=model),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await create_vercel_agents_handler()(CONFIG, "hello")
+        for span in (root, model):
+            span.set_attribute.assert_any_call("launchdarkly.run.cancelled", True)
+            span.end.assert_called_once()
+            span.record_exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_cancellation_is_not_reported_as_abandoned(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        ai_runtime.Agent.return_value.run.return_value = _CancelledContext()
+        root, model = MagicMock(), MagicMock()
+        stream = await create_vercel_agents_handler().stream(CONFIG, "hello")
+        with (
+            patch.object(handler_mod, "start_root_span", return_value=root),
+            patch.object(handler_mod, "start_model_span", return_value=model),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            async for _event in stream:
+                pass
+        for span in (root, model):
+            span.set_attribute.assert_any_call("launchdarkly.run.cancelled", True)
+            assert "launchdarkly.stream.abandoned" not in [
+                call.args[0] for call in span.set_attribute.call_args_list
+            ]
+            span.end.assert_called_once()
+
+
+class _CancelledContext:
+    async def __aenter__(self) -> None:
+        raise asyncio.CancelledError
+
+    async def __aexit__(self, *_args: Any) -> None:
+        return None
 
 
 class TestGraphWrapper:

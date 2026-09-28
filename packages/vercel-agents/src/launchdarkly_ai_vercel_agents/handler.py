@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import json
@@ -352,6 +353,7 @@ def create_vercel_agents_handler(
         parent = parent_context_of(span)
         model_span = start_model_span(cfg, parent)
         failed = False
+        cancelled = False
         try:
             agent = ai.Agent(
                 tools=build_agent_tools(cfg.get("tools"), tool_handlers, parent=parent)
@@ -377,13 +379,20 @@ def create_vercel_agents_handler(
             mark_ok(model_span)
             mark_ok(span)
             return {"output": output, "usage": usage}
-        except BaseException as exc:
-            if isinstance(exc, Exception):
-                failed = True
-                fail_span(model_span, exc)
-                fail_span(span, exc)
+        except asyncio.CancelledError:
+            # Not an Exception: a timeout or task.cancel() must still mark the run
+            # cancelled, matching the other handlers and the native graph path.
+            cancelled = True
+            raise
+        except Exception as exc:
+            failed = True
+            fail_span(model_span, exc)
+            fail_span(span, exc)
             raise
         finally:
+            if cancelled:
+                model_span.set_attribute("launchdarkly.run.cancelled", True)
+                span.set_attribute("launchdarkly.run.cancelled", True)
             if not failed:
                 model_span.end()
                 span.end()
@@ -401,6 +410,7 @@ def create_vercel_agents_handler(
         model_span = start_model_span(cfg, parent)
         completed = False
         failed = False
+        cancelled = False
         provider_stream: Any = None
         try:
             agent = ai.Agent(
@@ -430,14 +440,19 @@ def create_vercel_agents_handler(
                 "output": output_of(provider_stream),
                 "usage": usage,
             }
-        except BaseException as exc:
-            if isinstance(exc, Exception):
-                failed = True
-                fail_span(model_span, exc)
-                fail_span(span, exc)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as exc:
+            failed = True
+            fail_span(model_span, exc)
+            fail_span(span, exc)
             raise
         finally:
-            if not completed and not failed:
+            if cancelled:
+                model_span.set_attribute("launchdarkly.run.cancelled", True)
+                span.set_attribute("launchdarkly.run.cancelled", True)
+            elif not completed and not failed:
                 model_span.set_attribute("launchdarkly.stream.abandoned", True)
                 span.set_attribute("launchdarkly.stream.abandoned", True)
             if not failed:

@@ -35,7 +35,7 @@ def _handoff_tool(
     description: str | None,
     selected: dict[str, str | None],
 ) -> Any:
-    async def transfer() -> str:
+    async def transfer(**_kwargs: Any) -> str:
         selected[source] = target
         return target
 

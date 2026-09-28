@@ -246,6 +246,8 @@ class TestTopology:
         assert [
             tool.name for tool in root_tools if tool.name.startswith("transfer_to_")
         ] == ["transfer_to_leaf"]
+        transfer = next(tool for tool in root_tools if tool.name == "transfer_to_leaf")
+        assert await transfer.execute(reason="the leaf owns this") == "leaf"
 
     @pytest.mark.asyncio
     async def test_terminal_node_has_no_handoff_tools(
