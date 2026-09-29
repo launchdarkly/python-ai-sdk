@@ -102,15 +102,12 @@ The closed ``reason_code`` vocabulary. Stable: a detection rule written against
 these tokens keeps working, so adding one is a deliberate edit here rather than
 a new string invented at the call site that needed it.
 
-Eight of the ten are one token per ``record_integrity_failure`` call site,
-decided inside ``verify_raw_skill`` over a single object, and they fire **both**
-detection surfaces. ``key_mismatch`` and ``version_mismatch`` are the exceptions
-on both counts: they come from ``record_key_mismatch`` and
-``record_version_mismatch`` at the retrieval boundary, after verification has
-already passed, and they fire the log record only. They share this vocabulary
-anyway because a customer's detection rule cares that integrity failed, not
-about which layer noticed — see ``record_key_mismatch`` for why the signal
-stays out of both.
+Eight of the ten come from ``record_integrity_failure`` inside
+``verify_raw_skill`` and fire **both** detection surfaces. ``key_mismatch`` and
+``version_mismatch`` are decided at the retrieval boundary instead, after
+verification has passed, and fire the log record only — see
+``record_key_mismatch`` for why the signal stays out. They share the vocabulary
+because a detection rule cares that integrity failed, not which layer noticed.
 """
 
 INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode))
@@ -369,7 +366,7 @@ def record_key_mismatch(requested: Any, served: Any) -> None:
 
     **Log record only — no product signal.** One of the two integrity failures
     that fire one surface rather than both — ``record_version_mismatch`` is the
-    other — and the asymmetry is the decision rather than an oversight.
+    other — and the asymmetry is deliberate.
 
     The record fires because a substituting store is a genuine tampering
     indicator, and the record is the customer-owned detection path — the only
@@ -431,31 +428,24 @@ def record_version_mismatch(key: Any, requested: Any, served: Any) -> None:
     """
     Records a store answering a version pin with some other version.
 
-    **Log record only — no product signal**, for the same reason
-    ``record_key_mismatch`` writes one surface rather than two: the usual cause
-    is a broken store adapter rather than tampered content, and LaunchDarkly's
-    own counter must not fill up with customers' adapter bugs. The two are the
-    same decision made at the same boundary for the same population, so they
-    stay in step — giving one of them a signal has to be justified for both.
+    **Log record only — no product signal**, for the reason
+    ``record_key_mismatch`` gives: the usual cause is a broken store adapter
+    rather than tampered content. The two are the same decision at the same
+    boundary, so they stay in step — giving one a signal has to be justified for
+    both.
 
     Takes the key as well as the two versions, unlike ``record_key_mismatch``:
     here the key is *not* what disagreed, and the record still has to name it.
 
     Neither shipped store can reach this — ``FDv2SkillStore`` and
     ``InMemorySkillStore`` both answer a pin with exactly that version or with
-    ``None``, so an ordinary pin miss is ``absent``. The record exists for the
-    custom adapter that can: ``get_skill`` is the documented default and
-    collapses ``wrong_version`` to ``None`` exactly as it collapses
-    ``integrity_failure``, so without it an operator on that accessor has no
-    visibility into a store answering pins with the wrong version at all.
-
-    Lives here, beside ``record_key_mismatch``, so the single-emission-site rule
-    still holds by reading one module.
+    ``None``, so an ordinary pin miss is ``absent``. It exists for the custom
+    adapter that can, where ``get_skill`` collapses ``wrong_version`` to
+    ``None`` and would otherwise leave an operator no visibility at all.
     """
     record: dict[str, Any] = {
-        # Alphabetical at the insertion site, as in ``record_key_mismatch``'s
-        # TypeScript counterpart, so a reader comparing the two languages sees
-        # one order. ``sort_keys`` below is what actually fixes the output.
+        # Alphabetical here, as in the TypeScript counterpart, so the two read
+        # the same; ``sort_keys`` below is what actually fixes the output.
         "action": _ACTION_WITHHELD,
         "event": INTEGRITY_FAILURE_EVENT,
         "language": _LANGUAGE,
@@ -468,34 +458,24 @@ def record_version_mismatch(key: Any, requested: Any, served: Any) -> None:
         # The version the store answered with: the one datum that makes a broken
         # adapter diagnosable, so it is a parseable field rather than prose
         # buried in ``reason``. Record-only, never on the signal's allowlist.
-        #
-        # Not shape-checked, and it needs no redaction: it is a number rather
-        # than a string copied off the wire, so it cannot carry the skill body,
-        # and ``invalid_version`` would have fired inside verification before
-        # this boundary was reached. It must stay an integer, though — the
-        # sorted-key JSON is compared byte-for-byte across SDKs, and ``3`` and
-        # ``"3"`` are not the same line.
+        # Needs no redaction — a number cannot carry the skill body — but must
+        # stay an integer: the sorted-key JSON is compared byte-for-byte across
+        # SDKs, and ``3`` and ``"3"`` are not the same line.
         "served_version": served,
         # The key the caller asked for, the meaning it has on every other
-        # record. Nothing off the wire reaches it on this path, but it is
-        # shape-checked on the same rule as every other key that reaches a
-        # surface.
+        # record, shape-checked on the same rule as every other key that
+        # reaches a surface.
         "skill_key": key if is_valid_skill_key(key) else "<invalid-key>",
         # The version *requested*, again the meaning it has everywhere else, so
-        # a rule that groups or filters on ``version`` keeps working.
-        #
-        # Deliberately not shape-checked, unlike ``skill_key`` beside it: this
-        # is the caller's own pin, not a store-controlled value, so there is no
-        # body-smuggling vector to close — and redacting it would only hide a
-        # caller's mistake from them in their own log. A ``SkillReference`` is
-        # not validated at construction, so a mistyped pin does reach this
-        # branch and lands here verbatim; that is the one point at which it
-        # becomes visible, and coercing it would mask it.
+        # a rule that groups or filters on ``version`` keeps working. Not
+        # shape-checked, unlike ``skill_key`` beside it: this is the caller's own
+        # pin rather than a store-controlled value, so there is no body to
+        # smuggle, and coercing a mistyped one would hide the caller's own
+        # mistake from their log.
         "version": requested,
     }
-    # No ``expected_hash`` or ``observed_hash``: verification passed, so the
-    # hashes are not what disqualified the answer and there is no disagreement
-    # to report. Absent fields stay absent rather than being emitted as null.
+    # No ``expected_hash`` or ``observed_hash``: verification passed, so there is
+    # no hash disagreement to report. Absent fields stay absent, never null.
     logger.error(
         "%s %s",
         INTEGRITY_FAILURE_EVENT,
@@ -944,17 +924,12 @@ def resolve_from_store(
             ),
         )
     if wanted_version is not None and skill.version != wanted_version:
-        # Records the log surface but not the product signal, on the same split
-        # and for the same reason as the key mismatch above: verification has
-        # already passed, so this is not a verification failure and does not go
-        # through ``record_integrity_failure``. The asymmetry is pinned by a
-        # test in both directions, because an implementation that emitted the
-        # signal too would look correct from every other angle.
-        #
-        # The check stays here rather than moving inside ``verify_raw_skill``
-        # for the reason the key check does: verification is unary and this
-        # comparison is relational, and threading an expected version in would
-        # make the parameter optional at every existing call site.
+        # Log surface only, on the same split and for the same reason as the key
+        # mismatch above: verification has already passed, so this is not a
+        # verification failure and does not go through
+        # ``record_integrity_failure``. A test pins the asymmetry both ways.
+        # The check stays out of ``verify_raw_skill`` for the reason the key
+        # check does: verification is unary, this comparison relational.
         record_version_mismatch(key, wanted_version, skill.version)
         return Resolution(
             reason="wrong_version",

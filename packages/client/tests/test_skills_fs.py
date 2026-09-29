@@ -1161,18 +1161,17 @@ class TestResilience:
     ) -> None:
         """The write path is the fourth caller of the shared resolution path.
 
-        ``write_skills`` resolves each pinned reference through
-        ``resolve_from_store``, so a store answering a pin with another version
-        writes the same ``version_mismatch`` record the accessors write — a
-        suite written to the accessors alone leaves this path uncovered.
+        ``write_skills`` resolves pinned references through
+        ``resolve_from_store``, so it writes the same ``version_mismatch``
+        record the accessors do — a suite written to the accessors alone leaves
+        this path uncovered.
 
         A ``wrong_version`` is per-skill and **not** ``unavailable``, so it
-        takes the narrow protection rather than the wholesale one: the key
-        stays in the requested set carrying an ``error`` action, the copy
-        already on disk survives, and the run is not marked incomplete — so the
-        genuinely revoked skill in the same run is still removed. An
-        implementation that suppressed the prune instead would protect the file
-        for the wrong reason and stop the rest of the reconcile converging.
+        takes the narrow protection: an ``error`` action, the on-disk copy
+        survives, and the run is not incomplete — so the genuinely revoked
+        skill in the same run is still removed. Suppressing the prune instead
+        would protect the file for the wrong reason and stop the rest of the
+        reconcile converging.
         """
 
         class WrongVersionStore:
@@ -1193,8 +1192,8 @@ class TestResilience:
 
         # Both managed by one manifest: ``_place_managed`` rewrites the whole
         # document, so calling it twice would leave the first key unmanaged and
-        # its file would then survive by clobber protection instead of by the
-        # retention this test is about.
+        # surviving by clobber protection rather than by the retention under
+        # test.
         pinned = _place_managed(root, "pdf-extraction", SKILL_BODY)
         revoked = root / "gone" / "SKILL.md"
         revoked.parent.mkdir(parents=True)

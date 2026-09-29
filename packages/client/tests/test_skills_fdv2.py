@@ -209,11 +209,9 @@ class _FakeFDv2Endpoint:
         self._streams: list[list[dict[str, Any]]] = []
         self._lock = threading.Lock()
         self.hold_stream_open = False
-        # What a poll is answered with once the queued script runs out. 304 --
-        # "nothing has changed" -- is the right default for a healthy
-        # environment, but a standing 422 is what an environment with no skill
-        # payload answers *every* request with, and a queue cannot express
-        # "every".
+        # What a poll is answered with once the queued script runs out. 304 is
+        # right for a healthy environment, but a connection with no skill
+        # payload answers *every* request 422, and a queue cannot say "every".
         self.default_poll_status = 304
         # When set, every ``/sdk/stream`` answers 307 to this URL instead of
         # streaming, so a test can check that the store refuses to follow it.
@@ -396,10 +394,9 @@ class TestObjectIdentification:
         self,
     ) -> None:
         """
-        Two different things, and neither is derived from the other: the store
-        asks for a payload of kind ``agent-skill`` and reads objects of kind
-        ``skill`` out of it. Held apart so that a rename of either cannot
-        silently move the other.
+        Neither is derived from the other: the store asks for a payload of kind
+        ``agent-skill`` and reads objects of kind ``skill`` out of it. Held
+        apart so a rename of either cannot silently move the other.
         """
         assert FDV2_PAYLOAD_KIND == "agent-skill"
         assert FDV2_OBJECT_KIND == "skill"
@@ -1256,9 +1253,8 @@ class TestPollingAgainstTheEndpoint:
     ) -> None:
         """
         No ``mv``: that parameter selects the *flag* data model, and delivery
-        overrides whatever a request asks for with the payload's own default for
-        any non-flagging payload. Sending it would state a preference that is
-        ignored, so the store states none.
+        overrides it with the payload's own default for any non-flagging
+        payload, so sending it would state a preference that is ignored.
         """
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         with poll_store(endpoint) as store:
@@ -1274,10 +1270,9 @@ class TestPollingAgainstTheEndpoint:
         """
         Delivery narrows a connection to the kinds it declares and defaults to
         flags, so a request without this parameter is served the environment's
-        flag payload and no skills at all. It is on the first request as well as
-        the ones after it: the declaration selects what the connection is served
-        rather than describing what it already holds, so there is no state for
-        it to wait on.
+        flag payload and no skills at all. It is on the first request too: the
+        declaration selects what the connection is served rather than describing
+        what it holds, so there is no state for it to wait on.
         """
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         endpoint.queue_poll(status=304)
@@ -1485,9 +1480,8 @@ class TestStreamingAgainstTheEndpoint:
         assert endpoint.requests[0]["accept"] == "text/event-stream"
 
     def test_the_stream_request_declares_the_payload_kind(self, endpoint: Any) -> None:
-        """Asserted separately from polling: the two hosts are different
-        origins, and nothing stops one path from building its URL without the
-        declaration that selects what the connection is served."""
+        """Asserted separately from polling: the two paths build their own URLs
+        against different origins."""
         endpoint.hold_stream_open = True
         endpoint.queue_stream(full_payload(("put-object", put_skill())))
         store = FDv2SkillStore(SDK_KEY, base_uri=endpoint.base_uri, mode="stream")
@@ -1918,8 +1912,7 @@ class TestFailureHandling:
         # The premise: the rejected request did carry client state to drop.
         assert "basis" in endpoint.requests[1]["query"]
         # The retry was from scratch: no selector and no etag on the way back.
-        # The kind declaration stays, since it is not client state — it selects
-        # what the connection is served.
+        # The kind declaration stays; it is not client state.
         retried = endpoint.requests[2]
         assert retried["query"] == {"kinds": FDV2_PAYLOAD_KIND}
         assert retried["if_none_match"] is None
@@ -1997,19 +1990,17 @@ class TestFailureHandling:
         assert isinstance(_classify_status(503, None), _RecoverableTransportError)
         assert not isinstance(_classify_status(503, None), _StaleRequestStateError)
         # 422 is fatal, and the platform chose the status to be exactly that:
-        # a connection whose declared kinds match no payload it is assigned is
-        # refused, with a code LaunchDarkly SDKs stop on rather than retry.
+        # a code SDKs stop on rather than retry.
         refused = _classify_status(422, None)
         assert isinstance(refused, _FatalTransportError)
         assert not isinstance(refused, _RecoverableTransportError)
 
     def test_every_status_is_either_recoverable_or_fatal(self) -> None:
         """
-        There is no third class, and the shape matters more than the name. A
-        status classified as neither broken nor terminal is a retry loop with no
-        bound and no budget — retrying for the life of the process and invisible
-        to ``failed`` and ``connection_failures`` alike — which is exactly what
-        held 422 before it was classified as fatal.
+        There is no third class. A status classified as neither broken nor
+        terminal is a retry loop with no bound and no budget — retrying for the
+        life of the process, invisible to ``failed`` and ``connection_failures``
+        alike — which is what held 422 before it was classified as fatal.
         """
         for status in range(300, 600):
             classified = _classify_status(status, None)
@@ -2022,18 +2013,17 @@ class TestFailureHandling:
 
     def test_there_is_no_expected_recoverable_error_class(self) -> None:
         """
-        Asserted gone by name, because a reintroduction is otherwise visible
-        only in a log line no test reads. The class existed only to hold 422 and
-        goes away with that classification.
+        Asserted gone by name: the class existed only to hold 422, and a
+        reintroduction is otherwise visible only in a log line no test reads.
         """
         assert not hasattr(skills_fdv2, "_NoSkillPayloadError")
 
     def test_diagnostics_does_not_count_an_unavailable_payload(self) -> None:
         """
-        ``StoreDiagnostics`` is public API from the moment it ships, so its field
-        list is the contract. A field counting "no payload of the kind you
-        declared" would count the 422 — and that status is fatal, so there is no
-        recurring event to accumulate and no running store to accumulate it on.
+        ``StoreDiagnostics`` is public API from the moment it ships, so its
+        field list is the contract. A field counting "no payload of the kind you
+        declared" would count the 422, which is fatal — no recurring event to
+        accumulate, and no running store to accumulate it on.
         """
         assert "payload_unavailable" not in StoreDiagnostics.__dataclass_fields__
         assert not hasattr(StoreDiagnostics(), "payload_unavailable")
@@ -2052,14 +2042,13 @@ class TestFailureHandling:
     def test_a_422_on_the_first_response_stops_delivery(self, endpoint: Any) -> None:
         """
         A 422 means this connection will never be assigned a skill payload, not
-        that the environment has no skills yet: with delivery enabled and a key
-        that is not view-scoped, an environment holding zero skills is assigned
-        an empty payload that commits normally. Every cause of the 422 is
-        permanent, so the first one is enough to stop on.
+        that the environment has no skills yet — an environment holding zero
+        skills is assigned an empty payload that commits normally. Every cause
+        is permanent, so the first 422 is enough to stop on.
         """
         endpoint.queue_poll(status=422)
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        # Well above one, to show the bound is not what stopped it.
+        # Well above one, so the bound is not what stopped it.
         with poll_store(endpoint, max_consecutive_failures=5) as store:
             assert wait_until(lambda: store.failed is not None)
         assert "422" in store.failed
@@ -2069,13 +2058,10 @@ class TestFailureHandling:
 
     def test_the_422_message_names_both_of_its_real_causes(self, endpoint: Any) -> None:
         """
-        The message is a contract, because it is what a customer pastes into a
-        support ticket: it has to name the account-level enablement and the key's
-        scoping so the first person to read it can check both without reading
-        platform source.
-
-        Asserted on substance rather than prose, so the wording stays free to
-        improve while a message that drops either cause fails.
+        The message is what a customer pastes into a support ticket, so it has
+        to name both causes — account-level enablement and the key's scoping —
+        for the first person reading it to check. Asserted on substance rather
+        than prose, so the wording stays free to improve.
         """
         endpoint.queue_poll(status=422)
         with poll_store(endpoint) as store:
@@ -2083,9 +2069,8 @@ class TestFailureHandling:
         message = store.failed.lower()
         assert "enabled" in message and "account" in message
         assert "view-scoped" in message
-        # The two things it must not say. Both are what the earlier text said,
-        # and both are false: the condition is not about whether any skill
-        # exists, and no skill created later arrives without a restart.
+        # The two things it must not say, both false: the condition is not about
+        # whether any skill exists, and nothing arrives without a restart.
         assert "first skill" not in message
         assert "without a restart" not in message
         # It does name what actually clears the condition.
@@ -2097,10 +2082,9 @@ class TestFailureHandling:
         """
         ``connection_failures`` measures consecutive *recoverable* failures
         against the retry bound. A fatal never retries, so counting one would
-        put a number against a budget nothing will spend and make a store that
-        gave up on its first response indistinguishable from one that exhausted
-        its attempts. ``_give_up`` already accounts 401 and 404 this way, and
-        422 reaching it means the accounting comes for free — so it is asserted
+        make a store that gave up on its first response indistinguishable from
+        one that exhausted its attempts. ``_give_up`` already accounts 401 and
+        404 this way, so routing 422 through it makes this free — asserted
         rather than implemented.
         """
         endpoint.queue_poll(status=422)
@@ -2112,14 +2096,10 @@ class TestFailureHandling:
 
     def test_a_fatal_422_releases_wait_for_skills_at_once(self, endpoint: Any) -> None:
         """
-        The observable difference from treating the status as recoverable, and
-        as much the point of the classification as the stopped retries are: a
-        boot gated on skills behind a ten-second wait would otherwise pay that
-        wait on every start, against a store that knew the answer on its first
-        response.
-
-        The timeout is far longer than the suite would tolerate sitting through,
-        so the assertion is on the value *and* the elapsed time.
+        As much the point of the classification as the stopped retries are: a
+        boot gated on skills would otherwise pay its whole timeout on every
+        start, against a store that knew the answer on its first response. The
+        assertion is on the value *and* the elapsed time.
         """
         endpoint.queue_poll(status=422)
         with poll_store(endpoint) as store:
@@ -2134,16 +2114,15 @@ class TestFailureHandling:
         self, endpoint: Any, tmp_path: Any
     ) -> None:
         """
-        "LaunchDarkly will not deliver skills to this connection" and "this
-        environment's every skill was revoked" are the two readings of an empty
-        answer, and only the second may delete a customer's files. A 422 commits
-        no payload, so the readiness probe stays false and the wildcard
-        reconcile withholds the prune for the whole run.
+        "LaunchDarkly will not deliver skills to this connection" and "every
+        skill here was revoked" are the two readings of an empty answer, and
+        only the second may delete a customer's files. A 422 commits no payload,
+        so the readiness probe stays false and the wildcard reconcile withholds
+        the prune for the whole run.
 
-        The composition is what is under test rather than either half: the
-        readiness gate already exists, but "delivery gave up, therefore the
-        store is empty, therefore prune" is the inference an implementation
-        makes when it has to assemble this behaviour from two sections. It is
+        The composition is under test rather than either half: "delivery gave
+        up, therefore the store is empty, therefore prune" is the inference an
+        implementation makes when it assembles this from two sections. It is
         also the path a filesystem-agent deployment takes when Agent Skills is
         not enabled for the account.
         """

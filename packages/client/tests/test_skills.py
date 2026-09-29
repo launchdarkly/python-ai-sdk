@@ -1802,17 +1802,14 @@ class TestIntegrityFailureLogRecord:
 
         Both directions matter. An eleventh token added to the source without a
         call site fails here, and so does an eleventh call site that invented a
-        token the table does not cover — which is what keeps the Python and TypeScript
-        vocabularies from drifting apart one edit at a time.
+        token the table does not cover — which is what keeps the Python and
+        TypeScript vocabularies from drifting apart one edit at a time.
 
-        ``key_mismatch`` and ``version_mismatch`` are added in rather than living
-        in the table because they are the two tokens that are *not* verification
-        failures: both are decided at the retrieval boundary, after
-        ``verify_raw_skill`` has already passed, so neither is reachable through
-        ``all_skills`` and neither can join a table that is uniformly driven
-        through it. Their own coverage is
-        ``test_key_mismatch_records_the_log_but_not_the_signal`` and
-        ``test_version_mismatch_records_the_log_but_not_the_signal``.
+        ``key_mismatch`` and ``version_mismatch`` are added in rather than
+        living in the table: both are decided at the retrieval boundary, after
+        ``verify_raw_skill`` has passed, so neither is reachable through
+        ``all_skills``. They are covered by the two
+        ``test_*_records_the_log_but_not_the_signal`` cases below.
         """
         from launchdarkly_ai_server import skills_core
 
@@ -1922,15 +1919,9 @@ class TestIntegrityFailureLogRecord:
     ) -> None:
         """The second one-directional exception to "the two surfaces agree".
 
-        The record fires for the reason the key mismatch's does: the log surface
-        is the customer-owned detection path, and the population that reaches
-        this branch is the same one — a broken custom store adapter. Neither
-        shipped store can produce it, since both answer a pin with exactly that
-        version or with ``None``, so an ordinary pin miss is ``absent``.
-
-        The signal stays out for the same reason too, and that half is asserted
-        in both directions: an implementation that emitted it here would satisfy
-        every other assertion in this class.
+        Record and signal split for the reasons the key mismatch's do, and the
+        signal half is asserted in both directions: an implementation that
+        emitted it here would satisfy every other assertion in this class.
         """
         skills_module._set_store(_WrongVersionAnsweringStore(make_raw_skill))
         skills_module._set_emitter_for_testing(recording_emitter)
@@ -1953,29 +1944,24 @@ class TestIntegrityFailureLogRecord:
 
         # Both versions are named, and ``version`` keeps the meaning it has on
         # every other record — the version *requested* — so a rule grouping or
-        # filtering on it still works. The version the store answered with is
-        # what makes a broken adapter diagnosable, so it is a parseable field
-        # rather than prose buried in ``reason``.
+        # filtering on it still works.
         assert record["skill_key"] == "asked-for"
         assert record["version"] == 1
         assert record["served_version"] == 99
-        # Integers, not strings: the sorted-key JSON is compared byte-for-byte
-        # across SDKs, and ``3`` and ``"3"`` are not the same line. ``bool`` is
-        # an ``int`` subclass, so the type is checked exactly.
+        # Integers, not strings: the JSON is compared byte-for-byte across SDKs.
+        # ``bool`` is an ``int`` subclass, so the type is checked exactly.
         assert type(record["version"]) is int
         assert type(record["served_version"]) is int
 
-        # Verification passed, so there is no hash disagreement to report and
-        # the two hash fields stay absent rather than being emitted as null.
+        # Verification passed, so the hash fields stay absent, never null.
         assert "expected_hash" not in record
         assert "observed_hash" not in record
-        # ``served_key`` belongs to the other boundary code; the two never
-        # appear on one record.
+        # ``served_key`` belongs to the other boundary code; never both.
         assert "served_key" not in record
         assert None not in record.values()
 
-        # Sorted, like every other record, so the line stays byte-comparable
-        # across SDKs. ``served_version`` has to land in its alphabetical place.
+        # Sorted like every other record, so ``served_version`` has to land in
+        # its alphabetical place.
         assert list(record) == sorted(record)
 
         # The structured mirror is required alongside the text.
@@ -1992,10 +1978,8 @@ class TestIntegrityFailureLogRecord:
         """The accessor the record exists for.
 
         ``get_skill`` is the documented default and collapses ``wrong_version``
-        to ``None`` exactly as it collapses ``integrity_failure``, so without
-        this record an operator on it has no visibility into a store answering
-        pins with the wrong version at all. Asserted separately from the
-        reported accessor because it is the whole reason the record is written.
+        to ``None``, so without this record an operator on it has no visibility
+        into a store answering pins with the wrong version at all.
         """
         skills_module._set_store(_WrongVersionAnsweringStore(make_raw_skill))
         skills_module._set_emitter_for_testing(recording_emitter)
@@ -2017,14 +2001,11 @@ class TestIntegrityFailureLogRecord:
     ) -> None:
         """Two boundary codes, one determined answer.
 
-        A store that answers under both a different key and a different version
-        disagrees twice. The key check runs first — an answer that is not the
-        requested skill at all makes its version moot — so this input reports
-        ``key_mismatch`` with outcome ``integrity_failure``, not
-        ``version_mismatch`` with outcome ``wrong_version``. Without a fixed
-        order both the code *and* the caller-visible outcome would be whichever
-        check the implementation happened to reach first, which is why this is
-        pinned rather than left to the reader.
+        The key check runs first — an answer that is not the requested skill at
+        all makes its version moot — so a store that disagrees twice reports
+        ``key_mismatch``/``integrity_failure``, not
+        ``version_mismatch``/``wrong_version``. Unpinned, both the code and the
+        caller-visible outcome would follow whichever check ran first.
         """
 
         class _DoublyDisagreeingStore:

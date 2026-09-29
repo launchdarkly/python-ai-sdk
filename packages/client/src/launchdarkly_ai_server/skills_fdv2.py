@@ -73,8 +73,8 @@ the whole test. The value happens to equal ``skills_core.SKILL_OBJECT_KIND``;
 they remain separate constants, because one is a wire value LaunchDarkly owns and
 the other is what this SDK asks a store for.
 
-Not to be confused with ``FDV2_PAYLOAD_KIND``: this is the kind of the *objects*,
-that one the kind of the *payload* they arrive in.
+Not ``FDV2_PAYLOAD_KIND``: this is the kind of the *objects*, that one the kind
+of the *payload* they arrive in.
 """
 
 FDV2_PAYLOAD_KIND = "agent-skill"
@@ -84,13 +84,12 @@ as ``?kinds=``.
 
 Delivery narrows a connection to the payload kinds it declares and defaults to
 flags, so this is not an optimisation: a request that omits it receives the
-environment's flag payload and no skills at all. Declaring it is also what makes
-the connection carry exactly one payload -- the shape ``_ProtocolReader`` is
-built for -- since a skill-enabled environment assigns both the flag payload and
-this one.
+environment's flag payload and no skills at all. It also makes the connection
+carry exactly one payload — the shape ``_ProtocolReader`` is built for — since a
+skill-enabled environment assigns both the flag payload and this one.
 
-The wire accepts a comma-separated list, but this store wants the skill payload
-and nothing else, so it declares this one kind alone.
+The wire accepts a comma-separated list; this store wants nothing but skills, so
+it declares this kind alone.
 """
 
 FDV2_KEY_DELIMITER = ":"
@@ -289,9 +288,8 @@ class StoreDiagnostics:
     """``put-object`` events identified as skills, across all payloads."""
     objects_ignored: int = 0
     """Objects skipped because they were not skills. With the skill payload
-    declared on every request, this counts an object kind this version does not
-    recognise rather than the environment's flags. Skipping is the contract,
-    not a failure."""
+    declared on every request, that means a kind this version does not
+    recognise rather than the environment's flags. Skipping is the contract."""
     objects_revoked: int = 0
     """``delete-object`` events applied to skills."""
     payloads_ignored: int = 0
@@ -1080,9 +1078,8 @@ def _classify_status(status: int, headers: Any) -> Exception:
             f"LaunchDarkly returned HTTP 400. {_REQUEST_ADVICE}"
         )
     if status == 422:
-        # Delivery refuses a connection whose declared kinds exclude every
-        # payload it is assigned, and chose a non-400 4xx precisely so SDKs stop
-        # instead of retrying.
+        # Delivery refuses a connection whose declared kinds match no payload it
+        # is assigned, and chose a non-400 4xx so SDKs stop instead of retrying.
         return _FatalTransportError(
             "LaunchDarkly will not deliver Agent Skills on this connection "
             "(HTTP 422). Either Agent Skills is not enabled for this account, "
@@ -1237,14 +1234,13 @@ class _Requester:
         *origin* is the host for this path — polling and streaming have one
         each.
 
-        ``kinds`` is on every request, including the first one, because it
-        selects what the connection is served rather than describing what it
-        already holds (see ``FDV2_PAYLOAD_KIND``).
+        ``kinds`` is on the first request too: it selects what the connection is
+        served rather than describing what it holds (see ``FDV2_PAYLOAD_KIND``).
 
         Deliberately no ``mv`` (data model version). That parameter selects the
-        *flag* data model; delivery overrides whatever a request asks for with
-        the payload's own default for any non-flagging payload, so sending it
-        would state a preference that is ignored.
+        *flag* data model, and delivery overrides it with the payload's own
+        default for any non-flagging payload, so sending it would state a
+        preference that is ignored.
         """
         query: dict[str, str] = {"kinds": FDV2_PAYLOAD_KIND}
         if basis:
