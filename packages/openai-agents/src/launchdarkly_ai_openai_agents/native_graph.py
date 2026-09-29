@@ -209,14 +209,24 @@ def to_openai_agents(
                         get_client().track(
                             "$ld:ai:graph:handoff_success", ld_context, td, 1
                         )
-                to_key = agent_name_to_key.get(to_agent.name)
-                if to_key and to_key not in path:
-                    path.append(to_key)
 
             async def on_agent_start(self, context: Any, agent: Any) -> None:
                 node_key = agent_name_to_key.get(agent.name)
-                if node_key and node_key not in path:
-                    path.append(node_key)
+                if not node_key or node_key in path:
+                    return
+                index = len(path)
+                path.append(node_key)
+                if not ld_context:
+                    return
+                node = def_obj.get_node(node_key)
+                if node:
+                    td = make_track_data(node, def_obj.key, run_id)
+                    get_client().track(
+                        "$ld:ai:graph:node",
+                        ld_context,
+                        {**td, "nodeKey": node_key, "index": index},
+                        1,
+                    )
 
         hooks = _LDHooks()
 
@@ -297,7 +307,6 @@ def to_openai_agents(
             client = get_client()
             client.track("$ld:ai:graph:duration:total", ld_context, root_td, duration)
             client.track("$ld:ai:graph:total_tokens", ld_context, root_td, total_tokens)
-            client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
             client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
 
         return {"response": final_output, "usage": total_usage}
