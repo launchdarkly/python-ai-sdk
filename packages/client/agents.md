@@ -267,17 +267,7 @@ strings, held apart on purpose. No `mv`: that parameter selects the *flag* data 
 delivery overrides whatever a request asks for with the payload's own default for any
 non-flagging payload, so sending it would state a preference that is ignored.
 
-**HTTP 422 is not a failure.** It is the answer to that declaration when the credential is
-assigned no agent-skill payload, which is every project in which no skill has ever been created
-— LaunchDarkly creates that payload with the environment's first skill, never in advance. So
-`_classify_status` maps it to `_NoSkillPayloadError`, and `_run` catches that **ahead of**
-`_RecoverableTransportError`: counted under `diagnostics.payload_unavailable`, logged once per
-store, retried at `max_backoff` indefinitely, and kept off `connection_failures`, `last_error`,
-and `failed`. Neither of the two obvious classifications is right — as a recoverable failure it
-spends `max_consecutive_failures` and then gives up permanently on an ordinary configuration;
-as a fatal one, the skill created a minute later never arrives without a process restart. The
-retry is at the *cap* rather than the initial backoff because `_failures` deliberately never
-moves, so the exponential schedule would sit at the initial delay forever.
+**HTTP 422 is fatal, and the platform decided that rather than the SDK inferring it.** Delivery answers 422 when a connection's declared kinds exclude every payload it is assigned, and it picked a non-400 4xx *because* LD SDKs treat those as terminal. So `classifyStatus` returns a `FatalTransportError` and the existing give-up path handles it: `failed` and `lastError` are set, `connectionFailures` is untouched (it measures consecutive *recoverable* failures against the retry bound, and a fatal never retries), and `waitForSkills` resolves `false` at once rather than at the timeout.
 
 **The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
 plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a

@@ -552,13 +552,20 @@ that as every skill having been revoked and delete the files it wrote on a previ
 against a store that has not received a payload reports the retrieval unavailable and leaves
 everything on disk alone. `report.ok` is `False` in that case, and the error names it.
 
-**A project with no skills yet is a waiting state, not a failure.** Every request declares the
-payload it wants (`kinds=agent-skill`), and LaunchDarkly answers HTTP 422 when the environment
-has no such payload — which is the case until somebody creates the first skill in the project.
-The store logs it once, keeps asking at its backoff cap, and picks up that first skill without
-a restart. `failed` stays `None` throughout, the 422s are kept off `connection_failures` and
-`last_error`, and `diagnostics.payload_unavailable` counts them: nonzero and rising beside an
-empty store means "there is nothing to deliver", not "delivery is broken".
+**A 422 means this connection will never be assigned a skill payload, and delivery stops.**
+Every request declares the payload it wants (`kinds=agent-skill`), and LaunchDarkly answers
+HTTP 422 when it will not serve one. The cause you can act on is a **view-scoped SDK key**:
+a key restricted to a view cannot be assigned a skill payload, so check the key's scoping and
+use one that is not view-scoped. The other cause is that Agent Skills delivery is not enabled
+for your account, which is not a setting you control — contact LaunchDarkly support if the key
+is not the problem. Retrying fixes neither, and LaunchDarkly chose the status so that SDKs stop
+rather than hammer the fleet, so the store gives up: `failed` carries the reason, `lastError` is
+populated, `connectionFailures` stays at zero (it counts consecutive *recoverable* failures against
+the retry bound, which a fatal never spends), and `waitForSkills` resolves `false` immediately
+instead of at your timeout. It is **not** the answer for an environment that merely has no skills
+yet — with delivery enabled and a non-view-scoped key, an environment holding zero skills is served
+an empty payload that commits normally. Because delivery has stopped for good, a process that booted
+while the cause was in effect picks up skills only after a restart.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
 objects through the `SkillStore` interface and cannot tell which store produced them.
@@ -641,7 +648,7 @@ Windows.
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
 | `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `base_uri` and `stream_uri` are separate hosts, defaulting to LaunchDarkly's polling and streaming origins; `base_uri` alone covers both. `close()` is **final** — `start()` afterwards raises. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
 | `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. `debounce` is in **seconds** and must be non-negative and finite; `on_reconcile` is called with each *subsequent* report, the initial one being returned directly. One watcher per root. |
-| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `payload_unavailable`, `last_error`. |
+| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,
 the accessors raise `RuntimeError` explaining what to do and `write_skills` reports the
