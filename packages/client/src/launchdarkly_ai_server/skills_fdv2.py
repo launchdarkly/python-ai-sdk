@@ -1082,17 +1082,11 @@ def _classify_status(status: int, headers: Any) -> Exception:
     if status == 422:
         # Delivery refuses a connection whose declared kinds exclude every
         # payload it is assigned, and chose a non-400 4xx precisely so SDKs stop
-        # instead of retrying. Its own branch rather than the generic list
-        # below: the two causes are specific and nothing about them is a
-        # malformed request, so ``_REQUEST_ADVICE`` would send the reader to the
-        # base URI, which is not where the problem is.
+        # instead of retrying.
         return _FatalTransportError(
             "LaunchDarkly will not deliver Agent Skills on this connection "
-            "(HTTP 422). Either Agent Skills is not enabled for this account, "
-            "or this SDK key is view-scoped — a view-scoped key cannot be "
-            "assigned a skill payload. Neither is fixed by retrying, so "
-            "delivery has stopped; restart the process once Agent Skills is "
-            "enabled for the account."
+            "(HTTP 422). The usual cause is a view-scoped SDK key. Check your "
+            "SDK key or contact LaunchDarkly support.
         )
     if status in (405, 406, 414, 501):
         return _FatalTransportError(
