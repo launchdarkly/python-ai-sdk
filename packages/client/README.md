@@ -552,19 +552,20 @@ that as every skill having been revoked and delete the files it wrote on a previ
 against a store that has not received a payload reports the retrieval unavailable and leaves
 everything on disk alone. `report.ok` is `False` in that case, and the error names it.
 
-**Agent Skills has to be enabled for your account.** Every request declares the payload it
-wants (`kinds=agent-skill`), and LaunchDarkly answers HTTP 422 when this connection will never
-be assigned that payload: either Agent Skills is not enabled for the account, or the SDK key is
-view-scoped, which cannot be assigned a skill payload. Neither is fixed by retrying, so delivery
-stops — `failed` carries the reason and `last_error` is populated, while `connection_failures`
-stays at zero, since nothing was retried. The store never initializes, so a reconcile takes the
-readiness path above: `write_skills("*")` reports the retrieval unavailable and leaves every
-file on disk alone. Enabling Agent Skills for the account reaches a process that already gave
-up only when that process restarts.
-
-An environment that simply has no skills yet is **not** this case. It is assigned an empty
-agent-skill payload, which commits normally and initializes the store, so a skill created later
-arrives over the running connection with no restart.
+**A 422 means this connection will never be assigned a skill payload, and delivery stops.**
+Every request declares the payload it wants (`kinds=agent-skill`), and LaunchDarkly answers
+HTTP 422 when it will not serve one. The cause you can act on is a **view-scoped SDK key**:
+a key restricted to a view cannot be assigned a skill payload, so check the key's scoping and
+use one that is not view-scoped. The other cause is that Agent Skills delivery is not enabled
+for your account, which is not a setting you control — contact LaunchDarkly support if the key
+is not the problem. Retrying fixes neither, and LaunchDarkly chose the status so that SDKs stop
+rather than hammer the fleet, so the store gives up: `failed` carries the reason, `lastError` is
+populated, `connectionFailures` stays at zero (it counts consecutive *recoverable* failures against
+the retry bound, which a fatal never spends), and `waitForSkills` resolves `false` immediately
+instead of at your timeout. It is **not** the answer for an environment that merely has no skills
+yet — with delivery enabled and a non-view-scoped key, an environment holding zero skills is served
+an empty payload that commits normally. Because delivery has stopped for good, a process that booted
+while the cause was in effect picks up skills only after a restart.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
 objects through the `SkillStore` interface and cannot tell which store produced them.
