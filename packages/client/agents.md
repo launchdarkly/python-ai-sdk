@@ -267,28 +267,7 @@ strings, held apart on purpose. No `mv`: that parameter selects the *flag* data 
 delivery overrides whatever a request asks for with the payload's own default for any
 non-flagging payload, so sending it would state a preference that is ignored.
 
-**HTTP 422 is fatal, and the platform decided that rather than this SDK inferring it.**
-Delivery answers it when a connection's declared kinds exclude every payload it is assigned, and
-it picked a non-400 4xx *because* LaunchDarkly SDKs treat those as terminal — the streamer
-records the intent at both the narrow-assignment check and the status constant itself, each
-saying the code exists so a misconfigured SDK stops instead of hammering the fleet. Retrying it
-forever is the behaviour the status was chosen to prevent. So `_classify_status` returns a
-`_FatalTransportError` and `_run` reaches `_give_up` through the same path as 401 and 404, which
-is what gives the right accounting for free: `failed` and `last_error` are set, and
-`connection_failures` is untouched, because that counter measures consecutive *recoverable*
-failures against the retry bound and a fatal never retries. `wait_for_skills` returns `False`
-immediately rather than at the timeout, via `_give_up` → `_end_delivery` → `_released`.
-
-The gate is `payloadvers.SkillDeliveryAllowed` in gonfalon: skill delivery enabled for the
-account, **and** a credential that is not view-scoped. Every way of failing it is permanent —
-the account's beta gate is off, the key is view-scoped, or the declared kind is not one delivery
-recognises. **Skill existence is not among the causes**, which is what the error message must
-not claim: with the gate open and a non-view-scoped key, the assignment path creates the
-agent-skill payload row lazily, so an environment holding zero skills is assigned an empty
-payload that commits normally through `payload-transferred`. The one cost is that enabling Agent
-Skills for an account does not reach a process whose store already gave up: nothing reopens
-delivery short of constructing a new store, since `close` is final and a later `start` raises.
-That is preferred to retrying a permanent rejection for the life of the process.
+**HTTP 422 is fatal, and the platform decided that rather than the SDK inferring it.** Delivery answers 422 when a connection's declared kinds exclude every payload it is assigned, and it picked a non-400 4xx *because* LD SDKs treat those as terminal. So `classifyStatus` returns a `FatalTransportError` and the existing give-up path handles it: `failed` and `lastError` are set, `connectionFailures` is untouched (it measures consecutive *recoverable* failures against the retry bound, and a fatal never retries), and `waitForSkills` resolves `false` at once rather than at the timeout.
 
 **The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
 plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a
