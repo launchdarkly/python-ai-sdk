@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -538,6 +539,59 @@ def select_handler(
     raise ValueError(f"Handler for provider {provider} not found")
 
 
+def model_stamps_from_meta(meta: Any) -> dict[str, Any]:
+    """
+    Copies the pinned model-config identity (``modelKey``, ``modelVersion``)
+    from a variation's ``_ldMeta`` into a dict that can be merged into
+    ``TrackData``. Keys are omitted (never set to ``None``) when absent; an
+    empty ``modelKey`` is treated as absent and ``modelVersion`` is coerced to
+    ``int``. Gonfalon's cost attribution reads these two fields from every
+    ``$ld:ai:*`` event payload.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    stamps: dict[str, Any] = {}
+    model_key = meta.get("modelKey")
+    if isinstance(model_key, str) and model_key:
+        stamps["modelKey"] = model_key
+    model_version = _coerce_model_version(meta.get("modelVersion"))
+    if model_version is not None:
+        stamps["modelVersion"] = model_version
+    return stamps
+
+
+def _coerce_model_version(value: Any) -> int | None:
+    """
+    Coerces an ``_ldMeta.modelVersion`` value to ``int``. Accepts ``int``
+    (but not ``bool``), integral ``float`` and integer-looking ``str``;
+    returns ``None`` for anything else. ``_ldMeta`` is an untyped flag payload,
+    so a malformed value must be dropped rather than abort the invocation.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def omit_model_stamps(track_data: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Returns a copy of ``track_data`` without ``modelKey`` / ``modelVersion``.
+    Used when overlaying a judge's ``track_data`` on its parent's so a judge
+    without a pinned model config does not inherit the parent's identity.
+    """
+    return {
+        k: v for k, v in track_data.items() if k not in ("modelKey", "modelVersion")
+    }
+
+
 def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, Any]:
     """
     Builds the standard tracking payload for a graph node event.
@@ -552,6 +606,7 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
         "version": meta.get("version", 1),
         "modelName": config.get("model", {}).get("name", ""),
         "providerName": config.get("provider", {}).get("name", ""),
+        **model_stamps_from_meta(meta),
         "graphKey": graph_key,
     }
 

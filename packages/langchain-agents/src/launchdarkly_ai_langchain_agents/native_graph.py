@@ -15,11 +15,14 @@ from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
     NativeTool,
+    compose_history,
     get_client,
     make_track_data,
     parse_template,
     to_ld_context,
 )
+
+from .messages import to_lang_chain_messages
 
 try:
     from opentelemetry import trace
@@ -129,6 +132,7 @@ def to_lang_graph(
     async def invoke(
         input_text: str = "",
         variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         import importlib
 
@@ -165,8 +169,8 @@ def to_lang_graph(
 
         tracer_name = "@launchdarkly/ai-langchain-agents"
         if _HAS_OTEL:
-            span = trace.get_tracer(tracer_name).start_span("ld.ai.graph")
-            span.set_attribute("ld.ai.graph.key", def_obj.key)
+            span = trace.get_tracer(tracer_name).start_span("launchdarkly.graph")
+            span.set_attribute("launchdarkly.graph.key", def_obj.key)
         else:
             span = None
 
@@ -196,9 +200,11 @@ def to_lang_graph(
                 chat_model = model_factory(node)
             else:
                 lc_openai = importlib.import_module("langchain_openai")
-                chat_model = lc_openai.ChatOpenAI(
-                    model=node.config.get("model", {}).get("name", "gpt-4o")
-                )
+                model_cfg = node.config.get("model") or {}
+                raw = model_cfg.get("parameters")
+                kwargs = dict(raw) if isinstance(raw, dict) else {}
+                kwargs["model"] = model_cfg.get("name") or "gpt-4o"
+                chat_model = lc_openai.ChatOpenAI(**kwargs)
 
             regular_tools = _build_node_tools(node, tool_handlers)
 
@@ -236,7 +242,17 @@ def to_lang_graph(
             async def _node_fn(
                 state: WorkflowState, _node: GraphNode = node
             ) -> dict[str, Any]:
-                path.append(_node.key)
+                if _node.key not in path:
+                    index = len(path)
+                    path.append(_node.key)
+                    if ld_context:
+                        node_td = make_track_data(_node, def_obj.key, run_id)
+                        get_client().track(
+                            "$ld:ai:graph:node",
+                            ld_context,
+                            {**node_td, "nodeKey": _node.key, "index": index},
+                            1,
+                        )
                 node_start = time.monotonic()
 
                 system_prompt = _build_system_prompt(_node, vs)
@@ -341,8 +357,19 @@ def to_lang_graph(
 
         compiled = builder.compile()
 
+        # History is a root-only concern: it seeds the initial message state the
+        # entry node reads. Downstream nodes are reached through handoffs and see
+        # the accumulated graph state, never the original `history` array.
+        initial_messages = (
+            to_lang_chain_messages(
+                compose_history(history=history, user_input=input_text)
+            )
+            if history
+            else [HumanMessage(input_text)]
+        )
+
         try:
-            result = await compiled.ainvoke({"messages": [HumanMessage(input_text)]})
+            result = await compiled.ainvoke({"messages": initial_messages})
             if span:
                 span.set_status(SpanStatusCode.OK)
         except Exception as exc:
@@ -378,7 +405,7 @@ def to_lang_graph(
         final_output = _content_str(last_msg)
 
         if span:
-            span.set_attribute("ld.ai.graph.path", "->".join(path))
+            span.set_attribute("launchdarkly.graph.path", "->".join(path))
             span.set_attribute("gen_ai.usage.input_tokens", total_usage["input"])
             span.set_attribute("gen_ai.usage.output_tokens", total_usage["output"])
             span.set_attribute("gen_ai.usage.total_tokens", total_usage["total"])
@@ -391,7 +418,6 @@ def to_lang_graph(
             client.track(
                 "$ld:ai:graph:total_tokens", ld_context, root_td, total_usage["total"]
             )
-            client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
             client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
 
         return {"response": final_output, "usage": total_usage}

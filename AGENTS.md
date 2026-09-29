@@ -90,7 +90,7 @@ graph TD
   newHandler["launchdarkly-ai-new-provider\n(future)"]
  end
  subgraph tier0 ["Tier 0 — Core"]
-  ai["launchdarkly-ai\n(convenience barrel)"]
+  ai["launchdarkly-ai-python\n(convenience barrel)"]
   client["launchdarkly-ai-server"]
  end
 
@@ -109,9 +109,9 @@ graph TD
 ### Tiers
 
 - **Tier 0 — Core** (`launchdarkly-ai-server`): The foundation. Owns all LaunchDarkly integration, telemetry orchestration, shared data types, and the primary entry points (`config()`, `graph()`, `resolve_graph()`). Has no dependency on any other `launchdarkly-ai-*` package.
-- **Tier 0 — Convenience barrel** (`launchdarkly-ai`): A pure re-export package that makes all of `launchdarkly-ai-server` available under a shorter install name. No new logic — intended as the default install for most Python applications.
+- **Tier 0 — Convenience barrel** (`launchdarkly-ai-python`): A pure re-export package that makes all of `launchdarkly-ai-server` available under a shorter install name. No new logic — intended as the default install for most Python applications.
 - **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages.
-- **Tier 2 — Consumer applications** (e.g. `main.py`, downstream projects): Imports from one or more handler packages and either `launchdarkly-ai` or `launchdarkly-ai-server`. Owns tool implementations and orchestration logic. No `launchdarkly-ai-*` package should ever depend on Tier 2 code.
+- **Tier 2 — Consumer applications** (e.g. `main.py`, downstream projects): Imports from one or more handler packages and either `launchdarkly-ai-python` or `launchdarkly-ai-server`. Owns tool implementations and orchestration logic. No `launchdarkly-ai-*` package should ever depend on Tier 2 code.
 
 ### Rules
 
@@ -193,6 +193,8 @@ LaunchDarkly metadata attached to a flag variation.
 | `variationKey` | `str?` | Identifier for the specific variation. |
 | `version` | `int?` | Variation version number. |
 | `mode` | `"agent" \| "completion" \| "judge"` | Execution mode, used alongside `provider.name` to select a handler. |
+| `modelKey` | `str?` | Stable key of the pinned model config, from `_ldMeta.modelKey`. Absent when the variation has no linked model config. Copied onto `TrackData`. |
+| `modelVersion` | `int?` | Pinned model config version, from `_ldMeta.modelVersion`. Copied onto `TrackData`. |
 
 #### `ProviderResponse`
 
@@ -240,6 +242,8 @@ Payload attached to every LaunchDarkly tracking event.
 | `version` | `int` | Variation version number. |
 | `modelName` | `str` | Model name from the config. |
 | `providerName` | `str` | Provider name from the config. |
+| `modelKey` | `str?` | Stable key of the pinned model config, read from `_ldMeta.modelKey`. Omitted when the variation has no pinned model config. |
+| `modelVersion` | `int?` | Pinned model config version, read from `_ldMeta.modelVersion`. Omitted when absent. |
 | `graphKey` | `str?` | Present when the event was produced inside an agent graph. |
 | `toolKey` | `str?` | Present when the event is for a tool call. |
 | `judgeConfigKey` | `str?` | Present when the event is from a judge execution. |

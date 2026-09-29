@@ -1484,40 +1484,65 @@ class TestHistory:
         {"role": "user", "content": "What is feature flagging?"},
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
+    IMAGE_HISTORY: ClassVar[list[dict[str, Any]]] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc123",
+                    },
+                }
+            ],
+        }
+    ]
 
-    def test_history_appended_to_instructions(self) -> None:
+    def test_history_is_structured_input_not_system_prompt_text(self) -> None:
         config = _make_config(instructions="Be concise.")
-        _, _, instructions = _build_agent_and_prompt(
+        _, prompt, instructions = _build_agent_and_prompt(
             config, "hi", {}, {}, self.SAMPLE_HISTORY
         )
         assert instructions is not None
-        assert "Conversation History:" in instructions
         assert "Be concise." in instructions
+        assert "Conversation History:" not in instructions
+        assert isinstance(prompt, list)
+        assert "What is feature flagging?" in str(prompt)
+        assert "hi" in str(prompt)
 
-    def test_history_format_is_correct(self) -> None:
+    def test_history_turns_appear_before_user_input(self) -> None:
         config = _make_config(instructions="Be helpful.")
-        _, _, instructions = _build_agent_and_prompt(
-            config, "hi", {}, {}, self.SAMPLE_HISTORY
+        _, prompt, _ = _build_agent_and_prompt(
+            config, "follow up", {}, {}, self.SAMPLE_HISTORY
         )
-        assert instructions is not None
-        assert "user: What is feature flagging?" in instructions
-        assert "assistant: Feature flagging is a technique..." in instructions
+        assert isinstance(prompt, list)
+        serialized = str(prompt)
+        assert serialized.index("What is feature flagging?") < serialized.rindex(
+            "follow up"
+        )
 
     def test_empty_history_treated_like_no_history(self) -> None:
         config = _make_config(instructions="Be concise.")
-        _, _, instr_with_empty = _build_agent_and_prompt(config, "hi", {}, {}, [])
-        _, _, instr_without = _build_agent_and_prompt(config, "hi", {}, {})
+        _, prompt_with_empty, instr_with_empty = _build_agent_and_prompt(
+            config, "hi", {}, {}, []
+        )
+        _, prompt_without, instr_without = _build_agent_and_prompt(config, "hi", {}, {})
         assert instr_with_empty == instr_without
         assert "Conversation History:" not in (instr_with_empty or "")
+        assert prompt_with_empty == prompt_without
 
-    def test_history_without_prior_instructions(self) -> None:
-        config = _make_config()
-        _, _, instructions = _build_agent_and_prompt(
-            config, "hi", {}, {}, self.SAMPLE_HISTORY
+    def test_multimodal_image_history_maps_to_input_image(self) -> None:
+        config = _make_config(instructions="Be helpful.")
+        _, prompt, instructions = _build_agent_and_prompt(
+            config, "describe", {}, {}, self.IMAGE_HISTORY
         )
         assert instructions is not None
-        assert "Conversation History:" in instructions
-        assert "user: What is feature flagging?" in instructions
+        assert "Conversation History:" not in instructions
+        assert isinstance(prompt, list)
+        assert "input_image" in str(prompt)
+        assert "data:image/png;base64,abc123" in str(prompt)
 
 
 # ---------------------------------------------------------------------------

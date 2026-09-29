@@ -5,6 +5,7 @@ Reference: TESTING.md §2.2, §2.x.3
 
 from __future__ import annotations
 
+import json
 import sys
 from contextlib import contextmanager
 from typing import Any
@@ -188,6 +189,38 @@ def _make_langgraph_mocks(ai_msg: Any) -> dict[str, Any]:
     }
 
 
+def _capture_compiled_state(mocks: dict[str, Any], ai_msg: Any) -> list[dict[str, Any]]:
+    """Swaps in a StateGraph whose compiled graph records the state it is invoked
+    with, so a test can assert on the root's initial messages."""
+    states: list[dict[str, Any]] = []
+
+    class _CapturingStateGraph:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def add_node(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def add_edge(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def add_conditional_edges(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def compile(self) -> Any:
+            compiled = MagicMock()
+
+            async def _ainvoke(state: dict[str, Any]) -> Any:
+                states.append(state)
+                return {"messages": [ai_msg]}
+
+            compiled.ainvoke = _ainvoke
+            return compiled
+
+    mocks["langgraph.graph"].StateGraph = _CapturingStateGraph
+    return states
+
+
 @contextmanager
 def _patch_imports(mocks: dict[str, Any]) -> Any:
     """Patch sys.modules so importlib.import_module picks up our mocks."""
@@ -257,6 +290,44 @@ class TestToLangGraphLangChainSpecific:
         with _patch_imports(mocks):
             with pytest.raises(ValueError, match="disabled"):
                 await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+    @pytest.mark.asyncio
+    async def test_default_chat_openai_receives_model_parameters(self) -> None:
+        ai_msg = _make_ai_msg("final")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {
+                            "name": "gpt-4o",
+                            "parameters": {"temperature": 0.2, "max_tokens": 512},
+                        },
+                        "instructions": "help",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+
+        async def _visit(fn: Any, ctx: Any = None) -> None:
+            if graph_def.root is not None:
+                await fn(graph_def.root)
+
+        graph_def.traverse = _visit
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        mocks["langchain_openai"].ChatOpenAI.assert_called_once()
+        assert mocks["langchain_openai"].ChatOpenAI.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "model": "gpt-4o",
+        }
 
     @pytest.mark.asyncio
     async def test_null_root_throws(self) -> None:
@@ -363,6 +434,38 @@ class TestToLangGraphLangChainSpecific:
                 ).invoke("hi")
 
         assert "$ld:ai:graph:invocation_success" in track_calls
+        assert "$ld:ai:graph:path" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_node_function_emits_graph_node(self) -> None:
+        track_calls: list[tuple[str, Any, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data, val))
+        )
+
+        ai_msg = _make_ai_msg("done")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "test"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+                node_fn = mocks["_node_fns"]["root"]
+                await node_fn({"messages": []})
+
+        node_events = [item for item in track_calls if item[0] == "$ld:ai:graph:node"]
+        assert len(node_events) == 1
+        assert node_events[0][1]["nodeKey"] == "root"
+        assert node_events[0][1]["index"] == 0
+        assert node_events[0][2] == 1
 
     @pytest.mark.asyncio
     async def test_invocation_failure_tracked(self) -> None:
@@ -503,9 +606,11 @@ class TestToLangGraphLangChainSpecific:
                 with patch.object(ng_mod, "_HAS_OTEL", True):
                     await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
 
-        mock_trace.get_tracer.return_value.start_span.assert_called_with("ld.ai.graph")
+        mock_trace.get_tracer.return_value.start_span.assert_called_with(
+            "launchdarkly.graph"
+        )
         calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert "ld.ai.graph.key" in calls
+        assert "launchdarkly.graph.key" in calls
 
     @pytest.mark.asyncio
     async def test_terminal_leaf_connected_to_end(self) -> None:
@@ -691,6 +796,54 @@ class TestToLangGraphLangChainSpecific:
         ]
         assert system_msgs, "No SystemMessage found"
         assert "expert" in system_msgs[0].content
+
+    @pytest.mark.asyncio
+    async def test_no_history_seeds_root_with_plain_human_message(self) -> None:
+        ai_msg = _make_ai_msg()
+        mocks = _make_langgraph_mocks(ai_msg)
+        states = _capture_compiled_state(mocks, ai_msg)
+        graph_def = _make_graph_def()
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        messages = states[0]["messages"]
+        assert len(messages) == 1
+        assert messages[0].content == "hi"
+
+    @pytest.mark.asyncio
+    async def test_history_seeds_root_with_native_image_content(self) -> None:
+        """A multimodal history reaches the root as LangChain image content."""
+        ai_msg = _make_ai_msg()
+        mocks = _make_langgraph_mocks(ai_msg)
+        states = _capture_compiled_state(mocks, ai_msg)
+        graph_def = _make_graph_def()
+
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke(
+                "describe", {}, history
+            )
+
+        serialized = json.dumps([m.content for m in states[0]["messages"]])
+        assert "image_url" in serialized or '"type": "image"' in serialized
+        assert "abc123" in serialized
+        assert "describe" in serialized
 
     @pytest.mark.asyncio
     async def test_config_tools_creates_tool_node(self) -> None:

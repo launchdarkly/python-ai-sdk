@@ -9,11 +9,14 @@ Examples:
     python main.py streaming                launch-darkly-documentation-summarizer "Summarise feature flags in 3 bullets"
     python main.py judge                    launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py graph                    my-agent-graph "What is the LaunchDarkly AI SDK?"
+    python main.py graph-history            my-agent-graph ""
+    python main.py graph-streaming          travel-agent-flow "I was double charged for my flight"
     python main.py openai-only              my-openai-flag "Tell me about feature flags"
     python main.py langchain                my-langchain-flag "Tell me about feature flags"
     python main.py claude-agents            launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py openai-agents            launch-darkly-documentation-summarizer-open-ai-only "What is the LaunchDarkly AI SDK?"
     python main.py langchain-agents         launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
+    python main.py langchain-thinking       launch-darkly-documentation-summarizer-messages-claude "Reason it out yourself without any tools: what is 17 times 23?"
     python main.py native-graph             travel-agent-flow "Book me a flight to Paris"
     python main.py native-graph-langchain   travel-agent-flow "Book me a flight to Paris"
 """
@@ -43,6 +46,8 @@ EXAMPLES: dict[str, str] = {
     "agent": "examples.agent",
     "streaming": "examples.streaming",
     "graph": "examples.graph_example",
+    "graph-history": "examples.graph_history",
+    "graph-streaming": "examples.graph_streaming",
     "conversation": "examples.conversation",
     "history": "examples.history",
     "judge": "examples.judge_example",
@@ -54,6 +59,7 @@ EXAMPLES: dict[str, str] = {
     "langchain": "examples.langchain_example",
     "langchain-agents": "examples.langchain_agents_example",
     "langchain-messages": "examples.langchain_messages_example",
+    "langchain-thinking": "examples.langchain_thinking",
     "native-graph": "examples.native_graph",
     "native-graph-langchain": "examples.native_graph_langchain",
 }

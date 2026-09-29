@@ -1733,6 +1733,64 @@ class TestHistory:
         roles = [m["role"] for m in msgs]
         assert "system" not in roles
 
+    async def test_image_history_plus_user_input_merges_into_one_user_turn(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    }
+                ],
+            }
+        ]
+        h = create_claude_messages_handler()
+        await h(CONFIG, "What colour is this?", {}, {}, history)
+        msgs = mock_anthropic.messages.create.call_args.kwargs["messages"]
+        roles = [m["role"] for m in msgs]
+        assert not any(
+            roles[i] == "user" and roles[i + 1] == "user" for i in range(len(roles) - 1)
+        )
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert isinstance(last["content"], list)
+        assert any(b["type"] == "image" for b in last["content"])
+        assert any(
+            b["type"] == "text" and b["text"] == "What colour is this?"
+            for b in last["content"]
+        )
+
+    async def test_history_ending_in_user_text_plus_user_input_merges(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        h = create_claude_messages_handler()
+        await h(
+            CONFIG,
+            "follow-up",
+            {},
+            {},
+            [{"role": "user", "content": "prior question"}],
+        )
+        msgs = mock_anthropic.messages.create.call_args.kwargs["messages"]
+        merged_text = "".join(
+            b["text"]
+            for b in msgs[-1]["content"]
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+        assert "prior question" in merged_text
+        assert "follow-up" in merged_text
+
 
 class TestConvenienceWrapperForwardsCaptureContent:
     """`capture_content` must reach the handler, not fall through into `config()`.

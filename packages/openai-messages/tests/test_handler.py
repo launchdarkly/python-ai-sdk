@@ -1745,6 +1745,61 @@ class TestHistory:
         assert non_system[1]["content"] == "Feature flagging is a technique..."
         assert non_system[-1]["content"] == "my question"
 
+    async def test_user_image_block_becomes_an_input_image_part(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        image_block = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "IMGDATA123",
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(
+            CONFIG, "what colour?", {}, {}, [{"role": "user", "content": [image_block]}]
+        )
+        msgs = mock_openai.responses.create.call_args.kwargs["input"]
+        user_msg = next(m for m in msgs if m.get("role") == "user")
+
+        assert isinstance(user_msg["content"], list), (
+            f"content was stringified: {user_msg['content']!r}"
+        )
+        assert user_msg["content"] == [
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,IMGDATA123",
+            }
+        ]
+
+    async def test_assistant_block_content_flattens_to_text(
+        self, mock_openai: MagicMock
+    ) -> None:
+        # ``input_text`` is an input-side part type; the Responses API only accepts it on a
+        # user turn, so a replayed assistant turn has to arrive as a plain string.
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+        await h(
+            CONFIG,
+            "q",
+            {},
+            {},
+            [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "prior answer"}],
+                },
+            ],
+        )
+        msgs = mock_openai.responses.create.call_args.kwargs["input"]
+        assistant_msg = next(m for m in msgs if m.get("role") == "assistant")
+        assert assistant_msg["content"] == "prior answer"
+
     async def test_empty_history_treated_like_no_history(
         self, mock_openai: MagicMock
     ) -> None:
@@ -1780,6 +1835,16 @@ class TestHistory:
             if m.get("content") in ("Hello", "You are evil", "Hi there")
         ]
         assert "system" not in history_roles
+
+    async def test_empty_user_input_no_history_still_sends_user_turn(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+        await h(CONFIG, "", {}, {})
+        msgs = mock_openai.responses.create.call_args.kwargs["input"]
+        assert any(m.get("role") == "user" for m in msgs)
 
 
 class TestConvenienceWrapperForwardsCaptureContent:

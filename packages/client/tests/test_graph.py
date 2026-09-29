@@ -192,6 +192,55 @@ class TestGraphInvoke:
         result = await g.invoke("hi", CONTEXT)
         assert result.response is not None
 
+    async def test_graph_events_copy_model_key_and_version_from_ld_meta(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        graph_var = {
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "gv1",
+                "version": 2,
+                "modelKey": "graph-model",
+                "modelVersion": 5,
+            },
+            "root": "root-node",
+            "edges": {"root-node": [{"key": "leaf-node"}]},
+        }
+        original = mock_ld_client.variation
+
+        async def side_effect(key: str, ctx: dict, default: Any) -> Any:
+            if key == "graph-key":
+                return graph_var
+            return await original(key, ctx, default)
+
+        mock_ld_client.variation = AsyncMock(side_effect=side_effect)
+        g = graph("graph-key", handlers=[_make_handler()])
+        await g.invoke("hi", CONTEXT)
+        graph_calls = [
+            c
+            for c in mock_ld_client.track.call_args_list
+            if str(c[0][0]).startswith("$ld:ai:graph:")
+        ]
+        assert graph_calls
+        for c in graph_calls:
+            assert c[0][2]["modelKey"] == "graph-model"
+            assert c[0][2]["modelVersion"] == 5
+
+    async def test_graph_events_omit_model_key_and_version_when_absent(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        g = graph("graph-key", handlers=[_make_handler()])
+        await g.invoke("hi", CONTEXT)
+        graph_calls = [
+            c
+            for c in mock_ld_client.track.call_args_list
+            if str(c[0][0]).startswith("$ld:ai:graph:")
+        ]
+        assert graph_calls
+        for c in graph_calls:
+            assert "modelKey" not in c[0][2]
+            assert "modelVersion" not in c[0][2]
+
     async def test_graph_duration_total_tracked(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -224,12 +273,41 @@ class TestGraphInvoke:
             await g.invoke("hi", CONTEXT)
         events = [c[0][0] for c in mock_ld_client.track.call_args_list]
         assert "$ld:ai:graph:invocation_failure" in events
+        assert "$ld:ai:graph:path" not in events
+        node_events = [
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
+        ]
+        assert len(node_events) == 1
+        assert node_events[0][2]["nodeKey"] == "root-node"
+        assert node_events[0][2]["index"] == 0
+        assert node_events[0][2]["graphKey"] == "graph-key"
+        assert node_events[0][3] == 1
+        assert "path" not in node_events[0][2]
 
-    async def test_graph_path_tracked(self, mock_ld_client: MagicMock) -> None:
+    async def test_graph_node_tracked_per_visited_node(
+        self, mock_ld_client: MagicMock
+    ) -> None:
         g = graph("graph-key", handlers=[_make_handler()])
         await g.invoke("hi", CONTEXT)
         events = [c[0][0] for c in mock_ld_client.track.call_args_list]
-        assert "$ld:ai:graph:path" in events
+        assert "$ld:ai:graph:path" not in events
+        node_events = [
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
+        ]
+        assert len(node_events) == 2
+        assert node_events[0][2]["nodeKey"] == "root-node"
+        assert node_events[0][2]["index"] == 0
+        assert node_events[0][3] == 1
+        assert node_events[1][2]["nodeKey"] == "leaf-node"
+        assert node_events[1][2]["index"] == 1
+        assert node_events[1][3] == 1
+        assert node_events[0][2]["runId"] == node_events[1][2]["runId"]
+        assert node_events[0][2]["graphKey"] == "graph-key"
+        assert "path" not in node_events[0][2]
 
     async def test_node_variations_resolved_only_once(
         self, mock_ld_client: MagicMock
@@ -423,3 +501,107 @@ class TestGraphInvoke:
 
         assert gd.enabled is False
         mock_logger.error.assert_called()
+
+    async def test_history_forwarded_to_root_handler_only(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc",
+                        },
+                    }
+                ],
+            }
+        ]
+        await graph("graph-key", handlers=[handler]).invoke(
+            "hi", CONTEXT, history=history
+        )
+        assert len(received) >= 2
+        assert received[0] == history
+        assert all(h is None for h in received[1:])
+
+    async def test_image_block_reaches_the_root_node_unstringified(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        # Guards the shape, not just presence: a root handler that received the image as a
+        # repr'd string instead of a block would still "contain" the data. History is
+        # root-only by design, so later nodes are expected to see none of it.
+        image_block = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "IMGDATA123",
+            },
+        }
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        await graph("graph-key", handlers=[handler]).invoke(
+            "what colour?",
+            CONTEXT,
+            history=[{"role": "user", "content": [image_block]}],
+        )
+
+        assert len(received) >= 2
+        root_content = received[0][0]["content"]
+        assert isinstance(root_content, list), (
+            f"content was stringified: {root_content!r}"
+        )
+        assert root_content == [image_block]
+        assert all(h is None for h in received[1:])
+
+    async def test_omitted_history_leaves_root_handler_history_none(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        received: list[Any] = []
+
+        async def capturing_handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict:
+            received.append(history)
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        handler = ProviderHandler(
+            fn=capturing_handler, provides_for=("TestProvider", "messages")
+        )  # type: ignore[arg-type]
+        await graph("graph-key", handlers=[handler]).invoke("hi", CONTEXT)
+        assert received[0] is None

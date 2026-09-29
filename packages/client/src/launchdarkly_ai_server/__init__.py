@@ -3,13 +3,14 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.2"  # x-release-please-version
+__version__ = "0.2.3"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .content import (
     SpanMessage,
     SpanMessagePart,
     ToolDefinitionInput,
+    lang_chain_content_text,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     set_input_content_attributes,
@@ -25,14 +26,27 @@ from .conversation import (
     set_conversation_id_if_absent,
 )
 from .evaluations import (
+    AIConfig,
+    Criterion,
+    DatasetRow,
     EvalRunResult,
     EvaluationsError,
     EvaluationsModule,
     GenerationConfig,
+    Judge,
     RunSummary,
+    Scorer,
     init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
+from .history import (
+    any_multimodal,
+    compose_history,
+    content_to_text,
+    has_multimodal_content,
+    image_block_to_url,
+    is_content_blocks,
+)
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
     extract_variation,
@@ -78,6 +92,7 @@ from .types import (
     GraphEdge,
     GraphNode,
     GraphOptions,
+    GraphStreamEvent,
     GraphTopology,
     HandlerResult,
     HandlerStreamEvent,
@@ -121,8 +136,10 @@ from .utils import (
     end_unfinished_spans,
     lang_chain_span_usage,
     make_track_data,
+    model_stamps_from_meta,
     normalize_mode,
     number_or_zero,
+    omit_model_stamps,
     parse_json_with_possible_fences,
     parse_template,
     parse_usage,
@@ -146,6 +163,7 @@ __all__ = [  # noqa: RUF022
     "GraphEdge",
     "GraphNode",
     "GraphOptions",
+    "GraphStreamEvent",
     "GraphTopology",
     "HandlerResult",
     "HandlerStreamEvent",
@@ -184,6 +202,7 @@ __all__ = [  # noqa: RUF022
     "create_run_usage",
     "end_span_once",
     "end_unfinished_spans",
+    "lang_chain_content_text",
     "lang_chain_finish_reasons",
     "lang_chain_span_messages",
     "lang_chain_span_usage",
@@ -199,15 +218,22 @@ __all__ = [  # noqa: RUF022
     "to_semconv_finish_reason",
     "VariationMeta",
     # evaluations
+    "AIConfig",
     "EvalRunResult",
+    "Criterion",
+    "DatasetRow",
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
+    "Judge",
     "RunSummary",
+    "Scorer",
     "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",
+    "model_stamps_from_meta",
+    "omit_model_stamps",
     "normalize_mode",
     "parse_json_with_possible_fences",
     "parse_template",
@@ -216,6 +242,13 @@ __all__ = [  # noqa: RUF022
     "set_openllmetry_completion",
     "set_openllmetry_prompt",
     "to_ld_context",
+    # history
+    "compose_history",
+    "content_to_text",
+    "image_block_to_url",
+    "is_content_blocks",
+    "has_multimodal_content",
+    "any_multimodal",
     # validation
     "parse_ai_config",
     # registry

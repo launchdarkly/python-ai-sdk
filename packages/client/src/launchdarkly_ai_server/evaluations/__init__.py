@@ -9,19 +9,33 @@ from .api import (
     Transport,
     urllib_transport,
 )
+from .criteria import Criterion, Judge, Scorer, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
-from .types import EvalRunResult, GenerationConfig, RunSummary, Usage
+from .types import (
+    AIConfig,
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    RunSummary,
+    Usage,
+)
 
 __all__ = [
     "DEFAULT_BASE_URI",
+    "AIConfig",
+    "Criterion",
+    "DatasetRow",
     "EvalRunResult",
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
     "HttpResponse",
+    "Judge",
     "LDApiClient",
     "LDApiError",
     "RunSummary",
+    "Scorer",
+    "SuccessDirection",
     "Transport",
     "Usage",
     "init_evaluations",

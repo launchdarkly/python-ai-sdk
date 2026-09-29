@@ -13,11 +13,15 @@ from launchdarkly_ai_server import (
     SpanMessage,
     SpanMessagePart,
     SpanUsage,
+    compose_history,
     config,
     create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    image_block_to_url,
+    is_content_blocks,
+    lang_chain_content_text,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     lang_chain_span_usage,
@@ -60,6 +64,23 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _to_langchain_content(content: Any) -> Any:
+    """Maps LD-canonical content blocks to LangChain multimodal content parts.
+    String content passes through so text-only callers keep plain strings."""
+    if not is_content_blocks(content):
+        return content if content is not None else ""
+
+    parts: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            parts.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            parts.append(
+                {"type": "image_url", "image_url": {"url": image_block_to_url(block)}}
+            )
+    return parts
+
+
 def _build_messages(
     config: AiConfigRep,
     user_input: str,
@@ -75,7 +96,7 @@ def _build_messages(
     AIMessage = msgs_mod.AIMessage
 
     messages: list[Any] = []
-    last_role: str | None = None
+    config_messages: list[dict[str, Any]] = []
 
     if config.get("messages"):
         system_msgs = [m for m in config["messages"] if m.get("role") == "system"]
@@ -89,28 +110,40 @@ def _build_messages(
                 )
             )
         for msg in conv_msgs:
-            content = parse_template(msg["content"], variables)
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content))
-            last_role = msg["role"]
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                content = parse_template(content, variables)
+            if msg.get("role") in ("user", "assistant"):
+                config_messages.append({"role": msg["role"], "content": content})
     elif config.get("instructions"):
         messages.append(
             SystemMessage(parse_template(config["instructions"], variables))
         )
 
-    if history:
-        for msg in history:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "user":
-                messages.append(HumanMessage(content))
-            elif role == "assistant":
-                messages.append(AIMessage(content))
-            last_role = role
+    def append_turn(turn: dict[str, Any]) -> None:
+        content = _to_langchain_content(turn.get("content"))
+        if turn.get("role") == "user":
+            messages.append(HumanMessage(content=content))
+        else:
+            messages.append(AIMessage(content=content))
 
-    if last_role != "user":
+    if history:
+        for turn in compose_history(
+            history=history, user_input=user_input, config_messages=config_messages
+        ):
+            append_turn(turn)
+        return messages
+
+    for turn in config_messages:
+        append_turn(turn)
+
+    # Preserve the no-history behaviour: an empty input still produces a human
+    # message when the config carries no trailing user turn, so an empty history
+    # array stays identical to omitting history entirely.
+    last_non_system = next(
+        (m for m in reversed(messages) if getattr(m, "type", "") != "system"), None
+    )
+    if getattr(last_non_system, "type", "") != "human":
         messages.append(HumanMessage(user_input or ""))
     return messages
 
@@ -170,21 +203,82 @@ def _is_coroutine(fn: Any) -> bool:
 _MAX_STEPS = 10
 
 
+def _resolved_model_name(config: AiConfigRep, fallback_name: str = "") -> str:
+    """Bedrock ``model.region`` is an inference-profile prefix, prepended once."""
+    model = config.get("model") or {}
+    name = str(model.get("name") or fallback_name)
+    provider = str((config.get("provider") or {}).get("name") or "").lower()
+    if provider != "bedrock":
+        return name
+    prefix = str(model.get("region") or "")
+    if not prefix or name.startswith(f"{prefix}."):
+        return name
+    return f"{prefix}.{name}"
+
+
+def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
+    """Shallow copy with a resolved Bedrock model name. Does not mutate *config*."""
+    resolved = _resolved_model_name(config)
+    model = dict(config.get("model") or {})
+    if model.get("name") == resolved:
+        return config
+    return {**config, "model": {**model, "name": resolved}}
+
+
+def _model_constructor_kwargs(
+    config: AiConfigRep, fallback_name: str
+) -> dict[str, Any]:
+    raw = (config.get("model") or {}).get("parameters")
+    parameters = dict(raw) if isinstance(raw, dict) else {}
+    provider = str((config.get("provider") or {}).get("name") or "").lower()
+    if provider == "bedrock":
+        parameters.pop("tools", None)
+    # Name from the config always wins over a colliding ``model`` key in the parameter bag.
+    parameters["model"] = _resolved_model_name(config, fallback_name)
+    return parameters
+
+
+def _is_model_factory(llm: Any) -> bool:
+    """LangChain models are callable, so ``callable`` is not enough to spot a factory."""
+    return callable(llm) and not hasattr(llm, "invoke") and not hasattr(llm, "ainvoke")
+
+
 def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     """
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
+    ``model.parameters`` are passed through unchanged.
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
-    model_name = config.get("model", {}).get("name", "")
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            model=model_name or "claude-3-5-sonnet-20241022"
+            **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
         )
+    if provider == "bedrock":
+        try:
+            lc_aws = importlib.import_module("langchain_aws")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Bedrock models requires langchain-aws. "
+                "Install it with: pip install langchain-aws"
+            ) from exc
+        return lc_aws.ChatBedrockConverse(**_model_constructor_kwargs(config, ""))
     lc_openai = importlib.import_module("langchain_openai")
-    return lc_openai.ChatOpenAI(model=model_name or "gpt-4o")
+    return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
+
+
+async def _resolve_base_model(config: AiConfigRep, llm: Any, importlib: Any) -> Any:
+    invocation = _config_for_model_call(config)
+    if llm is None:
+        return _make_default_chat_model(invocation, importlib)
+    if _is_model_factory(llm):
+        model = llm(invocation)
+        if asyncio.iscoroutine(model):
+            return await model
+        return model
+    return llm
 
 
 async def _run_structured_turn(
@@ -281,8 +375,10 @@ def create_langchain_messages_handler(
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
     Requires ``langchain-openai`` or another LangChain integration to be installed.
-    Pass *llm* to use a specific chat model; omit to default to
-    ``ChatOpenAI(model=<config model name>)`` resolved at call time.
+    Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
+    called after flag evaluation so ``model.parameters`` can be applied unchanged. Omit
+    to default to ``ChatOpenAI`` / ``ChatAnthropic`` constructed at call time from the
+    config's model name and parameters.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
@@ -325,9 +421,7 @@ def create_langchain_messages_handler(
                     system_instructions=system_instructions,
                     messages=span_messages,
                 )
-            base_model = (
-                llm if llm is not None else _make_default_chat_model(config, importlib)
-            )
+            base_model = await _resolve_base_model(config, llm, importlib)
 
             tool_defs = _build_tools(config.get("tools") or {})
             output_format = config.get("outputFormat")
@@ -479,11 +573,7 @@ def create_langchain_messages_handler(
                                 run_usage=run_usage,
                             )
                         else:
-                            output = (
-                                response.content
-                                if isinstance(response.content, str)
-                                else ""
-                            )
+                            output = lang_chain_content_text(response.content)
                         break
 
                     if steps >= _MAX_STEPS:
@@ -643,7 +733,7 @@ async def _stream_gen(
     """
     import importlib
 
-    base_model = llm if llm is not None else _make_default_chat_model(config, importlib)
+    base_model = await _resolve_base_model(config, llm, importlib)
 
     span = start_root_span(config, variables)
     parent = parent_context_of(span)
@@ -723,7 +813,7 @@ async def _stream_gen(
                 chunk_stream = tool_model.astream(conversation_messages)
                 open_chunk_stream = chunk_stream
                 async for chunk in chunk_stream:
-                    text = chunk.content if isinstance(chunk.content, str) else ""
+                    text = lang_chain_content_text(chunk.content)
                     if text:
                         yield {"type": "chunk", "text": text}
                         accumulated_content += text

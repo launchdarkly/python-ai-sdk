@@ -518,6 +518,38 @@ class TestInspectConfig:
         assert result["config"]["model"]["name"] == "claude-3-5"  # type: ignore[index]
         assert result["meta"] is not None
 
+    async def test_preserves_model_key_and_version_on_meta(self) -> None:
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(
+            return_value={
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "v1",
+                    "version": 1,
+                    "modelKey": "my-model",
+                    "modelVersion": 3,
+                },
+                "model": {"name": "claude-3-5"},
+                "provider": {"name": "Anthropic"},
+                "instructions": "You are helpful.",
+            }
+        )
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            result = await inspect_config("my-flag", ctx)
+            extracted = await lifecycle_module.extract_variation("my-flag", ctx)
+
+        assert result["meta"] is not None
+        assert result["meta"]["modelKey"] == "my-model"  # type: ignore[index]
+        assert result["meta"]["modelVersion"] == 3  # type: ignore[index]
+        assert extracted["meta"]["modelKey"] == "my-model"
+        assert extracted["meta"]["modelVersion"] == 3
+
     async def test_returns_enabled_false_and_null_config_when_disabled(self) -> None:
         stub = _make_stub_client()
         stub.variation = AsyncMock(return_value={"_ldMeta": {"enabled": False}})

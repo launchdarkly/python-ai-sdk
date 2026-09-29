@@ -35,7 +35,7 @@ def _make_config(**kwargs: Any) -> dict[str, Any]:
 
 
 def _make_ai_msg(
-    content: str = "answer", input_tokens: int = 10, output_tokens: int = 5
+    content: Any = "answer", input_tokens: int = 10, output_tokens: int = 5
 ) -> Any:
     msg = MagicMock()
     msg.content = content
@@ -181,6 +181,19 @@ class TestFactory:
         h1 = create_langchain_agents_handler()
         h2 = create_langchain_agents_handler()
         assert h1 is not h2
+
+    @pytest.mark.asyncio
+    async def test_returns_text_from_mixed_thinking_and_text_blocks(self) -> None:
+        mocks = _make_langchain_mock()
+        mocks["_ai_msg"].content = [
+            {"type": "thinking", "thinking": "internal reasoning"},
+            {"type": "text", "text": "visible answer"},
+        ]
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            result = await create_langchain_agents_handler(llm=MagicMock())(
+                _make_config(), "q"
+            )
+        assert result["output"] == "visible answer"
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +508,7 @@ class _FakeToolModel(BaseChatModel):
 
 
 def _ai_message(
-    content: str = "",
+    content: Any = "",
     input_tokens: int = 10,
     output_tokens: int = 5,
     tool_calls: list[dict[str, Any]] | None = None,
@@ -765,18 +778,27 @@ class TestRootSpanAttributes:
         assert rec.root.attributes["gen_ai.provider.name"] == "anthropic"
         assert rec.root.attributes["gen_ai.system"] == "langchain"
 
+    @pytest.mark.parametrize(
+        ("provider_name", "expected"),
+        [
+            ("OpenAI", "openai"),
+            ("Bedrock", "bedrock"),
+            ("Azure", "azure"),
+            ("Cohere", "cohere"),
+            ("Typo", "typo"),
+            ("", "openai"),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_gen_ai_provider_name_falls_back_to_openai_for_anything_else(
-        self,
+    async def test_gen_ai_provider_name_is_the_configured_name(
+        self, provider_name: str, expected: str
     ) -> None:
-        # A binary choice, not a passthrough: Bedrock, Azure, Cohere, a typo, or nothing at all all
-        # report `openai`, because that mirrors which chat model class is really instantiated.
         ctx, rec = _recording()
-        cfg = {**BASE_CONFIG, "provider": {"name": "Bedrock"}}
+        cfg = {**BASE_CONFIG, "provider": {"name": provider_name}}
         llm = _FakeToolModel(replies=[_ai_message("hi")])
         with ctx:
             await create_langchain_agents_handler(llm)(cfg, "q")
-        assert rec.root.attributes["gen_ai.provider.name"] == "openai"
+        assert rec.root.attributes["gen_ai.provider.name"] == expected
 
     @pytest.mark.asyncio
     async def test_response_model_is_the_requested_name(self) -> None:
@@ -1232,6 +1254,30 @@ class TestStreaming:
         assert len(done_events) == 1
 
     @pytest.mark.asyncio
+    async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
+        mocks = _make_langchain_mock()
+        msg = _make_ai_msg(
+            [
+                {"type": "thinking", "thinking": "internal reasoning"},
+                {"type": "text", "text": "visible answer"},
+            ]
+        )
+
+        async def _mock_astream(*a: Any, **kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [msg]}}
+
+        mocks["_agent"].astream = _mock_astream
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            events = [
+                event
+                async for event in await create_langchain_agents_handler(
+                    llm=MagicMock()
+                ).stream(_make_config(), "q")
+            ]
+        assert {"type": "chunk", "text": "visible answer"} in events
+        assert events[-1]["output"] == "visible answer"
+
+    @pytest.mark.asyncio
     async def test_generator_throws_on_provider_error(self) -> None:
         mocks = _make_langchain_mock()
 
@@ -1479,33 +1525,84 @@ class TestHistory:
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
 
-    def test_history_appended_to_system_prompt(self) -> None:
+    def test_history_not_stuffed_into_system_prompt(self) -> None:
         config = _make_config(instructions="Be concise.")
-        system = _extract_system_prompt(config, {}, self.SAMPLE_HISTORY)
+        system = _extract_system_prompt(config, {})
         assert system is not None
-        assert "Conversation History:" in system
         assert "Be concise." in system
-
-    def test_history_format_is_correct(self) -> None:
-        config = _make_config(instructions="Be helpful.")
-        system = _extract_system_prompt(config, {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "user: What is feature flagging?" in system
-        assert "assistant: Feature flagging is a technique..." in system
+        assert "Conversation History:" not in system
 
     def test_empty_history_treated_like_no_history(self) -> None:
         config = _make_config(instructions="Be concise.")
-        system_with_empty = _extract_system_prompt(config, {}, [])
+        system_with_empty = _extract_system_prompt(config, {})
         system_without = _extract_system_prompt(config, {})
         assert system_with_empty == system_without
         assert "Conversation History:" not in (system_with_empty or "")
 
-    def test_history_without_prior_system_prompt(self) -> None:
+    def test_history_without_instructions_keeps_system_none(self) -> None:
         config = _make_config()
-        system = _extract_system_prompt(config, {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "Conversation History:" in system
-        assert "user: What is feature flagging?" in system
+        system = _extract_system_prompt(config, {})
+        assert system is None or "Conversation History:" not in system
+
+    @staticmethod
+    def _build(
+        config: dict[str, Any],
+        user_input: str | None,
+        history: list[dict[str, Any]] | None,
+    ) -> list[Any]:
+        lc_msgs = MagicMock()
+        lc_msgs.HumanMessage = MagicMock(
+            side_effect=lambda c: MagicMock(content=c, type="human")
+        )
+        lc_msgs.AIMessage = MagicMock(
+            side_effect=lambda c: MagicMock(content=c, type="ai")
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                lc_msgs if n == "langchain_core.messages" else __import__(n)
+            ),
+        ):
+            return _build_initial_messages(config, user_input, {}, history)
+
+    def test_history_becomes_structured_messages_before_user_input(self) -> None:
+        msgs = self._build(
+            _make_config(instructions="Be concise."), "and now?", self.SAMPLE_HISTORY
+        )
+        assert [m.type for m in msgs] == ["human", "ai", "human"]
+        assert msgs[0].content == "What is feature flagging?"
+        assert msgs[-1].content == "and now?"
+
+    def test_image_history_maps_to_langchain_image_url_parts(self) -> None:
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "abc123",
+                        },
+                    },
+                ],
+            }
+        ]
+        msgs = self._build(_make_config(instructions="Be concise."), "", history)
+        assert {"type": "text", "text": "what is this?"} in msgs[0].content
+        assert {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,abc123"},
+        } in msgs[0].content
+
+    def test_config_messages_precede_history(self) -> None:
+        config = _make_config(messages=[{"role": "user", "content": "config turn"}])
+        msgs = self._build(config, "q", self.SAMPLE_HISTORY)
+        assert msgs[0].content == "config turn"
+        assert msgs[1].content == "What is feature flagging?"
+        assert msgs[-1].content == "q"
 
 
 class TestAbandonOpenSpans:
@@ -2055,3 +2152,265 @@ class TestRootCompletionWithBlockContent:
 
         assert rec.root.attributes["gen_ai.completion.0.content"] == "a typed block"
         assert "a typed block" in str(rec.root.attributes["gen_ai.output.messages"])
+
+
+class TestModelSource:
+    @pytest.mark.asyncio
+    async def test_factory_receives_config_and_returned_model_is_used(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("from-factory")])
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 512,
+                    "tools": [{"name": "openai-tool"}],
+                },
+            },
+        }
+        with ctx:
+            result = await create_langchain_agents_handler(factory)(cfg, "q")
+        assert seen[0]["model"]["parameters"] == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "tools": [{"name": "openai-tool"}],
+        }
+        assert result["output"] == "from-factory"
+
+    @pytest.mark.asyncio
+    async def test_prebuilt_instance_is_used_as_is(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("from-instance")])
+        with ctx:
+            result = await create_langchain_agents_handler(llm)(
+                {
+                    **BASE_CONFIG,
+                    "model": {"name": "gpt-4o", "parameters": {"temperature": 0.2}},
+                },
+                "q",
+            )
+        assert result["output"] == "from-instance"
+
+    @pytest.mark.asyncio
+    async def test_default_openai_constructor_receives_parameters(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("default-openai")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {
+                    "temperature": 0.2,
+                    "max_tokens": 512,
+                    "tools": [{"name": "openai-tool"}],
+                },
+            },
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "tools": [{"name": "openai-tool"}],
+            "model": "gpt-4o",
+        }
+
+    @pytest.mark.asyncio
+    async def test_default_anthropic_constructor_receives_parameters(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("default-anthropic")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Anthropic"},
+            "model": {"name": "claude-sonnet-4-5", "parameters": {"temperature": 0.1}},
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules", {"langchain_anthropic": MagicMock(ChatAnthropic=ctor)}
+            ),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.1,
+            "model": "claude-sonnet-4-5",
+        }
+
+    @pytest.mark.asyncio
+    async def test_bedrock_region_is_prepended_to_the_default_constructor(
+        self,
+    ) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "tools": TOOL_CONFIG["tools"],
+            "model": {
+                "name": "anthropic.claude-sonnet-4-5",
+                "region": "us",
+                "parameters": {
+                    "temperature": 0.2,
+                    "tools": [{"name": "duplicated-search"}],
+                },
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_agents_handler()(
+                cfg, "q", {"search": AsyncMock(return_value="result")}
+            )
+        assert ctor.call_args.kwargs == {
+            "temperature": 0.2,
+            "model": "us.anthropic.claude-sonnet-4-5",
+        }
+        assert cfg["model"]["parameters"]["tools"] == [{"name": "duplicated-search"}]
+        assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_bedrock_region_prefix_is_idempotent(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "us.anthropic.claude-sonnet-4-5",
+                "region": "us",
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
+    async def test_bedrock_without_region_keeps_the_model_name(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "anthropic.claude-sonnet-4-5"
+
+    def test_bedrock_without_langchain_aws_has_a_clear_error(self) -> None:
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        with patch(
+            "importlib.import_module",
+            side_effect=ModuleNotFoundError("No module named 'langchain_aws'"),
+        ):
+            with pytest.raises(
+                ImportError,
+                match=r"pip install langchain-aws",
+            ):
+                handler_mod._make_default_chat_model(cfg)
+
+    @pytest.mark.asyncio
+    async def test_non_bedrock_ignores_model_region(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("openai")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "OpenAI"},
+            "model": {"name": "gpt-4o", "region": "us"},
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "gpt-4o"
+
+    @pytest.mark.asyncio
+    async def test_factory_receives_prefixed_bedrock_name_without_mutating_config(
+        self,
+    ) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("from-factory")])
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "anthropic.claude-sonnet-4-5",
+                "region": "us",
+                "parameters": {"temperature": 0.2},
+            },
+        }
+        with ctx:
+            await create_langchain_agents_handler(factory)(cfg, "q")
+        assert seen[0]["model"]["name"] == "us.anthropic.claude-sonnet-4-5"
+        assert cfg["model"]["name"] == "anthropic.claude-sonnet-4-5"
+        assert seen[0] is not cfg
+
+    @pytest.mark.asyncio
+    async def test_factory_is_resolved_on_the_streaming_path(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("streamed")])
+        seen: list[Any] = []
+
+        def factory(config: Any) -> Any:
+            seen.append(config)
+            return llm
+
+        cfg = {
+            **BASE_CONFIG,
+            "model": {"name": "gpt-4o", "parameters": {"temperature": 0.2}},
+        }
+        with ctx:
+            events = [
+                e
+                async for e in await create_langchain_agents_handler(factory).stream(
+                    cfg, "q", {}, {}
+                )
+            ]
+        assert seen[0]["model"]["parameters"] == {"temperature": 0.2}
+        assert any(
+            e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
+        )

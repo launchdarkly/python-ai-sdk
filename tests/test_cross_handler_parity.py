@@ -288,19 +288,17 @@ class TestModelIdentity:
         assert attrs["gen_ai.system"] == "langchain"
         assert attrs["gen_ai.provider.name"] == "anthropic"
 
-    def test_the_langchain_provider_name_is_binary_not_a_passthrough(
+    def test_the_langchain_provider_name_is_the_configured_name(
         self, handler_spans: Any
     ) -> None:
-        # Anything that is not Anthropic is served by the OpenAI client, so the attribute follows the
-        # client actually instantiated rather than whatever the config happens to name.
         package, module, _ = handler_spans
         if not package.startswith("langchain-"):
-            pytest.skip("only the LangChain handlers make this choice")
+            pytest.skip("only the LangChain handlers pass through provider.name")
         for configured, expected in (
             ("Anthropic", "anthropic"),
             ("OpenAI", "openai"),
-            ("Bedrock", "openai"),
-            ("Azure", "openai"),
+            ("Bedrock", "bedrock"),
+            ("Azure", "azure"),
             ("", "openai"),
         ):
             config = {**CONFIG, "provider": {"name": configured}}
@@ -382,10 +380,9 @@ EXPECTED_VOCABULARY = {
     "feature_flag.context.id",
     "feature_flag.contextKeys",
     "context.contextKeys",
-    # Graph spans, unchanged from before the span work
-    "ld.ai.graph",
-    "ld.ai.graph.key",
-    "ld.ai.graph.path",
+    # Graph spans. The graph key is listed with the root attributes above.
+    "launchdarkly.graph",
+    "launchdarkly.graph.path",
 }
 
 #: Functions kept exported for one release that nothing calls any more.
@@ -417,7 +414,7 @@ def _without_superseded(source: str) -> str:
 _KEY_PATTERN = re.compile(
     r'set_attribute\(\s*f?"([^"{]+)"'
     r'|add_event\(\s*"([^"]+)"'
-    r'|start_span\(\s*"(ld\.ai\.graph)"'
+    r'|start_span\(\s*"(launchdarkly\.graph)"'
     r'|"(gen_ai\.[a-z_.0-9]+)"'
     r'|f"(gen_ai\.[a-z_.]+)\.\{'
     # The feature_flag event's own attributes are built as a plain dict before being handed to

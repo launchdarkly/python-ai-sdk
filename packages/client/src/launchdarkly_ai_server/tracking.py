@@ -7,6 +7,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .trajectory import HANDOFF_TOOL_PREFIX, TrajectoryRecorder, render_trajectory
 from .types import (
     NATIVE_TOOL_KEY,
     AiConfigRep,
@@ -17,7 +18,7 @@ from .types import (
     TrackData,
     VariationMeta,
 )
-from .utils import parse_usage, to_ld_context
+from .utils import model_stamps_from_meta, parse_usage, to_ld_context
 
 
 def _try_get_environment_id() -> str | None:
@@ -80,14 +81,23 @@ def wrap_tool_handlers(
             def _make_regular_wrapper(
                 tool_name: str, original: Callable[..., Any]
             ) -> Callable[..., Any]:
+                # Synthetic graph handoff tools are sync and skipped for tool_call metrics.
+                # Keep them sync so a bare handoff() records the chosen edge (stream and
+                # invoke share the same surface; an async wrapper would leave `chosen` empty).
+                if tool_name.startswith(HANDOFF_TOOL_PREFIX):
+
+                    def handoff_wrapper(*args: Any, **kwargs: Any) -> Any:
+                        return original(*args, **kwargs)
+
+                    return handoff_wrapper
+
                 async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                    if not tool_name.startswith("__handoff_"):
-                        get_client().track(
-                            "$ld:ai:tool_call",
-                            user_context,
-                            {**track_data, "toolKey": tool_name},
-                            1,
-                        )
+                    get_client().track(
+                        "$ld:ai:tool_call",
+                        user_context,
+                        {**track_data, "toolKey": tool_name},
+                        1,
+                    )
                     result = original(*args, **kwargs)
                     return await result if inspect.isawaitable(result) else result
 
@@ -96,6 +106,35 @@ def wrap_tool_handlers(
             wrapped[name] = _make_regular_wrapper(name, fn)
 
     return wrapped
+
+
+def _exposed_tool_keys(
+    config: AiConfigRep,
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
+) -> list[str]:
+    """The tool keys this config offered the model, in declaration order.
+
+    The map handed to a handler can be wider -- ``config()`` merges a
+    ``Registry``'s tools in -- and only the offered set belongs in a trajectory.
+    Doubles as the "Tools available" list itself: a tool the config declares
+    but no implementation was registered for is still one the model could
+    call, so it belongs there even though the recorder can never observe it.
+    Excludes a routed graph node's synthetic ``__handoff_`` tools, for the
+    same reason ``TrajectoryRecorder.wrap`` excludes them from what it
+    records, and a ``NativeTool``: the provider executes it directly, so no
+    local recording is possible and listing it as available would read as
+    unused even when the model used it.
+    """
+    tools = config.get("tools") if isinstance(config, dict) else None
+    if not isinstance(tools, dict):
+        return []
+    handlers = tool_handlers or {}
+    return [
+        key
+        for key in tools
+        if not key.startswith(HANDOFF_TOOL_PREFIX)
+        and not isinstance(handlers.get(key), NativeTool)
+    ]
 
 
 async def execute_and_track(
@@ -129,6 +168,7 @@ async def execute_and_track(
         "providerName": config.get("provider", {}).get("name", "")
         if isinstance(config, dict)
         else "",
+        **model_stamps_from_meta(meta),
     }
     if graph_key:
         track_data["graphKey"] = graph_key
@@ -138,7 +178,17 @@ async def execute_and_track(
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
 
-    tracked_tool_handlers = wrap_tool_handlers(tool_handlers, ld_ctx, track_data)
+    # Recording composes *inside* wrap_tool_handlers, on the original map, so
+    # the recorder still sees a NativeTool and skips it -- wrapping the tracked
+    # map would record the callable stub instead and show a judge a tool call
+    # with an empty result. One recorder per invocation; they run concurrently.
+    exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
+    recorder = TrajectoryRecorder()
+    tracked_tool_handlers = wrap_tool_handlers(
+        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+        ld_ctx,
+        track_data,
+    )
     merged_variables: dict[str, Any] = {
         **(variables or {}),
         "ldContext": {**user_context},
@@ -172,7 +222,18 @@ async def execute_and_track(
 
     raw_output = result.get("output")
     response = raw_output if raw_output is not None else ""
-    return {"usage": usage, "response": response, "track_data": track_data}
+    return {
+        "usage": usage,
+        "response": response,
+        "track_data": track_data,
+        # Rendered, not structural: message_history is the only consumer, and
+        # a JudgeTask must stay picklable.
+        "trajectory": render_trajectory(
+            recorder.invocations,
+            observable_tools=exposed_tool_keys,
+            omitted=recorder.omitted,
+        ),
+    }
 
 
 async def execute_and_stream(
@@ -210,6 +271,7 @@ async def execute_and_stream(
         "providerName": config.get("provider", {}).get("name", "")
         if isinstance(config, dict)
         else "",
+        **model_stamps_from_meta(meta),
     }
     if graph_key:
         track_data["graphKey"] = graph_key
@@ -219,7 +281,13 @@ async def execute_and_stream(
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
 
-    tracked_tool_handlers = wrap_tool_handlers(tool_handlers, ld_ctx, track_data)
+    exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
+    recorder = TrajectoryRecorder()
+    tracked_tool_handlers = wrap_tool_handlers(
+        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+        ld_ctx,
+        track_data,
+    )
     merged_variables: dict[str, Any] = {
         **(variables or {}),
         "ldContext": {**user_context},
@@ -275,4 +343,9 @@ async def execute_and_stream(
         "response": full_text,
         "usage": usage,
         "track_data": track_data,
+        "trajectory": render_trajectory(
+            recorder.invocations,
+            observable_tools=exposed_tool_keys,
+            omitted=recorder.omitted,
+        ),
     }

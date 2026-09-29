@@ -11,8 +11,8 @@ section 1.
 Two provider keys, two different values, on purpose. ``gen_ai.system`` is the literal string
 ``langchain`` on every span this package opens, because that is what the handler shipped before
 the span hierarchy landed. ``gen_ai.provider.name`` names *who served the model*, and semconv's
-enum has no ``langchain`` member, so it follows :func:`serving_provider` instead: whichever chat
-model class the handler actually instantiates. See TELEMETRY-CONTRACT.md section 9.
+enum has no ``langchain`` member, so it follows :func:`serving_provider` instead: the configured
+provider name, lower-cased. See TELEMETRY-CONTRACT.md section 9.
 """
 
 from __future__ import annotations
@@ -50,17 +50,14 @@ def model_name(config: AiConfigRep) -> str:
 
 
 def serving_provider(config: AiConfigRep) -> str:
-    """The provider that actually serves the model.
+    """The configured provider, lower-cased, for ``gen_ai.provider.name``.
 
     ``gen_ai.provider.name`` names who served the request, and its semconv enum has no
-    ``langchain`` member, because LangChain is the framework, not the provider. This mirrors the
-    choice the handler's model-resolution logic makes: ``ChatAnthropic`` for a configured provider
-    of ``"anthropic"``, ``ChatOpenAI`` for everything else, including Bedrock, Azure, Cohere, a
-    typo, or an unset value. Not a passthrough of the configured name. See TELEMETRY-CONTRACT.md
-    section 9.
+    ``langchain`` member, because LangChain is the framework, not the provider. Empty or
+    missing names fall back to ``openai``. ``gen_ai.system`` stays the literal ``langchain``.
+    See TELEMETRY-CONTRACT.md section 9.
     """
-    provider = str((config.get("provider") or {}).get("name") or "").lower()
-    return "anthropic" if provider == "anthropic" else "openai"
+    return str((config.get("provider") or {}).get("name") or "openai").lower()
 
 
 # ─── Span starts ─────────────────────────────────────────────────────────────
