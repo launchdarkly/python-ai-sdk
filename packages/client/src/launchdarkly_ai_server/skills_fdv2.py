@@ -1085,8 +1085,10 @@ def _classify_status(status: int, headers: Any) -> Exception:
         # instead of retrying.
         return _FatalTransportError(
             "LaunchDarkly will not deliver Agent Skills on this connection "
-            "(HTTP 422). The usual cause is a view-scoped SDK key. Check your "
-            "SDK key or contact LaunchDarkly support.
+            "(HTTP 422). Either Agent Skills is not enabled for this account, "
+            "or this SDK key is view-scoped and cannot be assigned a skill "
+            "payload. Retrying fixes neither, so delivery has stopped; restart "
+            "the process once it is enabled."
         )
     if status in (405, 406, 414, 501):
         return _FatalTransportError(
