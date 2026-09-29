@@ -552,13 +552,19 @@ that as every skill having been revoked and delete the files it wrote on a previ
 against a store that has not received a payload reports the retrieval unavailable and leaves
 everything on disk alone. `report.ok` is `False` in that case, and the error names it.
 
-**A project with no skills yet is a waiting state, not a failure.** Every request declares the
-payload it wants (`kinds=agent-skill`), and LaunchDarkly answers HTTP 422 when the environment
-has no such payload — which is the case until somebody creates the first skill in the project.
-The store logs it once, keeps asking at its backoff cap, and picks up that first skill without
-a restart. `failed` stays `None` throughout, the 422s are kept off `connection_failures` and
-`last_error`, and `diagnostics.payload_unavailable` counts them: nonzero and rising beside an
-empty store means "there is nothing to deliver", not "delivery is broken".
+**Agent Skills has to be enabled for your account.** Every request declares the payload it
+wants (`kinds=agent-skill`), and LaunchDarkly answers HTTP 422 when this connection will never
+be assigned that payload: either Agent Skills is not enabled for the account, or the SDK key is
+view-scoped, which cannot be assigned a skill payload. Neither is fixed by retrying, so delivery
+stops — `failed` carries the reason and `last_error` is populated, while `connection_failures`
+stays at zero, since nothing was retried. The store never initializes, so a reconcile takes the
+readiness path above: `write_skills("*")` reports the retrieval unavailable and leaves every
+file on disk alone. Enabling Agent Skills for the account reaches a process that already gave
+up only when that process restarts.
+
+An environment that simply has no skills yet is **not** this case. It is assigned an empty
+agent-skill payload, which commits normally and initializes the store, so a skill created later
+arrives over the running connection with no restart.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
 objects through the `SkillStore` interface and cannot tell which store produced them.
@@ -641,7 +647,7 @@ Windows.
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
 | `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `base_uri` and `stream_uri` are separate hosts, defaulting to LaunchDarkly's polling and streaming origins; `base_uri` alone covers both. `close()` is **final** — `start()` afterwards raises. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
 | `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. `debounce` is in **seconds** and must be non-negative and finite; `on_reconcile` is called with each *subsequent* report, the initial one being returned directly. One watcher per root. |
-| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `payload_unavailable`, `last_error`. |
+| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,
 the accessors raise `RuntimeError` explaining what to do and `write_skills` reports the

@@ -51,12 +51,12 @@ from launchdarkly_ai_server.skills_fdv2 import (
     FDV2_OBJECT_KIND,
     FDV2_PAYLOAD_KIND,
     MAX_RESPONSE_BYTES,
+    StoreDiagnostics,
     _backoff_delay,
     _classify_status,
     _FatalTransportError,
     _is_skill_event,
     _iter_sse,
-    _NoSkillPayloadError,
     _ProtocolReader,
     _RecoverableTransportError,
     _Requester,
@@ -1783,19 +1783,6 @@ def stream_store(**kwargs: Any) -> FDv2SkillStore:
     )
 
 
-class _NoWaitStop(threading.Event):
-    """A ``_stop`` that answers every wait at once.
-
-    Retrying at the backoff cap is the right production behaviour and the wrong
-    test fixture: a test that only cares what happens *after* the wait should
-    not sit through one. Kept out of ``poll_store`` so the waits stay real
-    everywhere they are part of what is being asserted.
-    """
-
-    def wait(self, timeout: float | None = None) -> bool:
-        return super().wait(0.001)
-
-
 class TestFailureHandling:
     def test_a_403_stops_delivery_and_explains_why(
         self, endpoint: Any, caplog: Any
@@ -2009,123 +1996,172 @@ class TestFailureHandling:
             assert isinstance(_classify_status(status, None), _FatalTransportError)
         assert isinstance(_classify_status(503, None), _RecoverableTransportError)
         assert not isinstance(_classify_status(503, None), _StaleRequestStateError)
-        # 422 is the third class: recoverable enough to be retried, but its own
-        # type so the loop can keep it off the failure budget.
-        no_payload = _classify_status(422, None)
-        assert isinstance(no_payload, _NoSkillPayloadError)
-        assert isinstance(no_payload, _RecoverableTransportError)
-        assert not isinstance(no_payload, _FatalTransportError)
-        # The message explains the state rather than reciting the status: this
-        # is the line a user reads when their skills never show up.
-        assert "no Agent Skills payload" in str(no_payload)
+        # 422 is fatal, and the platform chose the status to be exactly that:
+        # a connection whose declared kinds match no payload it is assigned is
+        # refused, with a code LaunchDarkly SDKs stop on rather than retry.
+        refused = _classify_status(422, None)
+        assert isinstance(refused, _FatalTransportError)
+        assert not isinstance(refused, _RecoverableTransportError)
 
-    def test_a_422_never_stops_delivery_and_is_not_counted_as_a_failure(
-        self, endpoint: Any, caplog: Any
-    ) -> None:
+    def test_every_status_is_either_recoverable_or_fatal(self) -> None:
         """
-        A 422 means the credential is assigned no agent-skill payload, which is
-        every project in which no skill has ever been created. Counting it as a
-        failure would spend the budget and report an ordinary configuration as
-        "gave up after N consecutive failures"; so it is counted, said once, and
-        retried for as long as the store is open.
+        There is no third class, and the shape matters more than the name. A
+        status classified as neither broken nor terminal is a retry loop with no
+        bound and no budget — retrying for the life of the process and invisible
+        to ``failed`` and ``connection_failures`` alike — which is exactly what
+        held 422 before it was classified as fatal.
         """
-        endpoint.default_poll_status = 422
-        store = poll_store(endpoint, max_consecutive_failures=1)
-        with caplog.at_level("WARNING"):
-            with store:
-                # On the diagnostic rather than the request count: the counter
-                # moves after the response is read, so the fourth request being
-                # logged does not mean the fourth 422 has been handled.
-                assert wait_until(lambda: store.diagnostics.payload_unavailable >= 4)
-                # Well past a bound of one, and still asking.
-                assert store.failed is None
-        assert store.diagnostics.payload_unavailable >= 4
-        # None of it reads as a failure, because none of it is one.
-        assert store.diagnostics.connection_failures == 0
-        assert store.diagnostics.last_error is None
-        # Said once, not once per attempt.
-        idle = [r for r in caplog.records if "Skill delivery is idle" in r.getMessage()]
-        assert len(idle) == 1
-        assert "no Agent Skills payload" in idle[0].getMessage()
-        # And nothing was logged as a failure.
-        assert not any(
-            "Skill delivery failed" in r.getMessage() for r in caplog.records
-        )
+        for status in range(300, 600):
+            classified = _classify_status(status, None)
+            fatal = isinstance(classified, _FatalTransportError)
+            recoverable = isinstance(classified, _RecoverableTransportError)
+            assert fatal ^ recoverable, (
+                f"HTTP {status} classified as {type(classified).__name__}, "
+                "which is neither exactly recoverable nor exactly fatal"
+            )
 
-    def test_a_422_waits_the_backoff_cap_rather_than_the_initial_delay(
-        self, endpoint: Any
-    ) -> None:
+    def test_there_is_no_expected_recoverable_error_class(self) -> None:
         """
-        The exponential schedule is a function of the failure count, which this
-        case deliberately never advances — so reusing it would hold a store
-        waiting for its first skill at the *initial* delay forever, polling as
-        fast as a fresh connection retries.
-
-        Reaches into ``_stop`` because the delay is the thing under test: the
-        loop's wait is recorded and then not actually waited out, so the
-        assertion is on the interval asked for rather than on wall-clock timing.
+        Asserted gone by name, because a reintroduction is otherwise visible
+        only in a log line no test reads. The class existed only to hold 422 and
+        goes away with that classification.
         """
-        asked: list[float | None] = []
+        assert not hasattr(skills_fdv2, "_NoSkillPayloadError")
 
-        class RecordingStop(threading.Event):
-            def wait(self, timeout: float | None = None) -> bool:
-                asked.append(timeout)
-                return super().wait(0.001)
-
-        endpoint.default_poll_status = 422
-        store = poll_store(endpoint, initial_backoff=0.01, max_backoff=7.5)
-        store._stop = RecordingStop()
-        with store:
-            assert wait_until(lambda: len(endpoint.requests) >= 3)
-        assert asked, "the loop never waited"
-        assert asked[0] == 7.5
-        assert 0.01 not in asked
-
-    def test_a_skill_payload_arriving_after_a_422_is_picked_up(
-        self, endpoint: Any
-    ) -> None:
+    def test_diagnostics_does_not_count_an_unavailable_payload(self) -> None:
         """
-        The reason this is not fatal. A skill created after the store started is
-        delivered to the store that was already running, with nothing restarted.
+        ``StoreDiagnostics`` is public API from the moment it ships, so its field
+        list is the contract. A field counting "no payload of the kind you
+        declared" would count the 422 — and that status is fatal, so there is no
+        recurring event to accumulate and no running store to accumulate it on.
         """
-        store = poll_store(endpoint, max_consecutive_failures=1)
-        endpoint.queue_poll(status=422)
+        assert "payload_unavailable" not in StoreDiagnostics.__dataclass_fields__
+        assert not hasattr(StoreDiagnostics(), "payload_unavailable")
+        # The whole list, so a reintroduction under any other name fails too.
+        assert set(StoreDiagnostics.__dataclass_fields__) == {
+            "payloads_transferred",
+            "skill_objects_received",
+            "objects_ignored",
+            "objects_revoked",
+            "payloads_ignored",
+            "hashless_objects",
+            "connection_failures",
+            "last_error",
+        }
+
+    def test_a_422_on_the_first_response_stops_delivery(self, endpoint: Any) -> None:
+        """
+        A 422 means this connection will never be assigned a skill payload, not
+        that the environment has no skills yet: with delivery enabled and a key
+        that is not view-scoped, an environment holding zero skills is assigned
+        an empty payload that commits normally. Every cause of the 422 is
+        permanent, so the first one is enough to stop on.
+        """
         endpoint.queue_poll(status=422)
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        store._stop = _NoWaitStop()
-        with store:
-            assert store.wait_for_skills(timeout=5) is True
-            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
-        # Both readings, in the order they happened.
-        assert store.diagnostics.payload_unavailable == 2
-        assert store.diagnostics.payloads_transferred == 1
-        assert store.failed is None
+        # Well above one, to show the bound is not what stopped it.
+        with poll_store(endpoint, max_consecutive_failures=5) as store:
+            assert wait_until(lambda: store.failed is not None)
+        assert "422" in store.failed
+        # The queued payload is never asked for.
+        assert len(endpoint.requests) == 1
+        assert store.is_initialized() is False
 
-    async def test_a_422_leaves_the_store_uninitialised_and_prunes_nothing(
+    def test_the_422_message_names_both_of_its_real_causes(self, endpoint: Any) -> None:
+        """
+        The message is a contract, because it is what a customer pastes into a
+        support ticket: it has to name the account-level enablement and the key's
+        scoping so the first person to read it can check both without reading
+        platform source.
+
+        Asserted on substance rather than prose, so the wording stays free to
+        improve while a message that drops either cause fails.
+        """
+        endpoint.queue_poll(status=422)
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+        message = store.failed.lower()
+        assert "enabled" in message and "account" in message
+        assert "view-scoped" in message
+        # The two things it must not say. Both are what the earlier text said,
+        # and both are false: the condition is not about whether any skill
+        # exists, and no skill created later arrives without a restart.
+        assert "first skill" not in message
+        assert "without a restart" not in message
+        # It does name what actually clears the condition.
+        assert "restart" in message
+
+    def test_a_fatal_422_is_not_counted_against_the_retry_bound(
+        self, endpoint: Any
+    ) -> None:
+        """
+        ``connection_failures`` measures consecutive *recoverable* failures
+        against the retry bound. A fatal never retries, so counting one would
+        put a number against a budget nothing will spend and make a store that
+        gave up on its first response indistinguishable from one that exhausted
+        its attempts. ``_give_up`` already accounts 401 and 404 this way, and
+        422 reaching it means the accounting comes for free — so it is asserted
+        rather than implemented.
+        """
+        endpoint.queue_poll(status=422)
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+        assert store.diagnostics.connection_failures == 0
+        assert store.diagnostics.last_error is not None
+        assert store.failed == store.diagnostics.last_error
+
+    def test_a_fatal_422_releases_wait_for_skills_at_once(self, endpoint: Any) -> None:
+        """
+        The observable difference from treating the status as recoverable, and
+        as much the point of the classification as the stopped retries are: a
+        boot gated on skills behind a ten-second wait would otherwise pay that
+        wait on every start, against a store that knew the answer on its first
+        response.
+
+        The timeout is far longer than the suite would tolerate sitting through,
+        so the assertion is on the value *and* the elapsed time.
+        """
+        endpoint.queue_poll(status=422)
+        with poll_store(endpoint) as store:
+            started = time.monotonic()
+            assert store.wait_for_skills(timeout=30.0) is False
+            elapsed = time.monotonic() - started
+        assert elapsed < 5.0, (
+            f"waited {elapsed:.1f}s for an answer delivery already had"
+        )
+
+    async def test_a_store_that_gave_up_on_a_422_prunes_nothing(
         self, endpoint: Any, tmp_path: Any
     ) -> None:
         """
-        "LaunchDarkly has no skill payload for this environment" and "this
+        "LaunchDarkly will not deliver skills to this connection" and "this
         environment's every skill was revoked" are the two readings of an empty
         answer, and only the second may delete a customer's files. A 422 commits
         no payload, so the readiness probe stays false and the wildcard
-        reconcile withholds the prune.
+        reconcile withholds the prune for the whole run.
+
+        The composition is what is under test rather than either half: the
+        readiness gate already exists, but "delivery gave up, therefore the
+        store is empty, therefore prune" is the inference an implementation
+        makes when it has to assemble this behaviour from two sections. It is
+        also the path a filesystem-agent deployment takes when Agent Skills is
+        not enabled for the account.
         """
         root = tmp_path / "skills"
         stale = root / "left-behind"
         stale.mkdir(parents=True)
         (stale / "SKILL.md").write_text("not ours to delete", encoding="utf-8")
 
-        endpoint.default_poll_status = 422
-        store = poll_store(endpoint, max_consecutive_failures=1)
-        store._stop = _NoWaitStop()
+        endpoint.queue_poll(status=422)
+        store = poll_store(endpoint)
         with store:
-            assert wait_until(lambda: store.diagnostics.payload_unavailable >= 3)
+            assert wait_until(lambda: store.failed is not None)
             assert store.is_initialized() is False
             assert store.wait_for_skills(timeout=0.1) is False
             await init_client(options={"skillStore": store}, client=object())
             report = await write_skills("*", root)
-        assert (stale / "SKILL.md").exists()
+        assert report.ok is False
+        assert (stale / "SKILL.md").read_text(encoding="utf-8") == "not ours to delete"
         assert not any(a.action == "removed" for a in report.actions)
 
     def test_a_401_stops_delivery(self, endpoint: Any) -> None:
