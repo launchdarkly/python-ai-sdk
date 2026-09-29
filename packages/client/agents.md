@@ -250,11 +250,53 @@ deletes the user's files.
 ### The delivery transport, and the one field that will bite you
 
 `FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
-`GET /sdk/stream`, server-side SDK key in `Authorization`, `basis` + `mv` params,
+`GET /sdk/stream`, server-side SDK key in `Authorization`, `kinds` + `basis` params,
 `If-None-Match`/304). It lives below the store interface and produces raw objects in the
 shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**. If a transport
 change ever seems to require editing an accessor, verification, or `write_skills`, the adapter
 boundary is wrong.
+
+**Every request declares `kinds=agent-skill`, and that is load-bearing.** Delivery narrows a
+connection to the payload kinds it declares and defaults to flags, so a request without it is
+served the environment's flag payload and no skills at all — the store would run, report
+healthy, and hold nothing. It also makes the connection carry exactly one payload, which is
+the shape `_ProtocolReader` is built for: without it, a skill-enabled environment assigns two,
+and the reader warns about the second and reads only the first intent. `FDV2_PAYLOAD_KIND` is
+the payload's kind and `FDV2_OBJECT_KIND` the kind of the objects inside it — two different
+strings, held apart on purpose. No `mv`: that parameter selects the *flag* data model, and
+delivery overrides whatever a request asks for with the payload's own default for any
+non-flagging payload, so sending it would state a preference that is ignored.
+
+**HTTP 422 is fatal, and the platform decided that rather than the SDK inferring it.** Delivery
+answers 422 when a connection's declared kinds exclude every payload it is assigned, and it
+picked a non-400 4xx *because* LD SDKs treat those as terminal. So `_classify_status` returns a
+`_FatalTransportError` and the existing give-up path handles it: `failed` and `last_error` are
+set, `connection_failures` is untouched (it measures consecutive *recoverable* failures against
+the retry bound, and a fatal never retries — untouched, note, not zero: a run that already had
+recoverable failures keeps their count), and `wait_for_skills` returns `False` at once rather
+than at the timeout.
+
+**The 422's message is the TypeScript SDK's, word for word, and deliberately short.** It names
+the one cause a customer can act on — a view-scoped SDK key — and refers every other case to
+support rather than enumerating it. Do not extend it with the remaining causes: they are not a
+customer's to fix, and a message that lists conditions its reader cannot change costs them the
+one line that matters. Keeping the two SDKs identical here matters for the reason it matters on
+the integrity record: a customer comparing them should not have to work out whether they hit two
+different conditions. `test_the_422_message_names_its_one_actionable_cause` asserts the cause and
+the referral, and asserts the absences too, so an enumeration cannot creep back in.
+
+**A fatal stops the run, not the store, so every surface says `start()` and not "restart the
+process".** `_give_up` does not close — only `close` sets `_closed`, and `_closed` is the only
+thing `start` refuses — so a store that gave up resumes in place once the cause is fixed,
+dropping the terminal reason through `_rearm_waiters`. This is not 422-specific: `_give_up`'s
+log line is one line for a 401, a 403, a 404, a 422 and an exhausted retry budget alike, so an
+overstatement there is wrong five times over. Three surfaces carry the claim and each is
+asserted: the log line, by
+`test_the_give_up_line_points_at_start_not_a_process_restart`; the behaviour, by
+`test_a_store_that_gave_up_on_a_422_resumes_on_start`, with
+`test_a_restarted_store_does_not_report_the_old_failure` for the general case; and the README's
+422 section, in prose. The 422's own message is the one place that stays silent on it, having no
+room — the log line beside it says it instead.
 
 **The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
 plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a
@@ -287,7 +329,7 @@ stored `version`, under the stored key `pdf-extraction`. `version` (42) is the v
 including a flag with nothing to do with skills. Reading it as the skill's version fails
 **silently**: the object verifies, the hash matches, and the caller gets content under a
 version number that means nothing. There is no separate field for the skill's version: the
-agent-skill payload is a *generic* payload, and generic objects carry only `key`, `kind`,
+agent-skill payload is opaque to delivery, and its objects carry only `key`, `kind`,
 `version` and `object`, exactly like a flag. `_split_wire_key` is the only place the wire key
 is read, `_store_object_from_put` and `_tombstone_from_delete` both go through it, and
 `TestVersionTranslation` asserts the translation in both directions. A wire key that will
@@ -297,13 +339,13 @@ recognises; only a key with nothing before the delimiter is dropped, since there
 identity to hold it under.
 
 **Skills are identified by `kind == "skill"`; everything else is ignored, not rejected.**
-Object kinds on the SDK-facing channel are open strings, and the agent-skill payload is
-classified `generic`, so a skill arrives under the kind its producer registered — the bare
-category name — not under a broader wrapper kind with a narrowing field. An environment's
-payload assignment carries its flag payload alongside its agent-skill payload, so flag and
-segment objects arrive as a matter of course. Erroring on an unrecognised kind would turn a
-normal payload into a permanent reconnect loop — a flag-delivery outage caused by a skills
-rollout.
+Object kinds on the SDK-facing channel are open strings, so a skill arrives under the kind its
+producer registered — the bare category name — not under a broader wrapper kind with a
+narrowing field. The `kinds` declaration above means a flag or segment object should no longer
+arrive at all, but the skip stays and stays tested: erroring on an unrecognised kind would
+turn a payload that merely gained a new object kind into a permanent reconnect loop — a
+flag-delivery outage caused by a skills rollout — and an object nobody expected belongs
+outside the skill set rather than in it.
 
 **Changes commit at `payload-transferred`, not as objects arrive.** A payload version is the
 unit of consistency: a half-applied full transfer would publish a state the server never
@@ -361,15 +403,26 @@ Do not rename one on one side.
 
 Internal `Resolution.reason` maps 1:1 onto it, set explicitly at every construction site:
 
-| `resolve_from_store` outcome | `reason` |
-|---|---|
-| the store raised (`unavailable=True`) | `store_unavailable` |
-| `raw` is not a dict | `absent` |
-| `verify_raw_skill` returned `None` | `integrity_failure` |
-| `skill.version != wanted_version` | `wrong_version` |
-| success | `ok` |
+| `resolve_from_store` outcome | `reason` | Detection surface |
+|---|---|---|
+| the store raised (`unavailable=True`) | `store_unavailable` | an ERROR log line, no integrity record |
+| `raw` is not a dict | `absent` | none — a pinned non-dict tells us nothing about the key, and a tampering signal from a broken adapter would be a false positive |
+| `verify_raw_skill` returned `None` | `integrity_failure` | both: the log record **and** the product signal |
+| `skill.key != key` | `integrity_failure` | the log record only, `reason_code: key_mismatch` |
+| `skill.version != wanted_version` | `wrong_version` | the log record only, `reason_code: version_mismatch` |
+| success | `ok` | none |
 
-**Adding a sixth internal outcome means choosing which public token it maps to.**
+The two record-only rows are deliberate and are **not** a silence to "fix": both are decided
+after `verify_raw_skill` has passed, and the usual cause of either is a broken custom store
+adapter rather than tampered content, so the product signal stays out and LaunchDarkly's
+counter does not fill with customers' adapter bugs. Tests pin both directions for each —
+record present, signal absent — because an implementation that also emitted the signal would
+look correct from every other angle. Note the `reason` and the `reason_code` differ in
+spelling for the version row (`wrong_version` vs `version_mismatch`): one names what the
+caller got, the other names which check failed, and keeping one string out of two closed
+vocabularies is what stops a detection rule being ambiguous about which surface it matches.
+
+**Adding a seventh internal outcome means choosing which public token it maps to.**
 `Resolution.reason` has no default, so the compiler asks the question; answer it rather than
 defaulting to `absent`, which claims the store does not hold the skill. If the new outcome
 is genuinely neither of the five, the token set grows — on both sides, in the same commit.
@@ -527,7 +580,14 @@ aid. `record_integrity_failure` writes both, and is the only place either is con
 One ERROR record per withheld skill, message text = `INTEGRITY_FAILURE_EVENT` + a space +
 `json.dumps(record, sort_keys=True, separators=(",", ":"))`, plus the same mapping under
 `extra={"ld_skills": record}`. Fields: `event`, `action` (always `withheld`), `skill_key`,
-`version?`, `expected_hash?`, `observed_hash?`, `reason_code`, `reason`, `language`.
+`version?`, `expected_hash?`, `observed_hash?`, `reason_code`, `reason`, `language`, plus
+the two record-only fields the boundary codes carry — `served_key?` on a `key_mismatch` and
+`served_version?` on a `version_mismatch`, never both on one record. Both are store-controlled
+and both are shape-checked before they are written (`<invalid-key>`, `<invalid-version>`), even
+though verification has already accepted them on the only path that reaches either: that is a
+property of the call order, not of the recorders, and the guards are what keep a reordering
+from publishing a body. The `served_version` guard doubles as what keeps the field an integer,
+which the byte-comparable JSON needs.
 
 Each of those choices is load-bearing; do not undo one as a simplification.
 
@@ -548,11 +608,12 @@ Each of those choices is load-bearing; do not undo one as a simplification.
 - **`reason_code` is in the record only.** The signal's property set is the allowlist above
   and does not grow; the local record is where the detection vocabulary lives.
 
-`reason_code` is a **closed vocabulary of exactly nine tokens** — `IntegrityReasonCode`, a
-`Literal`, so a typo at a call site is a type error — and the same nine in every language
-implementation. Eight are one per `record_integrity_failure` call site; the ninth,
-`key_mismatch`, comes from `record_key_mismatch` and is the only one that fires the log
-record **without** the product signal:
+`reason_code` is a **closed vocabulary of exactly ten tokens** — `IntegrityReasonCode`, a
+`Literal`, so a typo at a call site is a type error — and the same ten in every language
+implementation. It is a finer vocabulary than `SkillOutcomeReason`, which stays five tokens;
+widening one does not widen the other. Eight are one per `record_integrity_failure` call
+site; the other two come from `record_key_mismatch` and `record_version_mismatch` at the
+retrieval boundary and are the ones that fire the log record **without** the product signal:
 
 | `reason_code` | Call site |
 |---|---|
@@ -565,16 +626,28 @@ record **without** the product signal:
 | `over_size_cap` | `verified_bytes` — over `MAX_SKILL_CONTENT_BYTES` |
 | `hash_mismatch` | `verified_bytes` — observed sha256 != `contentHash` |
 | `key_mismatch` | `resolve_from_store` — the served object's own `key` is not the key requested. **Log record only, no signal**, and carries a `served_key` field no other record has |
+| `version_mismatch` | `resolve_from_store` — the served object's `version` is not the pinned version requested. **Log record only, no signal**, and carries a `served_version` field no other record has, beside a `version` that means the version *requested* |
 
-`key_mismatch` cannot join `REASON_CODE_CASES`: that table is driven uniformly through
-`all_skills`, and this code is decided at the retrieval boundary after `verify_raw_skill`
-has passed, so a listing cannot reach it. It is unioned into the exhaustiveness assertion
-instead, and covered by `test_key_mismatch_records_the_log_but_not_the_signal`. The
-record-without-signal split is deliberate — a mismatch is usually a broken store adapter
-rather than an attacker, and LaunchDarkly's counter must not fill with customers' adapter
-bugs — and tests pin both directions. Do not "fix" it by emitting the signal.
+Neither boundary code can join `REASON_CODE_CASES`: that table is driven uniformly through
+`all_skills`, and both codes are decided at the retrieval boundary after `verify_raw_skill`
+has passed, so a listing cannot reach either. A listing has no requested key and no
+requested version to compare against at all, which is why the asymmetry is correct rather
+than a gap. They are unioned into the exhaustiveness assertion instead, and covered by
+`test_key_mismatch_records_the_log_but_not_the_signal` and
+`test_version_mismatch_records_the_log_but_not_the_signal`. The record-without-signal split
+is deliberate — either mismatch is usually a broken store adapter rather than an attacker,
+and LaunchDarkly's counter must not fill with customers' adapter bugs — and tests pin both
+directions for both codes. Do not "fix" it by emitting the signal.
 
-Adding a tenth failure mode means widening `IntegrityReasonCode`, adding a case to
+Both codes are reachable from all four callers of `resolve_from_store` — `get_skill`,
+`get_skills`, `get_skill_result`, and `write_skills`, which resolves each pinned reference
+through the same function. A suite written to the accessors alone leaves the write path
+uncovered. On that path a `wrong_version` is per-skill and not `unavailable`, so it takes
+the narrow protection: the key stays in the requested set carrying an `error` action, the
+copy already on disk is not pruned, and the run is **not** marked incomplete, so a
+genuinely revoked skill in the same run is still removed.
+
+Adding an eleventh failure mode means widening `IntegrityReasonCode`, adding a case to
 `REASON_CODE_CASES` in `test_skills.py` (whose exhaustiveness assertion fails otherwise),
 documenting it in the README table, **and** doing the same in the other language SDKs. A
 token added on one side only is a drift bug: a customer's detection rule stops matching
@@ -919,6 +992,6 @@ a conversation is out of reach at this layer either way.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
 - Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
-- Do not rename `ld.skills.integrity_failure`, and do not add a ninth `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
+- Do not rename `ld.skills.integrity_failure`, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
 - Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.

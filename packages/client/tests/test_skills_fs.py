@@ -1156,6 +1156,86 @@ class TestResilience:
         assert _actions_by_key(report)["requested-key"].action == "error"
         assert _actions_by_key(report)["other-key"].action == "skipped_current"
 
+    async def test_a_version_mismatch_records_the_log_and_never_prunes(
+        self, root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The write path is the fourth caller of the shared resolution path.
+
+        ``write_skills`` resolves pinned references through
+        ``resolve_from_store``, so it writes the same ``version_mismatch``
+        record the accessors do — a suite written to the accessors alone leaves
+        this path uncovered.
+
+        A ``wrong_version`` is per-skill and **not** ``unavailable``, so it
+        takes the narrow protection: an ``error`` action, the on-disk copy
+        survives, and the run is not incomplete — so the genuinely revoked
+        skill in the same run is still removed. Suppressing the prune instead
+        would protect the file for the wrong reason and stop the rest of the
+        reconcile converging.
+        """
+
+        class WrongVersionStore:
+            """Answers every pin with a version nobody asked for."""
+
+            def get_object(
+                self, kind: str, key: str, version: int | None = None
+            ) -> Any:
+                return {
+                    "key": key,
+                    "version": 99,
+                    "content": SKILL_BODY,
+                    "contentHash": _hash(SKILL_BODY),
+                }
+
+            def all_objects(self, kind: str) -> dict[str, Any]:
+                return {}
+
+        # Both managed by one manifest: ``_place_managed`` rewrites the whole
+        # document, so calling it twice would leave the first key unmanaged and
+        # surviving by clobber protection rather than by the retention under
+        # test.
+        pinned = _place_managed(root, "pdf-extraction", SKILL_BODY)
+        revoked = root / "gone" / "SKILL.md"
+        revoked.parent.mkdir(parents=True)
+        revoked.write_text(SKILL_BODY, encoding="utf-8")
+        _write_manifest(
+            root,
+            {
+                "manifestVersion": 1,
+                "entries": {
+                    "pdf-extraction/SKILL.md": _entry("pdf-extraction", 1, SKILL_BODY),
+                    "gone/SKILL.md": _entry("gone", 1, SKILL_BODY),
+                },
+            },
+        )
+        skills_module._set_store(WrongVersionStore())
+
+        with caplog.at_level("ERROR", logger="launchdarkly_ai_server.skills_core"):
+            report = await write_skills(
+                [SkillReference(key="pdf-extraction", version=1)], root
+            )
+
+        assert report.ok is False
+        # Narrow protection: this key's copy survives under an error action.
+        assert _actions_by_key(report)["pdf-extraction"].action == "error"
+        assert pinned.read_text(encoding="utf-8") == SKILL_BODY
+        assert "pdf-extraction/SKILL.md" in _read_manifest(root)["entries"]
+        # ...and the run is not incomplete, so a real revocation still lands.
+        assert _actions_by_key(report)["gone"].action == "removed"
+        assert not revoked.exists()
+
+        _INTEGRITY_EVENT = skills_core_module.INTEGRITY_FAILURE_EVENT
+        records = [
+            json.loads(entry.getMessage().split(" ", 1)[1])
+            for entry in caplog.records
+            if entry.getMessage().startswith(f"{_INTEGRITY_EVENT} ")
+        ]
+        assert len(records) == 1
+        assert records[0]["reason_code"] == "version_mismatch"
+        assert records[0]["skill_key"] == "pdf-extraction"
+        assert records[0]["version"] == 1
+        assert records[0]["served_version"] == 99
+
     async def test_an_unattributable_failure_never_prunes(self, root: Path) -> None:
         """A withholding with no usable key at all still must not prune.
 

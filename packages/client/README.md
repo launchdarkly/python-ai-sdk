@@ -358,7 +358,8 @@ LaunchDarkly's AI SDKs for the same input.
 | `action` | Always `withheld` — the content was not returned to your code. |
 | `skill_key` | The skill key **requested**, or `<invalid-key>` when the key was itself malformed. |
 | `served_key` | Only on `key_mismatch`: the key the store actually answered under. Same redaction as `skill_key`. Omitted on every other failure mode. |
-| `version` | The delivered version. Omitted when it was not a valid version, and on `key_mismatch`. |
+| `served_version` | Only on `version_mismatch`: the version the store actually answered with, as an integer — or `<invalid-version>` when it was not one. Omitted on every other failure mode. Never appears on the same record as `served_key`. |
+| `version` | The delivered version — or, on `version_mismatch`, the version **requested**. Omitted when it was not a valid version, and on `key_mismatch`. |
 | `expected_hash` | The delivered `contentHash`, or `<not-a-sha256-digest>` when it was not one. Omitted when none was delivered. |
 | `observed_hash` | The sha256 the SDK computed. Omitted when the failure happened before anything was hashed. |
 | `reason_code` | A stable token naming the failure mode — see below. |
@@ -379,21 +380,30 @@ could carry it, never appears in the record; neither does any filesystem path.
 | `not_utf8` | The content string had no UTF-8 encoding, so there are no bytes that could have been hashed. |
 | `over_size_cap` | The content exceeded the SDK's local size cap. |
 | `hash_mismatch` | The computed sha256 did not match the delivered `contentHash`. |
-| `key_mismatch` | The store answered under a different key than the one requested. Carries an extra `served_key` field naming the key it answered under, and — uniquely — records **no** `AgentControl Skill Integrity Failure` signal. |
+| `key_mismatch` | The store answered under a different key than the one requested. Carries an extra `served_key` field naming the key it answered under, and records **no** `AgentControl Skill Integrity Failure` signal. |
+| `version_mismatch` | The store answered a version pin with a different version. Carries an extra `served_version` field naming the version it answered with, beside a `version` naming the one requested, and records **no** `AgentControl Skill Integrity Failure` signal. |
 
-**`hash_mismatch` is the one worth paging on.** The other eight describe a malformed or
-truncated payload; a mismatch means content was delivered whose bytes are not the bytes
+**`hash_mismatch` is the one worth paging on.** The others describe a malformed or
+truncated payload, or a store answering a question other than the one it was asked; a
+mismatch means content was delivered whose bytes are not the bytes
 LaunchDarkly hashed, which is a possible **active-tampering** signal. Alert on it, and
 treat `expected_hash` / `observed_hash` as the evidence pair.
 
-**`key_mismatch` is the one code that reaches this record without the product signal.** It
-is decided after verification has passed, and its usual cause is a bug in a custom
-`SkillStore` adapter — a stale cache entry, a colliding key, a wrong index lookup — rather
-than tampering, so it does not inflate LaunchDarkly's own integrity counter. It still
-reaches this record, because a store substituting one skill for another is worth seeing,
-and a rule on `ld.skills.integrity_failure` catches it without modification. Treat it like
+**`key_mismatch` and `version_mismatch` are the two codes that reach this record without
+the product signal.** Both are decided after verification has passed, and the usual cause
+of either is a bug in a custom `SkillStore` adapter — a stale cache entry, a colliding key,
+a wrong index lookup — rather than tampering, so neither inflates LaunchDarkly's own
+integrity counter. Both still reach this record, because a store that substitutes one skill
+for another, or answers a pin with a version you did not ask for, is worth seeing; a rule on
+`ld.skills.integrity_failure` catches them without modification. Treat them like
 `hash_mismatch` if `FDv2SkillStore` is your only store; behind a custom adapter, suspect
 the adapter first.
+
+`version_mismatch` is worth watching for specifically if you resolve pinned references
+behind a custom store, because `get_skill` reports it the same way it reports every other
+failure — as `None` — so this record is the only place it is visible. `get_skill_result`
+names it as the `wrong_version` outcome (below); the two spellings are deliberate, one per
+surface.
 
 #### Failing closed on tampering
 
@@ -427,7 +437,7 @@ elif outcome.skill is not None:
 | `absent` | The store answered, and does not hold that key. |
 | `integrity_failure` | Content was delivered and failed verification, so it was withheld. **The one to fail closed on.** |
 | `store_unavailable` | The store itself could not answer — it raised. An outage, not a deletion. |
-| `wrong_version` | The store answered with a version other than the one asked for, so the answer was withheld. |
+| `wrong_version` | The store answered with a version other than the one asked for, so the answer was withheld. Also written to the integrity log record above, as `reason_code: version_mismatch`. |
 
 `.detail` is human-readable and safe to log or show an operator — it names the key and the
 failure mode, and never carries skill content or a filesystem path. Branch on `.reason`,
@@ -542,6 +552,25 @@ that as every skill having been revoked and delete the files it wrote on a previ
 against a store that has not received a payload reports the retrieval unavailable and leaves
 everything on disk alone. `report.ok` is `False` in that case, and the error names it.
 
+**A 422 means this connection will never be assigned a skill payload, and delivery stops.**
+Every request declares the payload it wants (`kinds=agent-skill`), and LaunchDarkly answers
+HTTP 422 when it will not serve one. **The usual cause is a view-scoped SDK key**: a key
+restricted to a view cannot be assigned a skill payload, so check the key's scoping and use one
+that is not view-scoped. Anything else answering 422 is unexpected — contact LaunchDarkly support
+if the key is not the problem. Retrying fixes neither, and LaunchDarkly chose the status so that
+SDKs stop rather than hammer the fleet, so the store gives up: `failed` carries the reason,
+`last_error` is populated, the 422 is kept off `connection_failures` (that counter measures
+consecutive *recoverable* failures against the retry bound, which a fatal never spends, so it
+holds whatever count the run had already reached), and `wait_for_skills` returns `False`
+immediately instead of at your timeout. It is **not** the answer for an environment that merely
+has no skills yet: an environment holding zero skills is served an empty payload that commits
+normally.
+
+**Once the cause is fixed, call `start()` on the same store.** Giving up ends the run, not the
+store: only `close()` is final, so a store that stopped on a 422 restarts in place — the terminal
+`failed` reason clears, the retry budget resets, and content already held stays readable throughout.
+Restarting the process works too, but it is not required.
+
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
 objects through the `SkillStore` interface and cannot tell which store produced them.
 
@@ -589,10 +618,11 @@ socket operation of a request, connecting included. In `mode="poll"` it bounds t
 request and defaults to 10 seconds; in `mode="stream"` it bounds each wait for the next bytes
 and defaults to 300 seconds, well beyond LaunchDarkly's heartbeat interval.
 
-**The connection also carries your flags.** A client cannot request only the skill payload,
-so a skills-enabled environment delivers flag and segment objects on the same connection.
-They are skipped, not evaluated — this store does no evaluation of any kind — and
-`diagnostics.objects_ignored` counts them.
+**The connection carries only skills.** Every request declares the skill payload, so flag
+and segment objects no longer arrive on it. Anything that is not a skill is still skipped
+rather than rejected — this store does no evaluation of any kind — and
+`diagnostics.objects_ignored` counts those: a nonzero count means the payload gained an
+object kind this version does not recognise, not that something failed.
 
 > **Beta caveats, worth knowing before you deploy.** Payload signing does not exist on this
 > channel yet, so delivery is TLS-only and the content hash establishes self-consistency, not
@@ -622,7 +652,7 @@ Windows.
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
 | `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `base_uri` and `stream_uri` are separate hosts, defaulting to LaunchDarkly's polling and streaming origins; `base_uri` alone covers both. `close()` is **final** — `start()` afterwards raises. **Server-side only** — a mobile key or client-side environment ID raises. See *Receiving skills from LaunchDarkly* above. |
 | `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change. Returns `(initial report, SkillWatcher)`; close the watcher when done. Revocation then takes effect within `debounce` of arriving rather than at the next restart. `debounce` is in **seconds** and must be non-negative and finite; `on_reconcile` is called with each *subsequent* report, the initial one being returned directly. One watcher per root. |
-| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `hashless_objects`, `connection_failures`, `last_error`. |
+| `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `init_client(options={"skillStore": store})`. With none configured,
 the accessors raise `RuntimeError` explaining what to do and `write_skills` reports the

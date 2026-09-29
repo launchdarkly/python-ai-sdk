@@ -66,12 +66,30 @@ FDV2_OBJECT_KIND = "skill"
 """
 The FDv2 ``kind`` skills are delivered under.
 
-Object kinds on the SDK-facing channel are open strings: the agent-skill payload
-is classified ``generic`` and every object in it carries the kind its producer
-registered, which for skills is the bare category name. Delivery lower-cases the
-kind, so an exact comparison is the whole test. The value happens to equal
-``skills_core.SKILL_OBJECT_KIND``; they remain separate constants, because one is
-a wire value LaunchDarkly owns and the other is what this SDK asks a store for.
+Object kinds on the SDK-facing channel are open strings: every object in the
+agent-skill payload carries the kind its producer registered, which for skills is
+the bare category name. Delivery lower-cases the kind, so an exact comparison is
+the whole test. The value happens to equal ``skills_core.SKILL_OBJECT_KIND``;
+they remain separate constants, because one is a wire value LaunchDarkly owns and
+the other is what this SDK asks a store for.
+
+Not ``FDV2_PAYLOAD_KIND``: this is the kind of the *objects*, that one the kind
+of the *payload* they arrive in.
+"""
+
+FDV2_PAYLOAD_KIND = "agent-skill"
+"""
+The kind of the FDv2 payload skills are delivered in, declared on every request
+as ``?kinds=``.
+
+Delivery narrows a connection to the payload kinds it declares and defaults to
+flags, so this is not an optimisation: a request that omits it receives the
+environment's flag payload and no skills at all. It also makes the connection
+carry exactly one payload — the shape ``_ProtocolReader`` is built for — since a
+skill-enabled environment assigns both the flag payload and this one.
+
+The wire accepts a comma-separated list; this store wants nothing but skills, so
+it declares this kind alone.
 """
 
 FDV2_KEY_DELIMITER = ":"
@@ -269,8 +287,9 @@ class StoreDiagnostics:
     skill_objects_received: int = 0
     """``put-object`` events identified as skills, across all payloads."""
     objects_ignored: int = 0
-    """Objects skipped because they were not skills: flags, segments, and any
-    future kind. Skipping is the contract, not a failure."""
+    """Objects skipped because they were not skills. With the skill payload
+    declared on every request, that means a kind this version does not
+    recognise rather than the environment's flags. Skipping is the contract."""
     objects_revoked: int = 0
     """``delete-object`` events applied to skills."""
     payloads_ignored: int = 0
@@ -988,8 +1007,9 @@ class _StaleRequestStateError(_RecoverableTransportError):
 
 _REQUEST_ADVICE = (
     "The request this adapter sent was not understood. It carries only the SDK "
-    "key and, after the first payload, a 'basis' selector, so check the base "
-    "URI and that the endpoint speaks FDv2."
+    "key, a 'kinds' parameter declaring the skill payload, and, after the first "
+    "payload, a 'basis' selector, so check the base URI and that the endpoint "
+    "speaks FDv2."
 )
 
 _FORBIDDEN_ADVICE = (
@@ -1056,6 +1076,21 @@ def _classify_status(status: int, headers: Any) -> Exception:
         # dropped and a full transfer requested; fatal once that has been tried.
         return _StaleRequestStateError(
             f"LaunchDarkly returned HTTP 400. {_REQUEST_ADVICE}"
+        )
+    if status == 422:
+        # Delivery refuses a connection whose declared kinds match no payload it
+        # is assigned, and chose a non-400 4xx so SDKs stop instead of retrying.
+        #
+        # Word-for-word the TypeScript SDK's message, deliberately: a customer
+        # comparing two of our SDKs should not have to work out whether they hit
+        # two different conditions. Names the one cause a reader can act on and
+        # sends every other case to support, rather than enumerating causes that
+        # are not theirs to fix — see the store's docs for what else produces
+        # this status and for the fact that ``start()`` resumes the store.
+        return _FatalTransportError(
+            "LaunchDarkly will not deliver Agent Skills on this connection "
+            "(HTTP 422). The usual cause is a view-scoped SDK key. Check your "
+            "SDK key or contact LaunchDarkly support."
         )
     if status in (405, 406, 414, 501):
         return _FatalTransportError(
@@ -1198,19 +1233,24 @@ class _Requester:
 
     def _url(self, origin: str, path: str, basis: str | None) -> str:
         """
-        The request URL: the path, plus ``basis`` once a payload has committed.
+        The request URL: the path, the payload kind this store accepts, and
+        ``basis`` once a payload has committed.
 
         *origin* is the host for this path — polling and streaming have one
         each.
 
+        ``kinds`` is on the first request too: it selects what the connection is
+        served rather than describing what it holds (see ``FDV2_PAYLOAD_KIND``).
+
         Deliberately no ``mv`` (data model version). That parameter selects the
-        *flag* data model and the connection rejects any value but the flag
-        default; the agent-skill payload is generic, is served regardless of it,
-        and has no model version of its own to ask for.
+        *flag* data model, and delivery overrides it with the payload's own
+        default for any non-flagging payload, so sending it would state a
+        preference that is ignored.
         """
-        if not basis:
-            return f"{origin}{path}"
-        return f"{origin}{path}?{urllib.parse.urlencode({'basis': basis})}"
+        query: dict[str, str] = {"kinds": FDV2_PAYLOAD_KIND}
+        if basis:
+            query["basis"] = basis
+        return f"{origin}{path}?{urllib.parse.urlencode(query)}"
 
     def _request(
         self, origin: str, path: str, basis: str | None, headers: dict[str, str]
@@ -1994,10 +2034,17 @@ class FDv2SkillStore:
             # re-arm the waiters and then have this dying thread end delivery
             # on the fresh run, releasing its waiters before it had answered.
             self._end_delivery()
+        # "will not retry" is the whole of it: this run is over, and the store
+        # is not. Naming ``start()`` rather than a process restart because
+        # ``close`` is the only thing that forecloses a restart, and an operator
+        # who has just fixed the cause should be told the cheaper of the two.
+        # The prefix is matched by a test that holds this line open to widen the
+        # give-up/start race; keep it.
         logger.error(
             "Skill delivery has stopped and will not retry: %s. The store keeps "
-            "serving the last content it received; skills will not update until "
-            "the process restarts with a working connection.",
+            "serving the last content it received, and skills will not update "
+            "until delivery runs again: call start() on this store once the "
+            "cause is fixed, or restart the process.",
             reason,
         )
 
