@@ -1993,6 +1993,27 @@ class TestIntegrityFailureLogRecord:
         assert records[0]["served_version"] == 99
         assert recording_emitter.records == []
 
+    async def test_a_hostile_served_version_is_redacted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Unreachable today, asserted anyway — the ``served_key`` rule.
+
+        ``verify_raw_skill`` accepts the served version before this path runs,
+        so the value is an integer by construction. That is a property of the
+        current call order rather than of the recorder, and the guard is what
+        keeps a future reordering from publishing a body here — and what keeps
+        the field an integer, which the byte-comparable JSON needs. Called
+        directly, since no store can currently drive it.
+        """
+        from launchdarkly_ai_server import skills_core
+
+        skills_core.record_version_mismatch("asked-for", 1, LOGGED_BODY)
+
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        assert records[0]["served_version"] == "<invalid-version>"
+        assert LOGGED_BODY not in json.dumps(records[0])
+
     async def test_the_key_check_wins_when_both_key_and_version_disagree(
         self,
         caplog: pytest.LogCaptureFixture,

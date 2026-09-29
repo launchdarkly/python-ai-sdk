@@ -267,7 +267,21 @@ strings, held apart on purpose. No `mv`: that parameter selects the *flag* data 
 delivery overrides whatever a request asks for with the payload's own default for any
 non-flagging payload, so sending it would state a preference that is ignored.
 
-**HTTP 422 is fatal, and the platform decided that rather than the SDK inferring it.** Delivery answers 422 when a connection's declared kinds exclude every payload it is assigned, and it picked a non-400 4xx *because* LD SDKs treat those as terminal. So `classifyStatus` returns a `FatalTransportError` and the existing give-up path handles it: `failed` and `lastError` are set, `connectionFailures` is untouched (it measures consecutive *recoverable* failures against the retry bound, and a fatal never retries), and `waitForSkills` resolves `false` at once rather than at the timeout.
+**HTTP 422 is fatal, and the platform decided that rather than the SDK inferring it.** Delivery
+answers 422 when a connection's declared kinds exclude every payload it is assigned, and it
+picked a non-400 4xx *because* LD SDKs treat those as terminal. So `_classify_status` returns a
+`_FatalTransportError` and the existing give-up path handles it: `failed` and `last_error` are
+set, `connection_failures` is untouched (it measures consecutive *recoverable* failures against
+the retry bound, and a fatal never retries — untouched, note, not zero: a run that already had
+recoverable failures keeps their count), and `wait_for_skills` returns `False` at once rather
+than at the timeout.
+
+**The 422's message names `start()`, not a process restart, and that is the accurate advice.**
+`_give_up` ends the run and not the store — only `close` sets `_closed`, and `_closed` is the
+only thing `start` refuses — so a store that stopped on a 422 resumes in place once the account
+is enabled, dropping the terminal reason through `_rearm_waiters`. Do not reword the message
+towards "restart the process": it is the remediation a customer acts on, and
+`test_a_store_that_gave_up_on_a_422_resumes_on_start` pins the cheaper one that works.
 
 **The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
 plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a
@@ -553,7 +567,12 @@ One ERROR record per withheld skill, message text = `INTEGRITY_FAILURE_EVENT` + 
 `extra={"ld_skills": record}`. Fields: `event`, `action` (always `withheld`), `skill_key`,
 `version?`, `expected_hash?`, `observed_hash?`, `reason_code`, `reason`, `language`, plus
 the two record-only fields the boundary codes carry — `served_key?` on a `key_mismatch` and
-`served_version?` on a `version_mismatch`, never both on one record.
+`served_version?` on a `version_mismatch`, never both on one record. Both are store-controlled
+and both are shape-checked before they are written (`<invalid-key>`, `<invalid-version>`), even
+though verification has already accepted them on the only path that reaches either: that is a
+property of the call order, not of the recorders, and the guards are what keep a reordering
+from publishing a body. The `served_version` guard doubles as what keeps the field an integer,
+which the byte-comparable JSON needs.
 
 Each of those choices is load-bearing; do not undo one as a simplification.
 

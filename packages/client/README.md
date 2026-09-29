@@ -358,7 +358,7 @@ LaunchDarkly's AI SDKs for the same input.
 | `action` | Always `withheld` — the content was not returned to your code. |
 | `skill_key` | The skill key **requested**, or `<invalid-key>` when the key was itself malformed. |
 | `served_key` | Only on `key_mismatch`: the key the store actually answered under. Same redaction as `skill_key`. Omitted on every other failure mode. |
-| `served_version` | Only on `version_mismatch`: the version the store actually answered with, as an integer. Omitted on every other failure mode. Never appears on the same record as `served_key`. |
+| `served_version` | Only on `version_mismatch`: the version the store actually answered with, as an integer — or `<invalid-version>` when it was not one. Omitted on every other failure mode. Never appears on the same record as `served_key`. |
 | `version` | The delivered version — or, on `version_mismatch`, the version **requested**. Omitted when it was not a valid version, and on `key_mismatch`. |
 | `expected_hash` | The delivered `contentHash`, or `<not-a-sha256-digest>` when it was not one. Omitted when none was delivered. |
 | `observed_hash` | The sha256 the SDK computed. Omitted when the failure happened before anything was hashed. |
@@ -559,13 +559,18 @@ a key restricted to a view cannot be assigned a skill payload, so check the key'
 use one that is not view-scoped. The other cause is that Agent Skills delivery is not enabled
 for your account, which is not a setting you control — contact LaunchDarkly support if the key
 is not the problem. Retrying fixes neither, and LaunchDarkly chose the status so that SDKs stop
-rather than hammer the fleet, so the store gives up: `failed` carries the reason, `lastError` is
-populated, `connectionFailures` stays at zero (it counts consecutive *recoverable* failures against
-the retry bound, which a fatal never spends), and `waitForSkills` resolves `false` immediately
-instead of at your timeout. It is **not** the answer for an environment that merely has no skills
-yet — with delivery enabled and a non-view-scoped key, an environment holding zero skills is served
-an empty payload that commits normally. Because delivery has stopped for good, a process that booted
-while the cause was in effect picks up skills only after a restart.
+rather than hammer the fleet, so the store gives up: `failed` carries the reason, `last_error` is
+populated, the 422 is kept off `connection_failures` (that counter measures consecutive
+*recoverable* failures against the retry bound, which a fatal never spends, so it holds whatever
+count the run had already reached), and `wait_for_skills` returns `False` immediately instead of at
+your timeout. It is **not** the answer for an environment that merely has no skills yet — with
+delivery enabled and a non-view-scoped key, an environment holding zero skills is served an empty
+payload that commits normally.
+
+**Once the cause is fixed, call `start()` on the same store.** Giving up ends the run, not the
+store: only `close()` is final, so a store that stopped on a 422 restarts in place — the terminal
+`failed` reason clears, the retry budget resets, and content already held stays readable throughout.
+Restarting the process works too, but it is not required.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
 objects through the `SkillStore` interface and cannot tell which store produced them.

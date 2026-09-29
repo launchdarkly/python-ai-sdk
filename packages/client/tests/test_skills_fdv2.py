@@ -209,10 +209,6 @@ class _FakeFDv2Endpoint:
         self._streams: list[list[dict[str, Any]]] = []
         self._lock = threading.Lock()
         self.hold_stream_open = False
-        # What a poll is answered with once the queued script runs out. 304 is
-        # right for a healthy environment, but a connection with no skill
-        # payload answers *every* request 422, and a queue cannot say "every".
-        self.default_poll_status = 304
         # When set, every ``/sdk/stream`` answers 307 to this URL instead of
         # streaming, so a test can check that the store refuses to follow it.
         self.redirect_stream_to: str | None = None
@@ -297,9 +293,7 @@ class _FakeFDv2Endpoint:
     def _serve_poll(self, handler: BaseHTTPRequestHandler) -> None:
         with self._lock:
             response = (
-                self._polls.pop(0)
-                if self._polls
-                else {"status": self.default_poll_status, "events": []}
+                self._polls.pop(0) if self._polls else {"status": 304, "events": []}
             )
         status = response["status"]
         handler.send_response(status)
@@ -2070,11 +2064,34 @@ class TestFailureHandling:
         assert "enabled" in message and "account" in message
         assert "view-scoped" in message
         # The two things it must not say, both false: the condition is not about
-        # whether any skill exists, and nothing arrives without a restart.
+        # whether any skill exists, and a process restart is not what clears it.
         assert "first skill" not in message
-        assert "without a restart" not in message
-        # It does name what actually clears the condition.
-        assert "restart" in message
+        assert "restart" not in message
+        # It does name the recovery that works, which the test below exercises.
+        assert "start()" in message
+
+    def test_a_store_that_gave_up_on_a_422_resumes_on_start(
+        self, endpoint: Any
+    ) -> None:
+        """The recovery the message names, asserted rather than claimed.
+
+        A fatal 422 stops the run, not the store: ``_give_up`` does not close
+        it, and ``close`` is the only thing ``start`` refuses. So the account
+        being enabled mid-process is recovered by starting this store again,
+        and the message must not send a customer to restart their service
+        instead. ``test_a_restarted_store_does_not_report_the_old_failure``
+        covers the general case; this pins the one the 422 advises.
+        """
+        endpoint.queue_poll(status=422)
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+
+            # The gate opens: nothing about the store has changed.
+            endpoint.queue_poll(full_payload(("put-object", put_skill())))
+            store.start()
+            assert store.wait_for_skills(timeout=5) is True
+            assert store.failed is None
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
 
     def test_a_fatal_422_is_not_counted_against_the_retry_bound(
         self, endpoint: Any

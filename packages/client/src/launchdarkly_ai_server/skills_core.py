@@ -458,10 +458,17 @@ def record_version_mismatch(key: Any, requested: Any, served: Any) -> None:
         # The version the store answered with: the one datum that makes a broken
         # adapter diagnosable, so it is a parseable field rather than prose
         # buried in ``reason``. Record-only, never on the signal's allowlist.
-        # Needs no redaction — a number cannot carry the skill body — but must
-        # stay an integer: the sorted-key JSON is compared byte-for-byte across
-        # SDKs, and ``3`` and ``"3"`` are not the same line.
-        "served_version": served,
+        #
+        # Shape-checked on the same rule as ``served_key``, and for the same
+        # reason: *served* cannot be hostile on the path that calls this, since
+        # ``verify_raw_skill`` accepted it first, but that is a property of the
+        # current call order rather than of this function. The check is also
+        # what keeps the field an integer, which the sorted-key JSON needs to
+        # stay byte-comparable across SDKs — ``3`` and ``"3"`` are not the same
+        # line.
+        "served_version": (
+            served if is_valid_skill_version(served) else "<invalid-version>"
+        ),
         # The key the caller asked for, the meaning it has on every other
         # record, shape-checked on the same rule as every other key that
         # reaches a surface.
