@@ -2034,10 +2034,17 @@ class FDv2SkillStore:
             # re-arm the waiters and then have this dying thread end delivery
             # on the fresh run, releasing its waiters before it had answered.
             self._end_delivery()
+        # "will not retry" is the whole of it: this run is over, and the store
+        # is not. Naming ``start()`` rather than a process restart because
+        # ``close`` is the only thing that forecloses a restart, and an operator
+        # who has just fixed the cause should be told the cheaper of the two.
+        # The prefix is matched by a test that holds this line open to widen the
+        # give-up/start race; keep it.
         logger.error(
             "Skill delivery has stopped and will not retry: %s. The store keeps "
-            "serving the last content it received; skills will not update until "
-            "the process restarts with a working connection.",
+            "serving the last content it received, and skills will not update "
+            "until delivery runs again: call start() on this store once the "
+            "cause is fixed, or restart the process.",
             reason,
         )
 

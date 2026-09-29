@@ -1783,6 +1783,33 @@ class TestFailureHandling:
         assert "opt-in" in store.failed
         assert any("opt-in" in r.getMessage() for r in caplog.records)
 
+    def test_the_give_up_line_points_at_start_not_a_process_restart(
+        self, endpoint: Any, caplog: Any
+    ) -> None:
+        """One line for every fatal, so it has to be true of every fatal.
+
+        ``_give_up`` ends the run and not the store, and the test below is what
+        proves a restarted store delivers. Telling an operator to restart their
+        process is therefore an overstatement wherever it appears, and this
+        line appears on all of them — a 401, a 403, a 404, a 422, and an
+        exhausted retry budget alike.
+        """
+        endpoint.queue_poll(status=401)
+        with caplog.at_level("ERROR"):
+            with poll_store(endpoint) as store:
+                assert wait_until(lambda: store.failed is not None)
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("Skill delivery has stopped")
+        ]
+        assert len(lines) == 1
+        assert "start()" in lines[0]
+        assert "until the process restarts" not in lines[0]
+        # It still says the held content survives, which is the other half of
+        # what an operator reading this needs to know.
+        assert "last content it received" in lines[0]
+
     def test_a_restarted_store_does_not_report_the_old_failure(
         self, endpoint: Any
     ) -> None:

@@ -285,12 +285,18 @@ the integrity record: a customer comparing them should not have to work out whet
 different conditions. `test_the_422_message_names_its_one_actionable_cause` asserts the cause and
 the referral, and asserts the absences too, so an enumeration cannot creep back in.
 
-**A 422 stops the run, not the store, and the docs say `start()` rather than a process restart.**
-`_give_up` does not close — only `close` sets `_closed`, and `_closed` is the only thing `start`
-refuses — so a store that stopped on a 422 resumes in place once the key is fixed, dropping the
-terminal reason through `_rearm_waiters`. The message has no room for that and the README carries
-it instead; `test_a_store_that_gave_up_on_a_422_resumes_on_start` pins the behaviour, so neither
-surface can drift back towards "restart the process".
+**A fatal stops the run, not the store, so every surface says `start()` and not "restart the
+process".** `_give_up` does not close — only `close` sets `_closed`, and `_closed` is the only
+thing `start` refuses — so a store that gave up resumes in place once the cause is fixed,
+dropping the terminal reason through `_rearm_waiters`. This is not 422-specific: `_give_up`'s
+log line is one line for a 401, a 403, a 404, a 422 and an exhausted retry budget alike, so an
+overstatement there is wrong five times over. Three surfaces carry the claim and each is
+asserted: the log line, by
+`test_the_give_up_line_points_at_start_not_a_process_restart`; the behaviour, by
+`test_a_store_that_gave_up_on_a_422_resumes_on_start`, with
+`test_a_restarted_store_does_not_report_the_old_failure` for the general case; and the README's
+422 section, in prose. The 422's own message is the one place that stays silent on it, having no
+room — the log line beside it says it instead.
 
 **The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
 plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a
