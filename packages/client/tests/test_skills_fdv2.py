@@ -2050,43 +2050,52 @@ class TestFailureHandling:
         assert len(endpoint.requests) == 1
         assert store.is_initialized() is False
 
-    def test_the_422_message_names_both_of_its_real_causes(self, endpoint: Any) -> None:
+    def test_the_422_message_names_its_one_actionable_cause(
+        self, endpoint: Any
+    ) -> None:
         """
-        The message is what a customer pastes into a support ticket, so it has
-        to name both causes — account-level enablement and the key's scoping —
-        for the first person reading it to check. Asserted on substance rather
-        than prose, so the wording stays free to improve.
+        The message is what a customer pastes into a support ticket, so it names
+        the one cause that is theirs to fix — a view-scoped SDK key — and sends
+        every other case to support. Asserted on substance rather than prose, so
+        the wording stays free to improve.
+
+        Word-for-word the TypeScript SDK's, which is why it is this short.
         """
         endpoint.queue_poll(status=422)
         with poll_store(endpoint) as store:
             assert wait_until(lambda: store.failed is not None)
         message = store.failed.lower()
-        assert "enabled" in message and "account" in message
         assert "view-scoped" in message
-        # The two things it must not say, both false: the condition is not about
-        # whether any skill exists, and a process restart is not what clears it.
+        assert "support" in message
+
+        # What it must not say. The remaining causes are not a customer's to
+        # fix, so they go to support unenumerated rather than being listed at
+        # the reader. The other two were simply false — the condition is not
+        # about whether any skill exists, and a *process* restart is not what
+        # clears it.
+        assert "account" not in message
+        assert "enabled" not in message
         assert "first skill" not in message
         assert "restart" not in message
-        # It does name the recovery that works, which the test below exercises.
-        assert "start()" in message
 
     def test_a_store_that_gave_up_on_a_422_resumes_on_start(
         self, endpoint: Any
     ) -> None:
-        """The recovery the message names, asserted rather than claimed.
+        """The recovery the README documents, asserted rather than claimed.
 
         A fatal 422 stops the run, not the store: ``_give_up`` does not close
-        it, and ``close`` is the only thing ``start`` refuses. So the account
-        being enabled mid-process is recovered by starting this store again,
-        and the message must not send a customer to restart their service
-        instead. ``test_a_restarted_store_does_not_report_the_old_failure``
-        covers the general case; this pins the one the 422 advises.
+        it, and ``close`` is the only thing ``start`` refuses. So a 422 whose
+        cause is fixed while the process runs is recovered by starting this
+        store again, and neither the docs nor the message may send a customer
+        to restart their service instead.
+        ``test_a_restarted_store_does_not_report_the_old_failure`` covers the
+        general case; this pins the one the 422's docs promise.
         """
         endpoint.queue_poll(status=422)
         with poll_store(endpoint) as store:
             assert wait_until(lambda: store.failed is not None)
 
-            # The gate opens: nothing about the store has changed.
+            # The key is replaced: nothing about the store has changed.
             endpoint.queue_poll(full_payload(("put-object", put_skill())))
             store.start()
             assert store.wait_for_skills(timeout=5) is True
@@ -2140,8 +2149,8 @@ class TestFailureHandling:
         The composition is under test rather than either half: "delivery gave
         up, therefore the store is empty, therefore prune" is the inference an
         implementation makes when it assembles this from two sections. It is
-        also the path a filesystem-agent deployment takes when Agent Skills is
-        not enabled for the account.
+        also the path a filesystem-agent deployment takes against a connection
+        skills are never delivered on.
         """
         root = tmp_path / "skills"
         stale = root / "left-behind"

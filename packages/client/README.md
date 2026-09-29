@@ -554,18 +554,17 @@ everything on disk alone. `report.ok` is `False` in that case, and the error nam
 
 **A 422 means this connection will never be assigned a skill payload, and delivery stops.**
 Every request declares the payload it wants (`kinds=agent-skill`), and LaunchDarkly answers
-HTTP 422 when it will not serve one. The cause you can act on is a **view-scoped SDK key**:
-a key restricted to a view cannot be assigned a skill payload, so check the key's scoping and
-use one that is not view-scoped. The other cause is that Agent Skills delivery is not enabled
-for your account, which is not a setting you control — contact LaunchDarkly support if the key
-is not the problem. Retrying fixes neither, and LaunchDarkly chose the status so that SDKs stop
-rather than hammer the fleet, so the store gives up: `failed` carries the reason, `last_error` is
-populated, the 422 is kept off `connection_failures` (that counter measures consecutive
-*recoverable* failures against the retry bound, which a fatal never spends, so it holds whatever
-count the run had already reached), and `wait_for_skills` returns `False` immediately instead of at
-your timeout. It is **not** the answer for an environment that merely has no skills yet — with
-delivery enabled and a non-view-scoped key, an environment holding zero skills is served an empty
-payload that commits normally.
+HTTP 422 when it will not serve one. **The usual cause is a view-scoped SDK key**: a key
+restricted to a view cannot be assigned a skill payload, so check the key's scoping and use one
+that is not view-scoped. Anything else answering 422 is unexpected — contact LaunchDarkly support
+if the key is not the problem. Retrying fixes neither, and LaunchDarkly chose the status so that
+SDKs stop rather than hammer the fleet, so the store gives up: `failed` carries the reason,
+`last_error` is populated, the 422 is kept off `connection_failures` (that counter measures
+consecutive *recoverable* failures against the retry bound, which a fatal never spends, so it
+holds whatever count the run had already reached), and `wait_for_skills` returns `False`
+immediately instead of at your timeout. It is **not** the answer for an environment that merely
+has no skills yet: an environment holding zero skills is served an empty payload that commits
+normally.
 
 **Once the cause is fixed, call `start()` on the same store.** Giving up ends the run, not the
 store: only `close()` is final, so a store that stopped on a 422 restarts in place — the terminal

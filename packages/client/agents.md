@@ -276,12 +276,21 @@ the retry bound, and a fatal never retries — untouched, note, not zero: a run 
 recoverable failures keeps their count), and `wait_for_skills` returns `False` at once rather
 than at the timeout.
 
-**The 422's message names `start()`, not a process restart, and that is the accurate advice.**
-`_give_up` ends the run and not the store — only `close` sets `_closed`, and `_closed` is the
-only thing `start` refuses — so a store that stopped on a 422 resumes in place once the account
-is enabled, dropping the terminal reason through `_rearm_waiters`. Do not reword the message
-towards "restart the process": it is the remediation a customer acts on, and
-`test_a_store_that_gave_up_on_a_422_resumes_on_start` pins the cheaper one that works.
+**The 422's message is the TypeScript SDK's, word for word, and deliberately short.** It names
+the one cause a customer can act on — a view-scoped SDK key — and refers every other case to
+support rather than enumerating it. Do not extend it with the remaining causes: they are not a
+customer's to fix, and a message that lists conditions its reader cannot change costs them the
+one line that matters. Keeping the two SDKs identical here matters for the reason it matters on
+the integrity record: a customer comparing them should not have to work out whether they hit two
+different conditions. `test_the_422_message_names_its_one_actionable_cause` asserts the cause and
+the referral, and asserts the absences too, so an enumeration cannot creep back in.
+
+**A 422 stops the run, not the store, and the docs say `start()` rather than a process restart.**
+`_give_up` does not close — only `close` sets `_closed`, and `_closed` is the only thing `start`
+refuses — so a store that stopped on a 422 resumes in place once the key is fixed, dropping the
+terminal reason through `_rearm_waiters`. The message has no room for that and the README carries
+it instead; `test_a_store_that_gave_up_on_a_422_resumes_on_start` pins the behaviour, so neither
+surface can drift back towards "restart the process".
 
 **The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
 plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a

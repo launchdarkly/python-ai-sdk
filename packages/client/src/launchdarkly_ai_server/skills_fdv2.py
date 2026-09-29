@@ -1080,12 +1080,17 @@ def _classify_status(status: int, headers: Any) -> Exception:
     if status == 422:
         # Delivery refuses a connection whose declared kinds match no payload it
         # is assigned, and chose a non-400 4xx so SDKs stop instead of retrying.
+        #
+        # Word-for-word the TypeScript SDK's message, deliberately: a customer
+        # comparing two of our SDKs should not have to work out whether they hit
+        # two different conditions. Names the one cause a reader can act on and
+        # sends every other case to support, rather than enumerating causes that
+        # are not theirs to fix — see the store's docs for what else produces
+        # this status and for the fact that ``start()`` resumes the store.
         return _FatalTransportError(
             "LaunchDarkly will not deliver Agent Skills on this connection "
-            "(HTTP 422). Either Agent Skills is not enabled for this account, "
-            "or this SDK key is view-scoped and cannot be assigned a skill "
-            "payload. Retrying fixes neither, so delivery has stopped; call "
-            "start() on this store once the cause is fixed."
+            "(HTTP 422). The usual cause is a view-scoped SDK key. Check your "
+            "SDK key or contact LaunchDarkly support."
         )
     if status in (405, 406, 414, 501):
         return _FatalTransportError(
