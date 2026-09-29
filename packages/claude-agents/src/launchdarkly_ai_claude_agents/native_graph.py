@@ -274,7 +274,17 @@ def to_claude_agents(
                             "$ld:ai:graph:handoff_success", ld_context, td, 1
                         )
 
-                    path.append(_node.key)
+                    if _node.key not in path:
+                        index = len(path)
+                        path.append(_node.key)
+                        if ld_context:
+                            node_td = make_track_data(_node, def_obj.key, run_id)
+                            get_client().track(
+                                "$ld:ai:graph:node",
+                                ld_context,
+                                {**node_td, "nodeKey": _node.key, "index": index},
+                                1,
+                            )
                     node_start = time.monotonic()
                     result = await _run_query(
                         _node,
@@ -328,7 +338,17 @@ def to_claude_agents(
                 if e.target_key in subagent_tool_ctx
             ]
 
-            path.append(root.key)
+            if root.key not in path:
+                root_index = len(path)
+                path.append(root.key)
+                if ld_context:
+                    root_node_td = make_track_data(root, def_obj.key, run_id)
+                    get_client().track(
+                        "$ld:ai:graph:node",
+                        ld_context,
+                        {**root_node_td, "nodeKey": root.key, "index": root_index},
+                        1,
+                    )
             root_start = time.monotonic()
 
             try:
@@ -402,7 +422,6 @@ def to_claude_agents(
                     root_td,
                     total_usage["total"],
                 )
-                client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
                 client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
 
             return {"response": final_output, "usage": total_usage}

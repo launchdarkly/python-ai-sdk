@@ -25,7 +25,7 @@ from .runner import (
     _provides_for,
     _segment,
 )
-from .types import EvalRunResult, GenerationConfig, RunSummary
+from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +128,7 @@ class EvaluationsModule:
         dataset: str,
         handler: EvalHandler,
         generation: GenerationConfig | None = None,
-        ai_config: str | None = None,
-        variation: str | None = None,
+        ai_config: AIConfig | None = None,
         tools: Mapping[str, ToolImplementation] | None = None,
         criteria: list[Criterion] | None = None,
         judge_handlers: list[EvalHandler] | None = None,
@@ -158,7 +157,7 @@ class EvaluationsModule:
         and a wider ``poll_interval_seconds``; both default to
         ``SUMMARY_POLL_TIMEOUT_SECONDS`` / ``SUMMARY_POLL_INTERVAL_SECONDS``.
 
-        Pass ``ai_config`` and ``variation`` to start from an existing AI Config
+        Pass ``ai_config`` to start from an existing AI Config
         variation instead of a hand-built ``generation``. Its model, provider,
         parameters, prompt and output format become the defaults, and anything
         set in ``generation`` overrides them field by field (``parameters``
@@ -180,18 +179,21 @@ class EvaluationsModule:
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
-        self._validate_config_source(
-            generation=generation, ai_config=ai_config, variation=variation
-        )
+        self._validate_config_source(generation=generation, ai_config=ai_config)
         pinned_tool_versions: dict[str, int] = {}
-        if ai_config is not None and variation is not None:
+        config_label = ""
+        if ai_config is not None:
+            config_label = f"{ai_config.key!r}/{ai_config.variation!r}"
             ai_config_variation = await asyncio.to_thread(
-                self._runner._fetch_config_variation, project_key, ai_config, variation
+                self._runner._fetch_config_variation,
+                project_key,
+                ai_config.key,
+                ai_config.variation,
             )
             generation = _merge_generation(ai_config_variation.generation, generation)
             if tools is None and ai_config_variation.tool_versions:
                 raise EvaluationsError(
-                    f"AI Config variation {ai_config!r}/{variation!r} uses tools "
+                    f"AI Config variation {config_label} uses tools "
                     "with no implementation: "
                     + ", ".join(
                         repr(name) for name in ai_config_variation.tool_versions
@@ -226,10 +228,9 @@ class EvaluationsModule:
             resolved_tool = resolved_tools.get(tool_key)
             if resolved_tool is not None and resolved_tool.version != pinned_version:
                 logger.warning(
-                    "AI Config variation %r/%r pins tool %r at version %d; "
+                    "AI Config variation %s pins tool %r at version %d; "
                     "evaluating against the latest version %d.",
-                    ai_config,
-                    variation,
+                    config_label,
                     tool_key,
                     pinned_version,
                     resolved_tool.version,
@@ -461,22 +462,20 @@ class EvaluationsModule:
     def _validate_config_source(
         *,
         generation: GenerationConfig | None,
-        ai_config: str | None,
-        variation: str | None,
+        ai_config: AIConfig | None,
     ) -> None:
         """Require a generation source before any request is made."""
-        if ai_config is None and variation is None:
+        if ai_config is None:
             if generation is None:
                 raise EvaluationsError(
-                    "Pass generation, or ai_config and variation to evaluate an "
-                    "existing AI Config variation"
+                    "Pass generation, or ai_config to evaluate an existing AI "
+                    "Config variation"
                 )
             return
-        if ai_config is None:
-            raise EvaluationsError("variation requires ai_config")
-        if variation is None:
-            raise EvaluationsError("ai_config requires variation")
-        for name, value in (("ai_config", ai_config), ("variation", variation)):
+        for name, value in (
+            ("ai_config.key", ai_config.key),
+            ("ai_config.variation", ai_config.variation),
+        ):
             if not value.strip():
                 raise EvaluationsError(f"{name} must not be blank")
 
@@ -485,8 +484,8 @@ class EvaluationsModule:
         """Check the final generation settings, after any fetched variation is merged."""
         if generation is None:
             raise EvaluationsError(
-                "Pass generation, or ai_config and variation to evaluate an "
-                "existing AI Config variation"
+                "Pass generation, or ai_config to evaluate an existing AI "
+                "Config variation"
             )
         provider = generation.get("provider")
         model = generation.get("model")

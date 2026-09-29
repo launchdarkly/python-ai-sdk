@@ -273,12 +273,41 @@ class TestGraphInvoke:
             await g.invoke("hi", CONTEXT)
         events = [c[0][0] for c in mock_ld_client.track.call_args_list]
         assert "$ld:ai:graph:invocation_failure" in events
+        assert "$ld:ai:graph:path" not in events
+        node_events = [
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
+        ]
+        assert len(node_events) == 1
+        assert node_events[0][2]["nodeKey"] == "root-node"
+        assert node_events[0][2]["index"] == 0
+        assert node_events[0][2]["graphKey"] == "graph-key"
+        assert node_events[0][3] == 1
+        assert "path" not in node_events[0][2]
 
-    async def test_graph_path_tracked(self, mock_ld_client: MagicMock) -> None:
+    async def test_graph_node_tracked_per_visited_node(
+        self, mock_ld_client: MagicMock
+    ) -> None:
         g = graph("graph-key", handlers=[_make_handler()])
         await g.invoke("hi", CONTEXT)
         events = [c[0][0] for c in mock_ld_client.track.call_args_list]
-        assert "$ld:ai:graph:path" in events
+        assert "$ld:ai:graph:path" not in events
+        node_events = [
+            c[0]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:node"
+        ]
+        assert len(node_events) == 2
+        assert node_events[0][2]["nodeKey"] == "root-node"
+        assert node_events[0][2]["index"] == 0
+        assert node_events[0][3] == 1
+        assert node_events[1][2]["nodeKey"] == "leaf-node"
+        assert node_events[1][2]["index"] == 1
+        assert node_events[1][3] == 1
+        assert node_events[0][2]["runId"] == node_events[1][2]["runId"]
+        assert node_events[0][2]["graphKey"] == "graph-key"
+        assert "path" not in node_events[0][2]
 
     async def test_node_variations_resolved_only_once(
         self, mock_ld_client: MagicMock

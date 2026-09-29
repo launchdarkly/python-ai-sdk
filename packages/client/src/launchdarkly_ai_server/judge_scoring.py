@@ -1,10 +1,12 @@
-"""Shared scoring contract for LaunchDarkly AI Judge invocations.
+"""Shared contract for LaunchDarkly AI Judge invocations.
 
-Both judge execution paths — the online path (``judges.run_judges``, sampled
-per invocation) and the offline evaluations path (``evaluations.runner``) —
-prompt a judge model for the same ``{"score": <0-1>, "reasoning": <string>}``
-JSON shape and must parse it the same way. This module owns that contract so
-the two paths cannot drift.
+Three judge execution paths exist — the online inline path
+(``judges.run_judges``, sampled per invocation), the online deferred path
+(``judges.run_judge``, from a ``JudgeTask`` on a background thread), and the
+offline evaluations path (``evaluations.runner``). All three prompt a judge
+model for the same ``{"score": <0-1>, "reasoning": <string>}`` JSON shape, and
+all three must show the judge the same conversation. This module owns both
+halves of that contract so the paths cannot drift.
 """
 
 from __future__ import annotations
@@ -25,6 +27,30 @@ FORMATTING_INSTRUCTIONS = "\n".join(
         "function. Do not include ```json tags.",
     ]
 )
+
+
+def build_message_history(
+    *,
+    user_input: Any = None,
+    trajectory: Any = None,
+    output: Any = None,
+) -> str:
+    """The conversation a judge is shown, as its ``message_history`` variable.
+
+    Ordered as it happened: what was asked, what the agent did, what it
+    answered, then how to format the verdict. Empty parts are skipped, so a
+    run with no tools yields the history it did before trajectories existed.
+
+    The formatting block is appended here, not by callers: judges built from
+    the AI Library's default templates read the JSON shape from
+    ``{{message_history}}``, and one that stopped being told it would return
+    prose and fail every result as invalid output.
+    """
+    return "\n\n".join(
+        str(part)
+        for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
+        if part
+    )
 
 
 def numeric_score(score: Any) -> float | None:

@@ -26,6 +26,7 @@ from .conversation import (
     set_conversation_id_if_absent,
 )
 from .evaluations import (
+    AIConfig,
     Criterion,
     DatasetRow,
     EvalRunResult,
@@ -73,6 +74,7 @@ from .types import (
     GraphEdge,
     GraphNode,
     GraphOptions,
+    GraphStreamEvent,
     GraphTopology,
     HandlerResult,
     HandlerStreamEvent,
@@ -136,6 +138,7 @@ __all__ = [  # noqa: RUF022
     "GraphEdge",
     "GraphNode",
     "GraphOptions",
+    "GraphStreamEvent",
     "GraphTopology",
     "HandlerResult",
     "HandlerStreamEvent",
@@ -184,6 +187,7 @@ __all__ = [  # noqa: RUF022
     "to_semconv_finish_reason",
     "VariationMeta",
     # evaluations
+    "AIConfig",
     "EvalRunResult",
     "Criterion",
     "DatasetRow",
