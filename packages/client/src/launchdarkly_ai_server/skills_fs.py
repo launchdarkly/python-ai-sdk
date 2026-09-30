@@ -877,7 +877,7 @@ def _write_one(
                 # Hash first, and decide from the bytes. The manifest check
                 # below is what protects a file the SDK did not write, but on
                 # its own it also refuses one the SDK wrote and was killed
-                # before recording it, wedging every later reconcile. Comparing
+                # before recording it, blocking every later reconcile. Comparing
                 # the bytes separates those two cases, and only content
                 # byte-identical to what LaunchDarkly resolved is adopted. This
                 # exception must not be widened — see agents.md.
@@ -1044,7 +1044,7 @@ def _sweep_orphan_temp_files(root: Path, root_fd: int | None, key: str) -> None:
         return
     except (OSError, ValueError) as exc:
         logger.warning(
-            "orphaned temp files under skill '%s' could not be swept: %s", key, exc
+            "Orphaned temp files under skill '%s' could not be swept: %s", key, exc
         )
 
 

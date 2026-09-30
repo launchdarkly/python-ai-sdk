@@ -57,7 +57,7 @@ SKILL_BODY = "---\nname: Test Skill\n---\nDo the thing.\n"
 
 
 class _RecordingEmitter:
-    """Telemetry seam double — records (signal, properties) pairs."""
+    """Telemetry emitter double — records (signal, properties) pairs."""
 
     def __init__(self) -> None:
         self.records: list[tuple[str, dict[str, Any]]] = []
@@ -70,7 +70,7 @@ class _RecordingEmitter:
 
 
 class _ThrowingEmitter:
-    """Telemetry seam double whose record() always raises."""
+    """Telemetry emitter double whose record() always raises."""
 
     def record(self, signal: str, properties: dict[str, Any]) -> None:
         raise RuntimeError("emitter exploded")

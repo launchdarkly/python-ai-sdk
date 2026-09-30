@@ -441,19 +441,21 @@ class TestVersionTranslation:
             put_skill("pdf-extraction", object_version=3)["key"] == "pdf-extraction:3"
         )
 
-    def test_the_version_after_the_delimiter_becomes_the_seam_version(self) -> None:
+    def test_the_version_after_the_delimiter_becomes_the_stored_version(
+        self,
+    ) -> None:
         raw = _store_object_from_put(put_skill(object_version=3, payload_version=42))
         assert raw is not None
         assert raw["version"] == 3
         assert isinstance(raw["version"], int)
 
-    def test_the_key_before_the_delimiter_becomes_the_seam_key(self) -> None:
+    def test_the_key_before_the_delimiter_becomes_the_stored_key(self) -> None:
         """A caller asks for ``pdf-extraction``, never for ``pdf-extraction:3``."""
         raw = _store_object_from_put(put_skill("pdf-extraction", object_version=3))
         assert raw is not None
         assert raw["key"] == "pdf-extraction"
 
-    def test_the_payload_version_never_reaches_the_seam(self) -> None:
+    def test_the_payload_version_is_never_stored(self) -> None:
         """
         The failure this asserts against is silent: a store that read ``version``
         would serve verifiable content under a version number that means nothing,
@@ -2423,9 +2425,9 @@ class TestFailureHandling:
 
         A server — or an intermediate proxy — answering ``0`` would otherwise
         have the loop reconnect as fast as it can schedule, spending the whole
-        bounded retry budget in milliseconds and hammering the endpoint on the
-        way. The floor is ``initial_backoff``, the same floor our own backoff
-        starts from.
+        bounded retry budget in milliseconds and putting needless load on the
+        endpoint. The floor is ``initial_backoff``, the same floor this module's
+        own backoff starts from.
         """
         requester = _ScriptedRequester(
             _RecoverableTransportError("slow down", retry_after=0.0),
@@ -3488,7 +3490,7 @@ class TestLifecycle:
         finally:
             store.close()
 
-    def test_the_store_satisfies_the_seam_before_it_starts(self) -> None:
+    def test_the_store_satisfies_the_interface_before_it_starts(self) -> None:
         store = FDv2SkillStore(SDK_KEY)
         assert store.get_object(SKILL_OBJECT_KIND, "anything") is None
         assert store.all_objects(SKILL_OBJECT_KIND) == {}

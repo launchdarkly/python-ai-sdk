@@ -135,13 +135,13 @@ class SkillStore(Protocol):
     """
     Structural interface every source of skill content satisfies.
 
-    Duck-typed on purpose, mirroring how the LaunchDarkly client interface works
+    Structural on purpose, mirroring how the LaunchDarkly client interface works
     in this package: pass any object carrying these methods.
 
     Three members are **optional**, and are deliberately not declared here: a
     Protocol member is required for structural compatibility, so declaring them
     would reject every store that does not implement them. Each is probed for
-    instead, and each has a defined behaviour when absent.
+    instead, and each has a defined behavior when absent.
 
     ``is_initialized()`` reports whether the store has received its initial data
     — for a delivery transport, whether a payload has arrived yet. Absent means
@@ -397,8 +397,8 @@ def record_key_mismatch(requested: Any, served: Any) -> None:
         "event": INTEGRITY_FAILURE_EVENT,
         "action": _ACTION_WITHHELD,
         "reason_code": "key_mismatch",
-        # Named apart from the eight so a reader of the line can tell the
-        # retrieval boundary from a verification failure without the spec.
+        # Named apart from the eight verification codes so a reader of the line
+        # can tell a retrieval-boundary failure from a verification failure.
         "reason": (
             "the skill store answered under a different key than the one requested"
         ),
@@ -449,8 +449,8 @@ def record_version_mismatch(key: Any, requested: Any, served: Any) -> None:
         "action": _ACTION_WITHHELD,
         "event": INTEGRITY_FAILURE_EVENT,
         "language": _LANGUAGE,
-        # Named apart from the eight so a reader of the line can tell the
-        # retrieval boundary from a verification failure without the spec.
+        # Named apart from the eight verification codes so a reader of the line
+        # can tell a retrieval-boundary failure from a verification failure.
         "reason": (
             "the skill store answered with a different version than the one requested"
         ),
@@ -476,8 +476,8 @@ def record_version_mismatch(key: Any, requested: Any, served: Any) -> None:
         # The version *requested*, again the meaning it has everywhere else, so
         # a rule that groups or filters on ``version`` keeps working. Not
         # shape-checked, unlike ``skill_key`` beside it: this is the caller's own
-        # pin rather than a store-controlled value, so there is no body to
-        # smuggle, and coercing a mistyped one would hide the caller's own
+        # pin rather than a store-controlled value, so it cannot carry skill
+        # content, and coercing a mistyped one would hide the caller's own
         # mistake from their log.
         "version": requested,
     }
@@ -566,8 +566,8 @@ def verified_bytes(
     code: **size** before **encoding** before **hash**. Size first is what makes
     over-cap content carrying a lone surrogate report ``over_size_cap`` rather
     than ``not_utf8`` — without a fixed order that input's code is whichever
-    check the implementation happens to reach first, and §3.21's "one code per
-    failure class" rule cannot be tested against it. The shape checks that
+    check the implementation happens to reach first, and the guarantee of one
+    reason code per failure class cannot be tested against it. The shape checks that
     precede all three are in ``verify_raw_skill``.
 
     Accepts either shape content arrives in. A wire-shaped ``str`` is UTF-8
@@ -582,7 +582,7 @@ def verified_bytes(
 
     Runs twice per skill by design — at the accessor boundary, and again
     immediately before a write, since a ``Skill`` can also be constructed
-    directly by a caller. Do not optimise the second pass away by carrying the
+    directly by a caller. Do not optimize the second pass away by carrying the
     first one's verdict forward: that puts a "trust the value computed upstream"
     branch inside the one function whose job is not to.
     """
@@ -949,7 +949,7 @@ def resolve_from_store(
 
 
 def reference_target(item: SkillReference | str) -> tuple[str, int | None]:
-    """Normalises a reference-or-key into ``(key, wanted version)``.
+    """Normalizes a reference-or-key into ``(key, wanted version)``.
 
     A bare string means "the latest version the store holds".
     """

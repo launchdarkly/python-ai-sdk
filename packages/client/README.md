@@ -584,8 +584,8 @@ path whose bytes are *already byte-identical* to the content LaunchDarkly resolv
 adopted — recorded in the manifest and reported `skipped_current` — rather than refused.
 Without that, a process killed after a skill file lands but before the manifest is rewritten
 leaves that file managed-but-unrecorded, which is indistinguishable from a file you wrote
-yourself, so every later reconcile would refuse it and the skill would stay wedged until
-someone intervened. Adoption cannot weaken the guarantee above, because bytes that differ in
+yourself, so every later reconcile would refuse it and the skill would stay unavailable
+until someone intervened. Adoption cannot weaken the guarantee above, because bytes that differ in
 any way are still refused and left untouched. Note that an adopted file becomes prunable
 like any other managed file — which is the same outcome the crash pre-empted.
 
@@ -641,7 +641,7 @@ HTTP 422 when it will not serve one. **The usual cause is a view-scoped SDK key*
 restricted to a view cannot be assigned a skill payload, so check the key's scoping and use one
 that is not view-scoped. Anything else answering 422 is unexpected — contact LaunchDarkly support
 if the key is not the problem. Retrying fixes neither, and LaunchDarkly chose the status so that
-SDKs stop rather than hammer the fleet, so the store gives up: `failed` carries the reason,
+SDKs stop rather than retry indefinitely, so the store gives up: `failed` carries the reason,
 `last_error` is populated, the 422 is kept off `connection_failures` (that counter measures
 consecutive *recoverable* failures against the retry bound, which a fatal never spends, so it
 holds whatever count the run had already reached), and `wait_for_skills` returns `False`

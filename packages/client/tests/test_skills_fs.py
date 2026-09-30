@@ -228,7 +228,8 @@ class _SwapRootDuring:
     stops matching, the swap never fires, and all three tests below pass while
     asserting nothing — the ``race.swapped is True`` guard would be the only
     thing standing between a real fix and a vacuous one, and it would be
-    load-bearing for the wrong reason. Firing in both worlds is what makes these
+    carrying that weight for the wrong reason. Firing in both worlds is what
+    makes these
     tests fail before the fix and pass after it.
     """
 
@@ -2048,7 +2049,7 @@ class TestRootSwapRaces:
         left unrecorded by a reconcile killed before its manifest rewrite, and
         the attacker's tree holds something else at the same path. Read by
         path, the compare read saw the attacker's bytes, they differed, and the
-        SDK refused to adopt its own file — wedging that skill on every later
+        SDK refused to adopt its own file — blocking that skill on every later
         run, on the strength of a file that was never inside the root. Read
         through the pin, the file is adopted as ``skipped_current``, which is
         what the real root's contents call for.
@@ -2549,7 +2550,7 @@ class TestCorruptManifest:
         assert _manifest_path(root).read_text(encoding="utf-8") == "{not json at all"
 
 
-# The three literal cases the security review names for the prune path.
+# The three cases in which a well-formed manifest must not authorize a prune.
 #
 # The distinction from ``TestCorruptManifest`` above is the whole point: a
 # corrupt manifest suppresses every destructive action wholesale, so those tests
@@ -2953,7 +2954,7 @@ def _place_unmanaged(root: Path, key: str, content: str) -> Path:
 
 
 class TestCrashMidReconcileRecovery:
-    """A crash between the writes and the manifest rewrite must not wedge a skill."""
+    """A crash between the writes and the manifest rewrite must not block a skill."""
 
     async def test_byte_identical_unmanaged_file_is_adopted(self, root: Path) -> None:
         """The whole point: the second reconcile repairs the first one's crash.
@@ -3069,7 +3070,7 @@ class TestCrashMidReconcileRecovery:
     async def test_an_unmanaged_fifo_is_refused_and_never_read(
         self, root: Path
     ) -> None:
-        """Adoption widened the read to foreign files, so this refusal is load-bearing.
+        """Adoption widened the read to foreign files, so this refusal matters.
 
         Opening a FIFO with no writer blocks forever; the descriptor-pinned read
         opens ``O_NONBLOCK`` and rejects anything that is not a regular file, so

@@ -23,8 +23,8 @@ to a package whose sole runtime dependency is ``opentelemetry-api``.
 Three things this module does *not* do, on purpose:
 
 - **It does not verify content.** Verification lives at the accessor boundary in
-  ``skills_core`` so that it applies to every store equally, including a
-  a store the application supplies itself.
+  ``skills_core`` so that it applies to every store equally, including a store
+  the application supplies itself.
 - **It does not work around a missing ``contentHash``.** A hashless object is
   held verbatim and *withheld* by verification with ``missing_content_hash``.
   This module's job is to make that outcome loud — see ``StoreDiagnostics``.
@@ -664,7 +664,7 @@ class _ProtocolReader:
         self._changes: list[dict[str, Any]] = []
         self.diagnostics = StoreDiagnostics()
         # Identities already reported by ``_warn_hashless``. Per reader, so a
-        # recreated store reports again and two stores never quieten each other.
+        # recreated store reports again and two stores never silence each other.
         self._warned_hashless: set[tuple[str, Any]] = set()
         # The payload the current intent describes, and the payload skills have
         # actually arrived on. One payload per connection makes these the same
@@ -1082,11 +1082,11 @@ def _classify_status(status: int, headers: Any) -> Exception:
         # is assigned, and chose a non-400 4xx so SDKs stop instead of retrying.
         #
         # Word-for-word the TypeScript SDK's message, deliberately: a customer
-        # comparing two of our SDKs should not have to work out whether they hit
-        # two different conditions. Names the one cause a reader can act on and
-        # sends every other case to support, rather than enumerating causes that
-        # are not theirs to fix — see the store's docs for what else produces
-        # this status and for the fact that ``start()`` resumes the store.
+        # comparing two LaunchDarkly SDKs should not have to work out whether
+        # they hit two different conditions. Names the one cause a reader can act
+        # on and refers every other case to support, rather than enumerating
+        # causes that are not theirs to fix — see the store's docs for what else
+        # produces this status and for the fact that ``start()`` resumes the store.
         return _FatalTransportError(
             "LaunchDarkly will not deliver Agent Skills on this connection "
             "(HTTP 422). The usual cause is a view-scoped SDK key. Check your "
@@ -1982,10 +1982,10 @@ class FDv2SkillStore:
                 else:
                     # A server asking for no delay still gets one: honouring
                     # ``Retry-After: 0`` literally would reconnect as fast as
-                    # the loop allows and burn the whole retry bound in
-                    # milliseconds, hammering the endpoint on the way. The
-                    # floor is ``initial_backoff``, the same floor our own
-                    # backoff starts from.
+                    # the loop allows, spending the whole retry bound in
+                    # milliseconds and putting needless load on the endpoint.
+                    # The floor is ``initial_backoff``, the same floor this
+                    # module's own backoff starts from.
                     delay = max(delay, self._initial_backoff)
                 # ``Retry-After`` is a request and ``max_backoff`` is a promise.
                 # The header may come from a proxy rather than LaunchDarkly, and
@@ -2038,8 +2038,7 @@ class FDv2SkillStore:
         # is not. Naming ``start()`` rather than a process restart because
         # ``close`` is the only thing that forecloses a restart, and an operator
         # who has just fixed the cause should be told the cheaper of the two.
-        # The prefix is matched by a test that holds this line open to widen the
-        # give-up/start race; keep it.
+        # A test matches on this message's prefix; keep it.
         logger.error(
             "Skill delivery has stopped and will not retry: %s. The store keeps "
             "serving the last content it received, and skills will not update "

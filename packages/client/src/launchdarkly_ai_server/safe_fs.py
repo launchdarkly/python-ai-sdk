@@ -1,9 +1,9 @@
 """
 Descriptor-pinned filesystem primitives.
 
-Nothing here knows what a skill is: this is the "write a file under a directory
-an attacker may be racing you for" problem, solved once. ``skills_fs.py`` is the
-only caller today.
+Nothing here knows what a skill is: these primitives solve, once, the problem of
+writing a file under a directory another process may be racing to replace.
+``skills_fs.py`` is the only caller today.
 
 **The invariant:** every operation runs relative to a descriptor pinned to a
 directory the caller already verified, never against a re-resolved path. A path
@@ -152,7 +152,7 @@ def open_or_create_directory(
 
     ``os.mkdir`` plus an ``lstat`` on the ``FileExistsError`` path, never
     ``Path.mkdir(exist_ok=True)``: that accepts an existing
-    symlink-to-directory as "already there", reopening the hole the caller's
+    symlink-to-directory as "already there", reopening the gap the caller's
     check just closed.
 
     *dir_fd* is a descriptor for the parent, and the ``mkdir`` needs it as much
@@ -351,12 +351,12 @@ def atomic_write(
             elif at_fd is None:
                 # Windows before 3.13 has no fchmod — and no ``*at()`` family
                 # either, so ``temp`` is a full path here and the mode goes on it.
-                # That concedes nothing this platform was getting: it is already
-                # on the path-based floor, the temp name is unguessable, and the
-                # only bit Windows takes from a POSIX mode is read-only. A
-                # platform with descriptors but no fchmod does not exist; were
-                # there one it would keep the 0600 the exclusive open already set,
-                # rather than have a bare name chmoded relative to the cwd.
+                # That concedes nothing on this platform: it is already on the
+                # path-based floor, the temp name is unguessable, and the only
+                # bit Windows takes from a POSIX mode is read-only. The branch
+                # is guarded on ``at_fd`` so that a platform with descriptors but
+                # no fchmod keeps the 0600 the exclusive open already set, rather
+                # than chmod a bare name relative to the current directory.
                 os.chmod(temp, _FILE_MODE)
             view = memoryview(data)
             while view:

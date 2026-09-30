@@ -1,6 +1,6 @@
 """
 Tests for Agent Skills types, reference discovery, content accessors,
-integrity verification, and the telemetry seam.
+integrity verification, and the telemetry interface.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def _skill(
 UNENCODABLE_BODIES = (
     json.loads(r'"hi \ud800 there"'),  # lone high surrogate
     # A lone *low* surrogate, which is the one range errors="surrogateescape"
-    # smuggles through (as a raw 0x80 byte) while raising on everything else.
+    # passes through (as a raw 0x80 byte) while raising on everything else.
     json.loads(r'"hi \udc80 there"'),
 )
 
@@ -331,7 +331,7 @@ class TestPackageExports:
         assert not hasattr(package, "MAX_SKILL_CONTENT_BYTES")
 
     def test_object_kind_is_not_public_api(self) -> None:
-        """The kind is an SDK-side seam value, not the wire contract.
+        """The kind is an SDK-side interface value, not the wire contract.
 
         A store adapter maps whatever the transport calls a skill onto the value
         this SDK passes it, so publishing the string would advertise a contract
@@ -446,8 +446,8 @@ class TestInMemorySkillStore:
     def test_all_objects_returns_everything(self, make_raw_skill: Any) -> None:
         """Asserted on the object bodies, not the dict keys.
 
-        ``all_objects`` keys are opaque store-internal identifiers — the seam
-        documents them as such — so a test that pinned their spelling would be
+        ``all_objects`` keys are opaque store-internal identifiers — the store
+        interface documents them as such — so a test that pinned their spelling would be
         asserting an implementation detail the contract disclaims.
         """
         s = InMemorySkillStore()
@@ -543,7 +543,7 @@ class TestInMemorySkillStore:
         assert s.all_objects("flag") == {}
 
     def test_put_notifies_skill_kind_listeners(self, make_raw_skill: Any) -> None:
-        """``add_listener`` is part of the seam, so its one
+        """``add_listener`` is part of the store interface, so its one
         implementation carries a smoke test for the callback contract: the raw
         object, verbatim and unverified, as a single positional argument."""
         s = InMemorySkillStore()
@@ -561,8 +561,8 @@ class TestInMemorySkillStore:
         ``put`` only accepts skill objects, so nothing else is ever delivered:
         a recorded listener on another kind would silently never fire, and that
         is indistinguishable from one whose objects never changed. It is the
-        same failure §3.26 refuses when the store has no ``add_listener`` at
-        all, so it gets the same loud answer.
+        same failure ``watch_skills`` refuses when the store has no
+        ``add_listener`` at all, so it gets the same loud answer.
         """
         s = InMemorySkillStore()
         with pytest.raises(ValueError, match="would never fire") as excinfo:
@@ -1264,7 +1264,8 @@ class TestVersionPinning:
 
     Delivery serves the newest version of every skill *plus* every version any
     variation currently pins, so this is the ordinary case rather than an edge
-    one. A seam keyed by key alone cannot express it: it answers with the newest
+    one. An interface keyed by key alone cannot express it: it answers with the
+    newest
     and the pin then reads as a missing skill.
     """
 
@@ -1362,7 +1363,7 @@ class TestVersionPinning:
         for one thing only — attributing a failure when the object's own key is
         unusable.
 
-        The seam never promised a map key spells a skill key, either: a store
+        The interface never promised a map key spells a skill key, either: a store
         holding several versions of one key has reason to spell it
         ``key:version``, which is exactly what ``FDv2SkillStore`` does. Pinned
         because the asymmetry with the pinned path is surprising enough to
@@ -2177,8 +2178,8 @@ class TestIntegrityFailureLogRecord:
         assert _integrity_records(caplog)[0]["reason_code"] == "hash_mismatch"
 
 
-class TestTelemetrySeam:
-    """Internal emitter seam, no client.track, no context."""
+class TestTelemetryEmitter:
+    """Internal emitter interface, no client.track, no context."""
 
     async def test_default_emitter_is_noop(
         self, store: InMemorySkillStore, make_raw_skill: Any
@@ -2217,7 +2218,7 @@ class TestTelemetrySeam:
                 assert "Do the thing." not in str(value)
 
     # ``skill_key`` and ``expected_hash`` are copied off the wire, so a hostile
-    # store can smuggle the body through either one and publish it in a signal
+    # store could place the body in either one and publish it in a signal
     # that is otherwise body-free. The sweep above cannot see that: it serves a
     # well-formed 64-character digest under a valid key, so neither replacement
     # branch ever runs, and it passes even against an implementation that copies
@@ -2225,7 +2226,7 @@ class TestTelemetrySeam:
     # Both assert the body's *absence* rather than the placeholder's exact
     # spelling, which is not part of the contract.
 
-    async def test_body_smuggled_through_content_hash_is_redacted(
+    async def test_body_placed_in_content_hash_is_redacted(
         self, recording_emitter: Any
     ) -> None:
         skills_module._set_emitter_for_testing(recording_emitter)
@@ -2243,7 +2244,7 @@ class TestTelemetrySeam:
         for value in signals[0].values():
             assert body not in str(value)
 
-    async def test_body_smuggled_through_the_key_is_redacted(
+    async def test_body_placed_in_the_key_is_redacted(
         self, recording_emitter: Any
     ) -> None:
         skills_module._set_emitter_for_testing(recording_emitter)

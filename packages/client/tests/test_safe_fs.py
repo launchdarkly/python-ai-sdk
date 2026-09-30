@@ -141,7 +141,7 @@ class TestAtomicWrite:
         """``os.replace`` is the single rename call site.
 
         ``os.rename`` must not be substituted for it: it is the only one with
-        defined overwrite semantics on Windows, and it is the seam the
+        defined overwrite semantics on Windows, and it is the call the
         materialization tests intercept to prove atomicity.
         """
         calls: list[object] = []
