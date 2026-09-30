@@ -85,83 +85,59 @@ def _provides_for(
     return None
 
 
-def _covers_provider(
-    provides_for: tuple[str, Literal["agent", "messages"]],
+def _select_handler(
     provider: str | None,
-) -> bool:
-    return provides_for[0] == provider or provides_for[0] == "*"
+    handlers: list[EvalHandler],
+    mode: Literal["agent", "messages"] | None = None,
+) -> EvalHandler:
+    """Pick the handler in ``handlers`` that serves ``provider``.
 
+    A single handler always runs, whatever it declares. With more than one
+    handler, an entry whose ``provides_for`` names ``provider`` exactly is a
+    candidate. A wildcard entry tagged ``("*", mode)`` is a candidate only
+    when no entry names ``provider`` exactly; this mirrors the fallback
+    ``config()`` and ``graph()`` give a multi-provider adapter. ``mode`` is a
+    judge's resolved mode (generation has none); an exact ``(provider,
+    mode)`` match wins over any other candidate for that provider.
 
-def _find_judge_handler(
-    judge_handlers: list[EvalHandler],
-    provider: str | None,
-    mode: Literal["agent", "messages"],
-) -> EvalHandler | None:
-    """Find a handler for ``provider`` in ``mode``, exact match before wildcard.
-
-    A wildcard handler is a fallback for multi-provider adapters, so it is only
-    chosen when no handler names the provider outright -- the priority
-    ``config()`` already applies to a generation config. Searching in one pass
-    would instead let the order the caller happened to list its handlers in
-    decide, sending an OpenAI judge through a LangChain adapter that was merely
-    listed first.
+    Raises :class:`EvaluationsError` when no candidate serves ``provider``,
+    or when more than one does and ``mode`` cannot break the tie.
     """
-    for exact in (True, False):
-        for candidate in judge_handlers:
-            provides_for = _provides_for(candidate)
-            if provides_for is None or provides_for[1] != mode:
-                continue
-            if exact:
-                if provides_for[0] == provider:
-                    return candidate
-            elif provides_for[0] == "*":
-                return candidate
-    return None
+    if len(handlers) == 1:
+        return handlers[0]
 
+    exact_provider = [
+        handler
+        for handler in handlers
+        if (tag := _provides_for(handler)) is not None and tag[0] == provider
+    ]
+    candidates = exact_provider or [
+        handler
+        for handler in handlers
+        if (tag := _provides_for(handler)) is not None and tag[0] == "*"
+    ]
+    if mode is not None:
+        exact = [
+            handler
+            for handler in candidates
+            if (tag := _provides_for(handler)) is not None and tag[1] == mode
+        ]
+        if len(exact) == 1:
+            return exact[0]
 
-def _select_judge_handler(
-    resolved: ResolvedJudge,
-    handler: EvalHandler,
-    judge_handlers: list[EvalHandler],
-) -> JudgeExecution | None:
-    """Pick the handler that can run this judge's config, or ``None``.
-
-    A judge is an independent AI Config: it may resolve to a different provider
-    and mode than the evaluation's generation config, and a handler built for
-    one provider cannot execute another's config. The priority mirrors the
-    online path (``judges.run_judges``):
-
-    1. a judge handler in the judge's mode, naming its provider outright
-       before any wildcard adapter;
-    2. an agent-mode judge handler for a messages-mode judge, whose messages
-       are collapsed into a single instructions block;
-    3. the generation handler, when it covers the judge's provider.
-
-    A handler that declares no ``provides_for`` is a plain callable doing its
-    own routing -- the same contract it already honours for the generation
-    config -- so it is treated as covering every judge.
-    """
-    match = _find_judge_handler(judge_handlers, resolved.provider, resolved.mode)
-    if match is not None:
-        return JudgeExecution(resolved=resolved, handler=match)
-    if resolved.mode == "messages":
-        agent_fallback = _find_judge_handler(judge_handlers, resolved.provider, "agent")
-        if agent_fallback is not None:
-            return JudgeExecution(
-                resolved=resolved, handler=agent_fallback, collapse_messages=True
-            )
-    generation_provides_for = _provides_for(handler)
-    if generation_provides_for is None:
-        return JudgeExecution(resolved=resolved, handler=handler)
-    if _covers_provider(generation_provides_for, resolved.provider):
-        return JudgeExecution(
-            resolved=resolved,
-            handler=handler,
-            collapse_messages=(
-                generation_provides_for[1] == "agent" and resolved.mode == "messages"
-            ),
+    if not candidates:
+        raise EvaluationsError(f"no handler registered for provider {provider!r}")
+    if len(candidates) > 1:
+        modes = sorted(
+            tag[1]
+            for handler in candidates
+            if (tag := _provides_for(handler)) is not None
         )
-    return None
+        raise EvaluationsError(
+            f"{len(candidates)} handlers registered for provider {provider!r} "
+            f"(modes: {modes}); can't disambiguate for this call."
+        )
+    return candidates[0]
 
 
 def _segment(value: str) -> str:
@@ -342,8 +318,7 @@ class EvaluationsRunner:
         self,
         project_key: str,
         judges: list[Judge],
-        handler: EvalHandler,
-        judge_handlers: list[EvalHandler] | None = None,
+        handlers: list[EvalHandler],
     ) -> dict[str, JudgeExecution]:
         """Resolve LD Judge configs before any evaluation records are created.
 
@@ -351,7 +326,6 @@ class EvaluationsRunner:
         rather than at scoring time, so a judge no handler covers fails the run
         before any records exist or any generation spend happens.
         """
-        available_judge_handlers = list(judge_handlers or [])
         resolved: dict[str, JudgeExecution] = {}
         # variation() rejects a context without kind and key; use the same
         # context shape the emitted evaluation events are attributed to.
@@ -392,18 +366,30 @@ class EvaluationsRunner:
                     meta.get("mode") if isinstance(meta.get("mode"), str) else None
                 ),
             )
-            execution = _select_judge_handler(
-                resolved_judge, handler, available_judge_handlers
-            )
-            if execution is None:
+            try:
+                selected = _select_handler(
+                    resolved_judge.provider, handlers, mode=resolved_judge.mode
+                )
+            except EvaluationsError as error:
                 raise EvaluationsError(
                     f"No handler can run LaunchDarkly judge {judge.key!r}: its "
                     f"config is served by provider {resolved_judge.provider!r} in "
-                    f"{resolved_judge.mode!r} mode, which neither the generation "
-                    "handler nor any judge_handlers entry provides for. Pass a "
-                    "handler for that provider to run(judge_handlers=[...])."
-                )
-            resolved[judge.key] = execution
+                    f"{resolved_judge.mode!r} mode. {error} Pass a handler for "
+                    "that provider to run(handlers=[...])."
+                ) from error
+            selected_tag = _provides_for(selected)
+            # A messages-mode judge served by an agent-only handler needs its
+            # messages folded into one instructions block first.
+            collapse_messages = bool(
+                selected_tag is not None
+                and selected_tag[1] == "agent"
+                and resolved_judge.mode == "messages"
+            )
+            resolved[judge.key] = JudgeExecution(
+                resolved=resolved_judge,
+                handler=selected,
+                collapse_messages=collapse_messages,
+            )
         return resolved
 
     def _fetch_dataset(self, project_key: str, dataset_key: str) -> DatasetRef:

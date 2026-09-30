@@ -234,7 +234,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         project_key="proj",
         key="support-qa-unique",
         dataset="golden",
-        handler=successful_handler,
+        handlers=[successful_handler],
         tools={"lookup_order": lookup_order},
         generation={
             "provider": "OpenAI",
@@ -410,7 +410,7 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -473,7 +473,7 @@ async def test_summary_is_polled_until_rows_are_accounted(
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -535,7 +535,7 @@ async def test_summary_polling_completes_for_real_backend_summary_without_state(
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -594,7 +594,7 @@ async def test_summary_polling_ignores_missing_state_even_when_pending_is_zero(
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -648,7 +648,7 @@ async def test_summary_polling_times_out_waiting_for_rows_to_be_accounted(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
         )
 
@@ -693,7 +693,7 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         poll_interval_seconds=0,
         poll_timeout_seconds=600,
@@ -710,7 +710,7 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             poll_timeout_seconds=-1,
         )
@@ -735,7 +735,7 @@ async def test_nan_poll_values_are_rejected(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
@@ -787,7 +787,7 @@ async def test_run_uses_a_byoc_client_when_no_sdk_key_is_configured(
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -819,7 +819,7 @@ async def test_run_raises_when_no_sdk_key_and_no_initialized_client(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
         )
 
@@ -872,7 +872,7 @@ async def test_failed_rows_fail_the_result() -> None:
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -890,7 +890,7 @@ async def test_run_rejects_instructions_and_messages_before_network_io() -> None
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             generation={
                 "provider": "OpenAI",
                 "model": "gpt-4o",
@@ -914,7 +914,7 @@ async def test_missing_tool_aborts_before_any_mutating_request() -> None:
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             tools={"missing_tool": lookup_order},
             generation={"provider": "OpenAI", "model": "gpt-4o"},
         )
@@ -943,7 +943,7 @@ async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
         )
 
@@ -1040,7 +1040,7 @@ async def test_complete_run_with_error_rows_does_not_pass(
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -1159,7 +1159,7 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -1290,7 +1290,7 @@ async def test_run_with_ld_judge_never_sends_a_verdict(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy", threshold=threshold)],
     )
@@ -1379,7 +1379,7 @@ async def test_judges_resolve_once_per_run_not_once_per_row(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -1450,7 +1450,7 @@ async def test_missing_ld_judge_aborts_before_mutating_request(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[Judge(key="security-judge")],
         )
@@ -1508,7 +1508,7 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
         project_key="proj",
         key="support-qa",
         dataset="support-golden-v3",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Scorer(name="refund-exists", fn=check_refund)],
     )
@@ -1637,7 +1637,7 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -1681,7 +1681,7 @@ async def test_generated_placeholders_are_not_expanded_into_judge_prompt(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -1735,7 +1735,7 @@ async def test_missing_expected_output_renders_empty_judge_variables(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -1755,7 +1755,7 @@ async def test_duplicate_criteria_rejected_before_any_request() -> None:
             project_key="proj",
             key="support-qa",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[
                 Judge(key="accuracy"),
@@ -1783,7 +1783,7 @@ async def test_duplicate_criteria_rejected_case_insensitively() -> None:
             project_key="proj",
             key="support-qa",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[
                 Judge(key="Accuracy"),
@@ -1819,7 +1819,7 @@ async def test_errored_generation_row_emits_generation_incomplete_criterion_even
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -1871,7 +1871,7 @@ async def test_failed_evaluation_event_tracking_raises_after_attempting_every_re
             project_key="proj",
             key="support-qa",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[
                 Judge(key="$ld:ai:judge:accuracy"),
@@ -1944,14 +1944,12 @@ async def _generation_only(
 
 
 @pytest.mark.asyncio
-async def test_judge_on_another_provider_fails_before_any_records_are_created(
+async def test_judge_on_an_uncovered_provider_fails_before_any_records_are_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A provider handler cannot execute another provider's judge config.
-
-    Passing it anyway spent the generation budget and then recorded every row
-    as handler_raised, so the mismatch is caught while it is still only a
-    configuration error: before the dataset is read or any record is created.
+    """A judge's provider only becomes known after the judge-resolution GET,
+    so this check runs there -- but still before the dataset is read or any
+    evaluation record is created.
     """
     transport = judge_run_transport()
     judge_variation(monkeypatch, provider="Anthropic")
@@ -1962,7 +1960,10 @@ async def test_judge_on_another_provider_fails_before_any_records_are_created(
             project_key="proj",
             key="support-qa",
             dataset="golden",
-            handler=create_handler(("OpenAI", "messages"), _generation_only),
+            handlers=[
+                create_handler(("OpenAI", "messages"), _generation_only),
+                create_handler(("Gemini", "messages"), _generation_only),
+            ],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[Judge(key="$ld:ai:judge:accuracy")],
         )
@@ -1970,6 +1971,36 @@ async def test_judge_on_another_provider_fails_before_any_records_are_created(
     assert "No handler can run LaunchDarkly judge" in str(error.value)
     assert "'Anthropic'" in str(error.value)
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_single_handler_serves_generation_and_every_judge_regardless_of_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """A single handler in ``handlers`` always runs, whatever it declares.
+
+    This keeps a single-provider eval script working with one plain handler:
+    it never needs a ``provides_for`` tag, and it serves a judge on any
+    provider too.
+    """
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handlers=[handler],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
 
 
 @pytest.mark.asyncio
@@ -1996,10 +2027,12 @@ async def test_judge_handlers_route_a_judge_to_its_own_provider(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            create_handler(("Anthropic", "messages"), anthropic_judge),
+        ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[create_handler(("Anthropic", "messages"), anthropic_judge)],
     )
 
     assert result.passed is True
@@ -2011,19 +2044,20 @@ async def test_judge_handlers_route_a_judge_to_its_own_provider(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("wildcard_first", [True, False])
-async def test_exact_provider_judge_handler_beats_a_wildcard_adapter(
+@pytest.mark.parametrize("agent_handler_first", [True, False])
+async def test_exact_mode_judge_handler_disambiguates_same_provider_handlers(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
-    wildcard_first: bool,
+    agent_handler_first: bool,
 ) -> None:
-    """A wildcard is a fallback, so the order handlers are listed in cannot decide.
+    """Two handlers may serve the same provider in different modes.
 
-    Taking the first provider-or-wildcard match would send an Anthropic judge
-    through a multi-provider adapter that merely happened to be listed first.
+    A judge carries its own resolved mode, so it picks the handler tagged for
+    that exact ``(provider, mode)`` pair, whichever order ``handlers`` lists
+    them in.
     """
     transport = judge_run_transport()
-    judge_variation(monkeypatch, provider="Anthropic")
+    judge_variation(monkeypatch, provider="Anthropic", mode="messages")
     evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
     chosen: list[str] = []
 
@@ -2040,55 +2074,29 @@ async def test_exact_provider_judge_handler_beats_a_wildcard_adapter(
 
         return run
 
-    wildcard = create_handler(("*", "messages"), judge_handler("wildcard"))
-    exact = create_handler(("Anthropic", "messages"), judge_handler("exact"))
+    agent_handler = create_handler(("Anthropic", "agent"), judge_handler("agent"))
+    messages_handler = create_handler(
+        ("Anthropic", "messages"), judge_handler("messages")
+    )
 
     result = await evals.run(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            *(
+                [agent_handler, messages_handler]
+                if agent_handler_first
+                else [messages_handler, agent_handler]
+            ),
+        ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[wildcard, exact] if wildcard_first else [exact, wildcard],
     )
 
     assert result.passed is True
-    assert chosen == ["exact"]
-
-
-@pytest.mark.asyncio
-async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
-    monkeypatch: pytest.MonkeyPatch,
-    stub_sdk_client: MagicMock,
-) -> None:
-    transport = judge_run_transport()
-    judge_variation(monkeypatch, provider="Anthropic")
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
-    judged: list[dict[str, Any]] = []
-
-    async def wildcard_judge(
-        config: dict[str, Any],
-        user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any]] | None = None,
-        variables: dict[str, Any] | None = None,
-        history: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        judged.append(config)
-        return {"output": '{"score": 1, "reasoning": "ok"}'}
-
-    result = await evals.run(
-        project_key="proj",
-        key="support-qa",
-        dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
-        criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[create_handler(("*", "messages"), wildcard_judge)],
-    )
-
-    assert result.passed is True
-    assert [config["provider"]["name"] for config in judged] == ["Anthropic"]
+    assert chosen == ["messages"]
 
 
 @pytest.mark.asyncio
@@ -2096,7 +2104,8 @@ async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
 ) -> None:
-    """Mirrors the online path's agent-mode fallback for a messages-mode judge."""
+    """A messages-mode judge served only by an agent-mode handler for its
+    provider gets its messages collapsed into a single instructions block."""
     transport = judge_run_transport()
     judge_variation(
         monkeypatch,
@@ -2126,10 +2135,12 @@ async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            create_handler(("Anthropic", "agent"), anthropic_agent_judge),
+        ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[create_handler(("Anthropic", "agent"), anthropic_agent_judge)],
     )
 
     assert result.passed is True
@@ -2165,7 +2176,7 @@ async def test_generation_handler_runs_a_judge_on_the_same_provider(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), openai_handler),
+        handlers=[create_handler(("OpenAI", "messages"), openai_handler)],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -2175,26 +2186,221 @@ async def test_generation_handler_runs_a_judge_on_the_same_provider(
 
 
 @pytest.mark.asyncio
-async def test_judge_handlers_must_declare_the_provider_they_serve(
+async def test_an_untagged_handler_cannot_serve_a_judge_when_others_are_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unrouted judge handler would silently never be selected."""
+    """With more than one handler, only a ``provides_for`` tag makes a handler
+    a candidate. An untagged handler passed alongside a tagged one is never
+    selected, even though it is present in ``handlers``.
+    """
     transport = judge_run_transport()
-    accuracy_judge_variation(monkeypatch)
+    judge_variation(monkeypatch, provider="Anthropic")
     evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
 
-    with pytest.raises(EvaluationsError, match="does not declare provides_for"):
+    with pytest.raises(
+        EvaluationsError, match="no handler registered for provider 'Anthropic'"
+    ):
         await evals.run(
             project_key="proj",
             key="support-qa",
             dataset="golden",
-            handler=_generation_only,
+            handlers=[
+                create_handler(("OpenAI", "messages"), _generation_only),
+                _generation_only,
+            ],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
             criteria=[Judge(key="$ld:ai:judge:accuracy")],
-            judge_handlers=[_generation_only],
         )
 
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wildcard_first", [True, False])
+async def test_exact_provider_judge_handler_beats_a_wildcard_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    wildcard_first: bool,
+) -> None:
+    """A wildcard is a fallback, so the order handlers are listed in cannot decide.
+
+    Taking the first provider-or-wildcard match would send an Anthropic judge
+    through a multi-provider adapter that merely happened to be listed first.
+    """
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    chosen: list[str] = []
+
+    def judge_handler(name: str) -> Any:
+        async def run(
+            config: dict[str, Any],
+            user_input: str | None = None,
+            tool_handlers: dict[str, Callable[..., Any]] | None = None,
+            variables: dict[str, Any] | None = None,
+            history: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+            chosen.append(name)
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+        return run
+
+    wildcard = create_handler(("*", "messages"), judge_handler("wildcard"))
+    exact = create_handler(("Anthropic", "messages"), judge_handler("exact"))
+    generation = create_handler(("OpenAI", "messages"), _generation_only)
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handlers=[wildcard, exact, generation]
+        if wildcard_first
+        else [exact, wildcard, generation],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    assert chosen == ["exact"]
+
+
+@pytest.mark.asyncio
+async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """A wildcard-tagged handler is a fallback: it is selected for a judge
+    when no handler in ``handlers`` names that judge's provider outright.
+    """
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    judged: list[dict[str, Any]] = []
+
+    async def wildcard_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        judged.append(config)
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            create_handler(("*", "messages"), wildcard_judge),
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    assert [config["provider"]["name"] for config in judged] == ["Anthropic"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_provides_for_tags_are_rejected_before_any_network_io() -> None:
+    """Two handlers tagged for the identical provider and mode could never be
+    told apart later, so this is checked eagerly, before the dataset or any
+    judge is even read."""
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def first(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    async def second(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(EvaluationsError, match=r"'Anthropic'.*'messages'"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handlers=[
+                create_handler(("Anthropic", "messages"), first),
+                create_handler(("Anthropic", "messages"), second),
+            ],
+            generation={"provider": "Anthropic", "model": "claude"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_generation_provider_must_resolve_unambiguously_before_any_network_io() -> (
+    None
+):
+    """Generation has no mode, so it can never break a tie between two
+    handlers that both declare the same provider. This is checked as soon as
+    ``generation`` is known, before any request the run would otherwise make.
+    """
+    transport = SequencedTransport([])
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def agent_handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    async def messages_handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(
+        EvaluationsError,
+        match=r"2 handlers registered for provider 'Anthropic'",
+    ):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handlers=[
+                create_handler(("Anthropic", "agent"), agent_handler),
+                create_handler(("Anthropic", "messages"), messages_handler),
+            ],
+            generation={"provider": "Anthropic", "model": "claude"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_generation_matches_the_handler_tagged_for_its_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    """With more than one handler, generation is routed by provider name
+    alone -- it has no mode to further disambiguate with."""
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="OpenAI")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    calls: list[str] = []
+
+    async def openai_handler(*args: object) -> dict[str, Any]:
+        calls.append("OpenAI")
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    async def anthropic_handler(*args: object) -> dict[str, Any]:
+        calls.append("Anthropic")
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handlers=[
+            create_handler(("OpenAI", "messages"), openai_handler),
+            create_handler(("Anthropic", "messages"), anthropic_handler),
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    assert result.passed is True
+    assert calls == ["OpenAI", "OpenAI"]
 
 
 @pytest.mark.asyncio
@@ -2253,7 +2459,7 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
         concurrency=2,
@@ -2344,7 +2550,7 @@ async def test_tool_trajectory_reaches_the_judge_via_message_history(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         tools={"lookup_order": lookup_order},
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
@@ -2406,7 +2612,7 @@ async def test_each_row_gets_only_its_own_tool_trajectory(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         tools={"lookup_order": lookup_order},
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
@@ -2446,7 +2652,7 @@ async def test_a_row_that_called_no_tools_says_so_to_the_judge(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         tools={"lookup_order": lambda args: "unused"},
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
@@ -2488,7 +2694,7 @@ async def test_a_run_without_tools_leaves_message_history_unchanged(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -2548,7 +2754,7 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
         project_key="proj",
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         tools={"lookup_order": lambda args: "{{expected_output}} leaked?"},
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
@@ -2679,7 +2885,7 @@ async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> Non
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         ai_config=AIConfig(key="support-agent", variation="control"),
     )
 
@@ -2716,7 +2922,7 @@ async def test_explicit_generation_overrides_the_fetched_variation() -> None:
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         ai_config=AIConfig(key="support-agent", variation="control"),
         generation={
             "model": "gpt-4o-mini",
@@ -2754,7 +2960,7 @@ async def test_variation_tools_without_implementations_fail_before_mutating_requ
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
@@ -2801,7 +3007,7 @@ async def test_variation_judges_become_the_default_criteria(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=handler,
+            handlers=[handler],
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
@@ -2820,7 +3026,7 @@ async def test_unknown_variation_fails_before_any_records_are_created() -> None:
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             ai_config=AIConfig(key="support-agent", variation="missing"),
         )
 
@@ -2853,7 +3059,7 @@ async def test_config_source_is_validated_before_network_io(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             **source,  # type: ignore[arg-type]
         )
 
@@ -2885,7 +3091,7 @@ async def test_tool_version_drift_from_the_variation_is_logged(
         project_key="proj",
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handlers=[handler],
         ai_config=AIConfig(key="support-agent", variation="control"),
         tools={"lookup_order": lookup_order},
     )
@@ -2912,7 +3118,7 @@ async def test_non_string_model_config_key_fails_loudly(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
@@ -2935,7 +3141,7 @@ async def test_variation_without_a_model_config_needs_an_explicit_provider(
             project_key="proj",
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handlers=[successful_handler],
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
