@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.2.3...launchdarkly-ai-claude-agents-0.2.4) (2026-09-30)
+
+
+### Features
+
+* **AIC-3211:** record each graph node as its own tracking event ([#114](https://github.com/launchdarkly/python-ai-sdk/issues/114)) ([c3c439e](https://github.com/launchdarkly/python-ai-sdk/commit/c3c439ede989ea98c43d238b80467351c5920c56))
+
 ## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.2.2...launchdarkly-ai-claude-agents-0.2.3) (2026-09-21)
 
 

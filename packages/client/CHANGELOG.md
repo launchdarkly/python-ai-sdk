@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.3...launchdarkly-ai-server-0.2.4) (2026-09-30)
+
+
+### Features
+
+* **AIC-3210:** support graph().stream() in the Python AI SDK ([#104](https://github.com/launchdarkly/python-ai-sdk/issues/104)) ([25a345a](https://github.com/launchdarkly/python-ai-sdk/commit/25a345a7a07f2160d242320fa849abc6b9de3553))
+* **AIC-3211:** record each graph node as its own tracking event ([#114](https://github.com/launchdarkly/python-ai-sdk/issues/114)) ([c3c439e](https://github.com/launchdarkly/python-ai-sdk/commit/c3c439ede989ea98c43d238b80467351c5920c56))
+* **AIC-3449:** refactor AI Config reference into a dataclass ([#113](https://github.com/launchdarkly/python-ai-sdk/issues/113)) ([3ac06b4](https://github.com/launchdarkly/python-ai-sdk/commit/3ac06b474c6adee9784e3e551f47d7101cb58178))
+* **AIC-3449:** Support pulling in configs for evals from code ([#108](https://github.com/launchdarkly/python-ai-sdk/issues/108)) ([fa374e2](https://github.com/launchdarkly/python-ai-sdk/commit/fa374e28c0f8b022c9791c6c31d9870c9625fba3))
+* **evaluations:** preserve the tool trajectory for judges ([#89](https://github.com/launchdarkly/python-ai-sdk/issues/89)) ([bcaa8c8](https://github.com/launchdarkly/python-ai-sdk/commit/bcaa8c80ae3859e332ddf391e867d9beed42a0f6))
+
+
+### Bug Fixes
+
+* **graph:** rename the graph span back to launchdarkly.graph, thread trajectory into stream judges ([79c9eeb](https://github.com/launchdarkly/python-ai-sdk/commit/79c9eeb2401c392008b95660ebcfa7e4c3039073))
+* **judges:** bound recorded values in memory, and show config's full tool catalog ([25fafef](https://github.com/launchdarkly/python-ai-sdk/commit/25fafefe47ffbbe6dc7a3c351e694a2b990a7fe5))
+* **judges:** exclude native tools from the config's available-tool list ([245a0a5](https://github.com/launchdarkly/python-ai-sdk/commit/245a0a58584ebe6202409d033e53c05502655f1e))
+* **judges:** keep trajectory recording total and observational ([57386b6](https://github.com/launchdarkly/python-ai-sdk/commit/57386b617686dfdd3e8a8210e47d18d8b3d0164c))
+
 ## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.2...launchdarkly-ai-server-0.2.3) (2026-09-21)
 
 
