@@ -39,7 +39,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint override (default: LaunchDarkly Observability backend) |
-| `LD_API_TOKEN` | For evaluations | API access token used by the evaluations management API |
+| `LD_API_TOKEN` | For evaluations | API key used by the evaluations management API |
 | `LD_SDK_KEY` | For evaluations | SDK key whose event transport carries generation results to LaunchDarkly |
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
@@ -165,40 +165,47 @@ A tool result is now judge-prompt input. It stays literal for the same reason th
 
 Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge or one no handler covers fails the run up front rather than after the generation spend. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
 
-The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
+### Give the evaluation tools
 
-Call `init_client()` explicitly when you want to:
-- Pass SDK or telemetry options programmatically (overriding env vars)
-- Initialize at startup before the first AI call (e.g. to avoid latency on the first request)
-- Fail fast at boot if `LD_SDK_KEY` is missing
+Pass `tools` to `run()` as a list of `Tool`. Construct one to define a tool in code. Call `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
 
 ```python
-import asyncio
-from launchdarkly_ai_server import init_client, shutdown
+from launchdarkly_ai_server import Tool, init_evaluations
 
-async def main():
-    # Standard path — auto-discovers launchdarkly-server-sdk.
-    client = await init_client({
-        "sdkKey": "sdk-...",
-        "serviceName": "my-service",
-        "environment": "production",
-    })
 
-    # Or skip init_client() and let the first model/graph call initialize lazily.
+def lookup_order(order_id: str) -> str:
+    return f"order {order_id} shipped"
 
-    # Flush telemetry, flush LD events, and close the client.
-    await shutdown()
 
-asyncio.run(main())
+evals = init_evaluations(project_key="my-project")
+
+# Read from the AI library now. Pins the version. Raises now if the tool is absent.
+search_docs_tool = evals.tools.get("search_docs", implementation=search_docs)
+
+# Defined here. Needs no tool in LaunchDarkly.
+lookup_order_tool = Tool(
+    key="lookup_order",
+    implementation=lookup_order,
+    schema={
+        "type": "object",
+        "properties": {"order_id": {"type": "string"}},
+        "required": ["order_id"],
+    },
+    description="Look up an order by id",
+)
+
+result = await evals.run(
+    key="support-qa-2026-08-20",
+    dataset="support-golden",
+    handler=create_openai_messages_handler(),
+    generation={"provider": "OpenAI", "model": "gpt-4o"},
+    tools=[search_docs_tool, lookup_order_tool],
+)
 ```
 
-| Export | Description |
-|---|---|
-| `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. |
-| `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery. |
-| `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
-| `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. |
-| `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
+`run()` reads no tool from the API. `tools.get()` blocks until its read completes, so call it while you set a run up, not inside a running event loop. A constructed `Tool` is always inline, because `source` and `version` are not constructor arguments. Only `tools.get()` produces a library tool. Handlers receive the same `{key: callable}` map whichever kind a tool is, so handler code needs no change.
+
+**The list is checked before any network I/O.** A blank key, an uppercase key, a `schema` that is not a JSON object, a schema that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued. A repeated key fails too, and keys are compared without case. A `NativeTool` is valid only for a library tool, because the provider supplies its schema.
 
 ### `config(**args)`
 

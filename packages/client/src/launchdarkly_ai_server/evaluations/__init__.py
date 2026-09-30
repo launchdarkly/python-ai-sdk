@@ -11,6 +11,7 @@ from .api import (
 )
 from .criteria import Criterion, Judge, Scorer, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
+from .tools import Tool, ToolsClient
 from .types import (
     AIConfig,
     DatasetRow,
@@ -36,6 +37,8 @@ __all__ = [
     "RunSummary",
     "Scorer",
     "SuccessDirection",
+    "Tool",
+    "ToolsClient",
     "Transport",
     "Usage",
     "init_evaluations",

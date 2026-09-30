@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from launchdarkly_ai_server import create_handler
+from launchdarkly_ai_server import NativeTool, create_handler
 from launchdarkly_ai_server.evaluations import (
     AIConfig,
     DatasetRow,
@@ -16,6 +16,7 @@ from launchdarkly_ai_server.evaluations import (
     HttpResponse,
     Judge,
     Scorer,
+    Tool,
     init_evaluations,
 )
 
@@ -117,6 +118,10 @@ async def successful_handler(
 
 def lookup_order(order_id: str) -> str:
     return order_id
+
+
+def refund_order(order_id: str) -> str:
+    return f"refunded {order_id}"
 
 
 @pytest.mark.asyncio
@@ -222,7 +227,8 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     client.flush = AsyncMock()
     init_client.return_value = client
     evals = init_evaluations(
-        api_token="token",
+        project_key="proj",
+        api_key="token",
         sdk_key="sdk-key",
         base_uri="https://api.example.com",
         ui_base_uri="https://ui.example.com/",
@@ -231,11 +237,10 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert evals.sdk_key == "sdk-key"
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa-unique",
         dataset="golden",
         handler=successful_handler,
-        tools={"lookup_order": lookup_order},
+        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
         generation={
             "provider": "OpenAI",
             "model": "gpt-4o",
@@ -277,7 +282,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "generationModel": "gpt-4o",
         "parameters": {"temperature": 0.2},
         "messages": [{"role": "system", "content": "Help the user."}],
-        "tools": [{"key": "lookup_order", "version": 7}],
+        "tools": [{"key": "lookup_order", "version": 7, "source": "library"}],
     }
     assert transport.requests[5]["url"].endswith(
         "/api/v2/projects/proj/evaluations/11111111-1111-1111-1111-111111111111/runs"
@@ -401,13 +406,14 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
     monkeypatch.setattr(
         "launchdarkly_ai_server.evaluations.module.init_client", fake_init_client
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -464,13 +470,12 @@ async def test_summary_is_polled_until_rows_are_accounted(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -526,13 +531,12 @@ async def test_summary_polling_completes_for_real_backend_summary_without_state(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -585,13 +589,12 @@ async def test_summary_polling_ignores_missing_state_even_when_pending_is_zero(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -635,7 +638,7 @@ async def test_summary_polling_times_out_waiting_for_rows_to_be_accounted(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
@@ -645,7 +648,6 @@ async def test_summary_polling_times_out_waiting_for_rows_to_be_accounted(
         match=r"Timed out after 0 seconds.*rows to be fully accounted.*pending_rows=1",
     ):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=handler,
@@ -684,13 +686,12 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -707,7 +708,6 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
 
     with pytest.raises(EvaluationsError, match="poll_timeout_seconds"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=handler,
@@ -725,14 +725,15 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
 async def test_nan_poll_values_are_rejected(
     poll_interval_seconds: float, poll_timeout_seconds: float
 ) -> None:
-    evals = init_evaluations(api_token="token", transport=failing_transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     with pytest.raises(EvaluationsError, match="must be a number"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=handler,
@@ -777,14 +778,13 @@ async def test_run_uses_a_byoc_client_when_no_sdk_key_is_configured(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
     assert evals.sdk_key is None
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -808,7 +808,9 @@ async def test_run_raises_when_no_sdk_key_and_no_initialized_client(
     monkeypatch.setattr(
         "launchdarkly_ai_server.evaluations.module.get_client", get_client
     )
-    evals = init_evaluations(api_token="token", transport=failing_transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
     get_client.side_effect = RuntimeError("client not initialized")
 
     async def handler(*args: object) -> dict[str, Any]:
@@ -816,7 +818,6 @@ async def test_run_raises_when_no_sdk_key_and_no_initialized_client(
 
     with pytest.raises(EvaluationsError, match="no initialized LaunchDarkly client"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=handler,
@@ -863,13 +864,12 @@ async def test_failed_rows_fail_the_result() -> None:
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -883,11 +883,10 @@ async def test_failed_rows_fail_the_result() -> None:
 @pytest.mark.asyncio
 async def test_run_rejects_instructions_and_messages_before_network_io() -> None:
     transport = SequencedTransport([])
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match=r"instructions.*messages"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
@@ -907,19 +906,453 @@ async def test_missing_tool_aborts_before_any_mutating_request() -> None:
     transport = SequencedTransport(
         [response(404, {"code": "not_found", "message": "not found"})]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match="missing_tool"):
+        evals.tools.get("missing_tool", implementation=lookup_order)
+
+    assert [request["method"] for request in transport.requests] == ["GET"]
+
+
+ORDER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"order_id": {"type": "string"}},
+    "required": ["order_id"],
+}
+
+
+def recorded_paths(transport: SequencedTransport) -> list[tuple[str, str]]:
+    """The recorded requests as ``(method, path)`` pairs, query strings dropped."""
+    return [
+        (
+            request["method"],
+            request["url"].split("/api/v2/", 1)[-1].split("?", 1)[0],
+        )
+        for request in transport.requests
+    ]
+
+
+def hosted_dataset_responses() -> list[HttpResponse]:
+    """Canned responses for a one-row hosted dataset run that passes."""
+    return [
+        response(200, {"id": "dataset-id", "name": "golden"}),
+        response(
+            200,
+            dataset_page(
+                [{"rowIndex": 0, "input": "Order A19", "variables": {}}], total=1
+            ),
+        ),
+        response(201, {"id": "evaluation-id", "name": "eval-key", "version": 3}),
+        response(
+            201,
+            {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+        ),
+        response(
+            200,
+            {
+                "statusCounts": {
+                    "total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "error": 0,
+                    "pending": 0,
+                }
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inline_tool_runs_without_reading_the_tool_api() -> None:
+    transport = SequencedTransport(hosted_dataset_responses())
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    seen: dict[str, Any] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["config_tools"] = config["tools"]
+        seen["tool_handlers"] = tool_handlers
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools=[
+            Tool(
+                key="lookup_order",
+                implementation=lookup_order,
+                schema=ORDER_SCHEMA,
+                description="Look up an order",
+            )
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert result.passed is True
+    # The full sequence, so a stray request anywhere in the run is visible.
+    assert recorded_paths(transport) == [
+        ("GET", "projects/proj/datasets/golden"),
+        ("GET", "projects/proj/datasets/golden/rows"),
+        ("POST", "projects/proj/evaluations"),
+        ("POST", "projects/proj/evaluations/evaluation-id/runs"),
+        ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
+    ]
+    # Asserted explicitly rather than left to the sequence above: a transport
+    # that tolerated a surplus request would not fail on a stray tool GET, and
+    # skipping that request is the whole point of an inline definition.
+    assert not any("/ai-tools" in request["url"] for request in transport.requests), (
+        "an inline tool must not be looked up in the AI library"
+    )
+
+    assert transport.requests[2]["body"]["tools"] == [
+        {
+            "key": "lookup_order",
+            "schema": ORDER_SCHEMA,
+            "description": "Look up an order",
+            "source": "inline",
+        }
+    ]
+    # Same config shape a library tool produces, fed from the inline body, so a
+    # handler cannot tell the two sources apart.
+    assert seen["config_tools"] == {
+        "lookup_order": {
+            "description": "Look up an order",
+            "parameters": ORDER_SCHEMA,
+        }
+    }
+    # The handler is passed the executable, not the definition wrapping it.
+    assert list(seen["tool_handlers"]) == ["lookup_order"]
+    assert seen["tool_handlers"]["lookup_order"]("A1") == "A1"
+
+
+@pytest.mark.asyncio
+async def test_inline_tool_description_defaults_to_empty_string() -> None:
+    transport = SequencedTransport(hosted_dataset_responses())
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools=[
+            Tool(key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA)
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert transport.requests[2]["body"]["tools"] == [
+        {
+            "key": "lookup_order",
+            "schema": ORDER_SCHEMA,
+            "description": "",
+            "source": "inline",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> None:
+    transport = SequencedTransport(
+        [
+            response(
+                200,
+                {
+                    "key": "lookup_order",
+                    "version": 7,
+                    "description": "Look up an order",
+                    "schema": {"type": "object"},
+                },
+            ),
+            *hosted_dataset_responses(),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    seen: dict[str, Any] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["config_tools"] = config["tools"]
+        seen["tool_handlers"] = tool_handlers
+        return {"output": "ok"}
+
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools=[
+            evals.tools.get("lookup_order", implementation=lookup_order),
+            Tool(
+                key="refund_order",
+                implementation=refund_order,
+                schema=ORDER_SCHEMA,
+                description="Refund an order",
+            ),
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    # Exactly one tool GET, for the library key only.
+    assert [
+        path for method, path in recorded_paths(transport) if "ai-tools" in path
+    ] == ["projects/proj/ai-tools/lookup_order"]
+    assert transport.requests[3]["body"]["tools"] == [
+        {"key": "lookup_order", "version": 7, "source": "library"},
+        {
+            "key": "refund_order",
+            "schema": ORDER_SCHEMA,
+            "description": "Refund an order",
+            "source": "inline",
+        },
+    ]
+    assert seen["config_tools"] == {
+        "lookup_order": {
+            "description": "Look up an order",
+            "parameters": {"type": "object"},
+        },
+        "refund_order": {
+            "description": "Refund an order",
+            "parameters": ORDER_SCHEMA,
+        },
+    }
+    assert sorted(seen["tool_handlers"]) == ["lookup_order", "refund_order"]
+    assert seen["tool_handlers"]["lookup_order"]("A1") == "A1"
+    assert seen["tool_handlers"]["refund_order"]("A1") == "refunded A1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "match"),
+    [
+        pytest.param(
+            [Tool(key="  ", implementation=lookup_order, schema=ORDER_SCHEMA)],
+            "must not be blank",
+            id="blank_key",
+        ),
+        pytest.param(
+            [
+                Tool(
+                    key="Lookup_Order", implementation=lookup_order, schema=ORDER_SCHEMA
+                )
+            ],
+            "must not use uppercase letters",
+            id="uppercase_key",
+        ),
+        pytest.param(
+            [Tool(key="lookup_order", implementation=lookup_order, schema=None)],  # type: ignore[arg-type]
+            "schema must be a JSON object",
+            id="schema_is_none",
+        ),
+        pytest.param(
+            [
+                Tool(
+                    key="lookup_order",
+                    implementation=lookup_order,
+                    schema=[{"type": "object"}],
+                )
+            ],  # type: ignore[arg-type]
+            "schema must be a JSON object",
+            id="schema_is_a_list",
+        ),
+        pytest.param(
+            [
+                Tool(
+                    key="lookup_order",
+                    implementation=lookup_order,
+                    schema={"default": object()},
+                )
+            ],
+            "schema must be JSON-serializable",
+            id="schema_is_not_serializable",
+        ),
+        pytest.param(
+            [
+                Tool(
+                    key="lookup_order",
+                    implementation=lookup_order,
+                    schema={"default": float("nan")},
+                )
+            ],
+            "schema must be JSON-serializable",
+            id="schema_holds_nan",
+        ),
+        pytest.param(
+            [
+                Tool(
+                    key="lookup_order",
+                    implementation=lookup_order,
+                    schema={"default": float("inf")},
+                )
+            ],
+            "schema must be JSON-serializable",
+            id="schema_holds_infinity",
+        ),
+        pytest.param(
+            [
+                Tool(
+                    key="lookup_order",
+                    implementation="not a function",
+                    schema=ORDER_SCHEMA,
+                )
+            ],  # type: ignore[arg-type]
+            "implementation must be callable",
+            id="implementation_is_not_callable",
+        ),
+        pytest.param(
+            [
+                Tool(
+                    key="lookup_order",
+                    implementation=lookup_order,
+                    schema=ORDER_SCHEMA,
+                    description=None,
+                )
+            ],  # type: ignore[arg-type]
+            "description must be a string",
+            id="description_is_not_a_string",
+        ),
+        pytest.param(
+            ["not a tool"],  # type: ignore[dict-item]
+            "each entry in tools must be a Tool",
+            id="entry_is_not_a_tool",
+        ),
+    ],
+)
+async def test_bad_tool_entry_is_rejected_with_zero_requests(
+    tools: list[Any], match: str
+) -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    with pytest.raises(EvaluationsError, match=match):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
-            tools={"missing_tool": lookup_order},
+            tools=tools,
             generation={"provider": "OpenAI", "model": "gpt-4o"},
         )
 
-    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_native_tool_paired_with_an_inline_definition_is_rejected() -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    with pytest.raises(EvaluationsError, match=r"lookup_order.*NativeTool"):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools=[
+                Tool(
+                    key="lookup_order",
+                    implementation=NativeTool("WebSearch"),
+                    schema=ORDER_SCHEMA,
+                )
+            ],
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"key": "web_search", "version": 2}),
+            *hosted_dataset_responses(),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        tools=[evals.tools.get("web_search", implementation=NativeTool("WebSearch"))],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert recorded_paths(transport)[0] == ("GET", "projects/proj/ai-tools/web_search")
+    assert transport.requests[3]["body"]["tools"] == [
+        {"key": "web_search", "version": 2, "source": "library"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_tool_key_is_rejected_with_zero_requests() -> None:
+    """One key names one tool, whichever source each entry came from."""
+    transport = SequencedTransport([])
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    with pytest.raises(
+        EvaluationsError, match=r"'lookup_order' appears more than once"
+    ):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools=[
+                Tool(
+                    key="lookup_order",
+                    implementation=lookup_order,
+                    schema=ORDER_SCHEMA,
+                ),
+                Tool(
+                    key="lookup_order",
+                    implementation=refund_order,
+                    schema=ORDER_SCHEMA,
+                ),
+            ],
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_tools_get_refuses_an_uppercase_key_before_any_request() -> None:
+    """A tool key is lowercase, whether it is constructed or read from the library."""
+    transport = SequencedTransport([])
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    with pytest.raises(EvaluationsError, match="must not use uppercase letters"):
+        evals.tools.get("Lookup_Order", implementation=lookup_order)
+
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio
@@ -936,11 +1369,10 @@ async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
             response(200, dataset_page([], total=0)),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match="empty"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
@@ -1034,10 +1466,11 @@ async def test_complete_run_with_error_rows_does_not_pass(
     monkeypatch.setattr(
         "launchdarkly_ai_server.evaluations.module.init_client", fake_init_client
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -1117,7 +1550,9 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
         "launchdarkly_ai_server.evaluations.runner.extract_variation",
         fake_extract_variation,
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1156,7 +1591,6 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
         }
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -1268,7 +1702,9 @@ async def test_run_with_ld_judge_never_sends_a_verdict(
         "launchdarkly_ai_server.evaluations.runner.extract_variation",
         fake_extract_variation,
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1287,7 +1723,6 @@ async def test_run_with_ld_judge_never_sends_a_verdict(
         }
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -1363,7 +1798,9 @@ async def test_judges_resolve_once_per_run_not_once_per_row(
         "launchdarkly_ai_server.evaluations.runner.extract_variation",
         fake_extract_variation,
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1376,7 +1813,6 @@ async def test_judges_resolve_once_per_run_not_once_per_row(
         return {"output": "generated"}
 
     await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -1437,7 +1873,9 @@ async def test_missing_ld_judge_aborts_before_mutating_request(
         "launchdarkly_ai_server.evaluations.runner.extract_variation",
         fake_extract_variation,
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
@@ -1447,7 +1885,6 @@ async def test_missing_ld_judge_aborts_before_mutating_request(
         match=r"Failed to resolve LaunchDarkly judge 'security-judge': not found",
     ):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=handler,
@@ -1490,7 +1927,9 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
             ),
         ]
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(*args: object) -> dict[str, Any]:
         return {
@@ -1505,7 +1944,6 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
         return "refund" in str(output)
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="support-golden-v3",
         handler=handler,
@@ -1621,7 +2059,9 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
 ) -> None:
     transport = judge_run_transport()
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1634,7 +2074,6 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -1661,7 +2100,9 @@ async def test_generated_placeholders_are_not_expanded_into_judge_prompt(
 
     transport = judge_run_transport()
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1678,7 +2119,6 @@ async def test_generated_placeholders_are_not_expanded_into_judge_prompt(
         return {"output": "{{expected_output}} leaked?"}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -1717,7 +2157,9 @@ async def test_missing_expected_output_renders_empty_judge_variables(
         ]
     )
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1732,7 +2174,6 @@ async def test_missing_expected_output_renders_empty_judge_variables(
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -1745,14 +2186,15 @@ async def test_missing_expected_output_renders_empty_judge_variables(
 @pytest.mark.asyncio
 async def test_duplicate_criteria_rejected_before_any_request() -> None:
     transport = SequencedTransport([])
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     with pytest.raises(EvaluationsError, match="Duplicate evaluation criteria"):
         await evals.run(
-            project_key="proj",
             key="support-qa",
             dataset="golden",
             handler=handler,
@@ -1773,14 +2215,15 @@ async def test_duplicate_criteria_rejected_case_insensitively() -> None:
     only by case would still collide there even though they'd look distinct
     to a case-sensitive check."""
     transport = SequencedTransport([])
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     with pytest.raises(EvaluationsError, match="Duplicate evaluation criteria"):
         await evals.run(
-            project_key="proj",
             key="support-qa",
             dataset="golden",
             handler=handler,
@@ -1803,7 +2246,9 @@ async def test_errored_generation_row_emits_generation_incomplete_criterion_even
         summary={"statusCounts": {"total": 1, "passed": 0, "error": 1, "pending": 0}}
     )
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1816,7 +2261,6 @@ async def test_errored_generation_row_emits_generation_incomplete_criterion_even
         raise RuntimeError("provider unavailable")
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -1854,7 +2298,9 @@ async def test_failed_evaluation_event_tracking_raises_after_attempting_every_re
             raise RuntimeError("event pipeline unavailable")
 
     stub_sdk_client.track = MagicMock(side_effect=track)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -1868,7 +2314,6 @@ async def test_failed_evaluation_event_tracking_raises_after_attempting_every_re
 
     with pytest.raises(EvaluationsError) as error:
         await evals.run(
-            project_key="proj",
             key="support-qa",
             dataset="golden",
             handler=handler,
@@ -1955,11 +2400,12 @@ async def test_judge_on_another_provider_fails_before_any_records_are_created(
     """
     transport = judge_run_transport()
     judge_variation(monkeypatch, provider="Anthropic")
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     with pytest.raises(EvaluationsError) as error:
         await evals.run(
-            project_key="proj",
             key="support-qa",
             dataset="golden",
             handler=create_handler(("OpenAI", "messages"), _generation_only),
@@ -1979,7 +2425,9 @@ async def test_judge_handlers_route_a_judge_to_its_own_provider(
 ) -> None:
     transport = judge_run_transport()
     judge_variation(monkeypatch, provider="Anthropic")
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     judged: list[dict[str, Any]] = []
 
     async def anthropic_judge(
@@ -1993,7 +2441,6 @@ async def test_judge_handlers_route_a_judge_to_its_own_provider(
         return {"output": '{"score": 0.75, "reasoning": "ok"}'}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=create_handler(("OpenAI", "messages"), _generation_only),
@@ -2024,7 +2471,9 @@ async def test_exact_provider_judge_handler_beats_a_wildcard_adapter(
     """
     transport = judge_run_transport()
     judge_variation(monkeypatch, provider="Anthropic")
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     chosen: list[str] = []
 
     def judge_handler(name: str) -> Any:
@@ -2044,7 +2493,6 @@ async def test_exact_provider_judge_handler_beats_a_wildcard_adapter(
     exact = create_handler(("Anthropic", "messages"), judge_handler("exact"))
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=create_handler(("OpenAI", "messages"), _generation_only),
@@ -2064,7 +2512,9 @@ async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
 ) -> None:
     transport = judge_run_transport()
     judge_variation(monkeypatch, provider="Anthropic")
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     judged: list[dict[str, Any]] = []
 
     async def wildcard_judge(
@@ -2078,7 +2528,6 @@ async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
         return {"output": '{"score": 1, "reasoning": "ok"}'}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=create_handler(("OpenAI", "messages"), _generation_only),
@@ -2109,7 +2558,9 @@ async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
             ]
         },
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     judged: list[dict[str, Any]] = []
 
     async def anthropic_agent_judge(
@@ -2123,7 +2574,6 @@ async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
         return {"output": '{"score": 1, "reasoning": "ok"}'}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=create_handler(("OpenAI", "messages"), _generation_only),
@@ -2146,7 +2596,9 @@ async def test_generation_handler_runs_a_judge_on_the_same_provider(
 ) -> None:
     transport = judge_run_transport()
     judge_variation(monkeypatch, provider="OpenAI")
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     calls: list[str | None] = []
 
     async def openai_handler(
@@ -2162,7 +2614,6 @@ async def test_generation_handler_runs_a_judge_on_the_same_provider(
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=create_handler(("OpenAI", "messages"), openai_handler),
@@ -2181,11 +2632,12 @@ async def test_judge_handlers_must_declare_the_provider_they_serve(
     """An unrouted judge handler would silently never be selected."""
     transport = judge_run_transport()
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     with pytest.raises(EvaluationsError, match="does not declare provides_for"):
         await evals.run(
-            project_key="proj",
             key="support-qa",
             dataset="golden",
             handler=_generation_only,
@@ -2229,7 +2681,9 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
         ]
     )
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     in_flight = 0
     max_in_flight = 0
@@ -2250,7 +2704,6 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -2316,7 +2769,9 @@ async def test_tool_trajectory_reaches_the_judge_via_message_history(
     """
     transport = tool_run_transport()
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     seen: dict[str, str] = {}
 
     def lookup_order(args: dict[str, Any]) -> str:
@@ -2341,11 +2796,10 @@ async def test_tool_trajectory_reaches_the_judge_via_message_history(
         return {"output": "Your order shipped."}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
-        tools={"lookup_order": lookup_order},
+        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -2379,7 +2833,9 @@ async def test_each_row_gets_only_its_own_tool_trajectory(
 
     transport = tool_run_transport(rows=2)
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     histories: dict[str, str] = {}
     both_started = asyncio.Barrier(2)
 
@@ -2403,11 +2859,10 @@ async def test_each_row_gets_only_its_own_tool_trajectory(
         return {"output": f"answered {row}"}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
-        tools={"lookup_order": lookup_order},
+        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
         concurrency=2,
@@ -2428,7 +2883,9 @@ async def test_a_row_that_called_no_tools_says_so_to_the_judge(
     """A judge grading tool selection needs to see the tool that went unused."""
     transport = tool_run_transport()
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     seen: dict[str, str] = {}
 
     async def handler(
@@ -2443,11 +2900,10 @@ async def test_a_row_that_called_no_tools_says_so_to_the_judge(
         return {"output": "I do not know."}
 
     await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
-        tools={"lookup_order": lambda args: "unused"},
+        tools=[evals.tools.get("lookup_order", implementation=lambda args: "unused")],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -2470,7 +2926,9 @@ async def test_a_run_without_tools_leaves_message_history_unchanged(
     """
     transport = judge_run_transport()
     accuracy_judge_variation(monkeypatch)
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
     seen: dict[str, str] = {}
 
     async def handler(
@@ -2485,7 +2943,6 @@ async def test_a_run_without_tools_leaves_message_history_unchanged(
         return {"output": "generated"}
 
     await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
@@ -2528,7 +2985,9 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
         "launchdarkly_ai_server.evaluations.runner.extract_variation",
         fake_extract_variation,
     )
-    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
 
     async def handler(
         config: dict[str, Any],
@@ -2545,11 +3004,15 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
         return {"output": "done"}
 
     result = await evals.run(
-        project_key="proj",
         key="support-qa",
         dataset="golden",
         handler=handler,
-        tools={"lookup_order": lambda args: "{{expected_output}} leaked?"},
+        tools=[
+            evals.tools.get(
+                "lookup_order",
+                implementation=lambda args: "{{expected_output}} leaked?",
+            )
+        ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -2564,7 +3027,7 @@ async def test_a_failed_row_keeps_the_calls_made_before_the_handler_raised() -> 
     from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner
 
     runner = EvaluationsRunner(
-        LDApiClient(api_token="token", transport=failing_transport)
+        LDApiClient(api_key="token", transport=failing_transport)
     )
 
     async def handler(
@@ -2668,7 +3131,7 @@ def evaluation_post(transport: SequencedTransport) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> None:
     transport = SequencedTransport(fetched_run_responses(config_variation_page()))
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
     seen_configs: list[dict[str, Any]] = []
 
     async def handler(config: dict[str, Any], *args: object) -> dict[str, Any]:
@@ -2676,7 +3139,6 @@ async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> Non
         return {"output": "generated"}
 
     result = await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -2707,13 +3169,12 @@ async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> Non
 @pytest.mark.asyncio
 async def test_explicit_generation_overrides_the_fetched_variation() -> None:
     transport = SequencedTransport(fetched_run_responses(config_variation_page()))
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
@@ -2747,11 +3208,10 @@ async def test_variation_tools_without_implementations_fail_before_mutating_requ
             response(200, MODEL_CONFIG),
         ]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match="'lookup_order'"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
@@ -2790,7 +3250,7 @@ async def test_variation_judges_become_the_default_criteria(
         "launchdarkly_ai_server.evaluations.runner.extract_variation",
         fake_extract_variation,
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
@@ -2798,7 +3258,6 @@ async def test_variation_judges_become_the_default_criteria(
     # Resolving the attached judge is what fails, so it was picked up as a criterion.
     with pytest.raises(EvaluationsError, match="'security-judge'"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=handler,
@@ -2813,11 +3272,10 @@ async def test_unknown_variation_fails_before_any_records_are_created() -> None:
     transport = SequencedTransport(
         [response(404, {"code": "not_found", "message": "not found"})]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match="was not found"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
@@ -2846,11 +3304,10 @@ async def test_config_source_is_validated_before_network_io(
     source: dict[str, AIConfig], message: str
 ) -> None:
     transport = SequencedTransport([])
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match=message):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
@@ -2869,31 +3326,30 @@ async def test_tool_version_drift_from_the_variation_is_logged(
         config_variation_page(tools=[{"key": "lookup_order", "version": 4}])
     )
     responses.insert(
-        2,
+        0,
         response(
             200,
             {"key": "lookup_order", "version": 7, "schema": {"type": "object"}},
         ),
     )
     transport = SequencedTransport(responses)
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
     await evals.run(
-        project_key="proj",
         key="eval-key",
         dataset="golden",
         handler=handler,
         ai_config=AIConfig(key="support-agent", variation="control"),
-        tools={"lookup_order": lookup_order},
+        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
     )
 
     assert "pins tool 'lookup_order' at version 4" in caplog.text
-    assert "latest version 7" in caplog.text
+    assert "the run uses version 7" in caplog.text
     assert evaluation_post(transport)["tools"] == [
-        {"key": "lookup_order", "version": 7}
+        {"key": "lookup_order", "version": 7, "source": "library"}
     ]
 
 
@@ -2905,11 +3361,10 @@ async def test_non_string_model_config_key_fails_loudly(
     transport = SequencedTransport(
         [response(200, config_variation_page(modelConfigKey=model_config_key))]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match="non-string modelConfigKey"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
@@ -2927,12 +3382,11 @@ async def test_variation_without_a_model_config_needs_an_explicit_provider(
     transport = SequencedTransport(
         [response(200, config_variation_page(modelConfigKey=model_config_key))]
     )
-    evals = init_evaluations(api_token="token", transport=transport)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     # No model config is linked, so none is fetched and no provider is known.
     with pytest.raises(EvaluationsError, match=r"generation\.provider is required"):
         await evals.run(
-            project_key="proj",
             key="eval-key",
             dataset="golden",
             handler=successful_handler,
@@ -2965,3 +3419,132 @@ def test_ai_config_variation_from_api_layers_the_model_config() -> None:
     unlinked = AIConfigVariation.from_api(latest)
     assert "provider" not in unlinked.generation
     assert unlinked.generation["parameters"] == {"temperature": 0.7}
+
+
+@pytest.mark.asyncio
+async def test_tools_get_pins_the_version_it_reads() -> None:
+    transport = SequencedTransport(
+        [
+            response(
+                200,
+                {
+                    "key": "lookup_order",
+                    "version": 7,
+                    "description": "Look up an order",
+                    "schema": ORDER_SCHEMA,
+                },
+            )
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    tool = evals.tools.get("lookup_order", implementation=lookup_order)
+
+    assert tool.source == "library"
+    assert tool.version == 7
+    assert tool.description == "Look up an order"
+    assert tool.schema == ORDER_SCHEMA
+    assert tool.implementation is lookup_order
+    assert recorded_paths(transport) == [("GET", "projects/proj/ai-tools/lookup_order")]
+
+
+def test_a_constructed_tool_is_always_inline() -> None:
+    """``source`` and ``version`` are not constructor arguments."""
+    tool = Tool(key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA)
+
+    assert tool.source == "inline"
+    assert tool.version is None
+    with pytest.raises(TypeError):
+        Tool(  # type: ignore[call-arg]
+            key="lookup_order",
+            implementation=lookup_order,
+            schema=ORDER_SCHEMA,
+            source="library",
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_reads_no_tool_from_the_api() -> None:
+    """``run`` resolves nothing: a library tool was already read by ``tools.get``."""
+    transport = SequencedTransport(
+        [
+            response(200, {"key": "lookup_order", "version": 7}),
+            *hosted_dataset_responses(),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    library_tool = evals.tools.get("lookup_order", implementation=lookup_order)
+    requests_before_run = len(transport.requests)
+
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=successful_handler,
+        tools=[
+            library_tool,
+            Tool(key="refund_order", implementation=refund_order, schema=ORDER_SCHEMA),
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    run_paths = [path for _, path in recorded_paths(transport)[requests_before_run:]]
+    assert not any("ai-tools" in path for path in run_paths), run_paths
+
+
+@pytest.mark.asyncio
+async def test_an_empty_tools_list_runs_a_variation_with_no_tools() -> None:
+    """A caller who passes tools= replaces the variation's list."""
+    transport = SequencedTransport(
+        fetched_run_responses(
+            config_variation_page(tools=[{"key": "lookup_order", "version": 4}])
+        )
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        ai_config=AIConfig(key="support-agent", variation="control"),
+        tools=[],
+    )
+
+    assert "tools" not in evaluation_post(transport)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_from_another_project_is_rejected() -> None:
+    transport = SequencedTransport(
+        [response(200, {"key": "lookup_order", "version": 4, "schema": {}})]
+    )
+    other = init_evaluations(
+        project_key="other-proj",
+        api_key="token",
+        sdk_key="sdk-key",
+        transport=transport,
+    )
+    foreign_tool = other.tools.get("lookup_order", implementation=lookup_order)
+    evals = init_evaluations(
+        project_key="proj",
+        api_key="token",
+        sdk_key="sdk-key",
+        transport=SequencedTransport([]),
+    )
+
+    with pytest.raises(EvaluationsError, match="cannot run in project 'proj'"):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools=[foreign_tool],
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
