@@ -714,6 +714,13 @@ response = await graph(
 ).invoke(user_input, context)
 ```
 
+## Cursor Cloud specific instructions
+
+- Python 3.12 and `uv` (`~/.local/bin` if it is not already on `PATH`). After checkout, run `uv lock` and then `uv sync --all-packages`, the same package set CI installs. Plain `uv sync` does not install every workspace member.
+- Verify with `make lint`, `make format-check`, `make typecheck`, and `make test`.
+- `main.py` examples call LaunchDarkly and a model provider. They need `LD_SDK_KEY` and the provider key from `.env.example`. The test suite mocks those services.
+- `uv lock` rewrites workspace member versions in `uv.lock` when they have drifted from each package's `pyproject.toml`. That dirty lockfile is not an install failure; do not commit it unless the lockfile change is intentional.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
