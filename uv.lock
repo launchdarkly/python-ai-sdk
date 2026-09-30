@@ -15,6 +15,7 @@ resolution-markers = [
 members = [
     "launchdarkly-ai-claude-agents",
     "launchdarkly-ai-claude-messages",
+    "launchdarkly-ai-google-adk-agents",
     "launchdarkly-ai-langchain-agents",
     "launchdarkly-ai-langchain-messages",
     "launchdarkly-ai-openai-agents",
@@ -874,6 +875,21 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
+    { name = "launchdarkly-ai-server", editable = "packages/client" },
+    { name = "opentelemetry-api", specifier = ">=1.25" },
+]
+
+[[package]]
+name = "launchdarkly-ai-google-adk-agents"
+version = "0.1.0"
+source = { editable = "packages/google-adk-agents" }
+dependencies = [
+    { name = "launchdarkly-ai-server" },
+    { name = "opentelemetry-api" },
+]
+
+[package.metadata]
+requires-dist = [
     { name = "launchdarkly-ai-server", editable = "packages/client" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
 ]

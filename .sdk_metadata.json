@@ -102,6 +102,19 @@
         "aiAgentGraph": { "introduced": "0.1" },
         "aiTrackMetrics": { "introduced": "0.1" }
       }
+    },
+    "python-ai-google-adk-agents": {
+      "name": "Google ADK Agents AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/google-adk-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-google-adk-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-google-adk-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
     }
   }
 }

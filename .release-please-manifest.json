@@ -6,5 +6,6 @@
   "packages/openai-agents": "0.2.3",
   "packages/openai-messages": "0.2.3",
   "packages/langchain-agents": "0.2.3",
-  "packages/langchain-messages": "0.2.3"
+  "packages/langchain-messages": "0.2.3",
+  "packages/google-adk-agents": "0.1.0"
 }
