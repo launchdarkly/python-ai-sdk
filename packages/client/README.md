@@ -92,8 +92,8 @@ from launchdarkly_ai_openai_messages import create_openai_messages_handler
 from launchdarkly_ai_server import DatasetRow, Judge, Scorer, init_evaluations
 
 
-def mentions_policy(row: DatasetRow, output: str | None) -> bool:
-    return "refund policy" in (output or "").lower()
+def mentions_policy(row: DatasetRow, output: str | None) -> float:
+    return 1.0 if "refund policy" in (output or "").lower() else 0.0
 
 
 result = await init_evaluations().run(
@@ -112,7 +112,7 @@ result = await init_evaluations().run(
 )
 ```
 
-`Scorer.fn` receives the `DatasetRow` the output was generated from plus the generated output, may be sync or async, and must return a bool or a number from 0 to 1; booleans become 1.0 or 0.0. `Judge.threshold` defaults to 0.5 and `Scorer.threshold` to 1.0 — a perfect score, which is what a boolean scorer wants — and both accept an optional `pass_rate_threshold`. Judge keys and scorer names share one `criterionType` namespace and must be unique within a run, case-insensitively, because that name is part of each result's deterministic event identity. `Judge.ground_truth_context` overrides what the judge is graded against when the dataset row's expected output is not it.
+`Scorer.fn` receives the `DatasetRow` the output was generated from plus the generated output, may be sync or async, and must return a **finite number from 0 to 1** — that is the whole contract, and nothing is coerced on your behalf. A scorer answering a yes/no question returns `1.0` or `0.0` itself; a `bool`, a `NaN`, or an out-of-range number is an `invalid_score` result. Returning one score type keeps a threshold comparison meaning the same thing for binary and graded scorers, and keeps a scorer that accidentally returns a non-score from passing silently — every non-empty value is truthy, so `return "high"` would otherwise score 1.0. `Judge.threshold` defaults to 0.5 and `Scorer.threshold` to 1.0 — a perfect score, which is what a yes/no scorer wants — and both accept an optional `pass_rate_threshold`. Judge keys and scorer names share one `criterionType` namespace and must be unique within a run, case-insensitively, because that name is part of each result's deterministic event identity. `Judge.ground_truth_context` overrides what the judge is graded against when the dataset row's expected output is not it.
 
 **The SDK reports scores and never rules on them.** LaunchDarkly derives each row's verdict at ingest by comparing the score against the criterion's stored threshold and success direction, so pass/fail policy is one server-side implementation that applies to every SDK version and to runs already recorded. A judge's direction lives on its AI Config and is injected server-side, keeping the one input a verdict turns on server-attested; a `Scorer` has no LaunchDarkly-side config to read, so it declares its own `success_direction` (default `"higher_is_better"` — set `"lower_is_better"` for a scorer that counts something unwanted, like a regex hit count).
 
