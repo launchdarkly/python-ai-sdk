@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import stat
+import unicodedata
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -367,6 +368,17 @@ pytestmark = pytest.mark.usefixtures("reset_skill_state")
 
 
 def _hash(content: str) -> str:
+    """Convenience for building fixtures whose ``content_hash`` is correct.
+
+    Deliberately the same expression the implementation hashes with, which is
+    what makes it useless as an oracle: a change to the hashing rule moves
+    every fixture built here along with it, and nothing in this file would
+    fail. The rule is pinned independently, against the digests LaunchDarkly's
+    delivery service computes, in ``TestContentHashContract`` in ``test_skills.py`` for the
+    accessor and write paths, and in
+    ``TestAdoptionContentHashContract`` below for the adoption
+    comparison, which hashes through an expression of its own.
+    """
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
@@ -3291,6 +3303,134 @@ class TestCrashMidReconcileRecovery:
         entries = _read_manifest(root)["entries"]
         assert entries["a/SKILL.md"]["key"] == "a"
         assert [e["key"] for e in entries.values()] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# The adoption comparison hashes the delivered rule
+# ---------------------------------------------------------------------------
+
+# The same vector and digest pinned in ``test_skills.py``, deliberately copied
+# rather than imported: the whole value of a literal is that it is not derived
+# from anything. Both copies are the digest LaunchDarkly's delivery service
+# computes for this content, so neither may be replaced by a call to ``_hash``,
+# and the two only ever change together — and only if the service's rule changed.
+#
+# ``é`` written as an escape rather than as the character, so a tool that
+# re-normalized this source file could not quietly change the input.
+_ADOPTION_HAZARD_CONTENT = "# héllo\r\n\ntrailing no newline"
+_ADOPTION_HAZARD_DIGEST = (
+    "2b7c050d94135e5e947263053ebde1c988c2bb90bcc037e8f3d1a2d340b9a558"
+)
+
+# The same three fixups the accessor-side contract test applies, here against
+# the file on disk: an editor rewriting line endings, a lint step adding the
+# final newline, a form decomposing the accent. None changes what the document
+# means and all three change its bytes, so none of them is the content
+# LaunchDarkly delivered.
+_ADOPTION_NORMALIZATIONS = [
+    pytest.param(lambda text: text.replace("\r\n", "\n"), id="crlf_to_lf"),
+    pytest.param(lambda text: text + "\n", id="trailing_newline_added"),
+    pytest.param(
+        lambda text: unicodedata.normalize("NFD", text), id="nfd_decomposition"
+    ),
+]
+
+
+def _plant_unmanaged(root: Path, key: str, content: str) -> Path:
+    """``_place_unmanaged``, but writing verbatim bytes.
+
+    ``write_text`` opens in text mode, where ``newline=None`` translates ``\\n``
+    to ``os.linesep``. That is a no-op on POSIX and on Windows it would rewrite
+    the CRLF these cases are about, turning the planted file into something
+    other than what the test meant to plant. Adoption decides from bytes, so the
+    fixture places bytes.
+    """
+    target = root / key / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content.encode("utf-8"))
+    return target
+
+
+class TestAdoptionContentHashContract:
+    """
+    The verbatim-bytes rule where adoption writes it down a second time.
+
+    ``TestContentHashContract`` in ``test_skills.py`` pins ``verified_bytes``,
+    which the accessor and the pre-write re-verify share. Adoption does not go
+    through it: it hashes the bytes it read off disk with an expression of its
+    own and compares that to ``content_hash``, so it is a second statement of
+    the same rule and the accessor-side test cannot reach it.
+
+    It is also the statement that decides whether an unmanaged file is claimed
+    or refused. A comparison that normalized would adopt a planted file whose
+    bytes merely *normalize* to the delivered content, leave those foreign bytes
+    on disk, and report ``skipped_current`` — an action documented to mean the
+    bytes on disk already are the resolved content.
+    """
+
+    @staticmethod
+    def _pinned() -> Skill:
+        """A skill carrying the pinned digest as a literal.
+
+        ``write_skills`` re-verifies through ``verified_bytes`` before it looks
+        at the disk at all, so this pins the write path's copy of the rule too:
+        a skill built this way only survives as far as the adoption comparison
+        while the digest still matches its content's exact bytes.
+        """
+        return Skill(
+            key="a",
+            version=1,
+            content=_ADOPTION_HAZARD_CONTENT.encode("utf-8"),
+            content_hash=_ADOPTION_HAZARD_DIGEST,
+        )
+
+    async def test_a_file_matching_the_pinned_digest_is_adopted(
+        self, root: Path
+    ) -> None:
+        """The positive control, and the half that fails if either side drifts.
+
+        The bytes on disk are byte-for-byte what the pinned digest is the digest
+        of, which is the one file adoption is for.
+        """
+        target = _plant_unmanaged(root, "a", _ADOPTION_HAZARD_CONTENT)
+
+        report = await write_skills([self._pinned()], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert _actions_by_key(report)["a"].action == "skipped_current"
+        # Adopted, not rewritten, and now recorded.
+        assert target.read_bytes() == _ADOPTION_HAZARD_CONTENT.encode("utf-8")
+        entry = _read_manifest(root)["entries"]["a/SKILL.md"]
+        assert entry["key"] == "a"
+        assert entry["sha256"] == _ADOPTION_HAZARD_DIGEST
+
+    @pytest.mark.parametrize("normalize", _ADOPTION_NORMALIZATIONS)
+    async def test_a_normalized_file_is_refused_rather_than_adopted(
+        self, root: Path, normalize: Any
+    ) -> None:
+        """The teeth. Adoption is only safe while disagreeing is detectable.
+
+        Each of these is content LaunchDarkly never delivered, so adopting one
+        would claim a foreign file into the manifest and report it as current.
+        """
+        planted = normalize(_ADOPTION_HAZARD_CONTENT)
+        assert planted != _ADOPTION_HAZARD_CONTENT, (
+            "the transform left this input alone"
+        )
+        target = _plant_unmanaged(root, "a", planted)
+
+        report = await write_skills([self._pinned()], root)
+
+        assert report.ok is False
+        action = _actions_by_key(report)["a"]
+        assert action.action == "error"
+        assert "refusing to overwrite a file this SDK did not write" in (
+            action.error or ""
+        )
+        # Neither adopted nor overwritten: the planted bytes are still the
+        # planted bytes, and nothing was claimed into the manifest.
+        assert target.read_bytes() == planted.encode("utf-8")
+        assert "a/SKILL.md" not in _read_manifest(root)["entries"]
 
 
 # ---------------------------------------------------------------------------
