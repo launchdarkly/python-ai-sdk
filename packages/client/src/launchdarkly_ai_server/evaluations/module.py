@@ -150,8 +150,9 @@ class EvaluationsModule:
         handler with ``create_handler()`` (or a provider package's
         ``create_*_handler()``) and give it a ``provides_for`` tag for its
         provider and mode. With more than one handler, run() picks the
-        handler tagged for the provider a call needs, and for a judge, also
-        for its mode. run() raises an error before any record exists if no
+        handler tagged for the provider a call needs. For a judge, or for
+        generation when ``ai_config`` supplies a known mode, run() also
+        matches on mode. run() raises an error before any record exists if no
         handler matches a call, or if more than one handler could match and
         the call has no mode to break the tie.
 
@@ -211,8 +212,11 @@ class EvaluationsModule:
                 ]
         generation = self._validate_generation(generation)
         # Checkable as soon as generation is known, and always before any
-        # network request the run still needs to make.
-        generation_handler = _select_handler(generation["provider"], handlers)
+        # network request the run still needs to make. A fetched AI Config
+        # variation may carry a mode; a hand-built generation has none.
+        generation_handler = _select_handler(
+            generation["provider"], handlers, mode=generation.get("mode")
+        )
         run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
         self._validate_criteria(run_criteria)

@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
 
+from ..utils import normalize_mode
+
 
 @dataclass
 class Usage:
@@ -36,6 +38,7 @@ class GenerationConfig(TypedDict, total=False):
     messages: list[dict[str, Any]]
     prompt_snippets: dict[str, str]
     output_format: dict[str, Any]
+    mode: Literal["agent", "messages"]
 
 
 @dataclass
@@ -144,6 +147,9 @@ class AIConfigVariation:
         output_format = data.get("outputFormat")
         if isinstance(output_format, Mapping):
             generation["output_format"] = dict(output_format)
+        mode = data.get("mode")
+        if isinstance(mode, str) and mode:
+            generation["mode"] = normalize_mode(mode)
 
         tools = data.get("tools")
         tool_versions = {
