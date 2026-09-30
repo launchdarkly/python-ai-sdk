@@ -438,6 +438,57 @@ class TestInMemorySkillStore:
     def test_get_object_unknown_key_returns_none(self) -> None:
         assert InMemorySkillStore().get_object("skill", "nope") is None
 
+    @pytest.mark.parametrize(
+        "inherited", ["constructor", "keys", "items", "get", "pop", "update"]
+    )
+    def test_an_inherited_name_is_not_a_held_object(self, inherited: str) -> None:
+        """Regression protection rather than a live guard on this side.
+
+        Skill keys arrive from the wire, and several names a mapping carries are
+        valid skill keys — ``constructor`` satisfies the key grammar, so it
+        arrives as an ordinary lookup. A store reaching its map through
+        attributes would answer one of these with a bound method. Python's
+        dicts make that free: a ``dict`` has no prototype chain and these are
+        ordinary absent keys. The assertion is here so a future change of map
+        type has to notice, not because the store is at risk today.
+        """
+        assert InMemorySkillStore().get_object("skill", inherited) is None
+
+    def test_a_put_under_an_inherited_name_moves_no_other_key(
+        self, make_raw_skill: Any
+    ) -> None:
+        """The second half of the pair: storing such a name corrupts nothing.
+
+        ``__proto__`` is the name that carries the hazard elsewhere; here it is
+        an ordinary string key, and what this pins is that it stays one.
+        """
+        store = InMemorySkillStore()
+        good = make_raw_skill(key="a")
+        store.put(good)
+        store.put(make_raw_skill(key="__proto__"))
+
+        assert store.get_object("skill", "a") == good
+        assert store.get_object("skill", "b") is None
+        assert store.get_object("skill", "constructor") is None
+
+    def test_a_miss_does_not_create_an_entry(self, make_raw_skill: Any) -> None:
+        """A missing key must not become a held one by being asked for.
+
+        This is the ``defaultdict`` trap, and it is the one way the free
+        behaviour above could be lost while every assertion in this class still
+        passed: a default-constructing map answers the miss with an empty object
+        rather than ``None``, and ``all_objects`` then grows an entry per
+        lookup — which on the materialization path is a key appearing in the
+        requested set that nobody requested.
+        """
+        store = InMemorySkillStore()
+        store.put(make_raw_skill(key="a"))
+
+        assert store.get_object("skill", "never-asked-before") is None
+        assert store.get_object("skill", "constructor") is None
+
+        assert len(store.all_objects("skill")) == 1
+
     def test_put_then_get(self, make_raw_skill: Any) -> None:
         s = InMemorySkillStore()
         raw = make_raw_skill(key="a")

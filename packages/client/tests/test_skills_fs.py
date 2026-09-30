@@ -837,15 +837,27 @@ class TestRootHandling:
 
 
 class TestTimeoutArgument:
-    """A negative timeout is a caller mistake, not a value to clamp."""
+    """An unusable timeout is a caller mistake, not a value to clamp.
 
-    @pytest.mark.parametrize("timeout", [-1.0, -0.001])
-    async def test_a_negative_timeout_raises(self, root: Path, timeout: float) -> None:
+    The guard is non-finite, not ``< 0``, because ``< 0`` is exactly the shape
+    both non-finite values slip through. Three invalid values, and the same rule
+    guards ``watch_skills``'s ``debounce`` and the delivery store's
+    ``poll_interval`` and ``read_timeout``.
+    """
+
+    @pytest.mark.parametrize(
+        "timeout",
+        [-1.0, -0.001, float("-inf"), float("nan"), float("inf")],
+        ids=["negative", "small negative", "-inf", "nan", "inf"],
+    )
+    async def test_an_unusable_timeout_raises(self, root: Path, timeout: float) -> None:
         """Raises the same class an unusable root does.
 
         Clamping to zero would silently turn the mistake into "do not retrieve
         anything", which is a working reconcile that quietly writes nothing —
-        the least visible possible reading of a typo.
+        the least visible possible reading of a typo. Passing a non-finite value
+        through is worse still: ``deadline`` becomes non-finite and the bound
+        this parameter promises is gone, with nothing reported.
         """
         with pytest.raises(ValueError) as excinfo:
             await write_skills([_skill("a")], root, timeout=timeout)
@@ -853,6 +865,30 @@ class TestTimeoutArgument:
         assert "timeout" in str(excinfo.value)
         # The raise precedes any filesystem work, as the bare-string guard does.
         assert list(root.iterdir()) == []
+
+    @pytest.mark.parametrize("timeout", [float("nan"), float("inf")])
+    async def test_a_non_finite_timeout_does_not_reach_the_deadline_arithmetic(
+        self, root: Path, timeout: float
+    ) -> None:
+        """The raise is what matters, and this is why it has to be a raise.
+
+        Both values pass a ``< 0`` guard, and what happens next differs by the
+        shape of the comparison rather than by the value: with ``inf`` the run
+        never expires, and with ``nan`` ``now > deadline`` is false while
+        ``deadline - now > 0`` is *also* false, so one implementation reads the
+        run as unbounded and another reads it as already expired. Neither is
+        detectably wrong from inside its own language, which is why this is
+        settled at the boundary rather than left to the deadline checks.
+        """
+        _place_managed(root, "stale", SKILL_BODY)
+
+        with pytest.raises(ValueError):
+            await write_skills([], root, timeout=timeout)
+
+        # Nothing ran, so the manifest-listed file is untouched either way —
+        # neither pruned by an unbounded run nor left by an exhausted one.
+        assert (root / "stale" / "SKILL.md").read_text(encoding="utf-8") == SKILL_BODY
+        assert "stale/SKILL.md" in _read_manifest(root)["entries"]
 
     async def test_a_zero_timeout_is_valid(self, root: Path) -> None:
         """Positive control, and the boundary the guard must not swallow.

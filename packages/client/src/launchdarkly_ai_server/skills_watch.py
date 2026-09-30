@@ -287,11 +287,15 @@ async def watch_skills(
             "observed. Use write_skills for a one-shot reconcile, or configure a "
             "store with a delivery transport (FDv2SkillStore)."
         )
-    # ``NaN`` is the case a bare ``< 0`` guard misses: ``nan < 0`` is ``False``,
-    # so it passes validation and then collapses the window to nothing, because
-    # ``Event.wait(nan)`` returns immediately. Every delivered object would
-    # reconcile on its own with no coalescing at all — the opposite of what the
-    # option is for. ``write_skills`` already guards its ``timeout`` this way.
+    # Both non-finite values are cases a bare ``< 0`` guard misses, and they
+    # fail in opposite directions. ``nan < 0`` is ``False``, so it passes and
+    # then collapses the window to nothing, because ``Event.wait(nan)`` returns
+    # immediately: every delivered object reconciles on its own with no
+    # coalescing at all, the opposite of what the option is for. ``inf`` passes
+    # too, and ``Event.wait(inf)`` never returns, so the watcher never
+    # reconciles again. One rule, stated three times: ``write_skills`` guards
+    # its ``timeout`` this way and the delivery store its ``poll_interval`` and
+    # ``read_timeout``. Narrowing any one of them back is breaking the others.
     if not math.isfinite(debounce) or debounce < 0:
         raise ValueError(
             f"debounce must be a non-negative finite number of seconds, got "

@@ -525,6 +525,14 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   read or the orphan listing lets a swap choose the *branch* instead — most seriously, a
   prune whose probe is answered "absent" from a swapped directory skips its unlink, drops
   the manifest entry, and reports `removed` while the revoked skill stays on disk.
+- **Every numeric option is guarded non-finite, never `< 0` or `<= 0`.** `write_skills`'s
+  `timeout`, `watch_skills`'s `debounce`, and `FDv2SkillStore`'s `poll_interval` and
+  `read_timeout` are one rule stated four times, and `< 0` is exactly the shape both
+  non-finite values slip through: `nan` and `inf` each compare false against zero, pass,
+  and then mean opposite things downstream — an unbounded deadline versus an
+  already-expired one, a coalescing window of zero versus one that never closes, a poll
+  loop that spins versus one that stops after a single request while still reporting
+  healthy. Narrowing any one of these back to a sign check is breaking the other three.
 - **A key valid to the data model may still be unrepresentable on disk.** The model allows
   256 characters; `NAME_MAX` is 255 bytes. Windows additionally reserves 22 MS-DOS device
   names, none of which can be a directory name there: `con`, `prn`, `aux`, `nul`,

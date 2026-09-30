@@ -1571,11 +1571,16 @@ class FDv2SkillStore:
         hold a long-lived connection, and revocation there is one
         ``poll_interval`` late.
 
+        *poll_interval* must be a positive finite number of seconds. ``nan`` and
+        ``inf`` raise alongside a non-positive value: both pass a bare ``<= 0``
+        guard and then mean opposite things to the wait between polls.
+
         *read_timeout* is the only network timeout and bounds every socket
         operation of a request, so its meaning and default follow the mode: in
         ``"poll"`` it bounds the whole request (``DEFAULT_POLL_TIMEOUT``); in
         ``"stream"`` it bounds each wait for the next bytes
-        (``DEFAULT_STREAM_READ_TIMEOUT``). Must be positive when given.
+        (``DEFAULT_STREAM_READ_TIMEOUT``). Must be positive and finite when
+        given.
 
         *max_backoff* caps every delay between retries, including one the server
         asks for with ``Retry-After``.
@@ -1598,7 +1603,15 @@ class FDv2SkillStore:
         _require_https_uri(stream_uri, "stream_uri")
         if mode not in ("stream", "poll"):
             raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
-        if poll_interval <= 0:
+        # Non-finite as well as non-positive, and on the same rule as
+        # ``read_timeout`` below: ``nan <= 0`` and ``inf <= 0`` are both false,
+        # so a ``<= 0`` guard passes each of them straight through to
+        # ``Event.wait``, where they mean opposite things. ``wait(nan)`` returns
+        # at once, so the loop polls as fast as the endpoint will answer;
+        # ``wait(inf)`` never returns, so the store polls once and then never
+        # again while reporting itself healthy. One value should not be able to
+        # produce either of those.
+        if not (math.isfinite(poll_interval) and poll_interval > 0):
             raise ValueError(f"poll_interval must be positive, got {poll_interval!r}")
         if read_timeout is None:
             read_timeout = (

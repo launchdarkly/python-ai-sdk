@@ -3870,6 +3870,29 @@ class TestTimeouts:
         with pytest.raises(ValueError, match="read_timeout"):
             FDv2SkillStore(SDK_KEY, read_timeout=value)
 
+    @pytest.mark.parametrize(
+        "value",
+        [0.0, -1.0, float("inf"), float("nan")],
+        ids=["zero", "negative", "inf", "nan"],
+    )
+    def test_a_non_positive_poll_interval_is_rejected(self, value: float) -> None:
+        """The same rule as ``read_timeout`` above, and for a sharper reason.
+
+        ``poll_interval`` is the argument to the wait between polls, so the two
+        non-finite values do not merely slip through a ``<= 0`` guard — they
+        mean opposite things once they arrive. ``Event.wait(nan)`` returns at
+        once, so the loop polls as fast as the endpoint will answer;
+        ``Event.wait(inf)`` never returns, so the store polls once and then
+        never again while reporting itself healthy.
+        """
+        with pytest.raises(ValueError, match="poll_interval"):
+            FDv2SkillStore(SDK_KEY, mode="poll", poll_interval=value)
+
+    def test_a_finite_positive_poll_interval_is_accepted(self) -> None:
+        """Positive control, so the guard above cannot reject every value."""
+        store = FDv2SkillStore(SDK_KEY, mode="poll", poll_interval=0.5)
+        assert store.failed is None
+
     def test_there_is_no_separate_connect_timeout(self) -> None:
         # ``urllib`` cannot bound the connect separately from the reads, so the
         # constructor does not offer a parameter that would only pretend to.

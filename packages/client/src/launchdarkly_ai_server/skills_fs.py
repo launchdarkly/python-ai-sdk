@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import time
@@ -192,6 +193,11 @@ async def write_skills(
     between steps rather than interrupting one in progress, for the same
     reason.
 
+    *timeout* must be a non-negative finite number of seconds. ``nan`` and
+    ``inf`` raise alongside a negative value: both pass a bare ``< 0`` guard and
+    then leave the call with no bound at all. Zero is valid and means there is
+    no time left, which every skill reports as an error rather than a raise.
+
     **One root, one reconcile at a time.** Because nothing here yields, a
     reconcile is atomic against every other task on the loop. Wrapping it to run
     concurrently makes that the caller's problem: two runs against the same root
@@ -204,8 +210,22 @@ async def write_skills(
         raise ValueError(
             f'on_unavailable must be "keep" or "raise", got {on_unavailable!r}'
         )
-    if timeout < 0:
-        raise ValueError(f"timeout must not be negative, got {timeout!r}")
+    # Non-finite as well as negative, and ``< 0`` alone is exactly the shape
+    # both non-finite values slip through: ``nan < 0`` and ``inf < 0`` are both
+    # false, so each passes and then makes ``deadline`` non-finite, after which
+    # the bound this parameter promises is silently void and the call runs
+    # unbounded. ``nan`` is worse than unbounded, because its failure mode
+    # depends on the shape of the comparison rather than on the value:
+    # ``now > deadline`` is false, so the run reads as never expiring, while
+    # ``deadline - now > 0`` is also false, so the same run reads as already
+    # expired. Rejecting it here is the one place that is settled once.
+    # ``-inf`` is caught by the ``< 0`` half. The same rule guards
+    # ``watch_skills``'s ``debounce`` and the delivery store's ``poll_interval``
+    # and ``read_timeout``.
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(
+            f"timeout must be a non-negative finite number of seconds, got {timeout!r}"
+        )
 
     deadline = time.monotonic() + timeout
     root_path = _resolve_root(root)
