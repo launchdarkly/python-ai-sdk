@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import unicodedata
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -2176,6 +2177,112 @@ class TestIntegrityFailureLogRecord:
             "language",
         }
         assert _integrity_records(caplog)[0]["reason_code"] == "hash_mismatch"
+
+
+# The content whose bytes a normalizing round trip would silently alter: a
+# non-ASCII character, a CRLF, and no trailing newline.
+_HAZARD_CONTENT = "# h\u00e9llo\r\n\ntrailing no newline"
+_HAZARD_DIGEST = "2b7c050d94135e5e947263053ebde1c988c2bb90bcc037e8f3d1a2d340b9a558"
+
+# Two digests LaunchDarkly's delivery service computes for the content beside
+# them, pinned here as literals.
+#
+# The literals are the point. Every other raw object in this suite is built by
+# a helper that hashes its content with the same expression ``verify_raw_skill``
+# uses, so a change to the hashing rule moves the expectation along with it and
+# nothing fails. That would leave the one rule which has to agree with a service
+# outside this process as the only rule in the feature with no independent
+# oracle. These two digests are that oracle.
+_SERVICE_HASH_VECTORS = [
+    pytest.param(
+        "# hello",
+        "ea67f39f2a707e536439ee31e49fdd586b4a8437d3408f0466112d040cd06681",
+        id="ascii",
+    ),
+    pytest.param(
+        _HAZARD_CONTENT, _HAZARD_DIGEST, id="non_ascii_crlf_no_trailing_newline"
+    ),
+]
+
+# Each of these is a fixup something between the author and this process might
+# plausibly apply to a markdown file: an editor rewriting line endings, a lint
+# step adding the final newline, a form decomposing the accent. None of the
+# three changes what the document means, and all three change what it hashes
+# to, which is the whole reason the rule is stated over bytes.
+_NORMALIZATIONS = [
+    pytest.param(lambda text: text.replace("\r\n", "\n"), id="crlf_to_lf"),
+    pytest.param(lambda text: text + "\n", id="trailing_newline_added"),
+    pytest.param(
+        lambda text: unicodedata.normalize("NFD", text), id="nfd_decomposition"
+    ),
+]
+
+
+class TestContentHashContract:
+    """
+    The verbatim-bytes rule, checked against the service that computes it.
+
+    ``contentHash`` is specified as sha256 over the content's exact UTF-8 bytes,
+    with no canonicalization on either side, so agreement between this SDK and
+    LaunchDarkly's delivery service is part of the rule rather than an
+    implementation detail. The SDK cannot verify the service's half, but it can
+    pin the one thing that would break if either half began normalizing: the
+    digests the service produces for content where a round trip is observable.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture_errors(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level("ERROR", logger="launchdarkly_ai_server.skills_core")
+
+    @pytest.mark.parametrize(("content", "digest"), _SERVICE_HASH_VECTORS)
+    async def test_the_services_pinned_digests_verify(
+        self, store: InMemorySkillStore, content: str, digest: str
+    ) -> None:
+        """sha256, lowercase hex, over the UTF-8 bytes of ``content`` alone.
+
+        Passing means the SDK computes what the service computed. Failing means
+        one of the two now normalizes, and a customer would see every skill in
+        the environment withheld with ``hash_mismatch`` and no way to tell why.
+        """
+        store.put({"key": "a", "version": 1, "content": content, "contentHash": digest})
+
+        skill = await get_skill("a")
+
+        assert skill is not None
+        # Byte-for-byte, so the hash attests the bytes the caller receives
+        # rather than some decoded form of them.
+        assert skill.content == content.encode("utf-8")
+
+    @pytest.mark.parametrize("normalize", _NORMALIZATIONS)
+    async def test_a_normalizing_round_trip_no_longer_verifies(
+        self, caplog: pytest.LogCaptureFixture, normalize: Any
+    ) -> None:
+        """The teeth on the test above.
+
+        Agreeing on a digest proves nothing unless disagreeing is detectable,
+        and a rule that quietly tolerated any of these three would let content
+        LaunchDarkly never delivered pass verification.
+        """
+        altered = normalize(_HAZARD_CONTENT)
+        assert altered != _HAZARD_CONTENT, "the transform left this input alone"
+
+        skills_module._set_store(
+            InMemorySkillStore(
+                {
+                    "a": {
+                        "key": "a",
+                        "version": 1,
+                        "content": altered,
+                        "contentHash": _HAZARD_DIGEST,
+                    }
+                }
+            )
+        )
+
+        assert await all_skills() == []
+        records = _integrity_records(caplog)
+        assert len(records) == 1
+        assert records[0]["reason_code"] == "hash_mismatch"
 
 
 class TestTelemetryEmitter:
