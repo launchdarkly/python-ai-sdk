@@ -354,40 +354,79 @@ async def _run_conversation(
 
     input_tokens = 0
     output_tokens = 0
-    for _ in range(MAX_STEPS):
-        kwargs: dict[str, Any] = {
-            "model": resolved_model,
-            "messages": messages,
-            "tools": tools,
-            "params": params,
-        }
-        if output_type is not None:
-            kwargs["output_type"] = output_type
-        async with ai.stream(**kwargs) as provider_stream:
-            async for event in provider_stream:
-                text = _text_delta(event)
-                if text is not None:
-                    yield {"type": "chunk", "text": text}
-        usage = _usage(provider_stream)
-        input_tokens += usage["input_tokens"]
-        output_tokens += usage["output_tokens"]
-        message = provider_stream.message
-        calls = list(message.tool_calls or [])
-        if not calls:
-            yield {
-                "type": "done",
-                "output": _final_output(provider_stream),
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                },
-            }
-            return
-        results = [await _tool_result(call, executors, parent) for call in calls]
-        messages = [*messages, message, ai.tool_message(*results)]
-    raise RuntimeError(
-        f"Vercel messages run did not reach a final response within {MAX_STEPS} steps"
-    )
+    # A schema on a turn that can still call tools stops the model from emitting
+    # those calls, or fails validation before a final answer exists. Tool turns
+    # stay unconstrained; the schema is applied only once the model has stopped
+    # calling tools (or immediately, when the config has no tools).
+    constrain_output = output_type is not None and not tools
+    open_model_span: Any = None
+    try:
+        for _ in range(MAX_STEPS):
+            model_span = start_model_span(cfg, parent)
+            open_model_span = model_span
+            try:
+                kwargs: dict[str, Any] = {
+                    "model": resolved_model,
+                    "messages": messages,
+                    "tools": [] if constrain_output else tools,
+                    "params": params,
+                }
+                if constrain_output and output_type is not None:
+                    kwargs["output_type"] = output_type
+                async with ai.stream(**kwargs) as provider_stream:
+                    async for event in provider_stream:
+                        text = _text_delta(event)
+                        if text is not None:
+                            yield {"type": "chunk", "text": text}
+                usage = _usage(provider_stream)
+                input_tokens += usage["input_tokens"]
+                output_tokens += usage["output_tokens"]
+                # This turn's counts, not the run total. The root span carries the sum.
+                finish_model_span(
+                    model_span,
+                    model_name(cfg),
+                    SpanUsage(
+                        input=usage["input_tokens"], output=usage["output_tokens"]
+                    ),
+                )
+                mark_ok(model_span)
+                model_span.end()
+                open_model_span = None
+            except asyncio.CancelledError:
+                model_span.set_attribute("launchdarkly.run.cancelled", True)
+                model_span.end()
+                open_model_span = None
+                raise
+            except Exception as exc:
+                fail_span(model_span, exc)
+                open_model_span = None
+                raise
+            message = provider_stream.message
+            calls = list(message.tool_calls or [])
+            if not calls or constrain_output:
+                if output_type is not None and tools and not constrain_output:
+                    constrain_output = True
+                    continue
+                yield {
+                    "type": "done",
+                    "output": _final_output(provider_stream),
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    },
+                }
+                return
+            results = [await _tool_result(call, executors, parent) for call in calls]
+            messages = [*messages, message, ai.tool_message(*results)]
+        raise RuntimeError(
+            f"Vercel messages run did not reach a final response within {MAX_STEPS} steps"
+        )
+    finally:
+        # A consumer that stops reading injects GeneratorExit, which neither
+        # except above sees. The chat span for the in-flight turn is still open.
+        if open_model_span is not None:
+            open_model_span.set_attribute("launchdarkly.stream.abandoned", True)
+            open_model_span.end()
 
 
 def create_vercel_messages_handler(
@@ -405,7 +444,6 @@ def create_vercel_messages_handler(
         vs = variables or {}
         span = start_root_span(cfg, vs)
         parent = parent_context_of(span)
-        model_span = start_model_span(cfg, parent)
         failed = False
         cancelled = False
         try:
@@ -430,28 +468,23 @@ def create_vercel_messages_handler(
             span_usage = SpanUsage(
                 input=usage["input_tokens"], output=usage["output_tokens"]
             )
-            response_model = model_name(cfg)
-            finish_model_span(model_span, response_model, span_usage)
-            finish_root_span(span, response_model, span_usage)
-            mark_ok(model_span)
+            finish_root_span(span, model_name(cfg), span_usage)
             mark_ok(span)
             return {"output": text, "usage": usage}
         except asyncio.CancelledError:
             # Not an Exception: a timeout or task.cancel() must still mark the run
-            # cancelled, matching the other handlers.
+            # cancelled, matching the other handlers. The in-flight chat span is
+            # marked inside _run_conversation, where that turn was opened.
             cancelled = True
             raise
         except Exception as exc:
             failed = True
-            fail_span(model_span, exc)
             fail_span(span, exc)
             raise
         finally:
             if cancelled:
-                model_span.set_attribute("launchdarkly.run.cancelled", True)
                 span.set_attribute("launchdarkly.run.cancelled", True)
             if not failed:
-                model_span.end()
                 span.end()
 
     async def stream(
@@ -464,7 +497,6 @@ def create_vercel_messages_handler(
         vs = variables or {}
         span = start_root_span(cfg, vs)
         parent = parent_context_of(span)
-        model_span = start_model_span(cfg, parent)
         completed = False
         failed = False
         cancelled = False
@@ -495,10 +527,7 @@ def create_vercel_messages_handler(
             span_usage = SpanUsage(
                 input=usage["input_tokens"], output=usage["output_tokens"]
             )
-            response_model = model_name(cfg)
-            finish_model_span(model_span, response_model, span_usage)
-            finish_root_span(span, response_model, span_usage)
-            mark_ok(model_span)
+            finish_root_span(span, model_name(cfg), span_usage)
             mark_ok(span)
             yield {"type": "done", "output": output, "usage": usage}
         except asyncio.CancelledError:
@@ -506,18 +535,14 @@ def create_vercel_messages_handler(
             raise
         except Exception as exc:
             failed = True
-            fail_span(model_span, exc)
             fail_span(span, exc)
             raise
         finally:
             if cancelled:
-                model_span.set_attribute("launchdarkly.run.cancelled", True)
                 span.set_attribute("launchdarkly.run.cancelled", True)
             elif not completed and not failed:
-                model_span.set_attribute("launchdarkly.stream.abandoned", True)
                 span.set_attribute("launchdarkly.stream.abandoned", True)
             if not failed:
-                model_span.end()
                 span.end()
 
     return create_handler(

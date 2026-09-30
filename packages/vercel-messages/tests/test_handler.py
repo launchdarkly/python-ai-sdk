@@ -376,6 +376,41 @@ class TestToolsAndOutput:
         )
 
     @pytest.mark.asyncio
+    async def test_tool_loop_records_each_turn_on_its_own_chat_span(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        config = {
+            **CONFIG,
+            "tools": {"weather": {"description": "Get weather", "parameters": {}}},
+        }
+        call = SimpleNamespace(
+            tool_call_id="tc-1", tool_name="weather", tool_args={"city": "Oakland"}
+        )
+        ai_runtime.stream.side_effect = [
+            FakeStream(text="", tool_calls=[call], input_tokens=10, output_tokens=4),
+            FakeStream(text="sunny in Oakland", input_tokens=7, output_tokens=2),
+        ]
+        first, second = MagicMock(), MagicMock()
+        with patch.object(handler_mod, "start_model_span", side_effect=[first, second]):
+            await create_vercel_messages_handler()(
+                config, "hello", {"weather": AsyncMock(return_value="sunny")}
+            )
+
+        def usage(span: MagicMock) -> dict[str, int]:
+            return {
+                call.args[0]: call.args[1]
+                for call in span.set_attribute.call_args_list
+                if call.args[0].startswith("gen_ai.usage.")
+            }
+
+        assert usage(first)["gen_ai.usage.input_tokens"] == 10
+        assert usage(first)["gen_ai.usage.output_tokens"] == 4
+        assert usage(second)["gen_ai.usage.input_tokens"] == 7
+        assert usage(second)["gen_ai.usage.output_tokens"] == 2
+        first.end.assert_called_once()
+        second.end.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_reports_a_failing_tool_back_to_the_model(
         self, ai_runtime: MagicMock
     ) -> None:
@@ -433,6 +468,40 @@ class TestToolsAndOutput:
         assert output_schema["required"] == ["answer"]
         assert output_schema["additionalProperties"] is False
         assert json.loads(result["output"]) == {"answer": "yes"}
+
+    @pytest.mark.asyncio
+    async def test_output_type_waits_until_the_model_stops_calling_tools(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+        config = {
+            **CONFIG,
+            "outputFormat": schema,
+            "tools": {"weather": {"description": "Get weather", "parameters": {}}},
+        }
+        call = SimpleNamespace(
+            tool_call_id="tc-1", tool_name="weather", tool_args={"city": "Oakland"}
+        )
+        ai_runtime.stream.side_effect = [
+            FakeStream(text="", tool_calls=[call]),
+            FakeStream(text="sunny"),
+            FakeStream(text="", output='{"answer":"yes"}'),
+        ]
+        result = await create_vercel_messages_handler()(
+            config, "question", {"weather": AsyncMock(return_value="sunny")}
+        )
+        rounds = ai_runtime.stream.call_args_list
+        assert len(rounds) == 3
+        assert "output_type" not in rounds[0].kwargs
+        assert "output_type" not in rounds[1].kwargs
+        assert rounds[1].kwargs["tools"]
+        assert "output_type" in rounds[2].kwargs
+        assert rounds[2].kwargs["tools"] == []
+        assert result["output"] == '{"answer":"yes"}'
 
     @pytest.mark.asyncio
     async def test_structured_output_types_nested_objects_and_array_items(

@@ -279,6 +279,51 @@ class TestNativeAgent:
         assert result["usage"] == {"input_tokens": 63, "output_tokens": 15}
 
     @pytest.mark.asyncio
+    async def test_opens_one_chat_span_per_model_turn(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        class Boundary:
+            def __init__(
+                self, kind: str, input_tokens: int = 0, output_tokens: int = 0
+            ) -> None:
+                self.kind = kind
+                self.usage = SimpleNamespace(
+                    input_tokens=input_tokens, output_tokens=output_tokens
+                )
+
+        ai_runtime.Agent.return_value.run.return_value = AgentStream(
+            [
+                Boundary("stream_start"),
+                TextDelta("a"),
+                Boundary("stream_end", 3, 1),
+                Boundary("stream_start"),
+                TextDelta("b"),
+                Boundary("stream_end", 4, 2),
+            ],
+            text="ab",
+            input_tokens=7,
+            output_tokens=3,
+        )
+        first, second = MagicMock(), MagicMock()
+        with patch.object(handler_mod, "start_model_span", side_effect=[first, second]):
+            result = await create_vercel_agents_handler()(CONFIG, "hello")
+
+        def usage(span: MagicMock) -> dict[str, int]:
+            return {
+                call.args[0]: call.args[1]
+                for call in span.set_attribute.call_args_list
+                if str(call.args[0]).startswith("gen_ai.usage.")
+            }
+
+        assert result["usage"] == {"input_tokens": 7, "output_tokens": 3}
+        assert usage(first)["gen_ai.usage.input_tokens"] == 3
+        assert usage(first)["gen_ai.usage.output_tokens"] == 1
+        assert usage(second)["gen_ai.usage.input_tokens"] == 4
+        assert usage(second)["gen_ai.usage.output_tokens"] == 2
+        first.end.assert_called_once()
+        second.end.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_structured_output_is_requested_and_serialized(
         self, ai_runtime: MagicMock
     ) -> None:

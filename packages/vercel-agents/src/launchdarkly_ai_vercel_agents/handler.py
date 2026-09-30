@@ -5,6 +5,7 @@ import base64
 import inspect
 import json
 from collections.abc import AsyncGenerator, Callable
+from types import SimpleNamespace
 from typing import Any
 
 import ai
@@ -326,6 +327,78 @@ def build_output_type(
     return create_model(name, __config__=ConfigDict(extra="forbid"), **fields)
 
 
+class _ChatTurns:
+    """One ``chat`` span per model turn.
+
+    ``Agent.run`` loops inferences inside a single call and brackets each one
+    with ``stream_start`` / ``stream_end``. A run that never emits those
+    boundaries — the in-memory test double — keeps the span opened up front
+    and records the run's usage on it.
+    """
+
+    def __init__(self, cfg: AiConfigRep, parent: Any) -> None:
+        self._cfg = cfg
+        self._parent = parent
+        self._open: Any = start_model_span(cfg, parent)
+        self._closed_a_turn = False
+
+    def observe(self, event: Any) -> str | None:
+        kind = getattr(event, "kind", None)
+        if kind == "stream_end":
+            if self._open is None:
+                self._open = start_model_span(self._cfg, self._parent)
+            self._close(getattr(event, "usage", None))
+            self._closed_a_turn = True
+        elif kind == "stream_start" and self._open is None:
+            self._open = start_model_span(self._cfg, self._parent)
+        return text_delta(event)
+
+    def finish(self, usage: dict[str, int]) -> None:
+        """Close a turn that never emitted ``stream_end``."""
+        if self._open is None:
+            return
+        if self._closed_a_turn:
+            self._close(None)
+            return
+        self._close(
+            SimpleNamespace(
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+            )
+        )
+
+    def cancel(self) -> None:
+        if self._open is None:
+            return
+        self._open.set_attribute("launchdarkly.run.cancelled", True)
+        self._open.end()
+        self._open = None
+
+    def fail(self, exc: BaseException) -> None:
+        if self._open is None:
+            return
+        fail_span(self._open, exc)
+        self._open = None
+
+    def abandon(self) -> None:
+        if self._open is None:
+            return
+        self._open.set_attribute("launchdarkly.stream.abandoned", True)
+        self._open.end()
+        self._open = None
+
+    def _close(self, usage: Any) -> None:
+        incoming, outgoing = _usage_values(usage)
+        finish_model_span(
+            self._open,
+            model_name(self._cfg),
+            SpanUsage(input=incoming, output=outgoing),
+        )
+        mark_ok(self._open)
+        self._open.end()
+        self._open = None
+
+
 def text_delta(event: Any) -> str | None:
     if getattr(event, "kind", None) == "text_delta":
         return str(getattr(event, "chunk", ""))
@@ -351,7 +424,7 @@ def create_vercel_agents_handler(
         vs = variables or {}
         span = start_root_span(cfg, vs)
         parent = parent_context_of(span)
-        model_span = start_model_span(cfg, parent)
+        turns = _ChatTurns(cfg, parent)
         failed = False
         cancelled = False
         try:
@@ -366,35 +439,32 @@ def create_vercel_agents_handler(
             if cfg.get("outputFormat"):
                 run_kwargs["output_type"] = build_output_type(cfg["outputFormat"])
             async with agent.run(**run_kwargs) as provider_stream:
-                async for _ in provider_stream:
-                    pass
+                async for event in provider_stream:
+                    turns.observe(event)
             usage = usage_of(provider_stream)
             output = output_of(provider_stream)
+            turns.finish(usage)
             span_usage = SpanUsage(
                 input=usage["input_tokens"], output=usage["output_tokens"]
             )
-            response_model = model_name(cfg)
-            finish_model_span(model_span, response_model, span_usage)
-            finish_root_span(span, response_model, span_usage)
-            mark_ok(model_span)
+            finish_root_span(span, model_name(cfg), span_usage)
             mark_ok(span)
             return {"output": output, "usage": usage}
         except asyncio.CancelledError:
             # Not an Exception: a timeout or task.cancel() must still mark the run
             # cancelled, matching the other handlers and the native graph path.
             cancelled = True
+            turns.cancel()
             raise
         except Exception as exc:
             failed = True
-            fail_span(model_span, exc)
+            turns.fail(exc)
             fail_span(span, exc)
             raise
         finally:
             if cancelled:
-                model_span.set_attribute("launchdarkly.run.cancelled", True)
                 span.set_attribute("launchdarkly.run.cancelled", True)
             if not failed:
-                model_span.end()
                 span.end()
 
     async def stream(
@@ -407,7 +477,7 @@ def create_vercel_agents_handler(
         vs = variables or {}
         span = start_root_span(cfg, vs)
         parent = parent_context_of(span)
-        model_span = start_model_span(cfg, parent)
+        turns = _ChatTurns(cfg, parent)
         completed = False
         failed = False
         cancelled = False
@@ -422,18 +492,16 @@ def create_vercel_agents_handler(
                 params=build_request_params(cfg),
             ) as provider_stream:
                 async for event in provider_stream:
-                    text = text_delta(event)
+                    text = turns.observe(event)
                     if text is not None:
                         yield {"type": "chunk", "text": text}
             completed = True
             usage = usage_of(provider_stream)
+            turns.finish(usage)
             span_usage = SpanUsage(
                 input=usage["input_tokens"], output=usage["output_tokens"]
             )
-            response_model = model_name(cfg)
-            finish_model_span(model_span, response_model, span_usage)
-            finish_root_span(span, response_model, span_usage)
-            mark_ok(model_span)
+            finish_root_span(span, model_name(cfg), span_usage)
             mark_ok(span)
             yield {
                 "type": "done",
@@ -442,21 +510,20 @@ def create_vercel_agents_handler(
             }
         except asyncio.CancelledError:
             cancelled = True
+            turns.cancel()
             raise
         except Exception as exc:
             failed = True
-            fail_span(model_span, exc)
+            turns.fail(exc)
             fail_span(span, exc)
             raise
         finally:
             if cancelled:
-                model_span.set_attribute("launchdarkly.run.cancelled", True)
                 span.set_attribute("launchdarkly.run.cancelled", True)
             elif not completed and not failed:
-                model_span.set_attribute("launchdarkly.stream.abandoned", True)
+                turns.abandon()
                 span.set_attribute("launchdarkly.stream.abandoned", True)
             if not failed:
-                model_span.end()
                 span.end()
 
     return create_handler(("*", "agent"), run, stream, capture_content=capture_content)

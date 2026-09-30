@@ -355,6 +355,12 @@ class TestInvocation:
         path = path_values[-1].split("->")
         assert path == ["root", "leaf"]
         assert len(path) == len(set(path))
+        attributes = {
+            call.args[0]: call.args[1] for call in span.set_attribute.call_args_list
+        }
+        assert attributes["gen_ai.usage.input_tokens"] == 14
+        assert attributes["gen_ai.usage.output_tokens"] == 5
+        assert attributes["gen_ai.usage.total_tokens"] == 19
 
 
 class TestTelemetryAndCleanup:

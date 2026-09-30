@@ -191,6 +191,9 @@ def to_vercel_agents(
 
             total = input_tokens + output_tokens
             span.set_attribute("launchdarkly.graph.path", "->".join(path))
+            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+            span.set_attribute("gen_ai.usage.total_tokens", total)
             span.set_status(StatusCode.OK)
             if context is not None:
                 _track(
