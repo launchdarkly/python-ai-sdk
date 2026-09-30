@@ -93,10 +93,12 @@ def _select_handler(
     """Pick the handler in ``handlers`` that serves ``provider``.
 
     A single handler always runs, whatever it declares. With more than one
-    handler, only entries whose ``provides_for`` names ``provider`` are
-    candidates. ``mode`` is a judge's resolved mode (generation has none); an
-    exact ``(provider, mode)`` match wins over any other candidate for that
-    provider.
+    handler, an entry whose ``provides_for`` names ``provider`` exactly is a
+    candidate. A wildcard entry tagged ``("*", mode)`` is a candidate only
+    when no entry names ``provider`` exactly; this mirrors the fallback
+    ``config()`` and ``graph()`` give a multi-provider adapter. ``mode`` is a
+    judge's resolved mode (generation has none); an exact ``(provider,
+    mode)`` match wins over any other candidate for that provider.
 
     Raises :class:`EvaluationsError` when no candidate serves ``provider``,
     or when more than one does and ``mode`` cannot break the tie.
@@ -104,10 +106,15 @@ def _select_handler(
     if len(handlers) == 1:
         return handlers[0]
 
-    candidates = [
+    exact_provider = [
         handler
         for handler in handlers
         if (tag := _provides_for(handler)) is not None and tag[0] == provider
+    ]
+    candidates = exact_provider or [
+        handler
+        for handler in handlers
+        if (tag := _provides_for(handler)) is not None and tag[0] == "*"
     ]
     if mode is not None:
         exact = [
