@@ -588,6 +588,84 @@ class TestToClaudeAgentsAnthropicSpecific:
         assert all(evt != "$ld:ai:graph:path" for evt, _ in track_calls)
 
     @pytest.mark.asyncio
+    async def test_graph_span_carries_config_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The graph span must identify the config so Monitoring can link the trace."""
+        import launchdarkly_ai_claude_agents.native_graph as ng_mod
+
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        mock_span = MagicMock()
+        mock_trace = MagicMock()
+        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(ng_mod, "get_client", return_value=MagicMock()):
+                with patch.object(ng_mod, "trace", mock_trace):
+                    with patch.object(ng_mod, "_HAS_OTEL", True):
+                        await to_claude_agents(
+                            _make_def_promise(graph_def),
+                            opts={"context": ctx},
+                        ).invoke("hi")
+
+        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "test-graph"
+        assert attrs["launchdarkly.graph.key"] == "test-graph"
+        assert attrs["launchdarkly.run.id"]
+        assert "launchdarkly.variation.key" in attrs
+        assert attrs["context.contextKeys.user"] == "u1"
+
+        events = {c[0][0]: c[0][1] for c in mock_span.add_event.call_args_list}
+        assert events["feature_flag"] == {
+            "feature_flag.key": "test-graph",
+            "feature_flag.provider.name": "LaunchDarkly",
+            "feature_flag.set.id": "env-123",
+            "feature_flag.context.id": "u1",
+            "feature_flag.contextKeys": '{"user":"u1"}',
+        }
+
+    @pytest.mark.asyncio
+    async def test_tracking_events_carry_the_environment_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        payloads: list[Any] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: payloads.append(data)
+        )
+
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "get_client", return_value=mock_ld_client):
+                await to_claude_agents(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+
+        assert payloads
+        for data in payloads:
+            assert data["environmentId"] == "env-123"
+
+    @pytest.mark.asyncio
     async def test_emits_invocation_failure_on_error(self) -> None:
         track_calls: list[str] = []
         mock_ld_client = MagicMock()

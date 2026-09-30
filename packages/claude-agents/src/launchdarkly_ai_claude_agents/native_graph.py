@@ -17,7 +17,9 @@ from launchdarkly_ai_server import (
     GraphNode,
     NativeTool,
     get_client,
+    make_graph_track_data,
     make_track_data,
+    set_ld_span_attributes,
     to_ld_context,
 )
 
@@ -245,6 +247,14 @@ def to_claude_agents(
 
         start_time = time.monotonic()
         run_id = str(uuid.uuid4())
+        if span:
+            set_ld_span_attributes(
+                span,
+                {
+                    "__ld": make_graph_track_data(def_obj.key, run_id),
+                    "ldContext": raw_ld_context,
+                },
+            )
         path: list[str] = []
         total_usage = {"input": 0, "output": 0, "total": 0}
         subagent_tool_ctx: dict[str, Any] = {}

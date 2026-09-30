@@ -17,8 +17,10 @@ from launchdarkly_ai_server import (
     NativeTool,
     compose_history,
     get_client,
+    make_graph_track_data,
     make_track_data,
     parse_template,
+    set_ld_span_attributes,
     to_ld_context,
 )
 
@@ -176,6 +178,14 @@ def to_lang_graph(
 
         start_time = time.monotonic()
         run_id = str(uuid.uuid4())
+        if span:
+            set_ld_span_attributes(
+                span,
+                {
+                    "__ld": make_graph_track_data(def_obj.key, run_id),
+                    "ldContext": raw_ld_context,
+                },
+            )
         path: list[str] = []
         total_usage = {"input": 0, "output": 0, "total": 0}
         edges_from = def_obj.edges_from
