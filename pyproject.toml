@@ -24,6 +24,7 @@ dev = [
   "pre-commit>=4.6.0",
   "brotlicffi>=1.0",
   "langchain-aws>=1",
+  "ai[openai]>=0.7",
 ]
 
 [tool.pytest.ini_options]
@@ -66,4 +67,6 @@ known-first-party = [
   "launchdarkly_ai_langchain_messages",
   "launchdarkly_ai_openai_agents",
   "launchdarkly_ai_openai_messages",
+  "launchdarkly_ai_vercel_agents",
+  "launchdarkly_ai_vercel_messages",
 ]

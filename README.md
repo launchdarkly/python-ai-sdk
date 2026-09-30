@@ -85,6 +85,8 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-claude-agents`](packages/claude-agents/README.md) | Anthropic | `agent` | Claude Agent SDK — agentic loop with MCP tool support |
 | [`launchdarkly-ai-langchain-messages`](packages/langchain-messages/README.md) | `*` (any) | `messages` | Any `BaseChatModel` via LangChain `bind_tools` loop |
 | [`launchdarkly-ai-langchain-agents`](packages/langchain-agents/README.md) | `*` (any) | `agent` | LangGraph `StateGraph` — managed ReAct loop |
+| [`launchdarkly-ai-vercel-messages`](packages/vercel-messages/README.md) | `*` (any) | `messages` | Vercel AI SDK with AI Gateway routing |
+| [`launchdarkly-ai-vercel-agents`](packages/vercel-agents/README.md) | `*` (any) | `agent` | Native Vercel `ai.Agent` loop and graph adapter |
 
 ## Quick Start
 
@@ -149,6 +151,8 @@ asyncio.run(main())
 | `claude_agents` | `launchdarkly-ai-claude-agents` | `claude-agent-sdk` | Claude Agent SDK (MCP) |
 | `langchain_messages` | `launchdarkly-ai-langchain-messages` | `langchain-core` | LangChain `bind_tools` loop |
 | `langchain_agents` | `launchdarkly-ai-langchain-agents` | `langgraph` | LangGraph `StateGraph` |
+| `vercel_messages` | `launchdarkly-ai-vercel-messages` | `ai` | Vercel AI SDK stream runtime |
+| `vercel_agents` | `launchdarkly-ai-vercel-agents` | `ai` | Native Vercel `ai.Agent` |
 
 ---
 
@@ -597,6 +601,10 @@ uv run python main.py [example] [flag-key] [user-input]
 | `graph-history` | `uv run python main.py graph-history` | `graph().invoke()` with multimodal `history` forwarded to the root node |
 | `openai-only` | `uv run python main.py openai-only` | `config()` with a custom `Registry` restricted to OpenAI handlers |
 | `streaming` | `uv run python main.py streaming` | `config().stream()` — token-by-token output |
+| `vercel-agents` | `uv run python main.py vercel-agents` | Native Vercel `ai.Agent` handler via AI Gateway |
+| `vercel-messages` | `uv run python main.py vercel-messages` | Vercel AI SDK messages handler via AI Gateway |
+| `vercel-direct` | `uv run python main.py vercel-direct` | Vercel messages handler with a constructed OpenAI model (no Gateway) |
+| `native-graph-vercel` | `uv run python main.py native-graph-vercel` | Framework-native Vercel `ai.Agent` graph runner |
 
 **Examples:**
 
