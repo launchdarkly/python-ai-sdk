@@ -597,9 +597,11 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
     Builds the standard tracking payload for a graph node event.
     Shared by all native graph adapters (openai-agents, claude-agents, langchain-agents).
     """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
     meta = node.meta if isinstance(node.meta, dict) else {}
     config = node.config if isinstance(node.config, dict) else {}
-    return {
+    track_data: dict[str, Any] = {
         "runId": run_id,
         "configKey": node.key,
         "variationKey": meta.get("variationKey", ""),
@@ -609,6 +611,10 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
         **model_stamps_from_meta(meta),
         "graphKey": graph_key,
     }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
 
 
 def _usable_context_key(value: Any) -> str | None:

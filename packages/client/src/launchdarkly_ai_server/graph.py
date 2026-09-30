@@ -109,7 +109,7 @@ async def _build_graph(
 ) -> tuple[GraphDefinition, TrackData, Callable[..., Any]]:
     from .judges import run_judges
     from .lifecycle import extract_variation, get_client
-    from .tracking import execute_and_track
+    from .tracking import _try_get_environment_id, execute_and_track
 
     result = await _fetch_graph_variation(key, context)
     # Convert once so all inner track() calls use an ldclient.Context object.
@@ -128,6 +128,9 @@ async def _build_graph(
         **model_stamps_from_meta(meta),
         "graphKey": key,
     }
+    _environment_id = _try_get_environment_id()
+    if _environment_id:
+        graph_track_data["environmentId"] = _environment_id
 
     if not enabled or not topology:
         return (
