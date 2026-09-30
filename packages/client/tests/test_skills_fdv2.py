@@ -18,13 +18,16 @@ Two layers, deliberately:
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
 import socket
 import threading
 import time
 from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
@@ -37,10 +40,12 @@ from launchdarkly_ai_server import (
     get_skill,
     get_skill_result,
     init_client,
+    skills_core,
     skills_fdv2,
     watch_skills,
     write_skills,
 )
+from launchdarkly_ai_server import skills as skills_module
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
     DEFAULT_BASE_URI,
@@ -375,6 +380,30 @@ def wait_until(predicate: Any, timeout: float = 5.0) -> bool:
     return predicate()
 
 
+def _assigned_literal(module: Any, name: str) -> Any:
+    """The literal *name* is assigned in *module*'s own source, or ``None``.
+
+    Read from the syntax rather than from the attribute, because the attribute
+    cannot answer the question being asked: a module that bound *name* to some
+    other module's constant would expose an identical value.
+    """
+    tree = ast.parse(inspect.getsource(module))
+    for node in tree.body:
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, ast.AnnAssign)
+            else []
+        )
+        named = any(
+            isinstance(target, ast.Name) and target.id == name for target in targets
+        )
+        if named and isinstance(node.value, ast.Constant):
+            return node.value.value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Identifying skill objects, and ignoring everything else
 # ---------------------------------------------------------------------------
@@ -395,6 +424,27 @@ class TestObjectIdentification:
         assert FDV2_PAYLOAD_KIND == "agent-skill"
         assert FDV2_OBJECT_KIND == "skill"
         assert FDV2_PAYLOAD_KIND != FDV2_OBJECT_KIND
+
+    def test_the_wire_object_kind_is_not_the_interface_kind_renamed(self) -> None:
+        """
+        Three related constants, and no one of them is an alias of another: the
+        wire payload kind and the wire object kind above, plus the kind the
+        accessors ask a store for. Only the first two are LaunchDarkly's.
+
+        ``FDV2_OBJECT_KIND`` and ``SKILL_OBJECT_KIND`` hold the same string
+        today, which is exactly why this needs asserting rather than comparing:
+        equal values cannot tell an intentional coincidence from one module
+        re-exporting the other's constant, and identity cannot either, since
+        CPython interns both. What fixes it is the definition — each module
+        states its own value, so renaming LaunchDarkly's wire kind cannot drag
+        this SDK's interface kind along with it, or the reverse.
+        """
+        # Pinned so that the day the coincidence ends, this test is what a
+        # reader lands on rather than a puzzling failure somewhere else.
+        assert FDV2_OBJECT_KIND == SKILL_OBJECT_KIND
+        assert _assigned_literal(skills_fdv2, "FDV2_OBJECT_KIND") == "skill"
+        assert _assigned_literal(skills_fdv2, "FDV2_PAYLOAD_KIND") == "agent-skill"
+        assert _assigned_literal(skills_core, "SKILL_OBJECT_KIND") == "skill"
 
     def test_the_kind_is_the_bare_category_name(self) -> None:
         """
@@ -3494,6 +3544,153 @@ class TestLifecycle:
         store = FDv2SkillStore(SDK_KEY)
         assert store.get_object(SKILL_OBJECT_KIND, "anything") is None
         assert store.all_objects(SKILL_OBJECT_KIND) == {}
+
+
+# ---------------------------------------------------------------------------
+# Layering and dependencies
+# ---------------------------------------------------------------------------
+
+
+def _module_imports(module: Any) -> set[str]:
+    """Every top-level package or module *module* imports, by root name."""
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
+        if isinstance(node, ast.Import):
+            found.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            # A relative import is a sibling module in this package, and is
+            # spelled with its leading dot so the two kinds cannot be confused.
+            prefix = "." if node.level else ""
+            found.add(f"{prefix}{node.module.split('.')[0]}")
+    return found
+
+
+class TestTransportLayering:
+    """The transport sits below the store interface and stays there.
+
+    It is the only module in the feature that opens a socket, and it earns that
+    by depending on almost nothing: the standard library, plus the two modules
+    holding the interface kind and the version predicate. Nothing in the feature
+    depends on it in turn, so the layering cannot invert — a module above the
+    interface must not be able to tell which store produced an object.
+    """
+
+    def test_it_adds_no_dependency(self) -> None:
+        """Standard library only, in a package whose one runtime dependency is
+        the OpenTelemetry API.
+
+        Asserted as an allowlist rather than by denying a list of package names:
+        a denylist cannot catch the dependency nobody thought of, which is the
+        only kind that gets added.
+        """
+        stdlib = {
+            "__future__",
+            "collections",
+            "dataclasses",
+            "json",
+            "logging",
+            "math",
+            "random",
+            "re",
+            "socket",
+            "threading",
+            "typing",
+            "urllib",
+        }
+        within_the_feature = {".skills_core", ".types_validation"}
+
+        assert _module_imports(skills_fdv2) == stdlib | within_the_feature
+
+    def test_nothing_in_the_feature_imports_it(self) -> None:
+        """Only the package's own entry point names it, to re-export two types.
+
+        That re-export is the published surface rather than a dependency: it is
+        what makes ``FDv2SkillStore`` reachable without a sub-path import. A
+        *feature* module importing the transport would be the layering
+        inverting, and the accessors would start being able to tell which store
+        answered them.
+        """
+        feature = [
+            "skills.py",
+            "skills_core.py",
+            "skills_fs.py",
+            "skills_watch.py",
+            "safe_fs.py",
+            "types.py",
+            "types_validation.py",
+            "lifecycle.py",
+        ]
+        source_dir = Path(inspect.getfile(skills_fdv2)).parent
+        importers = [
+            name
+            for name in feature
+            if "skills_fdv2" in (source_dir / name).read_text(encoding="utf-8")
+        ]
+
+        assert importers == []
+        # The positive control: the entry point does name it, so an empty result
+        # above cannot be a misspelt filename list finding nothing anywhere.
+        assert "skills_fdv2" in (source_dir / "__init__.py").read_text(encoding="utf-8")
+
+
+class TestTransportEmitsNoTelemetry:
+    """The three skills signals belong to verification and materialization.
+
+    The transport delivers bytes and counts what it saw; it decides nothing that
+    a signal reports. Its own observability is ``diagnostics`` and ``failed``,
+    which are assertable facts rather than telemetry a customer may have turned
+    off.
+    """
+
+    def test_a_full_delivery_cycle_records_nothing(
+        self, endpoint: Any, recording_emitter: Any
+    ) -> None:
+        skills_module._set_emitter_for_testing(recording_emitter)
+        # One of everything the transport can see in a payload: a skill, a
+        # revocation, an object of a kind it did not ask for, and a skill with no
+        # ``contentHash`` — the last two being the cases it counts and warns
+        # about, which are the likeliest places for a signal to be reached for.
+        endpoint.queue_poll(
+            full_payload(
+                ("put-object", put_skill()),
+                ("put-object", put_skill("to-revoke", object_version=1)),
+                ("put-object", put_skill("hashless", object_version=1, omit_hash=True)),
+                ("put-object", put_flag()),
+                ("delete-object", delete_skill("to-revoke", object_version=1)),
+            )
+        )
+        store = poll_store(endpoint)
+        try:
+            store.start()
+            assert store.wait_for_skills(timeout=5)
+            assert wait_until(lambda: store.diagnostics.hashless_objects >= 1)
+        finally:
+            store.close()
+
+        assert store.diagnostics.objects_revoked == 1
+        assert store.diagnostics.objects_ignored == 1
+        assert recording_emitter.records == []
+
+    def test_a_failed_delivery_records_nothing_either(
+        self, recording_emitter: Any
+    ) -> None:
+        """Giving up is reported on ``failed``, not as a signal.
+
+        The failure path is the other place a signal would plausibly be added,
+        and it is reached without any payload ever committing — so a test of the
+        success path alone would not cover it.
+        """
+        skills_module._set_emitter_for_testing(recording_emitter)
+        store = stream_store(
+            max_consecutive_failures=1, _requester=_ScriptedRequester()
+        )
+        try:
+            store.start()
+            assert wait_until(lambda: store.failed is not None)
+        finally:
+            store.close()
+
+        assert recording_emitter.records == []
 
 
 # ---------------------------------------------------------------------------

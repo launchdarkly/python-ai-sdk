@@ -582,6 +582,50 @@ class TestManifest:
         assert manifest["futureTopLevelField"] == {"keep": True}
         assert manifest["entries"]["a/SKILL.md"]["futureEntryField"] == "keep-me"
 
+    async def test_serialization_is_byte_identical_across_languages(
+        self, root: Path
+    ) -> None:
+        """Two-space indent, keys sorted at every level, no trailing newline,
+        and non-ASCII escaped as ``\\uXXXX``.
+
+        None of the four is a correctness requirement on its own — either form
+        parses. They exist so a repository where two LaunchDarkly AI SDKs
+        reconcile the same root does not see the file's bytes flip on every run
+        depending on which language wrote last.
+
+        Driven through a preserved unknown field, because every field the SDK
+        writes is ASCII by construction: keys match the key grammar, ``sha256``
+        is hex, ``version`` is an integer, and ``writtenAt`` is a timestamp. The
+        escaping rule is reachable only along the forward-compatibility path, so
+        a test that wrote SDK-owned fields alone could not detect a violation.
+        """
+        _write_manifest(
+            root,
+            {
+                "manifestVersion": 1,
+                # A two-byte character and one outside the basic multilingual
+                # plane, which has to come back as a surrogate pair.
+                "futureNote": "café \U0001f600",
+                "entries": {},
+            },
+        )
+
+        await write_skills([_skill("a")], root)
+
+        raw = _manifest_path(root).read_bytes()
+        assert not raw.endswith(b"\n")
+        assert all(byte < 128 for byte in raw), "non-ASCII escaped, not raw UTF-8"
+        assert b'"caf\\u00e9 \\ud83d\\ude00"' in raw
+        assert b'\n  "entries"' in raw, "two-space indent"
+        # Sorted at every level, including inside an entry.
+        document = json.loads(raw)
+        assert list(document) == sorted(document)
+        assert list(document["entries"]["a/SKILL.md"]) == sorted(
+            document["entries"]["a/SKILL.md"]
+        )
+        # And the field itself survived the round trip that carried it.
+        assert document["futureNote"] == "café \U0001f600"
+
 
 class TestReconcileSemantics:
     """The reconcile state table."""
@@ -790,6 +834,39 @@ class TestRootHandling:
     async def test_accepts_string_root(self, root: Path) -> None:
         report = await write_skills([_skill("a")], str(root))
         assert report.ok is True
+
+
+class TestTimeoutArgument:
+    """A negative timeout is a caller mistake, not a value to clamp."""
+
+    @pytest.mark.parametrize("timeout", [-1.0, -0.001])
+    async def test_a_negative_timeout_raises(self, root: Path, timeout: float) -> None:
+        """Raises the same class an unusable root does.
+
+        Clamping to zero would silently turn the mistake into "do not retrieve
+        anything", which is a working reconcile that quietly writes nothing —
+        the least visible possible reading of a typo.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            await write_skills([_skill("a")], root, timeout=timeout)
+
+        assert "timeout" in str(excinfo.value)
+        # The raise precedes any filesystem work, as the bare-string guard does.
+        assert list(root.iterdir()) == []
+
+    async def test_a_zero_timeout_is_valid(self, root: Path) -> None:
+        """Positive control, and the boundary the guard must not swallow.
+
+        Zero is the exhausted case: a legal value meaning "there is no time
+        left", reported as an ``error`` action on a report the caller gets back.
+        A guard written as ``<= 0`` would reject it along with the negatives and
+        turn an exhausted deadline into a raise.
+        """
+        report = await write_skills([_skill("a")], root, timeout=0.0)
+
+        assert report.ok is False
+        assert _actions_by_key(report)["a"].action == "error"
+        assert any("timeout" in m for m in _error_messages(report))
 
 
 class TestSkillsArgumentErrors:
@@ -2382,6 +2459,15 @@ CORRUPT_MANIFESTS: list[tuple[str, Any]] = [
         "version_negative_live_entries",
         {"manifestVersion": -1, "entries": _live_entries()},
     ),
+    # A bool is not an integer here, and Python is where that needs saying:
+    # ``isinstance(True, int)`` is true and ``True == 1``, so a range check
+    # alone reads ``manifestVersion: true`` as version 1 and authorizes every
+    # destructive action against the entries beside it. The explicit bool guard
+    # is the only thing refusing this document, which is why it gets a case.
+    (
+        "version_bool_live_entries",
+        {"manifestVersion": True, "entries": _live_entries()},
+    ),
 ]
 
 LIVE_ENTRY_MANIFESTS: list[tuple[str, Any]] = [
@@ -3128,6 +3214,47 @@ class TestCrashMidReconcileRecovery:
         assert spy.calls == []
         assert target.read_text(encoding="utf-8") == SKILL_BODY
         assert "a/SKILL.md" not in _read_manifest(root)["entries"]
+
+    async def test_a_byte_identical_file_under_a_mismatched_entry_is_re_keyed(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Where adoption and the mismatched-key refusal meet, adoption wins.
+
+        The mismatched-key rule exists to stop a manifest entry from
+        *authorizing destruction*. Adoption destroys nothing: byte equality with
+        the resolved content is still the entry condition, so the file holds
+        LaunchDarkly's content whatever the entry claimed, and rewriting the
+        entry to the key that the path and the verified bytes agree on replaces
+        a wrong claim with the truth. Refusing instead would leave the skill
+        stuck behind a manifest inconsistency the customer cannot see.
+
+        The differing-bytes half of the pair — which is what proves the rule is
+        byte equality and not a mismatched entry simply being ignored — is
+        ``test_manifest_entry_with_mismatched_key_does_not_authorize``.
+        """
+        target = root / "a" / "SKILL.md"
+        target.parent.mkdir()
+        target.write_text(SKILL_BODY, encoding="utf-8")
+        _write_manifest(
+            root,
+            {
+                "manifestVersion": 1,
+                "entries": {"a/SKILL.md": _entry("different-key", 1, SKILL_BODY)},
+            },
+        )
+        spy = _ReplaceSpy().install(monkeypatch)
+
+        report = await write_skills([_skill("a")], root)
+
+        assert report.ok is True, _error_messages(report)
+        assert _actions_by_key(report)["a"].action == "skipped_current"
+        # Not rewritten: adoption is a manifest edit.
+        assert spy.calls == []
+        assert target.read_text(encoding="utf-8") == SKILL_BODY
+        # And the entry now says what the path and the bytes already agreed on.
+        entries = _read_manifest(root)["entries"]
+        assert entries["a/SKILL.md"]["key"] == "a"
+        assert [e["key"] for e in entries.values()] == ["a"]
 
 
 # ---------------------------------------------------------------------------
