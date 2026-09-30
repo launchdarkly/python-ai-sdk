@@ -2941,6 +2941,82 @@ async def test_explicit_generation_overrides_the_fetched_variation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetched_variation_mode_disambiguates_same_provider_generation_handlers() -> (
+    None
+):
+    """A generation call built from ``generation=`` alone has no mode, so two
+    handlers for the same provider in different modes cannot be told apart.
+    A fetched AI Config variation carries a real mode, so it can break that
+    tie without the caller passing ``generation`` at all.
+    """
+    transport = SequencedTransport(
+        fetched_run_responses(config_variation_page(mode="agent"))
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+    chosen: list[str] = []
+
+    async def agent_handler(*args: object) -> dict[str, Any]:
+        chosen.append("agent")
+        return {"output": "generated"}
+
+    async def messages_handler(*args: object) -> dict[str, Any]:
+        chosen.append("messages")
+        return {"output": "generated"}
+
+    result = await evals.run(
+        project_key="proj",
+        key="eval-key",
+        dataset="golden",
+        handlers=[
+            create_handler(("OpenAI", "agent"), agent_handler),
+            create_handler(("OpenAI", "messages"), messages_handler),
+        ],
+        ai_config=AIConfig(key="support-agent", variation="control"),
+    )
+
+    assert result.passed is True
+    assert chosen == ["agent"]
+
+
+@pytest.mark.asyncio
+async def test_fetched_variation_without_a_mode_still_fails_ambiguous_handlers_eagerly() -> (
+    None
+):
+    """A variation response with no ``mode`` field leaves generation exactly
+    as unresolved as a hand-built ``generation=``, so the same ambiguity
+    error still fires before any network request the run would otherwise
+    make.
+    """
+    transport = SequencedTransport(
+        [response(200, config_variation_page()), response(200, MODEL_CONFIG)]
+    )
+    evals = init_evaluations(api_token="token", transport=transport)
+
+    async def agent_handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    async def messages_handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(
+        EvaluationsError,
+        match=r"2 handlers registered for provider 'OpenAI'",
+    ):
+        await evals.run(
+            project_key="proj",
+            key="eval-key",
+            dataset="golden",
+            handlers=[
+                create_handler(("OpenAI", "agent"), agent_handler),
+                create_handler(("OpenAI", "messages"), messages_handler),
+            ],
+            ai_config=AIConfig(key="support-agent", variation="control"),
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
+
+
+@pytest.mark.asyncio
 async def test_variation_tools_without_implementations_fail_before_mutating_requests() -> (
     None
 ):
@@ -3171,3 +3247,35 @@ def test_ai_config_variation_from_api_layers_the_model_config() -> None:
     unlinked = AIConfigVariation.from_api(latest)
     assert "provider" not in unlinked.generation
     assert unlinked.generation["parameters"] == {"temperature": 0.7}
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "expected_mode"),
+    [
+        ("agent", "agent"),
+        ("messages", "messages"),
+        ("something-else", "messages"),
+    ],
+)
+def test_ai_config_variation_from_api_reads_and_normalizes_mode(
+    raw_mode: str, expected_mode: str
+) -> None:
+    from launchdarkly_ai_server.evaluations.types import AIConfigVariation
+
+    latest = config_variation_page(mode=raw_mode)["items"][1]
+
+    variation = AIConfigVariation.from_api(latest, MODEL_CONFIG)
+
+    assert variation.generation["mode"] == expected_mode
+
+
+def test_ai_config_variation_from_api_leaves_mode_unset_when_absent() -> None:
+    """No mode in the response is exactly today's behavior: generation carries
+    no mode key at all, so handler selection falls back to provider only."""
+    from launchdarkly_ai_server.evaluations.types import AIConfigVariation
+
+    latest = config_variation_page()["items"][1]
+
+    variation = AIConfigVariation.from_api(latest, MODEL_CONFIG)
+
+    assert "mode" not in variation.generation
