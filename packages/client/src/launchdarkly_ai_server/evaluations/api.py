@@ -133,7 +133,15 @@ class LDApiClient:
         path: str,
         body: Any = None,
         params: dict[str, Any] | None = None,
+        *,
+        idempotent: bool = False,
     ) -> Any:
+        """Send one request, retrying where a replay cannot duplicate work.
+
+        ``idempotent`` marks a non-GET request the server applies at most once
+        per payload, so it may be replayed after a 5xx or transport failure.
+        """
+        retry_safe = idempotent or method.upper() in RETRY_SAFE_METHODS
         headers = {
             "Authorization": self.api_token,
             "Accept": "application/json",
@@ -152,10 +160,7 @@ class LDApiClient:
                     method, self.url_for(path, params), headers, payload, self._timeout
                 )
             except (TimeoutError, urllib.error.URLError) as error:
-                if (
-                    method.upper() not in RETRY_SAFE_METHODS
-                    or attempt >= self._max_retries
-                ):
+                if not retry_safe or attempt >= self._max_retries:
                     raise EvaluationsError(
                         f"LaunchDarkly API {method} {path} failed after retries: {error}"
                     ) from error
@@ -165,7 +170,7 @@ class LDApiClient:
             # A 429 is rejected before the server acts on it, so it is safe to
             # replay for any method.
             retryable = response.status == 429 or (
-                response.status >= 500 and method.upper() in RETRY_SAFE_METHODS
+                response.status >= 500 and retry_safe
             )
             if retryable and attempt < self._max_retries:
                 self._sleep(self._retry_delay(attempt, response))
@@ -190,5 +195,5 @@ class LDApiClient:
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self.request("GET", path, params=params)
 
-    def post(self, path: str, body: Any = None) -> Any:
-        return self.request("POST", path, body=body)
+    def post(self, path: str, body: Any = None, *, idempotent: bool = False) -> Any:
+        return self.request("POST", path, body=body, idempotent=idempotent)

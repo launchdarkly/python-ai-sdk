@@ -330,6 +330,57 @@ def test_rate_limited_post_is_retried() -> None:
     assert len(transport.requests) == 2
 
 
+def test_idempotent_post_is_retried_after_a_server_error() -> None:
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=503, body='{"message": "unavailable"}'),
+            HttpResponse(status=200, body='{"ok": true}'),
+        ]
+    )
+    client = LDApiClient(
+        api_token="api-token",
+        transport=transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.post(
+        "runs/run-id/dataset-rows", body={"rows": []}, idempotent=True
+    ) == {"ok": True}
+    assert len(transport.requests) == 2
+
+
+def test_idempotent_post_is_replayed_after_a_transport_failure() -> None:
+    attempts: list[str] = []
+
+    def flaky_transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        attempts.append(method)
+        if len(attempts) == 1:
+            raise TimeoutError("timed out")
+        return HttpResponse(status=200, body="")
+
+    client = LDApiClient(
+        api_token="api-token",
+        transport=flaky_transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert (
+        client.post("runs/run-id/dataset-rows", body={"rows": []}, idempotent=True)
+        is None
+    )
+    assert attempts == ["POST", "POST"]
+
+
 def test_forbidden_response_is_not_retried() -> None:
     transport = RecordingTransport(
         [HttpResponse(status=403, body='{"message": "forbidden"}')]
