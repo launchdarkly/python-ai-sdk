@@ -230,6 +230,35 @@ async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
     return _client
 
 
+def _release_otel_globals() -> None:
+    """
+    Releases the process-global tracer provider that ``_setup_telemetry``
+    installed, so a later ``init_client`` can install its own.
+
+    ``trace.set_tracer_provider`` is guarded by a ``Once``: a second call logs
+    "Overriding of current TracerProvider is not allowed" and keeps the provider
+    already in place. Without this, an init/shutdown/init cycle would leave every
+    span routed to the provider that was already shut down, and export nothing.
+
+    opentelemetry-python exposes no public API to unset it, so this reaches for
+    the module globals — both the slot and the ``Once`` that guards it, since
+    clearing the slot alone leaves the guard tripped and the next set a no-op.
+    Only called when we actually installed a provider, so a process where
+    telemetry never started keeps whatever another library registered.
+
+    The global text map propagator needs no equivalent: ``set_global_textmap``
+    is a plain assignment with no ``Once``, so the next setup overwrites it.
+    """
+    try:
+        from opentelemetry import trace
+        from opentelemetry.util._once import Once
+
+        trace._TRACER_PROVIDER = None
+        trace._TRACER_PROVIDER_SET_ONCE = Once()
+    except Exception:  # pragma: no cover - defensive, OTel absent or restructured
+        logger.debug("Could not release the global OTel tracer provider", exc_info=True)
+
+
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
@@ -238,6 +267,10 @@ async def shutdown() -> None:
     Also clears the configured skill store (and telemetry emitter): after a
     shutdown, re-pass ``skillStore`` to the next ``init_client`` if the skill
     accessors should keep working.
+
+    When telemetry was running, this also releases the process-global tracer
+    provider so a later ``init_client`` can install its own — see
+    ``_release_otel_globals``.
     """
     global _client, _tracer_provider
 
@@ -256,6 +289,7 @@ async def shutdown() -> None:
             local_provider.shutdown()
         except Exception:
             pass
+        _release_otel_globals()
 
     if local_client is not None:
         try:
@@ -281,9 +315,14 @@ def _set_client_for_testing(c: Any) -> None:
 def _reset_for_testing() -> None:
     """Test helper — clear all singleton state."""
     global _client, _tracer_provider
+    had_provider = _tracer_provider is not None
     _client = None
     _tracer_provider = None
     skills._clear_state()
+    # Mirrors shutdown(): without this a suite that inits more than once leaves
+    # every later span on the first test's provider.
+    if had_provider:
+        _release_otel_globals()
 
 
 async def inspect_config(
