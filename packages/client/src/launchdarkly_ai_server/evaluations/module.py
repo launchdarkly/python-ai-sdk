@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from ..lifecycle import get_client, init_client
@@ -24,14 +24,105 @@ from .runner import (
     ToolImplementation,
     _provides_for,
     _segment,
+    render_row,
 )
-from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
+from .types import (
+    AIConfig,
+    DatasetRef,
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    InlineDatasetRow,
+    RunSummary,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
 SUMMARY_POLL_INTERVAL_SECONDS = 2.0
 SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
+INLINE_ROW_FIELDS = ("rowIdx", "input", "expectedOutput", "variables", "metadata")
+
+
+def _render_inline_row(row: DatasetRow) -> DatasetRow:
+    return render_row(
+        row.row_index,
+        input_value=row.input,
+        expected_value=row.expected_output,
+        variables_value=row.variables,
+        metadata_value=row.metadata,
+    )
+
+
+def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]:
+    """Validate caller-supplied rows, returning them raw and indexed by position.
+
+    Pure, so a malformed row fails before any records are created. The values
+    stay unrendered: they are uploaded as stored rows, which the server renders
+    the same way it renders a hosted dataset's.
+    """
+    if not rows:
+        raise EvaluationsError("Inline dataset is empty")
+    normalized: list[DatasetRow] = []
+    for position, row in enumerate(rows):
+        if isinstance(row, DatasetRow):
+            if row.row_index != position:
+                raise EvaluationsError(
+                    f"Inline dataset row {position} has row_index {row.row_index}; "
+                    "an inline row's index is its position in the list"
+                )
+            values: Mapping[str, Any] = {
+                "input": row.input,
+                "expectedOutput": row.expected_output,
+                "variables": row.variables,
+                "metadata": row.metadata,
+            }
+        elif isinstance(row, Mapping):
+            unknown = sorted(str(key) for key in row if key not in INLINE_ROW_FIELDS)
+            if unknown:
+                raise EvaluationsError(
+                    f"Inline dataset row {position} has unknown fields: "
+                    + ", ".join(repr(key) for key in unknown)
+                    + ". Expected any of: "
+                    + ", ".join(repr(key) for key in INLINE_ROW_FIELDS)
+                )
+            row_idx = row.get("rowIdx")
+            if row_idx is not None and (
+                isinstance(row_idx, bool) or row_idx != position
+            ):
+                raise EvaluationsError(
+                    f"Inline dataset row {position} has rowIdx {row_idx!r}; "
+                    "an inline row's index is its position in the list"
+                )
+            values = row
+        else:
+            raise EvaluationsError(
+                f"Inline dataset row {position} must be a DatasetRow or a mapping"
+            )
+        for field_name in ("input", "expectedOutput"):
+            value = values.get(field_name)
+            if value is not None and not isinstance(value, str):
+                raise EvaluationsError(
+                    f"Inline dataset row {position} {field_name} must be a string"
+                )
+        for field_name in ("variables", "metadata"):
+            value = values.get(field_name)
+            if value is not None and not isinstance(value, Mapping):
+                raise EvaluationsError(
+                    f"Inline dataset row {position} {field_name} must be a mapping"
+                )
+        variables = values.get("variables")
+        metadata = values.get("metadata")
+        normalized.append(
+            DatasetRow(
+                row_index=position,
+                input=values.get("input"),
+                expected_output=values.get("expectedOutput"),
+                variables=dict(variables) if variables else {},
+                metadata=dict(metadata) if metadata is not None else None,
+            )
+        )
+    return normalized
 
 
 def _env(name: str) -> str | None:
@@ -125,7 +216,8 @@ class EvaluationsModule:
         *,
         project_key: str,
         key: str,
-        dataset: str,
+        dataset: str | None = None,
+        rows: Sequence[InlineDatasetRow] | None = None,
         handler: EvalHandler,
         generation: GenerationConfig | None = None,
         ai_config: AIConfig | None = None,
@@ -144,6 +236,14 @@ class EvaluationsModule:
         deterministic :class:`Scorer` functions — is then run against each
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
+
+        Pass exactly one of ``dataset``, the key of a dataset stored in
+        LaunchDarkly, or ``rows``, an inline dataset. Inline rows are
+        :class:`DatasetRow` values or mappings in the dataset-rows wire shape
+        (``input``, ``expectedOutput``, ``variables``, ``metadata``, optional
+        ``rowIdx``); each row's index is its position in the list. They are
+        uploaded to the run before any generation starts, and templates in
+        them render exactly as a stored dataset's do.
 
         A :class:`Judge` is an independent AI Config and may be served by a
         different provider or mode than ``generation``. ``handler`` runs a judge
@@ -173,12 +273,12 @@ class EvaluationsModule:
         self._validate_run_args(
             project_key=project_key,
             key=key,
-            dataset=dataset,
             handler=handler,
             concurrency=concurrency,
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
+        inline_rows = self._validate_dataset_source(dataset=dataset, rows=rows)
         self._validate_config_source(generation=generation, ai_config=ai_config)
         pinned_tool_versions: dict[str, int] = {}
         config_label = ""
@@ -238,12 +338,16 @@ class EvaluationsModule:
         resolved_judges = await self._runner._resolve_judges(
             project_key, ld_judges, handler, run_judge_handlers
         )
-        dataset_ref = await asyncio.to_thread(
-            self._runner._fetch_dataset, project_key, dataset
-        )
-        rows = await asyncio.to_thread(
-            self._runner._get_dataset_rows, project_key, dataset
-        )
+        if dataset is not None:
+            dataset_ref = await asyncio.to_thread(
+                self._runner._fetch_dataset, project_key, dataset
+            )
+            dataset_rows = await asyncio.to_thread(
+                self._runner._get_dataset_rows, project_key, dataset
+            )
+        else:
+            dataset_ref = DatasetRef(id=None, key=None)
+            dataset_rows = [_render_inline_row(row) for row in inline_rows]
         evaluation = await asyncio.to_thread(
             self._runner._create_evaluation,
             project_key,
@@ -258,9 +362,20 @@ class EvaluationsModule:
             evaluation.id,
             dataset_ref.id,
         )
+        if dataset is None:
+            # Must finish before any event is tracked: the run starts with a
+            # placeholder row count of 1, so a result counted before the rows
+            # land would mark the run complete.
+            await asyncio.to_thread(
+                self._runner._upload_dataset_rows,
+                project_key,
+                evaluation.id,
+                evaluation_run.id,
+                inline_rows,
+            )
         config = self._runner._build_handler_config(generation, resolved_tools)
         results = await self._runner._run_rows(
-            rows,
+            dataset_rows,
             handler,
             config,
             run_tools,
@@ -431,7 +546,6 @@ class EvaluationsModule:
         *,
         project_key: str,
         key: str,
-        dataset: str,
         handler: EvalHandler,
         concurrency: int,
         poll_interval_seconds: float,
@@ -440,7 +554,6 @@ class EvaluationsModule:
         for name, value in (
             ("project_key", project_key),
             ("key", key),
-            ("dataset", dataset),
         ):
             if not value.strip():
                 raise EvaluationsError(f"{name} must not be blank")
@@ -457,6 +570,44 @@ class EvaluationsModule:
                 raise EvaluationsError(f"{name} must be a number")
             if seconds < 0:
                 raise EvaluationsError(f"{name} must not be negative")
+
+    @staticmethod
+    def _validate_dataset_source(
+        *,
+        dataset: str | None,
+        rows: Sequence[InlineDatasetRow] | None,
+    ) -> list[DatasetRow]:
+        """Require exactly one dataset source, returning any inline rows raw.
+
+        Types are checked at runtime as well: a ``str`` is itself a
+        ``Sequence``, so a key passed as ``rows`` would otherwise be read as
+        one row per character. The list is empty for a hosted dataset; an
+        inline one is never empty.
+        """
+        if dataset is not None and rows is not None:
+            raise EvaluationsError(
+                "dataset and rows are mutually exclusive: pass dataset for a "
+                "LaunchDarkly dataset key, or rows for an inline dataset"
+            )
+        if dataset is not None:
+            if not isinstance(dataset, str):
+                raise EvaluationsError(
+                    "dataset must be a LaunchDarkly dataset key; pass inline "
+                    "rows with rows="
+                )
+            if not dataset.strip():
+                raise EvaluationsError("dataset must not be blank")
+            return []
+        if rows is None:
+            raise EvaluationsError(
+                "Pass dataset, a LaunchDarkly dataset key, or rows, an inline dataset"
+            )
+        if isinstance(rows, str) or not isinstance(rows, Sequence):
+            raise EvaluationsError(
+                "rows must be a sequence of rows; pass a LaunchDarkly dataset "
+                "key with dataset="
+            )
+        return _normalize_inline_rows(rows)
 
     @staticmethod
     def _validate_config_source(
