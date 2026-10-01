@@ -900,7 +900,7 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 - **Explicit initialization — SDK path.** `await init_client(options?)` dynamically imports `launchdarkly-server-sdk` at runtime (optional peer dep). If the package is not installed it raises with a clear message.
 - **Explicit initialization — BYOC path.** `await init_client(client)` accepts any pre-initialized object that satisfies `LDClientInterface` — this is the path for custom or edge environments whose SDK has different init semantics.
 - `get_client()` raises `RuntimeError` if `init_client()` has not resolved.
-- `await shutdown()` must be called before process exit. It flushes OTel spans, flushes LD events, and closes the LD client. It also releases the process-global OTel tracer provider, so a later `init_client()` can install its own — `trace.set_tracer_provider` is once-guarded, and leaving it set would route every later span to the provider just torn down. Only released when telemetry actually started, so globals another library owns are left alone.
+- `await shutdown()` must be called before process exit. It flushes OTel spans, flushes LD events, and closes the LD client. It also releases the process-global OTel tracer provider, so a later `init_client()` can install its own — `trace.set_tracer_provider` is once-guarded, and leaving it set would route every later span to the provider just torn down. Only released when this SDK's own `set_tracer_provider` actually took effect — the set is once-guarded, so when another library registered first ours is refused (a warning is emitted) and that provider is left alone rather than torn down.
 
 ---
 

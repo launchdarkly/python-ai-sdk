@@ -24,6 +24,11 @@ def _env(name: str) -> str | None:
 
 _client: Any = None
 _tracer_provider: Any = None
+# True only when *this* SDK's call to trace.set_tracer_provider actually took
+# effect. "We built a provider" is not the same as "we own the global": the set
+# is once-guarded, so when another library registered first ours is refused and
+# the global stays theirs. Only the owner may release it on shutdown.
+_owns_otel_globals: bool = False
 
 
 def get_client() -> Any:
@@ -49,7 +54,7 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
     - Registers W3C trace context and baggage propagators.
     - Configures GZIP compression on the OTLP exporter.
     """
-    global _tracer_provider
+    global _tracer_provider, _owns_otel_globals
 
     opts = options or {}
 
@@ -113,6 +118,18 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
             pass
 
         trace.set_tracer_provider(provider)
+        # The set is refused, with a warning from OTel, when another library got
+        # there first. Record whether it actually took: shutdown must not release
+        # a global it never owned, and the caller's telemetry options are moot if
+        # someone else's provider is the one handing out tracers.
+        _owns_otel_globals = trace.get_tracer_provider() is provider
+        if not _owns_otel_globals:
+            logger.warning(
+                "An OpenTelemetry tracer provider was already registered by "
+                "something else in this process, so LaunchDarkly's telemetry "
+                "configuration is not in effect; spans will go wherever that "
+                "provider sends them."
+            )
         _tracer_provider = provider
         return provider
 
@@ -243,8 +260,11 @@ def _release_otel_globals() -> None:
     opentelemetry-python exposes no public API to unset it, so this reaches for
     the module globals — both the slot and the ``Once`` that guards it, since
     clearing the slot alone leaves the guard tripped and the next set a no-op.
-    Only called when we actually installed a provider, so a process where
-    telemetry never started keeps whatever another library registered.
+
+    Callers must gate this on ``_owns_otel_globals``. Having built a provider is
+    not enough: when another library registered first, our set was refused and
+    the global is still theirs, so releasing it here would tear down the host
+    application's tracing and leave the global a no-op proxy.
 
     The global text map propagator needs no equivalent: ``set_global_textmap``
     is a plain assignment with no ``Once``, so the next setup overwrites it.
@@ -272,24 +292,30 @@ async def shutdown() -> None:
     provider so a later ``init_client`` can install its own — see
     ``_release_otel_globals``.
     """
-    global _client, _tracer_provider
+    global _client, _tracer_provider, _owns_otel_globals
 
     local_client = _client
     local_provider = _tracer_provider
+    owned_globals = _owns_otel_globals
 
     skills._clear_state()
 
     # Null the singleton before any awaits so a second call is a no-op
     _client = None
     _tracer_provider = None
+    _owns_otel_globals = False
     reset_ai_sdk_info()
 
     if local_provider is not None:
+        # Shut the provider down either way — we built it, and it owns an
+        # exporter and a batch timer — but only release the global registration
+        # when it was ours to take.
         try:
             local_provider.shutdown()
         except Exception:
             pass
-        _release_otel_globals()
+        if owned_globals:
+            _release_otel_globals()
 
     if local_client is not None:
         try:
@@ -314,14 +340,15 @@ def _set_client_for_testing(c: Any) -> None:
 
 def _reset_for_testing() -> None:
     """Test helper — clear all singleton state."""
-    global _client, _tracer_provider
-    had_provider = _tracer_provider is not None
+    global _client, _tracer_provider, _owns_otel_globals
+    owned_globals = _owns_otel_globals
     _client = None
     _tracer_provider = None
+    _owns_otel_globals = False
     skills._clear_state()
     # Mirrors shutdown(): without this a suite that inits more than once leaves
     # every later span on the first test's provider.
-    if had_provider:
+    if owned_globals:
         _release_otel_globals()
 
 

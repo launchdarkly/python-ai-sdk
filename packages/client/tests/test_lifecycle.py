@@ -317,8 +317,10 @@ class TestShutdown:
         provider = MagicMock()
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=provider):
             await init_client(client=_make_stub_client())
-        # _setup_telemetry is patched, so stand in for what it would have left.
+        # _setup_telemetry is patched, so stand in for what it would have left,
+        # ownership flag included — this is the case where our set did take.
         lifecycle_module._tracer_provider = provider
+        lifecycle_module._owns_otel_globals = True
         otel_trace._TRACER_PROVIDER = provider
         otel_trace._TRACER_PROVIDER_SET_ONCE.do_once(lambda: None)
 
@@ -359,6 +361,29 @@ class TestShutdown:
                 await shutdown()
         assert seen == ["cycle1", "cycle2"]
 
+    async def test_does_not_release_a_tracer_provider_another_library_registered(
+        self, restore_otel_globals: Any
+    ) -> None:
+        # Building a provider is not owning the global. When something else in
+        # the process registered first, our set_tracer_provider is refused and
+        # the global stays theirs — releasing it on shutdown would tear down the
+        # host application's tracing and leave a no-op proxy behind.
+        otel_trace = restore_otel_globals
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+
+        foreign = TracerProvider(resource=Resource.create({"service.name": "foreign"}))
+        otel_trace.set_tracer_provider(foreign)
+
+        await init_client({"sdkKey": "k", "serviceName": "ld"}, _make_stub_client())
+        assert otel_trace.get_tracer_provider() is foreign
+        assert lifecycle_module._owns_otel_globals is False
+
+        await shutdown()
+
+        assert otel_trace.get_tracer_provider() is foreign
+        assert otel_trace._TRACER_PROVIDER is foreign
+
     async def test_does_not_release_otel_globals_when_telemetry_never_started(
         self, restore_otel_globals: Any
     ) -> None:
@@ -370,6 +395,7 @@ class TestShutdown:
         otel_trace._TRACER_PROVIDER_SET_ONCE.do_once(lambda: None)
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=_make_stub_client())
+        assert lifecycle_module._owns_otel_globals is False
         await shutdown()
         assert otel_trace._TRACER_PROVIDER is sentinel
 
