@@ -123,6 +123,19 @@ class TestInitClientBYOC:
             assert await init_client(client=first) is first
             assert await init_client(client=second) is first
 
+    async def test_a_failed_telemetry_setup_does_not_adopt_the_client(self) -> None:
+        stub = _make_stub_client()
+        with patch.object(
+            lifecycle_module, "_setup_telemetry", side_effect=ValueError("bad config")
+        ):
+            with pytest.raises(ValueError):
+                await init_client(client=stub)
+        assert lifecycle_module._client is None
+        # The caller owns a BYOC client, so a failed init must not close it.
+        stub.close.assert_not_called()
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            assert await init_client(client=stub) is stub
+
     async def test_flushes_registered_ai_package_information(self) -> None:
         stub = _make_stub_client()
         register_ai_sdk_package("launchdarkly-ai-server", "0.1.3")
@@ -221,6 +234,32 @@ class TestInitClientSDKKeyPath:
                     await init_client()
         # LDClient is only instantiated on first init; singleton is reused
         assert mock_ld.LDClient.call_count == 1
+
+    async def test_a_failed_telemetry_setup_leaves_no_client_behind(
+        self, restore_otel_globals: Any
+    ) -> None:
+        # A malformed OTEL_EXPORTER_OTLP_TIMEOUT makes the real _setup_telemetry
+        # raise. _client used to be assigned first, so the next call returned the
+        # half-built client as a silent success with no telemetry, and its
+        # connection was never closed.
+        failed = _make_stub_client()
+        healthy = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(side_effect=[failed, healthy])
+        with patch("importlib.import_module", return_value=mock_ld):
+            bad_env = {"LD_SDK_KEY": "k", "OTEL_EXPORTER_OTLP_TIMEOUT": "soon"}
+            with patch.dict(os.environ, bad_env):
+                with pytest.raises(ValueError):
+                    await init_client()
+            assert lifecycle_module._client is None
+            failed.close.assert_awaited_once()
+
+            with patch.dict(os.environ, {"LD_SDK_KEY": "k"}):
+                with patch.object(
+                    lifecycle_module, "_setup_telemetry", return_value=None
+                ):
+                    assert await init_client() is healthy
 
     async def test_returns_initialized_client(self) -> None:
         stub = _make_stub_client()

@@ -194,8 +194,13 @@ async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
 
     # BYOC path — pre-initialized client
     if client is not None:
-        _client = client
+        # Adopted only after telemetry setup succeeds. ``_client`` is the
+        # idempotency guard above, so assigning it first meant a setup that
+        # raised (a malformed OTEL_EXPORTER_OTLP_TIMEOUT does) left it set: the
+        # next call returned it as a silent success with no telemetry, hiding
+        # the config error. The caller owns this client, so it is not closed.
         _setup_telemetry(opts.get("sdkKey", "byoc"), opts)
+        _client = client
         flush_ai_sdk_info(_client)
         return _client
 
@@ -241,8 +246,20 @@ async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
     # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
     ld_client = client_cls(ld_config, start_wait=10)
 
+    # As on the BYOC path: only a fully set-up client becomes the singleton. We
+    # built this one, so close it on failure — it holds a streaming connection
+    # that would otherwise outlive the attempt.
+    try:
+        _setup_telemetry(sdk_key, opts)
+    except Exception:
+        try:
+            close_result = ld_client.close()
+            if inspect.isawaitable(close_result):
+                await close_result
+        except Exception:
+            pass
+        raise
     _client = ld_client
-    _setup_telemetry(sdk_key, opts)
     flush_ai_sdk_info(_client)
     return _client
 
