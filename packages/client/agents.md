@@ -353,6 +353,23 @@ described, and would briefly empty the store — which, with pruning on, is the 
 between a reconcile and deleting a customer's skill files. An interrupted transfer therefore
 leaves last known good intact, and listeners fire once per commit.
 
+**A commit is the only thing that publishes a first payload, and a 304 is not one.**
+`is_initialized()` — the fact `write_skills("*")` authorizes a prune on — goes true when a
+payload *commits*, so every other answer has to stop short of claiming one. A
+`payload-transferred` that applied nothing reports neither a commit nor an up-to-date
+answer, and does not adopt the selector of a payload it never applied: a `none` intent
+builds no pending set, nor does an `intentCode` this SDK does not recognise, and a foreign
+payload's contents are declined. A poll adopts the response `ETag` only from a body that
+completed an exchange — a commit, or a `none` intent, which is the server saying the
+content held is what the etag describes. And a 304 *confirms* the payload held rather than
+establishing one, because the exchange it stands in for cannot establish one either.
+Loosen any of the three and the other two carry a store that received nothing into a prune
+of every managed `SKILL.md` on disk: an empty committed set reads as an environment that
+revoked every skill, and a 304 carries nothing to notice it on. There is no cached basis
+to make it safe — `_basis` and `_etag` both start as `None` with no injection point, so a
+304 reaching a store that holds nothing takes a server answering a request that carried no
+etag at all.
+
 **The first payload intent is read, and is assumed to be the skill payload.** Delivery
 provides one payload per credential and the protocol requires a client to ignore all but the
 first payload intent, so `payloads[0]` is both what arrives and what the protocol says to
