@@ -81,6 +81,25 @@ sys.exit(asyncio.run(main()))
 
 Generation and criterion events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises rather than creating a run that can never complete unless it can resolve an event transport: either an SDK key (`sdk_key` or `LD_SDK_KEY`) or a client already initialized through `init_client(client=...)`. Bringing your own client lets a process emit evaluation events without an SDK key in scope. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
 
+### Supply the dataset inline
+
+Pass `rows` instead of `dataset` for datasets that live in code or are built at run time rather than stored in LaunchDarkly. The two are mutually exclusive, and `run()` raises unless exactly one is given. Each row is a `DatasetRow` or a mapping in the upload wire shape — any of `input`, `expectedOutput`, `variables` and `metadata`, plus an optional `rowIdx` — and its index is its position in the list.
+
+```python
+result = await evals.run(
+    project_key="my-project",
+    key="support-qa-2026-08-20",
+    rows=[
+        {"input": "How do I reset my password?", "expectedOutput": "Use the reset link."},
+        {"input": "Where is order {{order_id}}?", "variables": {"order_id": "A-17"}},
+    ],
+    handler=create_openai_messages_handler(),
+    generation={"provider": "OpenAI", "model": "gpt-4o"},
+)
+```
+
+The rows are uploaded to the run, in batches of up to 500, before any generation starts. They are uploaded unrendered, and `{{...}}` placeholders render exactly as they do for a stored dataset. A malformed row fails the run before any records are created. Events from an inline run carry no dataset id.
+
 ### Score rows with judges and scorers
 
 Pass `criteria` to `run()` to score every generated row. A `Judge` references an AI Judge config that already exists in LaunchDarkly — the SDK creates no judges and ships none of its own — and a `Scorer` wraps a local function, so a run can mix model-graded and deterministic checks. Each criterion runs once per generated row, bounded by the same `concurrency` as generation, and emits one `$ld:ai:offline-evals:criterion` event per `(row, criterion)` carrying the criterion identity, the judge's variation key and version, the validated score, its reason, usage, and timings.
