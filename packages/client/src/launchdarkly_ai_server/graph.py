@@ -27,7 +27,13 @@ from .types import (
     UsageDict,
     VariationMeta,
 )
-from .utils import end_span_once, model_stamps_from_meta, select_handler, to_ld_context
+from .utils import (
+    end_span_once,
+    model_stamps_from_meta,
+    select_handler,
+    set_ld_span_attributes,
+    to_ld_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -917,7 +923,9 @@ class GraphInstance:
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
-            span.set_attribute("launchdarkly.graph.key", self._key)
+            set_ld_span_attributes(
+                span, {"__ld": graph_track_data, "ldContext": context}
+            )
 
             start_time = time.monotonic()
             total_usage = {"input": 0, "output": 0, "total": 0}
@@ -1133,7 +1141,7 @@ class GraphInstance:
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
-        span.set_attribute("launchdarkly.graph.key", self._key)
+        set_ld_span_attributes(span, {"__ld": graph_track_data, "ldContext": context})
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()
