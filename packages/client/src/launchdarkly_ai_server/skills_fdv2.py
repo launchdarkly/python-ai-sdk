@@ -589,12 +589,17 @@ class _ProtocolReader:
             self._pending = _SkillObjectSet()
         elif intent == _INTENT_TRANSFER_CHANGES:
             self._pending = self._committed.copy()
-        else:
-            if intent != _INTENT_TRANSFER_NONE:
-                logger.debug("Ignoring FDv2 server-intent with intentCode %r", intent)
+        elif intent == _INTENT_TRANSFER_NONE:
+            # Current, but not finished: later edits arrive on this connection
+            # with no second intent, so expect changes, as the base SDK's
+            # ``ChangeSetBuilder.expect_changes()`` does. The pending set is
+            # copied when the first object arrives.
+            self._intent = _INTENT_TRANSFER_CHANGES
             self._pending = None
-            # Only ``none`` is an answer; an unrecognised intent is not.
-            return _TransferOutcome(up_to_date=intent == _INTENT_TRANSFER_NONE)
+            return _TransferOutcome(up_to_date=True)
+        else:
+            logger.debug("Ignoring FDv2 server-intent with intentCode %r", intent)
+            self._pending = None
         return _TransferOutcome()
 
     def _target_for(self, data: Any) -> _SkillObjectSet | None:
@@ -1251,8 +1256,11 @@ def _backoff_delay(
 
     Jitter is subtracted, never added, so *maximum* is a true ceiling.
     """
-    # float(2 ** n): the integer power is untyped to mypy.
-    ceiling: float = min(maximum, base * float(2 ** max(0, attempt - 1)))
+    # Clamped: retries are unbounded, and ``float(2 ** n)`` overflows past
+    # about 1024. ``2 ** 62`` exceeds any real cap. ``float(...)``: the integer
+    # power is untyped to mypy.
+    exponent = min(max(0, attempt - 1), 62)
+    ceiling: float = min(maximum, base * float(2**exponent))
     return ceiling * (1.0 - jitter * random.random())
 
 
@@ -1307,7 +1315,6 @@ class FDv2SkillStore:
         read_timeout: float | None = None,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        max_consecutive_failures: int = 10,
         _requester: Any = None,
     ) -> None:
         """
@@ -1327,9 +1334,9 @@ class FDv2SkillStore:
           in ``"stream"`` mode, each wait for more bytes
           (``DEFAULT_STREAM_READ_TIMEOUT``).
         - *max_backoff*: caps every retry delay, including ``Retry-After``.
-        - *max_consecutive_failures*: after this many failures in a row,
-          delivery stops, logs an error, and ``failed`` is set; the store keeps
-          serving last known good. A completed exchange resets the count.
+
+        Recoverable failures are retried for as long as the store runs; only a
+        fatal status stops delivery and sets ``failed``.
         """
         _require_server_side_credential(sdk_key)
         # A lone ``base_uri`` serves both endpoints.
@@ -1358,7 +1365,6 @@ class FDv2SkillStore:
         self._poll_interval = poll_interval
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
-        self._max_consecutive_failures = max_consecutive_failures
 
         self._objects = _SkillObjectSet()
         self._reader = _ProtocolReader(self._objects)
@@ -1407,7 +1413,7 @@ class FDv2SkillStore:
 
         Raises ``RuntimeError`` if the store has been closed. A store whose
         delivery stopped on its own (``failed`` is set) can be started again,
-        with a fresh retry budget.
+        with its backoff reset.
         """
         with self._lock:
             if self._closed:
@@ -1437,7 +1443,7 @@ class FDv2SkillStore:
     def _rearm_waiters(self) -> None:
         """
         Resets per-run state for a store being started again after it gave up:
-        the ended-delivery flag, ``failed``, and the retry budget. A payload
+        the ended-delivery flag, ``failed``, and the failure count. A payload
         already held still answers ``wait_for_skills``. Call with the lock held.
         """
         self._delivery_ended.clear()
@@ -1616,7 +1622,6 @@ class FDv2SkillStore:
                 if self._stop.is_set():
                     # ``close`` interrupted the request; not a failure.
                     return
-                repairing_state = False
                 if isinstance(exc, _StaleRequestStateError):
                     # With no basis or etag to drop, the 400 is fatal. Otherwise
                     # drop them and request a full transfer once.
@@ -1626,7 +1631,6 @@ class FDv2SkillStore:
                             self._basis = None
                             self._etag = None
                             self._etag_basis = None
-                            repairing_state = True
                     if exhausted:
                         self._give_up(str(exc))
                         return
@@ -1638,14 +1642,6 @@ class FDv2SkillStore:
                     answered = self._attempt_answered
                     self._reader.diagnostics.connection_failures = failures
                     self._reader.diagnostics.last_error = str(exc)
-                if failures > self._max_consecutive_failures and not repairing_state:
-                    # The one stateless retry after a 400 is exempt, so an
-                    # exhausted budget cannot block that repair.
-                    self._give_up(
-                        f"gave up after {failures} consecutive failures; "
-                        f"last error: {exc}"
-                    )
-                    return
                 delay = exc.retry_after
                 if delay is None or not math.isfinite(delay):
                     delay = _backoff_delay(

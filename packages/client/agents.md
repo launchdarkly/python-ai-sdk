@@ -273,7 +273,7 @@ asserts both the cause and the absences.
 
 **A fatal stops the run, not the store, so every surface says `start()`, not "restart the
 process".** `_give_up` does not close; only `close` sets `_closed`, the one thing `start`
-refuses. A store that gave up — on a 401, 403, 404, 422, or an exhausted retry budget —
+refuses. A store that gave up — on a 401, 403, 404, 422, or another fatal status —
 resumes in place once the cause is fixed, clearing the terminal reason through
 `_rearm_waiters`. Asserted by `test_the_give_up_line_points_at_start_not_a_process_restart`,
 `test_a_store_that_gave_up_on_a_422_resumes_on_start`, and
@@ -720,7 +720,7 @@ create false confidence. The operator's verification steps are in the README.
 `timeout` is a monotonic deadline, checked before each retrieval, each write, and each prune;
 only the final manifest rewrite runs past it, so files already written are never orphaned.
 Bounded retries are **not** implemented at this layer; retry policy belongs to the delivery
-transport (`FDv2SkillStore`'s backoff and retry budget). Why:
+transport (`FDv2SkillStore`'s capped backoff). Why:
 
 1. **There is nothing transient to retry.** `SkillStore.get_object` is a synchronous
    in-process read of already-delivered data, modelled on the LaunchDarkly data-store API. A

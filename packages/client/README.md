@@ -628,7 +628,7 @@ HTTP 422 when it will not serve one.
 - **Not the empty case:** an environment with zero skills is served an empty payload that
   commits normally.
 - **Recovery:** once the cause is fixed, call `start()` on the same store. Only `close()` is
-  final: a restart clears `failed`, resets the retry budget, and held content stays readable
+  final: a restart clears `failed`, resets the backoff, and held content stays readable
   throughout. Restarting the process also works.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
@@ -656,10 +656,16 @@ delivery retries on its normal backoff.
 
 **Streaming is the default, and it is what makes revocation fast.** A `delete-object` reaches a
 live stream in seconds; with `mode="poll"` it arrives within one `poll_interval`. With
-`watch_skills`, a revoked skill's `SKILL.md` leaves the disk without a restart. During an
-outage the store keeps serving its last content, and `write_skills`' default
-`on_unavailable="keep"` leaves managed files alone, so an outage does not read as "everything
-was revoked".
+`watch_skills("*", ...)`, a revoked skill's `SKILL.md` leaves the disk without a restart. During
+an outage the store keeps serving its last content and retries for as long as it runs, and
+`write_skills`' default `on_unavailable="keep"` leaves managed files alone, so an outage does
+not read as "everything was revoked".
+
+**With an explicit skill list, revocation does not reach the disk.** Given a list such as
+`skill_refs(config)`, a skill deleted in LaunchDarkly is reported as an `error` action under
+its key, and its `SKILL.md` is kept rather than pruned. The watcher also listens only to the
+skill store, not to flag changes, so unpinning a skill from a variation is not seen either. Use
+`"*"` when revocation must reach the disk.
 
 **Without the watcher, the revocation bound is process lifetime.** If you call `write_skills`
 once at boot and never run `watch_skills`, a skill revoked after boot stays on disk, and in the

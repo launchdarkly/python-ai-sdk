@@ -377,9 +377,10 @@ def _resolve_requests(
     """
     Turns the caller's input into one request per skill.
 
-    Also returns whether any retrieval was incomplete (absent, uninitialized or
+    Also returns whether any retrieval was incomplete (an uninitialized or
     raising store, or an exhausted timeout). That flag suppresses pruning, so an
-    outage never deletes managed files.
+    outage never deletes managed files. An ``absent`` reference does not set it:
+    the key stays requested, carrying an error, so prune keeps its files.
     """
     if isinstance(skills, str):
         if skills != "*":

@@ -22,6 +22,7 @@ import ast
 import hashlib
 import inspect
 import json
+import math
 import socket
 import threading
 import time
@@ -935,6 +936,46 @@ class TestProtocolReader:
         )
         assert len(held) == 1
 
+    def test_a_put_after_a_none_intent_is_applied(self) -> None:
+        """``none`` means current, not finished: later edits follow it on the
+        same connection with no second intent, and must land."""
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            events(
+                ("server-intent", server_intent("none")),
+                ("put-object", put_skill(object_version=4)),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert held.get("pdf-extraction", 4) is not None
+        assert reader.diagnostics.objects_ignored == 0
+
+    def test_a_delete_after_a_none_intent_revokes(self) -> None:
+        """The case that matters: a skill revoked after a routine reconnect.
+
+        Dropping the delete while adopting the selector would keep serving the
+        revoked skill, and a reconnect would not recover it, because the basis
+        has already moved past the change.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill())))
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("none")),
+                ("delete-object", delete_skill()),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert len(held) == 0
+        assert reader.diagnostics.objects_revoked == 1
+        assert reader.diagnostics.objects_ignored == 0
+        assert outcomes[-1].changes == [{"key": "pdf-extraction", "version": 3}]
+        assert outcomes[-1].basis == "basis-2"
+
     def test_an_object_arriving_with_no_intent_is_treated_as_a_delta(self) -> None:
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -1538,6 +1579,43 @@ class TestStreamingAgainstTheEndpoint:
             store.close()
         assert endpoint.requests[0]["query"]["kinds"] == "agent-skill"
 
+    def test_a_revocation_after_an_up_to_date_answer_arrives(
+        self, endpoint: Any
+    ) -> None:
+        """A reconnect answered ``none``, then a revocation on the same stream.
+
+        The first connection ends after its payload, as a recycled stream does.
+        """
+        endpoint.queue_stream(full_payload(("put-object", put_skill())))
+        endpoint.queue_stream(
+            events(
+                ("server-intent", server_intent("none")),
+                ("delete-object", delete_skill()),
+                ("payload-transferred", transferred("basis-2")),
+            )
+        )
+        store = FDv2SkillStore(
+            SDK_KEY,
+            base_uri=endpoint.base_uri,
+            mode="stream",
+            initial_backoff=0.01,
+            max_backoff=0.02,
+        )
+        notified: list[dict[str, Any]] = []
+        store.add_listener(SKILL_OBJECT_KIND, notified.append)
+        try:
+            store.start()
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(
+                lambda: store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is None
+            )
+            assert store.diagnostics.objects_revoked == 1
+            assert {"key": "pdf-extraction", "version": 3} in notified
+        finally:
+            store.close()
+        # The premise: the revocation came on a reconnect carrying a basis.
+        assert endpoint.requests[1]["query"].get("basis") == "basis-1"
+
     def test_a_streamed_revocation_arrives_without_a_restart(
         self, endpoint: Any
     ) -> None:
@@ -1843,8 +1921,7 @@ class TestFailureHandling:
         ``_give_up`` ends the run and not the store, and the test below is what
         proves a restarted store delivers. Telling an operator to restart their
         process is therefore an overstatement wherever it appears, and this
-        line appears on all of them — a 401, a 403, a 404, a 422, and an
-        exhausted retry budget alike.
+        line appears on all of them — a 401, a 403, a 404, and a 422 alike.
         """
         endpoint.queue_poll(status=401)
         with caplog.at_level("ERROR"):
@@ -1922,25 +1999,37 @@ class TestFailureHandling:
             assert store.wait_for_skills(timeout=5) is True
             assert store.failed is None
 
-    def test_a_restart_returns_the_retry_budget(self, endpoint: Any) -> None:
-        """The retry budget belongs to the run that spent it.
+    def test_a_restart_resets_the_failure_count(self) -> None:
+        """The failure count belongs to the run that accumulated it.
 
-        A store that gave up at its failure limit would otherwise carry the
-        spent count into the restarted run and give up again on its first
-        recoverable failure, without retrying once.
+        Carried into a restarted run, it would start that run's backoff part
+        way up and report failures the new run never had.
         """
-        store = poll_store(endpoint, max_consecutive_failures=1)
-        # One over the limit, so the first run retries once and then gives up.
-        endpoint.queue_poll(status=500)
-        endpoint.queue_poll(status=500)
+        requester = _ScriptedRequester(
+            _RecoverableTransportError("x"),
+            _RecoverableTransportError("x"),
+            _FatalTransportError("401"),
+        )
+        store = FDv2SkillStore(
+            SDK_KEY,
+            mode="poll",
+            initial_backoff=0.001,
+            max_backoff=0.002,
+            _requester=requester,
+        )
         with store:
-            assert wait_until(lambda: store.failed is not None)
-
-            endpoint.queue_poll(status=500)
-            endpoint.queue_poll(full_payload(("put-object", put_skill())))
             store.start()
-            assert store.wait_for_skills(timeout=5) is True
-            assert store.failed is None
+            assert wait_until(lambda: store.failed is not None)
+            assert store.diagnostics.connection_failures == 2
+
+            requester.outcomes = [
+                _RecoverableTransportError("x"),
+                _FatalTransportError("401"),
+            ]
+            store.start()
+            assert wait_until(lambda: store.failed is not None)
+            # One failure in the new run, not three.
+            assert store.diagnostics.connection_failures == 1
 
     def test_a_404_stops_delivery_immediately(self, endpoint: Any) -> None:
         """A 404 means the endpoint does not exist for this credential.
@@ -1968,7 +2057,7 @@ class TestFailureHandling:
 
         The selector and the etag are the only client state the request carries,
         so a fresh connection built from nothing is the one repair available.
-        It gets exactly one: the retry bound is what keeps this from being
+        It gets exactly one: the one-retry limit is what keeps this from being
         "400 is recoverable".
         """
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
@@ -1991,49 +2080,6 @@ class TestFailureHandling:
         assert retried["if_none_match"] is None
         # Last known good survives both.
         assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
-
-    def test_a_400_still_reconnects_from_scratch_on_a_spent_budget(
-        self, endpoint: Any
-    ) -> None:
-        """The one repair available does not compete with the retry bound.
-
-        A 400 arriving on a budget an outage has already spent would otherwise
-        give up while holding the one request known to fix it, and delivery
-        would stop for the process lifetime over state the store was about to
-        drop. Exempting that request cannot unbound the loop: it carries no
-        state, so a second 400 is fatal on its own.
-        """
-        store = poll_store(endpoint, max_consecutive_failures=1)
-        endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        endpoint.queue_poll(status=500)
-        endpoint.queue_poll(status=400)
-        endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        with store:
-            assert store.wait_for_skills(timeout=5) is True
-            # The premise: the budget is spent by the time the 400 arrives.
-            assert wait_until(lambda: len(endpoint.requests) == 4)
-            assert store.failed is None
-        # The repair went out from scratch rather than never going out at all.
-        repair = endpoint.requests[3]
-        assert repair["query"] == {"kinds": FDV2_PAYLOAD_KIND}
-        assert repair["if_none_match"] is None
-
-    def test_a_non_400_after_the_repair_meets_the_spent_budget(
-        self, endpoint: Any
-    ) -> None:
-        """The exemption is for the repair, not for the run that follows it."""
-        store = poll_store(endpoint, max_consecutive_failures=1)
-        endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        endpoint.queue_poll(status=500)
-        endpoint.queue_poll(status=400)
-        endpoint.queue_poll(status=500)
-        endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        with store:
-            assert store.wait_for_skills(timeout=5) is True
-            assert wait_until(lambda: store.failed is not None)
-        assert "gave up after 3 consecutive failures" in store.failed
-        # The fifth queued payload is never asked for.
-        assert len(endpoint.requests) == 4
 
     def test_a_400_carrying_no_client_state_is_fatal_at_once(
         self, endpoint: Any
@@ -2121,8 +2167,7 @@ class TestFailureHandling:
         """
         endpoint.queue_poll(status=422)
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
-        # Well above one, so the bound is not what stopped it.
-        with poll_store(endpoint, max_consecutive_failures=5) as store:
+        with poll_store(endpoint) as store:
             assert wait_until(lambda: store.failed is not None)
         assert "422" in store.failed
         # The queued payload is never asked for.
@@ -2292,32 +2337,45 @@ class TestFailureHandling:
             assert store.wait_for_skills(timeout=5)
             assert wait_until(lambda: store.diagnostics.connection_failures == 0)
 
-    def test_retries_are_bounded(self) -> None:
+    def test_there_is_no_consecutive_failure_option(self) -> None:
+        """A count bound would freeze a give-up contract into the public API.
+
+        Asserted by name, so a reintroduction is caught here rather than in a
+        process that stopped receiving revocations after a short outage.
+        """
+        assert (
+            "max_consecutive_failures"
+            not in inspect.signature(FDv2SkillStore.__init__).parameters
+        )
+        with pytest.raises(TypeError):
+            FDv2SkillStore(SDK_KEY, max_consecutive_failures=3)  # type: ignore[call-arg]
+
+    def test_recoverable_failures_are_retried_indefinitely(self) -> None:
+        """Well past ten in a row, the bound this replaces, and still retrying."""
+        requester = _ScriptedRequester()
         store = FDv2SkillStore(
             SDK_KEY,
             mode="poll",
             poll_interval=0.01,
             initial_backoff=0.001,
             max_backoff=0.002,
-            max_consecutive_failures=3,
-            _requester=_ScriptedRequester(),
+            _requester=requester,
         )
         try:
             store.start()
-            assert wait_until(lambda: store.failed is not None)
-            # Four, not three: the bound is the number of failures *tolerated*,
-            # so the run that exceeds it is the one that gives up.
-            assert "gave up after 4 consecutive failures" in store.failed
+            assert wait_until(lambda: store.diagnostics.connection_failures >= 25)
+            assert store.failed is None
+            assert store.diagnostics.last_error is not None
         finally:
             store.close()
+        assert len(requester.calls) >= 25
 
     def test_recycled_stream_connections_are_not_failures(self) -> None:
         # A streaming connection only ever ends by being dropped, so a loop
-        # that counted every drop as a failure would give up on a healthy
-        # server after max_consecutive_failures + 1 recycles, and delivery
-        # (including revocation) would silently stop for the process lifetime.
+        # that counted every drop as a failure would back a healthy server off
+        # to ``max_backoff`` and report it as failing.
         requester = _RecyclingRequester()
-        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        store = stream_store(_requester=requester)
         try:
             store.start()
             assert wait_until(lambda: requester.connections >= 8)
@@ -2337,11 +2395,10 @@ class TestFailureHandling:
         # Resetting at a commit covers only a connection that carried new
         # content. An environment whose skills are not changing answers every
         # reconnect with ``intentCode: "none"`` and transfers nothing, so a loop
-        # that counted those drops would give up on a *healthy* idle stream
-        # after max_consecutive_failures + 1 recycles — and revocation, the one
-        # thing streaming exists to deliver promptly, would never arrive again.
+        # that counted those drops would back a *healthy* idle stream off to
+        # ``max_backoff`` and report it as failing.
         requester = _UpToDateRecyclingRequester(farewell=farewell)
-        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        store = stream_store(_requester=requester)
         try:
             store.start()
             assert wait_until(lambda: requester.connections >= 8)
@@ -2371,9 +2428,7 @@ class TestFailureHandling:
     def test_a_connection_that_never_answered_still_warns(self, caplog: Any) -> None:
         # The quiet path is earned by answering. A connection that failed before
         # it told us anything is the case the warning exists for.
-        store = stream_store(
-            max_consecutive_failures=10, _requester=_ScriptedRequester()
-        )
+        store = stream_store(_requester=_ScriptedRequester())
         with caplog.at_level("DEBUG", logger="launchdarkly_ai_server.skills_fdv2"):
             try:
                 store.start()
@@ -2399,7 +2454,7 @@ class TestFailureHandling:
         # such a failure as unexpected would stop delivery — including
         # revocation — for the process lifetime the first time a socket died.
         requester = _DyingStreamRequester(exc)
-        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        store = stream_store(_requester=requester)
         try:
             store.start()
             assert store.wait_for_skills(timeout=5) is True
@@ -2417,31 +2472,59 @@ class TestFailureHandling:
             _RecoverableTransportError("x"),
             _RecoverableTransportError("x"),
             payload,
+            _FatalTransportError("401"),
         )
-        store = stream_store(max_consecutive_failures=3, _requester=requester)
+        store = stream_store(_requester=requester)
         try:
             store.start()
             assert store.wait_for_skills(timeout=5)
-            # Three failures reach the bound, then a commit, then the exhausted
-            # requester fails on every reconnect. The count must start again at
-            # the commit: the stream's own drop is failure one, and three more
-            # connects are owed before giving up. Carrying the three over would
-            # give up on the drop itself, with no further connect at all.
             assert wait_until(lambda: store.failed is not None)
-            assert "gave up after 4 consecutive failures" in store.failed
-            assert "last error: x" in store.failed
-            assert len(requester.calls) == 7
+            # Three failures, then a commit, then the stream's own drop. The
+            # count starts again at the commit, so the drop is failure one, not
+            # four.
+            assert store.diagnostics.connection_failures == 1
+            assert len(requester.calls) == 5
         finally:
             store.close()
 
-    def test_stream_retries_are_bounded(self) -> None:
-        store = stream_store(
-            max_consecutive_failures=3, _requester=_ScriptedRequester()
-        )
+    def test_stream_failures_are_retried_indefinitely(self) -> None:
+        """Last known good is served throughout, however long the outage."""
+        payload = [
+            (e["event"], e["data"]) for e in full_payload(("put-object", put_skill()))
+        ]
+        store = stream_store(_requester=_ScriptedRequester(payload))
         try:
             store.start()
-            assert wait_until(lambda: store.failed is not None)
-            assert "gave up after 4 consecutive failures" in store.failed
+            assert store.wait_for_skills(timeout=5)
+            assert wait_until(lambda: store.diagnostics.connection_failures >= 25)
+            assert store.failed is None
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
+        finally:
+            store.close()
+
+    def test_an_announced_transfer_that_never_completes_is_a_failure(self) -> None:
+        """An intent is a promise, not a delivery, so it does not reset the count.
+
+        A server that announces a transfer and drops before
+        ``payload-transferred``, every time, has delivered nothing. Counted as
+        health, it would be retried forever at the initial backoff.
+        """
+
+        class _AnnouncesThenDrops(_FakeRequester):
+            def stream(self, basis: str | None) -> Any:
+                return _ScriptedConnection(
+                    [
+                        ("server-intent", server_intent("xfer-full")),
+                        ("put-object", put_skill()),
+                    ]
+                )
+
+        store = stream_store(_requester=_AnnouncesThenDrops())
+        try:
+            store.start()
+            assert wait_until(lambda: store.diagnostics.connection_failures >= 5)
+            assert store.failed is None
+            assert store.is_initialized() is False
         finally:
             store.close()
 
@@ -2560,6 +2643,17 @@ class TestFailureHandling:
         assert _backoff_delay(2, base=1.0, maximum=30.0, jitter=0.0) == 2.0
         assert _backoff_delay(3, base=1.0, maximum=30.0, jitter=0.0) == 4.0
         assert _backoff_delay(20, base=1.0, maximum=30.0, jitter=0.0) == 30.0
+
+    def test_backoff_stays_finite_at_any_attempt_number(self) -> None:
+        """Retries are unbounded, so the attempt number is too.
+
+        Unclamped, ``float(2 ** n)`` raises ``OverflowError`` past about 1024,
+        which a long enough outage reaches.
+        """
+        assert _backoff_delay(10_000, base=1.0, maximum=30.0, jitter=0.0) == 30.0
+        delay = _backoff_delay(10_000, base=1.0, maximum=30.0)
+        assert math.isfinite(delay)
+        assert 0.0 <= delay <= 30.0
 
     def test_jitter_never_exceeds_the_cap(self) -> None:
         for attempt in range(1, 12):
@@ -2683,11 +2777,14 @@ class TestTransportMemoryBound:
         body = json.dumps({"events": payload}).encode("utf-8")
         monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", len(body) - 1)
         endpoint.queue_poll(payload)
-        with poll_store(endpoint, max_consecutive_failures=0) as store:
-            assert wait_until(lambda: store.failed is not None)
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.diagnostics.last_error is not None)
             assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is None
-        assert f"{len(body) - 1}-byte transport bound" in store.failed
-        assert f"at least {len(body)} bytes received" in store.failed
+            # Recoverable: delivery keeps retrying.
+            assert store.failed is None
+            error = store.diagnostics.last_error
+        assert f"{len(body) - 1}-byte transport bound" in error
+        assert f"at least {len(body)} bytes received" in error
 
     def test_the_default_cap_leaves_ordinary_payloads_alone(
         self, endpoint: Any
@@ -3681,9 +3778,7 @@ class TestTransportEmitsNoTelemetry:
         success path alone would not cover it.
         """
         skills_module._set_emitter_for_testing(recording_emitter)
-        store = stream_store(
-            max_consecutive_failures=1, _requester=_ScriptedRequester()
-        )
+        store = stream_store(_requester=_ScriptedRequester(_FatalTransportError("401")))
         try:
             store.start()
             assert wait_until(lambda: store.failed is not None)
@@ -3974,7 +4069,7 @@ class TestWaitingForSkills:
         # Restarting after a *close* is not available — see
         # ``TestCloseIsFinal`` — so the give-up path is what exercises this.
         class _FailsThenGoesQuiet(_FakeRequester):
-            """One failure, enough to give up; silent on every run after."""
+            """One fatal failure; silent on every run after."""
 
             def __init__(self) -> None:
                 self.attempts = 0
@@ -3982,12 +4077,10 @@ class TestWaitingForSkills:
             def stream(self, basis: str | None) -> Any:
                 self.attempts += 1
                 if self.attempts == 1:
-                    raise _RecoverableTransportError("x")
+                    raise _FatalTransportError("x")
                 return _BlockingConnection()
 
-        store = stream_store(
-            max_consecutive_failures=0, _requester=_FailsThenGoesQuiet()
-        )
+        store = stream_store(_requester=_FailsThenGoesQuiet())
         store.start()
         assert wait_until(lambda: store.failed is not None)
         assert store.wait_for_skills(timeout=0.1) is False
