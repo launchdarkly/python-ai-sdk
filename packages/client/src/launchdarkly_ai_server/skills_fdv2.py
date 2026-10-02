@@ -795,9 +795,9 @@ class _ProtocolReader:
         # whose selector must not become the resume point if it is not the
         # payload skills arrive on.
         foreign = self._is_foreign_payload(payload_id)
-        # Whether this transfer moved the committed set. A ``none`` intent
-        # builds no pending set, nor does an intent code this SDK does not
-        # recognise, and a foreign payload's contents are declined below.
+        # A ``none`` intent builds no pending set, nor does an intent code this
+        # SDK does not recognise, and a foreign payload's contents are declined
+        # below.
         applied = not foreign and self._pending is not None
         if foreign:
             self._warn_foreign_payload(payload_id)
@@ -838,31 +838,12 @@ class _ProtocolReader:
             len(self._committed),
         )
         if not applied:
-            # A transfer that applied nothing claims nothing: not a commit, and
-            # not an up-to-date answer either.
-            #
-            # Not a commit, because a commit publishes a first payload, and
-            # ``is_initialized`` is the fact ``write_skills("*")`` prunes on. An
-            # empty committed set reported as a payload reads as an environment
-            # whose every skill was revoked, which deletes the last known good
-            # copy on disk.
-            #
-            # Not up to date either, because only the server can say that, and
-            # only the ``none`` intent does — on its own event, which has
-            # already reported it by the time a transfer completing it arrives.
-            # An intent code this SDK does not recognise says the opposite: the
-            # body carried objects this reader dropped, so the content held is
-            # *not* what that body describes, and an etag adopted from it would
-            # let a 304 report the store as current for as long as the server
-            # kept re-announcing it. Claiming nothing is what leaves the poll
-            # unconditional, so the body keeps arriving and keeps being visible.
-            #
-            # The selector goes the same way: resuming from a payload this store
-            # never applied would ask every later connection for changes since
-            # content it does not hold, with every diagnostic reading healthy.
-            #
-            # The transfer is still a wire fact: ``payloads_transferred`` counts
-            # it above either way.
+            # Nothing applied, so nothing to report — and in particular not a
+            # commit, because a commit publishes the first payload, and
+            # ``is_initialized`` (what ``write_skills("*")`` authorises a prune
+            # on) must not go true over a store that received nothing. Not up to
+            # date either: only the ``none`` intent says that, on its own event.
+            # The selector is withheld too — it names a payload never applied.
             return _TransferOutcome()
         return _TransferOutcome(
             committed=True,
@@ -2091,9 +2072,8 @@ class FDv2SkillStore:
         Feeds one event to the reader, publishes a commit, and raises the
         transport error the event calls for, if any.
 
-        Returns whether the event completed an exchange: a committed payload, or
-        the server confirming that the content held is current. Those are the
-        two answers that describe what this store now holds, and they are what
+        Returns whether the event completed an exchange — a commit, or the
+        server confirming the content held is current — which is what
         ``_poll_once`` adopts an etag on.
         """
         with self._lock:
@@ -2131,35 +2111,20 @@ class FDv2SkillStore:
         result = self._requester.poll(basis, etag)
         if result.not_modified:
             logger.debug("Skill payload unchanged (HTTP 304)")
-            # A 304 *confirms* the payload this store holds. It cannot establish
-            # one, and it is not a first payload: the exchange it stands in for
-            # is the ``none`` intent, which does not publish one either (see
-            # ``_apply``), and a 304 carries nothing a store holding nothing
-            # could be initialized from. Publishing here would make
-            # ``is_initialized`` true over an empty committed set, which is what
-            # authorises ``write_skills("*")`` to prune, so a 304 answering a
-            # request that carried no etag — the only way to reach one with
-            # nothing held — would delete the last known good copy on disk.
-            # ``_run`` counts the poll as a healthy answer either way.
+            # A 304 confirms the payload this store holds; it cannot establish
+            # one. ``is_initialized`` stays false until something commits, so a
+            # store that has received nothing never authorises a prune of the
+            # files on disk. ``_run`` counts the poll as a healthy answer.
             return
         completed = False
         for name, data in result.events:
             completed = self._apply(name, data) or completed
         if not completed:
-            # Adopted only from a body that completed an exchange: one that
-            # committed a payload, or a ``none`` intent, which is the server
-            # saying the content held is what the etag describes. A body that
-            # broke off partway — an ``error`` or ``goodbye`` after an announced
-            # transfer — raises above and never reaches here. One that merely
-            # transferred nothing, under an intent code this SDK does not
-            # recognise, reaches here having committed nothing: its etag
-            # describes a body whose contents this store does not hold, and
-            # keeping it would let the next 304 report a store missing that
-            # payload as current and healthy.
-            #
-            # The etag already held is left alone rather than cleared: it was
-            # earned by a body that did complete, and it still validates that
-            # content for as long as the basis it was paired with holds.
+            # An etag describes the body it came with, so it is adopted only when
+            # that body is also what the store now holds: a commit, or a ``none``
+            # intent. A transfer this SDK could not apply is neither, and keeping
+            # its etag would let the next 304 confirm content never applied. Any
+            # etag already held stays valid, so it is left alone, not cleared.
             return
         with self._lock:
             self._etag = result.etag
