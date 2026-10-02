@@ -219,7 +219,7 @@ so two versions of one key coexist routinely. A store keyed by key alone would a
 object, and the caller would then have to reject it — turning the primary use case, a
 version-pinned attachment, into a missing skill. `version=None` asks for the newest held.
 
-The equality check in `resolve_from_store` stays, now as a **defense** rather than as the
+The equality check in `resolve_from_store` is kept as a **defense** rather than as the
 selection mechanism: the store is untrusted, so an answer that is not the version asked for
 is withheld.
 
@@ -770,32 +770,23 @@ no second implementation to check them against — the TypeScript SDK has no Win
 either. Implementing them in Python alone would trade a documented bound for an unverified
 one.
 
-The parity argument used to be stronger than that, and the correction matters because the
-old wording is now wrong. It read: Node exposes no `*at()` family on *any* platform, so its
-racy floor is universal rather than Windows-only. The first half is still true and the
-second is not. `*at()` is not the only way to address a child relative to a pinned inode:
-TypeScript commit `0a15b10` added a `SUPPORTS_PROC_FD` probe and `/proc/self/fd/<fd>/<name>`
-addressing, which the Linux kernel resolves from the inode the descriptor holds rather than
-from the name it was opened under. That **closes** the swap window on Linux exactly as
-`*at()` does here, so TypeScript's `lstat` floor now applies on macOS and Windows only —
-the same shape as this side's, not a universal one.
-
-None of which reopens the decision above. It never rested on TypeScript being equally
-exposed; it rests on there being no Windows CI runner to verify the checks against, which is
-still the case in both repositories. Two follow-on facts: on Windows write permission on the
+Node exposes no `*at()` family, but the TypeScript SDK addresses children as
+`/proc/self/fd/<fd>/<name>` behind a `SUPPORTS_PROC_FD` probe, which the Linux kernel
+resolves from the pinned inode. That closes the swap window on Linux exactly as `*at()` does
+here, so TypeScript's `lstat` floor applies on macOS and Windows only — the same shape as
+this side's. The decision above rests on there being no Windows CI runner, not on parity. Two follow-on facts: on Windows write permission on the
 managed root is the only
 boundary, which is why the privilege-separated deployment is documented as the mitigation
-rather than as advice; and this bound retroactively lowers the priority of the reserved-device-name
-work above — keep that code, but do not read it as evidence that Windows is hardened. If
+rather than as advice; and keep the reserved-device-name code above, but do not read it as evidence that Windows
+is hardened. If
 Windows becomes a supported platform, revisit both together, and add the CI runner first.
 
 **Privilege separation is the deployment-side half of this, and `ReconcileReport` must not
 grow a writability field.** The recommended deployment runs the reconcile as a different
 identity than the agent, so the `0644`/`0755` modes above actually deny something: the agent
 reads its instructions and cannot rewrite them or the manifest. That is the mitigation for a
-prompt-injected agent editing its own skills. The security review asked for the report to
-surface whether the managed root is writable; we declined, and the reasoning is load-bearing
-rather than a preference. The SDK knows only its *own* identity, which trivially has write
+prompt-injected agent editing its own skills. Do not make the report surface whether the
+managed root is writable: the SDK knows only its *own* identity, which trivially has write
 access — it just wrote there — and cannot know which identity will later run the agent. Any
 check it could perform would answer a different question than the one asked and would create
 false confidence exactly where caution is wanted. The operator's verification steps live in
@@ -821,11 +812,10 @@ reasons, all of which the transport changes:
    `write_skills`. Backoff would mean either `time.sleep` — blocking the event loop of every
    caller — or async-ifying the whole path for a store that cannot benefit.
 
-Picking a bound and a backoff now would fix numbers in a cross-language contract with no
-transport to calibrate them against, so there is **no** retry test and no assumable attempt
-count. When the transport lands it owns the policy; keep both languages retry-free until
-then, since the number of times a throwing store is invoked is observable and the two would
-otherwise diverge.
+Retry policy is owned by the delivery transport (`FDv2SkillStore`'s backoff and retry
+budget), so there is **no** retry test and no assumable attempt count at this layer. Keep
+both languages retry-free here, since the number of times a throwing store is invoked is
+observable and the two would otherwise diverge.
 
 ---
 

@@ -65,28 +65,13 @@ class TestWatchSkills:
     ) -> None:
         """Six notifications spread across one window produce two reconciles.
 
-        Three things are needed for this to discriminate rather than pass
-        vacuously, and this test does all three:
+        To discriminate rather than pass vacuously, the puts happen after the
+        listener is attached, the counter is asserted against an exact figure,
+        and each put lands in its own scheduler pass (a back-to-back burst would
+        collapse to one reconcile with or without a debounce).
 
-        * The puts happen **after** ``watch_skills`` has attached its listener.
-          A payload committed before that reaches nobody, the counter stays at
-          zero, and an upper bound then passes against an implementation with
-          the debouncing deleted.
-        * The counter is asserted to have **moved**, and against an exact
-          figure. A run in which nothing was ever notified is not a test of
-          coalescing.
-        * The notifications are **spread over time**. A burst arriving inside
-          one synchronous pass of the listener collapses to a single reconcile
-          whether or not the debounce exists, because the worker had not woken
-          yet — so a payload of twelve objects put back to back proves nothing.
-          Each put here lands in its own scheduler pass.
-
-        **Two, not one.** This watcher clears its wake flag before the window
-        rather than after, so a change arriving *inside* the window schedules a
-        further pass instead of being merged into the reconcile that is about to
-        run: six puts across one window are one reconcile for the window plus
-        one for the spill. Six separate reconciles is what the debounce
-        prevents, and is what this figure discriminates against.
+        Two, not one: the wake flag is cleared before the window, so a change
+        arriving inside it schedules one further pass.
         """
         store = InMemorySkillStore()
         await init_client(options={"skillStore": store}, client=object())

@@ -1,23 +1,13 @@
 """
-Agent Skills — re-reconcile on delivery, so revocation does not wait for a restart.
+Agent Skills — keep skills on disk in sync as delivery changes.
 
-``write_skills`` is a one-shot reconcile: it materializes what the store holds
-now. With a hand-populated store that is sufficient, and a revocation takes
-effect at the next process restart.
+``write_skills`` is a one-shot reconcile of what the store holds now.
+``watch_skills`` re-runs it whenever the store reports a change, so a skill
+revoked in LaunchDarkly is removed from disk within a debounce interval rather
+than at the next restart.
 
-A streaming FDv2 connection changes the premise. A ``delete-object`` reaches a
-live connection in **seconds**, and the store publishes a change listener, so
-wiring the two together collapses the gap between "LaunchDarkly revoked this
-skill" and "its ``SKILL.md`` is off the agent's disk" from a process lifetime to
-a debounce interval.
-
-``on_unavailable="keep"`` stays the default: an outage must not read as
-"everything was revoked". A watcher that pruned on a failed retrieval would
-convert every transport failure into deletion of the application's skill files.
-
-Layering: this module sits *above* ``skills_fs`` and calls ``write_skills``
-without modifying it. Nothing in the reconcile, the accessors, or verification
-knows this file exists.
+``on_unavailable="keep"`` remains the default, so an outage never deletes the
+application's skill files.
 """
 
 from __future__ import annotations
@@ -38,33 +28,19 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DEBOUNCE_SECONDS = 0.5
 """
-How long a change waits for its neighbours before a reconcile runs.
-
-A full payload transfer commits many objects at once and the listener fires per
-object, so without coalescing a payload of forty skills would run forty
-reconciles against one root. Half a second is far below the seconds-scale
-latency this feature is trying to achieve and far above the microseconds a
-commit's listener calls take.
+Default debounce, in seconds: how long to wait after a change before
+reconciling, so a payload of many skills triggers one reconcile, not one each.
 """
 
 
 class SkillWatcher:
     """
-    A running re-reconcile. Returned by ``watch_skills``; stop it with ``close``.
+    A running watch. Returned by ``watch_skills``; stop it with ``close`` (or
+    use it as a context manager).
 
-    One watcher owns one root. **Do not point two watchers at the same root**,
-    and do not run ``write_skills`` against a watched root concurrently: the
-    reconcile's own contract is one root, one reconcile at a time, because two
-    interleaved runs lose the loser's manifest entries and leave the files it
-    wrote unmanaged. This class enforces that for its *own* reconciles — they run
-    on a single worker thread, serialised — and cannot enforce it against a
-    caller who reconciles the same root by hand.
-
-    The watcher owns its registration on *store*: it registers ``notify`` when
-    constructed and unregisters it in ``close``, so a closed watcher is no longer
-    reachable from the store and can be collected. *store* must implement
-    ``add_listener``; ``remove_listener`` is probed for and, when the store does
-    not offer it, the listener stays registered for the store's lifetime.
+    **One watcher per root.** Don't point two watchers at the same root or run
+    ``write_skills`` on a watched root concurrently: interleaved reconciles can
+    lose manifest entries. The watcher serialises its own reconciles only.
     """
 
     def __init__(
@@ -95,26 +71,16 @@ class SkillWatcher:
             target=self._run, name="ld-ai-skills-reconcile", daemon=True
         )
 
-        # Register before the initial reconcile, and leave the worker unstarted
-        # until ``start``. ``notify`` only sets an event, so a change that lands
-        # while that reconcile is still running is recorded rather than lost, and
-        # the worker cannot reconcile the root while the caller's own reconcile is
-        # in flight. A store whose ``add_listener`` raises leaves no thread behind.
+        # Register now but start the worker later (``_start``): a change during
+        # the initial reconcile is recorded, not lost, and never reconciled
+        # concurrently with it. If ``add_listener`` raises, no thread is left.
         self._store = store
         self._registered = False
         store.add_listener(SKILL_OBJECT_KIND, self.notify)
         self._registered = True
 
     def _start(self) -> None:
-        """
-        Starts the worker. ``watch_skills`` calls this once, after the initial
-        reconcile; it is not part of the caller-facing interface.
-
-        Split from construction so registration and reconciling can be ordered
-        independently: the listener attaches first, so no change is missed, while
-        the first re-reconcile waits for the initial one to finish, so a root only
-        ever has one reconcile running at a time.
-        """
+        """Starts the worker. Called once by ``watch_skills`` after the initial reconcile."""
         self._thread.start()
 
     # -- the listener the store calls -------------------------------------
@@ -123,12 +89,8 @@ class SkillWatcher:
         """
         The store's change listener. Records that something changed; runs nothing.
 
-        Deliberately trivial. It is called on the delivery thread, where a
-        reconcile — which does synchronous filesystem I/O, an fsync per file, and
-        a manifest rewrite — would stall event processing for the duration and,
-        on a stream, let the connection's read buffer back up behind a disk write.
-        The argument is ignored: a put's raw object and a revocation's tombstone
-        both mean the same thing here, which is "the store is not what it was".
+        Called on the delivery thread, so it must not block on filesystem work.
+        The argument is ignored: any change triggers a full reconcile.
         """
         self._wake.set()
 
@@ -140,9 +102,8 @@ class SkillWatcher:
                 continue
             if self._stop.is_set():
                 return
-            # Coalesce the rest of the burst. Clearing *before* the sleep rather
-            # than after is what makes a change arriving mid-debounce trigger the
-            # next pass instead of being swallowed by this one.
+            # Clear before the debounce so a change arriving mid-debounce
+            # triggers another pass instead of being swallowed by this one.
             self._wake.clear()
             if self._stop.wait(self._debounce):
                 return
@@ -160,8 +121,7 @@ class SkillWatcher:
                 )
             )
         except Exception:
-            # A watcher that died on one bad reconcile would silently stop
-            # tracking revocations, which is worse than a noisy one.
+            # Log and keep watching; dying here would silently stop revocations.
             logger.error(
                 "A skill re-reconcile raised; the watcher continues", exc_info=True
             )
@@ -189,26 +149,17 @@ class SkillWatcher:
 
     @property
     def reconciles(self) -> int:
-        """How many re-reconciles have completed since the watcher started.
-
-        Excludes the initial reconcile ``watch_skills`` awaits, which is the
-        caller's own result."""
+        """Number of re-reconciles completed, excluding the initial one."""
         with self._lock:
             return self._reconciles
 
     def close(self, timeout: float = 15.0) -> None:
         """
-        Stops watching. Idempotent. Does not undo anything already on disk.
+        Stops watching. Idempotent; leaves files on disk as they are.
 
-        Waits out an in-flight reconcile rather than interrupting one, because a
-        reconcile killed between its content writes and its manifest rewrite is
-        the one case the manifest format has to recover from — worth avoiding
-        where the timing is under the SDK's control.
-
-        Detaches ``notify`` from the store first, so no further change reaches a
-        watcher that is shutting down and the store no longer holds a reference to
-        it. A store without the optional ``remove_listener`` is left as it is
-        rather than failing the close.
+        Detaches from the store (when it has ``remove_listener``), then waits up
+        to *timeout* seconds for an in-flight reconcile to finish rather than
+        interrupting it mid-write.
         """
         self._detach()
         self._stop.set()
@@ -245,33 +196,31 @@ async def watch_skills(
     """
     Reconciles now, then re-reconciles whenever delivery changes.
 
-    Every argument that ``write_skills`` takes means the same thing here and is
-    passed straight through; the reconcile's semantics are untouched. Returns the
-    initial reconcile's report — so a caller can fail fast on a bad root or a
-    corrupt manifest exactly as they would with ``write_skills`` — paired with a
-    ``SkillWatcher`` to close when the process is done::
+    Takes the same arguments as ``write_skills``, plus the two below. Errors
+    from the initial ``write_skills`` (e.g. a bad root) propagate, so you can
+    fail fast exactly as with ``write_skills``. If the store has no
+    ``remove_listener``, a closed watcher stays registered with the store for
+    the store's lifetime.
 
-        report, watcher = await watch_skills("*", "/etc/agent/skills")
-        try:
-            ...
-        finally:
-            watcher.close()
+    Args:
+        debounce: Seconds to wait after a change before reconciling. Must be a
+            non-negative finite number.
+        on_reconcile: Called with each re-reconcile's report (not the initial
+            one). Exceptions it raises are logged and do not stop the watcher.
 
-    A revocation delivered over a streaming connection then prunes the skill's
-    files within ``debounce`` of arriving, rather than at the next restart.
+    Returns:
+        The initial reconcile's report and a ``SkillWatcher`` to close when done::
 
-    Requires a store that implements the optional ``add_listener`` half of the
-    ``SkillStore`` interface. Raises ``RuntimeError`` when no store is configured,
-    and when the configured store has no ``add_listener`` — the second case
-    failing loudly rather than degrading to a one-shot reconcile, because a
-    watcher that silently never fires looks exactly like a watcher whose skills
-    never changed. The optional ``remove_listener`` lets ``SkillWatcher.close``
-    detach from the store; a store without it still works, but each closed
-    watcher then stays registered for the store's lifetime.
+            report, watcher = await watch_skills("*", "/etc/agent/skills")
+            try:
+                ...
+            finally:
+                watcher.close()
 
-    *debounce* must be a non-negative finite number of seconds. ``NaN`` raises
-    alongside a negative value: it would pass a bare ``< 0`` guard and then
-    collapse the coalescing window to nothing.
+    Raises:
+        RuntimeError: If no store is configured, or the store has no
+            ``add_listener`` (use ``write_skills`` for a one-shot reconcile).
+        ValueError: If *debounce* is negative, ``NaN``, or infinite.
     """
     store = get_store()
     if store is None:
@@ -287,28 +236,16 @@ async def watch_skills(
             "observed. Use write_skills for a one-shot reconcile, or configure a "
             "store with a delivery transport (FDv2SkillStore)."
         )
-    # Both non-finite values are cases a bare ``< 0`` guard misses, and they
-    # fail in opposite directions. ``nan < 0`` is ``False``, so it passes and
-    # then collapses the window to nothing, because ``Event.wait(nan)`` returns
-    # immediately: every delivered object reconciles on its own with no
-    # coalescing at all, the opposite of what the option is for. ``inf`` passes
-    # too, and ``Event.wait(inf)`` never returns, so the watcher never
-    # reconciles again. One rule, stated three times: ``write_skills`` guards
-    # its ``timeout`` this way and the delivery store its ``poll_interval`` and
-    # ``read_timeout``. Narrowing any one of them back is breaking the others.
+    # A bare ``< 0`` check misses both non-finite values: ``Event.wait(nan)``
+    # returns immediately (no debouncing) and ``Event.wait(inf)`` never returns.
     if not math.isfinite(debounce) or debounce < 0:
         raise ValueError(
             f"debounce must be a non-negative finite number of seconds, got "
             f"{debounce!r}"
         )
 
-    # The watcher attaches its listener before the initial reconcile, not after.
-    # The reconcile snapshots the store as its first step and then spends the
-    # rest of its time on the filesystem — a write and an fsync per skill, the
-    # prune, the manifest rewrite — so a change delivered after that snapshot
-    # needs something already listening to be seen at all. Nothing re-reconciles
-    # on a timer, so a revocation that landed unobserved would wait for the next
-    # unrelated change, which on a quiet root means the next restart.
+    # Attach the listener before the initial reconcile, so a change delivered
+    # after its store snapshot is still seen (nothing re-reconciles on a timer).
     watcher = SkillWatcher(
         skills,
         root,
@@ -320,21 +257,15 @@ async def watch_skills(
         on_reconcile=on_reconcile,
     )
     try:
-        # The initial reconcile runs on the caller's thread, so its report is the
-        # caller's to inspect and a bad root raises out of `watch_skills` rather
-        # than into a worker thread's log.
+        # Run on the caller's task, so a bad root raises to the caller.
         report = await write_skills(
             skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
         )
     except BaseException:
-        # The listener is already attached, so a reconcile that raises must not
-        # leave it on the store: the caller has no watcher to close.
+        # The caller gets no watcher to close, so detach the listener here.
         watcher.close()
         raise
 
-    # Only now start the worker. A change that arrived during the reconcile has
-    # already set the wake event, so the worker's first pass picks it up; one that
-    # arrived before the reconcile's snapshot is already on disk, and the
-    # redundant pass it triggers converges on the same state.
+    # Any change seen during the initial reconcile is already pending.
     watcher._start()
     return report, watcher
