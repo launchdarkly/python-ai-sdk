@@ -151,7 +151,7 @@ All three judge paths build `{{message_history}}` through a single function, `ju
 
 Each one is the input, then the tool trajectory, then the output, then the `{score, reasoning}` format block, with empty parts skipped. A judge therefore grades the same conversation wherever it runs, which is what makes a rubric portable between a production sample and a dataset replay.
 
-All three paths build that history through a single function, so they cannot drift apart. Every path carries both the input and the trajectory, including the deferred one: `JudgeTask` has `user_input` and `trajectory` fields so a deferred judge never grades a response with no request beside it.
+Every path carries both the input and the trajectory, including the deferred one: `JudgeTask` has `user_input` and `trajectory` fields so a deferred judge never grades a response with no request beside it.
 
 For the deferred path those two fields travel on the task, which stays picklable — the trajectory crosses as the rendered string, not the structured record.
 
