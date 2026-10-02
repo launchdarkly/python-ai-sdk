@@ -18,12 +18,13 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import ProviderHandler, graph
+from launchdarkly_ai_server import ProviderHandler, RunJudgesResult, graph
 from launchdarkly_ai_server.conversation import (
     GEN_AI_CONVERSATION_ID,
     ConversationIdSpanProcessor,
     conversation_id,
 )
+from launchdarkly_ai_server.types import JudgeDiagnostic
 
 CONTEXT = {"kind": "user", "key": "u1"}
 
@@ -448,7 +449,7 @@ class TestGraphStream:
         with patch(
             "launchdarkly_ai_server.judges.run_judges",
             new_callable=AsyncMock,
-            return_value=judge_data,
+            return_value=RunJudgesResult(judge_results=judge_data),
         ) as run_judges:
             events = await _collect(
                 graph(
@@ -461,13 +462,49 @@ class TestGraphStream:
         assert events[-1]["type"] == "done"
         assert events[-1]["judgeResults"] == judge_data
 
+    async def test_graph_judge_diagnostics_reach_the_done_event(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        diagnostic = JudgeDiagnostic(
+            judge_key="graph-judge",
+            status="failed",
+            stage="provider",
+            code="judge_provider_failed",
+        )
+
+        async def judges(*args: Any, **kwargs: Any) -> RunJudgesResult:
+            judge_keys = (
+                [j["key"] for j in kwargs["config"]["judgeConfiguration"]["judges"]]
+                if (kwargs["config"] or {}).get("judgeConfiguration")
+                else []
+            )
+            if judge_keys == ["graph-judge"]:
+                return RunJudgesResult(judge_diagnostics=[diagnostic])
+            return RunJudgesResult()
+
+        with patch(
+            "launchdarkly_ai_server.judges.run_judges",
+            new_callable=AsyncMock,
+            side_effect=judges,
+        ):
+            events = await _collect(
+                graph(
+                    "graph-key",
+                    handlers=[_make_streaming_handler(["final"])],
+                    graph_judge="graph-judge",
+                ).stream("hi", CONTEXT)
+            )
+        assert events[-1]["type"] == "done"
+        assert "judgeResults" not in events[-1]
+        assert events[-1]["judgeDiagnostics"] == [diagnostic]
+
     async def test_omits_judge_results_when_empty(
         self, mock_ld_client: MagicMock
     ) -> None:
         with patch(
             "launchdarkly_ai_server.judges.run_judges",
             new_callable=AsyncMock,
-            return_value={},
+            return_value=RunJudgesResult(),
         ):
             events = await _collect(
                 graph(
@@ -527,7 +564,7 @@ class TestGraphStream:
         with patch(
             "launchdarkly_ai_server.judges.run_judges",
             new_callable=AsyncMock,
-            return_value={},
+            return_value=RunJudgesResult(),
         ) as run_judges:
             await _collect(
                 graph(
@@ -620,7 +657,7 @@ class TestGraphStreamMultiEdge:
         with patch(
             "launchdarkly_ai_server.judges.run_judges",
             new_callable=AsyncMock,
-            return_value={},
+            return_value=RunJudgesResult(),
         ) as run_judges:
             await _collect(graph("graph-key", handlers=[h]).stream("hi", CONTEXT))
 
@@ -691,7 +728,7 @@ class TestGraphStreamMultiEdge:
         with patch(
             "launchdarkly_ai_server.judges.run_judges",
             new_callable=AsyncMock,
-            return_value={},
+            return_value=RunJudgesResult(),
         ) as run_judges:
             await _collect(
                 graph(
@@ -915,16 +952,18 @@ class TestGraphStreamOtel:
     async def test_graph_judge_spans_nest_under_graph(
         self, mock_ld_client: MagicMock
     ) -> None:
-        async def run_judges_with_span(*args: Any, **kwargs: Any) -> dict:
+        async def run_judges_with_span(*args: Any, **kwargs: Any) -> RunJudgesResult:
             span = _tracer.start_span("graph.judge")
             span.end()
-            return {
-                "graph-judge": {
-                    "usage": {"input": 1, "output": 1, "total": 2},
-                    "response": "ok",
-                    "score": 0.9,
+            return RunJudgesResult(
+                judge_results={
+                    "graph-judge": {
+                        "usage": {"input": 1, "output": 1, "total": 2},
+                        "response": "ok",
+                        "score": 0.9,
+                    }
                 }
-            }
+            )
 
         with patch(
             "launchdarkly_ai_server.judges.run_judges",
