@@ -302,7 +302,11 @@ class TestToLangGraphLangChainSpecific:
                     "config": {
                         "model": {
                             "name": "gpt-4o",
-                            "parameters": {"temperature": 0.2, "max_tokens": 512},
+                            "parameters": {
+                                "temperature": 0.2,
+                                "max_tokens": 512,
+                                "tools": [{"name": "openai-tool"}],
+                            },
                         },
                         "instructions": "help",
                     },
