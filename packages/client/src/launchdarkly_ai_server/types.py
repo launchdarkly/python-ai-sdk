@@ -92,7 +92,8 @@ class Message:
 AiConfigRep = dict[str, Any]
 """
 Raw AI config dict as returned by ``parse_ai_config``. Fields include
-``model``, ``provider``, and at least one of ``instructions`` / ``messages``.
+``model``, ``provider``, at least one of ``instructions`` / ``messages``, and an
+optional ``skills`` array of ``{key, version}`` references (see ``skill_refs``).
 """
 
 VariationMeta = dict[str, Any]
@@ -441,6 +442,129 @@ class ProviderGraphResponse:
     """Aggregate token counts across all nodes."""
     judge_results: dict[str, JudgeResult] | None = None
     """Results from a graph-level judge, if configured."""
+
+
+# ---------------------------------------------------------------------------
+# Agent Skills
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SkillReference:
+    """A version-pinned pointer to a skill, as attached to an AI Config variation."""
+
+    key: str
+    """Immutable skill key — ``^[a-z0-9][a-z0-9-]*$``, at most 256 characters."""
+    version: int
+    """Immutable skill version — an integer >= 1."""
+
+
+@dataclass(frozen=True)
+class Skill:
+    """
+    A single verified ``SKILL.md`` document. Immutable.
+
+    The accessors return a ``Skill`` only after integrity verification, so
+    ``content`` is exactly the bytes LaunchDarkly delivered and ``content_hash``
+    is their sha256.
+    """
+
+    key: str
+    version: int
+    content: bytes
+    """The verbatim bytes. The SDK never decodes or parses them."""
+    content_hash: str
+    """sha256, lowercase hex, over the verbatim bytes of ``content``."""
+    name: str | None = None
+    """Display name from LaunchDarkly metadata; never parsed from the content."""
+    description: str | None = None
+    """Description from LaunchDarkly metadata; never parsed from the content."""
+
+
+SkillOutcomeReason = Literal[
+    "absent", "integrity_failure", "ok", "store_unavailable", "wrong_version"
+]
+"""
+The outcomes ``get_skill_result`` reports.
+
+- ``ok`` — a verified skill was returned.
+- ``absent`` — the store does not hold the key.
+- ``integrity_failure`` — content failed verification and was withheld. Fail
+  closed on this one: it can indicate tampering.
+- ``store_unavailable`` — the store raised. An outage, not a deletion.
+- ``wrong_version`` — the store holds a different version than the one
+  requested, so nothing was returned.
+"""
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """
+    The result of ``get_skill_result``: the skill, plus why it was or wasn't
+    returned. Immutable.
+    """
+
+    skill: Skill | None
+    """The verified skill; set only when ``reason == "ok"``."""
+    reason: SkillOutcomeReason
+    """Which outcome happened; see ``SkillOutcomeReason``."""
+    detail: str | None
+    """
+    Human-readable message, set for every reason except ``ok``.
+
+    Safe to log: never contains skill content or filesystem paths. Branch on
+    ``reason``, not on this.
+    """
+
+
+ReconcileActionKind = Literal[
+    "written", "updated", "skipped_current", "removed", "error"
+]
+"""
+The per-skill outcomes ``write_skills`` reports.
+
+- ``written`` — the file did not exist and now holds the resolved content.
+- ``updated`` — a managed file held different bytes and was overwritten.
+- ``skipped_current`` — the bytes on disk already are the resolved content.
+- ``removed`` — the skill is no longer managed and is not on disk (whether this
+  run deleted it or it was already gone).
+- ``error`` — the outcome was refused or failed; see ``ReconcileAction.error``.
+"""
+
+
+@dataclass(frozen=True)
+class ReconcileAction:
+    """What ``write_skills`` did — or refused to do — for one skill."""
+
+    key: str
+    """
+    The skill key, or ``""`` for a run-level failure not tied to one skill (for
+    example a corrupt or unwritable manifest, or a failed retrieval). Expect
+    ``""`` when grouping a report by key.
+    """
+    action: ReconcileActionKind
+    version: int | None = None
+    path: str | None = None
+    """Canonical resolved path, when one was determined."""
+    error: str | None = None
+    """Failure detail, set only when ``action == "error"``."""
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """The result of a ``write_skills`` run: one action per outcome."""
+
+    actions: list[ReconcileAction] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """``True`` iff no action is an ``error``."""
+        return not self.errors
+
+    @property
+    def errors(self) -> list[ReconcileAction]:
+        """The ``error`` actions, in ``actions`` order."""
+        return [a for a in self.actions if a.action == "error"]
 
 
 # ---------------------------------------------------------------------------

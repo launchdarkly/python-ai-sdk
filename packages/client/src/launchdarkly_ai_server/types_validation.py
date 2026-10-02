@@ -1,14 +1,53 @@
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, TypeGuard
 
 from .types import ParseFailure, ParseResult, ParseSuccess
 
 _VALID_ROLES = {"user", "assistant", "system"}
 
+SKILL_KEY_GRAMMAR = "^[a-z0-9][a-z0-9-]*$"
+"""The skill key grammar, as quoted in rejection messages."""
+
+_SKILL_KEY_PATTERN = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
+"""
+``SKILL_KEY_GRAMMAR`` anchored with ``\\A``/``\\Z``: ``$`` would also match before
+a trailing newline and let ``"pdf-extraction\\n"`` through as a directory name.
+"""
+
+SKILL_KEY_MAX_LENGTH = 256
+"""Longest permitted skill key. ``write_skills`` applies a tighter bound, since
+most filesystems cap a path component below 256 bytes."""
+
 
 def _is_object(v: Any) -> bool:
     return isinstance(v, dict)
+
+
+def skill_key_rejection_reason(key: Any) -> str | None:
+    """
+    Why *key* is not a valid skill key, or ``None`` when it is.
+
+    Shared by every caller that validates keys, so rejections read the same.
+    """
+    if not isinstance(key, str):
+        return "must be a string"
+    if len(key) > SKILL_KEY_MAX_LENGTH:
+        return f"must be at most {SKILL_KEY_MAX_LENGTH} characters"
+    if _SKILL_KEY_PATTERN.match(key) is None:
+        return f"must match {SKILL_KEY_GRAMMAR}"
+    return None
+
+
+def is_valid_skill_key(key: Any) -> TypeGuard[str]:
+    """Whether *key* is a valid skill key (see ``skill_key_rejection_reason``)."""
+    return isinstance(key, str) and skill_key_rejection_reason(key) is None
+
+
+def is_valid_skill_version(version: Any) -> TypeGuard[int]:
+    """Whether *version* is a valid skill version: an ``int`` >= 1 (not ``bool``)."""
+    return isinstance(version, int) and not isinstance(version, bool) and version >= 1
 
 
 def _parse_tool(raw: Any, key: str) -> str | None:
@@ -21,6 +60,27 @@ def _parse_tool(raw: Any, key: str) -> str | None:
         return f'tools.{key}.type must be "function"'
     if not _is_object(raw.get("parameters")):
         return f"tools.{key}.parameters must be an object"
+    return None
+
+
+def _parse_skills(raw: Any) -> str | None:
+    """
+    Validates the optional ``skills`` array. Returns an error message or ``None``.
+
+    Fails closed: one malformed reference fails the whole config, rather than
+    silently materializing a partial skill set.
+    """
+    if not isinstance(raw, list):
+        return "skills must be an array of {key, version} objects"
+
+    for index, entry in enumerate(raw):
+        if not _is_object(entry):
+            return f"skills[{index}] must be an object with key and version"
+        key_rejection = skill_key_rejection_reason(entry.get("key"))
+        if key_rejection is not None:
+            return f"skills[{index}].key {key_rejection}"
+        if not is_valid_skill_version(entry.get("version")):
+            return f"skills[{index}].version must be an integer >= 1"
     return None
 
 
@@ -87,5 +147,12 @@ def parse_ai_config(raw: Any) -> ParseResult:
             success=False,
             error={"message": "outputFormat must be an object (JSON Schema)"},
         )
+
+    # ``in``, not ``is not None``: ``skills: null`` must fail the parse. Read as
+    # "no skills", a ``prune=True`` reconcile would delete skill files on disk.
+    if "skills" in raw:
+        err = _parse_skills(raw["skills"])
+        if err:
+            return ParseFailure(success=False, error={"message": err})
 
     return ParseSuccess(success=True, data=raw)

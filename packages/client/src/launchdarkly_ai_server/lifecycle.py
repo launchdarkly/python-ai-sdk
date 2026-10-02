@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any
 
+from . import skills
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .types import InitClientOptions
 from .utils import model_stamps_from_meta
@@ -132,12 +133,32 @@ async def init_client(
 
     - Pass *client* directly (BYOC) to skip the LaunchDarkly Python SDK path.
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
+    - ``options['skillStore']`` sets the store the Agent Skills accessors read
+      from. Without one, the accessors raise ``RuntimeError``.
+
+    Idempotent: later calls return the existing client and ignore every option
+    **except** ``skillStore``, which is applied on every successful call, so you
+    can add a store after initialization. A ``None`` store never clears the
+    current one (use ``shutdown()``), and a call that raises installs nothing.
 
     Returns the initialized ``LDClientInterface`` instance.
     """
-    global _client
-
     opts = options or {}
+
+    ld_client = await _resolve_client(opts, client)
+
+    # Reached only on success, so a failed init installs no store.
+    skill_store = opts.get("skillStore")
+    if skill_store is not None:
+        skills._set_store(skill_store)
+    return ld_client
+
+
+async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
+    """
+    Returns the singleton client, initializing it on first call.
+    """
+    global _client
 
     # Idempotent — if already initialized, return the existing client
     if _client is not None:
@@ -203,11 +224,16 @@ async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
+
+    Also clears the configured skill store; pass ``skillStore`` again to the
+    next ``init_client`` to keep using the skill accessors.
     """
     global _client, _tracer_provider
 
     local_client = _client
     local_provider = _tracer_provider
+
+    skills._clear_state()
 
     # Null the singleton before any awaits so a second call is a no-op
     _client = None
@@ -246,6 +272,7 @@ def _reset_for_testing() -> None:
     global _client, _tracer_provider
     _client = None
     _tracer_provider = None
+    skills._clear_state()
 
 
 async def inspect_config(
