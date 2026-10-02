@@ -19,8 +19,10 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    set_ld_span_attributes,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 from .messages import to_lang_chain_messages
 
@@ -166,13 +168,6 @@ def to_lang_graph(
             if raw_ld_context is not None
             else None
         )
-
-        tracer_name = "@launchdarkly/ai-langchain-agents"
-        if _HAS_OTEL:
-            span = trace.get_tracer(tracer_name).start_span("launchdarkly.graph")
-            span.set_attribute("launchdarkly.graph.key", def_obj.key)
-        else:
-            span = None
 
         start_time = time.monotonic()
         run_id = str(uuid.uuid4())
@@ -368,6 +363,20 @@ def to_lang_graph(
             else [HumanMessage(input_text)]
         )
 
+        tracer_name = "@launchdarkly/ai-langchain-agents"
+        if _HAS_OTEL:
+            span = trace.get_tracer(tracer_name).start_span("launchdarkly.graph")
+        else:
+            span = None
+        if span:
+            set_ld_span_attributes(
+                span,
+                {
+                    "__ld": make_graph_track_data(def_obj.key, run_id),
+                    "ldContext": raw_ld_context,
+                },
+            )
+
         try:
             result = await compiled.ainvoke({"messages": initial_messages})
             if span:
@@ -378,7 +387,7 @@ def to_lang_graph(
                 span.set_status(SpanStatusCode.ERROR, str(exc))
                 span.end()
             if ld_context:
-                td = make_track_data(root, def_obj.key, run_id)
+                td = make_graph_track_data(def_obj.key, run_id)
                 get_client().track("$ld:ai:graph:invocation_failure", ld_context, td, 1)
             raise
 
@@ -412,13 +421,13 @@ def to_lang_graph(
             span.end()
 
         if ld_context:
-            root_td = make_track_data(root, def_obj.key, run_id)
+            graph_td = make_graph_track_data(def_obj.key, run_id)
             client = get_client()
-            client.track("$ld:ai:graph:duration:total", ld_context, root_td, duration)
+            client.track("$ld:ai:graph:duration:total", ld_context, graph_td, duration)
             client.track(
-                "$ld:ai:graph:total_tokens", ld_context, root_td, total_usage["total"]
+                "$ld:ai:graph:total_tokens", ld_context, graph_td, total_usage["total"]
             )
-            client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
+            client.track("$ld:ai:graph:invocation_success", ld_context, graph_td, 1)
 
         return {"response": final_output, "usage": total_usage}
 

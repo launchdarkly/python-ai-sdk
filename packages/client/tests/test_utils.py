@@ -18,6 +18,7 @@ from launchdarkly_ai_server import (
     parse_template,
     parse_usage,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 # ---------------------------------------------------------------------------
 # ?3.1 parse_template
@@ -304,6 +305,47 @@ class TestMakeTrackData:
         )
         assert "modelKey" not in td
         assert "modelVersion" not in td
+
+    def test_carries_the_environment_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-abc")
+        td = make_track_data(
+            self._node({"variationKey": "v1", "version": 1}), "graph-key", "run-1"
+        )
+        assert td["environmentId"] == "env-abc"
+
+    def test_omits_environment_id_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LD_ENVIRONMENT_ID", raising=False)
+        td = make_track_data(
+            self._node({"variationKey": "v1", "version": 1}), "graph-key", "run-1"
+        )
+        assert "environmentId" not in td
+
+
+class TestMakeGraphTrackData:
+    """The payload a native graph adapter puts on its ``launchdarkly.graph`` span."""
+
+    def test_uses_the_graph_key_as_the_config_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-abc")
+        assert make_graph_track_data("graph-key", "run-1") == {
+            "runId": "run-1",
+            "configKey": "graph-key",
+            "variationKey": "",
+            "version": 1,
+            "modelName": "",
+            "providerName": "",
+            "graphKey": "graph-key",
+            "environmentId": "env-abc",
+        }
+
+    def test_omits_environment_id_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LD_ENVIRONMENT_ID", raising=False)
+        assert "environmentId" not in make_graph_track_data("graph-key", "run-1")
 
 
 class TestModelStampsFromMeta:

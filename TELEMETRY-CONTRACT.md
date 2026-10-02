@@ -649,6 +649,16 @@ them so the graph span and the `invoke_agent` root share one name for the graph 
 everything LaunchDarkly owns on a span sits under `launchdarkly.`. `ld.ai.` stays reserved for
 metric and event keys.
 
+Every `launchdarkly.graph` span, from `graph()` and from each `native_graph` adapter, goes through
+`set_ld_span_attributes`, so it carries the identity in section 2 and the `feature_flag` event.
+Its config key is the graph key. The graph-level events (`$ld:ai:graph:invocation_success`,
+`invocation_failure`, `duration:total` and `total_tokens`) use the same track data, so their
+`configKey` is the graph key too, whichever runner produced them. Node-level events keep the node's
+own config key.
+
+A native adapter has no graph variation metadata, so its graph span and graph events report an
+empty `variationKey` and version 1. `graph()` reports the real values.
+
 Nothing else in `graph.py` or `native_graph.py` needs work.
 
 ---

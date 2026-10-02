@@ -27,7 +27,13 @@ from .types import (
     UsageDict,
     VariationMeta,
 )
-from .utils import end_span_once, model_stamps_from_meta, select_handler, to_ld_context
+from .utils import (
+    end_span_once,
+    model_stamps_from_meta,
+    select_handler,
+    set_ld_span_attributes,
+    to_ld_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +115,7 @@ async def _build_graph(
 ) -> tuple[GraphDefinition, TrackData, Callable[..., Any]]:
     from .judges import run_judges
     from .lifecycle import extract_variation, get_client
-    from .tracking import execute_and_track
+    from .tracking import _try_get_environment_id, execute_and_track
 
     result = await _fetch_graph_variation(key, context)
     # Convert once so all inner track() calls use an ldclient.Context object.
@@ -128,6 +134,9 @@ async def _build_graph(
         **model_stamps_from_meta(meta),
         "graphKey": key,
     }
+    _environment_id = _try_get_environment_id()
+    if _environment_id:
+        graph_track_data["environmentId"] = _environment_id
 
     if not enabled or not topology:
         return (
@@ -914,7 +923,9 @@ class GraphInstance:
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
-            span.set_attribute("launchdarkly.graph.key", self._key)
+            set_ld_span_attributes(
+                span, {"__ld": graph_track_data, "ldContext": context}
+            )
 
             start_time = time.monotonic()
             total_usage = {"input": 0, "output": 0, "total": 0}
@@ -1130,7 +1141,7 @@ class GraphInstance:
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
-        span.set_attribute("launchdarkly.graph.key", self._key)
+        set_ld_span_attributes(span, {"__ld": graph_track_data, "ldContext": context})
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()
