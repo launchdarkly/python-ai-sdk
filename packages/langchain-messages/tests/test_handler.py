@@ -186,6 +186,27 @@ class TestFactory:
         h = create_langchain_messages_handler(llm=_make_llm())
         assert h.provides_for == ("*", "messages")
 
+    def test_providers_is_unset_by_default(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        h = create_langchain_messages_handler(llm=_make_llm())
+        assert h.providers is None
+
+    def test_providers_scopes_the_wildcard(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        h = create_langchain_messages_handler(
+            llm=_make_llm(), providers=["Bedrock", "Anthropic"]
+        )
+        assert h.provides_for == ("*", "messages")
+        assert h.providers == ("Bedrock", "Anthropic")
+
+    def test_empty_providers_is_rejected(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        with pytest.raises(ValueError, match="providers"):
+            create_langchain_messages_handler(llm=_make_llm(), providers=[])
+
     def test_multiple_calls_return_independent_instances(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 
@@ -1124,6 +1145,24 @@ class TestConvenienceExport:
         mock_config_instance.invoke.assert_called_once_with(
             "hello", ctx, variables=None
         )
+
+    def test_providers_is_forwarded_to_the_handler(self) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        mock_config_instance = MagicMock()
+        mock_config_fn = MagicMock(return_value=mock_config_instance)
+        mock_config_instance.invoke = MagicMock(return_value="result")
+
+        with patch.object(handler_mod, "config", mock_config_fn):
+            from launchdarkly_ai_langchain_messages.handler import langchain_messages
+
+            ctx = {"kind": "user", "key": "u1"}
+            langchain_messages("my-flag", "hello", ctx, providers=["Bedrock"])
+
+        call_kwargs = mock_config_fn.call_args.kwargs
+        assert "providers" not in call_kwargs
+        assert call_kwargs["handler"].providers == ("Bedrock",)
+        assert call_kwargs["handler"].provides_for == ("*", "messages")
 
     def test_callable_without_extra_kwargs(self) -> None:
         import launchdarkly_ai_langchain_messages.handler as handler_mod

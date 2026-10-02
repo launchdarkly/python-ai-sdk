@@ -40,6 +40,15 @@ class TestLangChainGraph:
             assert "handlers" in kw
             assert len(kw["handlers"]) == 1
 
+    def test_providers_forwarded_to_the_handler(self) -> None:
+        with patch("launchdarkly_ai_langchain_agents.graph.graph") as mock_graph:
+            mock_graph.return_value = MagicMock()
+            langchain_graph("key", providers=["Bedrock"])
+            kw = mock_graph.call_args[1]
+            assert "providers" not in kw
+            assert kw["handlers"][0].providers == ("Bedrock",)
+            assert kw["handlers"][0].provides_for == ("*", "agent")
+
     def test_llm_option_forwarded(self) -> None:
         mock_llm = MagicMock()
         with patch("launchdarkly_ai_langchain_agents.graph.graph") as mock_graph:
