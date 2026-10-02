@@ -512,6 +512,83 @@ class TestToLangGraphLangChainSpecific:
             assert data["environmentId"] == "env-123"
 
     @pytest.mark.asyncio
+    async def test_graph_events_are_keyed_to_the_graph(self) -> None:
+        """Graph-level events carry the graph key, like the graph span and graph()."""
+        calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: calls.append((evt, data))
+        )
+
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+
+        graph_events = [
+            (e, d)
+            for e, d in calls
+            if e
+            in (
+                "$ld:ai:graph:invocation_success",
+                "$ld:ai:graph:duration:total",
+                "$ld:ai:graph:total_tokens",
+            )
+        ]
+        assert len(graph_events) == 3
+        for _, data in graph_events:
+            assert data["configKey"] == "test-graph"
+            assert data["graphKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_no_span_left_open_when_graph_setup_fails(self) -> None:
+        """A setup error before the run must not leave a started span un-ended."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        mock_span = MagicMock()
+        mock_trace = MagicMock()
+        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+
+        class _BadCompileStateGraph:
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_node(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_edge(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_conditional_edges(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def compile(self) -> Any:
+                raise ValueError("bad graph")
+
+        mocks["langgraph.graph"].StateGraph = _BadCompileStateGraph
+        graph_def = _make_graph_def()
+
+        with _patch_imports(mocks):
+            with patch.object(ng_mod, "trace", mock_trace):
+                with patch.object(ng_mod, "_HAS_OTEL", True):
+                    with pytest.raises(ValueError, match="bad graph"):
+                        await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        started = mock_trace.get_tracer.return_value.start_span.call_count
+        assert mock_span.end.call_count == started
+
+    @pytest.mark.asyncio
     async def test_node_function_emits_graph_node(self) -> None:
         track_calls: list[tuple[str, Any, Any]] = []
         mock_ld_client = MagicMock()

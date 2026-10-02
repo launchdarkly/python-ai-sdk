@@ -648,6 +648,98 @@ class TestToOpenAIAgentsOpenAISpecific:
             assert data["environmentId"] == "env-123"
 
     @pytest.mark.asyncio
+    async def test_graph_events_are_keyed_to_the_graph(self) -> None:
+        """Graph-level events carry the graph key, like the graph span and graph()."""
+        calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: calls.append((evt, data))
+        )
+
+        run_result = _make_run_result("done")
+        agents_mock = _make_agents_mock(run_result)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            with patch.object(_openai_ng, "get_client", return_value=mock_ld_client):
+                await to_openai_agents(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+
+        graph_events = [
+            (e, d)
+            for e, d in calls
+            if e
+            in (
+                "$ld:ai:graph:invocation_success",
+                "$ld:ai:graph:duration:total",
+                "$ld:ai:graph:total_tokens",
+            )
+        ]
+        assert len(graph_events) == 3
+        for _, data in graph_events:
+            assert data["configKey"] == "test-graph"
+            assert data["graphKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_invocation_failure_is_keyed_to_the_graph(self) -> None:
+        calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: calls.append((evt, data))
+        )
+
+        agents_mock = _make_agents_mock(_make_run_result("done"))
+        agents_mock.Runner.run = AsyncMock(side_effect=RuntimeError("provider error"))
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            with patch.object(_openai_ng, "get_client", return_value=mock_ld_client):
+                with pytest.raises(RuntimeError):
+                    await to_openai_agents(
+                        _make_def_promise(graph_def),
+                        opts={"context": ctx},
+                    ).invoke("hi")
+
+        failures = [d for e, d in calls if e == "$ld:ai:graph:invocation_failure"]
+        assert len(failures) == 1
+        assert failures[0]["configKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_no_span_left_open_when_agent_setup_fails(self) -> None:
+        """A setup error before the run must not leave a started span un-ended."""
+        mock_span = MagicMock()
+        mock_trace = MagicMock()
+        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+
+        agents_mock = _make_agents_mock(_make_run_result("done"))
+        agents_mock.Agent = MagicMock(side_effect=ValueError("bad agent"))
+        graph_def = _make_graph_def()
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            with patch.object(_openai_ng, "trace", mock_trace):
+                with patch.object(_openai_ng, "_HAS_OTEL", True):
+                    with pytest.raises(ValueError, match="bad agent"):
+                        await to_openai_agents(_make_def_promise(graph_def)).invoke(
+                            "hi"
+                        )
+
+        started = mock_trace.get_tracer.return_value.start_span.call_count
+        assert mock_span.end.call_count == started
+
+    @pytest.mark.asyncio
     async def test_agent_end_hook_emits_generation_success(self) -> None:
         """agent_end hook must emit $ld:ai:generation:success for the agent's node."""
         track_calls: list[str] = []

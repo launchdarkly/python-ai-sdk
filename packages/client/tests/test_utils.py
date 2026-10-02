@@ -10,7 +10,6 @@ import pytest
 
 from launchdarkly_ai_server import (
     create_handler,
-    make_graph_track_data,
     make_track_data,
     model_stamps_from_meta,
     normalize_mode,
@@ -19,6 +18,7 @@ from launchdarkly_ai_server import (
     parse_template,
     parse_usage,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 # ---------------------------------------------------------------------------
 # ?3.1 parse_template
