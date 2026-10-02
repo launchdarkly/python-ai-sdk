@@ -63,6 +63,25 @@ def _is_terminal_summary(summary: RunSummary) -> bool:
     )
 
 
+def _run_passed(summary: RunSummary, criteria: list[Criterion]) -> bool:
+    """Return whether a run meets its gate.
+
+    When every criterion sets ``pass_rate_threshold``, the run passes if no
+    row is pending and the share of passed rows is at least the highest
+    threshold. Errored rows count as not passed. Otherwise the run passes
+    only if no row failed, errored, or is pending.
+    """
+    if summary.pending_rows != 0:
+        return False
+    thresholds = [criterion.pass_rate_threshold for criterion in criteria]
+    if thresholds and all(threshold is not None for threshold in thresholds):
+        if summary.total_rows <= 0:
+            return False
+        required = max(t for t in thresholds if t is not None)
+        return summary.passed_rows / summary.total_rows >= required
+    return summary.error_rows == 0 and summary.failed_rows == 0
+
+
 def _merge_generation(
     base: GenerationConfig, override: GenerationConfig | None
 ) -> GenerationConfig:
@@ -309,16 +328,7 @@ class EvaluationsModule:
             f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
         )
         return EvalRunResult(
-            # failed_rows counts rows whose criteria were scored and did not
-            # meet their threshold, so a gate that ignores it exits 0 on a run
-            # where every row failed its judge. It was omissible while runs were
-            # generation-only -- a row either generated or errored, and nothing
-            # produced a fail -- and stops being so the moment criteria exist.
-            passed=(
-                summary.error_rows == 0
-                and summary.failed_rows == 0
-                and summary.pending_rows == 0
-            ),
+            passed=_run_passed(summary, run_criteria),
             url=url,
             run_id=evaluation_run.id,
             summary=summary,
