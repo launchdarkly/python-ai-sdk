@@ -194,6 +194,60 @@ class TestRunJudges:
         assert effective.get("instructions") is not None
         assert effective.get("messages") == []
 
+    async def test_scoped_wildcard_skips_a_judge_outside_its_list(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        called = False
+
+        async def recording_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            nonlocal called
+            called = True
+            return {"output": '{"score": 0.8, "reasoning": "ok"}', "usage": {}}
+
+        scoped = ProviderHandler(
+            fn=recording_fn,
+            provides_for=("*", "agent"),  # type: ignore[arg-type]
+        )
+        scoped.providers = ("Bedrock",)  # type: ignore[attr-defined]
+        parent = ProviderHandler(
+            fn=recording_fn,
+            provides_for=("OpenAI", "messages"),  # type: ignore[arg-type]
+        )
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "claude-3-5-sonnet"},
+                "provider": {"name": "Anthropic"},
+                "messages": [{"role": "user", "content": "Evaluate this."}],
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "OpenAI"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=parent,
+                handlers=[scoped],
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+        assert called is False
+
     async def test_exact_agent_handler_fallback_collapses_messages(
         self, mock_ld_client: MagicMock
     ) -> None:

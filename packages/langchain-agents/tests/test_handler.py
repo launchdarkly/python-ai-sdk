@@ -177,6 +177,19 @@ class TestFactory:
         h = create_langchain_agents_handler()
         assert h.provides_for == ("*", "agent")
 
+    def test_providers_is_unset_by_default(self) -> None:
+        h = create_langchain_agents_handler()
+        assert h.providers is None
+
+    def test_providers_scopes_the_wildcard(self) -> None:
+        h = create_langchain_agents_handler(providers=["Bedrock"])
+        assert h.provides_for == ("*", "agent")
+        assert h.providers == ("Bedrock",)
+
+    def test_empty_providers_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="providers"):
+            create_langchain_agents_handler(providers=[])
+
     def test_multiple_calls_return_independent_instances(self) -> None:
         h1 = create_langchain_agents_handler()
         h2 = create_langchain_agents_handler()
@@ -1188,6 +1201,21 @@ class TestConvenienceExport:
         mock_config_instance.invoke.assert_called_once_with(
             "hello", ctx, variables=None
         )
+
+    def test_providers_is_forwarded_to_the_handler(self) -> None:
+        mock_config_instance = MagicMock()
+        mock_config_fn = MagicMock(return_value=mock_config_instance)
+        mock_config_instance.invoke = MagicMock(return_value="result")
+
+        with patch.object(handler_mod, "config", mock_config_fn):
+            from launchdarkly_ai_langchain_agents.handler import langchain_agents
+
+            ctx = {"kind": "user", "key": "u1"}
+            langchain_agents("my-flag", "hello", ctx, providers=["Bedrock"])
+
+        call_kwargs = mock_config_fn.call_args.kwargs
+        assert "providers" not in call_kwargs
+        assert call_kwargs["handler"].providers == ("Bedrock",)
 
     def test_callable_without_extra_kwargs(self) -> None:
 

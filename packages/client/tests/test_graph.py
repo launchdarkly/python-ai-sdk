@@ -170,6 +170,18 @@ class TestResolveGraph:
 # ---------------------------------------------------------------------------
 
 
+class TestScopedWildcard:
+    async def test_sole_scoped_handler_does_not_run_an_unlisted_provider(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        handler = _make_handler()
+        handler.provides_for = ("*", "messages")  # type: ignore[assignment]
+        handler.providers = ("Bedrock",)  # type: ignore[attr-defined]
+        g = graph("graph-key", handlers=[handler])
+        with pytest.raises(ValueError, match="TestProvider"):
+            await g.invoke("hi", CONTEXT)
+
+
 class TestGraphInvoke:
     async def test_throws_when_graph_disabled(self, mock_ld_client: MagicMock) -> None:
         mock_ld_client.variation = AsyncMock(return_value={"edges": {}})

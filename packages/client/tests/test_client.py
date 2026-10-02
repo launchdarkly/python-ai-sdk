@@ -407,11 +407,33 @@ class TestConfigSingleHandler:
 # ---------------------------------------------------------------------------
 
 
-def _handler_for(provider: str, mode: str, response: str = "ok") -> ProviderHandler:
+def _handler_for(
+    provider: str,
+    mode: str,
+    response: str = "ok",
+    providers: list[str] | None = None,
+) -> ProviderHandler:
     async def fn(cfg, user_input, tool_handlers, variables, history=None) -> dict:  # type: ignore[override]
         return {"output": response, "usage": {"input_tokens": 1, "output_tokens": 1}}
 
-    return ProviderHandler(fn=fn, provides_for=(provider, mode))  # type: ignore[arg-type]
+    handler = ProviderHandler(fn=fn, provides_for=(provider, mode))  # type: ignore[arg-type]
+    if providers is not None:
+        handler.providers = tuple(providers)  # type: ignore[attr-defined]
+    return handler
+
+
+def _variation(provider: str, mode: str = "messages") -> dict[str, Any]:
+    return {
+        "model": {"name": "gpt-4"},
+        "provider": {"name": provider},
+        "instructions": "hi",
+        "_ldMeta": {
+            "enabled": True,
+            "variationKey": "v1",
+            "version": 1,
+            "mode": mode,
+        },
+    }
 
 
 class TestConfigMultiHandler:
@@ -508,6 +530,83 @@ class TestConfigMultiHandler:
         rm = config(key="flag", handler=[h])
         with pytest.raises((ValueError, RuntimeError)):
             await rm.invoke("hi", CONTEXT)
+
+    async def test_scoped_wildcard_matches_a_listed_provider(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        mock_ld_client.variation = AsyncMock(return_value=_variation("Bedrock"))
+        h = _handler_for("*", "messages", "from-bedrock", providers=["Bedrock"])
+        result = await config(key="flag", handler=[h]).invoke("hi", CONTEXT)
+        assert result.response == "from-bedrock"
+
+    async def test_scoped_wildcard_rejects_an_unlisted_provider(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        mock_ld_client.variation = AsyncMock(return_value=_variation("OpenAI"))
+        h = _handler_for("*", "messages", "from-bedrock", providers=["Bedrock"])
+        with pytest.raises(ValueError, match="OpenAI"):
+            await config(key="flag", handler=[h]).invoke("hi", CONTEXT)
+
+    async def test_two_scoped_wildcards_divide_providers(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        bedrock = _handler_for("*", "messages", "bedrock", providers=["Bedrock"])
+        anthropic = _handler_for("*", "messages", "anthropic", providers=["Anthropic"])
+        mock_ld_client.variation = AsyncMock(return_value=_variation("Anthropic"))
+        result = await config(key="flag", handler=[bedrock, anthropic]).invoke(
+            "hi", CONTEXT
+        )
+        assert result.response == "anthropic"
+
+    async def test_exact_handler_wins_over_scoped_wildcard(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        scoped = _handler_for("*", "messages", "scoped", providers=["TestProvider"])
+        exact = _handler_for("TestProvider", "messages", "exact")
+        result = await config(key="flag", handler=[scoped, exact]).invoke("hi", CONTEXT)
+        assert result.response == "exact"
+
+    async def test_unscoped_wildcard_is_the_fallback(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        scoped = _handler_for("*", "messages", "bedrock", providers=["Bedrock"])
+        unscoped = _handler_for("*", "messages", "any")
+        result = await config(key="flag", handler=[scoped, unscoped]).invoke(
+            "hi", CONTEXT
+        )
+        assert result.response == "any"
+
+    async def test_shorter_provider_list_wins(self, mock_ld_client: MagicMock) -> None:
+        mock_ld_client.variation = AsyncMock(return_value=_variation("Bedrock"))
+        wide = _handler_for("*", "messages", "wide", providers=["Bedrock", "Anthropic"])
+        narrow = _handler_for("*", "messages", "narrow", providers=["Bedrock"])
+        result = await config(key="flag", handler=[wide, narrow]).invoke("hi", CONTEXT)
+        assert result.response == "narrow"
+
+    async def test_equal_length_overlap_keeps_the_earlier_handler(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        mock_ld_client.variation = AsyncMock(return_value=_variation("Bedrock"))
+        earlier = _handler_for(
+            "*", "messages", "earlier", providers=["Bedrock", "Gemini"]
+        )
+        later = _handler_for(
+            "*", "messages", "later", providers=["Bedrock", "Anthropic"]
+        )
+        result = await config(key="flag", handler=[earlier, later]).invoke(
+            "hi", CONTEXT
+        )
+        assert result.response == "earlier"
+
+    async def test_scoped_wildcard_does_not_match_a_different_mode(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        mock_ld_client.variation = AsyncMock(
+            return_value=_variation("Bedrock", mode="agent")
+        )
+        h = _handler_for("*", "messages", "bedrock", providers=["Bedrock"])
+        with pytest.raises(ValueError, match="Bedrock"):
+            await config(key="flag", handler=[h]).invoke("hi", CONTEXT)
 
     async def test_resolves_handlers_from_registry(
         self, mock_ld_client: MagicMock
