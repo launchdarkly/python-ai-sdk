@@ -66,6 +66,7 @@ from launchdarkly_ai_server.skills_fdv2 import (
     _ProtocolReader,
     _RecoverableTransportError,
     _Requester,
+    _ResponseTooLargeError,
     _retry_after_seconds,
     _SkillObjectSet,
     _StaleRequestStateError,
@@ -1891,6 +1892,19 @@ class _SlowConnectRequester(_FakeRequester):
         return _BlockingConnection()
 
 
+def _record_backoff_attempts(monkeypatch: Any) -> list[int]:
+    """Records the attempt number of every backoff the store computes."""
+    attempts: list[int] = []
+    real = skills_fdv2._backoff_delay
+
+    def recording(attempt: int, **kwargs: Any) -> float:
+        attempts.append(attempt)
+        return real(attempt, **kwargs)
+
+    monkeypatch.setattr(skills_fdv2, "_backoff_delay", recording)
+    return attempts
+
+
 def stream_store(**kwargs: Any) -> FDv2SkillStore:
     return FDv2SkillStore(
         SDK_KEY,
@@ -2350,6 +2364,72 @@ class TestFailureHandling:
         with pytest.raises(TypeError):
             FDv2SkillStore(SDK_KEY, max_consecutive_failures=3)  # type: ignore[call-arg]
 
+    @pytest.mark.parametrize("option", ["initial_backoff", "max_backoff"])
+    @pytest.mark.parametrize("value", [0, 0.0, -5, math.nan, math.inf])
+    def test_a_backoff_option_must_be_positive_and_finite(
+        self, option: str, value: float
+    ) -> None:
+        """With no failure bound, these two numbers are the only limit on the
+        retry loop: zero or less reconnects as fast as the network allows."""
+        kwargs = {"initial_backoff": 1.0, "max_backoff": 30.0, option: value}
+        with pytest.raises(ValueError, match=option):
+            FDv2SkillStore(SDK_KEY, **kwargs)
+
+    def test_the_initial_backoff_may_not_exceed_the_cap(self) -> None:
+        with pytest.raises(ValueError, match="must not exceed"):
+            FDv2SkillStore(SDK_KEY, initial_backoff=5.0, max_backoff=1.0)
+        # Equal is a fixed delay, and fine.
+        FDv2SkillStore(SDK_KEY, initial_backoff=2.0, max_backoff=2.0)
+
+    def test_wait_for_skills_runs_to_its_timeout_during_an_outage(self) -> None:
+        """Recoverable failures no longer end delivery, so the store does not
+        know the answer yet, and the wait is not cut short."""
+        store = stream_store(_requester=_ScriptedRequester())
+        try:
+            store.start()
+            started = time.monotonic()
+            assert store.wait_for_skills(timeout=0.5) is False
+            assert time.monotonic() - started >= 0.4
+            assert store.failed is None
+            assert store.diagnostics.connection_failures > 0
+        finally:
+            store.close()
+
+    def test_a_400_after_a_recoverable_failure_still_repairs(
+        self, endpoint: Any
+    ) -> None:
+        """The repair still goes out from scratch when an outage came first."""
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: len(endpoint.requests) >= 4)
+            assert store.failed is None
+        # The 500 left the basis in place; the 400 is what dropped it.
+        assert "basis" in endpoint.requests[2]["query"]
+        repair = endpoint.requests[3]
+        assert repair["query"] == {"kinds": FDV2_PAYLOAD_KIND}
+        assert repair["if_none_match"] is None
+
+    def test_the_second_400_still_stops_with_a_recoverable_failure_between(
+        self, endpoint: Any
+    ) -> None:
+        """A recoverable failure between them does not earn the 400 another
+        repair: the request after it still carries no client state."""
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(status=400)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5) is True
+            assert wait_until(lambda: store.failed is not None)
+        assert "400" in store.failed
+        # The fifth queued payload is never asked for.
+        assert len(endpoint.requests) == 4
+
     def test_recoverable_failures_are_retried_indefinitely(self) -> None:
         """Well past ten in a row, the bound this replaces, and still retrying."""
         requester = _ScriptedRequester()
@@ -2403,11 +2483,36 @@ class TestFailureHandling:
             store.start()
             assert wait_until(lambda: requester.connections >= 8)
             assert store.failed is None
-            # As with a payload-carrying recycle, the count may read 1
-            # mid-reconnect. What it must never do is climb.
-            assert store.diagnostics.connection_failures <= 1
+            if farewell:
+                # A goodbye after an answer is the server recycling the stream,
+                # not a failure: it is neither counted nor reported.
+                assert store.diagnostics.connection_failures == 0
+                assert store.diagnostics.last_error is None
+            else:
+                # A plain drop counts until the next answer clears it, so the
+                # count may read 1 mid-reconnect. What it must never do is climb.
+                assert store.diagnostics.connection_failures <= 1
         finally:
             store.close()
+
+    def test_a_goodbye_before_any_answer_is_a_failure(self, caplog: Any) -> None:
+        """Only a completed exchange makes a goodbye routine. A server that only
+        ever says goodbye has delivered nothing, and must stay visible."""
+
+        class _OnlyGoodbye(_FakeRequester):
+            def stream(self, basis: str | None) -> Any:
+                return _ScriptedConnection([("goodbye", {"reason": "go away"})])
+
+        store = stream_store(_requester=_OnlyGoodbye())
+        with caplog.at_level("DEBUG", logger="launchdarkly_ai_server.skills_fdv2"):
+            try:
+                store.start()
+                assert wait_until(lambda: store.diagnostics.connection_failures >= 3)
+            finally:
+                store.close()
+        assert "goodbye" in (store.diagnostics.last_error or "")
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("server said goodbye" in r.getMessage() for r in warnings)
 
     def test_a_recycled_connection_reconnects_quietly(self, caplog: Any) -> None:
         # A healthy idle stream reconnects for as long as the process runs, so
@@ -2486,6 +2591,63 @@ class TestFailureHandling:
             assert len(requester.calls) == 5
         finally:
             store.close()
+
+    def test_an_answer_alone_does_not_reset_the_backoff_delay(
+        self, monkeypatch: Any
+    ) -> None:
+        """A server that answers ``none`` and drops at once is backed off.
+
+        Resetting the delay on every answer would reconnect it about once a
+        second, from every process, for as long as it stays degraded. The
+        failure count still clears on each answer.
+        """
+        attempts = _record_backoff_attempts(monkeypatch)
+        requester = _UpToDateRecyclingRequester()
+        store = stream_store(_requester=requester)
+        try:
+            store.start()
+            assert wait_until(lambda: len(attempts) >= 6)
+            assert store.diagnostics.connection_failures <= 1
+        finally:
+            store.close()
+        assert attempts[:6] == [1, 2, 3, 4, 5, 6]
+
+    def test_a_stream_held_past_the_threshold_resets_the_backoff_delay(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(skills_fdv2, "_BACKOFF_RESET_INTERVAL", 0.05)
+        attempts = _record_backoff_attempts(monkeypatch)
+
+        class _HeldThenDropped(_FakeRequester):
+            def stream(self, basis: str | None) -> Any:
+                def held() -> Any:
+                    yield ("server-intent", server_intent("none"))
+                    time.sleep(0.1)
+
+                return _ScriptedConnection(held())
+
+        store = stream_store(_requester=_HeldThenDropped())
+        try:
+            store.start()
+            assert wait_until(lambda: len(attempts) >= 3)
+        finally:
+            store.close()
+        assert attempts[:3] == [1, 1, 1]
+
+    def test_a_completed_poll_resets_the_backoff_delay(
+        self, endpoint: Any, monkeypatch: Any
+    ) -> None:
+        """Fail, succeed, fail: the second failure retries at the first step,
+        since ``poll_interval`` already spaces the requests."""
+        attempts = _record_backoff_attempts(monkeypatch)
+        endpoint.queue_poll(status=500)
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
+        endpoint.queue_poll(status=500)
+        with poll_store(endpoint) as store:
+            assert store.wait_for_skills(timeout=5)
+            assert wait_until(lambda: len(attempts) >= 2)
+            assert store.diagnostics.connection_failures <= 1
+        assert attempts[:2] == [1, 1]
 
     def test_stream_failures_are_retried_indefinitely(self) -> None:
         """Last known good is served throughout, however long the outage."""
@@ -2737,25 +2899,33 @@ class TestTransportMemoryBound:
     def test_the_bound_is_far_above_any_legitimate_payload(self) -> None:
         assert MAX_RESPONSE_BYTES == 64 * 1024 * 1024
 
-    def test_an_over_cap_poll_body_is_not_applied_and_is_retried(
+    def test_crossing_the_bound_is_fatal(self) -> None:
+        assert issubclass(_ResponseTooLargeError, _FatalTransportError)
+        assert not issubclass(_ResponseTooLargeError, _RecoverableTransportError)
+
+    def test_an_over_cap_poll_body_stops_delivery_without_applying_it(
         self, endpoint: Any, monkeypatch: Any
     ) -> None:
+        """Fatal, like a 422: the size belongs to the environment, so a retry
+        would download it again and be refused the same way."""
         monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 2048)
         endpoint.queue_poll(full_payload(("put-object", put_skill(content="x" * 8192))))
-        # A long enough backoff to observe the failure before the retry lands.
-        with poll_store(endpoint, initial_backoff=0.3, max_backoff=0.3) as store:
-            assert wait_until(lambda: store.diagnostics.connection_failures == 1)
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: store.failed is not None)
+            assert "2048-byte transport bound" in store.failed
             assert "2048-byte transport bound" in (store.diagnostics.last_error or "")
             assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is None
             assert store.diagnostics.payloads_transferred == 0
             assert store.diagnostics.skill_objects_received == 0
-            assert store.failed is None
-            # The retry is an ordinary poll; the endpoint answers it 304.
-            assert wait_until(lambda: len(endpoint.requests) >= 2)
+            assert store.diagnostics.connection_failures == 0
+            # Fatal means one request, not a retry loop.
+            assert len(endpoint.requests) == 1
+
+            # Once the payload is back under the bound, start() resumes.
+            endpoint.queue_poll(full_payload(("put-object", put_skill())))
+            store.start()
             assert store.wait_for_skills(timeout=5) is True
-            assert wait_until(lambda: store.diagnostics.connection_failures == 0)
-            assert "2048-byte transport bound" in (store.diagnostics.last_error or "")
-        assert all(r["path"] == "/sdk/poll" for r in endpoint.requests)
+            assert store.failed is None
 
     def test_a_poll_body_exactly_at_the_cap_is_accepted(
         self, endpoint: Any, monkeypatch: Any
@@ -2778,13 +2948,10 @@ class TestTransportMemoryBound:
         monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", len(body) - 1)
         endpoint.queue_poll(payload)
         with poll_store(endpoint) as store:
-            assert wait_until(lambda: store.diagnostics.last_error is not None)
+            assert wait_until(lambda: store.failed is not None)
             assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is None
-            # Recoverable: delivery keeps retrying.
-            assert store.failed is None
-            error = store.diagnostics.last_error
-        assert f"{len(body) - 1}-byte transport bound" in error
-        assert f"at least {len(body)} bytes received" in error
+        assert f"{len(body) - 1}-byte transport bound" in store.failed
+        assert f"at least {len(body)} bytes received" in store.failed
 
     def test_the_default_cap_leaves_ordinary_payloads_alone(
         self, endpoint: Any
@@ -2801,8 +2968,8 @@ class TestTransportMemoryBound:
     ) -> None:
         """
         The first payload commits. The second starts, then carries an event
-        over the cap: that connection is dropped, the half-received payload is
-        never committed, and the reconnect finds the committed set intact.
+        over the cap: delivery stops, the half-received payload is never
+        committed, and the committed set is still served.
         """
         monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 2048)
         endpoint.queue_stream(
@@ -2813,8 +2980,6 @@ class TestTransportMemoryBound:
                 ("payload-transferred", transferred("basis-2")),
             )
         )
-        endpoint.hold_stream_open = True
-        endpoint.queue_stream(events(("server-intent", server_intent("none"))))
         store = FDv2SkillStore(
             SDK_KEY,
             base_uri=endpoint.base_uri,
@@ -2825,16 +2990,13 @@ class TestTransportMemoryBound:
         try:
             store.start()
             assert store.wait_for_skills(timeout=5) is True
-            assert wait_until(
-                lambda: "transport bound" in (store.diagnostics.last_error or "")
-            )
-            assert wait_until(lambda: len(endpoint.requests) >= 2)
+            assert wait_until(lambda: store.failed is not None)
+            assert "transport bound" in store.failed
             assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
             assert store.get_object(SKILL_OBJECT_KIND, "oversized") is None
             assert store.diagnostics.payloads_transferred == 1
             assert store.diagnostics.skill_objects_received == 1
-            assert store.failed is None
-            assert endpoint.requests[1]["query"].get("basis") == "basis-1"
+            assert len(endpoint.requests) == 1
         finally:
             store.close()
 
@@ -2843,7 +3005,7 @@ class TestTransportMemoryBound:
     ) -> None:
         monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 1024)
         source = _LineSource(b"data: " + b"x" * 4096)
-        with pytest.raises(_RecoverableTransportError, match="1024-byte"):
+        with pytest.raises(_ResponseTooLargeError, match="1024-byte"):
             list(_iter_sse(source))
         assert source.closed
 
@@ -2851,7 +3013,7 @@ class TestTransportMemoryBound:
         monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 1024)
         lines = b"".join(b"data: " + b"x" * 500 + b"\n" for _ in range(3))
         source = _LineSource(b"event: put-object\n" + lines + b"\n")
-        with pytest.raises(_RecoverableTransportError, match="1024-byte"):
+        with pytest.raises(_ResponseTooLargeError, match="1024-byte"):
             list(_iter_sse(source))
         assert source.closed
 
@@ -3691,6 +3853,7 @@ class TestTransportLayering:
             "re",
             "socket",
             "threading",
+            "time",
             "typing",
             "urllib",
         }
