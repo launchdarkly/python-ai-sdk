@@ -47,7 +47,15 @@ from .history import (
     image_block_to_url,
     is_content_blocks,
 )
-from .judges import build_judge_tasks, run_judge, run_judges
+from .judges import (
+    BuildJudgeTasksResult,
+    JudgeContextResolution,
+    RunJudgesResult,
+    build_judge_tasks,
+    resolve_judge_context,
+    run_judge,
+    run_judges,
+)
 from .lifecycle import (
     extract_variation,
     get_client,
@@ -80,6 +88,8 @@ from .types import (
     HandlerStreamEvent,
     InitClientOptions,
     InputTokenDetails,
+    JsonValue,
+    JudgeDiagnostic,
     JudgeResult,
     JudgeRunResult,
     JudgeTask,
@@ -143,6 +153,10 @@ __all__ = [  # noqa: RUF022
     "HandlerResult",
     "HandlerStreamEvent",
     "InitClientOptions",
+    "BuildJudgeTasksResult",
+    "JsonValue",
+    "JudgeContextResolution",
+    "JudgeDiagnostic",
     "JudgeResult",
     "JudgeRunResult",
     "JudgeTask",
@@ -242,7 +256,9 @@ __all__ = [  # noqa: RUF022
     # judges
     "build_judge_tasks",
     "run_judge",
+    "resolve_judge_context",
     "run_judges",
+    "RunJudgesResult",
     # client
     "config",
     "ConfigInstance",

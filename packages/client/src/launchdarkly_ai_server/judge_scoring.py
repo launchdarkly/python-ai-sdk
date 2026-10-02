@@ -37,12 +37,17 @@ def build_message_history(
     user_input: Any = None,
     trajectory: Any = None,
     output: Any = None,
+    evidence: Any = None,
 ) -> str:
     """The conversation a judge is shown, as its ``message_history`` variable.
 
     Ordered as it happened: what was asked, what the agent did, what it
     answered, then how to format the verdict. Empty parts are skipped, so a
     run with no tools yields the history it did before trajectories existed.
+
+    ``evidence`` is the delimited block built from a caller's resolved judge
+    context, placed after the answer it grounds. With none, the history is
+    byte-identical to the one built without it.
 
     The formatting block is appended here, not by callers: judges built from
     the AI Library's default templates read the JSON shape from
@@ -51,7 +56,7 @@ def build_message_history(
     """
     return "\n\n".join(
         str(part)
-        for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
+        for part in (user_input, trajectory, output, evidence, FORMATTING_INSTRUCTIONS)
         if part
     )
 

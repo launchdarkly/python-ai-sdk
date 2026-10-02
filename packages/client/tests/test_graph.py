@@ -184,6 +184,28 @@ class TestGraphInvoke:
         with pytest.raises((ValueError, RuntimeError)):
             await g.invoke("hi", CONTEXT)
 
+    async def test_graph_judge_failure_comes_back_as_a_diagnostic(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        # The graph judge resolves to an ordinary config whose handler answers "ok",
+        # which is not a verdict: the run keeps its response and says why.
+        g = graph("graph-key", handlers=[_make_handler()], graph_judge="graph-judge")
+        result = await g.invoke("hi", CONTEXT)
+        assert result.response == "ok"
+        assert result.judge_results is None
+        assert result.judge_diagnostics is not None
+        assert [(d.judge_key, d.code) for d in result.judge_diagnostics] == [
+            ("graph-judge", "judge_response_invalid")
+        ]
+
+    async def test_graph_without_judge_failures_has_no_diagnostics(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        result = await graph("graph-key", handlers=[_make_handler()]).invoke(
+            "hi", CONTEXT
+        )
+        assert result.judge_diagnostics is None
+
     async def test_traverses_root_leaf_returns_aggregated_result(
         self, mock_ld_client: MagicMock
     ) -> None:
