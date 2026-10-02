@@ -436,6 +436,38 @@ class TestToLangGraphLangChainSpecific:
                 ).invoke("hi")
 
         assert "$ld:ai:graph:invocation_success" in track_calls
+        assert "$ld:ai:graph:path" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_node_function_emits_graph_node(self) -> None:
+        track_calls: list[tuple[str, Any, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data, val))
+        )
+
+        ai_msg = _make_ai_msg("done")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "test"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+                node_fn = mocks["_node_fns"]["root"]
+                await node_fn({"messages": []})
+
+        node_events = [item for item in track_calls if item[0] == "$ld:ai:graph:node"]
+        assert len(node_events) == 1
+        assert node_events[0][1]["nodeKey"] == "root"
+        assert node_events[0][1]["index"] == 0
+        assert node_events[0][2] == 1
 
     @pytest.mark.asyncio
     async def test_invocation_failure_tracked(self) -> None:
@@ -576,9 +608,11 @@ class TestToLangGraphLangChainSpecific:
                 with patch.object(ng_mod, "_HAS_OTEL", True):
                     await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
 
-        mock_trace.get_tracer.return_value.start_span.assert_called_with("ld.ai.graph")
+        mock_trace.get_tracer.return_value.start_span.assert_called_with(
+            "launchdarkly.graph"
+        )
         calls = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
-        assert "ld.ai.graph.key" in calls
+        assert "launchdarkly.graph.key" in calls
 
     @pytest.mark.asyncio
     async def test_terminal_leaf_connected_to_end(self) -> None:

@@ -301,6 +301,19 @@ class JudgeTask:
     variables: dict[str, Any] | None = None
     """Optional extra template variables for the judge prompt."""
     evaluation_metric_key: str | None = None
+    user_input: str | None = None
+    """The input that produced ``actual_output``.
+
+    Carried so this path builds the same ``message_history`` as the inline one.
+    Previously absent, which showed a deferred judge a response with no
+    request beside it.
+    """
+    trajectory: str = ""
+    """The invocation's rendered tool-call trajectory.
+
+    A plain string rather than the structured record, since every field here
+    must stay picklable.
+    """
     """LD metric key to track the score against."""
 
 
@@ -326,6 +339,14 @@ class JudgeRunResult:
 StreamChunkEvent = dict[str, Any]  # {"type": "chunk", "text": str}
 StreamDoneEvent = dict[str, Any]  # {"type": "done", "response": str, "usage": ..., ...}
 StreamEvent = dict[str, Any]  # StreamChunkEvent | StreamDoneEvent
+
+# Graph stream events (camelCase public fields, matching the TypeScript SDK)
+# node_start: {type, nodeKey}
+# chunk: {type, text, nodeKey}
+# node_done: {type, nodeKey, response, usage}
+# handoff: {type, sourceKey, targetKey}
+# done: {type, response, usage, judgeResults?}
+GraphStreamEvent = dict[str, Any]
 
 # Internal execute stream event that also carries track_data
 ExecuteStreamDoneEvent = dict[str, Any]

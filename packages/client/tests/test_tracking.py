@@ -70,15 +70,18 @@ class TestWrapToolHandlers:
         stub = wrapped["search"]
         assert getattr(stub, NATIVE_TOOL_KEY) is native
 
-    async def test_handoff_prefix_skips_tracking(self) -> None:
+    def test_handoff_prefix_skips_tracking(self) -> None:
         mock_client = _make_mock_client()
         original = MagicMock(return_value=None)
         with patch("launchdarkly_ai_server.lifecycle._client", mock_client):
             wrapped = wrap_tool_handlers(
                 {"__handoff_leaf": original}, CONTEXT, TRACK_DATA
             )
-            await wrapped["__handoff_leaf"]()
+            # Handoff tools stay sync so stream/invoke routing can record the choice
+            # with a bare call (an async wrapper would leave `chosen` empty).
+            wrapped["__handoff_leaf"]()
         mock_client.track.assert_not_called()
+        original.assert_called_once()
 
     def test_undefined_tool_handlers(self) -> None:
         result = wrap_tool_handlers(None, CONTEXT, TRACK_DATA)

@@ -567,6 +567,39 @@ class TestToolConversion:
         with pytest.raises(RuntimeError, match="handler error"):
             await tools[0].on_invoke_tool(MagicMock(), "{}")
 
+    async def test_sync_tool_handler_result_is_returned(self) -> None:
+        def _sync(args: Any) -> dict[str, Any]:
+            return {"order_id": args["order_id"], "status": "shipped"}
+
+        tools = _build_agent_tools(
+            {"my-tool": {"description": "d"}}, {"my-tool": _sync}
+        )
+        out = await tools[0].on_invoke_tool(MagicMock(), '{"order_id": "A19"}')
+        assert out == str({"order_id": "A19", "status": "shipped"})
+
+    async def test_async_tool_handler_result_is_returned(self) -> None:
+        async def _async(args: Any) -> str:
+            return f"order {args['order_id']}"
+
+        tools = _build_agent_tools(
+            {"my-tool": {"description": "d"}}, {"my-tool": _async}
+        )
+        out = await tools[0].on_invoke_tool(MagicMock(), '{"order_id": "A19"}')
+        assert out == "order A19"
+
+    async def test_sync_tool_handler_returning_awaitable_is_awaited(self) -> None:
+        async def _inner() -> str:
+            return "done"
+
+        def _sync_wrapper(args: Any) -> Any:
+            return _inner()
+
+        tools = _build_agent_tools(
+            {"my-tool": {"description": "d"}}, {"my-tool": _sync_wrapper}
+        )
+        out = await tools[0].on_invoke_tool(MagicMock(), "{}")
+        assert out == "done"
+
 
 # ---------------------------------------------------------------------------
 # §1.4 Tool execution loop (pre-span-era; restored, not telemetry)

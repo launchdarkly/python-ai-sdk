@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-agents-0.2.3...launchdarkly-ai-openai-agents-0.2.4) (2026-09-30)
+
+
+### Features
+
+* **AIC-3211:** record each graph node as its own tracking event ([#114](https://github.com/launchdarkly/python-ai-sdk/issues/114)) ([c3c439e](https://github.com/launchdarkly/python-ai-sdk/commit/c3c439ede989ea98c43d238b80467351c5920c56))
+
+
+### Bug Fixes
+
+* **openai-agents:** accept sync tool handlers ([0ac9231](https://github.com/launchdarkly/python-ai-sdk/commit/0ac9231bfeb9b1e136c452d2553415eae6a89edd))
+* **openai-agents:** accept sync tool handlers ([#119](https://github.com/launchdarkly/python-ai-sdk/issues/119)) ([656d922](https://github.com/launchdarkly/python-ai-sdk/commit/656d922a334e84ebea7aee4b871d176a96a21f96))
+
 ## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-agents-0.2.2...launchdarkly-ai-openai-agents-0.2.3) (2026-09-21)
 
 

@@ -7,7 +7,7 @@ import math
 import os
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from ..lifecycle import get_client, init_client
 from .api import (
@@ -25,7 +25,7 @@ from .runner import (
     _provides_for,
     _segment,
 )
-from .types import EvalRunResult, GenerationConfig, RunSummary
+from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,35 @@ def _is_terminal_summary(summary: RunSummary) -> bool:
     )
 
 
+def _merge_generation(
+    base: GenerationConfig, override: GenerationConfig | None
+) -> GenerationConfig:
+    """Layer a caller's generation settings over a fetched variation's.
+
+    Keys the caller sets replace the fetched ones, except ``parameters``, which
+    merge key by key so overriding ``temperature`` keeps a fetched
+    ``max_tokens``. ``instructions`` and ``messages`` are one prompt slot:
+    supplying either discards both fetched values, so a caller swapping an
+    agent prompt for a message list does not trip the mutual-exclusion check.
+    """
+    merged: dict[str, Any] = dict(base)
+    if not override:
+        return cast(GenerationConfig, merged)
+    if "instructions" in override or "messages" in override:
+        merged.pop("instructions", None)
+        merged.pop("messages", None)
+    for field_name, value in override.items():
+        if field_name == "parameters" and isinstance(value, Mapping):
+            base_parameters = merged.get("parameters")
+            merged["parameters"] = {
+                **(base_parameters if isinstance(base_parameters, Mapping) else {}),
+                **value,
+            }
+        else:
+            merged[field_name] = value
+    return cast(GenerationConfig, merged)
+
+
 class EvaluationsModule:
     """Entry point for running LaunchDarkly evaluations from customer code."""
 
@@ -98,7 +127,8 @@ class EvaluationsModule:
         key: str,
         dataset: str,
         handler: EvalHandler,
-        generation: GenerationConfig,
+        generation: GenerationConfig | None = None,
+        ai_config: AIConfig | None = None,
         tools: Mapping[str, ToolImplementation] | None = None,
         criteria: list[Criterion] | None = None,
         judge_handlers: list[EvalHandler] | None = None,
@@ -126,6 +156,15 @@ class EvaluationsModule:
         this method. Large datasets may need a longer ``poll_timeout_seconds``
         and a wider ``poll_interval_seconds``; both default to
         ``SUMMARY_POLL_TIMEOUT_SECONDS`` / ``SUMMARY_POLL_INTERVAL_SECONDS``.
+
+        Pass ``ai_config`` to start from an existing AI Config
+        variation instead of a hand-built ``generation``. Its model, provider,
+        parameters, prompt and output format become the defaults, and anything
+        set in ``generation`` overrides them field by field (``parameters``
+        merge key by key). When ``tools`` is omitted the variation's tools are
+        used, so each needs an implementation; pass ``tools`` to replace the
+        set. When ``criteria`` is omitted the variation's attached judges run;
+        pass ``criteria`` (even ``[]``) to replace them.
         """
         if poll_interval_seconds is None:
             poll_interval_seconds = SUMMARY_POLL_INTERVAL_SECONDS
@@ -136,11 +175,37 @@ class EvaluationsModule:
             key=key,
             dataset=dataset,
             handler=handler,
-            generation=generation,
             concurrency=concurrency,
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
+        self._validate_config_source(generation=generation, ai_config=ai_config)
+        pinned_tool_versions: dict[str, int] = {}
+        config_label = ""
+        if ai_config is not None:
+            config_label = f"{ai_config.key!r}/{ai_config.variation!r}"
+            ai_config_variation = await asyncio.to_thread(
+                self._runner._fetch_config_variation,
+                project_key,
+                ai_config.key,
+                ai_config.variation,
+            )
+            generation = _merge_generation(ai_config_variation.generation, generation)
+            if tools is None and ai_config_variation.tool_versions:
+                raise EvaluationsError(
+                    f"AI Config variation {config_label} uses tools "
+                    "with no implementation: "
+                    + ", ".join(
+                        repr(name) for name in ai_config_variation.tool_versions
+                    )
+                    + ". Pass tools= with an implementation for each."
+                )
+            pinned_tool_versions = ai_config_variation.tool_versions
+            if criteria is None:
+                criteria = [
+                    Judge(key=judge_key) for judge_key in ai_config_variation.judge_keys
+                ]
+        generation = self._validate_generation(generation)
         run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
         run_judge_handlers = list(judge_handlers or [])
@@ -157,6 +222,19 @@ class EvaluationsModule:
         resolved_tools = await asyncio.to_thread(
             self._runner._resolve_tools, project_key, run_tools
         )
+        # The tool API serves only the latest version, so a variation pinned to
+        # an older one is evaluated against the current schema.
+        for tool_key, pinned_version in pinned_tool_versions.items():
+            resolved_tool = resolved_tools.get(tool_key)
+            if resolved_tool is not None and resolved_tool.version != pinned_version:
+                logger.warning(
+                    "AI Config variation %s pins tool %r at version %d; "
+                    "evaluating against the latest version %d.",
+                    config_label,
+                    tool_key,
+                    pinned_version,
+                    resolved_tool.version,
+                )
         resolved_judges = await self._runner._resolve_judges(
             project_key, ld_judges, handler, run_judge_handlers
         )
@@ -355,7 +433,6 @@ class EvaluationsModule:
         key: str,
         dataset: str,
         handler: EvalHandler,
-        generation: GenerationConfig,
         concurrency: int,
         poll_interval_seconds: float,
         poll_timeout_seconds: float,
@@ -369,16 +446,6 @@ class EvaluationsModule:
                 raise EvaluationsError(f"{name} must not be blank")
         if not callable(handler):
             raise EvaluationsError("handler must be callable")
-        provider = generation.get("provider")
-        model = generation.get("model")
-        if not isinstance(provider, str) or not provider.strip():
-            raise EvaluationsError("generation.provider is required")
-        if not isinstance(model, str) or not model.strip():
-            raise EvaluationsError("generation.model is required")
-        if "instructions" in generation and "messages" in generation:
-            raise EvaluationsError(
-                "generation.instructions and generation.messages are mutually exclusive"
-            )
         if concurrency < 1:
             raise EvaluationsError("concurrency must be at least 1")
         for name, seconds in (
@@ -390,6 +457,47 @@ class EvaluationsModule:
                 raise EvaluationsError(f"{name} must be a number")
             if seconds < 0:
                 raise EvaluationsError(f"{name} must not be negative")
+
+    @staticmethod
+    def _validate_config_source(
+        *,
+        generation: GenerationConfig | None,
+        ai_config: AIConfig | None,
+    ) -> None:
+        """Require a generation source before any request is made."""
+        if ai_config is None:
+            if generation is None:
+                raise EvaluationsError(
+                    "Pass generation, or ai_config to evaluate an existing AI "
+                    "Config variation"
+                )
+            return
+        for name, value in (
+            ("ai_config.key", ai_config.key),
+            ("ai_config.variation", ai_config.variation),
+        ):
+            if not value.strip():
+                raise EvaluationsError(f"{name} must not be blank")
+
+    @staticmethod
+    def _validate_generation(generation: GenerationConfig | None) -> GenerationConfig:
+        """Check the final generation settings, after any fetched variation is merged."""
+        if generation is None:
+            raise EvaluationsError(
+                "Pass generation, or ai_config to evaluate an existing AI "
+                "Config variation"
+            )
+        provider = generation.get("provider")
+        model = generation.get("model")
+        if not isinstance(provider, str) or not provider.strip():
+            raise EvaluationsError("generation.provider is required")
+        if not isinstance(model, str) or not model.strip():
+            raise EvaluationsError("generation.model is required")
+        if "instructions" in generation and "messages" in generation:
+            raise EvaluationsError(
+                "generation.instructions and generation.messages are mutually exclusive"
+            )
+        return generation
 
 
 def init_evaluations(

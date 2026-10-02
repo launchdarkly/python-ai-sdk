@@ -546,13 +546,19 @@ class TestToClaudeAgentsAnthropicSpecific:
             evt for evt, _ in track_calls if evt == "$ld:ai:graph:handoff_success"
         ]
         assert len(handoff_events) >= 1
+        child_nodes = [
+            data
+            for evt, data in track_calls
+            if evt == "$ld:ai:graph:node" and data.get("nodeKey") == "child"
+        ]
+        assert len(child_nodes) == 1
 
     @pytest.mark.asyncio
     async def test_emits_invocation_success_on_completion(self) -> None:
-        track_calls: list[str] = []
+        track_calls: list[tuple[str, Any]] = []
         mock_ld_client = MagicMock()
         mock_ld_client.track = MagicMock(
-            side_effect=lambda evt, ctx, data, val: track_calls.append(evt)
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
         )
 
         mock_sdk = _make_sdk_mock("done")
@@ -571,7 +577,15 @@ class TestToClaudeAgentsAnthropicSpecific:
                     opts={"context": ctx},
                 ).invoke("hi")
 
-        assert "$ld:ai:graph:invocation_success" in track_calls
+        assert "$ld:ai:graph:invocation_success" in [evt for evt, _ in track_calls]
+        root_nodes = [
+            data
+            for evt, data in track_calls
+            if evt == "$ld:ai:graph:node" and data.get("nodeKey") == "root"
+        ]
+        assert len(root_nodes) == 1
+        assert root_nodes[0]["index"] == 0
+        assert all(evt != "$ld:ai:graph:path" for evt, _ in track_calls)
 
     @pytest.mark.asyncio
     async def test_emits_invocation_failure_on_error(self) -> None:
@@ -707,7 +721,7 @@ class TestToClaudeAgentsAnthropicSpecific:
 
 
 class TestNativeGraphConversationId:
-    """The telemetry contract claims the conversation id reaches ``ld.ai.graph`` spans.
+    """The telemetry contract claims the conversation id reaches ``launchdarkly.graph`` spans.
 
     The span is opened after an ``await`` on the graph definition, so this pins that the binding
     survives the await chain rather than only covering spans started synchronously in the block.
@@ -757,7 +771,7 @@ class TestNativeGraphConversationId:
                         )
 
         graph_spans = [
-            s for s in exporter.get_finished_spans() if s.name == "ld.ai.graph"
+            s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"
         ]
         assert len(graph_spans) == 1
         assert (graph_spans[0].attributes or {}).get(

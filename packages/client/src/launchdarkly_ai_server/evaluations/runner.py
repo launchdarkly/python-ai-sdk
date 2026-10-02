@@ -14,10 +14,16 @@ from typing import Any, Literal
 
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
+    build_message_history,
     numeric_score,
     parse_judge_response,
 )
 from ..lifecycle import extract_variation
+from ..trajectory import (
+    TrajectoryRecorder,
+    render_row_trajectory,
+    row_fields,
+)
 from ..types import NativeTool
 from ..utils import (
     collapse_messages_to_instructions,
@@ -36,6 +42,7 @@ from .events import (
     TokenUsage,
 )
 from .types import (
+    AIConfigVariation,
     DatasetRef,
     DatasetRow,
     EvaluationRef,
@@ -213,6 +220,85 @@ class EvaluationsRunner:
 
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
+
+    def _fetch_config_variation(
+        self,
+        project_key: str,
+        config_key: str,
+        variation_key: str,
+    ) -> AIConfigVariation:
+        """Read an AI Config variation by key from the management API.
+
+        Flag delivery cannot select a variation by key -- it serves whichever
+        variation targeting picks for a context -- so this reads the variation
+        definition directly. Provider and base model parameters live on the
+        linked model config, and are layered the way the served flag payload
+        layers them: model-config parameters first, variation parameters over.
+        """
+        description = f"AI Config variation {config_key!r}/{variation_key!r}"
+        path = (
+            f"projects/{_segment(project_key)}/ai-configs/{_segment(config_key)}"
+            f"/variations/{_segment(variation_key)}"
+        )
+        try:
+            raw = _mapping(self._api.get(path), description=description)
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly {description} was not found in project {project_key!r}"
+                ) from error
+            raise
+        # The endpoint returns every version of the variation; evaluate the latest.
+        items = raw.get("items")
+        versions = [
+            item
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, Mapping) and isinstance(item.get("version"), int)
+        ]
+        if not versions:
+            raise EvaluationsError(f"LaunchDarkly {description} has no versions")
+        latest = max(versions, key=lambda item: int(item["version"]))
+
+        # Absent or empty means the variation links no model config, so it has
+        # no provider -- flag delivery serves an empty provider name for it too.
+        # Anything other than a string is a response we do not understand.
+        model_config: Mapping[str, Any] | None = None
+        model_config_key = latest.get("modelConfigKey")
+        if model_config_key is not None and not isinstance(model_config_key, str):
+            raise EvaluationsError(
+                f"LaunchDarkly {description} has a non-string modelConfigKey: "
+                f"{model_config_key!r}"
+            )
+        if model_config_key:
+            model_config = self._fetch_model_config(
+                project_key, model_config_key, latest.get("modelConfigVersion")
+            )
+        return AIConfigVariation.from_api(latest, model_config)
+
+    def _fetch_model_config(
+        self,
+        project_key: str,
+        model_config_key: str,
+        version: Any,
+    ) -> Mapping[str, Any]:
+        path = (
+            f"projects/{_segment(project_key)}/ai-configs/model-configs/"
+            f"{_segment(model_config_key)}"
+        )
+        # A pinned variation names the model-config version it was built against.
+        params = {"version": version} if isinstance(version, int) else None
+        try:
+            return _mapping(
+                self._api.get(path, params=params),
+                description=f"model config {model_config_key!r}",
+            )
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly model config {model_config_key!r} was not found "
+                    f"in project {project_key!r}"
+                ) from error
+            raise
 
     def _resolve_tools(
         self,
@@ -544,11 +630,15 @@ class EvaluationsRunner:
 
         async def invoke(row: DatasetRow) -> dict[str, Any]:
             await controller.acquire(config["provider"]["name"])
+            # One per row, not per run: rows generate concurrently against the
+            # same tool map, so a shared recorder would splice their calls.
+            recorder = TrajectoryRecorder()
+            row_tool_handlers = recorder.wrap(tool_handlers)
             started = datetime.now(UTC)
             started_clock = time.perf_counter()
             try:
                 result = await handler(
-                    config, row.input, tool_handlers, dict(row.variables)
+                    config, row.input, row_tool_handlers, dict(row.variables)
                 )
                 if not isinstance(result, Mapping):
                     raise TypeError("handler result must be a mapping")
@@ -564,6 +654,7 @@ class EvaluationsRunner:
                     "generated_at": completed.isoformat().replace("+00:00", "Z"),
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
                     "status": "COMPLETE",
+                    **row_fields(recorder),
                 }
                 usage = result.get("usage")
                 if isinstance(usage, Mapping):
@@ -583,6 +674,8 @@ class EvaluationsRunner:
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
                     "status": "ERROR",
                     "error": {"code": 5001, "message": f"handler raised: {error}"},
+                    # The calls that ran are what explain why it raised.
+                    **row_fields(recorder),
                 }
             finally:
                 controller.release()
@@ -696,25 +789,23 @@ class EvaluationsRunner:
             ground_truth = parse_template(ground_truth, variables)
         elif expected is not None:
             ground_truth = str(expected)
-        # message_history carries FORMATTING_INSTRUCTIONS the same way the
-        # online path builds it (judges.run_judges), because that -- not the
-        # standalone formatting_instructions variable below -- is what every
-        # judge built from the AI Library's default templates (accuracy,
-        # relevance, toxicity, and any judge cloned from them) actually
-        # references. A judge authored before this variable existed must keep
-        # getting scored without edits.
+        # The calls the row made on its way to `output`, recorded during
+        # generation. Sits between input and output in message_history, which
+        # is where it happened.
+        trajectory = render_row_trajectory(row_result)
+        # Shared builder, not an inline join: this path and both online paths
+        # must show a judge the same conversation. The trajectory goes into
+        # message_history and nowhere else -- it is already the transcript
+        # variable judges read, and a second one would just let a rubric
+        # interpolate both and pay for the trajectory twice.
         variables.update(
             {
                 "input": row_result.get("input") or "",
                 "response_to_evaluate": output if output is not None else "",
-                "message_history": "\n\n".join(
-                    str(value)
-                    for value in (
-                        row_result.get("input"),
-                        output,
-                        FORMATTING_INSTRUCTIONS,
-                    )
-                    if value
+                "message_history": build_message_history(
+                    user_input=row_result.get("input"),
+                    trajectory=trajectory,
+                    output=output,
                 ),
                 "expected_output": expected if expected is not None else "",
                 "ground_truth_context": (

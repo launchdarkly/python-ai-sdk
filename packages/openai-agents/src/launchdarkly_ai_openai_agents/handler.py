@@ -19,6 +19,7 @@ interface intercepts it.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -135,7 +136,10 @@ def _build_agent_tools(
                 args = json.loads(args_str) if args_str else {}
             except (json.JSONDecodeError, ValueError):
                 args = {}
-            res = await handler(args)
+            # Accept a sync or an async tool handler.
+            res = handler(args)
+            if inspect.isawaitable(res):
+                res = await res
             return str(res)
 
         t = FunctionTool(

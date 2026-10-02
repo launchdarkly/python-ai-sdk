@@ -10,6 +10,7 @@ Examples:
     python main.py judge                    launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py graph                    my-agent-graph "What is the LaunchDarkly AI SDK?"
     python main.py graph-history            my-agent-graph ""
+    python main.py graph-streaming          travel-agent-flow "I was double charged for my flight"
     python main.py openai-only              my-openai-flag "Tell me about feature flags"
     python main.py langchain                my-langchain-flag "Tell me about feature flags"
     python main.py claude-agents            launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
@@ -46,6 +47,7 @@ EXAMPLES: dict[str, str] = {
     "streaming": "examples.streaming",
     "graph": "examples.graph_example",
     "graph-history": "examples.graph_history",
+    "graph-streaming": "examples.graph_streaming",
     "conversation": "examples.conversation",
     "history": "examples.history",
     "judge": "examples.judge_example",
