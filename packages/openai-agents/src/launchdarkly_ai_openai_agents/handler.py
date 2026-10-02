@@ -78,9 +78,9 @@ def _build_agent_tools(
     tool_handlers: dict[str, Any],
 ) -> list[Any]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK, which
-    # excludes an unregistered tool from the catalog entirely. This difference predates the span
-    # work and changes what the model is offered, not what a span reports, so it is left as it is;
-    # `to_tool_definitions` below records the catalog actually sent, whatever it is.
+    # excludes an unregistered tool from the catalog entirely. This difference changes what the
+    # model is offered, not what a span reports; `to_tool_definitions` below records the catalog
+    # actually sent, whatever it is.
     import importlib
 
     agents_mod = importlib.import_module("agents")
@@ -207,13 +207,11 @@ def _build_agent_and_prompt(
 
     tools = _build_agent_tools(config.get("tools") or {}, tool_handlers)
 
-    # `outputFormat` is not wired into `Agent(output_type=...)` here, matching this handler's
-    # pre-existing behaviour (and unlike the TypeScript handler, which does wire it): the Python
-    # Agents SDK requires a concrete Python type for `output_type`, not a raw JSON Schema dict (see
-    # `utils.build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
-    # change, not a telemetry one, so it is left alone. `_call_impl` still returns the parsed
-    # `final_output` object as-is when `outputFormat` is configured, matching the pre-existing
-    # return-shape contract.
+    # `outputFormat` is not wired into `Agent(output_type=...)` here (unlike the TypeScript handler,
+    # which does wire it): the Python Agents SDK requires a concrete Python type for `output_type`,
+    # not a raw JSON Schema dict (see `utils.build_output_type`'s docstring). `_call_impl` returns
+    # the parsed `final_output` object as-is when `outputFormat` is configured, matching the
+    # handler's return-shape contract.
     agent = Agent(
         name="assistant",
         model=config.get("model", {}).get("name", "gpt-4o"),
@@ -295,10 +293,11 @@ class _SpanningHooks(_RunHooksBase):
     def _tool_span_key(context: Any, tool: Any) -> str:
         """The key an open tool span is filed under, computed the same way by both hooks.
 
-        ``on_tool_start`` used to fall back to the tool name when ``tool_call_id`` was absent, while
-        ``on_tool_end`` read ``str(context.tool_call_id)`` with no fallback. An absent id therefore
-        filed the span under the tool name and looked for it under the string ``"None"``, so the span
-        never closed on success and lived until process teardown.
+        ``on_tool_start`` and ``on_tool_end`` must agree on the fallback for an absent
+        ``tool_call_id``. If one fell back to the tool name while the other read
+        ``str(context.tool_call_id)``, the span would be filed under the tool name and looked for
+        under the string ``"None"``, so it would never close on success and would live until
+        process teardown.
 
         Mirrors the single ``callId`` helper the TypeScript handler shares between its two hooks.
         """

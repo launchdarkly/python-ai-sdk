@@ -1,8 +1,8 @@
 """Shared conversation-history composition and multimodal content helpers.
 
 Mirrors the TypeScript ``history`` module so every handler composes runtime
-``history`` the same way (TESTING.md §1.11) and maps LaunchDarkly-canonical
-content blocks to each provider's native shape (Appendix A.7).
+``history`` the same way and maps LaunchDarkly-canonical content blocks to
+each provider's native shape.
 
 History messages are plain dicts: ``{"role": ..., "content": ...}`` where
 ``content`` is either a string or a list of content-block dicts:

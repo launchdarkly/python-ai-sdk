@@ -198,8 +198,8 @@ async def _run_tool_loop(
     the run's spend with it.
     """
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
-    # difference predates this span work and changes what the model is offered, not what the span
-    # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
+    # difference changes what the model is offered, not what the span reports: the catalog
+    # recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
     max_tokens = (config.get("model", {}).get("parameters") or {}).get(
         "max_tokens", 1024

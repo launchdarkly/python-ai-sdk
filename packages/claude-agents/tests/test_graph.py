@@ -1,6 +1,5 @@
 """
-Tests for §2.1 graph convenience wrapper (claude_graph).
-Reference: TESTING.md §2.1
+Tests for the graph convenience wrapper (claude_graph).
 """
 
 from unittest.mock import MagicMock, patch

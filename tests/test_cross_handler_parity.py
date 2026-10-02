@@ -365,16 +365,16 @@ EXPECTED_VOCABULARY = {
     "launchdarkly.graph.key",
     "launchdarkly.stream.abandoned",
     # A blocking run that was cancelled. asyncio.CancelledError is a BaseException, so it walks past
-    # every `except Exception` a handler writes, and without a `finally` the run exported no span at
-    # all. UNSET plus this marker, never ERROR, for the same reason as the abandoned stream above:
-    # nothing failed, the caller went away. Python only. TypeScript has no cancellation that skips a
-    # `catch`, so this key has no counterpart there and its absence is not drift.
+    # every `except Exception` a handler writes, and without a `finally` the run would export no
+    # span at all. UNSET plus this marker, never ERROR, for the same reason as the abandoned stream
+    # above: nothing failed, the caller went away. Python only. TypeScript has no cancellation that
+    # skips a `catch`, so this key has no counterpart there and its absence is not drift.
     "launchdarkly.run.cancelled",
     "feature_flag",
     "feature_flag.key",
     "feature_flag.provider.name",
     "feature_flag.set.id",
-    # AIC-3230: evaluation-context identity on the root feature_flag event / span.
+    # Evaluation-context identity on the root feature_flag event / span.
     # `context.contextKeys` is the f-string prefix; the keys actually emitted are
     # `context.contextKeys.<kind>`.
     "feature_flag.context.id",
@@ -385,7 +385,7 @@ EXPECTED_VOCABULARY = {
     "launchdarkly.graph.path",
 }
 
-#: Functions kept exported for one release that nothing calls any more.
+#: Functions that stay exported for one release but that nothing calls.
 #:
 #: Their bodies are cut out before the scan below, rather than their keys being listed as expected.
 #: Listing the keys does not work: `gen_ai.prompt` is written by the live content writer *and* by
@@ -612,8 +612,8 @@ class TestStreamingTeardownClosesToolSpans:
 
     `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so the tool loop's own
     handler never runs for those, and the streaming `finally` is the only code left that can end the
-    span. Four of the six handlers once held the open tool span in a local that `finally` never read,
-    which exported a closed parent above a child that never arrived.
+    span. A handler that holds the open tool span in a local that `finally` never reads exports a
+    closed parent above a child that never arrives.
 
     Structural rather than behavioural on purpose: the leak is a property of which variables the
     teardown reads, and a behavioural test would need a cancellable tool per handler to say the same

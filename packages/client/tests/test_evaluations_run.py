@@ -22,7 +22,7 @@ from launchdarkly_ai_server.evaluations import (
 
 @pytest.fixture(autouse=True)
 def stub_sdk_client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """Give every run a resolvable SDK client, since one is now required."""
+    """Give every run a resolvable SDK client, since one is required."""
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
     client = MagicMock()
     client.flush = AsyncMock()
@@ -1316,7 +1316,7 @@ async def test_judges_resolve_once_per_run_not_once_per_row(
     and the next -- rows in a single run scored against different judges. The
     online path does resolve per invocation (judges.build_judge_tasks), so
     routing the offline runner through it for convenience is a live way to
-    reintroduce this.
+    cause this.
     """
     transport = SequencedTransport(
         [
@@ -2502,7 +2502,7 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
 ) -> None:
-    """A tool result is now judge-prompt input, so it is an injection surface.
+    """A tool result is judge-prompt input, so it is an injection surface.
 
     It stays literal for the same reason the generated output does: the judge
     config is handed over unrendered and the handler makes exactly one template

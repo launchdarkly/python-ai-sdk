@@ -183,7 +183,7 @@ def to_lang_graph(
         # WorkflowState must reference add_messages from module-level scope.
         # With `from __future__ import annotations`, LangGraph resolves annotations
         # via get_type_hints() in the *module* global namespace — a local variable
-        # would cause NameError at StateGraph(WorkflowState) time (AIC-2948).
+        # would cause NameError at StateGraph(WorkflowState) time.
         class WorkflowState(TypedDict):
             messages: Annotated[list[Any], add_messages]
 

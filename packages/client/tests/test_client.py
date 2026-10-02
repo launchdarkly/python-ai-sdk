@@ -1,7 +1,5 @@
 """
-Tests for §3.10 config(), §3.12 LD context interpolation,
-§3.15 config().stream().
-Reference: TESTING.md §3.10, §3.12, §3.15
+Tests for config(), LD context interpolation, and config().stream().
 """
 
 from collections.abc import AsyncGenerator
@@ -79,7 +77,7 @@ def mock_ld_client() -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# §3.10 config() — single handler
+# config() — single handler
 # ---------------------------------------------------------------------------
 
 
@@ -382,7 +380,7 @@ class TestConfigSingleHandler:
         """When outputFormat is set but the handler returns an unparseable string,
         invoke() returns the raw string rather than raising — agents and streaming
         handlers cannot guarantee structured output (best-effort, consistent with
-        TypeScript SDK behavior). See TESTING.md §3.10."""
+        TypeScript SDK behavior)."""
         raw = {
             "model": {"name": "gpt-4"},
             "provider": {"name": "TestProvider"},
@@ -403,7 +401,7 @@ class TestConfigSingleHandler:
 
 
 # ---------------------------------------------------------------------------
-# §3.10 config() — multi-handler routing
+# config() — multi-handler routing
 # ---------------------------------------------------------------------------
 
 
@@ -565,7 +563,7 @@ class TestConfigMultiHandler:
 
 
 # ---------------------------------------------------------------------------
-# §3.12 LD context interpolation
+# LD context interpolation
 # ---------------------------------------------------------------------------
 
 
@@ -654,7 +652,7 @@ class TestLDContextInterpolation:
 
 
 # ---------------------------------------------------------------------------
-# §3.15 config().stream()
+# config().stream()
 # ---------------------------------------------------------------------------
 
 

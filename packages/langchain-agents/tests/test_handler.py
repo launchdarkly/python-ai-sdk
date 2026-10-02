@@ -1,7 +1,6 @@
 """
 Tests for launchdarkly-ai-langchain-agents handler.
-Covers §1.1–1.9 (generic) and §2.x.1 span name.
-Reference: TESTING.md §1, §2.x (LangChain)
+Covers the generic handler behaviours and the LangChain span name.
 """
 
 from __future__ import annotations
@@ -100,14 +99,14 @@ def _patch_lc(mocks: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.x.0 Agent creation API (Python: create_react_agent from langgraph.prebuilt)
+# Agent creation API (Python: create_react_agent from langgraph.prebuilt)
 # ---------------------------------------------------------------------------
 
 
 class TestAgentCreationAPI:
     @pytest.mark.asyncio
     async def test_calls_create_react_agent_not_createAgent(self) -> None:
-        """§2.x.0 — Python handler must call create_react_agent from langgraph.prebuilt."""
+        """Python handler must call create_react_agent from langgraph.prebuilt."""
         captured: dict[str, Any] = {"called": False, "args": None, "kwargs": None}
 
         mock_agent = AsyncMock()
@@ -160,7 +159,7 @@ class TestAgentCreationAPI:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory
+# Factory
 # ---------------------------------------------------------------------------
 
 
@@ -197,7 +196,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -317,7 +316,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -394,7 +393,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -463,7 +462,7 @@ class TestToolExecutionLoop:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Telemetry
+# Telemetry
 # ---------------------------------------------------------------------------
 
 
@@ -1147,7 +1146,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1208,7 +1207,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1296,7 +1295,7 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)
+# Streaming telemetry (do not patch _HAS_OTEL=False)
 # ---------------------------------------------------------------------------
 
 
@@ -1422,7 +1421,7 @@ class TestStreamingTelemetry:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format
+# Output format
 # ---------------------------------------------------------------------------
 
 
@@ -1474,12 +1473,12 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not raise or produce None content
+# None user_input must not raise or produce None content
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: _build_initial_messages must not pass None to
+    """_build_initial_messages must not pass None to
     HumanMessage when user_input is None."""
 
     def test_none_user_input_no_none_human_message_content(self) -> None:
@@ -1608,15 +1607,15 @@ class TestHistory:
 class TestAbandonOpenSpans:
     """An early consumer stop must not look like a provider failure.
 
-    The abandonment path used to reuse `close_open_spans`, which records a synthetic exception and
+    The abandonment path does not reuse `close_open_spans`, which records a synthetic exception and
     sets ERROR on every span still open. TELEMETRY-CONTRACT.md section 6 says an abandoned span stays
-    UNSET and carries `launchdarkly.stream.abandoned`, and `openai-agents` already did that.
+    UNSET and carries `launchdarkly.stream.abandoned`, as it does in `openai-agents`.
 
     Tested directly on the callback handler rather than through the streaming path. Reaching the
     state that matters, a chat or tool span still open at the break, needs a fake model that yields
     mid-turn, and with the fixtures here LangGraph has already run every callback by the time the
-    first chunk reaches the consumer. A test driven through `stream` therefore passes whether or not
-    the fix is present, which is worse than no test.
+    first chunk reaches the consumer. A test driven through `stream` would therefore pass whatever
+    the abandonment path did, which is worse than no test.
     """
 
     def _handler_with_open_spans(self) -> tuple[Any, Any, Any]:
@@ -1645,7 +1644,7 @@ class TestAbandonOpenSpans:
             assert span.exceptions == []
 
     def test_close_open_spans_still_fails_them_for_a_real_error(self) -> None:
-        # The failure path keeps its behaviour; only abandonment changed.
+        # The failure path still records an error; only abandonment leaves the status UNSET.
         from opentelemetry.trace import StatusCode
 
         bundle, chat, tool = self._handler_with_open_spans()
@@ -1762,7 +1761,8 @@ class TestModelSpanTrackedBeforeContent:
     """`_start_model` must insert the span before writing content that can raise.
 
     A span created but never inserted is unreachable by close_open_spans, abandon_open_spans and the
-    end callbacks alike, so it never ends and never exports. `on_tool_start` already had this fix.
+    end callbacks alike, so it would never end and never export. `on_tool_start` follows the same
+    order.
     """
 
     @pytest.mark.asyncio
@@ -1791,10 +1791,10 @@ class TestModelSpanTrackedBeforeContent:
 class TestZeroTokensAreStillReported:
     """A reported 0 is not a missing count.
 
-    `extract_llm_usage` read the llm_output fallback with `or`, so a genuine 0 was skipped. With both
-    counts at zero the bag came back all None, `lang_chain_span_usage` read that as "the provider
-    said nothing", and the run went unreported: a turn that completed and cost nothing became
-    indistinguishable from one that never reported.
+    `extract_llm_usage` must not read the llm_output fallback with `or`, which would skip a genuine
+    0. With both counts at zero the bag would come back all None, `lang_chain_span_usage` would read
+    that as "the provider said nothing", and the run would go unreported: a turn that completed and
+    cost nothing would be indistinguishable from one that never reported.
     """
 
     def test_a_zero_prompt_count_survives(self) -> None:
@@ -1871,7 +1871,7 @@ class TestSuccessAndFailureUsageAgree:
 
     @pytest.mark.asyncio
     async def test_usage_metadata_still_wins_when_both_are_present(self) -> None:
-        # The message-level sum stays authoritative where it has anything to say, so this change
+        # The message-level sum stays authoritative where it has anything to say, so the fallback
         # cannot double-count a provider that reports in both places.
         ctx, rec = _recording()
         llm = _FakeToolModel(
@@ -1928,9 +1928,9 @@ class TestCallbackKeepsBilledTokens:
 class TestInputWritesNeverLeakASpan:
     """Serialising the prompt must not be able to strand the root span.
 
-    The input content write ran before the guard that fails the root, so a raise there left it open:
-    never ended, never exported, so the run disappeared from AI Config Monitoring along with the
-    feature_flag event it carries.
+    The input content write sits inside the guard that fails the root. Ahead of it, a raise there
+    would leave the root open: never ended, never exported, so the run would disappear from AI
+    Config Monitoring along with the feature_flag event it carries.
     """
 
     @pytest.mark.asyncio
@@ -1985,10 +1985,10 @@ class TestCancellationEndsEverySpan:
 
     @pytest.mark.asyncio
     async def test_a_cancelled_run_still_exports_its_spans(self) -> None:
-        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before
-        # this, a cancelled run exported nothing at all: the root carries the feature_flag event
-        # and every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather
-        # than showing as incomplete.
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Without
+        # a `finally`, a cancelled run would export nothing at all: the root carries the
+        # feature_flag event and every launchdarkly.* attribute, so the run would vanish from AI
+        # Config Monitoring rather than showing as incomplete.
         import asyncio
 
         ctx, rec = _recording()
@@ -2099,9 +2099,9 @@ class TestStreamingRootUsageFallsBackToTheCallbacks:
         self,
     ) -> None:
         # The streaming walk reads usage_metadata off the astream payloads and sees nothing when a
-        # provider reports in llm_output.token_usage instead. Without the fallback the root wrote
-        # zero while its own chat spans held the billed tokens, which is the mismatch the blocking
-        # path already guards against.
+        # provider reports in llm_output.token_usage instead. Without the fallback the root would
+        # write zero while its own chat spans held the billed tokens, which is the mismatch the
+        # blocking path guards against too.
         from langchain_core.outputs import ChatGeneration, ChatResult
 
         class _LlmOutputOnlyModel(_FakeToolModel):

@@ -1,6 +1,5 @@
 """
-Tests for §3.14 run_judges.
-Reference: TESTING.md §3.14
+Tests for run_judges.
 """
 
 from typing import Any, ClassVar
@@ -388,7 +387,7 @@ class TestRunJudges:
 
 
 class TestScoreGuard:
-    """`float(score)` used to sit ahead of the evaluation-metric track, so a junk score killed it."""
+    """`float(score)` stays behind the evaluation-metric track, so a junk score cannot kill it."""
 
     def test_rejects_non_numeric_scores_without_raising(self) -> None:
         from launchdarkly_ai_server.judge_scoring import numeric_score
@@ -481,7 +480,7 @@ class TestRunJudgeScoreReporting:
 
 
 class TestRunJudgeTrackData:
-    """§3.13 run_judge result track_data must not inherit the parent's model stamps."""
+    """run_judge result track_data must not inherit the parent's model stamps."""
 
     PARENT: ClassVar[dict[str, Any]] = {
         "runId": "parent-run",

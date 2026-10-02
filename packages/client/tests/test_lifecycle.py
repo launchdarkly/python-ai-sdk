@@ -1,6 +1,5 @@
 """
-Tests for §3.9 init_client / get_client / shutdown.
-Reference: TESTING.md §3.9
+Tests for init_client / get_client / shutdown.
 """
 
 import os
@@ -290,7 +289,7 @@ class TestShutdown:
 
 
 # ---------------------------------------------------------------------------
-# OTel setup details (§3.9)
+# OTel setup details
 # ---------------------------------------------------------------------------
 
 

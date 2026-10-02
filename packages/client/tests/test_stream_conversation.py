@@ -198,7 +198,7 @@ class TestConcurrentConversationIsolation:
 
 
 class TestStreamParentingWithIdBound:
-    """The unbound parenting test cannot catch a regression in the wrapper — it never builds one.
+    """The unbound parenting test cannot catch a fault in the wrapper — it never builds one.
 
     A real streaming handler holds a span current across a ``yield``. The wrapper must not disturb
     that: a span the handler opens after resuming belongs to its own ``chat`` span, exactly as it

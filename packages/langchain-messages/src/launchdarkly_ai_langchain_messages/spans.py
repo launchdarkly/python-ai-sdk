@@ -9,10 +9,10 @@ children of it: both take the same parent context, which is the root's. See TELE
 section 1.
 
 Two provider keys, two different values, on purpose. ``gen_ai.system`` is the literal string
-``langchain`` on every span this package opens, because that is what the handler shipped before
-the span hierarchy landed. ``gen_ai.provider.name`` names *who served the model*, and semconv's
-enum has no ``langchain`` member, so it follows :func:`serving_provider` instead: the configured
-provider name, lower-cased. See TELEMETRY-CONTRACT.md section 9.
+``langchain`` on every span this package opens, the value existing consumers of that key expect and
+the one the TypeScript LangChain handlers emit. ``gen_ai.provider.name`` names *who served the
+model*, and semconv's enum has no ``langchain`` member, so it follows :func:`serving_provider`
+instead: the configured provider name, lower-cased. See TELEMETRY-CONTRACT.md section 9.
 """
 
 from __future__ import annotations

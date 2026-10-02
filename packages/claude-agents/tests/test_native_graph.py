@@ -1,6 +1,5 @@
 """
-Tests for §2.2 native graph adapter (to_claude_agents) plus Anthropic-specific specs.
-Reference: TESTING.md §2.2, §2.x (Anthropic)
+Tests for the native graph adapter (to_claude_agents) plus Anthropic-specific specs.
 """
 
 from __future__ import annotations
@@ -129,7 +128,7 @@ def _make_sdk_mock(result_text: str = "done") -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.2 Generic topology
+# Generic topology
 # ---------------------------------------------------------------------------
 
 
