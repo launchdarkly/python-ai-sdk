@@ -10,6 +10,7 @@ from .judge_scoring import (
     build_message_history,
     numeric_score,
     parse_judge_response,
+    without_output_format,
 )
 from .types import (
     AiConfigRep,
@@ -146,10 +147,11 @@ async def run_judges(
                         and handler.provides_for[1] == "agent"
                     )
 
-            effective_judge_config = (
+            effective_judge_config = without_output_format(
                 _collapse_messages_to_instructions(judge_ai_config)
                 if collapse_messages
-                else judge_ai_config
+                else judge_ai_config,
+                judge_key,
             )
 
             message_history = build_message_history(
@@ -314,7 +316,7 @@ async def build_judge_tasks(
             tasks.append(
                 JudgeTask(
                     config_key=judge_key,
-                    judge_config=judge_ai_config,
+                    judge_config=without_output_format(judge_ai_config, judge_key),
                     judge_meta=judge_meta,
                     actual_output=llm_response,
                     user_input=user_input,
@@ -381,10 +383,13 @@ async def run_judge(
     if judge_handler is None:
         return None
 
-    effective_config = (
+    # Defensive: a task serialized before outputFormat was stripped at build time
+    # may still carry it, so strip it here too rather than trust the producer.
+    effective_config = without_output_format(
         _collapse_messages_to_instructions(task.judge_config)
         if task.collapse_messages
-        else task.judge_config
+        else task.judge_config,
+        task.config_key,
     )
 
     # user_input and trajectory come off the task rather than being omitted:
