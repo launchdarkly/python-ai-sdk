@@ -25,6 +25,7 @@ import random
 import re
 import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -86,10 +87,18 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 """The most the transport holds in memory from one poll body or one streamed event.
 
 A memory backstop set far above any real payload, separate from the per-skill
-content limit verification enforces. Crossing it is a recoverable failure:
-nothing is applied, the store keeps its current content, and delivery retries."""
+content limit verification enforces. Crossing it is fatal: nothing is applied,
+the store keeps its current content, and ``failed`` is set. The payload's size
+belongs to the environment, so a retry would be refused the same way, after
+downloading up to this much again."""
 
 _READ_CHUNK_BYTES = 64 * 1024
+
+_BACKOFF_RESET_INTERVAL = 60.0
+"""
+Seconds a stream must stay open before its end resets the backoff delay, as in
+the base server-side SDKs. Overridden in tests.
+"""
 
 _EVENT_SERVER_INTENT = "server-intent"
 _EVENT_PUT_OBJECT = "put-object"
@@ -478,6 +487,9 @@ class _TransferOutcome:
     up_to_date: bool = False
     """A ``none`` intent: the content held is current. Counts as a healthy
     exchange though it commits nothing, like a 304 to a poll."""
+    recycled: bool = False
+    """The disconnect is a ``goodbye``: routine if the connection has already
+    completed an exchange."""
 
 
 def _identity_of(raw: dict[str, Any]) -> tuple[str, Any]:
@@ -589,12 +601,17 @@ class _ProtocolReader:
             self._pending = _SkillObjectSet()
         elif intent == _INTENT_TRANSFER_CHANGES:
             self._pending = self._committed.copy()
-        else:
-            if intent != _INTENT_TRANSFER_NONE:
-                logger.debug("Ignoring FDv2 server-intent with intentCode %r", intent)
+        elif intent == _INTENT_TRANSFER_NONE:
+            # Current, but not finished: later edits arrive on this connection
+            # with no second intent, so expect changes, as the base SDK's
+            # ``ChangeSetBuilder.expect_changes()`` does. The pending set is
+            # copied when the first object arrives.
+            self._intent = _INTENT_TRANSFER_CHANGES
             self._pending = None
-            # Only ``none`` is an answer; an unrecognised intent is not.
-            return _TransferOutcome(up_to_date=intent == _INTENT_TRANSFER_NONE)
+            return _TransferOutcome(up_to_date=True)
+        else:
+            logger.debug("Ignoring FDv2 server-intent with intentCode %r", intent)
+            self._pending = None
         return _TransferOutcome()
 
     def _target_for(self, data: Any) -> _SkillObjectSet | None:
@@ -712,12 +729,16 @@ class _ProtocolReader:
         silent = bool(data.get("silent")) if isinstance(data, dict) else False
         self._abandon_in_flight()
         if not silent:
-            logger.info("FDv2 connection closing: %s", reason)
+            # Debug only: a goodbye after a completed exchange is a routine
+            # recycle, and the delivery loop warns when one is not.
+            logger.debug("FDv2 connection closing: %s", reason)
         if catastrophe:
             return _TransferOutcome(
                 fatal=f"server sent a catastrophic goodbye: {reason}"
             )
-        return _TransferOutcome(disconnect=f"server said goodbye: {reason}")
+        return _TransferOutcome(
+            disconnect=f"server said goodbye: {reason}", recycled=True
+        )
 
     # -- payload identity ----------------------------------------------------
 
@@ -824,12 +845,25 @@ class _FatalTransportError(Exception):
     """A failure retrying cannot fix: bad credential, forbidden, wrong URI."""
 
 
+class _ResponseTooLargeError(_FatalTransportError):
+    """A poll body, stream line or stream event over ``MAX_RESPONSE_BYTES``."""
+
+
 class _RecoverableTransportError(Exception):
     """A failure worth retrying. Carries a server-requested delay when given one."""
 
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        retry_after: float | None = None,
+        *,
+        recycled: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.recycled = recycled
+        """A ``goodbye`` after a completed exchange: the server recycling the
+        stream. Reconnected, but not counted or reported as a failure."""
 
 
 class _StaleRequestStateError(_RecoverableTransportError):
@@ -1081,7 +1115,7 @@ class _Requester:
                 # urllib raises on 304; here it means "unchanged".
                 return _PollResult(not_modified=True, events=[], etag=etag)
             raise _classify_status(exc.code, exc.headers) from exc
-        except _RecoverableTransportError:
+        except (_RecoverableTransportError, _FatalTransportError):
             raise
         except Exception as exc:
             raise _RecoverableTransportError(
@@ -1124,7 +1158,7 @@ def _read_bounded(response: Any, limit: int) -> bytes:
             return b"".join(chunks)
         seen += len(chunk)
         if seen > limit:
-            raise _RecoverableTransportError(
+            raise _ResponseTooLargeError(
                 f"polling response exceeded the {limit}-byte transport bound "
                 f"(at least {seen} bytes received); nothing from it was applied"
             )
@@ -1169,13 +1203,13 @@ def _iter_stream_lines(response: Any, limit: int) -> Any:
             if not line:
                 return
             if len(line) > limit:
-                raise _RecoverableTransportError(
+                raise _ResponseTooLargeError(
                     f"an FDv2 stream line exceeded the {limit}-byte transport "
                     "bound; the connection was dropped and nothing from the "
                     "in-flight payload was applied"
                 )
             yield line
-    except _RecoverableTransportError:
+    except (_RecoverableTransportError, _FatalTransportError):
         raise
     except Exception as exc:
         raise _RecoverableTransportError(
@@ -1189,8 +1223,8 @@ def _iter_sse(response: Any) -> Any:
 
     Minimal: ``event:``/``data:`` fields, multi-line ``data`` joined with
     newlines, blank line dispatches, ``:`` comments skipped. An event over
-    ``MAX_RESPONSE_BYTES`` raises a recoverable error and the in-flight payload
-    is abandoned.
+    ``MAX_RESPONSE_BYTES`` raises a fatal error and the in-flight payload is
+    abandoned.
     """
     limit = MAX_RESPONSE_BYTES
     try:
@@ -1219,7 +1253,7 @@ def _iter_sse(response: Any) -> Any:
                 continue
             event_bytes += len(raw_line)
             if event_bytes > limit:
-                raise _RecoverableTransportError(
+                raise _ResponseTooLargeError(
                     f"an FDv2 stream event exceeded the {limit}-byte transport "
                     f"bound (at least {event_bytes} bytes received); the "
                     "connection was dropped and nothing from the in-flight "
@@ -1251,8 +1285,11 @@ def _backoff_delay(
 
     Jitter is subtracted, never added, so *maximum* is a true ceiling.
     """
-    # float(2 ** n): the integer power is untyped to mypy.
-    ceiling: float = min(maximum, base * float(2 ** max(0, attempt - 1)))
+    # Clamped: retries are unbounded, and ``float(2 ** n)`` overflows past
+    # about 1024. ``2 ** 62`` exceeds any real cap. ``float(...)``: the integer
+    # power is untyped to mypy.
+    exponent = min(max(0, attempt - 1), 62)
+    ceiling: float = min(maximum, base * float(2**exponent))
     return ceiling * (1.0 - jitter * random.random())
 
 
@@ -1307,7 +1344,6 @@ class FDv2SkillStore:
         read_timeout: float | None = None,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        max_consecutive_failures: int = 10,
         _requester: Any = None,
     ) -> None:
         """
@@ -1326,10 +1362,12 @@ class FDv2SkillStore:
           ``"poll"`` mode it bounds the whole request (``DEFAULT_POLL_TIMEOUT``);
           in ``"stream"`` mode, each wait for more bytes
           (``DEFAULT_STREAM_READ_TIMEOUT``).
-        - *max_backoff*: caps every retry delay, including ``Retry-After``.
-        - *max_consecutive_failures*: after this many failures in a row,
-          delivery stops, logs an error, and ``failed`` is set; the store keeps
-          serving last known good. A completed exchange resets the count.
+        - *initial_backoff*: the first retry delay; positive and finite.
+        - *max_backoff*: caps every retry delay, including ``Retry-After``;
+          positive, finite, and at least *initial_backoff*.
+
+        Recoverable failures are retried for as long as the store runs; only a
+        fatal status stops delivery and sets ``failed``.
         """
         _require_server_side_credential(sdk_key)
         # A lone ``base_uri`` serves both endpoints.
@@ -1353,12 +1391,24 @@ class FDv2SkillStore:
             )
         elif not (math.isfinite(read_timeout) and read_timeout > 0):
             raise ValueError(f"read_timeout must be positive, got {read_timeout!r}")
+        # With no failure bound these are the only limit on the retry loop: a
+        # zero or negative value reconnects as fast as the network allows.
+        for option, value in (
+            ("initial_backoff", initial_backoff),
+            ("max_backoff", max_backoff),
+        ):
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError(f"{option} must be positive and finite, got {value!r}")
+        if initial_backoff > max_backoff:
+            raise ValueError(
+                f"initial_backoff ({initial_backoff!r}) must not exceed "
+                f"max_backoff ({max_backoff!r})"
+            )
 
         self._mode: Mode = mode
         self._poll_interval = poll_interval
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
-        self._max_consecutive_failures = max_consecutive_failures
 
         self._objects = _SkillObjectSet()
         self._reader = _ProtocolReader(self._objects)
@@ -1393,6 +1443,12 @@ class FDv2SkillStore:
         # Recoverable failures in a row; reset by a completed exchange, not by a
         # connection ending (a stream only ends by being dropped).
         self._failures = 0
+        # The backoff's attempt number, kept apart from ``_failures``: reset
+        # only by a stream that stayed open ``_BACKOFF_RESET_INTERVAL``, or by
+        # a completed poll, so a server that answers and drops is backed off.
+        self._backoff_attempts = 0
+        # When the current stream connected, for the reset above.
+        self._connected_at: float | None = None
         # Whether the current attempt got a complete answer, which separates a
         # recycled healthy stream from a failed one.
         self._attempt_answered = False
@@ -1407,7 +1463,7 @@ class FDv2SkillStore:
 
         Raises ``RuntimeError`` if the store has been closed. A store whose
         delivery stopped on its own (``failed`` is set) can be started again,
-        with a fresh retry budget.
+        with its backoff reset.
         """
         with self._lock:
             if self._closed:
@@ -1437,12 +1493,13 @@ class FDv2SkillStore:
     def _rearm_waiters(self) -> None:
         """
         Resets per-run state for a store being started again after it gave up:
-        the ended-delivery flag, ``failed``, and the retry budget. A payload
+        the ended-delivery flag, ``failed``, and the failure count. A payload
         already held still answers ``wait_for_skills``. Call with the lock held.
         """
         self._delivery_ended.clear()
         self._failed_reason = None
         self._failures = 0
+        self._backoff_attempts = 0
         if not self._first_payload.is_set():
             self._released.clear()
 
@@ -1609,6 +1666,8 @@ class FDv2SkillStore:
                 # A returned poll is a current answer, even a 304. Stream
                 # successes are recorded in ``_apply``.
                 self._record_success()
+                with self._lock:
+                    self._backoff_attempts = 0
             except _FatalTransportError as exc:
                 self._give_up(str(exc))
                 return
@@ -1616,7 +1675,6 @@ class FDv2SkillStore:
                 if self._stop.is_set():
                     # ``close`` interrupted the request; not a failure.
                     return
-                repairing_state = False
                 if isinstance(exc, _StaleRequestStateError):
                     # With no basis or etag to drop, the 400 is fatal. Otherwise
                     # drop them and request a full transfer once.
@@ -1626,30 +1684,32 @@ class FDv2SkillStore:
                             self._basis = None
                             self._etag = None
                             self._etag_basis = None
-                            repairing_state = True
                     if exhausted:
                         self._give_up(str(exc))
                         return
                 with self._lock:
                     # Discard any partial payload from the dropped connection.
                     self._reader._abandon_in_flight()
-                    self._failures += 1
-                    failures = self._failures
                     answered = self._attempt_answered
-                    self._reader.diagnostics.connection_failures = failures
-                    self._reader.diagnostics.last_error = str(exc)
-                if failures > self._max_consecutive_failures and not repairing_state:
-                    # The one stateless retry after a 400 is exempt, so an
-                    # exhausted budget cannot block that repair.
-                    self._give_up(
-                        f"gave up after {failures} consecutive failures; "
-                        f"last error: {exc}"
-                    )
-                    return
+                    # A goodbye after a completed exchange is a routine recycle.
+                    recycled = exc.recycled and answered
+                    if not recycled:
+                        self._failures += 1
+                        self._reader.diagnostics.connection_failures = self._failures
+                        self._reader.diagnostics.last_error = str(exc)
+                    connected_at = self._connected_at
+                    self._connected_at = None
+                    if (
+                        connected_at is not None
+                        and time.monotonic() - connected_at >= _BACKOFF_RESET_INTERVAL
+                    ):
+                        self._backoff_attempts = 0
+                    self._backoff_attempts += 1
+                    attempt = self._backoff_attempts
                 delay = exc.retry_after
                 if delay is None or not math.isfinite(delay):
                     delay = _backoff_delay(
-                        failures, base=self._initial_backoff, maximum=self._max_backoff
+                        attempt, base=self._initial_backoff, maximum=self._max_backoff
                     )
                 else:
                     # Floor at ``initial_backoff`` so ``Retry-After: 0`` cannot
@@ -1713,7 +1773,7 @@ class FDv2SkillStore:
                 self._basis = outcome.basis
         if outcome.committed or outcome.up_to_date:
             # Both are completed exchanges. Counting ``up_to_date`` keeps a
-            # stream for an unchanging environment from exhausting its budget.
+            # stream for an unchanging environment from reading as failing.
             self._record_success()
         if outcome.committed:
             self._publish_first_payload()
@@ -1722,7 +1782,9 @@ class FDv2SkillStore:
         if outcome.fatal:
             raise _FatalTransportError(outcome.fatal)
         if outcome.disconnect:
-            raise _RecoverableTransportError(outcome.disconnect)
+            raise _RecoverableTransportError(
+                outcome.disconnect, recycled=outcome.recycled
+            )
 
     def _poll_once(self) -> None:
         with self._lock:
@@ -1751,6 +1813,7 @@ class FDv2SkillStore:
         connection = self._requester.stream(basis)
         with self._lock:
             self._connection = connection
+            self._connected_at = time.monotonic()
         try:
             # ``close`` may have run during the connect, before there was a
             # connection to interrupt.

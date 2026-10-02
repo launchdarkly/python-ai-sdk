@@ -628,7 +628,7 @@ HTTP 422 when it will not serve one.
 - **Not the empty case:** an environment with zero skills is served an empty payload that
   commits normally.
 - **Recovery:** once the cause is fixed, call `start()` on the same store. Only `close()` is
-  final: a restart clears `failed`, resets the retry budget, and held content stays readable
+  final: a restart clears `failed`, resets the backoff, and held content stays readable
   throughout. Restarting the process also works.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
@@ -651,15 +651,23 @@ never followed, so a 3xx stops delivery instead of forwarding the key to the `Lo
 Construct a new store to resume.
 
 **Reads are memory-bounded.** A poll body or streamed event larger than `MAX_RESPONSE_BYTES`
-(64 MiB) is dropped without being applied; the store keeps serving what it last held, and
-delivery retries on its normal backoff.
+(64 MiB) is dropped without being applied, and delivery stops: the payload's size belongs to the
+environment, so a retry would download it again and be refused the same way. `failed` carries
+the reason, the store keeps serving what it last held, and `start()` resumes delivery once the
+payload is back under the bound.
 
 **Streaming is the default, and it is what makes revocation fast.** A `delete-object` reaches a
 live stream in seconds; with `mode="poll"` it arrives within one `poll_interval`. With
-`watch_skills`, a revoked skill's `SKILL.md` leaves the disk without a restart. During an
-outage the store keeps serving its last content, and `write_skills`' default
-`on_unavailable="keep"` leaves managed files alone, so an outage does not read as "everything
-was revoked".
+`watch_skills("*", ...)`, a revoked skill's `SKILL.md` leaves the disk without a restart. During
+an outage the store keeps serving its last content and retries for as long as it runs, and
+`write_skills`' default `on_unavailable="keep"` leaves managed files alone, so an outage does
+not read as "everything was revoked".
+
+**With an explicit skill list, revocation does not reach the disk.** Given a list such as
+`skill_refs(config)`, a skill deleted in LaunchDarkly is reported as an `error` action under
+its key, and its `SKILL.md` is kept rather than pruned. The watcher also listens only to the
+skill store, not to flag changes, so unpinning a skill from a variation is not seen either. Use
+`"*"` when revocation must reach the disk.
 
 **Without the watcher, the revocation bound is process lifetime.** If you call `write_skills`
 once at boot and never run `watch_skills`, a skill revoked after boot stays on disk, and in the
@@ -697,7 +705,7 @@ that skips verification.
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative or non-finite `timeout`, or an unrecognised `on_unavailable`. `timeout=0` is valid and makes every skill report an error. **Performs synchronous filesystem I/O — see the note below.** |
 | `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `is_initialized()`, `add_listener(kind, fn)` / `remove_listener(kind, fn)`. A store without `is_initialized()` is treated as initialized. Both shipped stores deliver only the skill kind, so `add_listener` on any other kind raises. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
-| `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `close()` is **final** — `start()` afterwards raises. `poll_interval` and `read_timeout` must be positive and finite. **Server-side only.** See *Receiving skills from LaunchDarkly* above. |
+| `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `close()` is **final** — `start()` afterwards raises. `poll_interval`, `read_timeout`, `initial_backoff` and `max_backoff` must be positive and finite, and `initial_backoff` may not exceed `max_backoff`. **Server-side only.** See *Receiving skills from LaunchDarkly* above. |
 | `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, so revocation takes effect within `debounce` rather than at the next restart. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 

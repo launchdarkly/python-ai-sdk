@@ -273,7 +273,7 @@ asserts both the cause and the absences.
 
 **A fatal stops the run, not the store, so every surface says `start()`, not "restart the
 process".** `_give_up` does not close; only `close` sets `_closed`, the one thing `start`
-refuses. A store that gave up — on a 401, 403, 404, 422, or an exhausted retry budget —
+refuses. A store that gave up — on a 401, 403, 404, 422, or another fatal status —
 resumes in place once the cause is fixed, clearing the terminal reason through
 `_rearm_waiters`. Asserted by `test_the_give_up_line_points_at_start_not_a_process_restart`,
 `test_a_store_that_gave_up_on_a_422_resumes_on_start`, and
@@ -290,10 +290,12 @@ resumes in place once the cause is fixed, clearing the terminal reason through
 
 **Reads are memory-bounded.** `_read_bounded` (poll bodies) and
 `_iter_stream_lines`/`_iter_sse` (each line and each event) enforce `MAX_RESPONSE_BYTES`
-(64 MiB). Crossing it raises `_RecoverableTransportError`: nothing from that body or event
-is applied, the in-flight payload is abandoned, the failure is recorded in
-`connection_failures`/`last_error`, and delivery retries on the usual backoff while the
-committed set stays served. This bound is independent of
+(64 MiB). Crossing it raises `_ResponseTooLargeError`, a fatal error: nothing from that
+body or event is applied, the in-flight payload is abandoned, `failed` and `last_error` are
+set, and the committed set stays served. It is fatal because the size belongs to the
+environment, not the connection: retried, it would re-download up to 64 MiB on every backoff
+step forever. The requester wrappers re-raise fatal errors unchanged; do not let a generic
+`except Exception` turn one back into a recoverable error. This bound is independent of
 `skills_core.MAX_SKILL_CONTENT_BYTES` (one skill's content, at verification); do not derive
 one from the other.
 
@@ -720,7 +722,7 @@ create false confidence. The operator's verification steps are in the README.
 `timeout` is a monotonic deadline, checked before each retrieval, each write, and each prune;
 only the final manifest rewrite runs past it, so files already written are never orphaned.
 Bounded retries are **not** implemented at this layer; retry policy belongs to the delivery
-transport (`FDv2SkillStore`'s backoff and retry budget). Why:
+transport (`FDv2SkillStore`'s capped backoff). Why:
 
 1. **There is nothing transient to retry.** `SkillStore.get_object` is a synchronous
    in-process read of already-delivered data, modelled on the LaunchDarkly data-store API. A
@@ -881,6 +883,12 @@ deletes the last known-good copy and reports a routine `removed` with `report.ok
 true. Tampered content must never trigger deletion.
 
 ### 6. Expecting revocation to reach a boot-only `write_skills` deployment
+
+Even with `watch_skills`, only the `"*"` form removes a revoked skill from disk. With an
+explicit list such as `skill_refs(config)`, the list is fixed: a skill the store answers
+`absent` for is reported as an `error` and its files are kept, and the watcher listens only to
+the skill store, so unpinning a skill or moving it to a new version is not seen until the refs
+are read again.
 
 Without `watch_skills`, the revocation bound is process lifetime: a skill revoked after boot
 stays on disk until the process reconciles again, so a restart (or an explicit re-run of
