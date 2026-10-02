@@ -795,6 +795,10 @@ class _ProtocolReader:
         # whose selector must not become the resume point if it is not the
         # payload skills arrive on.
         foreign = self._is_foreign_payload(payload_id)
+        # A ``none`` intent builds no pending set, nor does an intent code this
+        # SDK does not recognise, and a foreign payload's contents are declined
+        # below.
+        applied = not foreign and self._pending is not None
         if foreign:
             self._warn_foreign_payload(payload_id)
             self.diagnostics.payloads_ignored += 1
@@ -833,15 +837,18 @@ class _ProtocolReader:
             version,
             len(self._committed),
         )
+        if not applied:
+            # Nothing applied, so nothing to report — and in particular not a
+            # commit, because a commit publishes the first payload, and
+            # ``is_initialized`` (what ``write_skills("*")`` authorises a prune
+            # on) must not go true over a store that received nothing. Not up to
+            # date either: only the ``none`` intent says that, on its own event.
+            # The selector is withheld too — it names a payload never applied.
+            return _TransferOutcome()
         return _TransferOutcome(
             committed=True,
             changes=changes,
-            # A declined payload must not move the resume point. Adopting the
-            # selector of a transfer whose contents this layer just threw away
-            # would ask the next poll or stream to resume from someone else's
-            # payload, and skill updates could stop arriving while every
-            # diagnostic still read healthy.
-            basis=state if not foreign and isinstance(state, str) and state else None,
+            basis=state if isinstance(state, str) and state else None,
         )
 
     def _abandon_in_flight(self) -> None:
@@ -2060,10 +2067,14 @@ class FDv2SkillStore:
             reason,
         )
 
-    def _apply(self, name: str, data: Any) -> None:
+    def _apply(self, name: str, data: Any) -> bool:
         """
         Feeds one event to the reader, publishes a commit, and raises the
         transport error the event calls for, if any.
+
+        Returns whether the event completed an exchange — a commit, or the
+        server confirming the content held is current — which is what
+        ``_poll_once`` adopts an etag on.
         """
         with self._lock:
             outcome = self._reader.handle(name, data)
@@ -2085,6 +2096,7 @@ class FDv2SkillStore:
             raise _FatalTransportError(outcome.fatal)
         if outcome.disconnect:
             raise _RecoverableTransportError(outcome.disconnect)
+        return outcome.committed or outcome.up_to_date
 
     def _poll_once(self) -> None:
         with self._lock:
@@ -2099,20 +2111,22 @@ class FDv2SkillStore:
         result = self._requester.poll(basis, etag)
         if result.not_modified:
             logger.debug("Skill payload unchanged (HTTP 304)")
-            # A 304 counts as a first payload, so a boot that reconnects with a
-            # cached basis is not blocked on a transfer the server will not
-            # send. It is a current answer because the etag that asked for it
-            # was issued for a body this store applied in full.
-            self._publish_first_payload()
+            # A 304 confirms the payload this store holds; it cannot establish
+            # one. ``is_initialized`` stays false until something commits, so a
+            # store that has received nothing never authorises a prune of the
+            # files on disk. ``_run`` counts the poll as a healthy answer.
             return
+        completed = False
         for name, data in result.events:
-            self._apply(name, data)
+            completed = self._apply(name, data) or completed
+        if not completed:
+            # An etag describes the body it came with, so it is adopted only when
+            # that body is also what the store now holds: a commit, or a ``none``
+            # intent. A transfer this SDK could not apply is neither, and keeping
+            # its etag would let the next 304 confirm content never applied. Any
+            # etag already held stays valid, so it is left alone, not cleared.
+            return
         with self._lock:
-            # Adopted only once the whole body has been applied. A body that
-            # broke off partway — an ``error`` or ``goodbye`` after an announced
-            # transfer — left the payload it described unapplied, and keeping
-            # its etag would let the next 304 report a store that is missing
-            # that payload as current and healthy.
             self._etag = result.etag
             self._etag_basis = basis
 

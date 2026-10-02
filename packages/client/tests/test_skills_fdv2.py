@@ -922,11 +922,19 @@ class TestProtocolReader:
         )
         assert outcome.fatal is not None
 
-    def test_transfer_none_holds_everything_and_commits(self) -> None:
+    def test_transfer_none_holds_everything_and_commits_nothing(self) -> None:
+        """
+        ``none`` is the server saying the payload held is current, so nothing is
+        applied and nothing is committed. It is a *completed exchange* — which
+        is what breaks a row of failures, and what lets the next request offer
+        the body's etag — but it is not a payload. Publishing one would make
+        ``is_initialized`` true over whatever the store happens to hold, and
+        that is the fact ``write_skills("*")`` prunes on.
+        """
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
         drive(reader, full_payload(("put-object", put_skill())))
-        drive(
+        intent, outcome = drive(
             reader,
             events(
                 ("server-intent", server_intent("none")),
@@ -934,6 +942,48 @@ class TestProtocolReader:
             ),
         )
         assert len(held) == 1
+        assert intent.up_to_date is True
+        assert outcome.committed is False
+        # The intent event above already carried the up-to-date answer; the
+        # transfer completing it adds nothing to report.
+        assert outcome.up_to_date is False
+        # Nor does it move the resume point. ``basis-2`` names a payload this
+        # store was never sent, and resuming from it would ask every later
+        # connection for changes since a payload it never applied.
+        assert outcome.basis is None
+
+    def test_a_transfer_that_applied_nothing_is_not_a_commit(self) -> None:
+        """
+        Three shapes reach ``payload-transferred`` with no pending set to apply:
+        an intent code this SDK does not recognise, a ``none`` intent, and a
+        lone transfer under no intent at all. None of them applied anything, so
+        none of them claims anything — neither a commit, which is what publishes
+        the first payload ``write_skills("*")`` prunes on, nor an up-to-date
+        answer, which only the server can give and only the ``none`` intent
+        does, on its own event.
+
+        The transfer is still a wire fact, counted either way.
+        """
+        for payload_events in (
+            events(
+                ("server-intent", server_intent("xfer-future")),
+                ("put-object", put_skill()),
+                ("payload-transferred", transferred("basis-1")),
+            ),
+            events(
+                ("server-intent", server_intent("none")),
+                ("payload-transferred", transferred("basis-1")),
+            ),
+            events(("payload-transferred", transferred("basis-1"))),
+        ):
+            held = _SkillObjectSet()
+            reader = _ProtocolReader(held)
+            outcome = drive(reader, payload_events)[-1]
+            assert outcome.committed is False
+            assert outcome.up_to_date is False
+            assert outcome.basis is None
+            assert len(held) == 0
+            assert reader.diagnostics.payloads_transferred == 1
 
     def test_an_object_arriving_with_no_intent_is_treated_as_a_delta(self) -> None:
         held = _SkillObjectSet()
@@ -1445,15 +1495,68 @@ class TestPollingAgainstTheEndpoint:
             assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
             assert store.diagnostics.payloads_transferred == 1
             assert store.failed is None
+            # A payload arrived, and a 304 does not take that back.
+            assert store.is_initialized() is True
 
-    def test_a_304_before_any_payload_still_releases_wait_for_skills(
+    def test_a_304_confirms_a_payload_but_cannot_establish_one(
         self, endpoint: Any
     ) -> None:
-        """A reconnect with a cached basis has nothing to transfer; boot must not
-        block on a payload the server has no reason to send."""
+        """
+        A 304 answers for content this store already holds, and the etag that
+        asked for it is only ever adopted from a body that completed an
+        exchange. Reaching one with nothing held therefore takes a server
+        answering a request that carried no etag at all, and that 304 says
+        nothing about a payload this store never received.
+
+        Releasing ``wait_for_skills`` on it would make ``is_initialized`` true
+        over an empty committed set — the fact ``write_skills("*")`` prunes on —
+        so a reconcile that raced delivery would delete every managed skill on
+        disk instead of reporting the retrieval unavailable (§3.21). Failing
+        closed costs a boot that is genuinely waiting nothing it was not already
+        waiting for.
+        """
         endpoint.queue_poll(status=304)
         with poll_store(endpoint) as store:
-            assert store.wait_for_skills(timeout=5) is True
+            assert store.wait_for_skills(timeout=0.5) is False
+            assert store.is_initialized() is False
+            # Not a failure either: the poll was answered, and the store is
+            # still asking.
+            assert store.failed is None
+            assert endpoint.requests[0]["if_none_match"] is None
+
+    def test_an_intent_it_cannot_apply_does_not_lend_its_etag_to_a_304(
+        self, endpoint: Any
+    ) -> None:
+        """
+        The chain this closes: a body under a future intent code announces and
+        transfers a payload this SDK cannot apply, its etag is adopted as though
+        the body had been applied in full, and the next 304 reports the empty
+        store it left behind as current. That store is initialized, healthy, and
+        authorises a prune of every managed skill on disk, with nothing in the
+        304 to notice it on.
+
+        An etag is adopted only from a body that completed an exchange, so the
+        second request carries none and the endpoint's standing 304 cannot
+        answer for content that never arrived.
+        """
+        endpoint.queue_poll(
+            events(
+                ("server-intent", server_intent("xfer-future")),
+                ("put-object", put_skill()),
+                ("payload-transferred", transferred("basis-1")),
+            ),
+            etag='W/"v1"',
+        )
+        with poll_store(endpoint) as store:
+            assert wait_until(lambda: len(endpoint.requests) >= 2)
+            assert store.is_initialized() is False
+            assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is None
+            assert endpoint.requests[1]["if_none_match"] is None
+            # Nor is the selector of a payload it could not apply a resume point.
+            assert [r["query"].get("basis") for r in endpoint.requests[:2]] == [
+                None,
+                None,
+            ]
 
     def test_a_mixed_payload_over_the_wire_yields_only_the_skill(
         self, endpoint: Any
@@ -2648,6 +2751,7 @@ class TestTransportMemoryBound:
     ) -> None:
         monkeypatch.setattr(skills_fdv2, "MAX_RESPONSE_BYTES", 2048)
         endpoint.queue_poll(full_payload(("put-object", put_skill(content="x" * 8192))))
+        endpoint.queue_poll(full_payload(("put-object", put_skill())))
         # A long enough backoff to observe the failure before the retry lands.
         with poll_store(endpoint, initial_backoff=0.3, max_backoff=0.3) as store:
             assert wait_until(lambda: store.diagnostics.connection_failures == 1)
@@ -2656,7 +2760,10 @@ class TestTransportMemoryBound:
             assert store.diagnostics.payloads_transferred == 0
             assert store.diagnostics.skill_objects_received == 0
             assert store.failed is None
-            # The retry is an ordinary poll; the endpoint answers it 304.
+            # The retry is an ordinary poll, and the payload it is answered
+            # with is what releases the waiter. A 304 could not: nothing has
+            # committed, and a 304 confirms a payload rather than establishing
+            # one.
             assert wait_until(lambda: len(endpoint.requests) >= 2)
             assert store.wait_for_skills(timeout=5) is True
             assert wait_until(lambda: store.diagnostics.connection_failures == 0)
