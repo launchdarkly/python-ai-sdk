@@ -18,6 +18,7 @@ from ..judge_scoring import (
     numeric_score,
     parse_judge_response,
     typesafe_judge_entries,
+    without_output_format,
 )
 from ..lifecycle import extract_variation
 from ..trajectory import (
@@ -369,7 +370,7 @@ class EvaluationsRunner:
             }
             resolved_judge = ResolvedJudge(
                 key=judge.key,
-                config=judge_config,
+                config=dict(without_output_format(judge_config, judge.key)),
                 variation_key=str(meta.get("variationKey") or ""),
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
