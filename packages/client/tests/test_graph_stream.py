@@ -755,6 +755,36 @@ class TestGraphStreamMultiEdge:
 # ---------------------------------------------------------------------------
 
 
+class TestGraphRunId:
+    @pytest.mark.parametrize("mode", ["invoke", "stream"])
+    async def test_each_run_gets_its_own_run_id(
+        self, mock_ld_client: MagicMock, mode: str
+    ) -> None:
+        """One graph() instance, one context, two runs: one id per run, shared within it."""
+        g = graph("graph-key", handlers=[_make_streaming_handler(["ok"])])
+
+        run_ids: list[set[str]] = []
+        for _ in range(2):
+            mock_ld_client.track.reset_mock()
+            if mode == "invoke":
+                await g.invoke("hi", CONTEXT)
+            else:
+                await _collect(g.stream("hi", CONTEXT))
+            graph_events = [
+                c[0]
+                for c in mock_ld_client.track.call_args_list
+                if c[0][0].startswith("$ld:ai:graph:")
+            ]
+            names = {e[0] for e in graph_events}
+            assert "$ld:ai:graph:handoff_success" in names
+            assert "$ld:ai:graph:invocation_success" in names
+            run_ids.append({e[2]["runId"] for e in graph_events})
+
+        assert len(run_ids[0]) == 1
+        assert len(run_ids[1]) == 1
+        assert run_ids[0] != run_ids[1]
+
+
 class TestGraphStreamOtel:
     async def test_stamps_conversation_id_when_bound_at_call_time(
         self, mock_ld_client: MagicMock

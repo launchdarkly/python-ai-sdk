@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 MAX_TRAVERSAL_DEPTH = 100
 MAX_GRAPH_CACHE_SIZE = 512
 
+# graph() caches a built graph per context, track data included. Each run passes its own copy
+# with a fresh runId through route/stream_route opts under this key, so the handoff events
+# emitted inside the cached build carry the run's id instead of the build's.
+_RUN_TRACK_DATA = "_run_track_data"
+
 
 def _sanitize_name(key: str) -> str:
     # Match TS sanitizeName: hyphens become underscores (tool names must be [a-zA-Z0-9_]).
@@ -259,7 +264,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -277,7 +282,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -435,7 +440,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": next_node.key,
                     },
@@ -455,7 +460,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": chosen_key,
                     },
@@ -551,7 +556,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -580,7 +585,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -694,7 +699,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": next_node.key,
                     },
@@ -725,7 +730,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": chosen_key,
                     },
@@ -907,10 +912,12 @@ class GraphInstance:
                     # Evict an arbitrary entry to keep the cache bounded.
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[cache_key] = built
-        graph_def, graph_track_data, _ = built
+        graph_def, built_track_data, _ = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
+
+        graph_track_data: TrackData = {**built_track_data, "runId": str(uuid.uuid4())}
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
@@ -944,7 +951,10 @@ class GraphInstance:
                         1,
                     )
                     entered += 1
-                    opts: dict[str, Any] = {"variables": variables}
+                    opts: dict[str, Any] = {
+                        "variables": variables,
+                        _RUN_TRACK_DATA: graph_track_data,
+                    }
                     if previous_node:
                         opts["from"] = previous_node
                     # History seeds the entry point only. After the root hop, nodes
@@ -1123,10 +1133,12 @@ class GraphInstance:
                 if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[cache_key] = built
-        graph_def, graph_track_data, stream_route = built
+        graph_def, built_track_data, stream_route = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
+
+        graph_track_data: TrackData = {**built_track_data, "runId": str(uuid.uuid4())}
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
@@ -1161,7 +1173,10 @@ class GraphInstance:
                     1,
                 )
                 entered += 1
-                route_opts: dict[str, Any] = {"variables": variables}
+                route_opts: dict[str, Any] = {
+                    "variables": variables,
+                    _RUN_TRACK_DATA: graph_track_data,
+                }
                 if previous_node:
                     route_opts["from"] = previous_node
                 # History seeds the entry point only. After the root hop, nodes
