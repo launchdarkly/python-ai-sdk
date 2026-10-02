@@ -11,6 +11,7 @@ import pytest
 from launchdarkly_ai_server import (
     create_handler,
     make_track_data,
+    model_parameters,
     model_stamps_from_meta,
     normalize_mode,
     omit_model_stamps,
@@ -348,3 +349,48 @@ class TestOmitModelStamps:
         td = {"runId": "r", "modelKey": "m"}
         omit_model_stamps(td)
         assert td == {"runId": "r", "modelKey": "m"}
+
+
+class TestModelParameters:
+    def test_returns_the_parameters_dict(self) -> None:
+        config = {"model": {"name": "gpt-4o", "parameters": {"temperature": 0.2}}}
+        assert model_parameters(config) == {"temperature": 0.2}
+
+    def test_returns_a_fresh_dict_not_the_original(self) -> None:
+        original = {"temperature": 0.2}
+        config = {"model": {"name": "gpt-4o", "parameters": original}}
+        result = model_parameters(config)
+        result["temperature"] = 99
+        assert original["temperature"] == 0.2
+
+    @pytest.mark.parametrize(
+        "model",
+        [None, {}, {"name": "gpt-4o"}, {"name": "gpt-4o", "parameters": None}],
+    )
+    def test_returns_empty_dict_when_parameters_absent(self, model: Any) -> None:
+        config: dict[str, Any] = {}
+        if model is not None:
+            config["model"] = model
+        assert model_parameters(config) == {}
+
+    @pytest.mark.parametrize("parameters", ["not-a-dict", 1, ["a", "b"], True])
+    def test_returns_empty_dict_when_parameters_not_a_mapping(
+        self, parameters: Any
+    ) -> None:
+        config = {"model": {"name": "gpt-4o", "parameters": parameters}}
+        assert model_parameters(config) == {}
+
+    def test_ignores_non_dict_config(self) -> None:
+        assert model_parameters("not-a-config") == {}  # type: ignore[arg-type]
+
+    def test_never_reads_custom(self) -> None:
+        config = {
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {"temperature": 0.2},
+                "custom": {"secret": "value"},
+            }
+        }
+        result = model_parameters(config)
+        assert "secret" not in result
+        assert "custom" not in result

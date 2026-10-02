@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pydantic
 import pytest
+from langchain_anthropic import ChatAnthropic as _REAL_CHAT_ANTHROPIC
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
 
 import launchdarkly_ai_langchain_agents.handler as handler_mod
 import launchdarkly_ai_langchain_agents.spans as spans_mod
@@ -22,6 +24,16 @@ from launchdarkly_ai_langchain_agents.handler import (
     _extract_system_prompt,
     create_langchain_agents_handler,
 )
+
+# ``langchain_aws`` is not a dependency of this package's test environment, so a mocked
+# ``ChatBedrockConverse`` gets a minimal hand-built ``model_fields`` shape (field name -> a
+# duck-typed stand-in exposing ``.alias``/``.validation_alias``, just like a real pydantic
+# ``FieldInfo``) covering the parameters these tests actually forward.
+_FAKE_BEDROCK_FIELDS = {
+    "temperature": SimpleNamespace(alias=None, validation_alias=None),
+    "top_p": SimpleNamespace(alias=None, validation_alias=None),
+    "max_tokens": SimpleNamespace(alias=None, validation_alias=None),
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2154,6 +2166,54 @@ class TestRootCompletionWithBlockContent:
         assert "a typed block" in str(rec.root.attributes["gen_ai.output.messages"])
 
 
+class TestModelParametersForwarding:
+    @pytest.mark.asyncio
+    async def test_ui_key_the_sdk_rejects_is_dropped_without_raising(self) -> None:
+        """``tools`` is not a ``ChatOpenAI`` constructor field (tools are bound via
+        ``bind_tools`` at call time); forwarding it unfiltered is a landmine, not a crash today
+        (pydantic ignores unknown constructor kwargs), but this handler must not rely on that."""
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("answer")])
+        ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_OPENAI.model_fields
+        cfg = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {"temperature": 0.2, "tools": [{"name": "x"}]},
+            },
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs == {"temperature": 0.2, "model": "gpt-4o"}
+
+    @pytest.mark.asyncio
+    async def test_transport_key_is_never_forwarded(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("answer")])
+        ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_OPENAI.model_fields
+        cfg = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {
+                    "temperature": 0.2,
+                    "extra_body": {"secret": "value"},
+                },
+            },
+        }
+        with (
+            ctx,
+            patch.dict("sys.modules", {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs == {"temperature": 0.2, "model": "gpt-4o"}
+
+
 class TestModelSource:
     @pytest.mark.asyncio
     async def test_factory_receives_config_and_returned_model_is_used(self) -> None:
@@ -2201,9 +2261,14 @@ class TestModelSource:
 
     @pytest.mark.asyncio
     async def test_default_openai_constructor_receives_parameters(self) -> None:
+        """``tools`` is dropped: it is not a ``ChatOpenAI`` constructor field (tools are bound via
+        ``bind_tools`` at call time, not passed to the constructor), so the UI offering it must not
+        raise or silently no-op — it is filtered out before this handler ever reaches the
+        constructor."""
         ctx, _rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("default-openai")])
         ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_OPENAI.model_fields
         cfg = {
             **BASE_CONFIG,
             "model": {
@@ -2223,7 +2288,6 @@ class TestModelSource:
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "max_tokens": 512,
-            "tools": [{"name": "openai-tool"}],
             "model": "gpt-4o",
         }
 
@@ -2232,6 +2296,7 @@ class TestModelSource:
         ctx, _rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("default-anthropic")])
         ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_ANTHROPIC.model_fields
         cfg = {
             **BASE_CONFIG,
             "provider": {"name": "Anthropic"},
@@ -2256,6 +2321,7 @@ class TestModelSource:
         ctx, _rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("bedrock")])
         ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _FAKE_BEDROCK_FIELDS
         cfg = {
             **BASE_CONFIG,
             "provider": {"name": "Bedrock"},
@@ -2414,3 +2480,43 @@ class TestModelSource:
         assert any(
             e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
         )
+
+
+class TestConnectionConfigIsNeverForwarded:
+    """``api_key``/``base_url`` in ``model.parameters`` are client/connection configuration; a
+    config author must never be able to redirect a call to a different endpoint or credential.
+    """
+
+    @pytest.mark.parametrize(
+        "provider,fallback", [("openai", "gpt-4o"), ("anthropic", "claude")]
+    )
+    def test_api_key_and_base_url_are_never_forwarded(
+        self, provider: str, fallback: str
+    ) -> None:
+        from launchdarkly_ai_langchain_agents.handler import (
+            _CHAT_ANTHROPIC_FORWARDED_KEYS,
+            _CHAT_OPENAI_FORWARDED_KEYS,
+            _model_constructor_kwargs,
+        )
+
+        forwarded_keys = (
+            _CHAT_OPENAI_FORWARDED_KEYS
+            if provider == "openai"
+            else _CHAT_ANTHROPIC_FORWARDED_KEYS
+        )
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": provider},
+            "model": {
+                "name": fallback,
+                "parameters": {
+                    "api_key": "stolen-key",
+                    "base_url": "https://evil.example.com",
+                    "temperature": 0.3,
+                },
+            },
+        }
+        kwargs = _model_constructor_kwargs(cfg, fallback, forwarded_keys)
+        assert "api_key" not in kwargs
+        assert "base_url" not in kwargs
+        assert kwargs["temperature"] == 0.3

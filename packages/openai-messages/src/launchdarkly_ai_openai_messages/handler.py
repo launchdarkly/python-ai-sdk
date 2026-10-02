@@ -21,7 +21,9 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
+    model_parameters,
     parse_template,
+    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
@@ -45,6 +47,96 @@ from .spans import (
     to_tool_definitions,
     tool_arguments,
 )
+
+#: Every key ``AsyncResponses.create``/``.stream`` accept, classified by hand into exactly one of:
+#: forwarded (below), handler-owned (``model``, ``input``, ``previous_response_id``, ``tools``,
+#: ``text``, popped after the filter runs, at each call site), or excluded.
+#: ``TestResponsesCreateAcceptsExactlyTheseKeys`` / ``TestResponsesStreamAcceptsExactlyTheseKeys``
+#: in this package's tests assert this classification stays exhaustive as the SDK's own signatures
+#: change. Confirms the UI offers several keys the Responses API has never accepted: ``max_tokens``,
+#: ``frequency_penalty``, ``presence_penalty``, ``seed``, ``n``, ``stop``, ``response_format``,
+#: ``logit_bias``, ``logprobs``, ``max_completion_tokens``, ``audio``, ``modalities``,
+#: ``prediction``.
+#:
+#: Excluded, and why:
+#: * ``stream``: the handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``stream_options``: only meaningful together with ``stream=True``, which the handler controls.
+#: * ``background``: returns before the output exists, so the handler would get no result.
+#: * ``conversation``: server-side conversation state conflicts with the input the handler builds.
+#: * ``prompt``: server-side prompt template conflicts with the input the handler builds.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Everything else the API accepts is forwarded, including keys that are not strictly generation
+#: settings (``store``, ``user``, ``safety_identifier``, ``prompt_cache_key``,
+#: ``prompt_cache_retention``, ``include``, ``context_management``, ``metadata``,
+#: ``service_tier``, ``instructions``, ``moderation``, ...).
+_RESPONSES_CREATE_FORWARDED_KEYS = frozenset(
+    {
+        "context_management",
+        "include",
+        "instructions",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "moderation",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "reasoning",
+        "safety_identifier",
+        "service_tier",
+        "store",
+        "temperature",
+        "tool_choice",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
+    }
+)
+
+#: Same as :data:`_RESPONSES_CREATE_FORWARDED_KEYS`, plus the resumption keys only ``.stream``
+#: accepts: ``response_id``, ``starting_after``, ``text_format``.
+_RESPONSES_STREAM_FORWARDED_KEYS = _RESPONSES_CREATE_FORWARDED_KEYS | {
+    "response_id",
+    "starting_after",
+    "text_format",
+}
+
+#: Named for the drift test and for review, not read at runtime: the forwarded lists above already
+#: leave these out, so nothing needs to subtract them again. See the comment above for why each one
+#: is here rather than forwarded.
+_RESPONSES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",
+        "stream_options",
+        "background",
+        "conversation",
+        "prompt",
+        "timeout",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+    }
+)
+
+
+def _apply_max_output_tokens_rename(params: dict[str, Any]) -> dict[str, Any]:
+    """Renames the Chat-Completions-era ``max_tokens``/``max_completion_tokens`` to the Responses
+    API's ``max_output_tokens``, the only one of the three the API actually accepts.
+
+    Precedence when more than one is set: an explicit ``max_output_tokens`` wins outright, then
+    ``max_completion_tokens``, then ``max_tokens``.
+    """
+    max_tokens = params.pop("max_tokens", None)
+    max_completion_tokens = params.pop("max_completion_tokens", None)
+    if "max_output_tokens" not in params:
+        if max_completion_tokens is not None:
+            params["max_output_tokens"] = max_completion_tokens
+        elif max_tokens is not None:
+            params["max_output_tokens"] = max_tokens
+    return params
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -261,7 +353,20 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                 messages=root_messages,
             )
 
+            extra_params = select_forwarded_parameters(
+                _apply_max_output_tokens_rename(model_parameters(config)),
+                _RESPONSES_CREATE_FORWARDED_KEYS,
+            )
+            for _owned_key in (
+                "model",
+                "input",
+                "previous_response_id",
+                "tools",
+                "text",
+            ):
+                extra_params.pop(_owned_key, None)
             params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": input_messages,
             }
@@ -341,6 +446,7 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                     client,
                     config,
                     {
+                        **extra_params,
                         "model": config["model"]["name"],
                         "previous_response_id": response.id,
                         "input": tool_outputs,
@@ -489,7 +595,20 @@ async def _stream_gen(
                     tool_definitions=tool_definitions,
                 )
 
+            extra_params = select_forwarded_parameters(
+                _apply_max_output_tokens_rename(model_parameters(config)),
+                _RESPONSES_STREAM_FORWARDED_KEYS,
+            )
+            for _owned_key in (
+                "model",
+                "input",
+                "previous_response_id",
+                "tools",
+                "text",
+            ):
+                extra_params.pop(_owned_key, None)
             stream_params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": current_input,
             }

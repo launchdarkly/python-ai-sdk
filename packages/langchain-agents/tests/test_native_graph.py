@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
 
 from launchdarkly_ai_langchain_agents.native_graph import _extract_usage, to_lang_graph
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
@@ -168,6 +169,7 @@ def _make_langgraph_mocks(ai_msg: Any) -> dict[str, Any]:
 
     mock_lc_openai = MagicMock()
     mock_lc_openai.ChatOpenAI = MagicMock(return_value=mock_chat_model)
+    mock_lc_openai.ChatOpenAI.model_fields = _REAL_CHAT_OPENAI.model_fields
 
     mock_gm = MagicMock()
     mock_gm.add_messages = MagicMock(return_value=MagicMock())
