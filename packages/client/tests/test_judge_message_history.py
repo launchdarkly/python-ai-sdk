@@ -282,7 +282,7 @@ async def test_a_native_tool_is_not_recorded_online_either(
         history: Any = None,
     ) -> dict[str, Any]:
         # Not awaited: the native stub is sync, unlike the async wrapper a
-        # real callable gets. Pre-existing asymmetry.
+        # real callable gets. A known asymmetry.
         tool_handlers["web_search"]({"q": "x"})
         return {"output": "done", "usage": {}}
 

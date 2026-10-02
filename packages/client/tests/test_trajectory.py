@@ -16,7 +16,7 @@ from launchdarkly_ai_server.types import NativeTool
 
 def test_wrapped_sync_tool_stays_sync() -> None:
     """A blanket async wrapper would hand a caller's handler a coroutine
-    object where it used to get the tool's value.
+    object where it expects the tool's value.
     """
 
     def lookup(args: dict[str, Any]) -> str:
@@ -246,8 +246,8 @@ def test_render_does_not_escape_non_ascii() -> None:
 
 
 def test_render_leaves_a_non_ascii_string_result_alone() -> None:
-    """A string result was never JSON-encoded, so it never escaped. Pins that
-    both paths agree now.
+    """A string result is never JSON-encoded, so it never escapes. Pins that
+    both paths agree.
     """
     rendered = render_trajectory(
         [ToolInvocation(name="lookup", arguments={}, result="café 東京")],

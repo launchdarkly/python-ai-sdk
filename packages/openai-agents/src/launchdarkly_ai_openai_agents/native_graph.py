@@ -234,7 +234,7 @@ def to_openai_agents(
         if history:
             # config.instructions takes priority over config.messages, so skip
             # config conversation turns when instructions are set (parity with the
-            # single-node handler and TESTING.md §1.11 composition order).
+            # single-node handler's history composition order).
             config_messages = (
                 []
                 if root.config.get("instructions")

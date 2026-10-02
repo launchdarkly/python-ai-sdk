@@ -305,8 +305,8 @@ class JudgeTask:
     """The input that produced ``actual_output``.
 
     Carried so this path builds the same ``message_history`` as the inline one.
-    Previously absent, which showed a deferred judge a response with no
-    request beside it.
+    Without it a deferred judge would see a response with no request beside
+    it.
     """
     trajectory: str = ""
     """The invocation's rendered tool-call trajectory.

@@ -388,8 +388,8 @@ async def run_judge(
     )
 
     # user_input and trajectory come off the task rather than being omitted:
-    # this path used to build a history with neither, so a judge grading the
-    # same response saw a different conversation than the inline path did.
+    # without them a judge grading the same response would see a different
+    # conversation than the inline path shows it.
     message_history = build_message_history(
         user_input=task.user_input,
         trajectory=task.trajectory,

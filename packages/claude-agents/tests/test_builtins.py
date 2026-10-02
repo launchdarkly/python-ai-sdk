@@ -1,6 +1,5 @@
 """
-Tests for §4 Claude Agents built-ins (builtins.py).
-Reference: TESTING.md §4
+Tests for Claude Agents built-ins (builtins.py).
 """
 
 from launchdarkly_ai_claude_agents.builtins import (

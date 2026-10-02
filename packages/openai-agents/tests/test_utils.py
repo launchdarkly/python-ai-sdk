@@ -1,6 +1,5 @@
 """
-Tests for §2.x.5 build_output_type utility.
-Reference: TESTING.md §2.x.5
+Tests for the build_output_type utility.
 """
 
 from launchdarkly_ai_openai_agents.utils import build_output_type
@@ -52,7 +51,7 @@ class TestBuildOutputType:
         assert "b" in required
 
     def test_required_omitted_when_properties_empty(self) -> None:
-        """§2.x.5 — required must not appear in schema when properties is empty.
+        """``required`` must not appear in schema when properties is empty.
 
         When ``outputFormat`` has a ``properties`` key that maps to ``{}``,
         the resulting schema must not include ``"required": []``. An empty

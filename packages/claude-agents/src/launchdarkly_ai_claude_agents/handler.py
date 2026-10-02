@@ -78,9 +78,9 @@ async def build_tool_mcp(
     """Build an in-process SDK MCP server from LD config tools + handler functions.
 
     Imports the SDK lazily rather than off the module-level ``claude_agent_sdk`` import that
-    ``query``/``ClaudeAgentOptions``/etc. use: ``native_graph.py`` (out of scope for this telemetry
-    pass) calls this function too, and its own tests mock the SDK by patching
-    ``importlib.import_module`` rather than this module's names.
+    ``query``/``ClaudeAgentOptions``/etc. use: ``native_graph.py`` calls this function too, and
+    its own tests mock the SDK by patching ``importlib.import_module`` rather than this module's
+    names.
     """
     import importlib
 
@@ -119,9 +119,8 @@ def partition_tools(
     user_config_tools: LD tool definitions for user-defined tools (sent via MCP)
     native_tool_names: provider-facing names for query(options.tools=[...])
 
-    Kept at a 3-tuple return for backward compatibility: ``native_graph.py`` (out of scope for this
-    telemetry pass) unpacks this directly. See :func:`_native_tool_aliases` for the fourth mapping
-    the span work needs.
+    Returns a 3-tuple because ``native_graph.py`` unpacks it directly. See
+    :func:`_native_tool_aliases` for the fourth mapping span recording needs.
     """
     native_tool_map: dict[str, Any] = {}
     user_config_tools: dict[str, Any] = {}
@@ -157,10 +156,10 @@ def _is_coroutine(fn: Any) -> bool:
 
 
 def _build_hooks(native_tool_map: dict[str, Any]) -> dict[str, Any] | None:
-    """The pre-span-work hook set: tracks a native tool call for telemetry purposes only.
+    """A span-free hook set: tracks a native tool call for telemetry purposes only.
 
-    Kept for ``native_graph.py`` (out of scope for this telemetry pass), which imports this name
-    directly and does not build ``execute_tool`` spans of its own. See :func:`build_tool_hooks` for
+    Used by ``native_graph.py``, which imports this name directly and does not build
+    ``execute_tool`` spans of its own. See :func:`build_tool_hooks` for
     the span-aware hook set this handler's own ``_call_impl``/``_stream_gen`` use.
     """
     if not native_tool_map:

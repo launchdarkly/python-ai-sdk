@@ -174,7 +174,7 @@ async def _run_query(
     # Hold an explicit reference so we can call aclose() in the finally block.
     # Bare `return` inside `async for` abandons the generator — Python's asyncio
     # finalizer later tries to aclose() it and may raise RuntimeError if the
-    # generator is suspended inside a real await in the SDK (AIC-2950).
+    # generator is suspended inside a real await in the SDK.
     gen = query_fn(prompt=query_prompt, options=options)
     try:
         async for message in gen:

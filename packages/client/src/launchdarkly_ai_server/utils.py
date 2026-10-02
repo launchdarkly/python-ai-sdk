@@ -70,7 +70,7 @@ def number_or_zero(value: Any) -> int:
     total is greater than zero, and that test is false for ``NaN``, so the metric is dropped
     silently rather than reported low.
 
-    Replaces the bare ``int(...)`` this module used to do, which raised on ``None``.
+    A bare ``int(...)`` is not enough here, because it raises on ``None``.
     """
     if value is None or isinstance(value, bool):
         return 0
@@ -154,10 +154,10 @@ def parse_usage(usage: dict[str, Any]) -> dict[str, Any]:
 def to_usage_dict(usage: dict[str, Any]) -> UsageDict:
     """Builds the public :class:`UsageDict` from a :func:`parse_usage` result.
 
-    Shared because ``invoke`` and the judge runner both need it and both used to build the dataclass
-    by hand from three keys, which silently dropped the cache breakdown the moment ``parse_usage``
-    started reporting one. A caller reading ``input_details`` off a blocking call got ``None`` while
-    the streaming path handed back the nested dict, so the two paths disagreed about the same run.
+    Shared because ``invoke`` and the judge runner both need it. Building the dataclass by hand
+    from three keys would silently drop the cache breakdown ``parse_usage`` reports, so a caller
+    reading ``input_details`` off a blocking call would get ``None`` while the streaming path handed
+    back the nested dict, and the two paths would disagree about the same run.
     """
     details = usage.get("input_details")
     return UsageDict(
@@ -338,10 +338,9 @@ def set_model_identity_attributes(
     """Writes the model identity attributes that every LLM span carries.
 
     Both spellings of the provider key are emitted on purpose. ``gen_ai.system`` is the pre-1.37
-    semconv name and is what handlers shipped before the span hierarchy landed;
-    ``gen_ai.provider.name`` is the current name. Emitting only the new key would silently break
-    dashboards written against the old one, and emitting only the old one leaves us off-spec, so
-    both go out until the next major.
+    semconv name; ``gen_ai.provider.name`` is the current name. Emitting only the new key would
+    silently break dashboards written against the old one, and emitting only the old one leaves us
+    off-spec, so both go out until the next major.
 
     ``legacy_system`` exists because the two keys do not always want the same value. The LangChain
     handlers ship ``gen_ai.system = 'langchain'``, but ``gen_ai.provider.name`` means *who served
@@ -406,9 +405,9 @@ def end_unfinished_spans(*spans: Any) -> None:
     """Ends every span still open, for an exception no ``except Exception`` can catch.
 
     ``asyncio.CancelledError`` inherits from ``BaseException``, deliberately, so a timeout or a
-    ``task.cancel()`` walks straight past every ``except Exception`` a handler writes. The blocking
-    paths ended their spans only from those clauses, so a cancelled run exported nothing at all: not a
-    wrong attribute, no span. The root carries the ``feature_flag`` event and every ``launchdarkly.*``
+    ``task.cancel()`` walks straight past every ``except Exception`` a handler writes. A path that
+    ends its spans only from those clauses exports nothing at all for a cancelled run: not a wrong
+    attribute, no span. The root carries the ``feature_flag`` event and every ``launchdarkly.*``
     attribute, so a stranded root means the whole run never reaches AI Config Monitoring.
 
     Call this from a ``finally``, not from an ``except``. The point is the paths an ``except`` cannot
@@ -545,7 +544,7 @@ def model_stamps_from_meta(meta: Any) -> dict[str, Any]:
     from a variation's ``_ldMeta`` into a dict that can be merged into
     ``TrackData``. Keys are omitted (never set to ``None``) when absent; an
     empty ``modelKey`` is treated as absent and ``modelVersion`` is coerced to
-    ``int``. Gonfalon's cost attribution reads these two fields from every
+    ``int``. LaunchDarkly's cost attribution reads these two fields from every
     ``$ld:ai:*`` event payload.
     """
     if not isinstance(meta, dict):
@@ -740,7 +739,7 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
 def set_openllmetry_prompt(span: Any, messages: list[dict[str, str]]) -> None:
     """Set OpenLLMetry-style indexed prompt attributes on a span.
 
-    Gonfalon's LLM Summary tab reads ``gen_ai.prompt.N.role`` / ``.content``
+    The LLM Summary tab in LaunchDarkly reads ``gen_ai.prompt.N.role`` / ``.content``
     (attribute-based, takes precedence over span events).
     """
     for i, msg in enumerate(messages):
@@ -755,7 +754,7 @@ def set_openllmetry_completion(
 ) -> None:
     """Set OpenLLMetry-style indexed completion attributes and token usage aliases.
 
-    Gonfalon reads ``gen_ai.completion.0.role`` / ``.content`` and prefers
+    LaunchDarkly reads ``gen_ai.completion.0.role`` / ``.content`` and prefers
     ``gen_ai.usage.prompt_tokens`` / ``completion_tokens``.
     """
     span.set_attribute("gen_ai.completion.0.role", "assistant")

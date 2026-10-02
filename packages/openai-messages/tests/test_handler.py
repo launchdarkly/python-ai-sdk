@@ -1,7 +1,6 @@
 """
 Tests for launchdarkly-ai-openai-messages handler.
-Covers §1.1-1.9.
-Reference: TESTING.md §1, TELEMETRY-CONTRACT.md
+Covers the generic handler behaviours and TELEMETRY-CONTRACT.md.
 """
 
 from __future__ import annotations
@@ -93,7 +92,7 @@ def mock_openai(mocker):
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory function and metadata
+# Factory function and metadata
 # ---------------------------------------------------------------------------
 
 
@@ -127,7 +126,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -264,7 +263,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -319,7 +318,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -407,7 +406,7 @@ class TestToolExecutionLoop:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Telemetry — span recording
+# Telemetry — span recording
 # ---------------------------------------------------------------------------
 
 
@@ -1022,7 +1021,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling
+# Error handling
 # ---------------------------------------------------------------------------
 
 
@@ -1128,7 +1127,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Structured output (outputFormat)
+# Structured output (outputFormat)
 # ---------------------------------------------------------------------------
 
 
@@ -1155,7 +1154,7 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1203,7 +1202,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1343,11 +1342,11 @@ class TestStreaming:
     async def test_tools_forwarded_on_second_streaming_turn(
         self, mock_openai: MagicMock
     ) -> None:
-        """§1.8 - tools must appear in stream_params on every streaming turn.
+        """Tools must appear in stream_params on every streaming turn.
 
-        This is a pre-existing Python-only behaviour that diverges from the TypeScript SDK (which
-        does not resend tools after the first turn). It changes what the model is offered, not what
-        the span reports, so this test only pins that the behaviour is unchanged by the span work.
+        This is a Python-only behaviour that diverges from the TypeScript SDK (which does not
+        resend tools after the first turn). It changes what the model is offered, not what the span
+        reports, so this test only pins the behaviour, independently of span recording.
         """
         import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
@@ -1436,12 +1435,12 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None content
+# None user_input must not produce None content
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the user-role message
+    """When user_input is None, the user-role message
     content sent to the provider must be '' not None."""
 
     async def test_none_user_input_instructions_path_no_none_content(
@@ -1470,12 +1469,12 @@ class TestNoneUserInput:
 
 
 # ---------------------------------------------------------------------------
-# §1.10 MAX_STEPS cap
+# MAX_STEPS cap
 # ---------------------------------------------------------------------------
 
 
 class TestMaxStepsCap:
-    """TESTING.md §1.10: The tool loop must break with an error after MAX_STEPS (5) iterations."""
+    """The tool loop must break with an error after MAX_STEPS (5) iterations."""
 
     def _tool_response(self) -> MagicMock:
         return _make_response(
@@ -1559,7 +1558,7 @@ class TestMaxStepsCap:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Streaming telemetry (do not patch _HAS_OTEL=False)
+# Streaming telemetry (do not patch _HAS_OTEL=False)
 # ---------------------------------------------------------------------------
 
 
@@ -1886,9 +1885,9 @@ class TestConvenienceWrapperForwardsCaptureContent:
 class TestChatSpanNeverLeaks:
     """A raise while recording conversation content must not leave the chat span open.
 
-    The content writes on both sides of the provider call used to sit outside the try that fails the
-    span. A raise there failed only the root, and the chat span was never ended, so the exporter
-    never saw the turn.
+    The content writes on both sides of the provider call sit inside the try that fails the span.
+    Outside it, a raise there would fail only the root, and the chat span would never end, so the
+    exporter would never see the turn.
     """
 
     async def test_an_unserialisable_output_still_ends_the_chat_span(
@@ -1948,10 +1947,10 @@ class TestChatSpanNeverLeaks:
 class TestOpenToolSpanIsNeverLeaked:
     """A BaseException while a tool runs must still close the execute_tool span.
 
-    The streaming `finally` closed the model span and the root, but the in-flight tool span was held
-    only by a local. `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so a
-    tool cancelled mid-flight left its span open and unexported: the trace showed a closed parent
-    above a child that never arrived.
+    The streaming `finally` closes the model span and the root, and the in-flight tool span too.
+    `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so if only a local held
+    that span, a tool cancelled mid-flight would leave it open and unexported: the trace would show
+    a closed parent above a child that never arrived.
     """
 
     async def test_a_tool_cancelled_mid_flight_still_ends_its_span(
@@ -2004,9 +2003,9 @@ class TestOpenToolSpanIsNeverLeaked:
         tools = rec.named("execute_tool ")
         assert len(tools) == 1
         assert tools[0].ended == 1, "the execute_tool span leaked"
-        # `cancelled`, not `abandoned`. This test used to assert the latter, which is what the defect
-        # looked like: nothing here chose to stop reading, a CancelledError ended the run underneath
-        # the consumer. The consumer-break test still asserts `abandoned`, which is that word's case.
+        # `cancelled`, not `abandoned`: nothing here chose to stop reading, a CancelledError ended
+        # the run underneath the consumer. The consumer-break test asserts `abandoned`, which is
+        # that word's case.
         assert tools[0].attributes["launchdarkly.run.cancelled"] is True
         assert "launchdarkly.stream.abandoned" not in tools[0].attributes
         assert rec.root.ended == 1
@@ -2015,10 +2014,10 @@ class TestOpenToolSpanIsNeverLeaked:
 class TestStreamingChatSpanAndTokens:
     """The streaming path must fail its span and keep its tokens when content serialisation raises.
 
-    The content write and the span finish sat after the try that fails the chat span, and the usage
-    was accumulated last. A raise while serialising the response therefore left the span for `finally`
-    to end as abandoned, which reads as a consumer who walked away rather than as the failure it was,
-    and dropped a turn the provider had already billed.
+    If the content write and the span finish sat outside the try that fails the chat span, with the
+    usage accumulated after them, a raise while serialising the response would leave the span for
+    `finally` to end as abandoned, which reads as a consumer who walked away rather than as the
+    failure it was, and drop a turn the provider had already billed.
     """
 
     def _exploding_stream(self, mock_openai: MagicMock) -> None:
@@ -2097,10 +2096,10 @@ class TestCancellationEndsEverySpan:
     async def test_a_cancelled_run_still_exports_its_spans(
         self, mock_openai: MagicMock
     ) -> None:
-        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before
-        # this, a cancelled run exported nothing at all: the root carries the feature_flag event
-        # and every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather
-        # than showing as incomplete.
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Without
+        # a `finally`, a cancelled run would export nothing at all: the root carries the
+        # feature_flag event and every launchdarkly.* attribute, so the run would vanish from AI
+        # Config Monitoring rather than showing as incomplete.
         import asyncio
 
         async def never_returns(*args: Any, **kwargs: Any) -> Any:

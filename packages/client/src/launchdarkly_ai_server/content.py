@@ -196,10 +196,10 @@ _SEMCONV_FINISH_REASONS: dict[str, str] = {
 def to_semconv_finish_reason(raw: str | None) -> str | None:
     """Maps one provider's finish reason onto semconv's ``gen_ai.response.finish_reasons`` vocabulary.
 
-    This SDK used to pass the provider's string through untranslated, on the argument that
-    translating ``end_turn`` into ``stop`` loses information. Measuring it settled the argument the
-    other way: a single run emits ``chat`` spans from more than one handler, so a consumer grouping
-    by finish reason saw ``stop`` and ``end_turn`` as two different outcomes for the same event.
+    The provider's string is translated rather than passed through, even though translating
+    ``end_turn`` into ``stop`` looks like it loses information: a single run emits ``chat`` spans
+    from more than one handler, so a consumer grouping by finish reason would otherwise see
+    ``stop`` and ``end_turn`` as two different outcomes for the same event.
 
     Nothing is lost. The provider's own wording is still on the span, because the raw response is
     what ``gen_ai.output.messages`` was built from, and an unrecognised reason is passed through
