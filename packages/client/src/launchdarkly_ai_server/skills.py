@@ -279,8 +279,8 @@ async def get_skills(refs: Sequence[SkillReference | str]) -> list[Skill]:
 
     Returns:
         The skills found, in input order. Entries that are missing, at the
-        wrong version, or fail verification are omitted, and a warning logs how
-        many.
+        wrong version, or fail verification are omitted. A warning logs how
+        many failed verification; misses are not counted.
 
     Raises:
         TypeError: If *refs* is a single string; pass ``[key]`` instead.
@@ -295,14 +295,18 @@ async def get_skills(refs: Sequence[SkillReference | str]) -> list[Skill]:
 
     store = require_store()
 
-    requests = list(refs)
     skills: list[Skill] = []
-    for ref in requests:
+    # Only what the store served counts toward the summary: a miss or an outage
+    # is not a verification failure, and the summary would report it as one.
+    served = 0
+    for ref in refs:
         key, wanted = reference_target(ref)
-        skill = resolve_from_store(store, key, wanted).skill
-        if skill is not None:
-            skills.append(skill)
-    log_withholding_summary("requested skills", len(requests), len(skills))
+        resolution = resolve_from_store(store, key, wanted)
+        if resolution.skill is not None:
+            skills.append(resolution.skill)
+        if resolution.reason in ("ok", "integrity_failure"):
+            served += 1
+    log_withholding_summary("requested skills the store served", served, len(skills))
     return skills
 
 

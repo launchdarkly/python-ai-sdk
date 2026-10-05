@@ -1536,6 +1536,50 @@ class TestWithholdingSummary:
             assert await all_skills() == []
         assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
 
+    async def test_get_skills_for_keys_the_store_does_not_hold_is_silent(
+        self, store: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An empty store at boot is not an integrity problem."""
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills_core"):
+            assert await get_skills(["a", "b"]) == []
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    async def test_a_get_skills_pin_miss_is_silent(
+        self, store: Any, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store.put(make_raw_skill(key="a", version=2))
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills_core"):
+            assert await get_skills([SkillReference(key="a", version=1)]) == []
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    async def test_a_get_skills_wrong_version_answer_is_not_counted(
+        self, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        skills_module._set_store(_WrongVersionAnsweringStore(make_raw_skill))
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills_core"):
+            assert await get_skills([SkillReference(key="a", version=1)]) == []
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    async def test_a_raising_store_is_not_counted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        skills_module._set_store(_RaisingStore())
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills_core"):
+            assert await get_skills(["a"]) == []
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    async def test_get_skills_counts_only_what_the_store_served(
+        self, store: Any, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store.put(make_raw_skill(key="good"))
+        store.put(self._tampered(make_raw_skill, key="bad"))
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills_core"):
+            skills = await get_skills(["good", "bad", "missing"])
+        assert [s.key for s in skills] == ["good"]
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "1 of 2" in warnings[0].getMessage()
+
     async def test_a_fully_resolved_run_is_silent(
         self, store: Any, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
