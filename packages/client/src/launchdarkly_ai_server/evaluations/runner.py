@@ -835,6 +835,7 @@ class EvaluationsRunner:
         self,
         row: Mapping[str, Any],
         scorer: Scorer,
+        warned_scorers: set[str],
     ) -> dict[str, Any]:
         started = datetime.now(UTC)
         started_clock = time.perf_counter()
@@ -866,25 +867,26 @@ class EvaluationsRunner:
             return self._criterion_error_result(
                 base, started_clock, "scorer_raised", f"scorer fn raised: {error}"
             )
-        if isinstance(score_value, bool):
-            score: float = 1.0 if score_value else 0.0
-        else:
-            maybe_score = numeric_score(score_value)
-            if maybe_score is None:
-                return self._criterion_error_result(
-                    base,
-                    started_clock,
-                    "invalid_score",
-                    "scorer fn must return a bool or a finite number, "
-                    f"got {score_value!r}",
+        # A bool is rejected rather than read as 1.0/0.0. numeric_score already
+        # excludes it, so the whole return contract is "a finite number in
+        # 0-1": a scorer answering a yes/no question returns 1.0 or 0.0 itself.
+        # Coercing on the caller's behalf sent two score types to ingest and
+        # made the threshold comparison mean different things for binary and
+        # graded scorers -- and silently scored `return "high"`-style bugs as a
+        # pass, since every non-empty value is truthy.
+        score = numeric_score(score_value)
+        if score is None or score < 0 or score > 1:
+            message = (
+                "scorer fn must return a finite number between 0 and 1, "
+                f"got {score_value!r}"
+            )
+            if scorer.name not in warned_scorers:
+                warned_scorers.add(scorer.name)
+                logger.warning(
+                    "scorer %r returned an invalid score: %s", scorer.name, message
                 )
-            score = maybe_score
-        if score < 0 or score > 1:
             return self._criterion_error_result(
-                base,
-                started_clock,
-                "invalid_score",
-                f"scorer fn score must be between 0 and 1, got {score_value!r}",
+                base, started_clock, "invalid_score", message
             )
         completed = datetime.now(UTC)
         return {
@@ -1001,6 +1003,7 @@ class EvaluationsRunner:
     ) -> list[dict[str, Any]]:
         """Run every (row, criterion) pair, bounded by the run's concurrency."""
         controller = ConcurrencyController(concurrency)
+        warned_scorers: set[str] = set()
 
         async def run_one(
             row: Mapping[str, Any], criterion: Criterion
@@ -1008,7 +1011,9 @@ class EvaluationsRunner:
             await controller.acquire()
             try:
                 if isinstance(criterion, Scorer):
-                    return await self._run_scorer_for_result(row, criterion)
+                    return await self._run_scorer_for_result(
+                        row, criterion, warned_scorers
+                    )
                 return await self._run_ld_judge_for_result(
                     row,
                     tool_handlers,

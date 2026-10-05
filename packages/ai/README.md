@@ -68,7 +68,7 @@ result = await evals.run(
     generation={"provider": "OpenAI", "model": "gpt-4o"},
     criteria=[
         Judge(key="accuracy-judge"),
-        Scorer(name="mentions-policy", fn=lambda row, output: "policy" in (output or "")),
+        Scorer(name="mentions-policy", fn=lambda row, output: 1.0 if "policy" in (output or "") else 0.0),
     ],
 )
 ```
