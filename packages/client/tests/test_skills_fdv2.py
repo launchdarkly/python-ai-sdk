@@ -2168,6 +2168,53 @@ class TestFailureHandling:
             # One failure in the new run, not three.
             assert store.diagnostics.connection_failures == 1
 
+    def test_a_restart_reports_no_failures_before_the_new_run_has_any(self) -> None:
+        """The reported count starts over in ``start()``, not at the next failure.
+
+        Read only after the new run fails, a stale count is overwritten and looks
+        reset. Read while the new run's first request is still in flight, it
+        would show the old run's failures on a store whose ``failed`` is None.
+        """
+
+        class _HoldsWhenScriptEnds(_ScriptedRequester):
+            def __init__(self, *outcomes: Any) -> None:
+                super().__init__(*outcomes)
+                self.release = threading.Event()
+
+            def poll(self, basis: str | None, etag: str | None) -> Any:
+                if not self.outcomes:
+                    self.calls.append((basis, etag))
+                    self.release.wait(timeout=10)
+                    raise _RecoverableTransportError("released")
+                return super().poll(basis, etag)
+
+        requester = _HoldsWhenScriptEnds(
+            _RecoverableTransportError("x"),
+            _RecoverableTransportError("x"),
+            _FatalTransportError("401"),
+        )
+        store = FDv2SkillStore(
+            SDK_KEY,
+            mode="poll",
+            initial_backoff=0.001,
+            max_backoff=0.002,
+            _requester=requester,
+        )
+        try:
+            store.start()
+            assert wait_until(lambda: store.failed is not None)
+            assert store.diagnostics.connection_failures == 2
+
+            calls = len(requester.calls)
+            store.start()
+            assert store.diagnostics.connection_failures == 0
+            assert wait_until(lambda: len(requester.calls) > calls)
+            assert store.failed is None
+            assert store.diagnostics.connection_failures == 0
+        finally:
+            requester.release.set()
+            store.close()
+
     def test_a_404_stops_delivery_immediately(self, endpoint: Any) -> None:
         """A 404 means the endpoint does not exist for this credential.
 
