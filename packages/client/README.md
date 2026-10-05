@@ -59,9 +59,8 @@ from launchdarkly_ai_server import init_evaluations
 
 
 async def main() -> int:
-    evals = init_evaluations()  # LD_API_TOKEN required; LD_SDK_KEY unless a client is already initialized
+    evals = init_evaluations(project_key="my-project")  # LD_API_TOKEN required; LD_SDK_KEY unless a client is already initialized
     result = await evals.run(
-        project_key="my-project",
         key="support-qa-2026-08-20",
         dataset="support-golden",
         handler=create_openai_messages_handler(),
@@ -78,7 +77,7 @@ async def main() -> int:
 sys.exit(asyncio.run(main()))
 ```
 
-`project_key` is supplied per run rather than during initialization. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
+`project_key` is supplied during initialization, either as an argument to `init_evaluations()` or through `LD_PROJECT_KEY`. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
 
 Generation and criterion events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises rather than creating a run that can never complete unless it can resolve an event transport: either an SDK key (`sdk_key` or `LD_SDK_KEY`) or a client already initialized through `init_client(client=...)`. Bringing your own client lets a process emit evaluation events without an SDK key in scope. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
 
@@ -96,8 +95,7 @@ def mentions_policy(row: DatasetRow, output: str | None) -> bool:
     return "refund policy" in (output or "").lower()
 
 
-result = await init_evaluations().run(
-    project_key="my-project",
+result = await init_evaluations(project_key="my-project").run(
     key="support-qa-2026-08-20",
     dataset="support-golden",
     handler=create_openai_messages_handler(),
@@ -165,12 +163,47 @@ A tool result is now judge-prompt input. It stays literal for the same reason th
 
 Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge or one no handler covers fails the run up front rather than after the generation spend. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
 
-### Give the evaluation tools
+The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 
-Pass `tools` to `run()` as a list of `Tool`. Construct one to define a tool in code. Call `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
+Call `init_client()` explicitly when you want to:
+- Pass SDK or telemetry options programmatically (overriding env vars)
+- Initialize at startup before the first AI call (e.g. to avoid latency on the first request)
+- Fail fast at boot if `LD_SDK_KEY` is missing
 
 ```python
-from launchdarkly_ai_server import Tool, init_evaluations
+import asyncio
+from launchdarkly_ai_server import init_client, shutdown
+
+async def main():
+    # Standard path — auto-discovers launchdarkly-server-sdk.
+    client = await init_client({
+        "sdkKey": "sdk-...",
+        "serviceName": "my-service",
+        "environment": "production",
+    })
+
+    # Or skip init_client() and let the first model/graph call initialize lazily.
+
+    # Flush telemetry, flush LD events, and close the client.
+    await shutdown()
+
+asyncio.run(main())
+```
+
+| Export | Description |
+|---|---|
+| `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. |
+| `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery. |
+| `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
+| `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. |
+| `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
+
+### Give the evaluation tools
+
+Pass `tools` to `run()` as a list of `EvalTool`. Construct one to define a tool in code. Await `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
+
+```python
+from launchdarkly_ai_server import EvalTool, init_evaluations
 
 
 def lookup_order(order_id: str) -> str:
@@ -180,10 +213,10 @@ def lookup_order(order_id: str) -> str:
 evals = init_evaluations(project_key="my-project")
 
 # Read from the AI library now. Pins the version. Raises now if the tool is absent.
-search_docs_tool = evals.tools.get("search_docs", implementation=search_docs)
+search_docs_tool = await evals.tools.get("search_docs", implementation=search_docs)
 
 # Defined here. Needs no tool in LaunchDarkly.
-lookup_order_tool = Tool(
+lookup_order_tool = EvalTool(
     key="lookup_order",
     implementation=lookup_order,
     schema={
@@ -203,7 +236,7 @@ result = await evals.run(
 )
 ```
 
-`run()` reads no tool from the API. `tools.get()` blocks until its read completes, so call it while you set a run up, not inside a running event loop. A constructed `Tool` is always inline, because `source` and `version` are not constructor arguments. Only `tools.get()` produces a library tool. Handlers receive the same `{key: callable}` map whichever kind a tool is, so handler code needs no change.
+`run()` reads no tool from the API. `tools.get()` is a coroutine, so await it. It reads in a worker thread and does not block the event loop. A constructed `EvalTool` is always inline, because `source` and `version` are not constructor arguments. Only `tools.get()` produces a library tool. Handlers receive the same `{key: callable}` map whichever kind a tool is, so handler code needs no change.
 
 **The list is checked before any network I/O.** A blank key, an uppercase key, a `schema` that is not a JSON object, a schema that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued. A repeated key fails too, and keys are compared without case. A `NativeTool` is valid only for a library tool, because the provider supplies its schema.
 

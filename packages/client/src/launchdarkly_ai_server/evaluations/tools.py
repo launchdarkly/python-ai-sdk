@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,26 +20,29 @@ from .api import (
 ToolImplementation = Callable[..., Any] | NativeTool
 
 
-@dataclass
-class Tool:
+@dataclass(frozen=True)
+class EvalTool:
     """A tool a run gives to its handler. Pass a list of these to ``run``.
 
-    Construct one to define a tool in code. ``source`` is then ``"inline"`` and
-    ``version`` is ``None``. Neither is a constructor argument, so a
+    Construct one to define a tool in code. ``schema`` is required, and ``{}``
+    is valid. ``source`` is then ``"inline"`` and ``version`` is ``None``.
+    Neither is a constructor argument, and the object is frozen, so a
     constructed tool is always inline.
 
-    Call ``evals.tools.get(key, implementation=...)`` instead to use a tool
-    from the LaunchDarkly tool library. That returns a tool with ``source``
-    ``"library"`` and the version it pinned.
+    Call ``await evals.tools.get(key, implementation=...)`` instead to use a
+    tool from the LaunchDarkly tool library. That returns a tool with
+    ``source`` ``"library"`` and the version it pinned.
 
     ``implementation`` is the function the handler calls. A key must be
     lowercase. A :class:`~launchdarkly_ai_server.NativeTool` is valid only for
     a library tool, because the provider supplies its schema.
+    ``dataclasses.replace`` on a library tool returns an inline tool that
+    keeps the library schema.
     """
 
     key: str
     implementation: ToolImplementation
-    schema: dict[str, Any] = field(default_factory=dict)
+    schema: dict[str, Any]
     description: str = ""
     source: Literal["library", "inline"] = field(default="inline", init=False)
     version: int | None = field(default=None, init=False)
@@ -54,7 +58,7 @@ class Tool:
         schema: dict[str, Any],
         description: str,
         project_key: str,
-    ) -> Tool:
+    ) -> EvalTool:
         """Build a library tool. Used by ``ToolsClient.get``."""
         tool = cls(
             key=key,
@@ -62,9 +66,9 @@ class Tool:
             schema=schema,
             description=description,
         )
-        tool.source = "library"
-        tool.version = version
-        tool.project_key = project_key
+        object.__setattr__(tool, "source", "library")
+        object.__setattr__(tool, "version", version)
+        object.__setattr__(tool, "project_key", project_key)
         return tool
 
     def to_create_wire(self) -> dict[str, Any]:
@@ -100,7 +104,7 @@ def validate_tool_implementation(key: str, implementation: Any) -> None:
         )
 
 
-def _validate_inline_tool(tool: Tool) -> None:
+def _validate_inline_tool(tool: EvalTool) -> None:
     """Validate one inline tool. Raises ``EvaluationsError``."""
     key = tool.key
     if isinstance(tool.implementation, NativeTool):
@@ -123,17 +127,17 @@ def _validate_inline_tool(tool: Tool) -> None:
         ) from error
 
 
-def validate_tools(tools: Sequence[Tool], project_key: str | None = None) -> None:
+def validate_tools(tools: Sequence[EvalTool], project_key: str) -> None:
     """Validate the tools list. Raises ``EvaluationsError``.
 
-    Checks each library tool against ``project_key`` when one is given. Issues
-    no requests.
+    Checks that each library tool has a project and that it matches
+    ``project_key``. Issues no requests.
     """
     keys_by_identity: dict[str, str] = {}
     for tool in tools:
-        if not isinstance(tool, Tool):
+        if not isinstance(tool, EvalTool):
             raise EvaluationsError(
-                "each entry in tools must be a Tool. Construct one for an "
+                "each entry in tools must be an EvalTool. Construct one for an "
                 "inline tool, or call evals.tools.get() for a library tool, "
                 f"got {type(tool).__name__}"
             )
@@ -147,11 +151,11 @@ def validate_tools(tools: Sequence[Tool], project_key: str | None = None) -> Non
             )
         if tool.source == "inline":
             _validate_inline_tool(tool)
-        elif (
-            project_key is not None
-            and tool.project_key is not None
-            and tool.project_key != project_key
-        ):
+        elif tool.project_key is None:
+            raise EvaluationsError(
+                f"Library tool {key!r} has no project. Read it with evals.tools.get()."
+            )
+        elif tool.project_key != project_key:
             raise EvaluationsError(
                 f"Tool {key!r} was read from project {tool.project_key!r} and "
                 f"cannot run in project {project_key!r}. Read it from "
@@ -170,12 +174,12 @@ def validate_tools(tools: Sequence[Tool], project_key: str | None = None) -> Non
         keys_by_identity[identity] = key
 
 
-def tool_handlers(tools: Sequence[Tool]) -> dict[str, ToolImplementation]:
+def tool_handlers(tools: Sequence[EvalTool]) -> dict[str, ToolImplementation]:
     """Return the tools list as ``{key: executable}``."""
     return {tool.key: tool.implementation for tool in tools}
 
 
-def handler_config_tools(tools: Sequence[Tool]) -> dict[str, dict[str, Any]]:
+def handler_config_tools(tools: Sequence[EvalTool]) -> dict[str, dict[str, Any]]:
     """Return the ``tools`` entry of a handler config."""
     return {
         tool.key: {"description": tool.description, "parameters": tool.schema}
@@ -183,7 +187,7 @@ def handler_config_tools(tools: Sequence[Tool]) -> dict[str, dict[str, Any]]:
     }
 
 
-def create_wire_tools(tools: Sequence[Tool]) -> list[dict[str, Any]]:
+def create_wire_tools(tools: Sequence[EvalTool]) -> list[dict[str, Any]]:
     """Return the ``tools`` array of an evaluation-create body."""
     return [tool.to_create_wire() for tool in tools]
 
@@ -195,20 +199,20 @@ class ToolsClient:
         self._api = api_client
         self._project_key = project_key
 
-    def get(self, key: str, *, implementation: ToolImplementation) -> Tool:
+    async def get(self, key: str, *, implementation: ToolImplementation) -> EvalTool:
         """Return the library tool ``key``, paired with ``implementation``.
 
         Reads the tool now and pins the version it returns. Raises
         ``EvaluationsError`` when the tool does not exist in the project.
 
-        This call blocks until the read completes. Call it while you set a run
-        up, not inside a running event loop.
+        The read runs in a worker thread, so it does not block the event loop.
         """
         validate_tool_key(key)
         validate_tool_implementation(key, implementation)
         path = f"projects/{segment(self._project_key)}/ai-tools/{segment(key)}"
         try:
-            raw = require_mapping(self._api.get(path), description=f"tool {key!r}")
+            response = await asyncio.to_thread(self._api.get, path)
+            raw = require_mapping(response, description=f"tool {key!r}")
         except LDApiError as error:
             if error.status == 404:
                 raise EvaluationsError(
@@ -224,7 +228,7 @@ class ToolsClient:
         schema = raw.get("schema")
         if not isinstance(schema, Mapping):
             schema = {}
-        return Tool._library(
+        return EvalTool._library(
             key,
             implementation,
             version=version,

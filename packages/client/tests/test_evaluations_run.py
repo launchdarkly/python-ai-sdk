@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import json
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -12,11 +14,11 @@ from launchdarkly_ai_server import NativeTool, create_handler
 from launchdarkly_ai_server.evaluations import (
     AIConfig,
     DatasetRow,
+    EvalTool,
     EvaluationsError,
     HttpResponse,
     Judge,
     Scorer,
-    Tool,
     init_evaluations,
 )
 
@@ -240,7 +242,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         key="support-qa-unique",
         dataset="golden",
         handler=successful_handler,
-        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
+        tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
         generation={
             "provider": "OpenAI",
             "model": "gpt-4o",
@@ -909,7 +911,7 @@ async def test_missing_tool_aborts_before_any_mutating_request() -> None:
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
     with pytest.raises(EvaluationsError, match="missing_tool"):
-        evals.tools.get("missing_tool", implementation=lookup_order)
+        await evals.tools.get("missing_tool", implementation=lookup_order)
 
     assert [request["method"] for request in transport.requests] == ["GET"]
 
@@ -985,7 +987,7 @@ async def test_inline_tool_runs_without_reading_the_tool_api() -> None:
         dataset="golden",
         handler=handler,
         tools=[
-            Tool(
+            EvalTool(
                 key="lookup_order",
                 implementation=lookup_order,
                 schema=ORDER_SCHEMA,
@@ -1047,7 +1049,9 @@ async def test_inline_tool_description_defaults_to_empty_string() -> None:
         dataset="golden",
         handler=handler,
         tools=[
-            Tool(key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA)
+            EvalTool(
+                key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA
+            )
         ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
@@ -1098,8 +1102,8 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
         dataset="golden",
         handler=handler,
         tools=[
-            evals.tools.get("lookup_order", implementation=lookup_order),
-            Tool(
+            await evals.tools.get("lookup_order", implementation=lookup_order),
+            EvalTool(
                 key="refund_order",
                 implementation=refund_order,
                 schema=ORDER_SCHEMA,
@@ -1142,13 +1146,13 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
     ("tools", "match"),
     [
         pytest.param(
-            [Tool(key="  ", implementation=lookup_order, schema=ORDER_SCHEMA)],
+            [EvalTool(key="  ", implementation=lookup_order, schema=ORDER_SCHEMA)],
             "must not be blank",
             id="blank_key",
         ),
         pytest.param(
             [
-                Tool(
+                EvalTool(
                     key="Lookup_Order", implementation=lookup_order, schema=ORDER_SCHEMA
                 )
             ],
@@ -1156,13 +1160,13 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
             id="uppercase_key",
         ),
         pytest.param(
-            [Tool(key="lookup_order", implementation=lookup_order, schema=None)],  # type: ignore[arg-type]
+            [EvalTool(key="lookup_order", implementation=lookup_order, schema=None)],  # type: ignore[arg-type]
             "schema must be a JSON object",
             id="schema_is_none",
         ),
         pytest.param(
             [
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=lookup_order,
                     schema=[{"type": "object"}],
@@ -1173,7 +1177,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
         ),
         pytest.param(
             [
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=lookup_order,
                     schema={"default": object()},
@@ -1184,7 +1188,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
         ),
         pytest.param(
             [
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=lookup_order,
                     schema={"default": float("nan")},
@@ -1195,7 +1199,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
         ),
         pytest.param(
             [
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=lookup_order,
                     schema={"default": float("inf")},
@@ -1206,7 +1210,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
         ),
         pytest.param(
             [
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation="not a function",
                     schema=ORDER_SCHEMA,
@@ -1217,7 +1221,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
         ),
         pytest.param(
             [
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=lookup_order,
                     schema=ORDER_SCHEMA,
@@ -1229,7 +1233,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
         ),
         pytest.param(
             ["not a tool"],  # type: ignore[dict-item]
-            "each entry in tools must be a Tool",
+            "each entry in tools must be an EvalTool",
             id="entry_is_not_a_tool",
         ),
     ],
@@ -1267,7 +1271,7 @@ async def test_native_tool_paired_with_an_inline_definition_is_rejected() -> Non
             dataset="golden",
             handler=successful_handler,
             tools=[
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=NativeTool("WebSearch"),
                     schema=ORDER_SCHEMA,
@@ -1298,7 +1302,9 @@ async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
         key="eval-key",
         dataset="golden",
         handler=handler,
-        tools=[evals.tools.get("web_search", implementation=NativeTool("WebSearch"))],
+        tools=[
+            await evals.tools.get("web_search", implementation=NativeTool("WebSearch"))
+        ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
 
@@ -1324,12 +1330,12 @@ async def test_a_repeated_tool_key_is_rejected_with_zero_requests() -> None:
             dataset="golden",
             handler=successful_handler,
             tools=[
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=lookup_order,
                     schema=ORDER_SCHEMA,
                 ),
-                Tool(
+                EvalTool(
                     key="lookup_order",
                     implementation=refund_order,
                     schema=ORDER_SCHEMA,
@@ -1350,7 +1356,7 @@ async def test_tools_get_refuses_an_uppercase_key_before_any_request() -> None:
     )
 
     with pytest.raises(EvaluationsError, match="must not use uppercase letters"):
-        evals.tools.get("Lookup_Order", implementation=lookup_order)
+        await evals.tools.get("Lookup_Order", implementation=lookup_order)
 
     assert transport.requests == []
 
@@ -2799,7 +2805,7 @@ async def test_tool_trajectory_reaches_the_judge_via_message_history(
         key="support-qa",
         dataset="golden",
         handler=handler,
-        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
+        tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -2862,7 +2868,7 @@ async def test_each_row_gets_only_its_own_tool_trajectory(
         key="support-qa",
         dataset="golden",
         handler=handler,
-        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
+        tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
         concurrency=2,
@@ -2903,7 +2909,9 @@ async def test_a_row_that_called_no_tools_says_so_to_the_judge(
         key="support-qa",
         dataset="golden",
         handler=handler,
-        tools=[evals.tools.get("lookup_order", implementation=lambda args: "unused")],
+        tools=[
+            await evals.tools.get("lookup_order", implementation=lambda args: "unused")
+        ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
@@ -3008,7 +3016,7 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
         dataset="golden",
         handler=handler,
         tools=[
-            evals.tools.get(
+            await evals.tools.get(
                 "lookup_order",
                 implementation=lambda args: "{{expected_output}} leaked?",
             )
@@ -3343,7 +3351,7 @@ async def test_tool_version_drift_from_the_variation_is_logged(
         dataset="golden",
         handler=handler,
         ai_config=AIConfig(key="support-agent", variation="control"),
-        tools=[evals.tools.get("lookup_order", implementation=lookup_order)],
+        tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
     )
 
     assert "pins tool 'lookup_order' at version 4" in caplog.text
@@ -3440,7 +3448,7 @@ async def test_tools_get_pins_the_version_it_reads() -> None:
         project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
     )
 
-    tool = evals.tools.get("lookup_order", implementation=lookup_order)
+    tool = await evals.tools.get("lookup_order", implementation=lookup_order)
 
     assert tool.source == "library"
     assert tool.version == 7
@@ -3452,17 +3460,91 @@ async def test_tools_get_pins_the_version_it_reads() -> None:
 
 def test_a_constructed_tool_is_always_inline() -> None:
     """``source`` and ``version`` are not constructor arguments."""
-    tool = Tool(key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA)
+    tool = EvalTool(
+        key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA
+    )
 
     assert tool.source == "inline"
     assert tool.version is None
     with pytest.raises(TypeError):
-        Tool(  # type: ignore[call-arg]
+        EvalTool(  # type: ignore[call-arg]
             key="lookup_order",
             implementation=lookup_order,
             schema=ORDER_SCHEMA,
             source="library",
         )
+
+
+def test_an_inline_tool_requires_a_schema() -> None:
+    with pytest.raises(TypeError, match="schema"):
+        EvalTool(key="lookup_order", implementation=lookup_order)  # type: ignore[call-arg]
+
+    tool = EvalTool(key="lookup_order", implementation=lookup_order, schema={})
+    assert tool.schema == {}
+
+
+def test_a_tool_cannot_be_reassigned_to_a_library_tool() -> None:
+    tool = EvalTool(
+        key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA
+    )
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        tool.source = "library"  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        tool.version = 99  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        tool.schema = {}  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_a_library_tool_without_a_project_is_rejected() -> None:
+    forged = EvalTool._library(
+        "lookup_order",
+        lookup_order,
+        version=1,
+        schema={},
+        description="",
+        project_key="proj",
+    )
+    object.__setattr__(forged, "project_key", None)
+    transport = SequencedTransport([])
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    with pytest.raises(EvaluationsError, match="has no project"):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=successful_handler,
+            tools=[forged],
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_tools_get_reads_in_a_worker_thread() -> None:
+    main_thread = threading.get_ident()
+    threads: list[int] = []
+
+    class RecordingTransport(SequencedTransport):
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            threads.append(threading.get_ident())
+            return super().__call__(*args, **kwargs)
+
+    transport = RecordingTransport(
+        [response(200, {"key": "lookup_order", "version": 7, "schema": {}})]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    await evals.tools.get("lookup_order", implementation=lookup_order)
+
+    assert threads
+    assert main_thread not in threads
 
 
 @pytest.mark.asyncio
@@ -3477,7 +3559,7 @@ async def test_run_reads_no_tool_from_the_api() -> None:
     evals = init_evaluations(
         project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
     )
-    library_tool = evals.tools.get("lookup_order", implementation=lookup_order)
+    library_tool = await evals.tools.get("lookup_order", implementation=lookup_order)
     requests_before_run = len(transport.requests)
 
     await evals.run(
@@ -3486,7 +3568,9 @@ async def test_run_reads_no_tool_from_the_api() -> None:
         handler=successful_handler,
         tools=[
             library_tool,
-            Tool(key="refund_order", implementation=refund_order, schema=ORDER_SCHEMA),
+            EvalTool(
+                key="refund_order", implementation=refund_order, schema=ORDER_SCHEMA
+            ),
         ],
         generation={"provider": "OpenAI", "model": "gpt-4o"},
     )
@@ -3532,7 +3616,7 @@ async def test_a_tool_from_another_project_is_rejected() -> None:
         sdk_key="sdk-key",
         transport=transport,
     )
-    foreign_tool = other.tools.get("lookup_order", implementation=lookup_order)
+    foreign_tool = await other.tools.get("lookup_order", implementation=lookup_order)
     evals = init_evaluations(
         project_key="proj",
         api_key="token",

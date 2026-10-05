@@ -30,13 +30,13 @@ from .evaluations import (
     Criterion,
     DatasetRow,
     EvalRunResult,
+    EvalTool,
     EvaluationsError,
     EvaluationsModule,
     GenerationConfig,
     Judge,
     RunSummary,
     Scorer,
-    Tool,
     init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
@@ -195,7 +195,7 @@ __all__ = [  # noqa: RUF022
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
-    "Tool",
+    "EvalTool",
     "Judge",
     "RunSummary",
     "Scorer",

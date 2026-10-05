@@ -57,7 +57,6 @@ class DatasetRow:
     metadata: dict[str, Any] | None = None
 
 
-@dataclass
 @dataclass(frozen=True)
 class AIConfig:
     """Identifies an existing AI Config variation to seed an evaluation run.

@@ -20,7 +20,7 @@ from .api import (
 )
 from .criteria import Criterion, Judge
 from .runner import EvalHandler, EvaluationsRunner, _provides_for
-from .tools import Tool, ToolsClient, tool_handlers, validate_tools
+from .tools import EvalTool, ToolsClient, tool_handlers, validate_tools
 from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
 
 logger = logging.getLogger(__name__)
@@ -137,7 +137,7 @@ class EvaluationsModule:
         handler: EvalHandler,
         generation: GenerationConfig | None = None,
         ai_config: AIConfig | None = None,
-        tools: Sequence[Tool] | None = None,
+        tools: Sequence[EvalTool] | None = None,
         criteria: list[Criterion] | None = None,
         judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
@@ -153,7 +153,7 @@ class EvaluationsModule:
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
 
-        ``tools`` is a list of :class:`Tool`. Construct one to define a tool
+        ``tools`` is a list of :class:`EvalTool`. Construct one to define a tool
         in code. Call ``evals.tools.get(key, implementation=...)`` to use a
         tool from the LaunchDarkly tool library, which reads the tool and pins
         its version at that point. One list may hold both kinds. ``run`` reads
@@ -215,7 +215,7 @@ class EvaluationsModule:
                     + ", ".join(
                         repr(name) for name in ai_config_variation.tool_versions
                     )
-                    + ". Pass tools= with a Tool for each."
+                    + ". Pass tools= with an EvalTool for each."
                 )
             # A caller who passes tools= replaces the variation's list, so an
             # empty list runs the variation with no tools.

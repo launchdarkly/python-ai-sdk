@@ -47,7 +47,7 @@ from .events import (
     TokenUsage,
 )
 from .tools import (
-    Tool,
+    EvalTool,
     ToolImplementation,
     create_wire_tools,
     handler_config_tools,
@@ -464,7 +464,7 @@ class EvaluationsRunner:
         project_key: str,
         key: str,
         generation: GenerationConfig,
-        tools: Sequence[Tool],
+        tools: Sequence[EvalTool],
         criteria: list[Criterion] | None = None,
     ) -> EvaluationRef:
         body: dict[str, Any] = {
@@ -534,7 +534,7 @@ class EvaluationsRunner:
     def _build_handler_config(
         self,
         generation: GenerationConfig,
-        tools: Sequence[Tool],
+        tools: Sequence[EvalTool],
     ) -> dict[str, Any]:
         parameters = generation.get("parameters")
         config: dict[str, Any] = {
