@@ -6,6 +6,7 @@ Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -288,8 +289,13 @@ def _build_agent_tools(
             fn = tool_handlers.get(_name)
             if not fn:
                 raise ValueError(f'No handler registered for tool "{_name}"')
-            res = await fn(kwargs)
-            return str(res)
+            # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
+            # routing records the selected edge on the call itself; awaiting a plain
+            # return value raises. Same rule as ``tracking.wrap_tool_handlers``.
+            result = fn(kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         t = tool_fn(
             name,

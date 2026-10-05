@@ -11,7 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import launchdarkly_ai_openai_agents.native_graph as _openai_ng
-from launchdarkly_ai_openai_agents.native_graph import to_openai_agents
+from launchdarkly_ai_openai_agents.native_graph import (
+    _build_node_tools,
+    to_openai_agents,
+)
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
 from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
@@ -802,3 +805,104 @@ class TestNativeGraphModelParameters:
         run_kwargs = agents_mock.Runner.run.call_args.kwargs
         assert run_kwargs["max_turns"] == 6
         assert not find_leaks({k: v for k, v in run_kwargs.items() if k != "hooks"})
+
+
+class TestBuildNodeToolsSyncHandlers:
+    """``_build_node_tools`` must accept sync handlers (native path skips wrap_tool_handlers)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_handler_returns_string(self) -> None:
+        captured: list[Any] = []
+
+        agents_mock = MagicMock()
+        agents_mock.tool = MagicMock(
+            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
+        )
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"weather": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            _build_node_tools(node, {"weather": lambda a: "sunny"})
+
+        assert captured, "tool was not registered"
+        assert await captured[0]({"city": "Paris"}) == "sunny"
+
+    @pytest.mark.asyncio
+    async def test_async_handler_is_awaited(self) -> None:
+        captured: list[Any] = []
+
+        agents_mock = MagicMock()
+        agents_mock.tool = MagicMock(
+            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
+        )
+
+        async def async_handler(args: Any) -> str:
+            return f"async:{args.get('q')}"
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"lookup": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            _build_node_tools(node, {"lookup": async_handler})
+
+        assert await captured[0]({"q": "hi"}) == "async:hi"
+
+    @pytest.mark.asyncio
+    async def test_sync_handler_returning_awaitable_is_awaited(self) -> None:
+        captured: list[Any] = []
+
+        agents_mock = MagicMock()
+        agents_mock.tool = MagicMock(
+            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
+        )
+
+        async def _inner() -> str:
+            return "done"
+
+        def sync_wrapper(_args: Any) -> Any:
+            return _inner()
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"my-tool": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            _build_node_tools(node, {"my-tool": sync_wrapper})
+
+        assert await captured[0]({}) == "done"
