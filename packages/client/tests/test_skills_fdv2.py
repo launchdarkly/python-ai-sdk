@@ -956,36 +956,56 @@ class TestProtocolReader:
 
     def test_a_transfer_that_applied_nothing_is_not_a_commit(self) -> None:
         """
-        Three shapes reach ``payload-transferred`` with no pending set to apply:
-        an intent code this SDK does not recognise, a ``none`` intent, and a
-        lone transfer under no intent at all. None of them applied anything, so
-        none of them claims anything — neither a commit, which is what publishes
-        the first payload ``write_skills("*")`` prunes on, nor an up-to-date
-        answer, which only the server can give and only the ``none`` intent
-        does, on its own event.
+        Four shapes reach ``payload-transferred`` with nothing to apply: an
+        intent code this SDK does not recognise, a ``none`` intent, a lone
+        transfer under no intent at all, and a foreign payload, which built a
+        pending set and threw it away. None of them applied anything, so none
+        of them claims anything — neither a commit, which is what publishes the
+        first payload ``write_skills("*")`` prunes on, nor an up-to-date answer,
+        which only the server can give and only the ``none`` intent does, on
+        its own event.
 
         The transfer is still a wire fact, counted either way.
         """
-        for payload_events in (
-            events(
-                ("server-intent", server_intent("xfer-future")),
-                ("put-object", put_skill()),
-                ("payload-transferred", transferred("basis-1")),
+        for prior, payload_events in (
+            (
+                [],
+                events(
+                    ("server-intent", server_intent("xfer-future")),
+                    ("put-object", put_skill()),
+                    ("payload-transferred", transferred("basis-1")),
+                ),
             ),
-            events(
-                ("server-intent", server_intent("none")),
-                ("payload-transferred", transferred("basis-1")),
+            (
+                [],
+                events(
+                    ("server-intent", server_intent("none")),
+                    ("payload-transferred", transferred("basis-1")),
+                ),
             ),
-            events(("payload-transferred", transferred("basis-1"))),
+            ([], events(("payload-transferred", transferred("basis-1")))),
+            (
+                # A payload is foreign only once the skill payload is known,
+                # which takes a commit first.
+                full_payload(("put-object", put_skill()), state="basis-skills"),
+                events(
+                    ("server-intent", server_intent("xfer-full", "env-flags")),
+                    ("put-object", put_skill("other")),
+                    ("payload-transferred", transferred("basis-flags")),
+                ),
+            ),
         ):
             held = _SkillObjectSet()
             reader = _ProtocolReader(held)
+            drive(reader, prior)
+            before = held.all_raw()
+            transfers = reader.diagnostics.payloads_transferred
             outcome = drive(reader, payload_events)[-1]
             assert outcome.committed is False
             assert outcome.up_to_date is False
             assert outcome.basis is None
-            assert len(held) == 0
-            assert reader.diagnostics.payloads_transferred == 1
+            assert held.all_raw() == before
+            assert reader.diagnostics.payloads_transferred == transfers + 1
 
     def test_a_put_after_a_none_intent_is_applied(self) -> None:
         """``none`` means current, not finished: later edits follow it on the
