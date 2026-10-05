@@ -672,6 +672,10 @@ class _ProtocolReader:
         # Checked even with no pending set (a ``none`` intent), so a foreign
         # payload's selector never becomes the resume point.
         foreign = self._is_foreign_payload(payload_id)
+        # A ``none`` intent builds no pending set, nor does an intent code this
+        # SDK does not recognise, and a foreign payload's contents are declined
+        # below.
+        applied = not foreign and self._pending is not None
         if foreign:
             self._warn_foreign_payload(payload_id)
             self.diagnostics.payloads_ignored += 1
@@ -702,12 +706,18 @@ class _ProtocolReader:
             version,
             len(self._committed),
         )
+        if not applied:
+            # Nothing applied, so nothing to report — and in particular not a
+            # commit, because a commit publishes the first payload, and
+            # ``is_initialized`` (what ``write_skills("*")`` authorises a prune
+            # on) must not go true over a store that received nothing. Not up to
+            # date either: only the ``none`` intent says that, on its own event.
+            # The selector is withheld too — it names a payload never applied.
+            return _TransferOutcome()
         return _TransferOutcome(
             committed=True,
             changes=changes,
-            # A declined payload must not move the resume point, or skill
-            # updates could silently stop arriving.
-            basis=state if not foreign and isinstance(state, str) and state else None,
+            basis=state if isinstance(state, str) and state else None,
         )
 
     def _abandon_in_flight(self) -> None:
@@ -1542,9 +1552,9 @@ class FDv2SkillStore:
         """
         Blocks until the first payload arrives, or *timeout* seconds elapse.
 
-        Returns ``True`` once a payload has committed or a 304 confirmed the one
-        held is current. That does not mean any skill verified, or that the
-        environment has skills; see ``diagnostics``.
+        Returns ``True`` once a payload has committed; a 304 alone does not
+        count. That does not mean any skill verified, or that the environment
+        has skills; see ``diagnostics``.
 
         Returns ``False`` on timeout, or early if delivery ends first (``close``,
         or a failure that will not be retried).
@@ -1762,10 +1772,14 @@ class FDv2SkillStore:
             reason,
         )
 
-    def _apply(self, name: str, data: Any) -> None:
+    def _apply(self, name: str, data: Any) -> bool:
         """
         Feeds one event to the reader, publishes a commit, and raises the
         transport error the event calls for, if any.
+
+        Returns whether the event completed an exchange — a commit, or the
+        server confirming the content held is current — which is what
+        ``_poll_once`` adopts an etag on.
         """
         with self._lock:
             outcome = self._reader.handle(name, data)
@@ -1785,6 +1799,7 @@ class FDv2SkillStore:
             raise _RecoverableTransportError(
                 outcome.disconnect, recycled=outcome.recycled
             )
+        return outcome.committed or outcome.up_to_date
 
     def _poll_once(self) -> None:
         with self._lock:
@@ -1795,15 +1810,22 @@ class FDv2SkillStore:
         result = self._requester.poll(basis, etag)
         if result.not_modified:
             logger.debug("Skill payload unchanged (HTTP 304)")
-            # A 304 counts as a first payload: the etag belongs to a body this
-            # store applied in full.
-            self._publish_first_payload()
+            # A 304 confirms the payload this store holds; it cannot establish
+            # one. ``is_initialized`` stays false until something commits, so a
+            # store that has received nothing never authorises a prune of the
+            # files on disk. ``_run`` counts the poll as a healthy answer.
             return
+        completed = False
         for name, data in result.events:
-            self._apply(name, data)
+            completed = self._apply(name, data) or completed
+        if not completed:
+            # An etag describes the body it came with, so it is adopted only when
+            # that body is also what the store now holds: a commit, or a ``none``
+            # intent. A transfer this SDK could not apply is neither, and keeping
+            # its etag would let the next 304 confirm content never applied. Any
+            # etag already held stays valid, so it is left alone, not cleared.
+            return
         with self._lock:
-            # Adopted only after the whole body applied, so a body that broke
-            # off partway cannot earn a later 304.
             self._etag = result.etag
             self._etag_basis = basis
 
