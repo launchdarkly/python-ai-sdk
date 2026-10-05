@@ -5,6 +5,7 @@ mirroring the TypeScript toLangGraph implementation.
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 import types
@@ -79,8 +80,12 @@ def _build_node_tools(
             fn = tool_handlers.get(_name)
             if not fn or isinstance(fn, NativeTool):
                 return ""
-            res = await fn(kwargs)
-            return str(res)
+            # Handlers may be sync or async. Same rule as handler._build_agent_tools
+            # and tracking.wrap_tool_handlers — awaiting a plain return raises.
+            result = fn(kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         t = tool_fn(
             name,
