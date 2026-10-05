@@ -155,15 +155,6 @@ async def _run_query(
     params = select_forwarded_parameters(
         model_parameters(node.config), _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS
     )
-    for _owned_key in (
-        "model",
-        "tools",
-        "allowed_tools",
-        "mcp_servers",
-        "hooks",
-        "system_prompt",
-    ):
-        params.pop(_owned_key, None)
 
     options = ClaudeAgentOptions(
         **params,

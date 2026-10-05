@@ -14,6 +14,7 @@ import pytest
 import launchdarkly_ai_claude_agents.native_graph as _claude_ng
 from launchdarkly_ai_claude_agents.native_graph import to_claude_agents
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -777,3 +778,47 @@ class TestNativeGraphConversationId:
         assert (graph_spans[0].attributes or {}).get(
             GEN_AI_CONVERSATION_ID
         ) == "thread-graph"
+
+
+class TestNativeGraphModelParameters:
+    @pytest.mark.asyncio
+    async def test_node_options_take_run_settings_and_nothing_never_forwarded(
+        self,
+    ) -> None:
+        """Each node runs its own query with options built from its own config, so a node's
+        ``max_turns`` applies to that node."""
+        mock_sdk = _make_sdk_mock("done")
+        nodes = {
+            "root": {
+                "key": "root",
+                "config": {
+                    "model": {
+                        "name": "claude-3",
+                        "parameters": {**NEVER_FORWARDED_BAG, "max_turns": 7},
+                    },
+                    "instructions": "be helpful",
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [],
+                "is_terminal": True,
+            }
+        }
+        graph_def = _make_graph_def(nodes=nodes)
+
+        captured_options: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured_options.append(kw), kw)[1]
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        assert captured_options
+        for opts in captured_options:
+            assert opts["max_turns"] == 7
+            assert not find_leaks(opts)

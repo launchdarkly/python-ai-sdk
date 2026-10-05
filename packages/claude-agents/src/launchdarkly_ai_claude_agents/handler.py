@@ -70,39 +70,67 @@ from .spans import (
 
 #: Every field ``ClaudeAgentOptions`` declares, classified by hand into exactly one of: forwarded
 #: (below), handler-owned (``model``, ``allowed_tools``, ``mcp_servers``, ``hooks``, ``tools``,
-#: ``system_prompt``, popped after the filter runs, at each call site), or excluded
-#: (``extra_args``, a raw CLI-argument escape hatch, is client/connection configuration and is never
-#: forwarded). ``TestClaudeAgentOptionsAcceptsExactlyTheseFields`` in this package's tests asserts
-#: this classification stays exhaustive as the SDK's own dataclass changes.
+#: ``system_prompt``, set by each call site itself), or excluded (below).
+#: ``TestClaudeAgentOptionsAcceptsExactlyTheseFields`` in this package's tests asserts this
+#: classification stays exhaustive as the SDK's own dataclass changes.
+#:
+#: Only model and run settings are forwarded: how the model thinks, how long the run may go, and
+#: what it may spend. Everything that configures the host process the SDK launches (its binary,
+#: environment, working directory, file access, permissions, settings files, plugins, sandbox,
+#: session state) stays under the application's control, never a config's.
 #:
 #: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
 #: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
-#: for other providers; forwarding one of those unfiltered raised ``TypeError`` before this filter
-#: existed.
+#: for other providers; they are dropped like any other key not listed here.
 _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
+    {
+        "betas",
+        "effort",
+        "fallback_model",
+        "max_budget_usd",
+        "max_thinking_tokens",
+        "max_turns",
+        "output_format",
+        "thinking",
+    }
+)
+
+#: Accepted by ``ClaudeAgentOptions`` but never forwarded, and why:
+#: * ``cli_path``, ``env``, ``cwd``, ``add_dirs``, ``settings``, ``setting_sources``, ``plugins``,
+#:   ``skills``, ``sandbox``, ``user``, ``extra_args``: which binary runs, with what environment,
+#:   as which user, with what files, settings, plugins, and CLI arguments. A config that could set
+#:   these could run code on, or read files from, the host.
+#: * ``permission_mode``, ``permission_prompt_tool_name``, ``can_use_tool``, ``disallowed_tools``,
+#:   ``strict_mcp_config``, ``agents``: what the agent is allowed to do and which tools or
+#:   subagents it gets. The handler wires tools and permissions itself.
+#: * ``resume``, ``session_id``, ``fork_session``, ``continue_conversation``, ``session_store``,
+#:   ``session_store_flush``, ``enable_file_checkpointing``: session state on the host.
+#: * ``stderr``, ``debug_stderr``, ``include_partial_messages``, ``include_hook_events``,
+#:   ``max_buffer_size``, ``load_timeout_ms``: process I/O and transport plumbing, including the
+#:   streamed message shape the handler reads.
+#: * ``task_budget``: not one of the agreed run settings yet; ``max_turns`` and ``max_budget_usd``
+#:   cover run limits.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
     {
         "add_dirs",
         "agents",
-        "betas",
         "can_use_tool",
         "cli_path",
         "continue_conversation",
         "cwd",
         "debug_stderr",
         "disallowed_tools",
-        "effort",
         "enable_file_checkpointing",
         "env",
-        "fallback_model",
+        "extra_args",
         "fork_session",
         "include_hook_events",
         "include_partial_messages",
         "load_timeout_ms",
-        "max_budget_usd",
         "max_buffer_size",
-        "max_thinking_tokens",
-        "max_turns",
-        "output_format",
         "permission_mode",
         "permission_prompt_tool_name",
         "plugins",
@@ -117,14 +145,9 @@ _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
         "stderr",
         "strict_mcp_config",
         "task_budget",
-        "thinking",
         "user",
     }
 )
-
-#: Named for the drift test and for review, not read at runtime: the forwarded list above already
-#: leaves this out, so nothing needs to subtract it again.
-_CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset({"extra_args"})
 
 # ---------------------------------------------------------------------------
 # Tool wiring
@@ -542,15 +565,6 @@ def _build_query_options(
     params = select_forwarded_parameters(
         model_parameters(config), _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS
     )
-    for _owned_key in (
-        "model",
-        "allowed_tools",
-        "mcp_servers",
-        "hooks",
-        "tools",
-        "system_prompt",
-    ):
-        params.pop(_owned_key, None)
     kwargs: dict[str, Any] = {
         **params,
         "model": config["model"]["name"],
