@@ -261,6 +261,24 @@ class TestInitClientSDKKeyPath:
                 ):
                     assert await init_client() is healthy
 
+    async def test_retries_after_a_failed_init_instead_of_replaying_it(self) -> None:
+        # A failure must not be cached: an app whose first call ran before its
+        # key was available would otherwise fail for the life of the process.
+        stub = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=stub)
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="SDK key"):
+                        await init_client()
+
+                    assert await init_client({"sdkKey": "late-key"}) is stub
+        mock_ld.Config.assert_called_once_with("late-key")
+        assert get_client() is stub
+
     async def test_returns_initialized_client(self) -> None:
         stub = _make_stub_client()
         mock_ld = MagicMock()
@@ -346,6 +364,22 @@ class TestShutdown:
             await shutdown()
             await init_client(client=stub2)
         assert get_client() is stub2
+
+    async def test_allows_initialization_after_a_failed_init(self) -> None:
+        stub = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=stub)
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="SDK key"):
+                        await init_client()
+                    await shutdown()
+
+                    await init_client({"sdkKey": "test-key"})
+        assert get_client() is stub
 
     async def test_releases_the_global_tracer_provider(
         self, restore_otel_globals: Any
@@ -780,6 +814,40 @@ class TestInspectConfig:
 
         assert result["enabled"] is True
         assert result["config"] is None
+
+    async def test_recovers_once_sdk_key_is_available_after_a_failed_lazy_init(
+        self,
+    ) -> None:
+        # inspect_config swallows the init error, so a cached failure would make
+        # an app that called it too early serve disabled configs forever.
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(
+            return_value={
+                "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+                "model": {"name": "claude-3-5"},
+                "provider": {"name": "Anthropic"},
+                "instructions": "You are helpful.",
+            }
+        )
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with patch(
+                        "launchdarkly_ai_server.utils.to_ld_context",
+                        side_effect=lambda _c, ctx: ctx,
+                    ):
+                        assert (await inspect_config("my-flag", ctx))[
+                            "enabled"
+                        ] is False
+
+                        os.environ["LD_SDK_KEY"] = "test-key"
+                        assert (await inspect_config("my-flag", ctx))["enabled"] is True
+        mock_ld.LDClient.assert_called_once()
 
     async def test_never_raises_when_variation_throws(self) -> None:
         stub = _make_stub_client()
