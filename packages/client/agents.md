@@ -88,15 +88,14 @@ from launchdarkly_ai_server import (
 )
 ```
 
-`MAX_SKILL_CONTENT_BYTES` is deliberately *not* among them: it is a local enforcement
-bound on content the platform produces, not a value this SDK defines, so exporting it
-would semver-lock a number this side does not own. Keep it internal to `skills_core`.
+`MAX_SKILL_CONTENT_BYTES` and `SKILL_OBJECT_KIND` are deliberately **not** exported; both stay
+internal to `skills_core`:
 
-`SKILL_OBJECT_KIND` is not exported either, for a different reason: it is the string this
-SDK hands a store, and a store adapter maps whatever the transport underneath calls a skill
-onto it. Publishing it would advertise an SDK-side seam value as the wire contract — a claim
-this side cannot make, and hard to walk back once a caller depends on it. An adapter that
-needs to agree with it reaches it through `launchdarkly_ai_server.skills_core`.
+- The size cap is a local bound on content the platform produces. Exporting it would
+  semver-lock a number this SDK does not own.
+- The kind is the SDK-side value handed to a store, not the wire contract, and publishing it
+  would imply otherwise. An adapter that needs it imports it from
+  `launchdarkly_ai_server.skills_core`.
 
 When adding a new export, add it to `__init__.py`'s imports and `__all__`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
 
@@ -210,110 +209,93 @@ Three layers, in increasing order of blast radius:
 
 ### The store seam, and why version is part of the lookup
 
-`SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, and the optional
-`is_initialized()` plus the optional pair `add_listener(kind, fn)` /
-`remove_listener(kind, fn)`. Version is part of the **lookup
-identity**, not a filter applied to the answer, and that is load-bearing: a delivery payload
-carries the newest version of every skill *plus* every version any variation currently pins,
-so two versions of one key coexist routinely. A store keyed by key alone would answer a pinned reference with the newest
-object, and the caller would then have to reject it — turning the primary use case, a
-version-pinned attachment, into a missing skill. `version=None` asks for the newest held.
+`SkillStore` is `get_object(kind, key, version=None)`, `all_objects(kind)`, an optional
+`is_initialized()`, and an optional `add_listener(kind, fn)` / `remove_listener(kind, fn)` pair.
 
-The equality check in `resolve_from_store` stays, now as a **defense** rather than as the
-selection mechanism: the store is untrusted, so an answer that is not the version asked for
-is withheld.
-
-`all_objects` returns one entry per `(key, version)` under keys that are **opaque** to this
-SDK. Do not parse them and do not assume one per skill key; identity is read off each
-object's own `key` and `version`, which are revalidated anyway. `newest_by_key` is the
-one place that collapses the result to one object per key, because both whole-store
-consumers need it — `all_skills`, since a list holding two versions of one key is not a set
-of skills, and the `"*"` reconcile, since `<root>/<key>/SKILL.md` is a single path. It keeps
-an object too malformed to carry a usable key and version, so verification is what withholds
-it and the key stays in the requested set where prune cannot touch its on-disk copy — unless
-another version resolved that key anyway, in which case keeping it would only report a
-withholding for a key that resolved.
+- **Version is part of the lookup identity**, not a filter on the answer. A delivery payload
+  carries the newest version of every skill *plus* every version a variation pins, so two
+  versions of one key routinely coexist. A key-only store would answer a pin with the newest
+  object and turn a version-pinned attachment into a missing skill. `version=None` asks for
+  the newest held.
+- **The equality check in `resolve_from_store` is a defense**, not the selection mechanism:
+  the store is untrusted, so an answer that is not the version asked for is withheld.
+- **`all_objects` keys are opaque.** It returns one entry per `(key, version)`; do not parse
+  the keys or assume one per skill key. Identity comes from each object's own `key` and
+  `version`, which are revalidated.
+- **`newest_by_key` is the one place that collapses to one object per key**, for both
+  whole-store consumers: `all_skills`, and the `"*"` reconcile (`<root>/<key>/SKILL.md` is a
+  single path). It keeps an object too malformed to carry a usable key and version, so
+  verification withholds it and its key stays in the requested set, out of prune's reach —
+  unless another version resolved that key.
 
 ### `is_initialized()` is what stands between a slow boot and deleting a customer's files
 
 Through the store interface, "this environment holds no skills" and "delivery has not
-answered yet" are the same empty answer, and `write_skills("*")` reads the first as every
-skill having been revoked. So `_available_store` — the single gate that sets `unavailable`
-and therefore suppresses pruning — consults `store_is_initialized`, and a store that has not
-received its initial data blocks retrieval instead of authorizing a prune. A store that does
-not implement the probe is treated as initialized, which is right for one populated by hand;
-a probe that *raises* counts as not initialized, because a store that cannot say whether it
-is ready is not one to delete on. Keep this check in that one gate: maintained in two places,
-a condition added to one and not the other does not merely produce a wrong message — it
-deletes the user's files.
+answered yet" are the same empty answer, and `write_skills("*")` would read the first as
+every skill revoked. So `_available_store` — the single gate that sets `unavailable` and
+therefore suppresses pruning — consults `store_is_initialized`:
+
+- Not yet initialized: retrieval is blocked instead of authorizing a prune.
+- Probe not implemented: treated as initialized (right for a store populated by hand).
+- Probe raises: treated as not initialized.
+
+Keep this check in that one gate. A second copy that drifts from the first deletes the
+user's files.
 
 ### The delivery transport, and the one field that will bite you
 
 `FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
 `GET /sdk/stream`, server-side SDK key in `Authorization`, `kinds` + `basis` params,
-`If-None-Match`/304). It lives below the store interface and produces raw objects in the
-shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**. If a transport
-change ever seems to require editing an accessor, verification, or `write_skills`, the adapter
-boundary is wrong.
+`If-None-Match`/304). It sits below the store interface and produces raw objects in the
+shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**.
+If a transport change seems to require editing an accessor, verification, or
+`write_skills`, the adapter boundary is wrong.
 
-**Every request declares `kinds=agent-skill`, and that is load-bearing.** Delivery narrows a
-connection to the payload kinds it declares and defaults to flags, so a request without it is
-served the environment's flag payload and no skills at all — the store would run, report
-healthy, and hold nothing. It also makes the connection carry exactly one payload, which is
-the shape `_ProtocolReader` is built for: without it, a skill-enabled environment assigns two,
-and the reader warns about the second and reads only the first intent. `FDV2_PAYLOAD_KIND` is
-the payload's kind and `FDV2_OBJECT_KIND` the kind of the objects inside it — two different
-strings, held apart on purpose. No `mv`: that parameter selects the *flag* data model, and
-delivery overrides whatever a request asks for with the payload's own default for any
-non-flagging payload, so sending it would state a preference that is ignored.
+**Every request declares `kinds=agent-skill`.** Delivery defaults to flags, so without it
+the store is served the flag payload and holds no skills while reporting healthy. It also
+narrows the connection to the one payload `_ProtocolReader` is built for; otherwise a
+skill-enabled environment assigns two, and the reader warns and reads only the first.
+`FDV2_PAYLOAD_KIND` (the payload) and `FDV2_OBJECT_KIND` (the objects inside it) are
+different strings; keep them apart. No `mv`: it selects the *flag* data model, and delivery
+ignores it for non-flag payloads.
 
-**HTTP 422 is fatal, and the platform decided that rather than the SDK inferring it.** Delivery
-answers 422 when a connection's declared kinds exclude every payload it is assigned, and it
-picked a non-400 4xx *because* LD SDKs treat those as terminal. So `_classify_status` returns a
-`_FatalTransportError` and the existing give-up path handles it: `failed` and `last_error` are
-set, `connection_failures` is untouched (it measures consecutive *recoverable* failures against
-the retry bound, and a fatal never retries — untouched, note, not zero: a run that already had
-recoverable failures keeps their count), and `wait_for_skills` returns `False` at once rather
-than at the timeout.
+**HTTP 422 is fatal.** Delivery answers 422 when a connection's declared kinds exclude every
+payload assigned to it, and chose a non-400 4xx because LD SDKs treat those as terminal.
+`_classify_status` returns a `_FatalTransportError` and the normal give-up path runs:
+`failed` and `last_error` are set, `wait_for_skills` returns `False` at once, and
+`connection_failures` is left untouched (it counts consecutive *recoverable* failures; an
+existing count is kept, not zeroed).
 
-**The 422's message is the TypeScript SDK's, word for word, and deliberately short.** It names
-the one cause a customer can act on — a view-scoped SDK key — and refers every other case to
-support rather than enumerating it. Do not extend it with the remaining causes: they are not a
-customer's to fix, and a message that lists conditions its reader cannot change costs them the
-one line that matters. Keeping the two SDKs identical here matters for the reason it matters on
-the integrity record: a customer comparing them should not have to work out whether they hit two
-different conditions. `test_the_422_message_names_its_one_actionable_cause` asserts the cause and
-the referral, and asserts the absences too, so an enumeration cannot creep back in.
+**The 422 message matches the TypeScript SDK's word for word, and stays short.** It names the
+one cause a customer can fix — a view-scoped SDK key — and refers every other case to
+support. Do not list the other causes. `test_the_422_message_names_its_one_actionable_cause`
+asserts both the cause and the absences.
 
-**A fatal stops the run, not the store, so every surface says `start()` and not "restart the
-process".** `_give_up` does not close — only `close` sets `_closed`, and `_closed` is the only
-thing `start` refuses — so a store that gave up resumes in place once the cause is fixed,
-dropping the terminal reason through `_rearm_waiters`. This is not 422-specific: `_give_up`'s
-log line is one line for a 401, a 403, a 404, a 422 and an exhausted retry budget alike, so an
-overstatement there is wrong five times over. Three surfaces carry the claim and each is
-asserted: the log line, by
-`test_the_give_up_line_points_at_start_not_a_process_restart`; the behaviour, by
-`test_a_store_that_gave_up_on_a_422_resumes_on_start`, with
-`test_a_restarted_store_does_not_report_the_old_failure` for the general case; and the README's
-422 section, in prose. The 422's own message is the one place that stays silent on it, having no
-room — the log line beside it says it instead.
+**A fatal stops the run, not the store, so every surface says `start()`, not "restart the
+process".** `_give_up` does not close; only `close` sets `_closed`, the one thing `start`
+refuses. A store that gave up — on a 401, 403, 404, 422, or an exhausted retry budget —
+resumes in place once the cause is fixed, clearing the terminal reason through
+`_rearm_waiters`. Asserted by `test_the_give_up_line_points_at_start_not_a_process_restart`,
+`test_a_store_that_gave_up_on_a_422_resumes_on_start`, and
+`test_a_restarted_store_does_not_report_the_old_failure`.
 
-**The key travels over TLS only, and only to the base URI.** `_require_https_base_uri` refuses a
-plain `http://` base URI in the constructor — the SDK key would go out in cleartext — with a
-loopback exemption (`localhost`, `127.0.0.1`, `::1`) because the test suite's fake endpoints
-listen there; and the opener is built with `_RefuseRedirects`, because `urllib`'s standard
-redirect handler copies `Authorization` onto the redirected request, so any 3xx (304 aside,
-which is a poll's not-modified answer) surfaces as an `HTTPError` that `_classify_status` maps
-to a fatal, non-retried failure instead of a request carrying the key to the `Location` host.
+**The key travels over TLS only, and only to the base URI.**
 
-**Reads are memory-bounded.** `_read_bounded` reads a poll body in chunks, and
-`_iter_stream_lines`/`_iter_sse` read each line with a size argument and total each event, all
-against `MAX_RESPONSE_BYTES` (64 MiB): crossing it raises `_RecoverableTransportError`, so
-nothing from that body or event is applied, the delivery loop abandons the reader's in-flight
-payload, records the failure in `connection_failures`/`last_error`, and retries on the usual
-backoff while the committed set stays served. The bound is a memory backstop for the transport
-and is independent of `skills_core.MAX_SKILL_CONTENT_BYTES`, which caps one skill's content at
-verification; do not derive one from the other.
+- `_require_https_base_uri` rejects a plain `http://` base URI in the constructor, except for
+  loopback (`localhost`, `127.0.0.1`, `::1`), where the test fakes listen.
+- The opener uses `_RefuseRedirects`, because `urllib`'s standard redirect handler copies
+  `Authorization` onto the redirected request. Any 3xx except 304 (a poll's not-modified
+  answer) surfaces as an `HTTPError` that `_classify_status` maps to a fatal, non-retried
+  failure.
+
+**Reads are memory-bounded.** `_read_bounded` (poll bodies) and
+`_iter_stream_lines`/`_iter_sse` (each line and each event) enforce `MAX_RESPONSE_BYTES`
+(64 MiB). Crossing it raises `_RecoverableTransportError`: nothing from that body or event
+is applied, the in-flight payload is abandoned, the failure is recorded in
+`connection_failures`/`last_error`, and delivery retries on the usual backoff while the
+committed set stays served. This bound is independent of
+`skills_core.MAX_SKILL_CONTENT_BYTES` (one skill's content, at verification); do not derive
+one from the other.
 
 **The skill's version is in the object's `key`. `version` is the payload's.** Each version
 of a skill is its own object on the wire, identified as `<key>:<version>`:
@@ -323,83 +305,76 @@ of a skill is its own object on the wire, identified as `<key>:<version>`:
  "object":{"contentType":"text/markdown","content":"…","contentHash":"…","name":"…"}}
 ```
 
-The `3` after the delimiter is what a `{key, version}` reference pins and what becomes the
-stored `version`, under the stored key `pdf-extraction`. `version` (42) is the version of the
-*payload* the object arrived in — it moves when anything in the environment moves,
-including a flag with nothing to do with skills. Reading it as the skill's version fails
-**silently**: the object verifies, the hash matches, and the caller gets content under a
-version number that means nothing. There is no separate field for the skill's version: the
-agent-skill payload is opaque to delivery, and its objects carry only `key`, `kind`,
-`version` and `object`, exactly like a flag. `_split_wire_key` is the only place the wire key
-is read, `_store_object_from_put` and `_tombstone_from_delete` both go through it, and
-`TestVersionTranslation` asserts the translation in both directions. A wire key that will
-not split cleanly is *held*, not dropped — version-less, or with the offending text as its
-version — so verification withholds it with `invalid_version` under a key the caller
-recognises; only a key with nothing before the delimiter is dropped, since there is no
-identity to hold it under.
+The `3` after the delimiter is what a `{key, version}` reference pins; it becomes the stored
+`version`, under the stored key `pdf-extraction`. `version` (42) is the version of the
+*payload*, and moves when anything in the environment moves, including an unrelated flag.
+Reading it as the skill's version fails **silently**: the object verifies, the hash matches,
+and the caller gets content under a meaningless version. Objects carry only `key`, `kind`,
+`version` and `object`, like a flag, so there is no other field to read.
 
-**Skills are identified by `kind == "skill"`; everything else is ignored, not rejected.**
-Object kinds on the SDK-facing channel are open strings, so a skill arrives under the kind its
-producer registered — the bare category name — not under a broader wrapper kind with a
-narrowing field. The `kinds` declaration above means a flag or segment object should no longer
-arrive at all, but the skip stays and stays tested: erroring on an unrecognised kind would
-turn a payload that merely gained a new object kind into a permanent reconnect loop — a
-flag-delivery outage caused by a skills rollout — and an object nobody expected belongs
-outside the skill set rather than in it.
+- `_split_wire_key` is the only place the wire key is read. `_store_object_from_put` and
+  `_tombstone_from_delete` both go through it, and `TestVersionTranslation` asserts both
+  directions.
+- A wire key that will not split cleanly is *held*, not dropped (version-less, or with the
+  offending text as its version), so verification withholds it as `invalid_version` under a
+  key the caller recognises. Only a key with nothing before the delimiter is dropped.
+
+**Skills are identified by `kind == "skill"`; other kinds are ignored, not rejected.** Object
+kinds are open strings, and a skill arrives under the bare kind its producer registered.
+With the `kinds` declaration, flag and segment objects should not arrive at all, but the skip
+stays and stays tested: erroring on an unknown kind would turn a payload that gained a new
+object kind into a permanent reconnect loop — a flag-delivery outage caused by a skills
+rollout.
 
 **Changes commit at `payload-transferred`, not as objects arrive.** A payload version is the
-unit of consistency: a half-applied full transfer would publish a state the server never
-described, and would briefly empty the store — which, with pruning on, is the difference
-between a reconcile and deleting a customer's skill files. An interrupted transfer therefore
-leaves last known good intact, and listeners fire once per commit.
+unit of consistency. A half-applied full transfer would publish a state the server never
+described and briefly empty the store, which with pruning on deletes skill files. An
+interrupted transfer keeps last known good, and listeners fire once per commit.
 
-**The first payload intent is read, and is assumed to be the skill payload.** Delivery
-provides one payload per credential and the protocol requires a client to ignore all but the
-first payload intent, so `payloads[0]` is both what arrives and what the protocol says to
-read. The cost of that assumption is that an `xfer-full` for somebody *else's* payload would
-start an empty pending set, and the next `payload-transferred` would publish it — every skill
-reported revoked, and with pruning on, a customer's files deleted. `_ProtocolReader`
-therefore learns which payload skills arrive on, from the intent's `id` or from the
-`(p:<id>:<version>)` selector, and declines to apply a transfer of any other: once at
-WARNING, counted in `diagnostics.payloads_ignored`, holding last known good. A transfer that
-names no payload is applied, since one-payload delivery is the common case. The residual is
-the first transfer of a connection — before a skill has arrived there is nothing to compare
-against — which is what the separate WARNING on a multi-payload intent is for.
+**The first payload intent is read, and assumed to be the skill payload.** Delivery sends one
+payload per credential and the protocol says to ignore all but the first intent, so
+`payloads[0]` is read. The risk: an `xfer-full` for *another* payload would start an empty
+pending set, and the next `payload-transferred` would publish it — every skill revoked, and
+with pruning on, files deleted.
 
-**A hashless object is held, not dropped.** Verification withholds it with
-`missing_content_hash`; the transport's job is to make that loud (an error per object, a
-summary per wholly-hashless payload, `diagnostics.hashless_objects`) rather than to work
-around it. Dropping it at the transport would report `absent` — indistinguishable from "no
-such skill" — and would let a prune delete the last known-good copy on disk. Never synthesize
-a hash from the delivered content: that certifies the content against itself and verifies
+- `_ProtocolReader` therefore learns the skills payload (from the intent's `id` or the
+  `(p:<id>:<version>)` selector) and declines a transfer of any other: one WARNING, counted
+  in `diagnostics.payloads_ignored`, last known good kept.
+- A transfer that names no payload is applied, since one-payload delivery is the common case.
+- The first transfer on a connection has nothing to compare against; the separate WARNING on
+  a multi-payload intent covers it.
+
+**A hashless object is held, not dropped.** Verification withholds it as
+`missing_content_hash`, and the transport makes that loud: an error per object, a summary
+per wholly-hashless payload, and `diagnostics.hashless_objects`. Dropping it would report
+`absent` — indistinguishable from "no such skill" — and let a prune delete the last
+known-good copy on disk. Never synthesize a hash from the delivered content; that verifies
 nothing.
 
-**There is one network timeout, not two.** `urllib`'s `timeout` is the socket timeout for the
-whole operation, so connect, headers and each read share it, and the module cannot bound the
-connect separately without a custom connection class it should not carry. `read_timeout` is
-therefore the only knob, and its default is per mode (`DEFAULT_POLL_TIMEOUT` for a whole poll
-request, `DEFAULT_STREAM_READ_TIMEOUT` for the gap between reads on a stream). Do not add a
-parameter that the standard library cannot honour; `TestTimeouts` measures the bound against a
-socket that accepts and never answers.
+**There is one network timeout.** `urllib`'s `timeout` covers connect, headers and each read,
+and the standard library cannot bound connect separately. `read_timeout` is the only knob,
+with a per-mode default: `DEFAULT_POLL_TIMEOUT` for a whole poll request,
+`DEFAULT_STREAM_READ_TIMEOUT` for the gap between reads on a stream. Do not add a parameter
+the standard library cannot honour. `TestTimeouts` measures the bound against a socket that
+accepts and never answers.
 
-**`close` interrupts the socket, it does not just set a flag.** The delivery thread spends its
-life blocked in a read that no flag can reach, and closing a response from another thread does
-not unblock CPython's buffered reader. `_interrupt_read` shuts the socket down underneath it.
-Without that, every shutdown of a *healthy* stream blocks for the full join timeout.
+**`close` interrupts the socket, not just a flag.** The delivery thread is blocked in a read
+no flag can reach, and closing the response from another thread does not unblock CPython's
+buffered reader. `_interrupt_read` shuts the socket down; without it, every shutdown of a
+healthy stream waits out the full join timeout.
 
 ### The reported outcome vocabulary, and the `Resolution` mapping
 
 `get_skill` returns `Skill | None`; `get_skill_result` returns a frozen `SkillOutcome`
-(`skill`, `reason`, `detail`) naming *which* outcome happened. Both are
-`resolve_from_store` — one retrieval, one verification, one telemetry pass — and they differ
-only in what they report. `get_skill`'s contract is load-bearing and **frozen**: `None` for
-every failure, never raises for one, documented in its docstring and in the README. Change
-it and every caller that treats `None` as "no skill" breaks silently.
+(`skill`, `reason`, `detail`) naming which outcome happened. Both run `resolve_from_store` —
+one retrieval, one verification, one telemetry pass — and differ only in what they report.
 
-`SkillOutcomeReason` is five tokens, listed alphabetically for the same reason
-`IntegrityReasonCode` is — so the vocabulary reads identically in the Python and TypeScript
-SDKs, where the type name, the accessor name, and the tokens are all deliberately the same.
-Do not rename one on one side.
+- **`get_skill`'s contract is frozen**: `None` for every failure, never raises for one
+  (documented in its docstring and the README). Callers treat `None` as "no skill"; changing
+  it breaks them silently.
+- **`SkillOutcomeReason` is five tokens**, listed alphabetically like `IntegrityReasonCode`.
+  The type name, accessor name and tokens are identical in the Python and TypeScript SDKs;
+  do not rename one side.
 
 Internal `Resolution.reason` maps 1:1 onto it, set explicitly at every construction site:
 
@@ -412,162 +387,142 @@ Internal `Resolution.reason` maps 1:1 onto it, set explicitly at every construct
 | `skill.version != wanted_version` | `wrong_version` | the log record only, `reason_code: version_mismatch` |
 | success | `ok` | none |
 
-The two record-only rows are deliberate and are **not** a silence to "fix": both are decided
-after `verify_raw_skill` has passed, and the usual cause of either is a broken custom store
-adapter rather than tampered content, so the product signal stays out and LaunchDarkly's
-counter does not fill with customers' adapter bugs. Tests pin both directions for each —
-record present, signal absent — because an implementation that also emitted the signal would
-look correct from every other angle. Note the `reason` and the `reason_code` differ in
-spelling for the version row (`wrong_version` vs `version_mismatch`): one names what the
-caller got, the other names which check failed, and keeping one string out of two closed
-vocabularies is what stops a detection rule being ambiguous about which surface it matches.
+**The two record-only rows are intentional; do not "fix" them.** Both are decided after
+`verify_raw_skill` passes, and the usual cause is a broken custom store adapter rather than
+tampered content, so the product signal is left out to keep adapter bugs out of
+LaunchDarkly's counter. Tests pin both directions for each (record present, signal absent).
+The version row's spellings differ on purpose: `wrong_version` names what the caller got,
+`version_mismatch` which check failed, so a detection rule is never ambiguous about which
+surface it matches.
 
-**Adding a seventh internal outcome means choosing which public token it maps to.**
-`Resolution.reason` has no default, so the compiler asks the question; answer it rather than
-defaulting to `absent`, which claims the store does not hold the skill. If the new outcome
-is genuinely neither of the five, the token set grows — on both sides, in the same commit.
+**A new internal outcome must choose its public token.** `Resolution.reason` has no default,
+so the type checker asks; do not answer `absent`, which claims the store lacks the skill. If
+none of the five fits, grow the token set in both SDKs in the same change.
 
-Two things the reason is deliberately *not*:
+The reason is deliberately *not*:
 
-- **Not derived from `Resolution.error`.** That string is prose for a human; recovering a
-  decision a caller fails closed on by matching it is the fragility the typed token exists
-  to remove. `detail` *is* that string, passed straight through — safe to surface (key and
-  failure mode only, never content, never a path), and not for matching on.
-- **Not `Resolution.unavailable`.** The flag answers "may prune run?" and the token answers
-  "what does the caller learn?". They agree by construction — `unavailable` is `True` in
-  exactly the `store_unavailable` case — and both exist because `store_unavailable` must
-  stay distinct from `absent`: only a raising store suppresses pruning, since deleting
-  managed files after a failed lookup turns an outage into data loss.
+- **Derived from `Resolution.error`.** That string is prose for a human. `detail` passes it
+  through: safe to surface (key and failure mode only, never content or a path), but not for
+  matching on.
+- **The same as `Resolution.unavailable`.** That flag answers "may prune run?" and is `True`
+  exactly for `store_unavailable`. It must stay distinct from `absent`: only a raising store
+  suppresses pruning, so an outage does not become data loss.
 
-`get_skill_result` emits nothing of its own. The integrity log record and signal already
-fired inside verification before `resolve_from_store` returned; recording anything here
-would double-count one failure in a SIEM and in the product counter.
-
-There is no `get_skills_result` or `all_skills_result`. The batch accessors keep omitting
-unresolved entries and keep logging the run-level WARN count, and a second accessor per
-batch form would double the surface for a case nobody has asked for.
+`get_skill_result` emits nothing of its own; the integrity record and signal already fired
+during verification, and emitting again would double-count. There is no `get_skills_result`
+or `all_skills_result`: the batch accessors omit unresolved entries and log a run-level WARN
+count.
 
 ### Security posture — do not relax any of this
 
 Store data is **untrusted input**; the transport is not part of the trust boundary.
 
-- **Skill content is an opaque byte buffer.** `Skill.content` is `bytes` — the verified
-  verbatim bytes, exactly what was hashed. The wire object delivers content as a JSON
-  string; the UTF-8 encode happens once, during verification, and from then on the SDK
-  never parses, decodes, or interprets the bytes anywhere: not in the integrity path, not
-  in an accessor, not during materialization. Consumers who want frontmatter parse it
+- **Skill content is an opaque byte buffer.** `Skill.content` is the verified verbatim
+  `bytes` that were hashed. The wire string is UTF-8 encoded once, during verification; after
+  that the SDK never parses, decodes, or interprets it. Consumers parse frontmatter
   themselves.
-- **Integrity is mandatory and doubled, through one implementation.** Every raw object is
-  verified at the accessor boundary (key pattern and length, integer version >= 1, content
-  at most 10 MiB, sha256 lowercase hex over the verbatim bytes against `contentHash`)
-  and the hash is re-verified immediately before a write, both through
-  `skills_core.verified_bytes`, so the integrity signal's property set cannot depend on
-  which layer caught the defect. A `Skill` is only ever constructed from content that
-  passed. Nothing unverified reaches user code.
-- **`contentHash` is required.** An object without one is withheld, not accepted on trust.
-  A payload built before the field is populated therefore yields nothing, which is why a
-  withholding run logs a run-level count at WARN — an empty result would otherwise be
-  indistinguishable from "this project has no skills".
-- **No unencodable string ever reaches an encode.** `json.loads` turns a `\ud800` escape
-  into an unpaired surrogate with no UTF-8 representation; every `.encode("utf-8")` site
-  treats that as a verification failure. Never reach for `errors="surrogatepass"` —
-  fabricating bytes could satisfy the hash comparison.
-- **Attacker-controlled strings are never echoed into telemetry.** `contentHash` and `key`
-  come off the wire, so a store could put the skill body in either; both are shape-checked
-  and redacted before they reach a signal or a log line.
-- **The key is re-validated inside `write_skills`**, regardless of upstream validation — a
-  key becomes a directory name. Rejection happens before any filesystem call.
-- **Never write through a symlink**, in either the skill directory or the target file, on
-  the write path *and* the prune path.
+- **Integrity is mandatory and checked twice, by one implementation.** Every raw object is
+  verified at the accessor boundary (key pattern and length, integer version >= 1, content at
+  most 10 MiB, lowercase-hex sha256 of the verbatim bytes against `contentHash`), and the
+  hash is re-verified just before a write. Both go through `skills_core.verified_bytes`, so
+  the integrity signal is the same whichever layer caught the defect. A `Skill` is only built
+  from content that passed.
+- **`contentHash` is required.** An object without one is withheld. A payload without hashes
+  therefore yields nothing, so a withholding run logs a run-level count at WARN rather than
+  looking like "this project has no skills".
+- **No unencodable string reaches an encode.** `json.loads` turns a `\ud800` escape into an
+  unpaired surrogate; every `.encode("utf-8")` site treats that as a verification failure.
+  Never use `errors="surrogatepass"` — fabricated bytes could satisfy the hash comparison.
+- **Wire strings are never echoed into telemetry.** A store could put the skill body in
+  `contentHash` or `key`, so both are shape-checked and redacted before reaching a signal or
+  a log line.
+- **`write_skills` re-validates the key** before any filesystem call, regardless of upstream
+  validation — a key becomes a directory name.
+- **Never write through a symlink** — skill directory or target file, on both the write and
+  prune paths.
 - **Destructive operations only on manifest-listed paths whose `key` matches.** A file at a
-  managed path with no matching manifest entry is reported as `error` and left alone —
-  *unless its bytes already are the resolved content*, in which case it is adopted (manifest
-  entry recorded, reported `skipped_current`). That single exception is what makes a
-  reconcile killed between the content writes and the final manifest rewrite recoverable
-  instead of permanently wedged, and it cannot be widened: the comparison is over the
-  verbatim bytes against the resolved `contentHash`, a read that fails is a refusal and
-  never an overwrite, and the read is bounded at `len(content) + 1` bytes so a file that
-  merely *begins* with the resolved content is refused too. Do not relax it to a prefix, a
-  length, an mtime, or the manifest's own recorded `sha256` — that field is untrusted and is
-  never a decision input. `skipped_current` is reused deliberately rather than adding an
-  `adopted` action kind; `ReconcileActionKind` is a public closed set.
-- **Temp files are swept, within the same bounds as everything else.** `atomic_write` unlinks
-  its own temp file on any exception, but a `SIGKILL` leaves one behind that no manifest
-  entry records, and a non-empty directory defeats `_prune_one`'s `rmdir` — so one orphan
-  pins a skill directory forever. The sweep is the only place this SDK removes a file the
-  manifest does not list, and it is bounded on every axis: inside `<root>/<key>/` only, for a
-  key that passes `_key_rejection_reason`; only names `safe_fs.is_temp_name` recognizes,
-  anchored at both ends and asked of `safe_fs` rather than re-spelled (a copy would drift
-  from the writer); only regular files, with the type read off the descriptor; listed off
-  the pinned descriptor (`os.listdir(fd)`), so the names come from the directory that was
-  pinned; unlinked through that same descriptor. It never raises and never aborts a run.
-- **A corrupt manifest fails closed**: unreadable, unparseable, not an object, malformed
+  managed path with no matching manifest entry is reported `error` and left alone — unless its
+  bytes already are the resolved content, in which case it is adopted (entry recorded,
+  reported `skipped_current`). That lets a reconcile killed before its final manifest rewrite
+  recover instead of wedging. Do not widen the exception:
+  - Compare the verbatim bytes against the resolved `contentHash` — never a prefix, a length,
+    an mtime, or the manifest's own `sha256`, which is untrusted and never a decision input.
+  - A read that fails is a refusal, never an overwrite.
+  - The read is bounded at `len(content) + 1` bytes, so a file that merely *begins* with the
+    resolved content is refused.
+
+  `skipped_current` is reused rather than adding an `adopted` kind because
+  `ReconcileActionKind` is a public closed set.
+- **Temp files are swept, within tight bounds.** `atomic_write` removes its temp file on any
+  exception, but a `SIGKILL` can leave one behind, and one orphan makes `_prune_one`'s
+  `rmdir` fail forever. The sweep is the only place the SDK removes a file the manifest does
+  not list, and it is bounded on every axis:
+  - only inside `<root>/<key>/`, for a key that passes `_key_rejection_reason`;
+  - only names `safe_fs.is_temp_name` recognizes (ask `safe_fs`; a copied pattern would
+    drift from the writer);
+  - only regular files, typed off the descriptor;
+  - listed with `os.listdir(fd)` and unlinked through that same pinned descriptor.
+
+  It never raises and never aborts a run.
+- **A corrupt manifest fails closed.** Unreadable, unparseable, not an object, malformed
   `entries`, larger than `_MAX_MANIFEST_BYTES`, or a `manifestVersion` outside
-  `1 <= v <= MANIFEST_VERSION` means no overwrites and no prunes, brand-new paths may still
-  be written, an `error` action names the manifest, and the manifest file itself is not
-  rewritten. The version is bounded on *both* sides: 1 is the first version ever written, so
-  0 or a negative is not a manifest this SDK produced, and accepting one would act
-  destructively on it and then silently rewrite it as version 1. The size bound exists
-  because the manifest is the one file here whose length no caller can predict, it lives in
-  a directory the SDK does not own exclusively, and a reconcile must not be the thing that
-  exhausts the process — every read in `skills_fs` is bounded, and `_read_regular_file`
-  takes a required `max_bytes` so a new call site cannot opt out by omission.
-- **An incomplete retrieval suppresses pruning.** Otherwise a transport outage would read
-  as "everything was revoked" and delete the customer's managed files.
-- **Writes are atomic**: temp file created exclusively in the target's *own* directory,
-  mode `0644` set explicitly (never inherited from the umask, never executable), write,
-  fsync, `os.replace`, fsync the directory. `os.replace` is the single rename call site
-  and must not be swapped for `os.rename`.
-- **Every operation under the root goes through a pinned descriptor, not a path — the
-  reads that decide an action included.** See "Descriptor-pinned filesystem access" below.
-  Re-resolving `<root>/<key>` from its path at write or unlink time reopens a swap window
-  that the checks above cannot cover; re-resolving it for the existence probe, the compare
-  read or the orphan listing lets a swap choose the *branch* instead — most seriously, a
-  prune whose probe is answered "absent" from a swapped directory skips its unlink, drops
-  the manifest entry, and reports `removed` while the revoked skill stays on disk.
-- **Every numeric option is guarded non-finite, never `< 0` or `<= 0`.** `write_skills`'s
-  `timeout`, `watch_skills`'s `debounce`, and `FDv2SkillStore`'s `poll_interval` and
-  `read_timeout` are one rule stated four times, and `< 0` is exactly the shape both
-  non-finite values slip through: `nan` and `inf` each compare false against zero, pass,
-  and then mean opposite things downstream — an unbounded deadline versus an
-  already-expired one, a coalescing window of zero versus one that never closes, a poll
-  loop that spins versus one that stops after a single request while still reporting
-  healthy. Narrowing any one of these back to a sign check is breaking the other three.
+  `1 <= v <= MANIFEST_VERSION` means: no overwrites, no prunes, brand-new paths may still be
+  written, an `error` action names the manifest, and the manifest itself is not rewritten.
+  - The version is bounded on both sides: this SDK never wrote a version below 1.
+  - The size bound exists because the manifest's length is unpredictable and it lives in a
+    directory the SDK does not own exclusively. Every read in `skills_fs` is bounded;
+    `_read_regular_file` requires `max_bytes` so a new call site cannot skip it.
+- **An incomplete retrieval suppresses pruning**, so a transport outage is not read as
+  "everything was revoked".
+- **Writes are atomic**: temp file created exclusively in the target's *own* directory, mode
+  `0644` set explicitly (never from the umask, never executable), write, fsync,
+  `os.replace`, fsync the directory. `os.replace` is the single rename call site; do not swap
+  in `os.rename`.
+- **Every operation under the root goes through a pinned descriptor, not a path — including
+  the reads that decide an action.** See "Descriptor-pinned filesystem access" below.
+  Re-resolving `<root>/<key>` by path reopens a swap window. For the decision reads, a swap
+  chooses the *branch*: a prune whose existence probe is answered "absent" by a swapped
+  directory skips its unlink, drops the manifest entry, and reports `removed` while the
+  revoked skill stays on disk.
+- **Every numeric option rejects non-finite values, not just negative ones.**
+  `write_skills`'s `timeout`, `watch_skills`'s `debounce`, and `FDv2SkillStore`'s
+  `poll_interval` and `read_timeout` share one rule. `nan` and `inf` both pass a `< 0` check
+  and then mean opposite things downstream: an unbounded vs. an already-expired deadline, a
+  zero vs. a never-closing coalescing window, a poll loop that spins vs. one that stops while
+  still reporting healthy. Do not narrow any of them back to a sign check.
 - **A key valid to the data model may still be unrepresentable on disk.** The model allows
-  256 characters; `NAME_MAX` is 255 bytes. Windows additionally reserves 22 MS-DOS device
-  names, none of which can be a directory name there: `con`, `prn`, `aux`, `nul`,
-  `com1`–`com9`, `lpt1`–`lpt9` (`com0` and `lpt0` are *not* reserved; do not add them).
-  `write_skills` rejects both before any filesystem call, and every per-skill filesystem
-  failure is caught at the loop so it becomes an `error` action — aborting the loop would
-  skip the manifest rewrite and orphan files already written in that run.
+  256 characters; `NAME_MAX` is 255 bytes. Windows also reserves 22 device names: `con`,
+  `prn`, `aux`, `nul`, `com1`–`com9`, `lpt1`–`lpt9` (`com0` and `lpt0` are *not* reserved;
+  do not add them). `write_skills` rejects both before any filesystem call. Every per-skill
+  filesystem failure is caught in the loop and becomes an `error` action; aborting would skip
+  the manifest rewrite and orphan files already written that run.
 - **Those two bounds live in `_key_rejection_reason`, not in the key grammar, and must not
-  move.** `is_valid_skill_key` / `skill_key_rejection_reason` keep admitting an over-long or
-  reserved key on purpose. `parse_ai_config` fails closed on a bad `skills` entry, so a
-  grammar-level rejection would invalidate the *entire* AI Config — model, provider,
-  instructions, tools — for a Linux customer over a Windows-only constraint; and it would
-  silently shrink `skill_refs`, which is what authorizes a prune, converting "this skill
-  fails to write on Windows" into "this skill gets deleted on Linux". `_key_rejection_reason`
-  is shared by the write and prune paths, so one edit covers both destructive paths.
-  The reserved-name check is unconditional rather than `os.name == "nt"`-gated: a root
-  written from a Linux container is routinely read from a Windows host, and neither
-  repository has a Windows CI runner (every matrix job is `ubuntu-latest`), so a gated branch
-  would be untestable — the exact condition that produced the gap. No suffix stripping and no
-  case folding are needed, because the grammar admits no `.` and no `$` (so `con.txt` and
-  `CONIN$` are unreachable) and is lowercase-only. The residual the SDK cannot check is total
-  path length: the 255-byte bound is per *component*, and the root belongs to the customer,
-  so `MAX_PATH` overflow is a README note rather than a check.
+  move.** `is_valid_skill_key` / `skill_key_rejection_reason` deliberately admit an over-long
+  or reserved key, because:
+  - `parse_ai_config` fails closed on a bad `skills` entry, so a grammar rejection would
+    invalidate the *entire* AI Config for a Linux customer over a Windows-only constraint;
+  - it would also shrink `skill_refs`, which authorizes a prune, turning "fails to write on
+    Windows" into "deleted on Linux".
+
+  `_key_rejection_reason` is shared by the write and prune paths. The reserved-name check is
+  not gated on `os.name == "nt"`: a root written from a Linux container is routinely read
+  from Windows, and with no Windows CI runner a gated branch would be untested. No suffix
+  stripping or case folding is needed, since the grammar is lowercase-only and admits no `.`
+  or `$` (so `con.txt` and `CONIN$` are unreachable). Total path length is not checked: the
+  255-byte bound is per component and the root is the customer's, so `MAX_PATH` overflow is a
+  README note.
 - **A key is untrusted input everywhere it appears.** `skill_key_rejection_reason` is the
-  single canonical explanation, so the config parser and the reference projection reject a
-  key for the same stated reason — and so does every layer added later. A silently
-  shortened projection is not acceptable: every dropped entry is logged.
+  single canonical explanation, so the config parser, the reference projection, and any later
+  layer reject a key for the same stated reason. A projection never shrinks silently: every
+  dropped entry is logged.
 
 ### Telemetry seam
 
-Skills telemetry goes through a private emitter with one method,
-`record(signal, properties)`, whose default implementation is a **no-op** — nothing leaves
-the process in this release. `client.track()` is deliberately *not* used: it needs an LD
-context, spends the customer's event volume, lands in their data export, and is silenced by
-offline mode. No LD context is involved anywhere in this feature.
+Skills telemetry goes through a private emitter with one method, `record(signal,
+properties)`, whose default is a **no-op** — nothing leaves the process in this release. Do
+not use `client.track()`: it needs an LD context, spends the customer's event volume, lands
+in their data export, and is silenced by offline mode. No LD context is involved anywhere in
+this feature.
 
 Exactly three signals exist, and the list is an **allowlist, not a floor**:
 
@@ -580,48 +535,45 @@ Exactly three signals exist, and the list is an **allowlist, not a floor**:
 ### The integrity-failure log record
 
 The signal above is product telemetry; the **log record** beside it is the customer-owned
-detection path, and the more load-bearing of the two. It is the only integrity surface that
-works when telemetry is off, and the only one that exists at all in an instance with no
-telemetry destination, so it is a documented contract in the README rather than a debugging
-aid. `record_integrity_failure` writes both, and is the only place either is constructed.
+detection path, and the more important of the two. It is the only integrity surface when
+telemetry is off, so it is a documented README contract, not a debugging aid.
+`record_integrity_failure` writes both and is the only place either is constructed.
 
-One ERROR record per withheld skill, message text = `INTEGRITY_FAILURE_EVENT` + a space +
-`json.dumps(record, sort_keys=True, separators=(",", ":"))`, plus the same mapping under
-`extra={"ld_skills": record}`. Fields: `event`, `action` (always `withheld`), `skill_key`,
-`version?`, `expected_hash?`, `observed_hash?`, `reason_code`, `reason`, `language`, plus
-the two record-only fields the boundary codes carry — `served_key?` on a `key_mismatch` and
-`served_version?` on a `version_mismatch`, never both on one record. Both are store-controlled
-and both are shape-checked before they are written (`<invalid-key>`, `<invalid-version>`), even
-though verification has already accepted them on the only path that reaches either: that is a
-property of the call order, not of the recorders, and the guards are what keep a reordering
-from publishing a body. The `served_version` guard doubles as what keeps the field an integer,
-which the byte-comparable JSON needs.
+One ERROR record per withheld skill. The message text is `INTEGRITY_FAILURE_EVENT` + a space
++ `json.dumps(record, sort_keys=True, separators=(",", ":"))`, and the same mapping is
+attached as `extra={"ld_skills": record}`.
 
-Each of those choices is load-bearing; do not undo one as a simplification.
+- Fields: `event`, `action` (always `withheld`), `skill_key`, `version?`, `expected_hash?`,
+  `observed_hash?`, `reason_code`, `reason`, `language`.
+- Plus one record-only field on the boundary codes: `served_key?` on a `key_mismatch`, or
+  `served_version?` on a `version_mismatch`, never both.
+- Both served fields are store-controlled and shape-checked before writing (`<invalid-key>`,
+  `<invalid-version>`), even though verification has already accepted them. The guards keep
+  a future reordering from publishing a body, and keep `served_version` an integer for the
+  byte-comparable JSON.
+
+Do not undo any of these as a simplification:
 
 - **The event name is in the message text**, not only in `extra`. Severity cannot
-  discriminate — `resolve_from_store` and `list_raw_objects` in the same module also log
-  ERROR for a raising store — and the stdlib's default formatter drops `extra` entirely, so
-  an `extra`-only record is invisible under a plain `logging.basicConfig()`.
-- **`ld.skills.integrity_failure` is documented for customers to match on**, which makes it
-  a compatibility surface. It must never be renamed.
-- **`sort_keys=True` is not cosmetic.** The other language implementations build the object
-  in alphabetical key order, so sorting makes the serialized line byte-identical across
-  SDKs for the same input, modulo `language`.
+  discriminate (`resolve_from_store` and `list_raw_objects` also log ERROR for a raising
+  store), and the stdlib's default formatter drops `extra`, so an `extra`-only record is
+  invisible under a plain `logging.basicConfig()`.
+- **`ld.skills.integrity_failure` is documented for customers to match on.** Never rename it.
+- **`sort_keys=True` makes the line byte-identical across SDKs** (modulo `language`), since
+  the other implementations build the object in alphabetical key order.
 - **Optional fields are omitted, never nulled**, so a SIEM field-existence check means
   something.
 - **The record spreads the signal's properties** rather than rebuilding them, so the two
-  cannot drift on the fields they share — in particular on which are redacted. Anything
-  added later that comes off the wire needs the same shape-check-then-redact treatment.
-- **`reason_code` is in the record only.** The signal's property set is the allowlist above
-  and does not grow; the local record is where the detection vocabulary lives.
+  cannot drift, especially on redaction. Any new wire-sourced field needs the same
+  shape-check-then-redact treatment.
+- **`reason_code` is in the record only.** The signal's property set is the allowlist above.
 
 `reason_code` is a **closed vocabulary of exactly ten tokens** — `IntegrityReasonCode`, a
-`Literal`, so a typo at a call site is a type error — and the same ten in every language
-implementation. It is a finer vocabulary than `SkillOutcomeReason`, which stays five tokens;
-widening one does not widen the other. Eight are one per `record_integrity_failure` call
-site; the other two come from `record_key_mismatch` and `record_version_mismatch` at the
-retrieval boundary and are the ones that fire the log record **without** the product signal:
+`Literal`, so a typo at a call site is a type error — identical in every SDK. It is finer
+than `SkillOutcomeReason` (five tokens); widening one does not widen the other. Eight map to
+`record_integrity_failure` call sites; the other two come from `record_key_mismatch` and
+`record_version_mismatch` at the retrieval boundary and write the log record **without** the
+product signal:
 
 | `reason_code` | Call site |
 |---|---|
@@ -636,196 +588,151 @@ retrieval boundary and are the ones that fire the log record **without** the pro
 | `key_mismatch` | `resolve_from_store` — the served object's own `key` is not the key requested. **Log record only, no signal**, and carries a `served_key` field no other record has |
 | `version_mismatch` | `resolve_from_store` — the served object's `version` is not the pinned version requested. **Log record only, no signal**, and carries a `served_version` field no other record has, beside a `version` that means the version *requested* |
 
-Neither boundary code can join `REASON_CODE_CASES`: that table is driven uniformly through
-`all_skills`, and both codes are decided at the retrieval boundary after `verify_raw_skill`
-has passed, so a listing cannot reach either. A listing has no requested key and no
-requested version to compare against at all, which is why the asymmetry is correct rather
-than a gap. They are unioned into the exhaustiveness assertion instead, and covered by
+**Testing the boundary codes.** Neither can join `REASON_CODE_CASES`, which drives every case
+through `all_skills`: a listing has no requested key or version to mismatch. They are added
+to the exhaustiveness assertion instead and covered by
 `test_key_mismatch_records_the_log_but_not_the_signal` and
-`test_version_mismatch_records_the_log_but_not_the_signal`. The record-without-signal split
-is deliberate — either mismatch is usually a broken store adapter rather than an attacker,
-and LaunchDarkly's counter must not fill with customers' adapter bugs — and tests pin both
-directions for both codes. Do not "fix" it by emitting the signal.
+`test_version_mismatch_records_the_log_but_not_the_signal`. Do not "fix" the missing signal
+(see the outcome table above).
 
-Both codes are reachable from all four callers of `resolve_from_store` — `get_skill`,
-`get_skills`, `get_skill_result`, and `write_skills`, which resolves each pinned reference
-through the same function. A suite written to the accessors alone leaves the write path
-uncovered. On that path a `wrong_version` is per-skill and not `unavailable`, so it takes
-the narrow protection: the key stays in the requested set carrying an `error` action, the
-copy already on disk is not pruned, and the run is **not** marked incomplete, so a
+**Both codes reach all four callers of `resolve_from_store`** — `get_skill`, `get_skills`,
+`get_skill_result`, and `write_skills` — so cover the write path too. There, `wrong_version`
+is per-skill and not `unavailable`: the key stays in the requested set with an `error`
+action, its on-disk copy is not pruned, and the run is **not** marked incomplete, so a
 genuinely revoked skill in the same run is still removed.
 
-Adding an eleventh failure mode means widening `IntegrityReasonCode`, adding a case to
-`REASON_CODE_CASES` in `test_skills.py` (whose exhaustiveness assertion fails otherwise),
-documenting it in the README table, **and** doing the same in the other language SDKs. A
-token added on one side only is a drift bug: a customer's detection rule stops matching
-where they cannot see it.
+**An eleventh failure mode** means widening `IntegrityReasonCode`, adding a case to
+`REASON_CODE_CASES` in `test_skills.py` (its exhaustiveness assertion fails otherwise),
+documenting it in the README table, **and** doing the same in the other SDKs. A token added
+on one side only silently breaks a customer's detection rule.
 
-`AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved`
-were considered and **deliberately excluded from SDK emission** — both are observable
-server-side. Do not add them. The skill body never appears in a signal, a log line, or
-an error message, and no signal carries a filesystem path (paths belong in the returned
-`ReconcileReport`, which is user-facing API). An emitter that raises is caught and logged;
-it never fails the operation.
+**Excluded signals.** `AgentControl Skill SDK Reference Returned` and `AgentControl Skill
+Content Retrieved` are **deliberately not emitted** — both are observable server-side. Do
+not add them. The skill body never appears in a signal, log line, or error message, and no
+signal carries a filesystem path (paths belong in the user-facing `ReconcileReport`). An
+emitter that raises is caught and logged; it never fails the operation.
 
-Module state lives in `skills_core.py`, the module `skills.py` and `skills_fs.py` share,
-so there is exactly one store and one emitter however the feature is entered. All three signals are emitted from the `record_*` functions
-next to the seam there — nothing outside that module calls `emit`, so the allowlist is
-enforced in one place.
+**Where state lives.** Module state is in `skills_core.py`, shared by `skills.py` and
+`skills_fs.py`, so there is one store and one emitter however the feature is entered. All
+three signals are emitted by the `record_*` functions there; nothing else calls `emit`, so
+the allowlist is enforced in one place.
 
-The injection path is deliberately narrower than the state's location: `skills.py` owns
-`_set_store`, `_set_emitter_for_testing` and `_clear_state`, which delegate to
-`skills_core`. `init_client` and `shutdown` use those, tests inject through those
-(`skills._set_store(store)` is the same setter `init_client` uses), and neither should
-reach into `skills_core` directly.
+**Injection goes through `skills.py`.** `_set_store`, `_set_emitter_for_testing` and
+`_clear_state` delegate to `skills_core`. `init_client`, `shutdown` and tests use those
+(`skills._set_store(store)` is the setter `init_client` uses); none should reach into
+`skills_core` directly.
 
 ### Descriptor-pinned filesystem access
 
-A path check is only as good as the last path resolution after it. Every `lstat`, `realpath`
-and containment check validates an *inode*, but a following
-`os.replace(tmp, root / key / "SKILL.md")` re-resolves `<root>/<key>` from its *name* — so
-anything holding write permission on a managed directory can move the validated directory
-aside, leave a symlink in its place, and redirect the write (or an unlink) somewhere else.
-Narrowing that window is not a fix; the race is winnable at any width.
+A path check is only as good as the last path resolution after it. `lstat`, `realpath` and
+containment checks validate an *inode*, but a following
+`os.replace(tmp, root / key / "SKILL.md")` re-resolves `<root>/<key>` by *name*. Anyone with
+write permission on a managed directory can move it aside, leave a symlink in its place, and
+redirect the write or an unlink. Narrowing the window is not a fix; the race is winnable at
+any width.
 
-So the checks hand off to a descriptor and nothing re-resolves a path afterwards. The
+So the checks hand off to a descriptor, and no path is re-resolved afterwards. The
 primitives live in `safe_fs.py`, which knows nothing about skills:
 
-- `open_directory_nofollow` opens the directory with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`
-  and confirms `S_ISDIR` on the `fstat` (the explicit check is what covers platforms with no
-  `O_DIRECTORY`). `open_or_create_directory` wraps it with `os.mkdir` plus an `lstat` on the
-  `FileExistsError` path — `Path.mkdir(exist_ok=True)` accepts a symlink-to-directory as
-  "already there", which would reopen the hole the caller's check just closed.
-  `pinned_directory` holds either for the duration of a block, so a caller states the
-  platform split once as `if dir_fd is not None` and cannot forget the `os.close`.
-- `atomic_write` creates the temp file with `O_CREAT | O_EXCL | O_NOFOLLOW` **at** that
-  descriptor (`_mkstemp_at`, since `tempfile` has no `dir_fd` form), `fchmod`s the
-  descriptor rather than `chmod`ing a path — probed, because Windows has no `os.fchmod`
-  before 3.13 and 3.12 is supported — writes, fsyncs, and renames with
-  `os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)`, then fsyncs the directory so the
-  rename survives a crash. `atomic_write_in` is the same against a directory the caller does
-  not already hold open. `os.replace` is the single rename call site, reached by attribute
-  lookup so tests can intercept it, and `os.rename` must not be substituted for it — it is
-  also the only one with defined overwrite semantics on Windows.
-- `unlink_file` probes and unlinks descriptor-relative too. `unlink` never follows a
-  *trailing* symlink, but it does resolve the directory above it, so the same swap turns a
-  removal into a delete of an attacker-chosen file. A symlink found where this SDK expects
-  its own file raises `SymlinkRefused` rather than being tidied away: the state on disk is
-  not what the caller believes, and that is the caller's to report. `_prune_one` goes
-  through it; `rmdir` is issued relative to the root descriptor, and is safe at the key
-  since it fails `ENOTDIR` on a symlink and only ever succeeds on an empty directory.
-- `open_directory_nofollow` raises `DirectoryMissing` — a `ValueError` subclass — when
-  nothing at the path is a directory (`ENOENT`, `ENOTDIR`). That is how the skills side
-  learns a skill directory is absent *from the pin itself*, rather than from a separate
-  `exists()` on the path that a swap could answer differently: a prune of a file that is
-  already gone and a sweep of a directory never created both take that branch.
+- **`open_directory_nofollow`** opens with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` and
+  confirms `S_ISDIR` on the `fstat` (covering platforms with no `O_DIRECTORY`). It raises
+  `DirectoryMissing`, a `ValueError` subclass, when nothing at the path is a directory
+  (`ENOENT`, `ENOTDIR`). Callers learn a skill directory is absent from the pin itself, not
+  from a separate `exists()` a swap could answer differently; a prune of an already-gone file
+  and a sweep of a never-created directory both take that branch.
+- **`open_or_create_directory`** adds `os.mkdir` plus an `lstat` on `FileExistsError`.
+  `Path.mkdir(exist_ok=True)` would accept a symlink-to-directory as "already there".
+- **`pinned_directory`** holds either for a block, so a caller branches once on
+  `if dir_fd is not None` and cannot forget the `os.close`.
+- **`atomic_write`** creates the temp file with `O_CREAT | O_EXCL | O_NOFOLLOW` at the
+  descriptor (`_mkstemp_at`, since `tempfile` has no `dir_fd` form), `fchmod`s the descriptor
+  (probed: Windows has no `os.fchmod` before 3.13, and 3.12 is supported), writes, fsyncs,
+  renames with `os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)`, then fsyncs the
+  directory. `atomic_write_in` does the same for a directory the caller has not opened.
+  `os.replace` is the single rename call site, looked up by attribute so tests can intercept
+  it. Do not substitute `os.rename`; it also lacks defined overwrite semantics on Windows.
+- **`unlink_file`** probes and unlinks descriptor-relative too: `unlink` never follows a
+  *trailing* symlink but does resolve the directory above it. A symlink where the SDK expects
+  its own file raises `SymlinkRefused` for the caller to report, rather than being tidied
+  away. `_prune_one` uses it; its `rmdir` is relative to the root descriptor, which is safe
+  because `rmdir` fails `ENOTDIR` on a symlink and only removes an empty directory.
 
-The reads that decide an action are pinned the same way, in `skills_fs`. Each of `_write_one`
-and `_prune_one` pins `<root>/<key>` relative to the root descriptor *before* it decides
-anything and holds the pin through the action: the existence probe is
-`os.stat(SKILL_FILENAME, dir_fd=skill_fd, follow_symlinks=False)`, the compare read is
-`_read_regular_file(SKILL_FILENAME, dir_fd=skill_fd)`, and the orphan sweep lists
-`os.listdir(skill_fd)`. So a swap after the pin cannot choose the branch — it cannot have
-a prune skip its unlink and still report `removed`, cannot have a compare read adopt or
-refuse over a file outside the root, and cannot feed the sweep names from elsewhere. Where
-`dir_fd` is `None` (the `lstat` floor) each of these stays path-based, which is the
-documented Windows bound. The manifest read was already pinned; nothing under the root is
-read by path any more.
+**`skills_fs` pins the reads that decide an action.** `_write_one` and `_prune_one` pin
+`<root>/<key>` relative to the root descriptor *before* deciding anything and hold it through
+the action:
 
-Every `lstat`, `realpath` and containment check on the skills side lives in one shared
-`_unsafe_path_reason`, so the write and prune paths cannot drift apart on what counts as
-unsafe. Those checks stay, ahead of the pin, as defense in depth — they are not the boundary
-and must not be removed. Symlink probes on the descriptor side are spelled
-`os.stat(..., follow_symlinks=False)` rather than `os.lstat`, matching the name the
-capability probe advertises.
+- existence probe: `os.stat(SKILL_FILENAME, dir_fd=skill_fd, follow_symlinks=False)`;
+- compare read: `_read_regular_file(SKILL_FILENAME, dir_fd=skill_fd)`;
+- orphan sweep: `os.listdir(skill_fd)`.
 
-`safe_fs.SUPPORTS_DIR_FD` gates all of it, and the probe is not the obvious one.
-`os.supports_dir_fd` is populated per underlying syscall, and CPython registers `renameat`
-under `os.rename` only and `fstatat` under `os.stat` only — even though `os.replace` is the
-same `renameat`-backed function and `os.lstat` is `fstatat` with `AT_SYMLINK_NOFOLLOW`.
-Probing the names this module actually calls reports "unsupported" on every POSIX platform
-and silently turns the defense off, so the probe names the advertised twins
-(`{os.rename, os.open, os.unlink, os.stat}`) and a caller's symlink check is spelled
-`os.stat(..., follow_symlinks=False)` rather than `os.lstat`. Where the family is absent
-(Windows) `open_directory_nofollow` returns `None` after an `lstat` check instead of
-attempting the descriptor open — `os.open` cannot open a directory there — and every caller
-falls back to the identical full-path sequence, the per-component `lstat` floor. The
-residual window on those platforms is documented rather than closed; the TOCTOU tests skip
-off this same flag, deliberately, so a probe that wrongly reports "unsupported" cannot also
-silently skip the tests that would have caught it.
+A later swap cannot make a prune skip its unlink and still report `removed`, make a compare
+read adopt or refuse over a file outside the root, or feed the sweep names from elsewhere.
+Where `dir_fd` is `None` (the `lstat` floor) these stay path-based — the documented Windows
+bound. Nothing else under the root is read by path.
 
-Both call shapes are admitted by the test seam. `os.replace` remains the single
-interceptable rename call site; under the descriptor-relative shape `dst` is the bare string
-`"SKILL.md"`, so an `endswith("SKILL.md")` spy filter still matches, and the
-same-directory requirement is proved by descriptor identity (`src_dir_fd == dst_dir_fd`,
-resolving to the skill directory's `(st_dev, st_ino)`) instead of by comparing path strings.
-A spy must `fstat` the descriptor **inside** the intercepted call — the implementation closes
-it as soon as the write returns.
+**Path checks stay as defense in depth.** Every `lstat`, `realpath` and containment check
+lives in one shared `_unsafe_path_reason`, so the write and prune paths agree on what is
+unsafe. They run before the pin; they are not the boundary, but do not remove them.
 
-**The platform bound is POSIX-only, and that is a decision — do not quietly "fix" it.**
-Windows reparse-point checks (`GetFileAttributesW`, `FILE_FLAG_OPEN_REPARSE_POINT`) are not
-implemented because Windows is not a supported or tested platform for this release: there is
-no Windows CI runner in either repository, so the checks would ship unverified, and there is
-no second implementation to check them against — the TypeScript SDK has no Windows story
-either. Implementing them in Python alone would trade a documented bound for an unverified
-one.
+**`safe_fs.SUPPORTS_DIR_FD` gates all of it, and probes the advertised twins.**
+`os.supports_dir_fd` is populated per syscall, and CPython registers `renameat` under
+`os.rename` only and `fstatat` under `os.stat` only, even though `os.replace` and `os.lstat`
+use the same syscalls. Probing the names actually called would report "unsupported" on every
+POSIX platform and silently disable the defense. So:
 
-The parity argument used to be stronger than that, and the correction matters because the
-old wording is now wrong. It read: Node exposes no `*at()` family on *any* platform, so its
-racy floor is universal rather than Windows-only. The first half is still true and the
-second is not. `*at()` is not the only way to address a child relative to a pinned inode:
-TypeScript commit `0a15b10` added a `SUPPORTS_PROC_FD` probe and `/proc/self/fd/<fd>/<name>`
-addressing, which the Linux kernel resolves from the inode the descriptor holds rather than
-from the name it was opened under. That **closes** the swap window on Linux exactly as
-`*at()` does here, so TypeScript's `lstat` floor now applies on macOS and Windows only —
-the same shape as this side's, not a universal one.
+- the probe names `{os.rename, os.open, os.unlink, os.stat}`;
+- symlink checks are spelled `os.stat(..., follow_symlinks=False)`, not `os.lstat`;
+- where the family is absent (Windows), `open_directory_nofollow` returns `None` after an
+  `lstat` check (`os.open` cannot open a directory there), and every caller falls back to the
+  per-component `lstat` floor. The residual window there is documented, not closed;
+- the TOCTOU tests skip off this same flag, so a probe that wrongly reports "unsupported"
+  cannot also silently skip the tests that would catch it.
 
-None of which reopens the decision above. It never rested on TypeScript being equally
-exposed; it rests on there being no Windows CI runner to verify the checks against, which is
-still the case in both repositories. Two follow-on facts: on Windows write permission on the
-managed root is the only
-boundary, which is why the privilege-separated deployment is documented as the mitigation
-rather than as advice; and this bound retroactively lowers the priority of the reserved-device-name
-work above — keep that code, but do not read it as evidence that Windows is hardened. If
-Windows becomes a supported platform, revisit both together, and add the CI runner first.
+**Test seam.** `os.replace` stays the single interceptable rename. In the descriptor-relative
+form `dst` is the bare `"SKILL.md"`, so an `endswith("SKILL.md")` spy filter still matches,
+and same-directory is proved by descriptor identity (`src_dir_fd == dst_dir_fd`, resolving to
+the skill directory's `(st_dev, st_ino)`) rather than path strings. A spy must `fstat` the
+descriptor **inside** the intercepted call; it is closed as soon as the write returns.
 
-**Privilege separation is the deployment-side half of this, and `ReconcileReport` must not
-grow a writability field.** The recommended deployment runs the reconcile as a different
-identity than the agent, so the `0644`/`0755` modes above actually deny something: the agent
-reads its instructions and cannot rewrite them or the manifest. That is the mitigation for a
-prompt-injected agent editing its own skills. The security review asked for the report to
-surface whether the managed root is writable; we declined, and the reasoning is load-bearing
-rather than a preference. The SDK knows only its *own* identity, which trivially has write
-access — it just wrote there — and cannot know which identity will later run the agent. Any
-check it could perform would answer a different question than the one asked and would create
-false confidence exactly where caution is wanted. The operator's verification steps live in
-the README instead. Do not add the field.
+**The platform bound is POSIX-only by decision — do not quietly "fix" it.** Windows
+reparse-point checks (`GetFileAttributesW`, `FILE_FLAG_OPEN_REPARSE_POINT`) are not
+implemented: Windows is not a supported or tested platform for this release, there is no
+Windows CI runner to verify them, and the TypeScript SDK has none to compare against.
+
+- The TypeScript SDK closes the swap window on Linux by addressing children as
+  `/proc/self/fd/<fd>/<name>` (behind `SUPPORTS_PROC_FD`), so its `lstat` floor applies on
+  macOS and Windows only — the same shape as here. The decision rests on the missing CI
+  runner, not on parity.
+- On Windows, write permission on the managed root is the only boundary, which is why
+  privilege separation is documented as the mitigation.
+- Keep the reserved-device-name check, but do not read it as Windows hardening. If Windows
+  becomes supported, add the CI runner first, then revisit both together.
+
+**Privilege separation is the deployment-side half, and `ReconcileReport` must not grow a
+writability field.** Run the reconcile as a different identity than the agent, so the
+`0644`/`0755` modes actually deny something: a prompt-injected agent can read its skills but
+cannot rewrite them or the manifest. The SDK cannot report whether the root is writable *by
+the agent* — it knows only its own identity, which just wrote there — so any such field would
+create false confidence. The operator's verification steps are in the README.
 
 ### Deferred: bounded retries
 
-`timeout` is implemented — a monotonic deadline, checked before each retrieval, before
-each write, and before each prune; only the final manifest rewrite runs past it, so files
-already written are never orphaned. Bounded retries inside that deadline are **not**
-implemented, and belong to the delivery transport, not to this layer. Three structural
-reasons, all of which the transport changes:
+`timeout` is a monotonic deadline, checked before each retrieval, each write, and each prune;
+only the final manifest rewrite runs past it, so files already written are never orphaned.
+Bounded retries are **not** implemented at this layer; retry policy belongs to the delivery
+transport (`FDv2SkillStore`'s backoff and retry budget). Why:
 
 1. **There is nothing transient to retry.** `SkillStore.get_object` is a synchronous
-   in-process read against already-delivered data, modelled on the LaunchDarkly
-   data-store API. `InMemorySkillStore` reads a dict. A retry re-invokes customer code and
-   returns the same answer.
-2. **The seam cannot classify a failure.** All it surfaces is "this raised". Retrying a
-   `PermissionError` or a malformed payload spends the caller's `timeout` on a certainty.
-   The transient/permanent taxonomy a retry policy needs is the transport's to define.
+   in-process read of already-delivered data, modelled on the LaunchDarkly data-store API. A
+   retry re-invokes customer code and gets the same answer.
+2. **The seam cannot classify a failure** — it only sees "this raised". Retrying a
+   `PermissionError` or a malformed payload just spends the caller's `timeout`.
 3. **Backoff has nowhere to sleep.** The retrieval path (`_resolve_requests`,
-   `_resolve_reference`, `_resolve_all`) is synchronous, called from an async
-   `write_skills`. Backoff would mean either `time.sleep` — blocking the event loop of every
-   caller — or async-ifying the whole path for a store that cannot benefit.
+   `_resolve_reference`, `_resolve_all`) is synchronous inside an async `write_skills`;
+   `time.sleep` would block the caller's event loop.
 
-Picking a bound and a backoff now would fix numbers in a cross-language contract with no
-transport to calibrate them against, so there is **no** retry test and no assumable attempt
-count. When the transport lands it owns the policy; keep both languages retry-free until
-then, since the number of times a throwing store is invoked is observable and the two would
-otherwise diverge.
+There is no retry test and no assumable attempt count here. Keep both SDKs retry-free at
+this layer, since how often a throwing store is called is observable.
 
 ---
 
@@ -929,7 +836,7 @@ Install with `pip install "launchdarkly-ai-server[otel]"`; see [OTel Setup](#ote
 
 | Package | Why |
 |---|---|
-| `launchdarkly-server-sdk` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. Undeclared on purpose: the BYOC path (`init_client(client=...)`) targets environments that supply their own client, and a hard dependency would force an unused SDK into every such install. So it is imported late and raises actionably when missing — absent ⇒ a `RuntimeError` naming the `pip install`, and only on the path that needs it. |
+| `launchdarkly-server-sdk` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. Undeclared because the BYOC path (`init_client(client=...)`) supplies its own client and should not have to install an unused SDK. Absent ⇒ a `RuntimeError` naming the `pip install`, only on the path that needs it. |
 
 ### Dev-only (workspace root `[dependency-groups] dev`) — the ones with a contract attached
 
@@ -953,27 +860,25 @@ Install with `pip install "launchdarkly-ai-server[otel]"`; see [OTel Setup](#ote
 
 ### 3. Interpreting skill content anywhere
 
-`Skill.content` is opaque `bytes` by construction. Do not add a parser, a decoder, or a
-convenience accessor that reads meaning into it — no YAML/frontmatter parsing, no
-"decode as UTF-8 for display", nothing. The SDK's whole contract is that content is the
-verified verbatim byte buffer and nothing more; a consumer who wants structure parses it
-on their side of the boundary.
+`Skill.content` is opaque `bytes`: the verified verbatim bytes that were hashed. Do not add a
+parser, a decoder, or a convenience accessor — no YAML/frontmatter parsing, no "decode as
+UTF-8 for display". Consumers who want structure parse the bytes themselves. Same contract
+as the TypeScript SDK.
 
 ### 4. Assuming `write_skills` prunes on every run
 
-Pruning is suppressed when the manifest is corrupt or any retrieval was incomplete — both
-mean the SDK cannot tell what it owns or what is still current, and deleting under that
-uncertainty is data loss. A run whose report contains a manifest `error` will not have
-pruned anything, so do not read "no `removed` actions" as "nothing is stale".
+Pruning is suppressed when the manifest is corrupt or any retrieval was incomplete: the SDK
+cannot tell what it owns or what is current, and deleting anyway is data loss. A run whose
+report has a manifest `error` pruned nothing, so "no `removed` actions" does not mean
+"nothing is stale".
 
 ### 5. Treating "absent from the resolved set" as always meaning revoked
 
-Revocation is pruning, but only for a skill the store genuinely no longer serves. An object
-that is *present and unverifiable* is a different thing, and `_resolve_all` must emit a
-failed `_PendingWrite` for it rather than filtering it out: dropping it silently leaves its
-key out of the requested set, so prune deletes the last known-good copy on disk and reports
-a routine `removed` with `report.ok` still true. Tampered content must never be able to
-trigger deletion.
+Revocation is pruning, but only for a skill the store no longer serves. An object that is
+*present and unverifiable* is different: `_resolve_all` must emit a failed `_PendingWrite`
+for it, not filter it out. Dropping it leaves its key out of the requested set, so prune
+deletes the last known-good copy and reports a routine `removed` with `report.ok` still
+true. Tampered content must never trigger deletion.
 
 ### 6. Expecting revocation to reach a boot-only `write_skills` deployment
 

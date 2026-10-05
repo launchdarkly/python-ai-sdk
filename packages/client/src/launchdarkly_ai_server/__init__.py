@@ -293,16 +293,16 @@ __all__ = [  # noqa: RUF022
     "write_skills",
     "SkillStore",
     "InMemorySkillStore",
-    # skills — the FDv2 delivery transport, and the eager re-reconcile it enables
+    # skills — LaunchDarkly delivery store and on-change re-reconcile
     "FDv2SkillStore",
     "StoreDiagnostics",
     "watch_skills",
     "SkillWatcher",
-    # skills — the three closed-set unions a typed consumer needs to name
+    # skills — literal types for typed consumers
     "ReconcileActionKind",
     "OnUnavailable",
     "SkillOutcomeReason",
-    # skills — on-disk constants, identical across languages
+    # skills — on-disk filenames and manifest version
     "SKILL_FILENAME",
     "MANIFEST_FILENAME",
     "MANIFEST_VERSION",

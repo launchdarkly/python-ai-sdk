@@ -1,22 +1,17 @@
 """
-Agent Skills — the internals ``skills`` and ``skills_fs`` both need.
+Agent Skills internals shared by ``skills`` and ``skills_fs``: the store
+interface and configured store, telemetry, integrity verification, and store
+resolution.
 
-Package-internal: nothing here is exported from ``launchdarkly_ai_server``
-except the two constants that are public API, and the dependency runs one way —
-this module imports neither ``skills`` nor ``skills_fs``.
+Package-internal except ``SkillStore``, which the package root re-exports. This
+module imports neither ``skills`` nor ``skills_fs``.
 
-It holds the store interface and the configured store, the telemetry emitter,
-integrity verification, and store resolution. Each lives here in one copy so the
-accessors and the materialization path cannot disagree: about whether a store is
-configured, about which signals exist, about what verification accepts, or about
-how a raising store is handled.
+**Everything a store returns is untrusted.** Key, version, size and content hash
+are revalidated on every pass, and no store-supplied value reaches a signal or
+log line without a shape check.
 
-**Everything a store hands back is untrusted input**; the transport is not part
-of the trust boundary. Key, version, size, and content hash are revalidated here
-on every pass, and no value off the wire is echoed into a signal or a log line
-without a shape check. The reasoning, and the signal and log-record contracts
-these must satisfy, are in ``agents.md`` under *Security posture*, *Telemetry*
-and *The integrity-failure log record*.
+Security and telemetry contracts: ``agents.md``, *Security posture* and
+*Telemetry seam*.
 """
 
 from __future__ import annotations
@@ -35,37 +30,26 @@ logger = logging.getLogger(__name__)
 
 SKILL_OBJECT_KIND = "skill"
 """
-The kind this SDK asks a store for.
-
-Internal, and deliberately not exported from the package root: it is what the
-accessors pass to ``SkillStore.get_object`` and ``SkillStore.all_objects``, and
-a store adapter is free to map it onto whatever its transport uses underneath.
-A store that needs to agree on a kind agrees with whatever the SDK hands it,
-reached through ``launchdarkly_ai_server.skills_core``.
+The kind the SDK passes to ``SkillStore.get_object`` and
+``SkillStore.all_objects``. A store adapter may map it onto whatever its
+transport uses.
 """
 
 MAX_SKILL_CONTENT_BYTES = 10 * 1024 * 1024
 """
-Hard cap on skill content. Legitimately delivered skills are well under this
-bound, so anything larger is withheld regardless of whether its hash checks out.
+Hard cap on skill content; anything larger is withheld even if its hash matches.
 
-Set well above LaunchDarkly's own limit on purpose. This is a backstop against
-absurd input, not a second enforcement of the real bound, so the headroom lets
-that bound grow without this constant moving.
-
-Not exported from the package root, unlike the on-disk and on-the-wire constants
-beside it: it is a local enforcement bound rather than a value a caller needs to
-agree with, and a caller pre-flighting "will my skill fit?" against it would be
-reading the client's guess rather than the real limit. ``verified_bytes``
-reports the bound in its reason string when it is what withheld content.
+A backstop against absurd input, set well above LaunchDarkly's own limit so that
+limit can grow without this changing. Not the real limit, so do not pre-flight
+skill sizes against it.
 """
 
 _LANGUAGE = "python"
 
 _SHA256_HEX = re.compile(r"\A[0-9a-f]{64}\Z")
 """What a legitimate content hash looks like. Anything else is redacted before
-it reaches telemetry: ``contentHash`` is untrusted, and a store that put the
-skill body there would otherwise leak it into a signal."""
+it reaches telemetry, so a store cannot leak the skill body through
+``contentHash``."""
 
 _SIGNAL_INTEGRITY_FAILURE = "AgentControl Skill Integrity Failure"
 _SIGNAL_MATERIALIZED = "AgentControl Skill Materialized"
@@ -73,13 +57,11 @@ _SIGNAL_REVOKED = "AgentControl Skill Revoked Received"
 
 INTEGRITY_FAILURE_EVENT = "ld.skills.integrity_failure"
 """
-Stable event identity for the local integrity-failure log record.
+Stable event name for the local integrity-failure log record. SIEM rules match
+on it, so it must never be renamed.
 
-A compatibility surface, not an implementation detail: this is the string a SIEM
-matches on, so it must never be renamed. It appears verbatim in the message
-text, not only in ``extra``, because the stdlib's default formatter drops
-``extra`` and severity alone cannot discriminate — a raising store logs ERROR
-from this module too.
+It appears in the message text as well as ``extra``, because the default
+formatter drops ``extra`` and this module also logs other errors at ERROR.
 """
 
 _ACTION_WITHHELD = "withheld"
@@ -98,16 +80,12 @@ IntegrityReasonCode = Literal[
     "version_mismatch",
 ]
 """
-The closed ``reason_code`` vocabulary. Stable: a detection rule written against
-these tokens keeps working, so adding one is a deliberate edit here rather than
-a new string invented at the call site that needed it.
+The closed, stable ``reason_code`` vocabulary for integrity failures; detection
+rules can match on these tokens, and every SDK language emits the same ones.
 
-Eight of the ten come from ``record_integrity_failure`` inside
-``verify_raw_skill`` and fire **both** detection surfaces. ``key_mismatch`` and
-``version_mismatch`` are decided at the retrieval boundary instead, after
-verification has passed, and fire the log record only — see
-``record_key_mismatch`` for why the signal stays out. They share the vocabulary
-because a detection rule cares that integrity failed, not which layer noticed.
+Eight come from ``verify_raw_skill`` and fire both the log record and the
+signal. ``key_mismatch`` and ``version_mismatch`` are detected after
+verification and fire the log record only (see ``record_key_mismatch``).
 """
 
 INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode))
@@ -119,11 +97,8 @@ NO_STORE_MESSAGE = (
     "content from LaunchDarkly, and InMemorySkillStore is available for local "
     "development and testing."
 )
-"""
-The first thing a user sees when no store is configured, so it names both stores,
-``FDv2SkillStore`` first because it is the answer in production. Callers match on
-"skill store"; keep that phrase if the wording changes.
-"""
+"""What the accessors report when no store is configured. Callers match on
+"skill store"; keep that phrase if the wording changes."""
 
 
 # ---------------------------------------------------------------------------
@@ -133,48 +108,30 @@ The first thing a user sees when no store is configured, so it names both stores
 
 class SkillStore(Protocol):
     """
-    Structural interface every source of skill content satisfies.
+    Structural interface for a source of skill content: pass any object with
+    these methods.
 
-    Structural on purpose, mirroring how the LaunchDarkly client interface works
-    in this package: pass any object carrying these methods.
-
-    Three members are **optional**, and are deliberately not declared here: a
-    Protocol member is required for structural compatibility, so declaring them
-    would reject every store that does not implement them. Each is probed for
-    instead, and each has a defined behavior when absent.
-
-    ``is_initialized()`` reports whether the store has received its initial data
-    — for a delivery transport, whether a payload has arrived yet. Absent means
-    initialized, which is right for a store populated by hand. It matters
-    because "the store holds nothing" and "the store has not heard yet" are the
-    same answer through ``all_objects``, and ``write_skills("*")`` would read the
-    first as "every skill was revoked": see ``store_is_initialized``.
-
-    ``add_listener(kind, fn)`` lets a delivery transport push updates, and
-    ``remove_listener(kind, fn)`` lets a consumer such as ``watch_skills`` stop
-    receiving them; it removes one occurrence of *fn* under *kind* and is a
-    no-op when *fn* is not registered. A store offering the first should offer
-    the second: consumers skip detaching when it is absent, so such a store
-    works at the cost of a listener that lives as long as it does.
-
-    The raw objects a store serves are wire-shaped, with camelCase field names::
+    Raw objects are wire-shaped, with camelCase field names::
 
         {"key": "pdf-extraction", "version": 2, "content": "---\\n...",
          "contentHash": "9f3a...", "name": "PDF Extraction", "description": "..."}
 
-    **Version is part of the lookup identity, not a filter applied afterwards.**
-    A delivery payload holds the newest version of every skill *and* every
-    version any variation currently pins, so two versions of one key coexist
-    routinely. An interface keyed by key alone cannot express "the one this
-    variation pinned": it would answer with the newest, and the caller rejecting
-    it turns a pinned reference into a missing skill. So ``get_object`` takes the
-    wanted version, and ``version=None`` means "the newest you hold".
+    - ``get_object(kind, key, version)`` returns one object, or ``None``. A store
+      may hold several versions of a key, so the version is part of the lookup;
+      ``version=None`` means the newest held.
+    - ``all_objects(kind)`` returns one entry per *(key, version)*. Its dict keys
+      are opaque; read identity from each object's ``key`` and ``version``.
 
-    ``all_objects`` returns one entry per *(key, version)* the store holds. Its
-    dict keys are **opaque store-internal identifiers** — do not parse them, and
-    do not assume one entry per skill key. Identity is read off each object's own
-    ``key`` and ``version`` fields, which are revalidated here anyway because
-    everything a store serves is untrusted.
+    Optional methods, probed for rather than declared (declaring them would make
+    them required):
+
+    - ``is_initialized()``: whether initial data has arrived. Absent means
+      initialized. Until it is, ``write_skills("*")`` does not prune, since an
+      empty store would otherwise look like every skill was revoked.
+    - ``add_listener(kind, fn)`` / ``remove_listener(kind, fn)``: push updates to
+      consumers such as ``watch_skills``. ``remove_listener`` removes one
+      registration and is a no-op if *fn* is not registered. Without it,
+      listeners stay attached for the store's lifetime.
     """
 
     def get_object(
@@ -195,13 +152,8 @@ class _TelemetryEmitter(Protocol):
 
 class _NoOpEmitter:
     """
-    The default emitter.
-
-    No skills telemetry leaves the process: ``client.track()`` is the wrong
-    channel for it — that needs an LD context, spends the application's event
-    volume, and lands in its data export. Signals are still constructed and
-    recorded, so a transport can be installed behind this interface without
-    touching a call site.
+    The default emitter: no skills telemetry leaves the process. Signals are
+    still built, so a transport can be installed without touching call sites.
     """
 
     def record(self, signal: str, properties: dict[str, Any]) -> None:
@@ -216,15 +168,11 @@ _NOOP_EMITTER: _TelemetryEmitter = _NoOpEmitter()
 
 _store: SkillStore | None = None
 _emitter: _TelemetryEmitter = _NOOP_EMITTER
-"""Never ``None``: "no emitter installed" is spelled as the no-op, so ``emit``
-has one code path instead of re-deciding on every signal."""
+"""Never ``None``; "no emitter" is the no-op emitter."""
 
 
 def set_store(store: Any) -> None:
-    """
-    Replaces the configured store. Reached through ``skills._set_store``, the
-    documented injection point.
-    """
+    """Replaces the configured store. Reached through ``skills._set_store``."""
     global _store
     _store = store
 
@@ -258,20 +206,9 @@ def store_is_initialized(store: Any) -> bool:
     """
     Whether *store* has received its initial data.
 
-    ``True`` for a store that does not implement the optional
-    ``is_initialized()``, since a hand-populated store is never waiting for
-    anything. Probed rather than declared on the Protocol for the reason
-    ``SkillStore`` gives: a declared member would reject every store without it.
-
-    This is what keeps ``write_skills("*")`` from reading a store that has not
-    yet received a payload as an environment whose every skill was revoked.
-    Retrieval through such a store is reported unavailable, which suppresses
-    pruning — the same treatment a raising store gets, and for the same reason:
-    deleting the application's files because content could not be retrieved would
-    turn a slow boot into data loss.
-
-    A probe that raises counts as not initialized. A store that cannot answer
-    whether it is ready is not one to authorize deletions on.
+    ``True`` if the store has no ``is_initialized()``. A probe that raises counts
+    as not initialized. An uninitialized store is reported unavailable, which
+    suppresses pruning so a slow start cannot delete managed files.
     """
     probe = getattr(store, "is_initialized", None)
     if not callable(probe):
@@ -288,10 +225,8 @@ def store_is_initialized(store: Any) -> bool:
 
 
 def emit(signal: str, properties: dict[str, Any]) -> None:
-    """
-    Records one signal. Never raises into the calling operation — a broken
-    emitter must not be able to fail a retrieval or a reconcile.
-    """
+    """Records one signal. Never raises: a broken emitter must not fail a
+    retrieval or reconcile."""
     try:
         _emitter.record(signal, properties)
     except Exception:
@@ -308,23 +243,14 @@ def record_integrity_failure(
     observed_hash: str | None = None,
 ) -> None:
     """
-    Records an integrity failure on both surfaces: one local log record, one
-    product signal.
+    Records an integrity failure as one local log record and one signal.
 
-    Carries hashes and byte counts only — the skill body never appears in a
-    signal, a log line, or an error message.
-
-    The signal is product telemetry: no-op by default, with a fixed property
-    set. The log record is the application's own detection path — the only one
-    that works when telemetry is off — so it also carries the stable event name,
-    the action taken, the reason, and the machine-parseable ``reason_code``, in
-    both the message text and ``extra["ld_skills"]``. Neither form alone
-    survives every handler configuration; ``agents.md`` states the contract.
+    Carries hashes and byte counts only, never the skill body. The log record
+    works even with telemetry off; it adds the event name, action, reason and
+    ``reason_code``, in both the message text and ``extra["ld_skills"]``.
     """
-    # Key and expected hash come off the wire, so neither may be echoed
-    # verbatim: a store could put the skill body in either. Shape-check, then
-    # redact. Every field added below is a literal or SDK-authored; anything
-    # added later needs this same treatment.
+    # Key and expected hash are store-supplied and could carry the skill body:
+    # shape-check, then redact. Any new store-supplied field needs the same.
     safe_key = skill_key if is_valid_skill_key(skill_key) else "<invalid-key>"
     properties: dict[str, Any] = {"skill_key": safe_key, "language": _LANGUAGE}
     if is_valid_skill_version(version):
@@ -338,9 +264,8 @@ def record_integrity_failure(
     if observed_hash is not None:
         properties["observed_hash"] = observed_hash
 
-    # Spread the signal's properties rather than rebuilding them, so the record
-    # cannot drift from the signal on which fields are redacted or omitted.
-    # Absent optional fields stay absent; the record never carries a null.
+    # Reuse the signal's properties so both redact the same fields. Absent
+    # fields are omitted, never null.
     record: dict[str, Any] = {
         "event": INTEGRITY_FAILURE_EVENT,
         "action": _ACTION_WITHHELD,
@@ -348,9 +273,8 @@ def record_integrity_failure(
         "reason": reason,
         **properties,
     }
-    # ``sort_keys`` is part of the record's format, not cosmetic: it is what
-    # makes the line stable for a given input. Do not drop it, and do not
-    # reorder the keys above expecting the output to follow.
+    # sort_keys is part of the format: it makes the line stable (and identical
+    # across SDK languages, apart from ``language``). Do not drop it.
     logger.error(
         "%s %s",
         INTEGRITY_FAILURE_EVENT,
@@ -364,58 +288,28 @@ def record_key_mismatch(requested: Any, served: Any) -> None:
     """
     Records a store answering under a key other than the one requested.
 
-    **Log record only — no product signal.** One of the two integrity failures
-    that fire one surface rather than both — ``record_version_mismatch`` is the
-    other — and the asymmetry is deliberate.
+    **Log record only, no signal.** A substituted skill may indicate tampering,
+    so it is logged under ``INTEGRITY_FAILURE_EVENT`` for existing SIEM rules to
+    catch. The usual cause, though, is a broken store adapter (stale cache,
+    colliding key), so it is kept out of product telemetry.
+    ``record_version_mismatch`` follows the same rule.
 
-    The record fires because a substituting store is a genuine tampering
-    indicator, and the record is the customer-owned detection path — the only
-    one that works when telemetry is opt-out or the instance has no telemetry
-    destination at all. It reuses ``INTEGRITY_FAILURE_EVENT`` deliberately: that
-    string is a documented compatibility surface a customer's SIEM matches on,
-    so reusing it means an existing rule catches this case without being
-    rewritten, with ``reason_code`` distinguishing it.
-
-    The signal stays out because the overwhelmingly common cause of a key
-    mismatch is not an attacker but a **broken store adapter** — a stale cache
-    entry, a colliding key, a wrong index lookup. Counting those as integrity
-    failures in LaunchDarkly's own product counter is the same false positive
-    ``resolve_from_store`` already refuses when a pinned ``get_object`` answers
-    with a non-dict: it reads that as ``absent`` rather than inventing a
-    tampering signal from a merely broken adapter.
-
-    Lives here, beside ``record_integrity_failure``, so the single-emission-site
-    rule still holds by reading one module.
-
-    Both keys are shape-checked and redacted on the same rule as every other key
-    that reaches a surface. *served* cannot actually be hostile on the path that
-    calls this — ``verify_raw_skill`` accepted it first — but that is a property
-    of the current call order rather than of this function, and the check is
-    what stops a future reordering from publishing a body here.
+    Both keys are shape-checked and redacted, regardless of call order.
     """
     record: dict[str, Any] = {
         "event": INTEGRITY_FAILURE_EVENT,
         "action": _ACTION_WITHHELD,
         "reason_code": "key_mismatch",
-        # Named apart from the eight verification codes so a reader of the line
-        # can tell a retrieval-boundary failure from a verification failure.
         "reason": (
             "the skill store answered under a different key than the one requested"
         ),
         "language": _LANGUAGE,
-        # ``skill_key`` keeps the meaning it has on every other record — the key
-        # the *caller asked for* — so a rule that groups by it keeps working.
+        # The key the caller asked for, as on every other record.
         "skill_key": requested if is_valid_skill_key(requested) else "<invalid-key>",
-        # The key the store answered under: the one datum that makes a broken
-        # adapter diagnosable, so it is a parseable field rather than prose
-        # buried in ``reason``. Record-only, never on the signal's allowlist.
+        # The key the store answered under, for diagnosing the adapter.
         "served_key": served if is_valid_skill_key(served) else "<invalid-key>",
     }
-    # No ``expected_hash``, ``observed_hash`` or ``version``: verification
-    # passed, so there is no hash disagreement to report and the served object's
-    # version is not what disqualified the answer — reporting it beside a
-    # ``skill_key`` that means the requested key would mix the two frames.
-    # Absent fields stay absent rather than being emitted as null.
+    # No hashes or version: verification passed, so neither disqualified it.
     logger.error(
         "%s %s",
         INTEGRITY_FAILURE_EVENT,
@@ -426,63 +320,33 @@ def record_key_mismatch(requested: Any, served: Any) -> None:
 
 def record_version_mismatch(key: Any, requested: Any, served: Any) -> None:
     """
-    Records a store answering a version pin with some other version.
+    Records a store answering a version pin with a different version.
 
-    **Log record only — no product signal**, for the reason
-    ``record_key_mismatch`` gives: the usual cause is a broken store adapter
-    rather than tampered content. The two are the same decision at the same
-    boundary, so they stay in step — giving one a signal has to be justified for
-    both.
+    **Log record only, no signal**, for the reason ``record_key_mismatch``
+    gives. The built-in stores answer a pin with that version or ``None``, so
+    only a custom adapter reaches this. ``get_skill`` returns ``None`` for
+    ``wrong_version``, so this record is what makes it visible.
 
-    Takes the key as well as the two versions, unlike ``record_key_mismatch``:
-    here the key is *not* what disagreed, and the record still has to name it.
-
-    Neither shipped store can reach this — ``FDv2SkillStore`` and
-    ``InMemorySkillStore`` both answer a pin with exactly that version or with
-    ``None``, so an ordinary pin miss is ``absent``. It exists for the custom
-    adapter that can, where ``get_skill`` collapses ``wrong_version`` to
-    ``None`` and would otherwise leave an operator no visibility at all.
+    *served* is shape-checked, which also keeps it an integer in the JSON.
+    *requested* is the caller's own pin and is logged as given.
     """
     record: dict[str, Any] = {
-        # Alphabetical here, as in the TypeScript counterpart, so the two read
-        # the same; ``sort_keys`` below is what actually fixes the output.
         "action": _ACTION_WITHHELD,
         "event": INTEGRITY_FAILURE_EVENT,
         "language": _LANGUAGE,
-        # Named apart from the eight verification codes so a reader of the line
-        # can tell a retrieval-boundary failure from a verification failure.
         "reason": (
             "the skill store answered with a different version than the one requested"
         ),
         "reason_code": "version_mismatch",
-        # The version the store answered with: the one datum that makes a broken
-        # adapter diagnosable, so it is a parseable field rather than prose
-        # buried in ``reason``. Record-only, never on the signal's allowlist.
-        #
-        # Shape-checked on the same rule as ``served_key``, and for the same
-        # reason: *served* cannot be hostile on the path that calls this, since
-        # ``verify_raw_skill`` accepted it first, but that is a property of the
-        # current call order rather than of this function. The check is also
-        # what keeps the field an integer, which the sorted-key JSON needs to
-        # stay byte-comparable across SDKs — ``3`` and ``"3"`` are not the same
-        # line.
+        # The version the store answered with, for diagnosing the adapter.
         "served_version": (
             served if is_valid_skill_version(served) else "<invalid-version>"
         ),
-        # The key the caller asked for, the meaning it has on every other
-        # record, shape-checked on the same rule as every other key that
-        # reaches a surface.
         "skill_key": key if is_valid_skill_key(key) else "<invalid-key>",
-        # The version *requested*, again the meaning it has everywhere else, so
-        # a rule that groups or filters on ``version`` keeps working. Not
-        # shape-checked, unlike ``skill_key`` beside it: this is the caller's own
-        # pin rather than a store-controlled value, so it cannot carry skill
-        # content, and coercing a mistyped one would hide the caller's own
-        # mistake from their log.
+        # The version requested, as ``version`` means on every other record.
         "version": requested,
     }
-    # No ``expected_hash`` or ``observed_hash``: verification passed, so there is
-    # no hash disagreement to report. Absent fields stay absent, never null.
+    # No hashes: verification passed, so they did not disqualify it.
     logger.error(
         "%s %s",
         INTEGRITY_FAILURE_EVENT,
@@ -495,10 +359,8 @@ def record_materialized(
     skill_key: str, content_bytes: int, content_hash: str, reconcile_action: str
 ) -> None:
     """
-    Records a materialization. Carries no filesystem path of any kind: the same
-    reasoning that keeps the skill body out of telemetry keeps the directory
-    layout out. Paths live in the returned ``ReconcileReport`` instead, which is
-    API rather than telemetry.
+    Records a materialization. Carries no filesystem path; paths are reported in
+    the returned ``ReconcileReport`` instead.
     """
     emit(
         _SIGNAL_MATERIALIZED,
@@ -513,16 +375,9 @@ def record_materialized(
 
 
 def record_revoked(skill_key: str, version: Any) -> None:
-    """
-    Records a revocation — a prune that removed a formerly managed skill.
-
-    Lives here with the other two recorders rather than at the prune site, so
-    every signal this SDK can emit is visible in one place and nothing outside
-    this module touches ``emit``.
-    """
-    # Both fields come off the manifest, which is untrusted — same rule as
-    # ``record_integrity_failure``: shape-check, then redact, so a hand-edited
-    # manifest cannot plant an arbitrary string in a signal.
+    """Records a revocation: a prune that removed a formerly managed skill."""
+    # Both fields come from the manifest, which is untrusted: shape-check, then
+    # redact.
     safe_key = skill_key if is_valid_skill_key(skill_key) else "<invalid-key>"
     properties: dict[str, Any] = {
         "skill_key": safe_key,
@@ -560,31 +415,17 @@ def verified_bytes(
     key: str, content: str | bytes, expected_hash: str, version: int
 ) -> VerifiedContent | VerificationFailure:
     """
-    The whole content half of integrity verification: size, encoding, hash.
+    Verifies content: size cap, then UTF-8 encoding, then sha256 hash.
 
-    The order is fixed, so content failing two classes reports one determined
-    code: **size** before **encoding** before **hash**. Size first is what makes
-    over-cap content carrying a lone surrogate report ``over_size_cap`` rather
-    than ``not_utf8`` — without a fixed order that input's code is whichever
-    check the implementation happens to reach first, and the guarantee of one
-    reason code per failure class cannot be tested against it. The shape checks that
-    precede all three are in ``verify_raw_skill``.
+    The fixed order means content failing several checks always reports the same
+    ``reason_code``. A ``str`` (from the wire) is UTF-8 encoded here; ``bytes``
+    (a ``Skill.content``) is hashed directly.
 
-    Accepts either shape content arrives in. A wire-shaped ``str`` is UTF-8
-    encoded here, once — the only place that encode happens. ``bytes`` is an
-    already-verified ``Skill.content`` being re-verified, and is hashed directly.
+    Returns the verbatim bytes and the locally computed hash, or a
+    ``VerificationFailure`` after recording the integrity failure.
 
-    Returns the verbatim bytes and their locally computed sha256, or a
-    human-readable reason, having already recorded the integrity signal so it
-    does not depend on which caller noticed. The hash handed back is always the
-    one computed here, never the caller's expected value, which keeps an
-    untrusted string out of ``Skill``.
-
-    Runs twice per skill by design — at the accessor boundary, and again
-    immediately before a write, since a ``Skill`` can also be constructed
-    directly by a caller. Do not optimize the second pass away by carrying the
-    first one's verdict forward: that puts a "trust the value computed upstream"
-    branch inside the one function whose job is not to.
+    Runs at the accessor boundary and again before a write, because callers can
+    construct a ``Skill`` directly. Do not skip the second pass.
     """
     encodable = True
     if isinstance(content, bytes):
@@ -593,18 +434,9 @@ def verified_bytes(
         try:
             encoded = content.encode("utf-8")
         except UnicodeEncodeError:
-            # json.loads turns a "\ud800" escape into an unpaired surrogate,
-            # which has no UTF-8 encoding — so there are no bytes the server
-            # could have hashed.
-            #
-            # These replacement bytes exist only to measure the content against
-            # the size cap, so that the *reported* failure follows the fixed
-            # order above. They are never hashed and never returned: the
-            # ``not_utf8`` branch below returns before the hash comparison, and
-            # nothing else reads ``encoded`` on this path. That is the whole
-            # reason ``errors="replace"`` is safe here and
-            # ``errors="surrogatepass"`` would not be anywhere — fabricated
-            # bytes that reached the comparison could satisfy it.
+            # A lone surrogate (e.g. from a "\ud800" JSON escape) has no UTF-8
+            # encoding. The replacement bytes are only used to check the size
+            # cap; ``not_utf8`` returns before they could be hashed.
             encodable = False
             encoded = content.encode("utf-8", errors="replace")
 
@@ -633,8 +465,7 @@ def verified_bytes(
         )
         return VerificationFailure(reason)
 
-    # sha256, lowercase hex, over the verbatim bytes — no canonicalization and
-    # no content parsing of any kind anywhere in the integrity path.
+    # sha256, lowercase hex, over the verbatim bytes; no canonicalization.
     observed_hash = hashlib.sha256(encoded).hexdigest()
     if observed_hash != expected_hash:
         record_integrity_failure(
@@ -652,11 +483,10 @@ def verified_bytes(
 
 def verify_raw_skill(raw: Any) -> Skill | None:
     """
-    Turns one untrusted raw store object into a ``Skill``, or withholds it.
+    Turns one untrusted raw store object into a ``Skill``, or returns ``None``.
 
-    On any failure the skill is treated as missing, the integrity signal is
-    recorded, and an error is logged. No unverified content is ever returned to
-    user code.
+    On failure, records the integrity failure and logs an error. Unverified
+    content is never returned.
     """
     if not isinstance(raw, dict):
         record_integrity_failure(
@@ -720,15 +550,10 @@ def verify_raw_skill(raw: Any) -> Skill | None:
 
 def log_withholding_summary(subject: str, requested: int, resolved: int) -> None:
     """
-    One WARN per run when content was withheld, naming the counts.
+    Logs one WARN per batch when content was withheld, with the counts.
 
-    Every individual withholding already records an integrity signal and an error
-    line, but a caller reading logs at WARN sees neither — and the case that
-    matters most is a run where *nothing* verified, because the result is then an
-    empty list indistinguishable from "this project has no skills".
-
-    Called once per batch, not once per skill, so a large withholding run does
-    not itself become the noise.
+    Makes withholding visible at WARN level, especially when nothing verified
+    and the empty result would look like "no skills".
     """
     withheld = requested - resolved
     if withheld <= 0:
@@ -760,20 +585,12 @@ def list_raw_objects(
     store: SkillStore,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
     """
-    Every raw object the store holds, or the reason it could not answer.
+    Every raw object the store holds, as ``(objects, None)``, or
+    ``({}, reason)`` if the store raised.
 
-    One entry per *(key, version)*, under keys that are opaque to this SDK — see
-    ``SkillStore``. Callers that need one skill per key have to collapse the
-    result themselves; ``newest_by_key`` does it.
-
-    Returns the reason rather than raising, because both callers need the
-    distinction between "no skills" and "the store is broken", worded
-    identically.
-
-    An answer that is not a mapping is a broken store, on the same footing as
-    one that raised — **not** an empty one. Collapsing it to ``{}`` would make a
-    store that served nothing usable indistinguishable from a store that holds
-    no skills, which reads downstream as "every skill was revoked".
+    One entry per *(key, version)*; use ``newest_by_key`` for one per key. A
+    non-dict answer is treated as a broken store, not an empty one, so it cannot
+    read downstream as "every skill was revoked".
     """
     try:
         objects = store.all_objects(SKILL_OBJECT_KIND)
@@ -794,22 +611,12 @@ def list_raw_objects(
 
 def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
     """
-    One raw object per skill key — the highest version of each, paired with the
-    store key it was served under.
+    The highest version of each skill key, paired with its store key (used to
+    attribute failures when the object's own key is unusable).
 
-    ``all_objects`` may hold several versions of one key, and both whole-store
-    callers want one skill per key: ``all_skills``, because a list holding two
-    versions of one key is not a set of skills, and the ``"*"`` reconcile,
-    because ``<root>/<key>/SKILL.md`` is a single path. The store key is carried
-    through because the reconcile attributes a failure to it when the object's
-    own key is unusable.
-
-    An object too malformed to carry a usable key and version is **kept**, so
-    verification is what withholds it: dropped silently it would fall out of the
-    requested set, and prune would then delete the last known-good copy on disk.
-    The exception is an object whose key resolved from another version anyway —
-    that key is already in the requested set, so keeping the malformed sibling
-    would only report a withholding for a key that resolved.
+    Objects without a usable key and version are **kept** so verification
+    reports them; dropping them would let prune delete the last good copy on
+    disk. They are dropped only when their key resolved from another version.
     """
     best: dict[str, tuple[str, Any]] = {}
     unusable: list[tuple[str, Any]] = []
@@ -825,7 +632,7 @@ def newest_by_key(objects: dict[str, dict[str, Any]]) -> list[tuple[str, Any]]:
     withheld = [
         (object_key, raw)
         for object_key, raw in unusable
-        # ``is_valid_skill_key`` first: an unhashable key cannot be looked up.
+        # is_valid_skill_key first: an unhashable key cannot be looked up.
         if not (
             is_valid_skill_key(raw.get("key") if isinstance(raw, dict) else None)
             and raw["key"] in best
@@ -845,26 +652,16 @@ class Resolution:
 
     reason: SkillOutcomeReason
     """
-    Which of the five public outcomes this resolution is.
-
-    Declared first and **without a default**, so every construction site has to
-    state which public token it maps to rather than inheriting one.
-
-    ``get_skill_result`` publishes this value directly. It is carried as a token
-    rather than recovered from ``error``, because pattern-matching prose for a
-    decision a caller fails closed on is the fragility the typed outcome removes.
-
-    Distinct from ``unavailable``, which answers a different question (may prune
-    run?), but the two can only disagree by a bug: ``unavailable`` is ``True`` in
-    exactly the ``store_unavailable`` case.
+    Which of the five public outcomes this is; ``get_skill_result`` publishes it.
+    No default, so every construction site must choose one.
     """
     skill: Skill | None = None
     error: str | None = None
     unavailable: bool = False
     """
-    ``True`` when the *store* could not answer — it raised — rather than when it
-    answered "no". Only the former suppresses pruning: deleting managed files
-    because a lookup failed would turn an outage into data loss.
+    ``True`` when the store could not answer, rather than answered "no"; set
+    exactly when ``reason`` is ``store_unavailable``. Suppresses pruning, so an
+    outage cannot delete managed files.
     """
 
 
@@ -872,18 +669,11 @@ def resolve_from_store(
     store: SkillStore, key: str, wanted_version: int | None
 ) -> Resolution:
     """
-    Fetches one key and verifies it — the sequence the accessors and the
-    materialization path share, written once so the two cannot drift apart on
-    the policy for a raising store.
+    Fetches one key from *store* and verifies it.
 
-    ``wanted_version`` goes *into* the lookup, because a store may hold several
-    versions of one key and only it can pick between them; ``None`` asks for the
-    newest. The equality check afterwards is kept as a **defense**, not as the
-    selection mechanism: the store is untrusted, so an answer that is not the
-    version that was asked for is withheld rather than returned. The key is
-    checked the same way and for the same reason: identity is read off the
-    object itself, so an answer served under a different key would otherwise be
-    returned under the caller's key while carrying its own.
+    ``wanted_version`` is passed to the store (``None`` for the newest). Because
+    the store is untrusted, an answer with a different key or version is still
+    withheld.
     """
     try:
         raw = store.get_object(SKILL_OBJECT_KIND, key, wanted_version)
@@ -908,20 +698,9 @@ def resolve_from_store(
             error=f"skill '{key}' failed integrity verification and was withheld",
         )
     if skill.key != key:
-        # ``integrity_failure`` rather than ``absent``: content was delivered
-        # and its identity did not verify, which is the one token a caller is
-        # expected to fail closed on. Reporting ``absent`` would file a store
-        # that substitutes one skill for another in the bucket the same caller
-        # is invited to tolerate. It is not ``wrong_version`` either — that
-        # token names a version mismatch specifically, and there is deliberately
-        # no ``wrong_key`` to parallel it.
-        #
-        # Records the log surface but not the product signal. ``verify_raw_skill``
-        # has already passed, so this is not a verification failure and does not
-        # go through ``record_integrity_failure``; see ``record_key_mismatch``
-        # for why the two surfaces part company here. The asymmetry is pinned by
-        # a test in both directions, because an implementation that emitted the
-        # signal too would look correct from every other angle.
+        # integrity_failure, not absent: a substituted skill is something
+        # callers should fail closed on. Log record only; see
+        # record_key_mismatch.
         record_key_mismatch(key, skill.key)
         return Resolution(
             reason="integrity_failure",
@@ -931,12 +710,7 @@ def resolve_from_store(
             ),
         )
     if wanted_version is not None and skill.version != wanted_version:
-        # Log surface only, on the same split and for the same reason as the key
-        # mismatch above: verification has already passed, so this is not a
-        # verification failure and does not go through
-        # ``record_integrity_failure``. A test pins the asymmetry both ways.
-        # The check stays out of ``verify_raw_skill`` for the reason the key
-        # check does: verification is unary, this comparison relational.
+        # Log record only; see record_version_mismatch.
         record_version_mismatch(key, wanted_version, skill.version)
         return Resolution(
             reason="wrong_version",
@@ -949,10 +723,8 @@ def resolve_from_store(
 
 
 def reference_target(item: SkillReference | str) -> tuple[str, int | None]:
-    """Normalizes a reference-or-key into ``(key, wanted version)``.
-
-    A bare string means "the latest version the store holds".
-    """
+    """Normalizes a reference or bare key into ``(key, wanted version)``; a
+    bare key wants the newest version."""
     if isinstance(item, str):
         return item, None
     return item.key, item.version

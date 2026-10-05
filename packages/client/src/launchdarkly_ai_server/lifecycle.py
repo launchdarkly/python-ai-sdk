@@ -150,19 +150,13 @@ async def init_client(
 
     - Pass *client* directly (BYOC) to skip the LaunchDarkly Python SDK path.
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
-    - ``options['skillStore']`` configures the store the Agent Skills accessors
-      read from. Absent by default, in which case they raise an actionable error.
+    - ``options['skillStore']`` sets the store the Agent Skills accessors read
+      from. Without one, the accessors raise ``RuntimeError``.
 
-    This function is idempotent for the client singleton: a second call returns
-    the existing client without re-initializing, and every option is ignored —
-    **except** ``skillStore``, which is applied on every successful call. That
-    asymmetry is deliberate, and it is what lets a client that was lazily
-    auto-initialized, or initialized without a store, be given one afterwards.
-    A ``skillStore`` of ``None`` (or absent) never clears an already-configured
-    store; use ``shutdown()`` for that. The store is installed only once
-    initialization has succeeded: a call that raises leaves no global state
-    behind, so a failed init cannot leave the skill accessors working against a
-    store the application believes was never installed.
+    Idempotent: later calls return the existing client and ignore every option
+    **except** ``skillStore``, which is applied on every successful call, so you
+    can add a store after initialization. A ``None`` store never clears the
+    current one (use ``shutdown()``), and a call that raises installs nothing.
 
     Returns the initialized ``LDClientInterface`` instance.
     """
@@ -170,8 +164,7 @@ async def init_client(
 
     ld_client = await _resolve_client(opts, client)
 
-    # The single success point: every path that raises returns before here, so
-    # "installed only on success" is one statement rather than a copy per exit.
+    # Reached only on success, so a failed init installs no store.
     skill_store = opts.get("skillStore")
     if skill_store is not None:
         skills._set_store(skill_store)
@@ -181,9 +174,6 @@ async def init_client(
 async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
     """
     Returns the singleton client, initializing it on first call.
-
-    Split from ``init_client`` so that function has exactly one success point to
-    hang the ``skillStore`` carve-out on.
     """
     global _client
 
@@ -301,9 +291,8 @@ async def shutdown() -> None:
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also clears the configured skill store (and telemetry emitter): after a
-    shutdown, re-pass ``skillStore`` to the next ``init_client`` if the skill
-    accessors should keep working.
+    Also clears the configured skill store; pass ``skillStore`` again to the
+    next ``init_client`` to keep using the skill accessors.
 
     When telemetry was running, this also releases the process-global tracer
     provider so a later ``init_client`` can install its own — see

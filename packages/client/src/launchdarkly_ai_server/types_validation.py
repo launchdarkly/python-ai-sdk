@@ -8,22 +8,17 @@ from .types import ParseFailure, ParseResult, ParseSuccess
 _VALID_ROLES = {"user", "assistant", "system"}
 
 SKILL_KEY_GRAMMAR = "^[a-z0-9][a-z0-9-]*$"
-"""
-The skill key grammar, as a string, so every message that has to explain a
-rejection quotes the rule rather than restating it. Tightening the pattern below
-then cannot leave an error message describing the old grammar.
-"""
+"""The skill key grammar, as quoted in rejection messages."""
 
 _SKILL_KEY_PATTERN = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
 """
-``SKILL_KEY_GRAMMAR``, anchored with ``\\A``/``\\Z`` rather than ``^``/``$``
-because ``$`` also matches immediately before a trailing newline, which would
-let ``"pdf-extraction\\n"`` through as a directory name.
+``SKILL_KEY_GRAMMAR`` anchored with ``\\A``/``\\Z``: ``$`` would also match before
+a trailing newline and let ``"pdf-extraction\\n"`` through as a directory name.
 """
 
 SKILL_KEY_MAX_LENGTH = 256
-"""Longest key the data model permits. Note that no mainstream filesystem allows
-a 256-byte path component, so ``write_skills`` applies a tighter bound of its own."""
+"""Longest permitted skill key. ``write_skills`` applies a tighter bound, since
+most filesystems cap a path component below 256 bytes."""
 
 
 def _is_object(v: Any) -> bool:
@@ -34,9 +29,7 @@ def skill_key_rejection_reason(key: Any) -> str | None:
     """
     Why *key* is not a valid skill key, or ``None`` when it is.
 
-    The canonical explanation, so the config parser, the filesystem layer and
-    the reference projection all reject a key for the same stated reason.
-    ``is_valid_skill_key`` is this predicate with the reason discarded.
+    Shared by every caller that validates keys, so rejections read the same.
     """
     if not isinstance(key, str):
         return "must be a string"
@@ -48,12 +41,12 @@ def skill_key_rejection_reason(key: Any) -> str | None:
 
 
 def is_valid_skill_key(key: Any) -> TypeGuard[str]:
-    """Skill keys are untrusted input everywhere they appear — validate every time."""
+    """Whether *key* is a valid skill key (see ``skill_key_rejection_reason``)."""
     return isinstance(key, str) and skill_key_rejection_reason(key) is None
 
 
 def is_valid_skill_version(version: Any) -> TypeGuard[int]:
-    """Skill versions are integers >= 1. ``bool`` is not an acceptable integer."""
+    """Whether *version* is a valid skill version: an ``int`` >= 1 (not ``bool``)."""
     return isinstance(version, int) and not isinstance(version, bool) and version >= 1
 
 
@@ -74,9 +67,8 @@ def _parse_skills(raw: Any) -> str | None:
     """
     Validates the optional ``skills`` array. Returns an error message or ``None``.
 
-    Fail closed: a malformed reference makes the whole config malformed, because
-    an SDK that silently dropped a bad reference would materialize a partial
-    skill set without telling anyone.
+    Fails closed: one malformed reference fails the whole config, rather than
+    silently materializing a partial skill set.
     """
     if not isinstance(raw, list):
         return "skills must be an array of {key, version} objects"
@@ -156,13 +148,8 @@ def parse_ai_config(raw: Any) -> ParseResult:
             error={"message": "outputFormat must be an object (JSON Schema)"},
         )
 
-    # ``in`` rather than ``is not None``: an explicit ``skills: null`` must fail
-    # the parse, not read as absent. Read as absent it makes ``skill_refs``
-    # return ``[]``, and a ``prune=True`` reconcile then *deletes* previously
-    # materialized skill files on the strength of a field the SDK could not
-    # parse — the hazard the store path already refuses, where reading a
-    # malformed object as absent would let prune delete the last known-good
-    # copy on disk. Failing the whole parse is the louder and safer outcome.
+    # ``in``, not ``is not None``: ``skills: null`` must fail the parse. Read as
+    # "no skills", a ``prune=True`` reconcile would delete skill files on disk.
     if "skills" in raw:
         err = _parse_skills(raw["skills"])
         if err:

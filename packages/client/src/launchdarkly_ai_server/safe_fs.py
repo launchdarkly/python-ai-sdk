@@ -1,22 +1,17 @@
 """
-Descriptor-pinned filesystem primitives.
-
-Nothing here knows what a skill is: these primitives solve, once, the problem of
-writing a file under a directory another process may be racing to replace.
-``skills_fs.py`` is the only caller today.
+Descriptor-pinned filesystem primitives for writing files under a directory
+another process may be racing to replace.
 
 **The invariant:** every operation runs relative to a descriptor pinned to a
 directory the caller already verified, never against a re-resolved path. A path
 check is only as good as the last resolution after it.
 
-**POSIX only.** Windows has no ``*at()`` family, so only the per-component
-``lstat`` floor runs there — a check-then-use race rather than a closed window.
-Write permission on the managed root is therefore the only boundary on Windows,
-which is why the README documents a privilege-separated deployment as the
-mitigation rather than as advice.
+**POSIX only.** Windows has no ``*at()`` family, so only a per-component
+``lstat`` check runs there — a check-then-use race, not a closed window. On
+Windows, write permission on the managed root is the only boundary; the README's
+privilege-separated deployment is the mitigation.
 
-The threat model, the platform decision behind it, and what must not be relaxed
-are in ``agents.md`` under *Descriptor-pinned filesystem access*.
+Full threat model: ``agents.md``, *Descriptor-pinned filesystem access*.
 """
 
 from __future__ import annotations
@@ -32,59 +27,44 @@ from contextlib import contextmanager
 from pathlib import Path
 
 _FILE_MODE = 0o644
-"""Mode set explicitly on every written file — never inherited from the umask,
-and never executable."""
+"""Mode set explicitly on every written file: never from the umask, never
+executable."""
 
 _SUPPORTS_FCHMOD = hasattr(os, "fchmod")
-"""
-Whether the mode can be set on the descriptor rather than on a path.
-
-POSIX always has ``os.fchmod``; Windows only gained it in CPython 3.13, and this
-package supports 3.12. Probing for it rather than assuming it is what keeps the
-documented Windows fallback a fallback instead of an ``AttributeError`` raised
-after the temp file is already open.
-"""
+"""Whether the mode can be set on the descriptor. Probed because Windows only
+has ``os.fchmod`` from CPython 3.13, and this package supports 3.12."""
 
 SUPPORTS_DIR_FD = os.supports_dir_fd.issuperset(
-    # renameat, openat, unlinkat, fstatat, mkdirat, and unlinkat's AT_REMOVEDIR
-    # form — the six this module and its caller need.
+    # renameat, openat, unlinkat, fstatat, mkdirat, and unlinkat(AT_REMOVEDIR).
     {os.rename, os.open, os.unlink, os.stat, os.mkdir, os.rmdir}
 )
 """
 Whether the ``*at()`` syscall family is available. Gates every descriptor-pinned
-operation in this module; ``False`` falls back to the ``lstat`` floor.
+operation; ``False`` falls back to the ``lstat`` check.
 
-**Do not "correct" the names in this probe.** ``os.supports_dir_fd`` is
-populated per underlying syscall, and CPython registers ``renameat`` under
-``rename`` only and ``fstatat`` under ``stat`` only — so probing the
-``os.replace`` and ``os.lstat`` this module actually calls reports
-"unsupported" on every POSIX platform and silently disables the defense.
+**Do not "correct" the names in this probe.** CPython registers ``renameat``
+under ``os.rename`` only and ``fstatat`` under ``os.stat`` only, so probing
+``os.replace`` / ``os.lstat`` reports "unsupported" everywhere and silently
+disables the defense.
 """
 
 
 class DirectoryMissing(ValueError):
     """
-    Raised by ``open_directory_nofollow`` when nothing at the path is a
-    directory: the name is absent (``ENOENT``) or names a non-directory
-    (``ENOTDIR``).
+    Raised by ``open_directory_nofollow`` when the path is absent (``ENOENT``)
+    or is not a directory (``ENOTDIR``).
 
-    A ``ValueError`` subclass so a caller that treats every unpinnable directory
-    alike keeps its single ``except``; a distinct type so one for which "not
-    there" is an ordinary outcome — a prune whose file is already gone, a sweep
-    of a directory that was never created — can tell it from a refusal without
-    matching on a message or an errno. A symlink is never this: it is refused
-    as a symlink.
+    A ``ValueError`` subclass, so callers can catch every unpinnable directory
+    alike, or catch this alone to treat "not there" as an ordinary outcome. A
+    symlink never raises this; it is refused as a symlink.
     """
 
 
 def _at(directory: Path, dir_fd: int | None) -> str | Path:
     """
-    What to name *directory* by, given a descriptor for its parent.
-
-    With a *dir_fd*, the bare final component, so the kernel resolves it inside
-    the pinned parent; without one, the full path. Spelled once because a single
-    call site left on the full path would silently reopen the window the
-    descriptor closes.
+    How to name *directory* given a descriptor for its parent: the bare final
+    component with a *dir_fd*, the full path without. One helper, because a
+    single call site left on the full path would reopen the race.
     """
     return directory.name if dir_fd is not None else directory
 
@@ -95,21 +75,16 @@ def open_directory_nofollow(
     """
     Opens *directory* without following a final symlink, and pins it.
 
-    *dir_fd* is a descriptor for the *parent*. Passing one extends the guarantee
-    past the final component: ``O_NOFOLLOW`` refuses a link at *directory*
-    itself, but without a parent descriptor every ancestor is re-resolved on
-    each open.
+    *dir_fd* is a descriptor for the *parent*. Without one, ``O_NOFOLLOW`` only
+    protects the final component; every ancestor is re-resolved on the open.
 
     Returns ``None`` where the ``*at()`` family is absent, after an ``lstat``
-    check for a real non-symlink directory. It must not attempt the descriptor
-    open there: ``os.open`` cannot open a directory on Windows, so that path
-    would fail every operation rather than fall back.
+    check for a real, non-symlink directory (``os.open`` cannot open a directory
+    on Windows).
 
-    Raises ``ValueError`` when the path will not open, or inspect, as a real
-    directory — ``DirectoryMissing`` when that is because nothing is there or
-    what is there is not a directory, so a caller can treat absence as an
-    outcome rather than a failure. Both are decided by the open itself (or the
-    ``lstat`` on the floor), never by a separate existence probe on the path.
+    Raises ``ValueError`` when the path will not open as a real directory, or
+    ``DirectoryMissing`` when nothing is there or it is not a directory. Both are
+    decided by the open (or ``lstat``) itself, never by a separate existence check.
     """
     if not SUPPORTS_DIR_FD:
         try:
@@ -134,8 +109,7 @@ def open_directory_nofollow(
             f"the directory could not be opened without following links: {exc}"
         ) from exc
     try:
-        # O_DIRECTORY already guarantees this wherever the platform defines it;
-        # the explicit check is what covers the platforms that do not.
+        # Covers platforms without O_DIRECTORY.
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
             raise ValueError("the path is not a directory")
     except BaseException:
@@ -150,26 +124,21 @@ def open_or_create_directory(
     """
     Creates *directory* if absent and returns a descriptor pinned to it.
 
-    ``os.mkdir`` plus an ``lstat`` on the ``FileExistsError`` path, never
-    ``Path.mkdir(exist_ok=True)``: that accepts an existing
-    symlink-to-directory as "already there", reopening the gap the caller's
-    check just closed.
+    Uses ``os.mkdir`` plus an ``lstat`` on ``FileExistsError``, because
+    ``Path.mkdir(exist_ok=True)`` accepts an existing symlink-to-directory.
 
-    *dir_fd* is a descriptor for the parent, and the ``mkdir`` needs it as much
-    as the open does — ``mkdir`` follows a symlink at its parent, so a create
-    against the full path is how a directory gets made, and then written into,
-    outside the root.
+    *dir_fd* is a descriptor for the parent. The ``mkdir`` needs it too:
+    ``mkdir`` follows a symlinked parent, so creating against the full path
+    could create (and then write into) a directory outside the root.
     """
-    # A parent descriptor is only usable where the ``*at()`` family is, and the
-    # mkdir below would raise rather than take the floor without this.
+    # Without the *at() family the mkdir below would raise on a dir_fd.
     if not SUPPORTS_DIR_FD:
         dir_fd = None
     try:
         os.mkdir(_at(directory, dir_fd), 0o755, dir_fd=dir_fd)
     except FileExistsError:
-        # os.stat(follow_symlinks=False) on the descriptor path, os.lstat off it:
-        # identical results, and the former is the spelling os.supports_dir_fd
-        # advertises.
+        # os.stat(follow_symlinks=False) is the spelling os.supports_dir_fd
+        # advertises; it is equivalent to os.lstat.
         if dir_fd is not None:
             mode = os.stat(directory.name, dir_fd=dir_fd, follow_symlinks=False).st_mode
         else:
@@ -186,15 +155,11 @@ def pinned_directory(
     directory: Path, *, create: bool = False, dir_fd: int | None = None
 ) -> Iterator[int | None]:
     """
-    Holds *directory* pinned for the duration of the block, then releases it.
+    Holds *directory* pinned for the duration of the block, then closes it.
 
-    Yields what the two openers above return — a descriptor, or ``None`` on the
-    ``lstat`` floor — so a caller states the platform split once and cannot
-    forget the ``os.close``. Raises ``ValueError`` for a directory that will not
-    pin.
-
-    Note which descriptor is which: *dir_fd* pins the parent, and the yielded
-    one pins *directory* itself.
+    Yields a descriptor for *directory*, or ``None`` where the ``*at()`` family
+    is absent. *dir_fd*, if given, is the parent's descriptor. Raises
+    ``ValueError`` for a directory that cannot be pinned.
     """
     dir_fd = (
         open_or_create_directory(directory, dir_fd=dir_fd)
@@ -212,9 +177,8 @@ class SymlinkRefused(OSError):
     """
     Raised instead of removing a symlink found where a real file was expected.
 
-    An ``OSError`` subclass so a caller that only cares that the removal failed
-    keeps its single ``except``; a distinct type so one that must report *this*
-    refusal specifically does not have to match on a message.
+    An ``OSError`` subclass, so callers that only care that removal failed need
+    no extra ``except``.
     """
 
 
@@ -222,27 +186,21 @@ def unlink_file(directory: Path, name: str, *, dir_fd: int | None) -> None:
     """
     Removes ``<directory>/<name>``, refusing to follow a symlink at *name*.
 
-    Descriptor-relative for the same reason as ``atomic_write``: ``unlink``
-    never follows a *trailing* symlink, but it does resolve the directory above
-    it, so a swapped ``<directory>`` would turn this into a delete of an
-    attacker-chosen file.
+    Descriptor-relative because ``unlink`` resolves the directory above the
+    name: a swapped ``<directory>`` would otherwise delete an attacker-chosen file.
 
-    Raises ``SymlinkRefused`` when *name* is a symlink — refusing rather than
-    removing, because a link where the SDK expects its own file means the state
-    on disk is not what the manifest describes, and that is the caller's to
-    report rather than to tidy away.
+    Raises ``SymlinkRefused`` when *name* is a symlink: a link where the SDK
+    expects its own file means the disk does not match the manifest, which the
+    caller should report rather than silently tidy.
     """
     if dir_fd is None:
-        # No ``*at()`` family: the trailing-symlink check and the unlink are both
-        # path-based, the per-component floor.
+        # No *at() family: path-based check and unlink.
         target = directory / name
         if target.is_symlink():
             raise SymlinkRefused(f"{name} is a symlink")
         target.unlink()
         return
 
-    # os.stat(follow_symlinks=False), not os.lstat: identical result, and it is
-    # the spelling os.supports_dir_fd actually advertises.
     probe = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     if stat.S_ISLNK(probe.st_mode):
         raise SymlinkRefused(f"{name} is a symlink")
@@ -253,34 +211,29 @@ _TEMP_SUFFIX = ".tmp"
 """Suffix on every temp file this module creates."""
 
 _TEMP_TOKEN_BYTES = 8
-"""Bytes of randomness in a temp name, as ``secrets.token_hex`` takes them."""
+"""Bytes of randomness in a temp name."""
 
 _TEMP_TOKEN_PATTERN = re.compile(
-    # Two producers, one recognizer: ``secrets.token_hex`` on the descriptor
-    # path, ``tempfile.mkstemp``'s eight ``[a-z0-9_]`` characters on the
-    # fallback. Used with ``fullmatch``, so both branches are anchored.
+    # secrets.token_hex on the descriptor path; tempfile.mkstemp's eight
+    # [a-z0-9_] characters otherwise. Used with fullmatch.
     rf"[0-9a-f]{{{_TEMP_TOKEN_BYTES * 2}}}|[a-z0-9_]{{8}}"
 )
 
 
 def temp_name_prefix(name: str) -> str:
     """
-    The prefix every temp file for *name* is created under.
-
-    Spelled once because two callers must agree: ``atomic_write`` creates the
-    name and the orphan sweep recognizes it, and a second copy of the format
-    would drift from the writer.
+    The prefix every temp file for *name* is created under. Shared by
+    ``atomic_write`` and the orphan sweep so the two cannot drift.
     """
     return f".{name}."
 
 
 def is_temp_name(candidate: str, name: str) -> bool:
     """
-    Whether *candidate* is a name this module could have created for *name*.
+    Whether *candidate* is a temp name this module could have created for *name*.
 
-    Deliberately narrow — prefix, random token and suffix must all match, with
-    nothing before or after — because the only thing a caller does with a
-    ``True`` here is delete the file.
+    Deliberately strict (prefix, token and suffix must match exactly), because
+    callers delete the file when this returns ``True``.
     """
     prefix = temp_name_prefix(name)
     if not candidate.startswith(prefix) or not candidate.endswith(_TEMP_SUFFIX):
@@ -291,11 +244,9 @@ def is_temp_name(candidate: str, name: str) -> bool:
 
 def _mkstemp_at(dir_fd: int, prefix: str) -> tuple[int, str]:
     """
-    ``tempfile.mkstemp`` for a directory descriptor.
-
-    ``tempfile`` has no ``dir_fd`` form, so this reproduces the part that
-    matters: ``O_CREAT | O_EXCL`` against an unpredictable name, retried on
-    collision, so a planted temp path is never written through.
+    ``tempfile.mkstemp`` relative to a directory descriptor: ``O_CREAT | O_EXCL``
+    on an unpredictable name, retried on collision, so a planted temp path is
+    never written through.
     """
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     for _ in range(tempfile.TMP_MAX):
@@ -314,19 +265,16 @@ def atomic_write(
     Writes *data* to ``<directory>/<name>`` so no partial file is ever
     observable.
 
-    The temp file is created exclusively in the target's *own* directory — one
-    anywhere else would make the rename cross-device, and so not atomic —
-    written, fsynced, renamed over the target, and the directory fsynced so the
-    rename survives a crash. Mode is set explicitly rather than left to the
-    umask, and the execute bit is never set.
+    The temp file is created exclusively in the target's own directory (so the
+    rename is not cross-device), written, fsynced, renamed over the target, and
+    the directory fsynced so the rename survives a crash. The mode is set
+    explicitly, never executable.
 
-    Given a *dir_fd*, every one of those steps runs relative to that descriptor
-    and both names are bare filenames; without one, the identical sequence runs
+    With a *dir_fd*, every step runs relative to that descriptor; without one,
     against full paths.
 
-    ``os.replace`` is the one and only rename call site. ``os.rename`` must not
-    be substituted for it: only ``os.replace`` has defined overwrite semantics
-    on Windows.
+    Uses ``os.replace``, not ``os.rename``: only ``os.replace`` overwrites on
+    Windows.
     """
     at_fd = dir_fd if dir_fd is not None and SUPPORTS_DIR_FD else None
     prefix = temp_name_prefix(name)
@@ -343,20 +291,14 @@ def atomic_write(
 
     try:
         try:
-            # fchmod, not chmod: operating on the descriptor cannot be redirected
-            # by a swap of the temp path, and it makes the mode independent of
-            # the process umask (both creation paths open 0600).
+            # fchmod on the descriptor cannot be redirected by a swap of the
+            # temp path, and overrides the 0600 both creation paths use.
             if _SUPPORTS_FCHMOD:
                 os.fchmod(fd, _FILE_MODE)
             elif at_fd is None:
-                # Windows before 3.13 has no fchmod — and no ``*at()`` family
-                # either, so ``temp`` is a full path here and the mode goes on it.
-                # That concedes nothing on this platform: it is already on the
-                # path-based floor, the temp name is unguessable, and the only
-                # bit Windows takes from a POSIX mode is read-only. The branch
-                # is guarded on ``at_fd`` so that a platform with descriptors but
-                # no fchmod keeps the 0600 the exclusive open already set, rather
-                # than chmod a bare name relative to the current directory.
+                # Windows before 3.13: no fchmod and no *at() family, so temp is
+                # a full path. Guarded on at_fd so a platform with descriptors
+                # but no fchmod keeps 0600 rather than chmod a bare relative name.
                 os.chmod(temp, _FILE_MODE)
             view = memoryview(data)
             while view:
@@ -386,13 +328,11 @@ def atomic_write(
 
 def atomic_write_in(directory: Path, name: str, data: bytes) -> None:
     """
-    ``atomic_write`` against a directory this module does not already hold open.
+    ``atomic_write`` for a directory the caller does not already hold open.
 
-    The descriptor is taken with ``O_NOFOLLOW``, so a directory swapped for a
-    symlink between the caller's checks and the write fails it rather than
-    redirecting it. That still leaves the directory's *ancestors* re-resolved on
-    the open, so prefer ``atomic_write`` with a descriptor the caller already
-    holds; this is for callers that hold nothing better.
+    The directory is opened with ``O_NOFOLLOW``, so one swapped for a symlink
+    fails the write. Its ancestors are still re-resolved, so prefer
+    ``atomic_write`` with a descriptor you already hold.
     """
     with pinned_directory(directory) as dir_fd:
         atomic_write(directory, name, data, dir_fd=dir_fd)
