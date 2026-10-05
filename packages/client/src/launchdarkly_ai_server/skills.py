@@ -1,17 +1,12 @@
 """
 Agent Skills — reference discovery and content accessors.
 
-The public retrieval surface: projecting the skill references a resolved AI
-Config carries, and retrieving skill content through a configurable store.
+- ``skill_refs`` reads the skill references a resolved AI Config carries.
+- ``get_skill``, ``get_skill_result``, ``get_skills`` and ``all_skills`` return
+  verified skill content from the configured store.
+- ``InMemorySkillStore`` is a simple store for local development and tests.
 
-The feature is three modules, and the dependencies run one way only:
-
-- ``skills_core.py`` — the store interface, module state, integrity
-  verification, and store resolution. Shared, and imports neither of the others.
-- ``skills.py`` (this file) — ``skill_refs``, the accessors, and
-  ``InMemorySkillStore``.
-- ``skills_fs.py`` — materialization onto disk. It owns the manifest format and
-  the on-disk filenames; nothing here knows about the filesystem.
+Writing skills to disk lives in ``skills_fs`` (``write_skills``).
 """
 
 from __future__ import annotations
@@ -44,14 +39,8 @@ logger = logging.getLogger(__name__)
 # Injection points
 # ---------------------------------------------------------------------------
 #
-# ``init_client`` and ``shutdown`` reach the configured store through these
-# names. They delegate to ``skills_core``, which owns the state, so there is
-# exactly one store and one emitter no matter which layer reaches for it.
-#
-# Bound directly to the implementations rather than wrapped: a delegating
-# one-liner per name would give every state mutation two definitions to keep in
-# agreement. ``_set_emitter_for_testing`` keeps its distinct name because it has
-# no production caller.
+# Used by ``init_client`` and ``shutdown`` (and tests). The state itself lives in
+# ``skills_core``, so there is exactly one store and one emitter.
 _set_store = skills_core.set_store
 _set_emitter_for_testing = skills_core.set_emitter
 _clear_state = skills_core.clear_state
@@ -59,22 +48,16 @@ _clear_state = skills_core.clear_state
 
 class InMemorySkillStore:
     """
-    A skill store backed by plain dicts.
+    An in-memory skill store, for local development, tests, and
+    bring-your-own-content.
 
-    For local development, tests, and bring-your-own-content. Holds raw wire
-    objects verbatim and performs no validation of its own: verification belongs
-    at the accessor boundary, where it applies to every store equally.
-
-    Several versions of one key coexist here, because they coexist in a real
-    delivery payload: the newest version of every skill, plus every version a
-    variation currently pins. ``get_object`` therefore selects on
-    ``(key, version)``, and ``version=None`` means "the newest held".
-
-    An object whose ``version`` is not an integer >= 1 is still accepted and
-    still served, under its key alone. Withholding it is verification's job, not
-    the store's: a store that quietly refused it would make a malformed object
-    indistinguishable from an absent one, and no integrity signal would be
-    recorded.
+    - Holds raw skill objects verbatim and does no validation; the accessors
+      verify everything they return.
+    - Can hold several versions of one key. ``get_object`` selects on
+      ``(key, version)``; ``version=None`` means the newest held.
+    - An object with an invalid ``version`` is still stored (under its key
+      alone), so the accessors report it as an integrity failure rather than as
+      absent.
     """
 
     def __init__(self, objects: dict[str, dict[str, Any]] | None = None) -> None:
@@ -100,12 +83,12 @@ class InMemorySkillStore:
         Adds or replaces a raw skill object, keyed by its own ``key`` and
         ``version`` fields.
 
-        Putting a second version of a key keeps both; putting the same
-        ``(key, version)`` twice replaces it.
+        A second version of a key is kept alongside the first; the same
+        ``(key, version)`` replaces it. Then calls every ``"skill"`` listener with
+        the raw, unverified object.
 
-        Notifies every skill-kind listener with the raw object as a single
-        positional argument. No validation happens here, so a listener sees
-        exactly what was put, unverified.
+        Raises:
+            ValueError: If *raw* has no string ``key``.
         """
         key = raw.get("key")
         if not isinstance(key, str):
@@ -121,12 +104,8 @@ class InMemorySkillStore:
             return None
         held = self._versions.get(key, {})
         if not held:
-            # Nothing well-formed is filed under this key, so the version-less
-            # entry is all there is: serve it, and let verification withhold it
-            # with a signal rather than have it read as simply absent. A pin that
-            # misses while well-formed versions do exist is a plain miss, and
-            # answering it with a leftover malformed object would record an
-            # integrity failure for a skill whose integrity is not in question.
+            # Only a malformed entry exists: serve it so verification reports it.
+            # When well-formed versions exist, a missed pin is a plain miss.
             return self._loose.get(key)
         if version is not None:
             return held.get(version)
@@ -136,8 +115,8 @@ class InMemorySkillStore:
         """
         Every object held, one entry per ``(key, version)``.
 
-        The dict keys are opaque store-internal identifiers, as ``SkillStore``
-        documents. Do not parse them and do not assume one entry per skill key.
+        The dict keys are opaque identifiers: don't parse them or assume one
+        entry per skill key.
         """
         if kind != SKILL_OBJECT_KIND:
             return {}
@@ -153,14 +132,10 @@ class InMemorySkillStore:
         """
         Registers *fn* to be called with each raw object ``put`` under *kind*.
 
-        Only ``kind == SKILL_OBJECT_KIND`` is ever notified, because ``put``
-        only accepts skill objects — so a registration for any other kind
-        **raises** rather than being recorded and silently never firing. This is
-        the reason ``watch_skills`` refuses a store with no ``add_listener`` at
-        all: a listener that never fires looks exactly like one whose objects
-        never changed, and a store that accepted the registration has promised
-        something it cannot keep. ``FDv2SkillStore.add_listener`` refuses the
-        same way.
+        Raises:
+            ValueError: If *kind* is not ``"skill"``. This store notifies no other
+                kind, and a listener that silently never fires would look like
+                one whose skills never changed.
         """
         if kind != SKILL_OBJECT_KIND:
             raise ValueError(
@@ -172,11 +147,10 @@ class InMemorySkillStore:
 
     def remove_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:
         """
-        Unregisters *fn* from *kind*, so a subsequent ``put`` no longer calls it.
+        Unregisters *fn* from *kind*.
 
-        Removes one occurrence: a callable registered twice must be removed twice.
-        Removing a callable that is not registered is a no-op, not an error, so a
-        consumer that detaches on close can do so unconditionally.
+        Removes one registration per call. Removing a callable that is not
+        registered is a no-op.
         """
         listeners = self._listeners.get(kind)
         if listeners is None:
@@ -194,16 +168,14 @@ class InMemorySkillStore:
 
 def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
     """
-    Projects a resolved AI Config's ``skills`` array into typed references.
+    Returns the skill references attached to a resolved AI Config.
 
-    A pure projection — no network, no client, no store, no telemetry. Returns
-    ``[]`` when the config carries no skills. Compose it with the accessors for
-    per-context resolution: ``await get_skills(skill_refs(config))``.
+    Pure: no network, store, or telemetry. Returns ``[]`` when the config has no
+    skills. Typical use: ``await get_skills(skill_refs(config))``.
 
-    A config that came through ``parse_ai_config`` never contains an invalid
-    entry, since parsing fails closed on one. A hand-built dict can, and a
-    silently shortened projection would let ``write_skills`` prune the dropped
-    skill's on-disk copy, so every dropped entry is logged.
+    Invalid entries (possible only in a hand-built dict; ``parse_ai_config``
+    rejects them) are dropped with a warning, because ``write_skills`` with
+    ``prune=True`` would delete a dropped skill's files.
     """
     if not isinstance(config, dict):
         return []
@@ -223,8 +195,7 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
             continue
         key = entry.get("key")
         version = entry.get("version")
-        # Branch on the TypeGuard predicate (not the reason string) so the type
-        # checker narrows ``key`` to ``str`` for the reference below.
+        # Branch on the TypeGuard so ``key`` narrows to ``str``.
         if not is_valid_skill_key(key):
             logger.warning(
                 "skills[%d].key %s; it was dropped from the projection",
@@ -251,17 +222,20 @@ async def get_skill(key: str, *, version: int | None = None) -> Skill | None:
     """
     Retrieves one verified skill by key.
 
-    ``version=None`` means the newest version the store holds; a specific
-    ``version`` asks the store for that version and returns it only when the
-    store answers with it. A payload holding several versions of one key
-    resolves a pin to the pinned version, not to the newest.
-    Returns ``None`` — never raises — when the skill is missing, the requested
-    version is not the one held, or verification fails. Raises ``RuntimeError``
-    only when no skill store is configured.
+    Skills have no targeting, so there is no context parameter. For the skills a
+    given context's AI Config uses, call ``get_skills(skill_refs(config))``.
 
-    There is no context parameter: skills have no targeting, so the SDK
-    credentials fully determine availability. Compose per-context resolution
-    explicitly with ``get_skills(skill_refs(config))``.
+    Args:
+        key: The skill key.
+        version: The exact version to return. ``None`` (default) means the
+            newest version the store holds.
+
+    Returns:
+        The ``Skill``, or ``None`` if it is missing, not at the requested
+        version, or fails verification. Use ``get_skill_result`` to learn which.
+
+    Raises:
+        RuntimeError: If no skill store is configured.
     """
     return resolve_from_store(require_store(), key, version).skill
 
@@ -270,12 +244,10 @@ async def get_skill_result(key: str, *, version: int | None = None) -> SkillOutc
     """
     Retrieves one verified skill, reporting *why* when there is none.
 
-    Same retrieval, same verification, same telemetry as ``get_skill``; the two
-    differ only in what they report. ``get_skill`` collapses "no such skill",
-    "the store raised", "that is not the version held", and "the content failed
-    integrity verification" to one ``None``. This returns a ``SkillOutcome``
-    whose ``reason`` names which of them happened, so a caller can fail closed on
-    suspected tampering while tolerating a merely-absent skill:
+    Behaves exactly like ``get_skill`` (same lookup, verification, and
+    telemetry), but returns a ``SkillOutcome`` whose ``reason`` says what
+    happened instead of collapsing every failure to ``None``. Use it to fail
+    closed on tampering while tolerating a missing skill:
 
     ```python
     outcome = await get_skill_result("pdf-extraction")
@@ -285,14 +257,11 @@ async def get_skill_result(key: str, *, version: int | None = None) -> SkillOutc
         print(outcome.skill.content)
     ```
 
-    ``detail`` is human-readable and safe to surface — it names the key and the
-    failure mode, never any skill content or filesystem path. Branch on
-    ``reason``, not on ``detail``.
+    ``detail`` is a human-readable message, safe to log: it never contains skill
+    content or filesystem paths. Branch on ``reason``, not ``detail``.
 
-    Emits nothing of its own: verification has already recorded the log record
-    and the signal, and a second here would double-count one failure. Raises
-    ``RuntimeError`` only when no skill store is configured, as ``get_skill``
-    does.
+    Raises:
+        RuntimeError: If no skill store is configured.
     """
     resolved = resolve_from_store(require_store(), key, version)
     return SkillOutcome(
@@ -304,16 +273,21 @@ async def get_skills(refs: Sequence[SkillReference | str]) -> list[Skill]:
     """
     Retrieves a batch of verified skills.
 
-    Accepts a mixed sequence of ``SkillReference`` values and bare key strings,
-    where a string means "the latest version". Results follow input order for
-    the skills that were found; entries that are missing, are the wrong version,
-    or fail verification are omitted rather than returned as placeholders — and
-    a run that omitted anything logs a count at WARN, so a batch that resolved
-    nothing is not silent.
+    Args:
+        refs: ``SkillReference`` values and/or bare key strings (a string means
+            the newest version).
+
+    Returns:
+        The skills found, in input order. Entries that are missing, at the
+        wrong version, or fail verification are omitted, and a warning logs how
+        many.
+
+    Raises:
+        TypeError: If *refs* is a single string; pass ``[key]`` instead.
+        RuntimeError: If no skill store is configured.
     """
     if isinstance(refs, str):
-        # str satisfies Sequence[str], so this type-checks; iterating it would
-        # silently look up one skill per character.
+        # A str type-checks as Sequence[str] but would be iterated per character.
         raise TypeError(
             "get_skills takes a sequence of references; pass [key] rather than a "
             f"bare string. Got {refs!r}."
@@ -336,15 +310,17 @@ async def all_skills() -> list[Skill]:
     """
     Retrieves every verified skill the store currently holds.
 
-    Skills that fail verification are omitted. Raises ``RuntimeError`` only when
-    no skill store is configured.
+    Returns the newest version of each key. Skills that fail verification are
+    omitted, and a warning logs how many.
+
+    Raises:
+        RuntimeError: If no skill store is configured.
     """
     objects, error = list_raw_objects(require_store())
     if error is not None:
         return []
 
-    # One entry per key at its newest version: ``all_objects`` may hold several
-    # versions of one key, and a list carrying two of them is not a set of skills.
+    # The store may hold several versions per key; keep only the newest.
     candidates = newest_by_key(objects)
     skills: list[Skill] = []
     for _object_key, raw in candidates:

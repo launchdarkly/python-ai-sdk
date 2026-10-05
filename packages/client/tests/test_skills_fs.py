@@ -221,16 +221,10 @@ class _SwapRootDuring:
     ``<root>/<key>`` or as the bare ``<key>`` — and every other call passes
     straight through.
 
-    Matching *both* spellings is what keeps this honest across the fix. Code
-    that opens ``<root>/<key>`` by path names it absolutely; code that opens it
-    relative to a held root descriptor passes the bare key. Triggering only on
-    the absolute form would mean that the moment the root is pinned the trigger
-    stops matching, the swap never fires, and all three tests below pass while
-    asserting nothing — the ``race.swapped is True`` guard would be the only
-    thing standing between a real fix and a vacuous one, and it would be
-    carrying that weight for the wrong reason. Firing in both worlds is what
-    makes these
-    tests fail before the fix and pass after it.
+    Both spellings are matched because code that opens ``<root>/<key>`` by
+    path names it absolutely, while code that opens it relative to a held root
+    descriptor passes the bare key. Matching only the absolute form would never
+    fire against a pinned root, and the tests below would assert nothing.
     """
 
     def __init__(self, attribute: str, root: Path, key: str, outside: Path) -> None:
@@ -386,11 +380,8 @@ def oversize_content() -> tuple[str, str]:
     """Content one byte past the cap, with its hash — ``(content, sha256)``.
 
     Derived from ``MAX_SKILL_CONTENT_BYTES`` rather than written as a literal,
-    because a literal is how this went wrong: both consumers were pinned at the
-    old 64 KiB bound and stayed there when the cap moved to 10 MiB, which put
-    them *under* the limit and left them asserting that oversize content is
-    written and reported clean. Derived, they are one byte past whatever the
-    bound currently is, and moving it again cannot silently invert them.
+    so it stays one byte past the cap if the cap ever changes; a stale literal
+    would silently fall under the limit and invert the tests that use it.
 
     The bound's *value* is asserted once, in ``TestPackageExports``, which
     spells the literal out on purpose — reading it from the module there would
@@ -1791,17 +1782,13 @@ class TestSymlinkAttacks:
 class TestRootSwapRaces:
     """The swap one level up: the managed *root*, not ``<root>/<key>``.
 
-    ``_resolve_root`` validates the root and returns a path. It used to end
-    there: each write and each prune then opened ``<root>/<key>`` *by path* with
-    ``O_NOFOLLOW | O_DIRECTORY`` and pinned that, and ``O_NOFOLLOW`` guards only
-    the final component — so the root and every ancestor were re-resolved on
-    every such open, and a root renamed aside and replaced with a symlink after
-    validation redirected the open, and with it every descriptor-relative step
-    behind it, into the attacker's directory. The manifest rewrite refused, but
-    by then the skill file was already outside the root.
+    ``O_NOFOLLOW`` guards only the final path component, so opening
+    ``<root>/<key>`` by path would re-resolve the root on every open, and a
+    root renamed aside and replaced with a symlink after validation would
+    redirect the write into the attacker's directory.
 
-    ``write_skills`` now pins the root once, before anything is read or written,
-    and holds that descriptor for the whole reconcile: the skill directory is
+    ``write_skills`` therefore pins the root once, before anything is read or
+    written, and holds that descriptor for the whole reconcile: the skill directory is
     created and opened relative to it, the unlink and the ``rmdir`` run relative
     to it, and so does the manifest write. The swap still happens in each of
     these — ``race.swapped`` asserts it did — and the descriptor still names the
@@ -1965,34 +1952,17 @@ class TestRootSwapRaces:
     ) -> None:
         """The manifest is read through the descriptor, not through the path.
 
-        Read by path, the manifest was the one input to the reconcile that the
-        pin did not cover: the swap redirected the read into the attacker's
-        directory, the run adopted whatever entries it found there, and
-        ``_rewrite_manifest`` then committed them back over the *real* manifest
-        through the held descriptor. Nothing escaped the root — but the
-        ownership record inside it was destroyed, and that record is the only
-        thing standing between the next reconcile and the customer's own files.
-        Note that this is strictly worse than the behavior it replaced: before
-        the root was pinned at all, the manifest write was the one operation
-        that took its own ``O_NOFOLLOW`` descriptor, so a swapped root made the
-        write *fail* and left the real manifest intact.
+        Read by path, the swap would redirect the manifest read into the
+        attacker's directory, and ``_rewrite_manifest`` would then commit those
+        entries over the *real* manifest through the held descriptor. Nothing
+        escapes the root, but the ownership record — the only thing protecting
+        the customer's own files from the next reconcile — is destroyed.
 
-        The attacker's manifest here is valid and empty, which is the cheapest
-        version to plant and the one that does the most damage: every managed
-        file looks unowned, so the entry recording it is simply dropped on the
-        rewrite. ``prune`` is off so that what this asserts is the entries the
-        run read, uncoupled from what a prune driven by them would then remove
-        — which is the next test.
-
-        The write of the requested skill is refused either way, by the path
-        checks: they resolve ``<root>/other`` into the attacker's tree and see
-        it land outside the managed root. That refusal is what makes this test
-        narrow rather than weaker — with no write and no prune, the manifest
-        rewrite is the only thing left in the run, so the surviving entry can
-        only have come from reading the real manifest. It is also the two
-        layers doing the jobs they are each documented to do: the path checks
-        turn a hostile layout into a reported refusal, and the descriptor is
-        what makes the refusal unnecessary for correctness.
+        The attacker's manifest is valid and empty, so every managed entry
+        would be dropped on the rewrite. ``prune`` is off (the next test covers
+        it), and the path checks refuse the requested write, so the manifest
+        rewrite is the only thing left in the run: a surviving entry can only
+        have come from reading the real manifest.
         """
         root = tmp_path / "skills"
         root.mkdir()
@@ -2033,10 +2003,9 @@ class TestRootSwapRaces:
         The deletion then happens on the *next* reconcile — an ordinary one,
         with no attacker present and every path check passing, because by then
         the entry is in the legitimate manifest, the key is well formed, and the
-        path really is inside the real root. That is what makes reading the
-        manifest by path worth fixing rather than noting: the blast radius is
-        not the swapped run, it is every run after it, and the report for the
-        run that did the damage shows only a refusal.
+        path really is inside the real root. The blast radius is every run
+        after the swapped one, and the report for the run that did the damage
+        shows only a refusal.
 
         Both phases run here for that reason. Asserting only that the entry is
         absent after phase one would leave the consequence implicit, and the
@@ -2085,13 +2054,12 @@ class TestRootSwapRaces:
         """The existence probe before a prune is answered from the pinned
         directory, not from the path.
 
-        Answered from the path, a swap landing between the pin and the probe
-        made the probe look into the attacker's tree, find nothing, and skip
-        the unlink — while the prune still dropped the manifest entry and still
-        reported ``removed``. The revoked skill stayed on disk, now unmanaged,
-        under a report that said it was gone: the one outcome a revocation must
-        never have. The attacker's directory is empty here for exactly that
-        reason — it is the "nothing to remove" answer, planted.
+        Answered from the path, a swap between the pin and the probe would make
+        the probe find nothing in the attacker's tree and skip the unlink, while
+        the prune still drops the entry and reports ``removed`` — leaving the
+        revoked skill on disk under a report that says it is gone. The
+        attacker's directory is empty here to plant that "nothing to remove"
+        answer.
 
         Pinned, the probe sees the real file, the unlink removes it, and the
         report is true.
@@ -2124,8 +2092,8 @@ class TestRootSwapRaces:
         The real root holds a customer-authored file at the managed path with
         no manifest entry; the attacker's tree holds a byte-identical copy of
         the resolved content at the same relative path. Read by path, the
-        compare read landed on the attacker's copy, matched, and adopted — and
-        the entry it recorded was then written into the *real* manifest through
+        compare read would land on the attacker's copy, match, and adopt — and
+        the entry it records would be written into the *real* manifest through
         the held descriptor, claiming the customer's file for the next reconcile
         to overwrite or delete. Read through the pin, the bytes are the
         customer's, they differ, and the write is refused for the reason the
@@ -2161,8 +2129,8 @@ class TestRootSwapRaces:
         """The mirror image: the real root's file *is* the resolved content,
         left unrecorded by a reconcile killed before its manifest rewrite, and
         the attacker's tree holds something else at the same path. Read by
-        path, the compare read saw the attacker's bytes, they differed, and the
-        SDK refused to adopt its own file — blocking that skill on every later
+        path, the compare read would see the attacker's bytes, and the SDK
+        would refuse to adopt its own file — blocking that skill on every later
         run, on the strength of a file that was never inside the root. Read
         through the pin, the file is adopted as ``skipped_current``, which is
         what the real root's contents call for.
@@ -2232,28 +2200,16 @@ class TestRootSwapRaces:
     ) -> None:
         """The invariant behind the three races, asserted directly.
 
-        Each test above plants one swap and checks the blast radius, so each
-        covers the one sequence it races. This covers the property they are
-        each an instance of: across a reconcile that creates a directory,
-        writes a file, renames a temp over it, writes the manifest, unlinks and
-        removes the directory, *no* destructive call names an absolute path.
-        Every one passes a bare component and a descriptor to resolve it
-        against, which is what makes the swap unable to redirect any of them.
+        Across a reconcile that creates a directory, writes a file, renames a
+        temp over it, writes the manifest, unlinks and removes the directory,
+        *no* destructive call names an absolute path: each passes a bare
+        component and a descriptor. This catches a new full-path call site that
+        the race tests above, aimed at existing sequences, would miss.
 
-        Written as an audit rather than another race because the failure mode is
-        a new call site, not a new attack: one operation added on the full path
-        would reopen the window for that operation alone, and no swap test aimed
-        at the existing sequences would notice.
-
-        The reads that *decide* those calls are held to the same bar. The
-        existence probe and the compare read name ``SKILL.md``, the manifest
-        read names the manifest, and each must pass the bare name and a
-        descriptor; the orphan listing must be handed the descriptor itself.
-        ``_unsafe_path_reason`` is stubbed out for the run: its checks stat
-        absolute paths on purpose, as defense in depth ahead of the pin, and
-        they are not what this audit is about. With them out of the way, every
-        remaining read that names the skill file or the manifest is a decision
-        read, and must be pinned.
+        The decision reads (existence probe, compare read, manifest read) must
+        also pass a bare name and a descriptor, and the orphan listing the
+        descriptor itself. ``_unsafe_path_reason`` is stubbed out because its
+        absolute-path stats are defense in depth ahead of the pin.
         """
         monkeypatch.setattr(
             skills_fs_module, "_unsafe_path_reason", lambda *args, **kwargs: None

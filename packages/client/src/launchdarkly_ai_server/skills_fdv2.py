@@ -1,39 +1,19 @@
 """
 Agent Skills — the FDv2 delivery transport.
 
-The store implementation that talks to LaunchDarkly. It sits *below* the
-``SkillStore`` interface: it produces raw wire objects in the shape
-``skills_core`` documents, and everything above — the accessors, integrity
-verification, the ``Skill`` dataclass, materialization — is unaware of it.
+``FDv2SkillStore`` is the ``SkillStore`` that receives skills from LaunchDarkly
+over ``GET /sdk/poll`` or ``GET /sdk/stream``, authenticated with the
+environment's server-side SDK key. It holds raw wire objects and serves them to
+the accessors; it uses only the standard library.
 
-Layering::
+What it does not do:
 
-    launchdarkly_ai_server
-      └─ SkillStore protocol (skills_core)     ── the interface accessors call
-            └─ FDv2SkillStore (this module)    ── deserialise, hold, serve
-                  └─ LaunchDarkly's SDK-facing FDv2 channel
-                     GET /sdk/poll, GET /sdk/stream, authenticated with the
-                     environment's server-side SDK key
-
-Dependencies run one way: this module imports ``skills_core`` for the
-interface's kind constant and nothing else from the feature, and nothing in the
-feature imports it. It uses only the standard library, so it adds no dependency
-to a package whose sole runtime dependency is ``opentelemetry-api``.
-
-Three things this module does *not* do, on purpose:
-
-- **It does not verify content.** Verification lives at the accessor boundary in
-  ``skills_core`` so that it applies to every store equally, including a store
-  the application supplies itself.
-- **It does not work around a missing ``contentHash``.** A hashless object is
-  held verbatim and *withheld* by verification with ``missing_content_hash``.
-  This module's job is to make that outcome loud — see ``StoreDiagnostics``.
-- **It does not evaluate anything.** Flag and segment objects that share the
-  connection are skipped and counted, nothing more.
-
-Why the skill's version is read from the object's ``key`` and never from
-``version``, why changes commit at ``payload-transferred``, and why there is one
-network timeout are each explained where the code does it.
+- **Verify content.** Integrity verification happens at the accessor boundary,
+  so it applies to every store, including one you supply yourself.
+- **Work around a missing ``contentHash``.** Such an object is held as-is and
+  then withheld by verification with ``missing_content_hash``; the store logs an
+  error and counts it in ``StoreDiagnostics.hashless_objects``.
+- **Evaluate flags.** Non-skill objects are skipped and counted.
 """
 
 from __future__ import annotations
@@ -64,59 +44,32 @@ logger = logging.getLogger(__name__)
 
 FDV2_OBJECT_KIND = "skill"
 """
-The FDv2 ``kind`` skills are delivered under.
+The FDv2 object ``kind`` of a skill (exact, lower-case match).
 
-Object kinds on the SDK-facing channel are open strings: every object in the
-agent-skill payload carries the kind its producer registered, which for skills is
-the bare category name. Delivery lower-cases the kind, so an exact comparison is
-the whole test. The value happens to equal ``skills_core.SKILL_OBJECT_KIND``;
-they remain separate constants, because one is a wire value LaunchDarkly owns and
-the other is what this SDK asks a store for.
-
-Not ``FDV2_PAYLOAD_KIND``: this is the kind of the *objects*, that one the kind
-of the *payload* they arrive in.
+Distinct from ``FDV2_PAYLOAD_KIND``, the kind of the payload skills arrive in.
 """
 
 FDV2_PAYLOAD_KIND = "agent-skill"
 """
-The kind of the FDv2 payload skills are delivered in, declared on every request
-as ``?kinds=``.
+The FDv2 payload kind declared on every request as ``?kinds=``.
 
-Delivery narrows a connection to the payload kinds it declares and defaults to
-flags, so this is not an optimisation: a request that omits it receives the
-environment's flag payload and no skills at all. It also makes the connection
-carry exactly one payload — the shape ``_ProtocolReader`` is built for — since a
-skill-enabled environment assigns both the flag payload and this one.
-
-The wire accepts a comma-separated list; this store wants nothing but skills, so
-it declares this kind alone.
+Required: a request without it is served the flag payload and no skills.
 """
 
 FDV2_KEY_DELIMITER = ":"
 """
-What separates a skill's key from its version inside the object's wire ``key``.
-
-A generic object is identified on the wire as ``<key>:<version>`` — the skill's
-own key, one delimiter, the skill's own version — because each version of a
-skill is a distinct object in the payload. Delivery forbids the delimiter inside
-a registered category and skill keys cannot contain it, so a well-formed wire key
-has exactly one.
+Separates key from version in a skill object's wire ``key``
+(``<key>:<version>``). Each version of a skill is a separate object.
 """
 
 DEFAULT_BASE_URI = "https://sdk.launchdarkly.com"
-"""Where ``GET /sdk/poll`` is served. Overridable for Federal instances, private
-instances, and relay deployments."""
+"""Where ``GET /sdk/poll`` is served. Override for Federal, private, or relay
+deployments."""
 
 DEFAULT_STREAM_URI = "https://stream.launchdarkly.com"
 """
-Where ``GET /sdk/stream`` is served.
-
-LaunchDarkly serves streaming from a different host than polling, which is
-why this is a second default rather than a path under ``DEFAULT_BASE_URI``.
-
-A *base_uri* given on its own applies to both endpoints, because a relay or a
-private instance serving both from one host should need only one option; see
-``FDv2SkillStore.__init__``.
+Where ``GET /sdk/stream`` is served. LaunchDarkly streams from a different host
+than it polls from; a *base_uri* given without a *stream_uri* is used for both.
 """
 
 POLL_PATH = "/sdk/poll"
@@ -130,19 +83,13 @@ DEFAULT_STREAM_READ_TIMEOUT = 300.0
 between two reads. LaunchDarkly's heartbeats arrive well inside this."""
 
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-"""The most the transport will hold in memory from one response.
+"""The most the transport holds in memory from one poll body or one streamed event.
 
-A memory backstop, not a content limit. Verification caps each skill's content
-at 10 MiB in ``skills_core``; this bound is on what one poll body, or one
-streamed event, may accumulate *before* verification can run against it, and
-it is deliberately far above any payload LaunchDarkly legitimately serves. The
-two bound different things and are set independently. A body or event that
-crosses it is dropped unread as a recoverable transport failure: nothing from
-it is committed, the store keeps serving what it last held, and the delivery
-loop retries on its usual backoff."""
+A memory backstop set far above any real payload, separate from the per-skill
+content limit verification enforces. Crossing it is a recoverable failure:
+nothing is applied, the store keeps its current content, and delivery retries."""
 
 _READ_CHUNK_BYTES = 64 * 1024
-"""How much of a poll body is read per call while checking it against the bound."""
 
 _EVENT_SERVER_INTENT = "server-intent"
 _EVENT_PUT_OBJECT = "put-object"
@@ -158,19 +105,14 @@ _INTENT_TRANSFER_NONE = "none"
 
 _ENVELOPE_FIELDS = ("contentType", "content", "contentHash", "name", "description")
 """
-The skill object envelope's fields, copied through verbatim. Nothing is coerced
-or defaulted: a transport that filled in a missing field would be forging the
-very thing verification exists to check.
+Envelope fields copied verbatim. Never coerced or defaulted: filling in a
+missing field would forge what verification checks.
 """
 
 _PAYLOAD_SELECTOR = re.compile(r"\(p:([^:()]+):\d+\)")
 """
-The payload identity inside a transfer's selector, ``(p:<id>:<version>)``.
-
-The selector is the only place a completed transfer names its own payload:
-``put-object``, ``delete-object`` and ``payload-transferred`` carry no payload id
-of their own. ``_ProtocolReader`` reads it as a fallback for an intent that named
-no ``id``.
+The payload id inside a transfer's selector, ``(p:<id>:<version>)``. Used when
+the intent named no ``id``.
 """
 
 Mode = Literal["stream", "poll"]
@@ -178,8 +120,7 @@ Mode = Literal["stream", "poll"]
 _MOBILE_KEY_PREFIX = "mob-"
 _SERVER_KEY_PREFIX = "sdk-"
 _CLIENT_SIDE_ID = re.compile(r"\A[0-9a-f]{20,}\Z")
-"""A client-side environment ID: bare lowercase hex. Server-side and mobile keys
-both carry a prefix, so this shape is unambiguous rather than heuristic."""
+"""A client-side environment ID: unprefixed lowercase hex."""
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +130,11 @@ both carry a prefix, so this shape is unambiguous rather than heuristic."""
 
 def _require_server_side_credential(sdk_key: str) -> None:
     """
-    Refuses a mobile key or a client-side environment ID.
+    Raises ``ValueError`` for a missing key, a mobile key, or a client-side
+    environment ID.
 
-    Skill content is customer-confidential, and payload assignment is shared
-    across credential types, so a client-side credential may well *succeed*
-    against these endpoints — which is why this refuses rather than relying on
-    the server to. Raises rather than logs: a store built on the wrong
-    credential should not exist.
+    Skill content is confidential, and the server may not refuse a client-side
+    credential itself, so the SDK does.
     """
     if not isinstance(sdk_key, str) or not sdk_key.strip():
         raise ValueError(
@@ -218,8 +157,7 @@ def _require_server_side_credential(sdk_key: str) -> None:
             "process. Use the environment's server-side SDK key (sdk-...)."
         )
     if not key.startswith(_SERVER_KEY_PREFIX):
-        # Not rejected: private instances and test doubles issue credentials
-        # without the public prefix. Only the two unambiguous shapes above are.
+        # Warn only: private instances and test doubles may use unprefixed keys.
         logger.warning(
             "The credential given to FDv2SkillStore does not look like a "
             "LaunchDarkly server-side SDK key (sdk-...). Skills are delivered "
@@ -234,14 +172,10 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 def _require_https_uri(base_uri: str, option: str = "base_uri") -> None:
     """
-    Refuses a URI that would send the SDK key in cleartext.
+    Raises ``ValueError`` for a URI that would send the SDK key in cleartext.
 
-    Every request carries the environment's server-side SDK key in
-    ``Authorization``, so the transport is ``https://`` only. The one exception
-    is ``http://`` to a loopback host (``localhost``, ``127.0.0.1``, ``::1``),
-    which never leaves the machine and is what a local test double listens on.
-    Raises rather than logs, for the same reason the credential check does: a
-    store that would leak its key should not exist.
+    Requires ``https://`` with a host; plain ``http://`` is allowed only to a
+    loopback host (``localhost``, ``127.0.0.1``, ``::1``) for local test doubles.
     """
     if not isinstance(base_uri, str) or not base_uri.strip():
         raise ValueError(
@@ -275,11 +209,10 @@ def _require_https_uri(base_uri: str, option: str = "base_uri") -> None:
 @dataclass
 class StoreDiagnostics:
     """
-    What the transport has seen. Read-only from a caller's perspective.
+    Counters describing what the transport has seen. Read-only.
 
-    Not part of the ``SkillStore`` interface. It exists because "this environment
-    has no skills" and "every skill was withheld" are easy to mistake for each
-    other, and a counter is easier to assert on than a log line.
+    Useful for telling "this environment has no skills" apart from "every skill
+    was withheld".
     """
 
     payloads_transferred: int = 0
@@ -287,31 +220,28 @@ class StoreDiagnostics:
     skill_objects_received: int = 0
     """``put-object`` events identified as skills, across all payloads."""
     objects_ignored: int = 0
-    """Objects skipped because they were not skills. With the skill payload
-    declared on every request, that means a kind this version does not
-    recognise rather than the environment's flags. Skipping is the contract."""
+    """Objects skipped because they were not skills."""
     objects_revoked: int = 0
-    """``delete-object`` events applied to skills."""
+    """Skill revocations: each ``delete-object`` that removed something, plus each
+    key a full transfer dropped entirely (not a key whose version moved)."""
     payloads_ignored: int = 0
-    """
-    Transfers not applied because they completed a payload other than the one
-    skills arrive on. Zero while delivery sends one payload per connection.
-    """
+    """Transfers not applied because they completed a payload other than the
+    skill payload. Normally zero."""
     hashless_objects: int = 0
     """
     Skill objects whose envelope carried no ``contentHash``.
 
-    **Nonzero means skills are being withheld**: verification withholds every one
-    of these with ``missing_content_hash``.
+    **Nonzero means skills are being withheld** with ``missing_content_hash``.
+    Cumulative: read it as "this has happened", not as the current count.
     """
     connection_failures: int = 0
-    """Recoverable transport failures since the last successful transfer."""
+    """Recoverable transport failures in a row; reset by a completed exchange."""
     last_error: str | None = None
     """The most recent transport error, if any. Human-readable; do not parse."""
 
 
 # ---------------------------------------------------------------------------
-# Deserialisation — where the skill's version lives in the key, not in version
+# Deserialisation
 # ---------------------------------------------------------------------------
 
 
@@ -327,9 +257,8 @@ def _is_skill_event(data: Any) -> bool:
     """
     Whether one ``put-object`` / ``delete-object`` payload is a skill.
 
-    The kind alone decides it. Every other kind is ignored, not rejected,
-    because flag and segment objects share the connection and erroring on them
-    would turn a normal payload into a reconnect loop.
+    Other kinds are ignored rather than rejected, so an unrecognised kind cannot
+    cause a reconnect loop.
     """
     if not isinstance(data, dict):
         return False
@@ -351,23 +280,17 @@ _NO_VERSION = object()
 
 def _split_wire_key(wire_key: Any) -> _WireIdentity | None:
     """
-    Reads ``<key>:<version>`` off one object's wire ``key``.
+    Splits ``<key>:<version>`` from one object's wire ``key``.
 
-    Lenient where leniency keeps the object diagnosable and strict only where
-    there is nothing to diagnose:
+    Malformed versions are kept so verification can report them under a
+    recognisable key:
 
-    - No delimiter: the whole wire key is the skill key and there is no version,
-      so the object is held version-less and verification reports
-      ``invalid_version`` under a key the caller can recognise.
-    - A version that is not a run of digits (``"pdf:latest"``, ``"pdf:"``,
-      ``"a:1:2"``): the text is carried through *as the version*, for the same
-      reason — the caller learns that ``pdf`` arrived broken, not that it is
-      absent.
-    - An empty key before the delimiter (``":3"``): there is no identity to hold
-      it under, so ``None``, and the caller drops it.
+    - No delimiter: no version; verification reports ``invalid_version``.
+    - Non-digit version (``"pdf:latest"``, ``"pdf:"``, ``"a:1:2"``): the text
+      is kept as the version.
+    - Empty key (``":3"``): ``None``; the object is dropped.
 
-    Leading zeros are accepted (``"pdf:03"`` is version 3) since ``int`` is the
-    identity a reference pins, not the spelling.
+    Leading zeros are accepted (``"pdf:03"`` is version 3).
     """
     if not isinstance(wire_key, str) or not wire_key:
         return None
@@ -383,25 +306,16 @@ def _split_wire_key(wire_key: Any) -> _WireIdentity | None:
 
 def _store_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Translates one FDv2 skill ``put-object`` into the raw object shape the
-    ``SkillStore`` interface defines.
-
-    **The one translation this adapter must get right:**
+    Translates one FDv2 skill ``put-object`` into a raw ``SkillStore`` object.
 
         wire ``key``      →  stored ``key`` and ``version``  (split on ``:``)
         wire ``version``  →  dropped                          (the *payload* version)
 
-    Each version of a skill is its own object on the wire, identified as
-    ``<key>:<version>``; that version is what a ``{key, version}`` reference
-    pins. The event's ``version`` field is the version of the payload the object
-    arrived in and moves whenever anything in the environment moves. Confusing
-    them fails silently: the object verifies and the caller gets content under a
-    version number that means nothing.
+    The event's ``version`` is the payload's version, not the skill's; using it
+    would serve content under a meaningless version number.
 
-    Returns ``None`` only when the wire ``key`` carries no skill key at all,
-    since such an object has no identity to store it under. Every other defect
-    is carried through so that verification withholds it with a reason code
-    rather than the transport dropping it into indistinguishable absence.
+    Returns ``None`` only when the wire ``key`` has no skill key. Other defects
+    are carried through so verification withholds them with a reason code.
     """
     identity = _split_wire_key(data.get("key"))
     if identity is None:
@@ -414,8 +328,7 @@ def _store_object_from_put(data: dict[str, Any]) -> dict[str, Any] | None:
 
     raw: dict[str, Any] = {"key": identity.key}
 
-    # Absent stays absent and malformed stays malformed, so verification sees
-    # what arrived (as `invalid_version`) rather than something invented here.
+    # Absent or malformed versions pass through for verification to report.
     if identity.version is not _NO_VERSION:
         raw["version"] = identity.version
 
@@ -445,14 +358,11 @@ def _payload_id_from_selector(state: Any) -> str | None:
 
 def _tombstone_from_delete(data: dict[str, Any]) -> _Tombstone | None:
     """
-    Narrows one FDv2 skill ``delete-object`` to the identity it revokes, reading
-    the wire ``key`` the same way a put does.
+    Narrows one FDv2 skill ``delete-object`` to the identity it revokes.
 
-    An ``object_version`` of ``None`` means the delete named no usable version
-    and is read as "revoke every version of this key". That is the safe
-    direction: the alternative is continuing to serve content LaunchDarkly has
-    withdrawn. It also removes whatever a malformed put of the same wire key
-    left held, since that was stored version-less under the same skill key.
+    A delete with no usable version (``object_version=None``) revokes every
+    version of the key, including a version-less malformed entry. Erring this way
+    avoids serving withdrawn content.
     """
     identity = _split_wire_key(data.get("key"))
     if identity is None:
@@ -478,15 +388,8 @@ class _SkillObjectSet:
     """
     Raw skill objects held in memory, keyed by ``(key, version)``.
 
-    Lookup semantics are identical to ``InMemorySkillStore``'s, down to when a
-    version-less entry is reachable, so the store an application configures
-    cannot change how a pinned reference resolves. Reimplemented rather than
-    inherited because the transport needs ``delete`` and the atomic
-    ``replace_with`` a full transfer requires.
-
-    An object too malformed to carry a usable version is still held, under its
-    key alone, so verification withholds it with a signal rather than the
-    transport dropping it.
+    Lookups match ``InMemorySkillStore``. An object with no usable version is
+    held under its key alone so verification can withhold it with a reason.
     """
 
     def __init__(self) -> None:
@@ -523,12 +426,8 @@ class _SkillObjectSet:
     def get(self, key: str, version: int | None) -> dict[str, Any] | None:
         held = self._versions.get(key, {})
         if not held:
-            # Nothing well-formed is filed under this key, so the version-less
-            # entry is all there is: serve it, and let verification withhold it
-            # with a signal rather than have it read as simply absent. A pin
-            # that misses while well-formed versions do exist is a plain miss,
-            # and answering it with a leftover malformed object would record an
-            # integrity failure for a skill whose integrity is not in question.
+            # Only a version-less entry exists: serve it so verification reports
+            # it. A pin that misses while valid versions exist is a plain miss.
             return self._loose.get(key)
         if version is not None:
             return held.get(version)
@@ -577,22 +476,12 @@ class _TransferOutcome:
     fatal: str | None = None
     disconnect: str | None = None
     up_to_date: bool = False
-    """
-    The server said the content held is current and it has nothing to transfer.
-
-    A complete answer that commits nothing, which is what a 304 is to a poll.
-    The delivery loop counts it as a healthy connection; see
-    ``FDv2SkillStore._apply``.
-    """
+    """A ``none`` intent: the content held is current. Counts as a healthy
+    exchange though it commits nothing, like a 304 to a poll."""
 
 
 def _identity_of(raw: dict[str, Any]) -> tuple[str, Any]:
-    """
-    One object's ``(key, version)`` identity, as something comparable.
-
-    An object with no usable version compares alike to any other of its key,
-    which is what holding it under its key alone already means.
-    """
+    """One object's comparable ``(key, version)``; an unusable version is ``None``."""
     version = raw.get("version")
     return (raw["key"], version if is_valid_skill_version(version) else None)
 
@@ -601,14 +490,11 @@ def _revocations_between(
     current: _SkillObjectSet, pending: _SkillObjectSet
 ) -> list[dict[str, Any]]:
     """
-    Tombstones for every object *pending* no longer holds.
+    Tombstones for every ``(key, version)`` *pending* no longer holds.
 
-    A full transfer states the whole payload, so its revocations arrive as an
-    absence rather than as an event; this recovers them. At ``(key, version)``
-    granularity to match ``delete-object``, so a key whose version moved yields
-    both a put for the arrival and a tombstone for the departure — what a
-    listener that reads versions needs, and harmless to one that only needs
-    "something changed".
+    A full transfer revokes by omission; this recovers those revocations. A key
+    whose version moved yields a put for the new version and a tombstone for the
+    old one.
     """
     surviving = {_identity_of(raw) for raw in pending.all_raw()}
     return [
@@ -620,13 +506,9 @@ def _revocations_between(
 
 def _keys_fully_revoked(revoked: list[dict[str, Any]], pending: _SkillObjectSet) -> int:
     """
-    How many of *revoked* are true revocations rather than version moves.
+    How many keys in *revoked* left the payload entirely (not version moves).
 
-    Counted per key, not per tombstone: a key *pending* still holds under some
-    other version has moved, and only a key that left the payload entirely is
-    gone. That is what ``objects_revoked`` counts, the same rule
-    ``_delete_object`` applies when it counts only a tombstone that took
-    something away. ``changes`` carries every tombstone regardless.
+    This is what ``objects_revoked`` counts; ``changes`` carries every tombstone.
     """
     return len(
         {
@@ -639,22 +521,15 @@ def _keys_fully_revoked(revoked: list[dict[str, Any]], pending: _SkillObjectSet)
 
 class _ProtocolReader:
     """
-    Applies FDv2 events to an object set. Pure — no sockets, no threads, no
-    clock — so every wire case is testable without a server.
+    Applies FDv2 events to an object set. Pure: no sockets, threads, or clock.
 
-    **Changes are buffered and committed at ``payload-transferred``.** A payload
-    version is the unit of consistency: applying half of one would publish a
-    state the server never described, and on a full transfer would briefly empty
-    the store. Listeners therefore fire once per commit, not once per object.
-
-    **The first payload intent is read, and is taken to be the skill payload.**
-    Delivery provides one payload per credential and the protocol requires a
-    client to ignore all but the first intent. Should that ever widen, an
-    ``xfer-full`` for another payload would publish the skill set empty — with
-    pruning on, the difference between a reconcile and deleting the
-    application's files. So this layer learns which payload skills arrive on and
-    declines to apply a transfer of any other. The residual case is the first
-    transfer of a connection, where there is nothing to compare against yet.
+    - **Changes commit at ``payload-transferred``**, never half-applied, so a
+      full transfer never briefly empties the store and listeners fire only at
+      commit.
+    - **Only the first payload intent is read**, as the protocol requires, and
+      it is taken to be the skill payload. The reader learns which payload
+      carries skills and declines transfers of any other, which would otherwise
+      empty the skill set.
     """
 
     def __init__(self, committed: _SkillObjectSet) -> None:
@@ -663,12 +538,10 @@ class _ProtocolReader:
         self._pending: _SkillObjectSet | None = None
         self._changes: list[dict[str, Any]] = []
         self.diagnostics = StoreDiagnostics()
-        # Identities already reported by ``_warn_hashless``. Per reader, so a
-        # recreated store reports again and two stores never silence each other.
+        # Per reader, so each store reports hashless objects independently.
         self._warned_hashless: set[tuple[str, Any]] = set()
-        # The payload the current intent describes, and the payload skills have
-        # actually arrived on. One payload per connection makes these the same
-        # payload; the class docstring says why they are kept apart regardless.
+        # The payload the current intent describes, and the one skills arrive
+        # on; kept apart so a transfer of another payload can be declined.
         self._intent_payload_id: str | None = None
         self._skill_payload_id: str | None = None
         self._skills_in_payload = 0
@@ -712,8 +585,7 @@ class _ProtocolReader:
         self._changes = []
         self._skills_in_payload = 0
         if intent == _INTENT_TRANSFER_FULL:
-            # Built alongside the live set rather than in place, so an
-            # interrupted transfer leaves last known good intact.
+            # Built beside the live set so an interrupted transfer keeps it.
             self._pending = _SkillObjectSet()
         elif intent == _INTENT_TRANSFER_CHANGES:
             self._pending = self._committed.copy()
@@ -721,19 +593,15 @@ class _ProtocolReader:
             if intent != _INTENT_TRANSFER_NONE:
                 logger.debug("Ignoring FDv2 server-intent with intentCode %r", intent)
             self._pending = None
-            # ``none`` is a complete answer that carries nothing. An intent this
-            # module does not recognise is not an answer at all, so only the
-            # former reports itself up to date.
+            # Only ``none`` is an answer; an unrecognised intent is not.
             return _TransferOutcome(up_to_date=intent == _INTENT_TRANSFER_NONE)
         return _TransferOutcome()
 
     def _target_for(self, data: Any) -> _SkillObjectSet | None:
         """
-        The pending set a skill object event applies to, or ``None`` when the
-        event is not a skill or the current intent carries no objects.
-
-        An object arriving with no ``server-intent`` at all is treated as a
-        delta against what is held rather than dropped.
+        The pending set a skill event applies to, or ``None`` when the event is
+        not a skill or the current intent carries no objects. An object with no
+        preceding ``server-intent`` is treated as a delta.
         """
         if not _is_skill_event(data):
             self.diagnostics.objects_ignored += 1
@@ -771,16 +639,10 @@ class _ProtocolReader:
             return _TransferOutcome()
         removed = target.delete(tombstone)
         if removed:
-            # Only a tombstone that took something away is a revocation. A
-            # delete for a key the store never held revoked nothing, and
-            # counting it inflates the one counter an operator reads to work
-            # out whether a revocation actually landed. ``changes`` below
-            # carries the tombstone either way, so a listener still sees it.
+            # Counted only if it removed something; listeners see it either way.
             self.diagnostics.objects_revoked += 1
         # A revocation identifies the skill payload just as a put does.
         self._skills_in_payload += 1
-        # A tombstone carries identity and no content; see
-        # ``FDv2SkillStore.add_listener`` for what listeners should expect.
         self._changes.append(
             {"key": tombstone.key, "version": tombstone.object_version}
         )
@@ -790,10 +652,8 @@ class _ProtocolReader:
         state = data.get("state") if isinstance(data, dict) else None
         version = data.get("version") if isinstance(data, dict) else None
         payload_id = self._intent_payload_id or _payload_id_from_selector(state)
-        # Asked regardless of whether a pending set exists: a ``none`` intent
-        # builds none, and the transfer that completes it still names a payload
-        # whose selector must not become the resume point if it is not the
-        # payload skills arrive on.
+        # Checked even with no pending set (a ``none`` intent), so a foreign
+        # payload's selector never becomes the resume point.
         foreign = self._is_foreign_payload(payload_id)
         # A ``none`` intent builds no pending set, nor does an intent code this
         # SDK does not recognise, and a foreign payload's contents are declined
@@ -805,25 +665,17 @@ class _ProtocolReader:
             self._changes = []
         elif self._pending is not None:
             if self._intent == _INTENT_TRANSFER_FULL:
-                # A full transfer revokes by omission: whatever it did not carry
-                # is gone, and no ``delete-object`` ever says so. Diffed before
-                # the swap, so those departures reach listeners as tombstones
-                # like any other revocation — without which the one case pruning
-                # exists for, an environment's last skill being revoked, would
-                # empty the store and wake nobody.
+                # A full transfer revokes by omission. Diff before the swap so
+                # those departures reach listeners as tombstones.
                 revoked = _revocations_between(self._committed, self._pending)
                 self._changes.extend(revoked)
-                # Every departure is reported; only a key that left counts as
-                # revoked.
                 self.diagnostics.objects_revoked += _keys_fully_revoked(
                     revoked, self._pending
                 )
             self._committed.replace_with(self._pending)
             _warn_if_nothing_can_verify(self._committed)
             if self._skills_in_payload and payload_id is not None:
-                # Learnt, not configured: nothing below the interface is told
-                # which payload is which, so the payload that carried a skill
-                # put or revocation is the payload skills arrive on.
+                # The payload that carried a skill put or delete is the skill payload.
                 self._skill_payload_id = payload_id
         self._pending = None
         self._intent = None
@@ -881,10 +733,8 @@ class _ProtocolReader:
 
     def _is_foreign_payload(self, payload_id: str | None) -> bool:
         """
-        Whether a transfer completes a payload other than the one skills arrive on.
-
-        ``False`` unless both payloads are known, so one-payload delivery and
-        the first transfer of a connection are unaffected.
+        Whether a transfer completes a payload other than the skill payload.
+        ``False`` unless both payload ids are known.
         """
         return (
             self._skill_payload_id is not None
@@ -896,12 +746,8 @@ class _ProtocolReader:
 
     def _warn_multiple_payloads(self, payloads: list[Any]) -> None:
         """
-        One WARNING per reader for an intent describing more than one payload.
-
-        Not an error: reading only the first is what the protocol asks for. But
-        it means the first payload is no longer *guaranteed* to be the skill
-        payload, and an intent for another payload arriving before any skill has
-        been seen is the one case ``_is_foreign_payload`` cannot catch.
+        One WARNING per reader for an intent describing more than one payload:
+        the first is then not guaranteed to be the skill payload.
         """
         if self._warned_multiple_payloads:
             return
@@ -931,10 +777,8 @@ class _ProtocolReader:
 
     def _warn_hashless(self, raw: dict[str, Any]) -> None:
         """
-        One ERROR per ``(key, version)`` whose envelope had no ``contentHash``.
-
-        ERROR rather than WARN because an empty accessor result is otherwise
-        indistinguishable from an environment that has no skills.
+        One ERROR per ``(key, version)`` whose envelope had no ``contentHash``,
+        so withheld skills are not mistaken for an environment with none.
         """
         identity = (raw["key"], raw.get("version"))
         if identity in self._warned_hashless:
@@ -962,11 +806,10 @@ _HASHLESS_ADVICE = (
 
 def _warn_if_nothing_can_verify(committed: _SkillObjectSet) -> None:
     """
-    One ERROR per committed payload in which *nothing* held can possibly verify.
+    One ERROR per committed payload in which *nothing* held can verify.
 
-    ``log_withholding_summary`` reports the same condition at the accessor
-    boundary, but only once a caller asks. This fires at delivery time, so it is
-    visible in a process that boots, materializes nothing, and exits.
+    Fires at delivery time, so it shows even in a process that never reads a
+    skill.
     """
     held = committed.all_raw()
     if not held:
@@ -1001,14 +844,9 @@ class _RecoverableTransportError(Exception):
 
 class _StaleRequestStateError(_RecoverableTransportError):
     """
-    An HTTP 400 for a request carrying client state — the ``basis`` selector, or
-    an ``If-None-Match`` etag.
-
-    That state is the one part of the request that can go stale, so it is
-    dropped and a full transfer asked for **once** before the status is treated
-    as fatal. The bound is what keeps a 400 from being plain "recoverable": a
-    request carrying no state at all was itself refused, and no reconnect fixes
-    that.
+    An HTTP 400. If the request carried client state (``basis`` or an
+    ``If-None-Match`` etag), that state is dropped and a full transfer requested
+    once; a 400 for a request with no state is fatal.
     """
 
 
@@ -1028,11 +866,8 @@ _FORBIDDEN_ADVICE = (
 
 def _retry_after_seconds(headers: Any) -> float | None:
     """
-    ``Retry-After`` in seconds, when the server sent a usable one.
-
-    The HTTP-date form, and non-finite values such as ``inf`` or ``1e309`` that
-    ``float`` accepts, fall back to this module's backoff: none is a delay,
-    and an infinite one would overflow the wait that honours it.
+    ``Retry-After`` in seconds, or ``None`` when absent or unusable (the
+    HTTP-date form, or a non-finite number), in which case normal backoff applies.
     """
     if headers is None:
         return None
@@ -1071,29 +906,20 @@ def _classify_status(status: int, headers: Any) -> Exception:
             "to."
         )
     if status == 404:
-        # The endpoint does not exist for this credential or instance — a
-        # mistyped base URI, typically. No reconnect produces one.
+        # Typically a mistyped base URI; retrying will not help.
         return _FatalTransportError(
             "LaunchDarkly returned HTTP 404 for the FDv2 endpoint. Check the "
             "base URI, and that this instance serves /sdk/poll and /sdk/stream."
         )
     if status == 400:
-        # The one rejection this adapter can act on: the selector it sent may be
-        # one the server no longer accepts. Recoverable so the state can be
-        # dropped and a full transfer requested; fatal once that has been tried.
+        # The selector sent may be stale: recoverable once (see
+        # ``_StaleRequestStateError``).
         return _StaleRequestStateError(
             f"LaunchDarkly returned HTTP 400. {_REQUEST_ADVICE}"
         )
     if status == 422:
-        # Delivery refuses a connection whose declared kinds match no payload it
-        # is assigned, and chose a non-400 4xx so SDKs stop instead of retrying.
-        #
-        # Word-for-word the TypeScript SDK's message, deliberately: a customer
-        # comparing two LaunchDarkly SDKs should not have to work out whether
-        # they hit two different conditions. Names the one cause a reader can act
-        # on and refers every other case to support, rather than enumerating
-        # causes that are not theirs to fix — see the store's docs for what else
-        # produces this status and for the fact that ``start()`` resumes the store.
+        # No payload matching the declared kinds is available on this
+        # connection, most often because of a view-scoped SDK key. Fatal.
         return _FatalTransportError(
             "LaunchDarkly will not deliver Agent Skills on this connection "
             "(HTTP 422). The usual cause is a view-scoped SDK key. Check your "
@@ -1113,11 +939,9 @@ def _interrupt_read(response: Any) -> None:
     """
     Best-effort interruption of a read blocked on *response*, from another thread.
 
-    Closing the response is not enough: CPython's buffered reader stays parked in
-    ``readline`` until bytes arrive. Shutting the *socket* down underneath it
-    unblocks it immediately. Reaching the socket means walking urllib's private
-    attribute chain, so every step is guarded and failure is silent: the
-    delivery thread is a daemon and ``close``'s join timeout is the backstop.
+    Closing the response does not unblock a parked ``readline``; shutting down
+    the socket does. That socket is reached through urllib's private attributes,
+    so every step is guarded and failure is silent.
     """
     for path in (("fp", "raw", "_sock"), ("fp", "_sock"), ("_sock",)):
         found: Any = response
@@ -1134,10 +958,7 @@ def _interrupt_read(response: Any) -> None:
 
 
 class _StreamConnection:
-    """
-    One open streaming connection: an event iterator plus a way to interrupt it
-    from another thread, which is what ``FDv2SkillStore.close`` needs.
-    """
+    """One open streaming connection: an event iterator that ``close`` can interrupt."""
 
     def __init__(self, response: Any) -> None:
         self._response = response
@@ -1156,13 +977,9 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
     """
     A redirect handler that follows nothing.
 
-    The standard handler copies every request header onto the redirected
-    request, ``Authorization`` included, so a 3xx from a proxy or a misconfigured
-    private instance would hand the SDK key to whatever host ``Location`` names.
-    Declining here makes ``urllib`` surface the 3xx as an ``HTTPError``, which
-    ``_classify_status`` turns into a fatal, non-retried failure. Same-host
-    redirects are refused too: the endpoints this module calls do not redirect,
-    and a 304 is not a redirect and never reaches this handler.
+    Following a redirect would forward the ``Authorization`` header (the SDK key)
+    to whatever host ``Location`` names. Refused 3xx responses surface as
+    ``HTTPError`` and are fatal. The FDv2 endpoints never redirect.
     """
 
     def redirect_request(
@@ -1191,12 +1008,10 @@ class _PollResult:
 
 class _Requester:
     """
-    The only place this module opens a socket. Standard library only, on purpose.
+    The only place this module opens a socket.
 
-    *read_timeout* is applied to every socket operation of a request. ``urllib``
-    has no separate connect timeout: its ``timeout`` becomes the socket timeout
-    for the whole operation, so connecting, waiting for headers and each body
-    read are all bounded by the same value.
+    *read_timeout* bounds every socket operation of a request (connect, headers,
+    each body read); ``urllib`` has no separate connect timeout.
     """
 
     def __init__(
@@ -1210,28 +1025,21 @@ class _Requester:
     ) -> None:
         self._sdk_key = sdk_key
         self._base_uri = base_uri.rstrip("/")
-        # Streaming and polling are served from different hosts by LaunchDarkly;
-        # a caller that names only one host means both, which is a relay or a
-        # private instance. ``FDv2SkillStore`` resolves the two-default case.
         self._stream_uri = (stream_uri or base_uri).rstrip("/")
         self._read_timeout = read_timeout
-        # Injectable, so an alternative transport can be supplied. The default
-        # never follows a redirect; see ``_RefuseRedirects``.
+        # The default opener never follows a redirect; see ``_RefuseRedirects``.
         self._opener = opener or _build_opener()
         self._lock = threading.Lock()
-        # The response of a poll in flight, so ``interrupt`` can reach its
-        # socket from another thread. Polling only: a stream's response is
-        # handed straight to the caller as a ``_StreamConnection``, which
-        # carries an interrupt of its own.
+        # The in-flight poll response, so ``interrupt`` can reach its socket.
+        # Streams are interrupted through their ``_StreamConnection``.
         self._in_flight: Any = None
 
     def interrupt(self) -> None:
         """
         Unblocks a poll parked in its body read, from another thread.
 
-        Best effort, and safe to call when nothing is in flight. A request still
-        inside its connect has no response to reach yet and is bounded only by
-        ``read_timeout``; ``FDv2SkillStore.start`` covers what that leaves.
+        Best effort; a no-op when nothing is in flight. A request still
+        connecting is bounded only by ``read_timeout``.
         """
         with self._lock:
             response = self._in_flight
@@ -1240,19 +1048,11 @@ class _Requester:
 
     def _url(self, origin: str, path: str, basis: str | None) -> str:
         """
-        The request URL: the path, the payload kind this store accepts, and
-        ``basis`` once a payload has committed.
+        The request URL: ``?kinds=`` on every request (see
+        ``FDV2_PAYLOAD_KIND``), plus ``basis`` once a payload has committed.
 
-        *origin* is the host for this path — polling and streaming have one
-        each.
-
-        ``kinds`` is on the first request too: it selects what the connection is
-        served rather than describing what it holds (see ``FDV2_PAYLOAD_KIND``).
-
-        Deliberately no ``mv`` (data model version). That parameter selects the
-        *flag* data model, and delivery overrides it with the payload's own
-        default for any non-flagging payload, so sending it would state a
-        preference that is ignored.
+        No ``mv`` parameter: it selects the flag data model and does not apply
+        to skills.
         """
         query: dict[str, str] = {"kinds": FDV2_PAYLOAD_KIND}
         if basis:
@@ -1288,8 +1088,7 @@ class _Requester:
                         self._in_flight = None
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
-                # urllib raises on any non-2xx, 304 included; it is a current
-                # answer here, not a redirect, and is handled before classifying.
+                # urllib raises on 304; here it means "unchanged".
                 return _PollResult(not_modified=True, events=[], etag=etag)
             raise _classify_status(exc.code, exc.headers) from exc
         except _RecoverableTransportError:
@@ -1324,11 +1123,8 @@ class _Requester:
 
 def _read_bounded(response: Any, limit: int) -> bytes:
     """
-    Reads a whole poll body, holding no more than *limit* bytes of it.
-
-    Read in chunks rather than all at once so a body that is never going to be
-    accepted is abandoned as soon as it crosses the bound, with at most one
-    byte over it in memory, instead of being buffered whole and measured after.
+    Reads a whole poll body in chunks, abandoning it as soon as it exceeds
+    *limit* bytes.
     """
     chunks: list[bytes] = []
     seen = 0
@@ -1347,8 +1143,8 @@ def _read_bounded(response: Any, limit: int) -> bytes:
 
 def _decode_poll_body(body: bytes) -> list[tuple[str, Any]]:
     """
-    Unwraps ``{"events": [...]}``. Polling and streaming carry identical event
-    objects, which is why the protocol reader is shared between the two modes.
+    Unwraps ``{"events": [...]}``. Poll and stream events are identical, so both
+    modes share one protocol reader.
     """
     try:
         parsed = json.loads(body.decode("utf-8"))
@@ -1370,19 +1166,12 @@ def _decode_poll_body(body: bytes) -> list[tuple[str, Any]]:
 
 def _iter_stream_lines(response: Any, limit: int) -> Any:
     """
-    Yields a streaming body's raw lines, presenting a read failure as retryable
-    and refusing any single line longer than *limit* bytes.
+    Yields a streaming body's raw lines, refusing any line over *limit* bytes.
 
-    A live stream dies mid-body far more often than it refuses to open: a read
-    timeout on a stream that went quiet, a reset, a truncated chunk. Each of
-    those arrives as whatever the socket raised, and the delivery loop retries
-    only the transport errors this module defines — anything else it reads as a
-    bug and stops for the process lifetime. Connecting is already wrapped in
-    ``_Requester.stream``; this is the same promise for the body.
-
-    Lines are read with a size argument rather than by iterating the response,
-    because an unbounded ``readline`` buffers until it finds a newline, and a
-    line that never ends would be held whole before anything here saw it.
+    Any read failure (timeout, reset, truncation) is re-raised as
+    ``_RecoverableTransportError``; the delivery loop treats other exceptions as
+    bugs and stops. ``readline`` is given a size so a line that never ends is not
+    buffered whole.
     """
     try:
         while True:
@@ -1408,13 +1197,10 @@ def _iter_sse(response: Any) -> Any:
     """
     Decodes an SSE body into ``(event name, data)`` pairs.
 
-    Minimal on purpose: ``event:``/``data:`` fields, multi-line ``data`` joined
-    with newlines, a blank line dispatching, and ``:`` comments skipped.
-
-    One event may accumulate at most ``MAX_RESPONSE_BYTES`` across its lines.
-    Past that it is a recoverable transport failure: the generator raises, the
-    delivery loop drops the connection and retries, and the payload in flight
-    is abandoned rather than committed.
+    Minimal: ``event:``/``data:`` fields, multi-line ``data`` joined with
+    newlines, blank line dispatches, ``:`` comments skipped. An event over
+    ``MAX_RESPONSE_BYTES`` raises a recoverable error and the in-flight payload
+    is abandoned.
     """
     limit = MAX_RESPONSE_BYTES
     try:
@@ -1473,9 +1259,7 @@ def _backoff_delay(
     """
     Exponential backoff with jitter, capped at *maximum*.
 
-    Jitter is subtractive over the whole range rather than added on top, so the
-    cap is a real ceiling: a fleet restarted together must not reconnect in
-    lockstep, and must not exceed the interval the cap promises.
+    Jitter is subtracted, never added, so *maximum* is a true ceiling.
     """
     # float(2 ** n): the integer power is untyped to mypy.
     ceiling: float = min(maximum, base * float(2 ** max(0, attempt - 1)))
@@ -1506,47 +1290,20 @@ class FDv2SkillStore:
 
     It also works as a context manager.
 
-    **Server-side only.** A mobile key or a client-side environment ID is
-    refused in the constructor.
-
-    **The SDK key goes only where it was pointed.** *base_uri* and *stream_uri*
-    must each be ``https://`` — plain ``http://`` is refused except to a
-    loopback host, for local test doubles — and redirects are never followed, so
-    a 3xx from a proxy or a private instance is a fatal failure rather than a
-    request carrying the key to whatever host ``Location`` named.
-
-    **Polling and streaming have separate hosts.** LaunchDarkly serves them from
-    different origins, so the defaults are a pair (``DEFAULT_BASE_URI`` and
-    ``DEFAULT_STREAM_URI``). A *base_uri* given on its own applies to both,
-    which is what a relay or a private instance serving both endpoints from one
-    host needs.
-
-    **``close`` is final.** A closed store still answers from what it received,
-    but delivery cannot be resumed: ``start`` afterwards raises. Construct a new
-    store instead.
-
-    **Delivery is in the background; retrieval is not.** A daemon thread owns
-    the connection and fills memory, and ``get_object`` only ever reads what has
-    already arrived. A process that calls ``get_skill`` immediately after
-    ``start()`` may see an empty store; ``wait_for_skills`` orders boot against
-    the first payload, and ``is_initialized`` reports the same fact without
-    waiting — which is what stops ``write_skills("*")`` from pruning against a
-    store that has not heard yet.
-
-    **Last known good survives an outage.** A transport failure never empties
-    the store and never makes ``get_object`` raise, which is what makes
-    ``write_skills(on_unavailable="keep")`` correct. ``diagnostics`` and
-    ``failed`` report the degradation.
-
-    **Reads are memory-bounded.** No poll body or streamed event is held past
-    ``MAX_RESPONSE_BYTES``; one that crosses it is dropped unapplied as a
-    recoverable failure, the store keeps serving what it last held, and
-    delivery retries.
-
-    **What arrives is untrusted.** Raw wire objects are held verbatim and
-    verified at the accessor boundary, not here. In particular an object with no
-    ``contentHash`` is held and then *withheld*; see
-    ``StoreDiagnostics.hashless_objects``.
+    - **Server-side only.** A mobile key or client-side environment ID raises.
+    - **The SDK key stays where you point it.** URIs must be ``https://``
+      (``http://`` only to loopback) and redirects are never followed.
+    - **Delivery runs in the background.** A daemon thread fills memory;
+      ``get_object`` reads only what has arrived. Use ``wait_for_skills`` or
+      ``is_initialized`` before relying on content.
+    - **Last known good survives an outage.** A transport failure never empties
+      the store or makes ``get_object`` raise; ``diagnostics`` and ``failed``
+      report it.
+    - **``close`` is final.** A closed store still serves what it received, but
+      ``start`` raises; construct a new store instead.
+    - **Content is verified by the accessors, not here.** An object with no
+      ``contentHash`` is held and then withheld; see
+      ``StoreDiagnostics.hashless_objects``.
     """
 
     def __init__(
@@ -1564,44 +1321,28 @@ class FDv2SkillStore:
         _requester: Any = None,
     ) -> None:
         """
-        *base_uri* is where ``GET /sdk/poll`` is sent (``DEFAULT_BASE_URI``) and
-        *stream_uri* where ``GET /sdk/stream`` is sent (``DEFAULT_STREAM_URI``),
-        because LaunchDarkly serves the two from different hosts. A *base_uri*
-        given **without** a *stream_uri* is used for both, which is what a relay
-        or a private instance serving both endpoints from one host needs; naming
-        both overrides them independently. Each must be ``https://``;
-        ``http://`` is accepted only for ``localhost``, ``127.0.0.1`` or
-        ``::1``. Raises ``ValueError`` otherwise.
+        Raises ``ValueError`` for an invalid credential, URI, mode, or interval.
 
-        *mode* is ``"stream"`` by default. Prefer it: a ``delete-object`` reaches
-        a live stream in seconds. ``"poll"`` exists for environments that cannot
-        hold a long-lived connection, and revocation there is one
-        ``poll_interval`` late.
-
-        *poll_interval* must be a positive finite number of seconds. ``nan`` and
-        ``inf`` raise alongside a non-positive value: both pass a bare ``<= 0``
-        guard and then mean opposite things to the wait between polls.
-
-        *read_timeout* is the only network timeout and bounds every socket
-        operation of a request, so its meaning and default follow the mode: in
-        ``"poll"`` it bounds the whole request (``DEFAULT_POLL_TIMEOUT``); in
-        ``"stream"`` it bounds each wait for the next bytes
-        (``DEFAULT_STREAM_READ_TIMEOUT``). Must be positive and finite when
-        given.
-
-        *max_backoff* caps every delay between retries, including one the server
-        asks for with ``Retry-After``.
-
-        *max_consecutive_failures* bounds the retry loop. On exceeding it the
-        transport stops, logs an error, and the store keeps serving last known
-        good; ``failed`` reports it. Only failures in a row count: a committed
-        payload resets the count. The one request built from nothing after a
-        stale selector is refused is exempt, so an outage that has already
-        spent the budget cannot swallow the one repair available.
+        - *base_uri*: origin for ``GET /sdk/poll`` (default ``DEFAULT_BASE_URI``).
+          Given without *stream_uri*, it is used for streaming too (relays and
+          private instances).
+        - *stream_uri*: origin for ``GET /sdk/stream`` (default
+          ``DEFAULT_STREAM_URI``). Both must be ``https://``; ``http://`` is
+          accepted only for ``localhost``, ``127.0.0.1`` or ``::1``.
+        - *mode*: ``"stream"`` (default, recommended: revocations arrive in
+          seconds) or ``"poll"`` (revocations arrive within one *poll_interval*).
+        - *poll_interval*: seconds between polls; positive and finite.
+        - *read_timeout*: the only network timeout, positive and finite. In
+          ``"poll"`` mode it bounds the whole request (``DEFAULT_POLL_TIMEOUT``);
+          in ``"stream"`` mode, each wait for more bytes
+          (``DEFAULT_STREAM_READ_TIMEOUT``).
+        - *max_backoff*: caps every retry delay, including ``Retry-After``.
+        - *max_consecutive_failures*: after this many failures in a row,
+          delivery stops, logs an error, and ``failed`` is set; the store keeps
+          serving last known good. A completed exchange resets the count.
         """
         _require_server_side_credential(sdk_key)
-        # A lone ``base_uri`` means "both endpoints are here"; the two-host
-        # default applies only when neither was named.
+        # A lone ``base_uri`` serves both endpoints.
         if stream_uri is None:
             stream_uri = DEFAULT_STREAM_URI if base_uri is None else base_uri
         if base_uri is None:
@@ -1610,14 +1351,8 @@ class FDv2SkillStore:
         _require_https_uri(stream_uri, "stream_uri")
         if mode not in ("stream", "poll"):
             raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
-        # Non-finite as well as non-positive, and on the same rule as
-        # ``read_timeout`` below: ``nan <= 0`` and ``inf <= 0`` are both false,
-        # so a ``<= 0`` guard passes each of them straight through to
-        # ``Event.wait``, where they mean opposite things. ``wait(nan)`` returns
-        # at once, so the loop polls as fast as the endpoint will answer;
-        # ``wait(inf)`` never returns, so the store polls once and then never
-        # again while reporting itself healthy. One value should not be able to
-        # produce either of those.
+        # ``nan`` and ``inf`` pass a ``<= 0`` check, but would make the poll
+        # loop spin or never poll again.
         if not (math.isfinite(poll_interval) and poll_interval > 0):
             raise ValueError(f"poll_interval must be positive, got {poll_interval!r}")
         if read_timeout is None:
@@ -1642,11 +1377,7 @@ class FDv2SkillStore:
 
         self._basis: str | None = None
         self._etag: str | None = None
-        # The basis ``_etag`` was issued against. An ETag validates one
-        # representation of one resource, and the basis is part of the request
-        # that names it; holding the pair is what lets ``_poll_once`` tell an
-        # etag that still answers the question it is about to ask from one that
-        # answers a question it has stopped asking.
+        # The basis ``_etag`` was issued for; the etag is only sent with it.
         self._etag_basis: str | None = None
 
         self._requester = _requester or _Requester(
@@ -1657,41 +1388,23 @@ class FDv2SkillStore:
         )
 
         self._closed = False
-        """
-        ``close`` has been called. Final: ``start`` raises afterwards.
-
-        What gives ``close`` a postcondition a caller can rely on — "delivery
-        has stopped" — including when the join timed out. A store that could be
-        restarted after a timed-out close leaves the caller unable to tell
-        whether delivery stopped, and a restart that silently never delivers
-        again is the failure this forecloses. To resume, construct a new store.
-        """
+        """``close`` has been called. Final: ``start`` raises afterwards."""
         self._stop = threading.Event()
         self._first_payload = threading.Event()
         """A payload has committed. The fact ``wait_for_skills`` reports."""
         self._delivery_ended = threading.Event()
-        """
-        Delivery has stopped, by ``close`` or by ``_give_up``. Kept apart from
-        ``_first_payload`` because it is not one: a waiter has to be let go
-        either way, but only a payload makes ``wait_for_skills`` true.
-        """
+        """Delivery has stopped, by ``close`` or ``_give_up``."""
         self._released = threading.Event()
-        """
-        Either of the two above, and what a waiter actually parks on: an
-        ``Event`` cannot wait on two, so the setters funnel through here.
-        """
+        """Set by either of the above; what ``wait_for_skills`` waits on."""
         self._thread: threading.Thread | None = None
         self._failed_reason: str | None = None
         # The open streaming connection, so ``close`` can interrupt its read.
         self._connection: Any = None
-        # Recoverable failures since the last committed payload. Reset at the
-        # commit rather than when a connection returns: a stream only ever ends
-        # by being dropped, so resetting on return would count every healthy,
-        # server-recycled connection as a failure.
+        # Recoverable failures in a row; reset by a completed exchange, not by a
+        # connection ending (a stream only ends by being dropped).
         self._failures = 0
-        # Whether the current attempt got a complete answer before it ended.
-        # A stream only ever ends by being dropped, so this is what separates
-        # a recycled healthy connection from one that failed.
+        # Whether the current attempt got a complete answer, which separates a
+        # recycled healthy stream from a failed one.
         self._attempt_answered = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -1702,10 +1415,9 @@ class FDv2SkillStore:
 
         Does not block: use ``wait_for_skills`` when boot ordering matters.
 
-        Raises ``RuntimeError`` on a **closed** store: ``close`` is final, so
-        there is no resuming it. A store that gave up at its failure bound is
-        not closed and can be started again — the retry budget and the terminal
-        reason both belong to the run that spent them.
+        Raises ``RuntimeError`` if the store has been closed. A store whose
+        delivery stopped on its own (``failed`` is set) can be started again,
+        with a fresh retry budget.
         """
         with self._lock:
             if self._closed:
@@ -1716,10 +1428,8 @@ class FDv2SkillStore:
                     "FDv2SkillStore to resume delivery. Held content is still "
                     "readable from the closed store."
                 )
-            # Read before the rearm clears it: a thread inside ``_give_up`` is
-            # still alive and no longer delivering, so ``is_alive`` on its own
-            # would have this call adopt a run that is about to return and
-            # leave a store reporting no failure and never delivering again.
+            # Read before the rearm clears ``_failed_reason``: a thread inside
+            # ``_give_up`` is still alive but no longer delivering.
             delivering = (
                 self._failed_reason is None
                 and self._thread is not None
@@ -1728,8 +1438,6 @@ class FDv2SkillStore:
             self._rearm_waiters()
             if delivering:
                 return self
-            # Only ``close`` sets the stop flag, and a closed store never gets
-            # here, so there is nothing to clear.
             self._thread = threading.Thread(
                 target=self._run, name="ld-ai-skills-fdv2", daemon=True
             )
@@ -1738,48 +1446,32 @@ class FDv2SkillStore:
 
     def _rearm_waiters(self) -> None:
         """
-        Re-arms ``wait_for_skills`` for a store being started again after it
-        gave up. A payload already held stays an answer; an ended delivery does
-        not, or the next waiter would be released before it began.
-
-        A terminal ``failed`` reason is dropped for the same reason: it says why
-        delivery stopped for good, and delivery is about to run again. Leaving
-        it would have a healthy store reporting a failure it has recovered from.
-        Called with the lock held, which is what ``failed`` reads under.
+        Resets per-run state for a store being started again after it gave up:
+        the ended-delivery flag, ``failed``, and the retry budget. A payload
+        already held still answers ``wait_for_skills``. Call with the lock held.
         """
         self._delivery_ended.clear()
         self._failed_reason = None
-        # The retry budget belongs to the run that spent it. Carrying it over
-        # would have a store that gave up after its failure limit give up again
-        # on the restarted run's first recoverable failure.
         self._failures = 0
         if not self._first_payload.is_set():
             self._released.clear()
 
     def close(self, timeout: float = 5.0) -> None:
         """
-        Stops delivery. Idempotent, safe to call from any thread, and **final**:
-        a subsequent ``start`` raises rather than resuming. Construct a new
-        store to resume delivery.
+        Stops delivery and waits up to *timeout* seconds for the thread to exit.
+        Idempotent and safe from any thread.
 
-        Finality is what gives this call a postcondition — delivery has
-        stopped — even when the join below times out on a thread parked
-        somewhere no interrupt reaches. A store that could be restarted from
-        there would leave the caller unable to tell whether delivery stopped.
-
-        Held content is *not* dropped: a closed store still answers from what it
-        received. Detaching the store from the accessors is the job of the
-        package-level ``launchdarkly_ai_server.shutdown()`` coroutine.
+        **Final:** ``start`` raises afterwards; construct a new store to resume.
+        Held content is kept, so a closed store still serves what it received.
+        ``launchdarkly_ai_server.shutdown()`` detaches the store from the
+        accessors.
         """
         with self._lock:
             self._closed = True
         self._stop.set()
-        # A waiter parked in ``wait_for_skills`` is owed an answer now rather
-        # than at the end of its timeout; delivery is over either way.
+        # Release any ``wait_for_skills`` caller now.
         self._end_delivery()
-        # The delivery thread is normally blocked in a socket read that no flag
-        # can reach; without this the join waits out its full timeout. Streaming
-        # parks in the connection, polling in the request, so interrupt both.
+        # Unblock the socket read the delivery thread is parked in (stream or poll).
         with self._lock:
             connection = self._connection
         if connection is not None:
@@ -1801,15 +1493,14 @@ class FDv2SkillStore:
 
     def wait_for_skills(self, timeout: float = 10.0) -> bool:
         """
-        Blocks until the first payload has been committed, or *timeout* elapses.
+        Blocks until the first payload arrives, or *timeout* seconds elapse.
 
-        ``True`` means a payload arrived — not that any skill in it verified, and
-        not that the environment has any skills. ``diagnostics`` answers the rest.
+        Returns ``True`` once a payload has committed; a 304 alone does not
+        count. That does not mean any skill verified, or that the environment
+        has skills; see ``diagnostics``.
 
-        Returns early, ``False``, when delivery ends before any payload does:
-        a ``close`` from another thread, or a failure delivery cannot retry.
-        Waiting out the full timeout for an answer that has already arrived
-        would delay every shutdown that raced a waiter.
+        Returns ``False`` on timeout, or early if delivery ends first (``close``,
+        or a failure that will not be retried).
         """
         self._released.wait(timeout=timeout)
         return self._first_payload.is_set()
@@ -1826,18 +1517,11 @@ class FDv2SkillStore:
 
     def is_initialized(self) -> bool:
         """
-        Whether a payload has arrived, so reads reflect delivery rather than an
-        empty store still waiting for its first one.
+        Whether a payload has arrived: ``wait_for_skills`` without the wait.
 
-        The optional half of the ``SkillStore`` interface, and the same fact
-        ``wait_for_skills`` returns — without the wait. ``write_skills("*")``
-        consults it so a reconcile that runs before delivery reports the
-        retrieval unavailable rather than pruning every managed skill as though
-        the environment had revoked it.
-
-        Stays ``True`` once a payload has arrived, including after ``close``: a
-        closed store still answers from what it received, and a later
-        reconcile against that content is a reconcile against real delivery.
+        Optional ``SkillStore`` method. ``write_skills("*")`` checks it so a
+        reconcile before first delivery reports "unavailable" instead of pruning
+        every skill. Stays ``True`` after ``close``.
         """
         return self._first_payload.is_set()
 
@@ -1871,26 +1555,18 @@ class FDv2SkillStore:
 
     def add_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:
         """
-        Registers *fn* to be called once per changed object, at
-        ``payload-transferred`` rather than as objects stream in.
+        Registers *fn* to be called once per changed object, when a payload
+        commits (never mid-transfer).
 
-        A put notifies with the raw skill object. A revocation notifies with a
-        ``{"key", "version"}`` tombstone carrying no content, so a listener that
-        reads content must check for ``content`` rather than assume it. Both
-        ways of stating a revocation arrive that way: a ``delete-object``, and a
-        full transfer that simply stopped carrying the object.
+        - A put passes the raw skill object.
+        - A revocation passes a ``{"key", "version"}`` tombstone with no
+          ``content``; check for ``content`` before reading it.
 
-        *fn* runs on the delivery thread. Keep it cheap and non-blocking. An
-        exception it raises is logged and swallowed, because a broken listener
-        must not be able to kill delivery.
+        *fn* runs on the delivery thread: keep it cheap and non-blocking.
+        Exceptions it raises are logged and swallowed.
 
-        Only ``SKILL_OBJECT_KIND`` is ever delivered, so a registration for any
-        other kind **raises** rather than being recorded and silently never
-        firing. ``InMemorySkillStore.add_listener`` refuses the same way, for
-        the reason ``watch_skills`` refuses a store with no ``add_listener`` at
-        all: a listener that never fires looks exactly like one whose objects
-        never changed, and a store that accepted the registration has promised
-        something it cannot keep.
+        Raises ``ValueError`` for any *kind* other than ``SKILL_OBJECT_KIND``,
+        since such a listener would never fire.
         """
         if kind != SKILL_OBJECT_KIND:
             raise ValueError(
@@ -1903,12 +1579,9 @@ class FDv2SkillStore:
 
     def remove_listener(self, kind: str, fn: Callable[[dict[str, Any]], Any]) -> None:
         """
-        Unregisters *fn* from *kind*. Safe to call from any thread, including
-        from inside a listener: a removal during one commit takes effect from
-        the next.
-
-        Removes one occurrence; removing a callable that is not registered is a
-        no-op, so ``SkillWatcher.close`` can detach unconditionally.
+        Unregisters one occurrence of *fn* from *kind*; a no-op if it is not
+        registered. Safe from any thread, including inside a listener (takes
+        effect from the next commit).
         """
         with self._lock:
             listeners = self._listeners.get(kind)
@@ -1943,26 +1616,20 @@ class FDv2SkillStore:
                     self._stream_once()
                 else:
                     self._poll_once()
-                # A poll that returned is a current answer even when it committed
-                # nothing (HTTP 304). A stream never returns normally; its
-                # successes are counted at each commit in ``_apply``.
+                # A returned poll is a current answer, even a 304. Stream
+                # successes are recorded in ``_apply``.
                 self._record_success()
             except _FatalTransportError as exc:
                 self._give_up(str(exc))
                 return
             except _RecoverableTransportError as exc:
                 if self._stop.is_set():
-                    # ``close`` interrupted the request on purpose. Counting it
-                    # would spend a retry from the bounded budget and leave a
-                    # misleading ``last_error`` on a healthy store.
+                    # ``close`` interrupted the request; not a failure.
                     return
                 repairing_state = False
                 if isinstance(exc, _StaleRequestStateError):
-                    # The selector and the etag are the only client state in the
-                    # request, so a rejection of a request carrying neither is
-                    # the request itself being refused, and reconnecting cannot
-                    # fix it. Carrying one, the state may be stale: drop it, ask
-                    # for a full transfer, and let the next 400 be the fatal one.
+                    # With no basis or etag to drop, the 400 is fatal. Otherwise
+                    # drop them and request a full transfer once.
                     with self._lock:
                         exhausted = self._basis is None and self._etag is None
                         if not exhausted:
@@ -1974,8 +1641,7 @@ class FDv2SkillStore:
                         self._give_up(str(exc))
                         return
                 with self._lock:
-                    # Whatever the dropped connection had transferred so far is
-                    # not a payload; the next connection starts one afresh.
+                    # Discard any partial payload from the dropped connection.
                     self._reader._abandon_in_flight()
                     self._failures += 1
                     failures = self._failures
@@ -1983,12 +1649,8 @@ class FDv2SkillStore:
                     self._reader.diagnostics.connection_failures = failures
                     self._reader.diagnostics.last_error = str(exc)
                 if failures > self._max_consecutive_failures and not repairing_state:
-                    # The one-shot request built from nothing is exempt from the
-                    # bound, so an outage that has already spent the budget
-                    # cannot swallow the repair a stale selector is asking for.
-                    # It cannot unbound the loop either: the repaired request
-                    # carries no state, so a second 400 is fatal on its own and
-                    # any other failure meets a budget still over the bound.
+                    # The one stateless retry after a 400 is exempt, so an
+                    # exhausted budget cannot block that repair.
                     self._give_up(
                         f"gave up after {failures} consecutive failures; "
                         f"last error: {exc}"
@@ -2000,23 +1662,13 @@ class FDv2SkillStore:
                         failures, base=self._initial_backoff, maximum=self._max_backoff
                     )
                 else:
-                    # A server asking for no delay still gets one: honouring
-                    # ``Retry-After: 0`` literally would reconnect as fast as
-                    # the loop allows, spending the whole retry bound in
-                    # milliseconds and putting needless load on the endpoint.
-                    # The floor is ``initial_backoff``, the same floor this
-                    # module's own backoff starts from.
+                    # Floor at ``initial_backoff`` so ``Retry-After: 0`` cannot
+                    # cause a tight reconnect loop.
                     delay = max(delay, self._initial_backoff)
-                # ``Retry-After`` is a request and ``max_backoff`` is a promise.
-                # The header may come from a proxy rather than LaunchDarkly, and
-                # a value in the hours would park revocation for that long.
+                # Cap at ``max_backoff`` even if ``Retry-After`` asks for more.
                 delay = min(delay, self._max_backoff)
                 if answered:
-                    # LaunchDarkly, and any proxy in between, recycles a
-                    # long-lived stream. A connection that answered before it
-                    # ended delivered everything it was asked for, so the
-                    # reconnect is routine rather than a fault worth warning
-                    # about for as long as the process runs.
+                    # A stream recycled after a complete answer is routine.
                     logger.debug(
                         "The FDv2 stream ended after a complete answer (%s); "
                         "reconnecting in %.1fs",
@@ -2048,17 +1700,10 @@ class FDv2SkillStore:
         with self._lock:
             self._failed_reason = reason
             self._reader.diagnostics.last_error = reason
-            # Let go of anyone waiting on a first payload that is never coming.
-            # Recorded beside the reason and under the lock so the two are
-            # published together: a ``start`` that landed between them would
-            # re-arm the waiters and then have this dying thread end delivery
-            # on the fresh run, releasing its waiters before it had answered.
+            # Under the lock with the reason, so a concurrent ``start`` cannot
+            # have its fresh waiters released by this dying run.
             self._end_delivery()
-        # "will not retry" is the whole of it: this run is over, and the store
-        # is not. Naming ``start()`` rather than a process restart because
-        # ``close`` is the only thing that forecloses a restart, and an operator
-        # who has just fixed the cause should be told the cheaper of the two.
-        # A test matches on this message's prefix; keep it.
+        # Tests match on this message's prefix.
         logger.error(
             "Skill delivery has stopped and will not retry: %s. The store keeps "
             "serving the last content it received, and skills will not update "
@@ -2081,12 +1726,8 @@ class FDv2SkillStore:
             if outcome.committed and outcome.basis is not None:
                 self._basis = outcome.basis
         if outcome.committed or outcome.up_to_date:
-            # Both break the row of consecutive failures: a commit is a payload
-            # delivered, and ``up_to_date`` is the server confirming the store
-            # already holds it. Counting only the commit would give up on a healthy
-            # stream serving an environment whose skills are not changing:
-            # nothing to transfer means no commit, while every recycled
-            # connection still ends in a drop.
+            # Both are completed exchanges. Counting ``up_to_date`` keeps a
+            # stream for an unchanging environment from exhausting its budget.
             self._record_success()
         if outcome.committed:
             self._publish_first_payload()
@@ -2101,12 +1742,8 @@ class FDv2SkillStore:
     def _poll_once(self) -> None:
         with self._lock:
             basis = self._basis
-            # Offered only while the pair still holds. The basis is part of the
-            # request, so an etag issued before the basis moved validates a
-            # payload this store has stopped asking for, and a server answering
-            # it ``304`` would be answering the previous question. One
-            # unconditional request after each commit is the whole cost: a
-            # payload that changed was never going to be a 304 anyway.
+            # Send the etag only with the basis it was issued for; a 304 to a
+            # stale pair would describe the previous request.
             etag = self._etag if self._etag_basis == basis else None
         result = self._requester.poll(basis, etag)
         if result.not_modified:
@@ -2137,9 +1774,8 @@ class FDv2SkillStore:
         with self._lock:
             self._connection = connection
         try:
-            # ``close`` may have run while the connect was in flight and found
-            # no connection to interrupt; this is the last chance to notice
-            # before the read below blocks.
+            # ``close`` may have run during the connect, before there was a
+            # connection to interrupt.
             if self._stop.is_set():
                 return
             for name, data in connection.events:
