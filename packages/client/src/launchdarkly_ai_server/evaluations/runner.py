@@ -220,7 +220,6 @@ class EvaluationsRunner:
 
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
-        self._warned_invalid_scorers: set[str] = set()
 
     def _fetch_config_variation(
         self,
@@ -836,6 +835,7 @@ class EvaluationsRunner:
         self,
         row: Mapping[str, Any],
         scorer: Scorer,
+        warned_scorers: set[str],
     ) -> dict[str, Any]:
         started = datetime.now(UTC)
         started_clock = time.perf_counter()
@@ -880,8 +880,8 @@ class EvaluationsRunner:
                 "scorer fn must return a finite number between 0 and 1, "
                 f"got {score_value!r}"
             )
-            if scorer.name not in self._warned_invalid_scorers:
-                self._warned_invalid_scorers.add(scorer.name)
+            if scorer.name not in warned_scorers:
+                warned_scorers.add(scorer.name)
                 logger.warning(
                     "scorer %r returned an invalid score: %s", scorer.name, message
                 )
@@ -1003,6 +1003,7 @@ class EvaluationsRunner:
     ) -> list[dict[str, Any]]:
         """Run every (row, criterion) pair, bounded by the run's concurrency."""
         controller = ConcurrencyController(concurrency)
+        warned_scorers: set[str] = set()
 
         async def run_one(
             row: Mapping[str, Any], criterion: Criterion
@@ -1010,7 +1011,9 @@ class EvaluationsRunner:
             await controller.acquire()
             try:
                 if isinstance(criterion, Scorer):
-                    return await self._run_scorer_for_result(row, criterion)
+                    return await self._run_scorer_for_result(
+                        row, criterion, warned_scorers
+                    )
                 return await self._run_ld_judge_for_result(
                     row,
                     tool_handlers,

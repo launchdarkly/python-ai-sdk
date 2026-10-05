@@ -3109,3 +3109,31 @@ async def test_async_scorer_score_is_awaited_before_validation(
     scorer_event = next(event for event in events if event.get("kind") == "scorer")
     assert scorer_event["status"] == "COMPLETE"
     assert scorer_event["score"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_invalid_score_warning_repeats_on_each_run(
+    stub_sdk_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One module logs a warning in each run for a scorer that returns an invalid score."""
+    transport = scorer_run_transport()
+    transport.responses = transport.responses * 2
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            await evals.run(
+                project_key="proj",
+                key="support-qa",
+                dataset="golden",
+                handler=handler,
+                generation={"provider": "OpenAI", "model": "gpt-4o"},
+                criteria=[Scorer(name="quality", fn=lambda row, output: "high")],
+            )
+
+    warnings = [r for r in caplog.records if "invalid score" in r.getMessage()]
+    assert len(warnings) == 2
