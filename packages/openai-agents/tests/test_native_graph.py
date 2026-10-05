@@ -154,6 +154,55 @@ def _make_agents_mock(run_result: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _recording_trace() -> tuple[Any, Any, list[Any]]:
+    """A real tracer behind the module's ``trace`` lookup, with every span's ``end`` spied.
+
+    Returns the stand-in ``trace`` module, the exporter holding finished spans, and the
+    ``end`` spies, so a test can check both what was exported and how often each span ended.
+    """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    end_spies: list[Any] = []
+
+    def _start_span(name: str, *args: Any, **kwargs: Any) -> Any:
+        span = tracer.start_span(name, *args, **kwargs)
+        span.end = MagicMock(wraps=span.end)  # type: ignore[method-assign]
+        end_spies.append(span.end)
+        return span
+
+    fake_trace = MagicMock()
+    fake_trace.get_tracer.return_value.start_span.side_effect = _start_span
+    return fake_trace, exporter, end_spies
+
+
+def _assert_one_failed_graph_span(
+    exporter: Any, end_spies: list[Any], message: str, track_calls: list[Any]
+) -> None:
+    from opentelemetry.trace import StatusCode
+
+    assert [spy.call_count for spy in end_spies] == [1]
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description == message
+    assert [e.name for e in span.events].count("exception") == 1
+    assert (span.attributes or {}).get("launchdarkly.graph.key") == "test-graph"
+
+    failures = [d for e, d in track_calls if e == "$ld:ai:graph:invocation_failure"]
+    assert len(failures) == 1
+    assert failures[0]["configKey"] == "test-graph"
+    assert failures[0]["graphKey"] == "test-graph"
+
+
 class TestToOpenAIAgentsTopology:
     @pytest.mark.asyncio
     async def test_each_graph_node_translated(self) -> None:
@@ -715,11 +764,14 @@ class TestToOpenAIAgentsOpenAISpecific:
         assert failures[0]["configKey"] == "test-graph"
 
     @pytest.mark.asyncio
-    async def test_no_span_left_open_when_agent_setup_fails(self) -> None:
-        """A setup error before the run must not leave a started span un-ended."""
-        mock_span = MagicMock()
-        mock_trace = MagicMock()
-        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+    async def test_agent_setup_error_fails_the_graph_span(self) -> None:
+        """A setup error before the run ends one ERROR span and tracks the failure."""
+        fake_trace, exporter, end_spies = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
 
         agents_mock = _make_agents_mock(_make_run_result("done"))
         agents_mock.Agent = MagicMock(side_effect=ValueError("bad agent"))
@@ -729,15 +781,19 @@ class TestToOpenAIAgentsOpenAISpecific:
             "importlib.import_module",
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
-            with patch.object(_openai_ng, "trace", mock_trace):
+            with patch.object(_openai_ng, "trace", fake_trace):
                 with patch.object(_openai_ng, "_HAS_OTEL", True):
-                    with pytest.raises(ValueError, match="bad agent"):
-                        await to_openai_agents(_make_def_promise(graph_def)).invoke(
-                            "hi"
-                        )
+                    with patch.object(
+                        _openai_ng, "get_client", return_value=mock_ld_client
+                    ):
+                        with pytest.raises(ValueError, match="bad agent"):
+                            await to_openai_agents(
+                                _make_def_promise(graph_def),
+                                opts={"context": {"kind": "user", "key": "u1"}},
+                            ).invoke("hi")
 
-        started = mock_trace.get_tracer.return_value.start_span.call_count
-        assert mock_span.end.call_count == started
+        agents_mock.Runner.run.assert_not_called()
+        _assert_one_failed_graph_span(exporter, end_spies, "bad agent", track_calls)
 
     @pytest.mark.asyncio
     async def test_agent_end_hook_emits_generation_success(self) -> None:

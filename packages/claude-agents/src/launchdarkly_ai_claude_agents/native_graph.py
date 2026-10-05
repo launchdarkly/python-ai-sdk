@@ -238,27 +238,30 @@ def to_claude_agents(
         )
         raw_handlers: dict[str, Any] = _opts.get("tool_handlers") or {}
 
+        start_time = time.monotonic()
+        run_id = str(uuid.uuid4())
         tracer_name = "@launchdarkly/ai-claude-agents"
         if _HAS_OTEL:
             span = trace.get_tracer(tracer_name).start_span("launchdarkly.graph")
         else:
             span = None
-
-        start_time = time.monotonic()
-        run_id = str(uuid.uuid4())
-        if span:
-            set_ld_span_attributes(
-                span,
-                {
-                    "__ld": make_graph_track_data(def_obj.key, run_id),
-                    "ldContext": raw_ld_context,
-                },
-            )
         path: list[str] = []
         total_usage = {"input": 0, "output": 0, "total": 0}
         subagent_tool_ctx: dict[str, Any] = {}
 
+        # One try covers setup and the run, so a setup error (a sub-agent tool
+        # that fails to build) is recorded on the span and tracked as an
+        # invocation failure, like a run error. The span ends exactly once, in
+        # the finally.
         try:
+            if span:
+                set_ld_span_attributes(
+                    span,
+                    {
+                        "__ld": make_graph_track_data(def_obj.key, run_id),
+                        "ldContext": raw_ld_context,
+                    },
+                )
 
             async def _build_node(node: GraphNode) -> None:
                 if node.key == root.key:
@@ -360,29 +363,17 @@ def to_claude_agents(
                     )
             root_start = time.monotonic()
 
-            try:
-                result = await _run_query(
-                    root,
-                    input_text,
-                    vs,
-                    raw_handlers,
-                    ld_context,
-                    def_obj.key,
-                    run_id,
-                    root_child_tools,
-                    history,
-                )
-            except Exception as exc:
-                if span:
-                    span.record_exception(exc)
-                    span.set_status(SpanStatusCode.ERROR, str(exc))
-                    span.end()
-                if ld_context:
-                    td = make_graph_track_data(def_obj.key, run_id)
-                    get_client().track(
-                        "$ld:ai:graph:invocation_failure", ld_context, td, 1
-                    )
-                raise
+            result = await _run_query(
+                root,
+                input_text,
+                vs,
+                raw_handlers,
+                ld_context,
+                def_obj.key,
+                run_id,
+                root_child_tools,
+                history,
+            )
 
             final_output = result["output"]
             root_usage = result["usage"]
@@ -416,8 +407,6 @@ def to_claude_agents(
                 span.set_attribute("gen_ai.usage.input_tokens", total_usage["input"])
                 span.set_attribute("gen_ai.usage.output_tokens", total_usage["output"])
                 span.set_attribute("gen_ai.usage.total_tokens", total_usage["total"])
-                span.set_status(SpanStatusCode.OK)
-                span.end()
 
             if ld_context:
                 graph_td = make_graph_track_data(def_obj.key, run_id)
@@ -433,13 +422,23 @@ def to_claude_agents(
                 )
                 client.track("$ld:ai:graph:invocation_success", ld_context, graph_td, 1)
 
+            if span:
+                span.set_status(SpanStatusCode.OK)
             return {"response": final_output, "usage": total_usage}
-
         except Exception as exc:
             if span:
                 span.record_exception(exc)
                 span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            if ld_context:
+                get_client().track(
+                    "$ld:ai:graph:invocation_failure",
+                    ld_context,
+                    make_graph_track_data(def_obj.key, run_id),
+                    1,
+                )
             raise
+        finally:
+            if span:
+                span.end()
 
     return types.SimpleNamespace(invoke=invoke)
