@@ -50,28 +50,21 @@ from .spans import (
 
 #: Every key ``AsyncResponses.create``/``.stream`` accept, classified by hand into exactly one of:
 #: forwarded (below), handler-owned (``model``, ``input``, ``previous_response_id``, ``tools``,
-#: ``text``, popped after the filter runs, at each call site), or excluded.
+#: ``text``, set by each call site itself), or excluded (below).
 #: ``TestResponsesCreateAcceptsExactlyTheseKeys`` / ``TestResponsesStreamAcceptsExactlyTheseKeys``
 #: in this package's tests assert this classification stays exhaustive as the SDK's own signatures
-#: change. Confirms the UI offers several keys the Responses API has never accepted: ``max_tokens``,
+#: change. The UI offers several keys the Responses API has never accepted: ``max_tokens``,
 #: ``frequency_penalty``, ``presence_penalty``, ``seed``, ``n``, ``stop``, ``response_format``,
 #: ``logit_bias``, ``logprobs``, ``max_completion_tokens``, ``audio``, ``modalities``,
-#: ``prediction``.
+#: ``prediction``. Of those, ``max_tokens``/``max_completion_tokens`` are renamed to
+#: ``max_output_tokens`` (see :func:`_apply_max_output_tokens_rename`); the rest are dropped.
 #:
-#: Excluded, and why:
-#: * ``stream``: the handler chooses blocking vs. streaming itself, not via a kwarg.
-#: * ``stream_options``: only meaningful together with ``stream=True``, which the handler controls.
-#: * ``background``: returns before the output exists, so the handler would get no result.
-#: * ``conversation``: server-side conversation state conflicts with the input the handler builds.
-#: * ``prompt``: server-side prompt template conflicts with the input the handler builds.
-#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
-#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#: The UI writes reasoning effort as ``reasoning: {"effort": ...}``, the Responses API's own shape,
+#: so ``reasoning`` is forwarded as-is and no top-level ``reasoning_effort`` is read.
 #:
-#: Everything else the API accepts is forwarded, including keys that are not strictly generation
-#: settings (``store``, ``user``, ``safety_identifier``, ``prompt_cache_key``,
-#: ``prompt_cache_retention``, ``include``, ``context_management``, ``metadata``,
-#: ``service_tier``, ``instructions``, ``moderation``, ...).
-_RESPONSES_CREATE_FORWARDED_KEYS = frozenset(
+#: Only model and run settings are forwarded, and the same list serves ``invoke`` and ``stream``,
+#: so one config behaves the same whichever is called.
+_RESPONSES_FORWARDED_KEYS = frozenset(
     {
         "context_management",
         "include",
@@ -96,17 +89,22 @@ _RESPONSES_CREATE_FORWARDED_KEYS = frozenset(
     }
 )
 
-#: Same as :data:`_RESPONSES_CREATE_FORWARDED_KEYS`, plus the resumption keys only ``.stream``
-#: accepts: ``response_id``, ``starting_after``, ``text_format``.
-_RESPONSES_STREAM_FORWARDED_KEYS = _RESPONSES_CREATE_FORWARDED_KEYS | {
-    "response_id",
-    "starting_after",
-    "text_format",
-}
-
-#: Named for the drift test and for review, not read at runtime: the forwarded lists above already
-#: leave these out, so nothing needs to subtract them again. See the comment above for why each one
-#: is here rather than forwarded.
+#: Accepted by the API but never forwarded, and why:
+#: * ``stream``: the handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``stream_options``: only meaningful together with ``stream=True``, which the handler controls.
+#: * ``background``: returns before the output exists, so the handler would get no result.
+#: * ``conversation``: server-side conversation state conflicts with the input the handler builds.
+#: * ``prompt``: server-side prompt template conflicts with the input the handler builds.
+#: * ``response_id``, ``starting_after``: only ``.stream`` accepts them, to resume an existing
+#:   response rather than start a new one. That is request state, not a setting, and ``invoke`` has
+#:   no equivalent.
+#: * ``text_format``: only ``.stream`` accepts it, and it is a Python type to parse into, which a
+#:   config cannot express. Structured output goes through ``text``, which the handler owns.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
 _RESPONSES_EXCLUDED_KEYS = frozenset(
     {
         "stream",
@@ -114,6 +112,9 @@ _RESPONSES_EXCLUDED_KEYS = frozenset(
         "background",
         "conversation",
         "prompt",
+        "response_id",
+        "starting_after",
+        "text_format",
         "timeout",
         "extra_headers",
         "extra_query",
@@ -355,16 +356,8 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
 
             extra_params = select_forwarded_parameters(
                 _apply_max_output_tokens_rename(model_parameters(config)),
-                _RESPONSES_CREATE_FORWARDED_KEYS,
+                _RESPONSES_FORWARDED_KEYS,
             )
-            for _owned_key in (
-                "model",
-                "input",
-                "previous_response_id",
-                "tools",
-                "text",
-            ):
-                extra_params.pop(_owned_key, None)
             params: dict[str, Any] = {
                 **extra_params,
                 "model": config["model"]["name"],
@@ -597,16 +590,8 @@ async def _stream_gen(
 
             extra_params = select_forwarded_parameters(
                 _apply_max_output_tokens_rename(model_parameters(config)),
-                _RESPONSES_STREAM_FORWARDED_KEYS,
+                _RESPONSES_FORWARDED_KEYS,
             )
-            for _owned_key in (
-                "model",
-                "input",
-                "previous_response_id",
-                "tools",
-                "text",
-            ):
-                extra_params.pop(_owned_key, None)
             stream_params: dict[str, Any] = {
                 **extra_params,
                 "model": config["model"]["name"],

@@ -15,6 +15,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from tests.never_forwarded import (
+    NEVER_FORWARDED_BAG,
+    NEVER_FORWARDED_KEYS,
+    find_leaks,
+)
+
 CONFIG = {
     "model": {"name": "gpt-4o"},
     "provider": {"name": "OpenAI"},
@@ -2514,3 +2520,76 @@ class TestEmptyOutputItemsDoNotHideTheAnswer:
         chat = rec.named("chat ")[0]
         assert chat.attributes["gen_ai.completion.0.content"] == "the real answer"
         assert "gen_ai.completion.1.content" not in chat.attributes
+
+
+class TestNeverForwardedParameters:
+    """No credential, endpoint, request-injection, remote-tool, or host-process key in
+    ``model.parameters`` reaches ``responses.create`` or ``responses.stream``."""
+
+    async def test_invoke_forwards_none_of_them(self, mock_openai: MagicMock) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": dict(NEVER_FORWARDED_BAG)},
+        }
+        await create_openai_messages_handler()(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert not find_leaks(kwargs)
+        assert not set(kwargs) & NEVER_FORWARDED_KEYS
+
+    async def test_stream_forwards_none_of_them(self, mock_openai: MagicMock) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["hi"])
+        )
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": dict(NEVER_FORWARDED_BAG)},
+        }
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+            [e async for e in await h.stream(config, "q")]
+        kwargs = mock_openai.responses.stream.call_args.kwargs
+        assert not find_leaks(kwargs)
+        assert not set(kwargs) & NEVER_FORWARDED_KEYS
+
+
+class TestInvokeAndStreamForwardTheSameKeys:
+    """``response_id``, ``starting_after`` and ``text_format`` are accepted by
+    ``responses.stream`` only. Forwarding them there and not on ``create`` made one config behave
+    differently by call. They resume an existing response or name a Python type to parse into,
+    neither of which is a setting, so both paths drop them."""
+
+    _PARAMS: ClassVar[dict[str, Any]] = {
+        "response_id": "resp-other",
+        "starting_after": 3,
+        "text_format": "not-a-type",
+        "top_p": 0.4,
+    }
+
+    async def test_invoke(self, mock_openai: MagicMock) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+        await create_openai_messages_handler()(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert not {"response_id", "starting_after", "text_format"} & set(kwargs)
+        assert kwargs["top_p"] == 0.4
+
+    async def test_stream(self, mock_openai: MagicMock) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["hi"])
+        )
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+            [e async for e in await h.stream(config, "q")]
+        kwargs = mock_openai.responses.stream.call_args.kwargs
+        assert not {"response_id", "starting_after", "text_format"} & set(kwargs)
+        assert kwargs["top_p"] == 0.4
