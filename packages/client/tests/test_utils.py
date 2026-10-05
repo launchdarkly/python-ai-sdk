@@ -11,7 +11,6 @@ import pytest
 from launchdarkly_ai_server import (
     create_handler,
     make_track_data,
-    model_parameters,
     model_stamps_from_meta,
     normalize_mode,
     omit_model_stamps,
@@ -19,6 +18,7 @@ from launchdarkly_ai_server import (
     parse_template,
     parse_usage,
 )
+from launchdarkly_ai_server.utils import model_parameters
 
 # ---------------------------------------------------------------------------
 # ?3.1 parse_template

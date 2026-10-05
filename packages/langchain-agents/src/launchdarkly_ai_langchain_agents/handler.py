@@ -25,12 +25,12 @@ from launchdarkly_ai_server import (
     lang_chain_content_text,
     lang_chain_span_messages,
     lang_chain_span_usage,
-    model_parameters,
     parse_template,
-    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from .messages import to_lang_chain_messages
 from .spans import (

@@ -41,14 +41,14 @@ from launchdarkly_ai_server import (
     create_handler,
     end_span_once,
     end_unfinished_spans,
-    model_parameters,
     parse_template,
-    select_forwarded_parameters,
     set_conversation_id_if_absent,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from .spans import (
     MCP_TOOL_PREFIX,

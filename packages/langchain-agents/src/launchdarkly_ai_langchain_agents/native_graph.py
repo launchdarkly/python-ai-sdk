@@ -18,11 +18,11 @@ from launchdarkly_ai_server import (
     compose_history,
     get_client,
     make_track_data,
-    model_parameters,
     parse_template,
-    select_forwarded_parameters,
     to_ld_context,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from .handler import _CHAT_OPENAI_FORWARDED_KEYS
 from .messages import to_lang_chain_messages

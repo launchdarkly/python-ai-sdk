@@ -18,10 +18,10 @@ from launchdarkly_ai_server import (
     NativeTool,
     get_client,
     make_track_data,
-    model_parameters,
-    select_forwarded_parameters,
     to_ld_context,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 try:
     from opentelemetry import trace

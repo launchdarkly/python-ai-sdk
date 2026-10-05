@@ -21,13 +21,13 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
-    model_parameters,
     parse_template,
-    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from .spans import (
     fail_span,

@@ -18,14 +18,14 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
-    model_parameters,
     parse_template,
-    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from .spans import (
     RawRunUsage,

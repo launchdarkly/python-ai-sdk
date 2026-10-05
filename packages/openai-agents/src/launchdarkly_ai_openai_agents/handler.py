@@ -38,14 +38,14 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     image_block_to_url,
-    model_parameters,
     parse_template,
-    select_forwarded_parameters,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from .spans import (
     derive_finish_reason,

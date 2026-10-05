@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from launchdarkly_ai_server import select_forwarded_parameters
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 
 
 class TestSelectForwardedParameters:
