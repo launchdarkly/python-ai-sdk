@@ -4,10 +4,11 @@ Shared filtering for ``model.parameters`` before it reaches a provider SDK call.
 ``model.parameters`` is a free-form dict the LaunchDarkly UI writes, offering keys that make
 sense across providers (``temperature``, ``top_p``, ``max_tokens``, ``tool_choice``, ...). No
 single provider SDK accepts all of them, and each handler package classifies every key its own
-provider entry point accepts into exactly one written-down list: forwarded, handler-owned (popped
-after this filter runs, decided per call site), or excluded (accepted by the provider but never
-forwarded, either because forwarding it would break the handler or because it is client/connection
-configuration such as an API key, a base URL, an HTTP client, or a timeout). Those lists are
+provider entry point accepts into exactly one written-down list: forwarded (model and run settings
+only), handler-owned (set by the call site itself), or excluded (accepted by the provider but never
+forwarded: credentials, endpoints and connection settings, raw request injection such as extra
+headers or ``model_kwargs``, remote tools, host-process settings, and anything that would break
+the handler). Only the forwarded list is read at runtime; every other key is dropped. Those lists are
 literal, next to each handler's own call sites, not derived from the provider SDK at runtime: a
 hand-maintained list is reviewable and a runtime-derived one is not, and each handler package has a
 drift test asserting its lists still cover everything its provider SDK accepts.

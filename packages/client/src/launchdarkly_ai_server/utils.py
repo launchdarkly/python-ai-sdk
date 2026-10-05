@@ -45,9 +45,9 @@ def model_parameters(config: AiConfigRep) -> dict[str, Any]:
     Values are forwarded to the provider as-is, keyed by whatever name the
     LaunchDarkly UI wrote (already snake_case for every Python provider SDK
     here), so no case conversion happens on the way through. Callers must
-    still remove any key the call site sets itself before merging the result
-    into a provider call, so a config value never overrides a handler-owned
-    argument.
+    filter the result to their own forwarded-keys list (see
+    ``parameter_forwarding.select_forwarded_parameters``) before merging it
+    into a provider call; nothing else here is safe to forward as-is.
 
     Never reads ``model.custom`` — that field is not forwarded to providers.
     """
