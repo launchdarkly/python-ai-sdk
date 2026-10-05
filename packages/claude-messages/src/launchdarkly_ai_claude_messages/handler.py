@@ -55,7 +55,6 @@ from .spans import (
 _MESSAGES_FORWARDED_KEYS = frozenset(
     {
         "cache_control",
-        "container",
         "max_tokens",
         "metadata",
         "output_config",
@@ -66,7 +65,6 @@ _MESSAGES_FORWARDED_KEYS = frozenset(
         "tool_choice",
         "top_k",
         "top_p",
-        "user_profile_id",
     }
 )
 
@@ -76,6 +74,10 @@ _MESSAGES_FORWARDED_KEYS = frozenset(
 #:   ``stream`` behave differently. ``output_config`` (forwarded) carries the same output format
 #:   on both.
 #: * ``inference_geo``: the region inference runs in, which decides where data is processed.
+#: * ``container``: selects server-side container state carried over from another request, not
+#:   a model setting.
+#: * ``user_profile_id``: attributes the request to a party other than the caller, an identity
+#:   setting rather than a model setting.
 #: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
 #:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
 #:
@@ -86,6 +88,8 @@ _MESSAGES_EXCLUDED_KEYS = frozenset(
         "stream",
         "output_format",
         "inference_geo",
+        "container",
+        "user_profile_id",
         "timeout",
         "extra_headers",
         "extra_query",

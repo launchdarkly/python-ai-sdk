@@ -168,7 +168,6 @@ _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
         "max_tokens",
         "max_tokens_to_sample",
         "output_config",
-        "reuse_last_container",
         "stop",
         "stop_sequences",
         "temperature",
@@ -185,6 +184,8 @@ _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
 #: * ``default_headers``, ``model_kwargs``: raw request injection. ``model_kwargs`` is merged
 #:   straight into the request, so it would carry any excluded key past this list.
 #: * ``mcp_servers``: attaches remote MCP servers, which then receive the conversation.
+#: * ``reuse_last_container``: reuses server-side container state from an earlier request, not
+#:   a model setting.
 #: * ``default_request_timeout``, ``timeout``, ``max_retries``: timeouts and retries.
 #: * ``stream_usage``: how usage is reported back to the handler.
 #: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
@@ -200,6 +201,7 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "default_headers",
     "model_kwargs",
     "mcp_servers",
+    "reuse_last_container",
     "default_request_timeout",
     "timeout",
     "max_retries",
