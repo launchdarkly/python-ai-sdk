@@ -45,19 +45,17 @@ from .spans import (
 )
 
 #: Every key ``AsyncMessages.create``/``.stream`` accept, classified by hand into exactly one of:
-#: forwarded (below), handler-owned (``model``, ``messages``, ``system``, ``tools``, popped after
-#: the filter runs, at each call site), or excluded (below). ``TestMessagesCreateAcceptsExactlyThese
-#: Keys`` / ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
+#: forwarded (below), handler-owned (``model``, ``messages``, ``system``, ``tools``, set by each
+#: call site itself), or excluded (below). ``TestMessagesCreateAcceptsExactlyTheseKeys`` /
+#: ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
 #: classification stays exhaustive as the SDK's own signatures change.
 #:
-#: Everything else the API accepts is forwarded, including keys that are not strictly generation
-#: settings (``metadata``, ``service_tier``, ``container``, ``user_profile_id``, ``output_config``,
-#: ...).
-_MESSAGES_CREATE_FORWARDED_KEYS = frozenset(
+#: Only model and run settings are forwarded, and the same list serves ``invoke`` and ``stream``,
+#: so one config behaves the same whichever is called.
+_MESSAGES_FORWARDED_KEYS = frozenset(
     {
         "cache_control",
         "container",
-        "inference_geo",
         "max_tokens",
         "metadata",
         "output_config",
@@ -72,20 +70,22 @@ _MESSAGES_CREATE_FORWARDED_KEYS = frozenset(
     }
 )
 
-#: Same as :data:`_MESSAGES_CREATE_FORWARDED_KEYS`, plus ``output_format``: ``.stream`` accepts it,
-#: ``.create`` does not.
-_MESSAGES_STREAM_FORWARDED_KEYS = _MESSAGES_CREATE_FORWARDED_KEYS | {"output_format"}
-
 #: Accepted by the API but never forwarded, and why:
 #: * ``stream``: the handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``output_format``: only ``.stream`` accepts it, so forwarding it would make ``invoke`` and
+#:   ``stream`` behave differently. ``output_config`` (forwarded) carries the same output format
+#:   on both.
+#: * ``inference_geo``: the region inference runs in, which decides where data is processed.
 #: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
 #:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
 #:
-#: Named for the drift test and for review, not read at runtime: the forwarded lists above already
-#: leave these out, so nothing needs to subtract them again.
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
 _MESSAGES_EXCLUDED_KEYS = frozenset(
     {
         "stream",
+        "output_format",
+        "inference_geo",
         "timeout",
         "extra_headers",
         "extra_query",
@@ -270,11 +270,9 @@ async def _run_tool_loop(
     tools = _build_tools(config.get("tools") or {})
     extra_params = select_forwarded_parameters(
         _rename_effort_to_output_config(model_parameters(config)),
-        _MESSAGES_CREATE_FORWARDED_KEYS,
+        _MESSAGES_FORWARDED_KEYS,
     )
     max_tokens = extra_params.pop("max_tokens", 1024)
-    for _owned_key in ("model", "messages", "system", "tools"):
-        extra_params.pop(_owned_key, None)
     conversation = list(messages)
     output = ""
     steps = 0
@@ -568,11 +566,9 @@ async def _stream_gen(
     tool_definitions = to_tool_definitions(tools)
     extra_params = select_forwarded_parameters(
         _rename_effort_to_output_config(model_parameters(config)),
-        _MESSAGES_STREAM_FORWARDED_KEYS,
+        _MESSAGES_FORWARDED_KEYS,
     )
     max_tokens = extra_params.pop("max_tokens", 1024)
-    for _owned_key in ("model", "messages", "system", "tools"):
-        extra_params.pop(_owned_key, None)
     conversation = list(messages)
     full_output = ""
     steps = 0

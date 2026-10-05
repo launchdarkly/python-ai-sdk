@@ -16,6 +16,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from tests.never_forwarded import (
+    NEVER_FORWARDED_BAG,
+    NEVER_FORWARDED_KEYS,
+    find_leaks,
+)
+
 # ---------------------------------------------------------------------------
 # Fake anthropic response helpers
 # ---------------------------------------------------------------------------
@@ -2543,3 +2549,80 @@ class TestStreamingInputWriteIsGuarded:
         assert chat.ended == 1
         assert StatusCode.ERROR in chat.statuses
         assert "launchdarkly.stream.abandoned" not in chat.attributes
+
+
+class TestNeverForwardedParameters:
+    """No credential, endpoint, request-injection, remote-tool, or host-process key in
+    ``model.parameters`` reaches ``messages.create`` or ``messages.stream``."""
+
+    async def test_invoke_forwards_none_of_them(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": dict(NEVER_FORWARDED_BAG)},
+        }
+        await create_claude_messages_handler()(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert not find_leaks(call_kwargs)
+        assert not set(call_kwargs) & NEVER_FORWARDED_KEYS
+
+    async def test_stream_forwards_none_of_them(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, _ = _make_stream_context(["hi"])
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": dict(NEVER_FORWARDED_BAG)},
+        }
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_claude_messages_handler()
+        async for _event in await h.stream(config, "q", {}, {}):
+            pass
+        call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
+        assert not find_leaks(call_kwargs)
+        assert not set(call_kwargs) & NEVER_FORWARDED_KEYS
+
+
+class TestInvokeAndStreamForwardTheSameKeys:
+    """``output_format`` is accepted by ``messages.stream`` only. Forwarding it there and not on
+    ``create`` made one config behave differently by call, so it is dropped on both, and
+    ``output_config`` (accepted by both) carries the output format instead."""
+
+    _PARAMS: ClassVar[dict[str, Any]] = {
+        "output_format": {"type": "json_schema", "schema": {}},
+        "output_config": {"format": {"type": "json_schema", "schema": {}}},
+        "top_p": 0.4,
+    }
+
+    async def test_invoke(self, mock_anthropic: MagicMock) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+        await create_claude_messages_handler()(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert "output_format" not in call_kwargs
+        assert call_kwargs["output_config"] == self._PARAMS["output_config"]
+        assert call_kwargs["top_p"] == 0.4
+
+    async def test_stream(self, mock_anthropic: MagicMock) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, _ = _make_stream_context(["hi"])
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_claude_messages_handler()
+        async for _event in await h.stream(config, "q", {}, {}):
+            pass
+        call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
+        assert "output_format" not in call_kwargs
+        assert call_kwargs["output_config"] == self._PARAMS["output_config"]
+        assert call_kwargs["top_p"] == 0.4
