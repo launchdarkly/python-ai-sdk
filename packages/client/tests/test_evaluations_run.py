@@ -2965,3 +2965,46 @@ def test_ai_config_variation_from_api_layers_the_model_config() -> None:
     unlinked = AIConfigVariation.from_api(latest)
     assert "provider" not in unlinked.generation
     assert unlinked.generation["parameters"] == {"temperature": 0.7}
+
+
+def _scorer(**options: Any) -> Scorer:
+    return Scorer(name="accuracy", fn=lambda row, output: True, **options)
+
+
+@pytest.mark.parametrize(
+    ("counts", "criteria", "expected"),
+    [
+        # 28 of 30 rows passed: 93% meets a 0.9 pass rate.
+        ((30, 28, 1, 1, 0), [_scorer(pass_rate_threshold=0.9)], True),
+        # The strictest pass rate across criteria applies.
+        (
+            (30, 28, 1, 1, 0),
+            [_scorer(pass_rate_threshold=0.9), _scorer(pass_rate_threshold=0.95)],
+            False,
+        ),
+        # Without a pass rate on every criterion, any failed row fails the run.
+        ((30, 28, 1, 1, 0), [_scorer(pass_rate_threshold=0.9), _scorer()], False),
+        ((30, 28, 1, 1, 0), [_scorer()], False),
+        ((30, 30, 0, 0, 0), [_scorer()], True),
+        # A pending row never passes.
+        ((30, 29, 0, 0, 1), [_scorer(pass_rate_threshold=0.5)], False),
+        # An empty run never passes a pass rate.
+        ((0, 0, 0, 0, 0), [_scorer(pass_rate_threshold=0.0)], False),
+    ],
+)
+def test_run_passed_honours_pass_rate_threshold(
+    counts: tuple[int, int, int, int, int], criteria: list[Scorer], expected: bool
+) -> None:
+    from launchdarkly_ai_server.evaluations.module import _run_passed
+    from launchdarkly_ai_server.evaluations.types import RunSummary
+
+    total, passed, failed, error, pending = counts
+    summary = RunSummary(
+        total_rows=total,
+        passed_rows=passed,
+        failed_rows=failed,
+        error_rows=error,
+        pending_rows=pending,
+    )
+
+    assert _run_passed(summary, criteria) is expected
