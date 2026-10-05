@@ -16,8 +16,10 @@ from launchdarkly_ai_server.evaluations import (
     HttpResponse,
     Judge,
     Scorer,
+    ScorerContext,
     init_evaluations,
 )
+from launchdarkly_ai_server.trajectory import ToolInvocation
 
 
 @pytest.fixture(autouse=True)
@@ -2965,3 +2967,108 @@ def test_ai_config_variation_from_api_layers_the_model_config() -> None:
     unlinked = AIConfigVariation.from_api(latest)
     assert "provider" not in unlinked.generation
     assert unlinked.generation["parameters"] == {"temperature": 0.7}
+
+
+def _scorer_runner() -> Any:
+    from launchdarkly_ai_server.evaluations.api import LDApiClient
+    from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner
+
+    return EvaluationsRunner(
+        LDApiClient(api_token="token", transport=failing_transport)
+    )
+
+
+def _generated_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "row_index": 0,
+        "input": "Question",
+        "expected_output": None,
+        "variables": {},
+        "metadata": None,
+        "output": "answer",
+        "status": "COMPLETE",
+        "tool_calls": [
+            ToolInvocation(name="lookup_order", arguments='{"id":"A1"}', result="ok"),
+            ToolInvocation(name="refund", arguments='{"id":"A1"}', result="done"),
+        ],
+        "tool_calls_omitted": 3,
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_scorer_with_a_third_parameter_receives_the_tool_calls_in_order() -> None:
+    seen: list[ScorerContext] = []
+
+    def scorer_fn(row: DatasetRow, output: Any, context: ScorerContext) -> float:
+        seen.append(context)
+        names = [call.name for call in context.tool_calls]
+        return 1.0 if names == ["lookup_order", "refund"] else 0.0
+
+    result = await _scorer_runner()._run_scorer_for_result(
+        _generated_row(), Scorer(name="trajectory", fn=scorer_fn)
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["score"] == 1.0
+    assert seen[0].tool_calls_omitted == 3
+
+
+@pytest.mark.asyncio
+async def test_async_scorer_with_a_context_is_awaited() -> None:
+    async def scorer_fn(row: DatasetRow, output: Any, context: ScorerContext) -> float:
+        return 1.0 if len(context.tool_calls) == 2 else 0.0
+
+    result = await _scorer_runner()._run_scorer_for_result(
+        _generated_row(), Scorer(name="trajectory", fn=scorer_fn)
+    )
+
+    assert result["score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_scorer_context_is_empty_when_no_tool_was_called() -> None:
+    def scorer_fn(row: DatasetRow, output: Any, context: ScorerContext) -> float:
+        assert context.tool_calls == ()
+        assert context.tool_calls_omitted == 0
+        return 1.0
+
+    result = await _scorer_runner()._run_scorer_for_result(
+        _generated_row(tool_calls=[], tool_calls_omitted=0),
+        Scorer(name="trajectory", fn=scorer_fn),
+    )
+
+    assert result["status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_two_parameter_scorer_is_called_without_a_context() -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    def scorer_fn(*args: Any) -> float:
+        calls.append(args)
+        return 1.0
+
+    def two_parameter(row: DatasetRow, output: Any) -> float:
+        return scorer_fn(row, output)
+
+    await _scorer_runner()._run_scorer_for_result(
+        _generated_row(), Scorer(name="plain", fn=two_parameter)
+    )
+
+    assert len(calls[0]) == 2
+
+
+def test_scorer_detects_the_context_parameter_once_at_construction() -> None:
+    assert Scorer(name="a", fn=lambda row, output: 1.0).accepts_context is False
+    assert Scorer(name="b", fn=lambda row, output, ctx: 1.0).accepts_context is True
+    assert (
+        Scorer(name="c", fn=lambda row, output, ctx=None: 1.0).accepts_context is True
+    )
+    assert Scorer(name="d", fn=lambda *args: 1.0).accepts_context is False
+
+
+def test_scorer_rejects_a_function_that_needs_more_than_three_arguments() -> None:
+    with pytest.raises(ValueError, match="at most"):
+        Scorer(name="too-many", fn=lambda a, b, c, d: 1.0)

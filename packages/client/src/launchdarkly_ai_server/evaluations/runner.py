@@ -33,7 +33,7 @@ from ..utils import (
     to_ld_context,
 )
 from .api import EvaluationsError, LDApiClient, LDApiError
-from .criteria import Criterion, Judge, Scorer
+from .criteria import Criterion, Judge, Scorer, ScorerContext
 from .events import (
     CriterionEventPayload,
     CriterionStatus,
@@ -859,7 +859,14 @@ class EvaluationsRunner:
             metadata=row.get("metadata"),
         )
         try:
-            score_value = scorer.fn(dataset_row, row.get("output"))
+            if scorer.accepts_context:
+                context = ScorerContext(
+                    tool_calls=tuple(row.get("tool_calls") or ()),
+                    tool_calls_omitted=int(row.get("tool_calls_omitted") or 0),
+                )
+                score_value = scorer.fn(dataset_row, row.get("output"), context)  # type: ignore[call-arg]
+            else:
+                score_value = scorer.fn(dataset_row, row.get("output"))  # type: ignore[call-arg]
             if inspect.isawaitable(score_value):
                 score_value = await score_value
         except Exception as error:
