@@ -9,7 +9,7 @@ from .api import (
     Transport,
     urllib_transport,
 )
-from .criteria import Criterion, Judge, Scorer, SuccessDirection
+from .criteria import Criterion, Judge, Scorer, ScorerContext, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
 from .types import (
     AIConfig,
@@ -35,6 +35,7 @@ __all__ = [
     "LDApiError",
     "RunSummary",
     "Scorer",
+    "ScorerContext",
     "SuccessDirection",
     "Transport",
     "Usage",
