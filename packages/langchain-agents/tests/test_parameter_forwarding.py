@@ -14,7 +14,7 @@ classified yet fails loudly by name, and so does a list entry that is not a real
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 import langchain_anthropic
 import langchain_openai
@@ -32,6 +32,7 @@ from launchdarkly_ai_langchain_agents.handler import (
     _CHAT_OPENAI_OWNED_KEYS,
     _model_constructor_kwargs,
 )
+from tests.never_forwarded import NEVER_FORWARDED_BAG
 
 
 def _accepted_keys(cls: Any) -> frozenset[str]:
@@ -180,3 +181,70 @@ class TestModelFieldAliasesAreNeverForwarded:
             _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
         )
         assert kwargs == {"model": "configured-model", "temperature": 0.2}
+
+
+class TestNeverForwardedKeys:
+    """No credential, endpoint, request-injection, or remote-tool key in ``model.parameters``
+    reaches any chat model constructor."""
+
+    def _config(self, provider: str, parameters: dict[str, Any]) -> Any:
+        return {
+            "model": {"name": "configured-model", "parameters": parameters},
+            "provider": {"name": provider},
+        }
+
+    @pytest.mark.parametrize(
+        ("provider", "forwarded_keys"),
+        [
+            ("openai", _CHAT_OPENAI_FORWARDED_KEYS),
+            ("anthropic", _CHAT_ANTHROPIC_FORWARDED_KEYS),
+            ("bedrock", _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS),
+        ],
+    )
+    def test_constructor_kwargs_hold_none_of_them(
+        self, provider: str, forwarded_keys: frozenset[str]
+    ) -> None:
+        kwargs = _model_constructor_kwargs(
+            self._config(provider, {**NEVER_FORWARDED_BAG, "temperature": 0.2}),
+            "fallback",
+            forwarded_keys,
+        )
+        assert kwargs == {"model": "configured-model", "temperature": 0.2}
+
+
+class TestModelKwargsCannotSmuggleRequestKeys:
+    """``ChatOpenAI`` merges ``model_kwargs`` straight into the request payload, so forwarding it
+    would carry ``extra_headers``/``extra_query`` past every exclusion."""
+
+    _SMUGGLED: ClassVar[dict[str, Any]] = {
+        "model_kwargs": {
+            "extra_headers": {"X-Smuggled": "1"},
+            "extra_query": {"smuggled": "1"},
+        }
+    }
+
+    def _payload(self, **kwargs: Any) -> dict[str, Any]:
+        from langchain_core.messages import HumanMessage
+
+        model = langchain_openai.ChatOpenAI(api_key="sk-test-not-a-real-key", **kwargs)
+        payload: dict[str, Any] = model._get_request_payload([HumanMessage("hi")])
+        return payload
+
+    def test_model_kwargs_would_reach_the_payload_if_forwarded(self) -> None:
+        """The control: passed to ``ChatOpenAI`` directly, both keys reach the payload."""
+        payload = self._payload(model="gpt-4o", **self._SMUGGLED)
+        assert payload["extra_headers"] == {"X-Smuggled": "1"}
+        assert payload["extra_query"] == {"smuggled": "1"}
+
+    def test_forwarded_model_parameters_keep_them_out_of_the_payload(self) -> None:
+        kwargs = _model_constructor_kwargs(
+            {
+                "model": {"name": "gpt-4o", "parameters": dict(self._SMUGGLED)},
+                "provider": {"name": "openai"},
+            },
+            "fallback",
+            _CHAT_OPENAI_FORWARDED_KEYS,
+        )
+        payload = self._payload(**kwargs)
+        assert "extra_headers" not in payload
+        assert "extra_query" not in payload

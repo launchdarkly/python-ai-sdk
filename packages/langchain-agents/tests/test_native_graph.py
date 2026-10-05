@@ -16,6 +16,7 @@ from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
 
 from launchdarkly_ai_langchain_agents.native_graph import _extract_usage, to_lang_graph
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.never_forwarded import NEVER_FORWARDED_BAG
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -930,3 +931,41 @@ class TestWorkflowStateAnnotationsResolve:
 
         assert isinstance(result, dict)
         assert "response" in result
+
+
+class TestNativeGraphNeverForwardedParameters:
+    @pytest.mark.asyncio
+    async def test_default_chat_openai_receives_no_never_forwarded_key(self) -> None:
+        ai_msg = _make_ai_msg("final")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {
+                            "name": "gpt-4o",
+                            "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.2},
+                        },
+                        "instructions": "help",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+
+        async def _visit(fn: Any, ctx: Any = None) -> None:
+            if graph_def.root is not None:
+                await fn(graph_def.root)
+
+        graph_def.traverse = _visit
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        assert mocks["langchain_openai"].ChatOpenAI.call_args.kwargs == {
+            "temperature": 0.2,
+            "model": "gpt-4o",
+        }
