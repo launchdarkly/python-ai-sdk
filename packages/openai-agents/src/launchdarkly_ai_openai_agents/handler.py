@@ -76,7 +76,7 @@ except ImportError:  # pragma: no cover - `agents` is a hard dependency of this 
 
 #: Every field ``agents.ModelSettings`` declares, classified by hand into exactly one of: forwarded
 #: (below) or excluded. ``ModelSettings`` has no handler-owned fields: ``model`` and ``max_turns``
-#: live outside it (on ``Agent``/``Runner.run``, see the ``.pop("max_turns", ...)`` below).
+#: live outside it (on ``Agent``/``Runner.run``; ``max_turns`` is read separately for the run).
 #: ``TestModelSettingsAcceptsExactlyTheseFields`` in this package's tests asserts this
 #: classification stays exhaustive as the SDK's own dataclass changes.
 #:
@@ -253,11 +253,10 @@ def _build_agent_and_prompt(
     # change, not a telemetry one, so it is left alone. `_call_impl` still returns the parsed
     # `final_output` object as-is when `outputFormat` is configured, matching the pre-existing
     # return-shape contract.
-    model_settings_params = model_parameters(config)
-    # `max_turns` is a `Runner.run` option, not a `ModelSettings` field.
-    model_settings_params.pop("max_turns", None)
+    # `max_turns` is a `Runner.run` option, not a `ModelSettings` field, so the filter drops it here
+    # and the run call reads it separately.
     model_settings_params = select_forwarded_parameters(
-        model_settings_params, _MODEL_SETTINGS_FORWARDED_KEYS
+        model_parameters(config), _MODEL_SETTINGS_FORWARDED_KEYS
     )
     agent = Agent(
         name="assistant",

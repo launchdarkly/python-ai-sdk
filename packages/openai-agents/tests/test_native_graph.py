@@ -13,6 +13,7 @@ import pytest
 import launchdarkly_ai_openai_agents.native_graph as _openai_ng
 from launchdarkly_ai_openai_agents.native_graph import to_openai_agents
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -761,3 +762,43 @@ class TestToOpenAIAgentsOpenAISpecific:
 
         assert captured_hooks, "hooks were not passed to Runner.run"
         assert "$ld:ai:graph:handoff_success" in track_calls
+
+
+class TestNativeGraphModelParameters:
+    @pytest.mark.asyncio
+    async def test_no_never_forwarded_key_reaches_any_agent_or_the_run(self) -> None:
+        run_result = _make_run_result("out")
+        agents_mock = _make_agents_mock(run_result)
+        agents_mock.ModelSettings = MagicMock(side_effect=lambda **kw: dict(kw))
+        nodes = {
+            "root": {
+                "key": "root",
+                "config": {
+                    "model": {
+                        "name": "gpt-4o",
+                        "parameters": {
+                            **NEVER_FORWARDED_BAG,
+                            "temperature": 0.1,
+                            "max_turns": 6,
+                        },
+                    },
+                    "instructions": "help",
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [],
+                "is_terminal": True,
+            }
+        }
+        graph_def = _make_graph_def(nodes=nodes)
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            await to_openai_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        (root_agent,) = agents_mock._created_agents
+        assert root_agent._kw["model_settings"] == {"temperature": 0.1}
+        run_kwargs = agents_mock.Runner.run.call_args.kwargs
+        assert run_kwargs["max_turns"] == 6
+        assert not find_leaks({k: v for k, v in run_kwargs.items() if k != "hooks"})

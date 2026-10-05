@@ -177,11 +177,8 @@ def to_openai_agents(
             agent_name = _sanitize_name(node.key)
             agent_name_to_key[agent_name] = node.key
 
-            node_model_settings_params = model_parameters(node.config)
-            # `max_turns` is a `Runner.run` option, not a `ModelSettings` field.
-            node_model_settings_params.pop("max_turns", None)
             node_model_settings_params = select_forwarded_parameters(
-                node_model_settings_params, _MODEL_SETTINGS_FORWARDED_KEYS
+                model_parameters(node.config), _MODEL_SETTINGS_FORWARDED_KEYS
             )
             agent = Agent(
                 name=agent_name,
@@ -278,6 +275,10 @@ def to_openai_agents(
             root_prompt = _to_openai_agent_items(turns)
 
         try:
+            # Only the root node's `max_turns` applies. The whole graph is one `Runner.run`, and
+            # the Agents SDK counts turns once for that run, across every handoff: `max_turns` is
+            # a `Runner.run` argument, and `Agent` has no per-agent turn limit to set from a
+            # child node's config.
             root_max_turns = model_parameters(root.config).get("max_turns")
             root_run_kwargs = (
                 {"max_turns": root_max_turns} if root_max_turns is not None else {}

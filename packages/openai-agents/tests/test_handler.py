@@ -27,6 +27,7 @@ from launchdarkly_ai_openai_agents.handler import (
     openai_agents,
 )
 from launchdarkly_ai_openai_agents.utils import build_output_type
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # Fake `agents` SDK
@@ -2254,3 +2255,57 @@ class TestCancelledStreamSaysCancelled:
 
         assert rec.root.attributes.get("launchdarkly.run.cancelled") is True
         assert "launchdarkly.stream.abandoned" not in rec.root.attributes
+
+
+class TestNeverForwardedParameters:
+    """No credential, endpoint, request-injection, remote-tool, or host-process key in
+    ``model.parameters`` reaches ``ModelSettings`` or the ``Runner`` call."""
+
+    async def test_invoke_forwards_none_of_them(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.1},
+            },
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = captured["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs == {"temperature": 0.1}
+        assert not find_leaks(captured["run_kwargs"])
+
+    async def test_stream_forwards_none_of_them(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def run_streamed(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            return FakeStreamedResult(
+                agent, prompt, hooks, [{"output": _text_output("hi")}], "done"
+            )
+
+        agents_mod = _fake_agents_module(run_streamed=run_streamed)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.1},
+            },
+        )
+        with _patched_agents(agents_mod):
+            gen = await create_openai_agent_handler().stream(config, "q", {}, {})
+            async for _event in gen:
+                pass
+        model_settings = captured["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs == {"temperature": 0.1}
+        assert not find_leaks(captured["run_kwargs"])
