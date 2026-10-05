@@ -24,6 +24,7 @@ from .runner import (
     ToolImplementation,
     _provides_for,
     _segment,
+    _select_handler,
 )
 from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
 
@@ -126,12 +127,11 @@ class EvaluationsModule:
         project_key: str,
         key: str,
         dataset: str,
-        handler: EvalHandler,
+        handlers: list[EvalHandler],
         generation: GenerationConfig | None = None,
         ai_config: AIConfig | None = None,
         tools: Mapping[str, ToolImplementation] | None = None,
         criteria: list[Criterion] | None = None,
-        judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
         poll_interval_seconds: float | None = None,
         poll_timeout_seconds: float | None = None,
@@ -139,17 +139,21 @@ class EvaluationsModule:
         """
         Create and run an evaluation in the caller's process.
 
-        Each dataset row is generated with ``handler``; every entry in
-        ``criteria`` — LaunchDarkly :class:`Judge` references and local
-        deterministic :class:`Scorer` functions — is then run against each
-        generated row, and one evaluation event is emitted per
+        run() generates each dataset row with a handler from ``handlers``.
+        Every entry in ``criteria`` (a LaunchDarkly :class:`Judge` reference
+        or a local :class:`Scorer` function) then runs against each
+        generated row. run() emits one evaluation event per
         ``(row, criterion)`` result.
 
-        A :class:`Judge` is an independent AI Config and may be served by a
-        different provider or mode than ``generation``. ``handler`` runs a judge
-        only when it provides for that judge's provider; pass handlers for any
-        other providers your judges use in ``judge_handlers``. A judge no
-        handler covers fails the run before any records are created.
+        Pass one handler in ``handlers`` when generation and every judge use
+        the same provider. Pass more than one handler otherwise. Build each
+        handler with ``create_handler()`` (or a provider package's
+        ``create_*_handler()``) and give it a ``provides_for`` tag for its
+        provider and mode. With more than one handler, run() picks the
+        handler tagged for the provider a call needs, and for a judge, also
+        for its mode. run() raises an error before any record exists if no
+        handler matches a call, or if more than one handler could match and
+        the call has no mode to break the tie.
 
         The returned pass/fail result is derived from LaunchDarkly's run summary.
         A CI script can exit with ``0 if result.passed else 1`` after awaiting
@@ -174,7 +178,7 @@ class EvaluationsModule:
             project_key=project_key,
             key=key,
             dataset=dataset,
-            handler=handler,
+            handlers=handlers,
             concurrency=concurrency,
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
@@ -206,11 +210,12 @@ class EvaluationsModule:
                     Judge(key=judge_key) for judge_key in ai_config_variation.judge_keys
                 ]
         generation = self._validate_generation(generation)
+        # Checkable as soon as generation is known, and always before any
+        # network request the run still needs to make.
+        generation_handler = _select_handler(generation["provider"], handlers)
         run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
-        run_judge_handlers = list(judge_handlers or [])
         self._validate_criteria(run_criteria)
-        self._validate_judge_handlers(run_judge_handlers)
         ld_judges = [
             criterion for criterion in run_criteria if isinstance(criterion, Judge)
         ]
@@ -236,7 +241,7 @@ class EvaluationsModule:
                     resolved_tool.version,
                 )
         resolved_judges = await self._runner._resolve_judges(
-            project_key, ld_judges, handler, run_judge_handlers
+            project_key, ld_judges, handlers
         )
         dataset_ref = await asyncio.to_thread(
             self._runner._fetch_dataset, project_key, dataset
@@ -261,7 +266,7 @@ class EvaluationsModule:
         config = self._runner._build_handler_config(generation, resolved_tools)
         results = await self._runner._run_rows(
             rows,
-            handler,
+            generation_handler,
             config,
             run_tools,
             concurrency,
@@ -407,24 +412,29 @@ class EvaluationsModule:
             )
 
     @staticmethod
-    def _validate_judge_handlers(judge_handlers: list[EvalHandler]) -> None:
-        """Reject judge handlers that cannot be routed by provider and mode.
+    def _validate_handlers(handlers: list[EvalHandler]) -> None:
+        """Reject an empty or invalid ``handlers`` list before any request.
 
-        A judge handler is only ever chosen by matching its ``provides_for``
-        against the judge's resolved provider and mode. One without that
-        metadata could never be selected, so it would silently fall through to
-        the generation handler instead of running the judge it was passed for.
+        Two entries tagged for the identical provider and mode could never be
+        told apart later, so that check also runs here rather than at
+        selection time.
         """
-        for index, candidate in enumerate(judge_handlers):
+        if not handlers:
+            raise EvaluationsError("handlers must not be empty")
+        seen: dict[tuple[str, str], int] = {}
+        for index, candidate in enumerate(handlers):
             if not callable(candidate):
-                raise EvaluationsError(f"judge_handlers[{index}] must be callable")
-            if _provides_for(candidate) is None:
+                raise EvaluationsError(f"handlers[{index}] must be callable")
+            tag = _provides_for(candidate)
+            if tag is None:
+                continue
+            if tag in seen:
                 raise EvaluationsError(
-                    f"judge_handlers[{index}] does not declare provides_for. "
-                    "Build judge handlers with create_handler() (or a provider "
-                    "package's create_*_handler()) so they can be matched to a "
-                    "judge's provider and mode."
+                    f"handlers[{seen[tag]}] and handlers[{index}] both declare "
+                    f"provides_for {tag[0]!r} in {tag[1]!r} mode. Only one "
+                    "handler may serve a given provider and mode."
                 )
+            seen[tag] = index
 
     @staticmethod
     def _validate_run_args(
@@ -432,7 +442,7 @@ class EvaluationsModule:
         project_key: str,
         key: str,
         dataset: str,
-        handler: EvalHandler,
+        handlers: list[EvalHandler],
         concurrency: int,
         poll_interval_seconds: float,
         poll_timeout_seconds: float,
@@ -444,8 +454,7 @@ class EvaluationsModule:
         ):
             if not value.strip():
                 raise EvaluationsError(f"{name} must not be blank")
-        if not callable(handler):
-            raise EvaluationsError("handler must be callable")
+        EvaluationsModule._validate_handlers(handlers)
         if concurrency < 1:
             raise EvaluationsError("concurrency must be at least 1")
         for name, seconds in (
