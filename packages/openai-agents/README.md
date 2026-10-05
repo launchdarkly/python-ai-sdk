@@ -34,6 +34,11 @@ async def main():
 asyncio.run(main())
 ```
 
+Tool handlers may be sync or async. Sync handlers run on the event-loop thread, so
+blocking I/O stalls the agent. Keep graph `__handoff_*` handlers synchronous: routing
+records the selected edge on the call itself, and moving them onto `asyncio.to_thread`
+would break that.
+
 ### Convenience wrapper
 
 ```python

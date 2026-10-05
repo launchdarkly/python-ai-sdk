@@ -468,6 +468,13 @@ class TestToolExecutionLoop:
 
     @pytest.mark.asyncio
     async def test_sync_handler_returns_string(self) -> None:
+        """Direct ``_build_agent_tools`` call (skips ``wrap_tool_handlers``).
+
+        On the normal invoke/stream path, user handlers are wrapped async before
+        they reach here, so the production failure was primarily ``__handoff_*``
+        tools (and native-graph handlers that also bypass wrapping).
+        """
+
         def sync_handler(args: dict[str, Any]) -> str:
             assert args == {"city": "Paris"}
             return "sunny"
