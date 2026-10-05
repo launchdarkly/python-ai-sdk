@@ -57,6 +57,7 @@ NEVER_FORWARDED_KEYS = frozenset(
         "extra_query",
         "extra_args",
         "model_kwargs",
+        "provider_data",
         "additional_model_request_fields",
         # Remote tools.
         "mcp_servers",

@@ -43,6 +43,7 @@ from launchdarkly_ai_claude_agents.handler import (
     partition_tools,
 )
 from launchdarkly_ai_server import ConversationIdSpanProcessor, conversation_id
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # A real tracer provider, reset between tests
@@ -1527,19 +1528,23 @@ class TestModelParametersForwarding:
         ):
             assert not hasattr(options, rejected) or getattr(options, rejected) is None
 
-    async def test_transport_key_is_never_forwarded(
+    async def test_no_never_forwarded_key_reaches_the_query_options(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Every credential, endpoint, request-injection, remote-tool, and host-process key,
+        including the real ``ClaudeAgentOptions`` fields ``cli_path``, ``env``, ``cwd``,
+        ``add_dirs``, ``permission_mode`` and ``can_use_tool``, is dropped on the way to
+        ``query``; the agreed run setting still lands."""
         config = {
             **BASE_CONFIG,
             "model": {
                 **BASE_CONFIG["model"],
-                "parameters": {"extra_body": {"secret": "value"}, "max_turns": 2},
+                "parameters": {**NEVER_FORWARDED_BAG, "max_turns": 2},
             },
         }
         options = await self._run_and_capture_options(config, monkeypatch)
         assert options.max_turns == 2
-        assert not hasattr(options, "extra_body") or options.extra_body is None
+        assert not find_leaks(options)
 
     async def test_temperature_top_p_and_max_turns_run_without_type_error(
         self, monkeypatch: pytest.MonkeyPatch
