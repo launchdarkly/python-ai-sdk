@@ -3007,6 +3007,7 @@ def scorer_run_transport() -> SequencedTransport:
 async def test_scorer_must_return_a_finite_number_in_range(
     stub_sdk_client: MagicMock,
     returned: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A bool is an invalid score, not a shortcut for 1.0/0.0.
 
@@ -3021,14 +3022,15 @@ async def test_scorer_must_return_a_finite_number_in_range(
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "generated"}
 
-    result = await evals.run(
-        project_key="proj",
-        key="support-qa",
-        dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
-        criteria=[Scorer(name="binary", fn=lambda row, output: returned)],
-    )
+    with caplog.at_level("WARNING"):
+        result = await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=handler,
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[Scorer(name="binary", fn=lambda row, output: returned)],
+        )
 
     events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
     scorer_event = next(event for event in events if event.get("kind") == "scorer")
@@ -3038,6 +3040,11 @@ async def test_scorer_must_return_a_finite_number_in_range(
     assert repr(returned) in scorer_event["error"]["message"]
     assert scorer_event["errorMessage"] == scorer_event["error"]["message"]
     assert "score" not in scorer_event
+    # The caller's own logs name the scorer and the value, once per scorer.
+    warnings = [r for r in caplog.records if "invalid score" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "'binary'" in warnings[0].getMessage()
+    assert repr(returned) in warnings[0].getMessage()
     # A rejected score is a per-criterion ERROR, never a raised exception: the
     # row's generation has already been paid for.
     assert result.run_id == "run-id"

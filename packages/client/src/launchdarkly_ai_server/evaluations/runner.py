@@ -220,6 +220,7 @@ class EvaluationsRunner:
 
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
+        self._warned_invalid_scorers: set[str] = set()
 
     def _fetch_config_variation(
         self,
@@ -875,12 +876,17 @@ class EvaluationsRunner:
         # pass, since every non-empty value is truthy.
         score = numeric_score(score_value)
         if score is None or score < 0 or score > 1:
-            return self._criterion_error_result(
-                base,
-                started_clock,
-                "invalid_score",
+            message = (
                 "scorer fn must return a finite number between 0 and 1, "
-                f"got {score_value!r}",
+                f"got {score_value!r}"
+            )
+            if scorer.name not in self._warned_invalid_scorers:
+                self._warned_invalid_scorers.add(scorer.name)
+                logger.warning(
+                    "scorer %r returned an invalid score: %s", scorer.name, message
+                )
+            return self._criterion_error_result(
+                base, started_clock, "invalid_score", message
             )
         completed = datetime.now(UTC)
         return {
