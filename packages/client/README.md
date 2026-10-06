@@ -345,7 +345,11 @@ asyncio.run(main())
 
 ---
 
-### Agent Skills
+### Agent Skills (experimental)
+
+> **Experimental.** Import Agent Skills from `launchdarkly_ai_server.experimental.skills`;
+> none of these names is exported from the package root. They may change in a minor release,
+> and each change is listed in the changelog under **Experimental**.
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
@@ -357,9 +361,9 @@ import asyncio
 import hashlib
 from pathlib import Path
 
-from launchdarkly_ai_server import (
-    init_client, inspect_config, skill_refs, get_skill, write_skills,
-    InMemorySkillStore,
+from launchdarkly_ai_server import init_client, inspect_config
+from launchdarkly_ai_server.experimental.skills import (
+    InMemorySkillStore, get_skill, set_skill_store, skill_refs, write_skills,
 )
 
 SKILL_MD = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
@@ -376,7 +380,8 @@ async def main():
         # hash does not match is withheld.
         "contentHash": hashlib.sha256(SKILL_MD.encode("utf-8")).hexdigest(),
     })
-    await init_client(options={"skillStore": store})
+    set_skill_store(store)
+    await init_client()
 
     # 1. Which skills does this config reference? Pure projection — no I/O.
     info = await inspect_config("doc-agent", {"kind": "user", "key": "user-123"})
@@ -542,7 +547,7 @@ retrieval, verification, and telemetry as `get_skill`, but reports which of five
 happened instead of collapsing them all to `None`.
 
 ```python
-from launchdarkly_ai_server import get_skill_result
+from launchdarkly_ai_server.experimental.skills import get_skill_result
 
 outcome = await get_skill_result("pdf-extraction")
 
@@ -590,13 +595,15 @@ authenticated with the environment's server-side SDK key.
 ```python
 import os
 
-from launchdarkly_ai_server import FDv2SkillStore, init_client, watch_skills
+from launchdarkly_ai_server.experimental.skills import (
+    FDv2SkillStore, set_skill_store, watch_skills,
+)
 
 store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
 if not store.wait_for_skills(timeout=10):
     # No payload arrived. Reconciling now would find an empty store; see below.
     print(f"skill delivery has not answered yet: {store.failed or 'still waiting'}")
-await init_client(options={"skillStore": store})
+set_skill_store(store)
 
 # Materialize now, and re-materialize whenever delivery changes.
 report, watcher = await watch_skills("*", ".claude/skills")
@@ -709,9 +716,10 @@ that skips verification.
 | `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, so revocation takes effect within `debounce` rather than at the next restart. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
-Configure the store with `init_client(options={"skillStore": store})`. With none configured,
-the accessors raise `RuntimeError` explaining what to do, and `write_skills` reports the
-failure (or raises, with `on_unavailable="raise"`). `shutdown()` clears it.
+Configure the store with `set_skill_store(store)`. It applies on every call, before or after
+`init_client`, and `None` never clears a configured store. With none configured, the accessors
+raise `RuntimeError` explaining what to do, and `write_skills` reports the failure (or raises,
+with `on_unavailable="raise"`). `shutdown()` clears it.
 
 `ReconcileReport.actions` holds one `ReconcileAction` per outcome (`written`, `updated`,
 `skipped_current`, `removed`, or `error`), each with `key`, `version`, the resolved `path`, and

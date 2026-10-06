@@ -228,7 +228,7 @@ async def watch_skills(
     if store is None:
         raise RuntimeError(
             "watch_skills needs a configured skill store. Configure one with "
-            'init_client(options={"skillStore": store}).'
+            "set_skill_store(store)."
         )
     add_listener = getattr(store, "add_listener", None)
     if not callable(add_listener):

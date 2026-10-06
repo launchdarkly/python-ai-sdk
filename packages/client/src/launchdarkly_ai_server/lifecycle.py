@@ -150,25 +150,12 @@ async def init_client(
 
     - Pass *client* directly (BYOC) to skip the LaunchDarkly Python SDK path.
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
-    - ``options['skillStore']`` sets the store the Agent Skills accessors read
-      from. Without one, the accessors raise ``RuntimeError``.
 
-    Idempotent: later calls return the existing client and ignore every option
-    **except** ``skillStore``, which is applied on every successful call, so you
-    can add a store after initialization. A ``None`` store never clears the
-    current one (use ``shutdown()``), and a call that raises installs nothing.
+    Idempotent: later calls return the existing client and ignore every option.
 
     Returns the initialized ``LDClientInterface`` instance.
     """
-    opts = options or {}
-
-    ld_client = await _resolve_client(opts, client)
-
-    # Reached only on success, so a failed init installs no store.
-    skill_store = opts.get("skillStore")
-    if skill_store is not None:
-        skills._set_store(skill_store)
-    return ld_client
+    return await _resolve_client(options or {}, client)
 
 
 async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
@@ -286,13 +273,21 @@ def _release_otel_globals() -> None:
         logger.debug("Could not release the global OTel tracer provider", exc_info=True)
 
 
+def _clear_experimental_state() -> None:
+    """Clears experimental feature state. A failure is logged, never raised."""
+    try:
+        skills._clear_state()
+    except Exception:
+        logger.warning("Could not clear the Agent Skills state", exc_info=True)
+
+
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also clears the configured skill store; pass ``skillStore`` again to the
-    next ``init_client`` to keep using the skill accessors.
+    Also clears any experimental feature state, such as a configured skill
+    store.
 
     When telemetry was running, this also releases the process-global tracer
     provider so a later ``init_client`` can install its own — see
@@ -304,7 +299,7 @@ async def shutdown() -> None:
     local_provider = _tracer_provider
     owned_globals = _owns_otel_globals
 
-    skills._clear_state()
+    _clear_experimental_state()
 
     # Null the singleton before any awaits so a second call is a no-op
     _client = None
@@ -351,7 +346,7 @@ def _reset_for_testing() -> None:
     _client = None
     _tracer_provider = None
     _owns_otel_globals = False
-    skills._clear_state()
+    _clear_experimental_state()
     # Mirrors shutdown(): without this a suite that inits more than once leaves
     # every later span on the first test's provider.
     if owned_globals:

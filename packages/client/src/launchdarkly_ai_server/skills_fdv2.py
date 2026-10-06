@@ -1313,13 +1313,13 @@ class FDv2SkillStore:
     A ``SkillStore`` fed by LaunchDarkly's SDK-facing FDv2 delivery channel.
 
     Constructed with the environment's server-side SDK key, started explicitly,
-    and passed to ``init_client``::
+    and passed to ``set_skill_store``::
 
         store = FDv2SkillStore(sdk_key=os.environ["LD_SDK_KEY"])
         store.start()
         if not store.wait_for_skills(timeout=10):
             ...  # no payload yet: see is_initialized
-        await init_client(options={"skillStore": store})
+        set_skill_store(store)
 
         skill = await get_skill("pdf-extraction")
         ...

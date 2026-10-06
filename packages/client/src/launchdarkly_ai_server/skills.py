@@ -18,6 +18,7 @@ from typing import Any
 from . import skills_core
 from .skills_core import (
     SKILL_OBJECT_KIND,
+    SkillStore,
     list_raw_objects,
     log_withholding_summary,
     newest_by_key,
@@ -39,11 +40,27 @@ logger = logging.getLogger(__name__)
 # Injection points
 # ---------------------------------------------------------------------------
 #
-# Used by ``init_client`` and ``shutdown`` (and tests). The state itself lives in
-# ``skills_core``, so there is exactly one store and one emitter.
+# Used by ``set_skill_store`` and ``shutdown`` (and tests). The state itself lives
+# in ``skills_core``, so there is exactly one store and one emitter.
 _set_store = skills_core.set_store
 _set_emitter_for_testing = skills_core.set_emitter
 _clear_state = skills_core.clear_state
+
+
+def set_skill_store(store: SkillStore | None) -> None:
+    """
+    Sets the store the skill accessors and ``write_skills`` read from.
+
+    Applies on every call, including after ``init_client``, so a lazily
+    initialized client can be given a store afterwards. ``None`` never clears a
+    configured store; ``shutdown()`` does that.
+
+    Args:
+        store: ``FDv2SkillStore`` to receive skills from LaunchDarkly, or
+            ``InMemorySkillStore`` for local development and tests.
+    """
+    if store is not None:
+        _set_store(store)
 
 
 class InMemorySkillStore:

@@ -22,13 +22,12 @@ import launchdarkly_ai_server.safe_fs as safe_fs_module
 import launchdarkly_ai_server.skills as skills_module
 import launchdarkly_ai_server.skills_core as skills_core_module
 import launchdarkly_ai_server.skills_fs as skills_fs_module
-from launchdarkly_ai_server import (
+from launchdarkly_ai_server import init_client, parse_ai_config
+from launchdarkly_ai_server.experimental.skills import (
     InMemorySkillStore,
     Skill,
     SkillReference,
     get_skill,
-    init_client,
-    parse_ai_config,
     skill_refs,
     write_skills,
 )
