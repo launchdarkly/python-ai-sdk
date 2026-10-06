@@ -3724,12 +3724,11 @@ async def test_inline_dataset_uploads_rows_before_any_event_and_omits_dataset_id
                 "input": "How do I reset my password?",
                 "expectedOutput": "Use the link.",
             },
-            DatasetRow(
-                row_index=1,
-                input="Where is order {{order_id}}?",
-                variables={"order_id": "A-17"},
-                metadata={"suite": "orders"},
-            ),
+            {
+                "input": "Where is order {{order_id}}?",
+                "variables": {"order_id": "A-17"},
+                "metadata": {"suite": "orders"},
+            },
         ],
         handler=handler,
         generation=INLINE_GENERATION,
@@ -3840,18 +3839,20 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
     ("dataset", "message"),
     [
         ([], "Inline dataset is empty"),
-        ([DatasetRow(row_index=3, input="hi")], "has row_index 3"),
         (
             [{"input": "hi", "expected_output": "x"}],
             "unknown fields: 'expected_output'",
         ),
         ([{"rowIdx": 1, "input": "hi"}], "has rowIdx 1"),
         ([{"rowIdx": True, "input": "hi"}], "has rowIdx True"),
-        (["just a string"], "must be a DatasetRow or a mapping"),
+        (["just a string"], "row 0 must be a mapping"),
+        (
+            [DatasetRow(row_index=0, input="hi")],
+            "row 0 must be a mapping",
+        ),
         ([{"input": 7}], "input must be a non-empty string"),
         ([{}], "row 0 input must be a non-empty string"),
         ([{"input": ""}], "input must be a non-empty string"),
-        ([DatasetRow(row_index=0)], "input must be a non-empty string"),
         ([{"input": "hi", "expectedOutput": 7}], "expectedOutput must be a string"),
         ([{"input": "hi", "variables": ["a"]}], "variables must be a mapping"),
         (
@@ -3871,7 +3872,7 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
             "metadata must be JSON-encodable",
         ),
         (
-            [DatasetRow(row_index=0, input="hi", variables={"when": datetime.now()})],
+            [{"input": "hi", "variables": {"when": datetime.now()}}],
             "variables must be JSON-encodable",
         ),
         (

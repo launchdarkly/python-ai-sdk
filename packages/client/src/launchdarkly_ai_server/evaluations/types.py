@@ -62,13 +62,13 @@ class DatasetRow:
     metadata: dict[str, Any] | None = None
 
 
-InlineDatasetRow = DatasetRow | Mapping[str, Any]
+InlineDatasetRow = Mapping[str, Any]
 """One caller-supplied row of an inline dataset.
 
 A mapping uses the dataset-rows wire shape: ``input``, ``expectedOutput``,
 ``variables``, ``metadata`` and an optional ``rowIdx``. A row's index is its
-position in the list; a ``rowIdx`` or ``DatasetRow.row_index`` that disagrees
-with that position is rejected.
+position in the list; a ``rowIdx`` that disagrees with that position is
+rejected.
 """
 
 

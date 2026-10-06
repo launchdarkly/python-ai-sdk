@@ -83,7 +83,7 @@ Generation and criterion events are the only path by which row results reach Lau
 
 ### Supply the dataset inline
 
-Pass a list of rows as `dataset`, instead of a dataset key, for datasets that live in code or are built at run time rather than stored in LaunchDarkly. Each row is a `DatasetRow` or a mapping in the upload wire shape — any of `input`, `expectedOutput`, `variables` and `metadata`, plus an optional `rowIdx` — and its index is its position in the list.
+Pass a list of rows as `dataset`, instead of a dataset key, for datasets that live in code or are built at run time rather than stored in LaunchDarkly. Each row is a mapping in the upload wire shape — any of `input`, `expectedOutput`, `variables` and `metadata`, plus an optional `rowIdx` — and its index is its position in the list.
 
 ```python
 result = await evals.run(

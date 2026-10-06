@@ -79,52 +79,34 @@ def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]
         raise EvaluationsError("Inline dataset is empty")
     normalized: list[DatasetRow] = []
     for position, row in enumerate(rows):
-        if isinstance(row, DatasetRow):
-            if row.row_index != position:
-                raise EvaluationsError(
-                    f"Inline dataset row {position} has row_index {row.row_index}; "
-                    "an inline row's index is its position in the list"
-                )
-            values: Mapping[str, Any] = {
-                "input": row.input,
-                "expectedOutput": row.expected_output,
-                "variables": row.variables,
-                "metadata": row.metadata,
-            }
-        elif isinstance(row, Mapping):
-            unknown = sorted(str(key) for key in row if key not in INLINE_ROW_FIELDS)
-            if unknown:
-                raise EvaluationsError(
-                    f"Inline dataset row {position} has unknown fields: "
-                    + ", ".join(repr(key) for key in unknown)
-                    + ". Expected any of: "
-                    + ", ".join(repr(key) for key in INLINE_ROW_FIELDS)
-                )
-            row_idx = row.get("rowIdx")
-            if row_idx is not None and (
-                isinstance(row_idx, bool) or row_idx != position
-            ):
-                raise EvaluationsError(
-                    f"Inline dataset row {position} has rowIdx {row_idx!r}; "
-                    "an inline row's index is its position in the list"
-                )
-            values = row
-        else:
+        if not isinstance(row, Mapping):
+            raise EvaluationsError(f"Inline dataset row {position} must be a mapping")
+        unknown = sorted(str(key) for key in row if key not in INLINE_ROW_FIELDS)
+        if unknown:
             raise EvaluationsError(
-                f"Inline dataset row {position} must be a DatasetRow or a mapping"
+                f"Inline dataset row {position} has unknown fields: "
+                + ", ".join(repr(key) for key in unknown)
+                + ". Expected any of: "
+                + ", ".join(repr(key) for key in INLINE_ROW_FIELDS)
             )
-        row_input = values.get("input")
+        row_idx = row.get("rowIdx")
+        if row_idx is not None and (isinstance(row_idx, bool) or row_idx != position):
+            raise EvaluationsError(
+                f"Inline dataset row {position} has rowIdx {row_idx!r}; "
+                "an inline row's index is its position in the list"
+            )
+        row_input = row.get("input")
         if not isinstance(row_input, str) or not row_input:
             raise EvaluationsError(
                 f"Inline dataset row {position} input must be a non-empty string"
             )
-        expected_output = values.get("expectedOutput")
+        expected_output = row.get("expectedOutput")
         if expected_output is not None and not isinstance(expected_output, str):
             raise EvaluationsError(
                 f"Inline dataset row {position} expectedOutput must be a string"
             )
         for field_name in ("variables", "metadata"):
-            value = values.get(field_name)
+            value = row.get(field_name)
             if value is None:
                 continue
             if not isinstance(value, Mapping):
@@ -143,8 +125,8 @@ def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]
                     f"Inline dataset row {position} {field_name} must be "
                     f"JSON-encodable without NaN or Infinity: {error}"
                 ) from error
-        variables = values.get("variables")
-        metadata = values.get("metadata")
+        variables = row.get("variables")
+        metadata = row.get("metadata")
         normalized.append(
             DatasetRow(
                 row_index=position,
@@ -288,8 +270,8 @@ class EvaluationsModule:
         Handlers receive a ``{key: executable}`` map either way.
 
         ``dataset`` is either the key of a dataset stored in LaunchDarkly or
-        a sequence of inline rows. Inline rows are
-        :class:`DatasetRow` values or mappings in the dataset-rows wire shape
+        a sequence of inline rows. Inline rows are mappings in the
+        dataset-rows wire shape
         (``input``, ``expectedOutput``, ``variables``, ``metadata``, optional
         ``rowIdx``); each row's index is its position in the list. They are
         uploaded to the run before any generation starts, and templates in
