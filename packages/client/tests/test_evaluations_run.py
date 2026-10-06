@@ -4083,6 +4083,10 @@ async def test_hosted_dataset_event_identity_is_unchanged(
         (None, "dataset must be a LaunchDarkly dataset key or a sequence"),
         ({"input": "hi"}, "dataset must be a LaunchDarkly dataset key or a sequence"),
         (7, "dataset must be a LaunchDarkly dataset key or a sequence"),
+        (
+            ({"input": text} for text in ("hi", "there")),
+            "dataset must be a LaunchDarkly dataset key or a sequence",
+        ),
     ],
 )
 @pytest.mark.asyncio
