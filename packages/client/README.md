@@ -717,9 +717,9 @@ that skips verification.
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `set_skill_store(store)`. It applies on every call, before or after
-`init_client`; passing `None` raises `TypeError`. With none configured, the accessors
-raise `RuntimeError` explaining what to do, and `write_skills` reports the failure (or raises,
-with `on_unavailable="raise"`). `shutdown()` clears it.
+`init_client`, and `None` is ignored rather than clearing a configured store. With none
+configured, the accessors raise `RuntimeError` explaining what to do, and `write_skills`
+reports the failure (or raises, with `on_unavailable="raise"`). `shutdown()` clears it.
 
 `ReconcileReport.actions` holds one `ReconcileAction` per outcome (`written`, `updated`,
 `skipped_current`, `removed`, or `error`), each with `key`, `version`, the resolved `path`, and

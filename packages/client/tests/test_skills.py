@@ -759,16 +759,15 @@ class TestStoreConfiguration:
         assert await get_skill("second") is not None
         assert await get_skill("first") is None
 
-    async def test_set_skill_store_refuses_none_and_keeps_the_store(
+    async def test_set_skill_store_none_leaves_the_configured_one(
         self, make_raw_skill: Any
     ) -> None:
-        """``None`` is refused rather than read as "clear"; ``shutdown()`` clears."""
+        """``None`` never clears a store; ``shutdown()`` does that."""
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
         set_skill_store(store)
 
-        with pytest.raises(TypeError, match="shutdown"):
-            set_skill_store(None)  # type: ignore[arg-type]
+        set_skill_store(None)
 
         assert await get_skill("a") is not None
 
