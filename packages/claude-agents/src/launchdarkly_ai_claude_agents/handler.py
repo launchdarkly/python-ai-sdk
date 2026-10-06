@@ -49,6 +49,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     MCP_TOOL_PREFIX,
     TOOL_MCP_NAME,
@@ -509,7 +510,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. See TELEMETRY-CONTRACT.md section 7.
     """
-    report_usage("claude-agents.createClaudeAgentsHandler")
+    report_usage("claude-agents.createClaudeAgentsHandler", PACKAGE_NAME, __version__)
     return _create_claude_agents_handler(capture_content=capture_content)
 
 
@@ -893,7 +894,7 @@ def claude_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    report_usage("claude-agents.claudeAgents")
+    report_usage("claude-agents.claudeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
     return _config(

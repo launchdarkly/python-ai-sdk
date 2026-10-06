@@ -58,7 +58,14 @@ def _helpers(client: MagicMock) -> list[str]:
     return [call.args[2].get("helper") for call in _usage(client)]
 
 
-_USAGE_FIELDS = ("helper", "aiSdkName", "aiSdkVersion", "aiSdkLanguage")
+_USAGE_FIELDS = (
+    "helper",
+    "aiSdkName",
+    "aiSdkVersion",
+    "aiSdkLanguage",
+    "helperPackageName",
+    "helperPackageVersion",
+)
 
 _ENABLED_CONFIG: dict[str, Any] = {
     "model": {"name": "gpt-4o"},
@@ -82,7 +89,13 @@ def _expect_usage(client: MagicMock, helper: str) -> None:
         "aiSdkVersion": __version__,
         "aiSdkLanguage": "python",
         "helper": helper,
+        "helperPackageName": "launchdarkly-ai-server",
+        "helperPackageVersion": __version__,
     }
+    # A client.* helper belongs to the core package.
+    payload = calls[0].args[2]
+    assert payload["helperPackageName"] == payload["aiSdkName"]
+    assert payload["helperPackageVersion"] == payload["aiSdkVersion"]
     assert calls[0].args[3] == 1
 
 
@@ -433,10 +446,55 @@ async def test_generation_events_gain_no_usage_fields() -> None:
         assert "$ld:ai:generation:success" in names
         assert "$ld:ai:tokens:total" in names
         for call in others:
-            payload = call.args[2]
-            assert "helper" not in payload
-            assert "aiSdkName" not in payload
-            assert "aiSdkVersion" not in payload
-            assert "aiSdkLanguage" not in payload
+            for field in _USAGE_FIELDS:
+                assert field not in call.args[2]
     finally:
         await shutdown()
+
+
+def _package_payload(helper: str) -> dict[str, Any]:
+    return {
+        "aiSdkName": "launchdarkly-ai-server",
+        "aiSdkVersion": __version__,
+        "aiSdkLanguage": "python",
+        "helper": helper,
+        "helperPackageName": "launchdarkly-ai-example",
+        "helperPackageVersion": "9.8.7",
+    }
+
+
+async def test_package_helper_names_its_package_and_the_core(
+    client: MagicMock,
+) -> None:
+    sdk_usage_module.report_usage("example.helper", "launchdarkly-ai-example", "9.8.7")
+    calls = _usage(client, "example.helper")
+    assert [call.args[2] for call in calls] == [_package_payload("example.helper")]
+
+    # The package is not part of the dedupe key.
+    sdk_usage_module.report_usage("example.helper", "launchdarkly-ai-other", "1.0.0")
+    assert len(_usage(client, "example.helper")) == 1
+
+
+async def test_held_package_helper_flushes_with_its_package() -> None:
+    await shutdown()
+    lifecycle_module._reset_for_testing()
+    sdk_usage_module.report_usage("example.helper", "launchdarkly-ai-example", "9.8.7")
+    await build_judge_tasks(**_judge_kwargs())
+    client = _client()
+    with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+        await init_client(client=client)
+    assert [call.args[2] for call in _usage(client, "example.helper")] == [
+        _package_payload("example.helper")
+    ]
+    _expect_usage(client, HELPER)
+    await shutdown()
+
+
+async def test_package_name_without_version_reports_the_core(
+    client: MagicMock,
+) -> None:
+    sdk_usage_module.report_usage("example.helper", "launchdarkly-ai-example")
+    calls = _usage(client, "example.helper")
+    assert len(calls) == 1
+    assert calls[0].args[2]["helperPackageName"] == "launchdarkly-ai-server"
+    assert calls[0].args[2]["helperPackageVersion"] == __version__

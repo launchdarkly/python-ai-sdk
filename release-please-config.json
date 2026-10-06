@@ -31,7 +31,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_claude_agents/__init__.py"
+        "src/launchdarkly_ai_claude_agents/_version.py"
       ],
       "component": "launchdarkly-ai-claude-agents"
     },
@@ -42,7 +42,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_claude_messages/__init__.py"
+        "src/launchdarkly_ai_claude_messages/_version.py"
       ],
       "component": "launchdarkly-ai-claude-messages"
     },
@@ -53,7 +53,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_openai_agents/__init__.py"
+        "src/launchdarkly_ai_openai_agents/_version.py"
       ],
       "component": "launchdarkly-ai-openai-agents"
     },
@@ -64,7 +64,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_openai_messages/__init__.py"
+        "src/launchdarkly_ai_openai_messages/_version.py"
       ],
       "component": "launchdarkly-ai-openai-messages"
     },
@@ -75,7 +75,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_langchain_agents/__init__.py"
+        "src/launchdarkly_ai_langchain_agents/_version.py"
       ],
       "component": "launchdarkly-ai-langchain-agents"
     },
@@ -86,7 +86,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_langchain_messages/__init__.py"
+        "src/launchdarkly_ai_langchain_messages/_version.py"
       ],
       "component": "launchdarkly-ai-langchain-messages"
     }

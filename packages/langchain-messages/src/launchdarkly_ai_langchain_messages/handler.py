@@ -33,6 +33,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     fail_span,
     finish_model_span,
@@ -385,7 +386,7 @@ def create_langchain_messages_handler(
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
     meaning models, token counts, timings and tool names, until a caller asks for more.
     """
-    report_usage("langchain-messages.createLangChainHandler")
+    report_usage("langchain-messages.createLangChainHandler", PACKAGE_NAME, __version__)
     return _create_langchain_messages_handler(llm, capture_content=capture_content)
 
 
@@ -1022,7 +1023,7 @@ def langchain_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
-    report_usage("langchain-messages.langchainMessages")
+    report_usage("langchain-messages.langchainMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
     return _config(

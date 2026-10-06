@@ -13,6 +13,8 @@ from launchdarkly_ai_claude_agents import (
     create_claude_agents_handler,
     to_claude_agents,
 )
+from launchdarkly_ai_claude_agents._version import PACKAGE_NAME
+from launchdarkly_ai_claude_agents._version import __version__ as PACKAGE_VERSION
 from launchdarkly_ai_server import SDK_INFO_CONTEXT, __version__, init_client, shutdown
 
 CONTEXT = {"kind": "user", "key": "user-1"}
@@ -74,6 +76,8 @@ async def test_helper_sends_one_usage_event(
         "aiSdkVersion": __version__,
         "aiSdkLanguage": "python",
         "helper": helper,
+        "helperPackageName": PACKAGE_NAME,
+        "helperPackageVersion": PACKAGE_VERSION,
     }
     assert calls[0].args[3] == 1
 
@@ -114,3 +118,32 @@ async def test_native_adapter_invoke_reports_only_the_adapter(
     with pytest.raises(ValueError, match="disabled"):
         await runner.invoke("q")
     assert _helpers(client) == ["claude-agents.toClaudeAgents"]
+
+
+async def test_held_helper_flushes_with_its_package() -> None:
+    """A helper called before init keeps its package fields until the flush."""
+    await shutdown()
+    lifecycle_module._reset_for_testing()
+    try:
+        create_claude_agents_handler()
+    except Exception:
+        pass  # The factory may need credentials; it reports first.
+    installed = _fake()
+    with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+        await init_client(client=installed)
+    calls = [
+        entry.args[2]
+        for entry in installed.track.call_args_list
+        if entry.args[0] == "$ld:ai:sdk:usage"
+    ]
+    assert calls == [
+        {
+            "aiSdkName": "launchdarkly-ai-server",
+            "aiSdkVersion": __version__,
+            "aiSdkLanguage": "python",
+            "helper": "claude-agents.createClaudeAgentsHandler",
+            "helperPackageName": PACKAGE_NAME,
+            "helperPackageVersion": PACKAGE_VERSION,
+        }
+    ]
+    await shutdown()

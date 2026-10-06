@@ -46,6 +46,7 @@ from launchdarkly_ai_server import (
     text_message,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     derive_finish_reason,
     fail_span,
@@ -465,7 +466,7 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
     meaning models, token counts, timings and tool names, until a caller asks for more.
     """
-    report_usage("openai-agents.createOpenAIAgentHandler")
+    report_usage("openai-agents.createOpenAIAgentHandler", PACKAGE_NAME, __version__)
     return _create_openai_agent_handler(capture_content=capture_content)
 
 
@@ -719,7 +720,7 @@ def openai_agents(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
-    report_usage("openai-agents.openaiAgents")
+    report_usage("openai-agents.openaiAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
     return _config(

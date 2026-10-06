@@ -22,6 +22,8 @@ from launchdarkly_ai_server import (
     to_ld_context,
 )
 
+from ._version import PACKAGE_NAME, __version__
+
 try:
     from opentelemetry import trace
     from opentelemetry.trace import StatusCode as SpanStatusCode
@@ -208,7 +210,7 @@ def to_claude_agents(
 
     Returns an object with a ``.invoke(input, variables)`` coroutine.
     """
-    report_usage("claude-agents.toClaudeAgents")
+    report_usage("claude-agents.toClaudeAgents", PACKAGE_NAME, __version__)
     _opts = opts or {}
 
     async def invoke(

@@ -26,6 +26,7 @@ from launchdarkly_ai_server import (
     to_semconv_finish_reason,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     RawRunUsage,
     fail_span,
@@ -360,7 +361,9 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
     meaning models, token counts, timings and tool names, until a caller asks for more. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
-    report_usage("claude-messages.createClaudeMessagesHandler")
+    report_usage(
+        "claude-messages.createClaudeMessagesHandler", PACKAGE_NAME, __version__
+    )
     return _create_claude_messages_handler(capture_content=capture_content)
 
 
@@ -717,7 +720,7 @@ def claude_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
-    report_usage("claude-messages.claudeMessages")
+    report_usage("claude-messages.claudeMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
     return _config(
