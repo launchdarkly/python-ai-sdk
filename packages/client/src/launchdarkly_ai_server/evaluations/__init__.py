@@ -17,7 +17,6 @@ from .types import (
     DatasetRow,
     EvalRunResult,
     GenerationConfig,
-    InlineDatasetRow,
     RunSummary,
     Usage,
 )
@@ -33,7 +32,6 @@ __all__ = [
     "EvaluationsModule",
     "GenerationConfig",
     "HttpResponse",
-    "InlineDatasetRow",
     "Judge",
     "LDApiClient",
     "LDApiError",
