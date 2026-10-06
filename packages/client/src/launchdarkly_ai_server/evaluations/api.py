@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -84,7 +84,7 @@ class LDApiClient:
 
     def __init__(
         self,
-        api_token: str,
+        api_key: str,
         base_uri: str = DEFAULT_BASE_URI,
         transport: Transport = urllib_transport,
         timeout: float = 30.0,
@@ -92,7 +92,7 @@ class LDApiClient:
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
     ) -> None:
-        self.api_token = api_token
+        self.api_key = api_key
         self.base_uri = base_uri.rstrip("/")
         self._transport = transport
         self._timeout = timeout
@@ -135,7 +135,7 @@ class LDApiClient:
         params: dict[str, Any] | None = None,
     ) -> Any:
         headers = {
-            "Authorization": self.api_token,
+            "Authorization": self.api_key,
             "Accept": "application/json",
             "LD-API-Version": "20240415",
             "User-Agent": "launchdarkly-ai-evaluations-python",
@@ -192,3 +192,27 @@ class LDApiClient:
 
     def post(self, path: str, body: Any = None) -> Any:
         return self.request("POST", path, body=body)
+
+
+def segment(value: str) -> str:
+    """Percent-encode one path segment."""
+    return urllib.parse.quote(value, safe="")
+
+
+def require_mapping(value: Any, *, description: str) -> Mapping[str, Any]:
+    """Return ``value`` as a mapping. Raises ``EvaluationsError``."""
+    if not isinstance(value, Mapping):
+        raise EvaluationsError(
+            f"LaunchDarkly returned an invalid {description} response"
+        )
+    return value
+
+
+def require_string(data: Mapping[str, Any], key: str, description: str) -> str:
+    """Return the non-empty string at ``key``. Raises ``EvaluationsError``."""
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise EvaluationsError(
+            f"LaunchDarkly {description} response is missing string field {key!r}"
+        )
+    return value

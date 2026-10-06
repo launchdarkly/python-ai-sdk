@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from ..lifecycle import get_client, init_client
@@ -15,16 +15,12 @@ from .api import (
     EvaluationsError,
     LDApiClient,
     Transport,
+    segment,
     urllib_transport,
 )
 from .criteria import Criterion, Judge
-from .runner import (
-    EvalHandler,
-    EvaluationsRunner,
-    ToolImplementation,
-    _provides_for,
-    _segment,
-)
+from .runner import EvalHandler, EvaluationsRunner, _provides_for
+from .tools import EvalTool, ToolsClient, tool_handlers, validate_tools
 from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
 
 logger = logging.getLogger(__name__)
@@ -98,17 +94,30 @@ class EvaluationsModule:
     def __init__(
         self,
         api_client: LDApiClient,
+        project_key: str,
         sdk_key: str | None,
         ui_base_uri: str = DEFAULT_UI_BASE_URI,
     ) -> None:
         self._api = api_client
+        self._project_key = project_key
         self._sdk_key = sdk_key
         self._ui_base_uri = ui_base_uri.rstrip("/")
         self._runner = EvaluationsRunner(api_client)
+        self._tools = ToolsClient(api_client, project_key)
 
     @property
     def api(self) -> LDApiClient:
         return self._api
+
+    @property
+    def project_key(self) -> str:
+        """Project that holds this module's evaluations, tools, and datasets."""
+        return self._project_key
+
+    @property
+    def tools(self) -> ToolsClient:
+        """Reader for tools in the LaunchDarkly tool library."""
+        return self._tools
 
     @property
     def sdk_key(self) -> str | None:
@@ -123,13 +132,12 @@ class EvaluationsModule:
     async def run(
         self,
         *,
-        project_key: str,
         key: str,
         dataset: str,
         handler: EvalHandler,
         generation: GenerationConfig | None = None,
         ai_config: AIConfig | None = None,
-        tools: Mapping[str, ToolImplementation] | None = None,
+        tools: Sequence[EvalTool] | None = None,
         criteria: list[Criterion] | None = None,
         judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
@@ -144,6 +152,13 @@ class EvaluationsModule:
         deterministic :class:`Scorer` functions — is then run against each
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
+
+        ``tools`` is a list of :class:`EvalTool`. Construct one to define a tool
+        in code. Call ``evals.tools.get(key, implementation=...)`` to use a
+        tool from the LaunchDarkly tool library, which reads the tool and pins
+        its version at that point. One list may hold both kinds. ``run`` reads
+        no tool from the API, and it checks the list before any network I/O.
+        Handlers receive a ``{key: executable}`` map either way.
 
         A :class:`Judge` is an independent AI Config and may be served by a
         different provider or mode than ``generation``. ``handler`` runs a judge
@@ -171,7 +186,6 @@ class EvaluationsModule:
         if poll_timeout_seconds is None:
             poll_timeout_seconds = SUMMARY_POLL_TIMEOUT_SECONDS
         self._validate_run_args(
-            project_key=project_key,
             key=key,
             dataset=dataset,
             handler=handler,
@@ -180,13 +194,16 @@ class EvaluationsModule:
             poll_timeout_seconds=poll_timeout_seconds,
         )
         self._validate_config_source(generation=generation, ai_config=ai_config)
+        run_tools = list(tools or [])
+        validate_tools(run_tools, self._project_key)
+        run_tool_handlers = tool_handlers(run_tools)
         pinned_tool_versions: dict[str, int] = {}
         config_label = ""
         if ai_config is not None:
             config_label = f"{ai_config.key!r}/{ai_config.variation!r}"
             ai_config_variation = await asyncio.to_thread(
                 self._runner._fetch_config_variation,
-                project_key,
+                self._project_key,
                 ai_config.key,
                 ai_config.variation,
             )
@@ -198,15 +215,25 @@ class EvaluationsModule:
                     + ", ".join(
                         repr(name) for name in ai_config_variation.tool_versions
                     )
-                    + ". Pass tools= with an implementation for each."
+                    + ". Pass tools= with an EvalTool for each."
                 )
+            # A caller who passes tools= replaces the variation's list, so an
+            # empty list runs the variation with no tools.
+            supplied = {tool.key for tool in run_tools}
+            for name in ai_config_variation.tool_versions:
+                if name not in supplied:
+                    logger.warning(
+                        "AI Config variation %s attaches tool %r, which this run "
+                        "does not use.",
+                        config_label,
+                        name,
+                    )
             pinned_tool_versions = ai_config_variation.tool_versions
             if criteria is None:
                 criteria = [
                     Judge(key=judge_key) for judge_key in ai_config_variation.judge_keys
                 ]
         generation = self._validate_generation(generation)
-        run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
         run_judge_handlers = list(judge_handlers or [])
         self._validate_criteria(run_criteria)
@@ -218,58 +245,57 @@ class EvaluationsModule:
 
         # The management API client is synchronous; running it in a worker thread
         # keeps the caller's event loop free.
-        # Tool/judge verification is deliberately first: a typo must not create records.
-        resolved_tools = await asyncio.to_thread(
-            self._runner._resolve_tools, project_key, run_tools
-        )
-        # The tool API serves only the latest version, so a variation pinned to
-        # an older one is evaluated against the current schema.
+        # Judge verification is first: a typo must not create records.
+        # A variation pins a tool version. Compare it with the version the run
+        # uses, which tools.get() already read.
+        tools_by_key = {tool.key: tool for tool in run_tools}
         for tool_key, pinned_version in pinned_tool_versions.items():
-            resolved_tool = resolved_tools.get(tool_key)
-            if resolved_tool is not None and resolved_tool.version != pinned_version:
-                logger.warning(
-                    "AI Config variation %s pins tool %r at version %d; "
-                    "evaluating against the latest version %d.",
-                    config_label,
-                    tool_key,
-                    pinned_version,
-                    resolved_tool.version,
-                )
+            tool = tools_by_key.get(tool_key)
+            if tool is None or tool.version is None or tool.version == pinned_version:
+                continue
+            logger.warning(
+                "AI Config variation %s pins tool %r at version %d; "
+                "the run uses version %d.",
+                config_label,
+                tool_key,
+                pinned_version,
+                tool.version,
+            )
         resolved_judges = await self._runner._resolve_judges(
-            project_key, ld_judges, handler, run_judge_handlers
+            self._project_key, ld_judges, handler, run_judge_handlers
         )
         dataset_ref = await asyncio.to_thread(
-            self._runner._fetch_dataset, project_key, dataset
+            self._runner._fetch_dataset, self._project_key, dataset
         )
         rows = await asyncio.to_thread(
-            self._runner._get_dataset_rows, project_key, dataset
+            self._runner._get_dataset_rows, self._project_key, dataset
         )
         evaluation = await asyncio.to_thread(
             self._runner._create_evaluation,
-            project_key,
+            self._project_key,
             key,
             generation,
-            resolved_tools,
+            run_tools,
             run_criteria,
         )
         evaluation_run = await asyncio.to_thread(
             self._runner._create_evaluation_run,
-            project_key,
+            self._project_key,
             evaluation.id,
             dataset_ref.id,
         )
-        config = self._runner._build_handler_config(generation, resolved_tools)
+        config = self._runner._build_handler_config(generation, run_tools)
         results = await self._runner._run_rows(
             rows,
             handler,
             config,
-            run_tools,
+            run_tool_handlers,
             concurrency,
         )
         try:
             self._runner._emit_generation_events(
                 client,
-                project_key=project_key,
+                project_key=self._project_key,
                 evaluation=evaluation,
                 evaluation_run=evaluation_run,
                 dataset=dataset_ref,
@@ -278,14 +304,14 @@ class EvaluationsModule:
             if run_criteria:
                 criterion_results = await self._runner._run_criteria_for_results(
                     results,
-                    run_tools,
+                    run_tool_handlers,
                     run_criteria,
                     resolved_judges,
                     concurrency,
                 )
                 self._runner._emit_evaluation_events(
                     client,
-                    project_key=project_key,
+                    project_key=self._project_key,
                     evaluation=evaluation,
                     evaluation_run=evaluation_run,
                     dataset=dataset_ref,
@@ -298,15 +324,14 @@ class EvaluationsModule:
             if inspect.isawaitable(flush_result):
                 await flush_result
         summary = await self._poll_summary_until_terminal(
-            project_key,
             evaluation.id,
             evaluation_run.id,
             poll_interval_seconds,
             poll_timeout_seconds,
         )
         url = (
-            f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
-            f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
+            f"{self._ui_base_uri}/projects/{segment(self._project_key)}/ai/evaluations/"
+            f"{segment(evaluation.id)}/runs/{segment(evaluation_run.id)}"
         )
         return EvalRunResult(
             # failed_rows counts rows whose criteria were scored and did not
@@ -326,7 +351,6 @@ class EvaluationsModule:
 
     async def _poll_summary_until_terminal(
         self,
-        project_key: str,
         evaluation_id: str,
         run_id: str,
         poll_interval_seconds: float,
@@ -336,7 +360,7 @@ class EvaluationsModule:
         last_summary = None
         while True:
             last_summary = await asyncio.to_thread(
-                self._runner._get_summary, project_key, evaluation_id, run_id
+                self._runner._get_summary, self._project_key, evaluation_id, run_id
             )
             if _is_terminal_summary(last_summary):
                 return last_summary
@@ -429,7 +453,6 @@ class EvaluationsModule:
     @staticmethod
     def _validate_run_args(
         *,
-        project_key: str,
         key: str,
         dataset: str,
         handler: EvalHandler,
@@ -438,7 +461,6 @@ class EvaluationsModule:
         poll_timeout_seconds: float,
     ) -> None:
         for name, value in (
-            ("project_key", project_key),
             ("key", key),
             ("dataset", dataset),
         ):
@@ -501,18 +523,30 @@ class EvaluationsModule:
 
 
 def init_evaluations(
-    api_token: str | None = None,
+    project_key: str | None = None,
+    api_key: str | None = None,
     sdk_key: str | None = None,
     base_uri: str | None = None,
     ui_base_uri: str | None = None,
     transport: Transport = urllib_transport,
 ) -> EvaluationsModule:
-    """Resolve credentials and construct the evaluations module."""
-    token = api_token or _env("LD_API_TOKEN")
+    """Resolve credentials and construct the evaluations module.
+
+    ``project_key`` names the project that holds the evaluations, the tools,
+    and the datasets this module uses.
+    """
+    resolved_project_key = (project_key or "").strip() or _env("LD_PROJECT_KEY")
+    if not resolved_project_key:
+        raise EvaluationsError(
+            "No LaunchDarkly project key provided. Set the LD_PROJECT_KEY "
+            "environment variable or pass project_key to init_evaluations()."
+        )
+
+    token = api_key or _env("LD_API_TOKEN")
     if not token:
         raise EvaluationsError(
-            "No LaunchDarkly API access token provided. Set the LD_API_TOKEN "
-            "environment variable or pass api_token to init_evaluations()."
+            "No LaunchDarkly API key provided. Set the LD_API_TOKEN "
+            "environment variable or pass api_key to init_evaluations()."
         )
 
     resolved_sdk_key = sdk_key or _env("LD_SDK_KEY")
@@ -529,12 +563,13 @@ def init_evaluations(
             )
 
     api_client = LDApiClient(
-        api_token=token,
+        api_key=token,
         base_uri=base_uri or _env("LD_API_BASE_URI") or DEFAULT_BASE_URI,
         transport=transport,
     )
     return EvaluationsModule(
         api_client=api_client,
+        project_key=resolved_project_key,
         sdk_key=resolved_sdk_key,
         ui_base_uri=ui_base_uri or _env("LD_UI_BASE_URI") or DEFAULT_UI_BASE_URI,
     )
