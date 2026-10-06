@@ -55,6 +55,17 @@ def _render_inline_row(row: DatasetRow) -> DatasetRow:
     )
 
 
+def _check_string_keys(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"keys must be str, not {type(key).__name__}")
+            _check_string_keys(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_string_keys(item)
+
+
 def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]:
     """Validate caller-supplied rows, returning them raw and indexed by position.
 
@@ -121,9 +132,12 @@ def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]
                     f"Inline dataset row {position} {field_name} must be a mapping"
                 )
             # NaN and Infinity are rejected: json.dumps would otherwise emit
-            # them as bare tokens, which are not valid JSON.
+            # them as bare tokens, which are not valid JSON. Non-str keys are
+            # rejected rather than coerced; json.dumps runs first so circular
+            # references fail there instead of recursing in the key check.
             try:
                 json.dumps(value, allow_nan=False)
+                _check_string_keys(value)
             except (TypeError, ValueError) as error:
                 raise EvaluationsError(
                     f"Inline dataset row {position} {field_name} must be "

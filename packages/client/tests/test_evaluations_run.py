@@ -3878,6 +3878,22 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
             [{"input": "hi", "variables": {("a", "b"): 1}}],
             "variables must be JSON-encodable",
         ),
+        (
+            [{"input": "hi", "variables": {1: "a"}}],
+            "variables must be JSON-encodable.*keys must be str, not int",
+        ),
+        (
+            [{"input": "hi", "metadata": {"nested": [{True: "x"}]}}],
+            "metadata must be JSON-encodable.*keys must be str, not bool",
+        ),
+        (
+            [{"input": "hi", "variables": {"a": {None: 1}}}],
+            "variables must be JSON-encodable.*keys must be str, not NoneType",
+        ),
+        (
+            [{"input": "hi", "metadata": {1.5: "x"}}],
+            "metadata must be JSON-encodable.*keys must be str, not float",
+        ),
     ],
 )
 @pytest.mark.asyncio
