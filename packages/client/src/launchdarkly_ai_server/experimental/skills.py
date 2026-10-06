@@ -3,8 +3,8 @@ Agent Skills (experimental).
 
 Configure a store with ``set_skill_store``, then read verified skill content with
 ``get_skill``, ``get_skills`` or ``all_skills``, or write it to disk with
-``write_skills``. These names may change in a minor release; see the changelog's
-**Experimental** section.
+``write_skills``. These names may change in a minor release, so review the
+changelog when you upgrade.
 """
 
 from ..skills import (

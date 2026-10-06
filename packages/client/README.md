@@ -349,7 +349,7 @@ asyncio.run(main())
 
 > **Experimental.** Import Agent Skills from `launchdarkly_ai_server.experimental.skills`;
 > none of these names is exported from the package root. They may change in a minor release,
-> and each change is listed in the changelog under **Experimental**.
+> so review the changelog when you upgrade.
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
@@ -717,7 +717,7 @@ that skips verification.
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `set_skill_store(store)`. It applies on every call, before or after
-`init_client`, and `None` never clears a configured store. With none configured, the accessors
+`init_client`; passing `None` raises `TypeError`. With none configured, the accessors
 raise `RuntimeError` explaining what to do, and `write_skills` reports the failure (or raises,
 with `on_unavailable="raise"`). `shutdown()` clears it.
 

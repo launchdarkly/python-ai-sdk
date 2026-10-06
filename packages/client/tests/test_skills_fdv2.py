@@ -34,8 +34,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from launchdarkly_ai_server import init_client, skills_core, skills_fdv2
 from launchdarkly_ai_server import skills as skills_module
+from launchdarkly_ai_server import skills_core, skills_fdv2
 from launchdarkly_ai_server.experimental.skills import (
     FDv2SkillStore,
     InMemorySkillStore,
@@ -2478,7 +2478,6 @@ class TestFailureHandling:
             assert wait_until(lambda: store.failed is not None)
             assert store.is_initialized() is False
             assert store.wait_for_skills(timeout=0.1) is False
-            await init_client(client=object())
             set_skill_store(store)
             report = await write_skills("*", root)
         assert report.ok is False
@@ -3326,7 +3325,6 @@ class TestMissingContentHash:
         endpoint.queue_poll(full_payload(("put-object", put_skill(omit_hash=True))))
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
 
             outcome = await get_skill_result("pdf-extraction")
@@ -3350,7 +3348,6 @@ class TestMissingContentHash:
             raw = store.get_object(SKILL_OBJECT_KIND, "pdf-extraction")
             assert raw is not None
             assert "contentHash" not in raw
-            await init_client(client=object())
             set_skill_store(store)
             assert (await get_skill_result("pdf-extraction")).reason != "absent"
 
@@ -3470,7 +3467,6 @@ class TestMissingContentHash:
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
             assert store.diagnostics.hashless_objects == 0
-            await init_client(client=object())
             set_skill_store(store)
             assert (
                 await get_skill_result("pdf-extraction")
@@ -3481,7 +3477,6 @@ class TestMissingContentHash:
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
 
             skill = await get_skill("pdf-extraction")
@@ -3503,7 +3498,6 @@ class TestMissingContentHash:
         )
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
 
             pinned = await get_skill("pdf-extraction", version=2)
@@ -3534,7 +3528,6 @@ class TestMissingContentHash:
         )
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
 
             missed = await get_skill_result("pdf-extraction", version=9)
@@ -3562,7 +3555,6 @@ class TestMissingContentHash:
         )
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
             by_payload_version = await get_skill_result("pdf-extraction", version=42)
             assert by_payload_version.skill is None
@@ -3767,7 +3759,6 @@ class TestWatchSkillsOverTheTransport:
 
         with poll_store(endpoint, poll_interval=0.2) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
             report, watcher = await watch_skills(
                 "*", tmp_path / "skills", debounce=0.05
@@ -3794,7 +3785,6 @@ class TestWatchSkillsOverTheTransport:
 
         with poll_store(endpoint, poll_interval=0.2) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
             report, watcher = await watch_skills(
                 "*", tmp_path / "skills", debounce=0.05
@@ -3823,7 +3813,6 @@ class TestWatchSkillsOverTheTransport:
 
         with poll_store(endpoint, poll_interval=0.2) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
             _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
             try:
@@ -3842,7 +3831,6 @@ class TestWatchSkillsOverTheTransport:
         endpoint.queue_poll(status=500)
         with poll_store(endpoint, poll_interval=0.05) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(client=object())
             set_skill_store(store)
             _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
             try:
@@ -4051,14 +4039,14 @@ class TestTransportLayering:
         assert _module_imports(skills_fdv2) == stdlib | within_the_feature
 
     def test_nothing_in_the_feature_imports_it(self) -> None:
-        """Only the experimental entry point names it, to re-export two types.
+        """Only the experimental entry point names it, to re-export
+        ``FDv2SkillStore`` and ``StoreDiagnostics``.
 
         That re-export is the published surface rather than a dependency: it is
         what makes ``FDv2SkillStore`` reachable without importing the
-        implementation module. A
-        *feature* module importing the transport would be the layering
-        inverting, and the accessors would start being able to tell which store
-        answered them.
+        implementation module. A *feature* module importing the transport would
+        be the layering inverting, and the accessors would start being able to
+        tell which store answered them.
         """
         feature = [
             "skills.py",

@@ -116,6 +116,39 @@ class TestInitClientBYOC:
         assert setup.call_count == 1
         assert setup.call_args.args[1] == {"serviceName": "first"}
 
+    async def test_warns_about_an_unrecognized_option(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A misspelt or retired option would otherwise be dropped silently."""
+        stub = _make_stub_client()
+        with (
+            patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await init_client({"serviceName": "svc", "sdkkey": "sdk-x"}, stub)
+        warnings = [r.getMessage() for r in caplog.records]
+        assert warnings == ["Ignoring unrecognized init_client option(s): sdkkey"]
+
+    async def test_does_not_warn_about_documented_options(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        stub = _make_stub_client()
+        options = {
+            "sdkKey": "sdk-x",
+            "baseUri": "https://base.example",
+            "streamUri": "https://stream.example",
+            "eventsUri": "https://events.example",
+            "otlpEndpoint": "https://otlp.example",
+            "serviceName": "svc",
+            "environment": "test",
+        }
+        with (
+            patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await init_client(options, stub)
+        assert caplog.records == []
+
     async def test_repeat_call_does_not_swap_the_client(self) -> None:
         first = _make_stub_client()
         second = _make_stub_client()

@@ -759,28 +759,31 @@ class TestStoreConfiguration:
         assert await get_skill("second") is not None
         assert await get_skill("first") is None
 
-    async def test_set_skill_store_none_leaves_the_configured_one(
+    async def test_set_skill_store_refuses_none_and_keeps_the_store(
         self, make_raw_skill: Any
     ) -> None:
-        """``None`` never clears a store; ``shutdown()`` does that."""
+        """``None`` is refused rather than read as "clear"; ``shutdown()`` clears."""
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
         set_skill_store(store)
 
-        set_skill_store(None)
-        await init_client(client=MagicMock())
+        with pytest.raises(TypeError, match="shutdown"):
+            set_skill_store(None)  # type: ignore[arg-type]
 
         assert await get_skill("a") is not None
 
     async def test_init_client_ignores_a_skill_store_option(
-        self, make_raw_skill: Any
+        self, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Core client options do not configure an experimental feature."""
+        """Core client options do not configure an experimental feature, and
+        the ignored option is reported rather than dropped silently."""
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
 
-        await init_client(options={"skillStore": store}, client=MagicMock())
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"):
+            await init_client(options={"skillStore": store}, client=MagicMock())
 
+        assert any("skillStore" in message for message in caplog.messages)
         with pytest.raises(RuntimeError, match="skill store"):
             await get_skill("a")
 

@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 
 _LD_DEFAULT_OTLP_ENDPOINT = "https://otel.observability.app.launchdarkly.com"
 
+_INIT_CLIENT_OPTIONS = frozenset(
+    {
+        "sdkKey",
+        "baseUri",
+        "streamUri",
+        "eventsUri",
+        "otlpEndpoint",
+        "serviceName",
+        "environment",
+    }
+)
+"""Every ``init_client`` option key that is read. Any other key is warned about."""
+
 
 def _env(name: str) -> str | None:
     """Read an env var, treating blank/whitespace-only values as unset."""
@@ -152,17 +165,18 @@ async def init_client(
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
 
     Idempotent: later calls return the existing client and ignore every option.
+    An option this function does not read is logged as a warning and ignored.
 
     Returns the initialized ``LDClientInterface`` instance.
     """
-    return await _resolve_client(options or {}, client)
-
-
-async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
-    """
-    Returns the singleton client, initializing it on first call.
-    """
     global _client
+
+    opts = options or {}
+    unknown = sorted(str(key) for key in opts if key not in _INIT_CLIENT_OPTIONS)
+    if unknown:
+        logger.warning(
+            "Ignoring unrecognized init_client option(s): %s", ", ".join(unknown)
+        )
 
     # Idempotent — if already initialized, return the existing client
     if _client is not None:
@@ -346,7 +360,9 @@ def _reset_for_testing() -> None:
     _client = None
     _tracer_provider = None
     _owns_otel_globals = False
-    _clear_experimental_state()
+    # Directly, not through _clear_experimental_state: a failed reset should
+    # fail the test rather than leak state into the next one.
+    skills._clear_state()
     # Mirrors shutdown(): without this a suite that inits more than once leaves
     # every later span on the first test's provider.
     if owned_globals:

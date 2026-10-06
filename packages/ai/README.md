@@ -75,6 +75,13 @@ result = await evals.run(
 
 `LD_API_TOKEN` is required. Configure `LD_SDK_KEY` — or initialize your own client with `init_client(client=...)` — to emit one `$ld:ai:offline-evals:generation` event per generated row, plus one `$ld:ai:offline-evals:criterion` event per `(row, criterion)` when `criteria` are supplied, through the standard SDK event transport. The SDK reports scores; LaunchDarkly rules on them at ingest. A judge served by a different provider than `generation` needs a handler for it in `judge_handlers`. Each row's tool calls are recorded during generation and rendered into the judge's `{{message_history}}`, between the row input and the generated output, so a rubric can grade the tool trajectory as well as the final answer. Use `LD_API_BASE_URI` for staging or local management API traffic; it is separate from the SDK delivery setting `LD_BASE_URI`. Evaluation-run links use the explicit `ui_base_uri` option or `LD_UI_BASE_URI`, defaulting to `https://app.launchdarkly.com`; set it when the project is not in production, or a run created elsewhere still links to the production app. See the [core evaluations guide](../client/README.md#run-an-evaluation-from-code).
 
+## Experimental features
+
+Experimental features are not re-exported from this package. Import them from
+`launchdarkly_ai_server.experimental`, which this package installs. For example, Agent Skills
+lives in `launchdarkly_ai_server.experimental.skills`; see the
+[Agent Skills guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#agent-skills-experimental).
+
 ---
 
 All exports, types, and behaviors are identical to `launchdarkly-ai-server`. See the [core client README](../client/README.md) for the full API reference.

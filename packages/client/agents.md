@@ -93,7 +93,8 @@ An experimental feature is exported only from its module under
 `launchdarkly_ai_server.experimental`, and its names may change in a minor release. No core
 public type, function or `init_client` option may name it. Core reaches it only through an
 internal hook (as `shutdown` clears the skill store), and an error there is logged, never
-raised into the core call.
+raised into the core call. The experimental part is the SDK's API, not the LaunchDarkly data
+model: `AiConfigRep` still documents the `skills` references a config carries.
 
 `MAX_SKILL_CONTENT_BYTES` and `SKILL_OBJECT_KIND` are deliberately **not** exported; both stay
 internal to `skills_core`:

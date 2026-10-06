@@ -47,20 +47,26 @@ _set_emitter_for_testing = skills_core.set_emitter
 _clear_state = skills_core.clear_state
 
 
-def set_skill_store(store: SkillStore | None) -> None:
+def set_skill_store(store: SkillStore) -> None:
     """
     Sets the store the skill accessors and ``write_skills`` read from.
 
     Applies on every call, including after ``init_client``, so a lazily
-    initialized client can be given a store afterwards. ``None`` never clears a
-    configured store; ``shutdown()`` does that.
+    initialized client can be given a store afterwards. ``shutdown()`` clears
+    it.
 
     Args:
         store: ``FDv2SkillStore`` to receive skills from LaunchDarkly, or
             ``InMemorySkillStore`` for local development and tests.
+
+    Raises:
+        TypeError: If *store* is ``None``.
     """
-    if store is not None:
-        _set_store(store)
+    if store is None:
+        raise TypeError(
+            "set_skill_store needs a store; shutdown() clears the configured one."
+        )
+    _set_store(store)
 
 
 class InMemorySkillStore:
