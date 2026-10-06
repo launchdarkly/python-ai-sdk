@@ -5,9 +5,10 @@ from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 from .conversation import bind_conversation_id
-from .judges import build_judge_tasks, run_judges
+from .judges import _build_judge_tasks, run_judges
 from .lifecycle import extract_variation
 from .registry import resolve_handlers, resolve_tools
+from .sdk_usage import report_usage
 from .tracking import execute_and_stream, execute_and_track
 from .types import (
     AiConfigRep,
@@ -73,13 +74,10 @@ class ConfigInstance:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> ProviderResponse[Any]:
-        from .sdk_usage import report_usage, within_sdk
-
         report_usage("client.config.invoke")
-        with within_sdk():
-            return await self._invoke_body(user_input, context, variables, history)
+        return await self._invoke(user_input, context, variables, history)
 
-    async def _invoke_body(
+    async def _invoke(
         self,
         user_input: str | None,
         context: LDContext,
@@ -129,7 +127,7 @@ class ConfigInstance:
         usage_obj = to_usage_dict(usage)
 
         if self._skip_judges:
-            judge_tasks = await build_judge_tasks(
+            judge_tasks = await _build_judge_tasks(
                 config=config,
                 user_context=context,
                 handler=handler,
@@ -176,11 +174,20 @@ class ConfigInstance:
         Deliberately not an ``async def`` with ``yield``: a generator body does not run until the
         first ``__anext__``, by which point a :func:`conversation_id` block wrapped around this
         call has already exited. Binding here — at call time — is what lets a caller hand the
-        generator off and iterate it later.
+        generator off and iterate it later. The usage report runs here for the same reason: it
+        fires on the call, before any iteration.
         """
-        from .sdk_usage import report_usage
-
         report_usage("client.config.stream")
+        return self._stream(user_input, context, variables, history)
+
+    def _stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Non-reporting :meth:`stream`: binds the conversation id at call time."""
         return bind_conversation_id(
             self._stream_events(user_input, context, variables, history)
         )
@@ -248,6 +255,32 @@ class ConfigInstance:
             }
 
 
+class _InternalConfigInstance(ConfigInstance):
+    """A ``ConfigInstance`` whose ``invoke`` and ``stream`` do not report usage.
+
+    Returned by :func:`_config` for SDK wrappers: the wrapper reports itself, and the
+    config call it makes is not a call from the application.
+    """
+
+    async def invoke(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ProviderResponse[Any]:
+        return await self._invoke(user_input, context, variables, history)
+
+    def stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        return self._stream(user_input, context, variables, history)
+
+
 def config(
     *,
     key: str,
@@ -269,6 +302,24 @@ def config(
     thread calling ``run_judge(task, handlers)``.
     """
     return ConfigInstance(
+        key=key,
+        handler=handler,
+        tool_handlers=tool_handlers,
+        registry=registry,
+        skip_judges=skip_judges,
+    )
+
+
+def _config(
+    *,
+    key: str,
+    handler: ProviderHandler | list[ProviderHandler] | None = None,
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    registry: Any = None,
+    skip_judges: bool = False,
+) -> ConfigInstance:
+    """Non-reporting :func:`config` for SDK wrappers."""
+    return _InternalConfigInstance(
         key=key,
         handler=handler,
         tool_handlers=tool_handlers,

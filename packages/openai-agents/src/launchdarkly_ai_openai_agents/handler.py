@@ -30,11 +30,10 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     RunUsage,
     SpanUsage,
-    call_within_sdk,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
@@ -45,7 +44,6 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
     text_message,
-    within_sdk,
 )
 
 from .spans import (
@@ -461,18 +459,18 @@ def _usage_from_error(error: BaseException) -> SpanUsage | None:
 
 
 def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
-    report_usage("openai-agents.createOpenAIAgentHandler")
-    with within_sdk():
-        return _create_openai_agent_handler(capture_content=capture_content)
-
-
-def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
     meaning models, token counts, timings and tool names, until a caller asks for more.
     """
+    report_usage("openai-agents.createOpenAIAgentHandler")
+    return _create_openai_agent_handler(capture_content=capture_content)
+
+
+def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
+    """Non-reporting :func:`create_openai_agent_handler`, used by this package's wrappers."""
 
     async def _call_impl(
         config: AiConfigRep,
@@ -569,7 +567,7 @@ def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHa
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("OpenAI", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -724,10 +722,8 @@ def openai_agents(
     report_usage("openai-agents.openaiAgents")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return call_within_sdk(
-        lambda: config(
-            key=config_key,
-            handler=create_openai_agent_handler(capture_content=capture_content),
-            **kwargs,
-        ).invoke(user_input, context, variables=variables)
-    )
+    return _config(
+        key=config_key,
+        handler=_create_openai_agent_handler(capture_content=capture_content),
+        **kwargs,
+    ).invoke(user_input, context, variables=variables)

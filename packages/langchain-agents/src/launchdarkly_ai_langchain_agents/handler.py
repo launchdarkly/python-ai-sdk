@@ -17,10 +17,9 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
-    call_within_sdk,
+    _config,
+    _create_handler,
     compose_history,
-    config,
-    create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
@@ -31,7 +30,6 @@ from launchdarkly_ai_server import (
     report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
-    within_sdk,
 )
 
 from .messages import to_lang_chain_messages
@@ -259,14 +257,6 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 def create_langchain_agents_handler(
     llm: Any = None, *, capture_content: bool = False
 ) -> ProviderHandler:
-    report_usage("langchain-agents.createLangChainAgentsHandler")
-    with within_sdk():
-        return _create_langchain_agents_handler(llm, capture_content=capture_content)
-
-
-def _create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool = False
-) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
 
     Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
@@ -276,6 +266,14 @@ def _create_langchain_agents_handler(
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
     meaning models, token counts, timings and tool names, until a caller asks for more.
     """
+    report_usage("langchain-agents.createLangChainAgentsHandler")
+    return _create_langchain_agents_handler(llm, capture_content=capture_content)
+
+
+def _create_langchain_agents_handler(
+    llm: Any = None, *, capture_content: bool = False
+) -> ProviderHandler:
+    """Non-reporting :func:`create_langchain_agents_handler`, used by this package's wrappers."""
 
     async def _call_impl(
         config: AiConfigRep,
@@ -423,7 +421,7 @@ def _create_langchain_agents_handler(
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("*", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -584,10 +582,8 @@ def langchain_agents(
     report_usage("langchain-agents.langchainAgents")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return call_within_sdk(
-        lambda: config(
-            key=config_key,
-            handler=create_langchain_agents_handler(capture_content=capture_content),
-            **kwargs,
-        ).invoke(user_input, context, variables=variables)
-    )
+    return _config(
+        key=config_key,
+        handler=_create_langchain_agents_handler(capture_content=capture_content),
+        **kwargs,
+    ).invoke(user_input, context, variables=variables)

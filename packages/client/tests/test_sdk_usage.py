@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
+import launchdarkly_ai_server.sdk_usage as sdk_usage_module
 from launchdarkly_ai_server import (
     SDK_INFO_CONTEXT,
     ProviderHandler,
@@ -51,6 +52,25 @@ def _usage(client: MagicMock, helper: str | None = None) -> list[Any]:
         if call.args[0] == "$ld:ai:sdk:usage"
         and (helper is None or call.args[2].get("helper") == helper)
     ]
+
+
+def _helpers(client: MagicMock) -> list[str]:
+    return [call.args[2].get("helper") for call in _usage(client)]
+
+
+_USAGE_FIELDS = ("helper", "aiSdkName", "aiSdkVersion", "aiSdkLanguage")
+
+_ENABLED_CONFIG: dict[str, Any] = {
+    "model": {"name": "gpt-4o"},
+    "provider": {"name": "OpenAI"},
+    "instructions": "Be helpful.",
+    "_ldMeta": {
+        "enabled": True,
+        "variationKey": "v1",
+        "version": 1,
+        "mode": "messages",
+    },
+}
 
 
 def _expect_usage(client: MagicMock, helper: str) -> None:
@@ -151,6 +171,9 @@ async def client() -> Any:
 async def test_helper_sends_one_usage_event(client: MagicMock, helper: str) -> None:
     await _settle(_call(helper))
     _expect_usage(client, helper)
+    # One call emits only its own helper: config.invoke emits no client.createHandler,
+    # client.buildJudgeTasks, and so on.
+    assert _helpers(client) == [helper]
     if helper == "client.graph.invoke":
         assert _usage(client, "client.graph.stream") == []
     if helper == "client.graph.stream":
@@ -181,6 +204,38 @@ async def test_helper_before_client_is_sent_on_init() -> None:
     await shutdown()
 
 
+async def test_held_helper_is_sent_on_sdk_key_init() -> None:
+    await shutdown()
+    lifecycle_module._reset_for_testing()
+    await build_judge_tasks(**_judge_kwargs())
+    stub = _client()
+    ld_module = MagicMock()
+    ld_module.Config = MagicMock(return_value=MagicMock())
+    ld_module.LDClient = MagicMock(return_value=stub)
+    with (
+        patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+        patch("importlib.import_module", return_value=ld_module),
+    ):
+        await init_client({"sdkKey": "sdk-key"})
+    ld_module.LDClient.assert_called_once()
+    _expect_usage(stub, HELPER)
+    await shutdown()
+
+
+async def test_test_setter_does_not_flush_but_already_initialized_init_does() -> None:
+    await shutdown()
+    lifecycle_module._reset_for_testing()
+    await build_judge_tasks(**_judge_kwargs())
+    client = _client()
+    lifecycle_module._set_client_for_testing(client)
+    assert _usage(client) == []
+
+    # init_client returns the existing client on this path and flushes what was held.
+    assert await init_client() is client
+    _expect_usage(client, HELPER)
+    await shutdown()
+
+
 async def test_track_failure_does_not_fail_the_helper_or_retry(
     client: MagicMock,
 ) -> None:
@@ -192,6 +247,154 @@ async def test_track_failure_does_not_fail_the_helper_or_retry(
     client.track.reset_mock(side_effect=True)
     await build_judge_tasks(**_judge_kwargs())
     assert _usage(client, HELPER) == []
+
+
+async def test_payload_failure_does_not_fail_the_helper_or_retry(
+    client: MagicMock,
+) -> None:
+    with patch.object(
+        sdk_usage_module, "_version", side_effect=RuntimeError("no version")
+    ) as version:
+        assert await build_judge_tasks(**_judge_kwargs()) == []
+        assert await build_judge_tasks(**_judge_kwargs()) == []
+    # Building the payload threw before track, once. The helper counts as reported.
+    assert version.call_count == 1
+    assert _usage(client) == []
+    await build_judge_tasks(**_judge_kwargs())
+    assert _usage(client) == []
+
+
+async def test_held_payload_failure_on_flush_is_swallowed() -> None:
+    await shutdown()
+    lifecycle_module._reset_for_testing()
+    await build_judge_tasks(**_judge_kwargs())
+    client = _client()
+    with (
+        patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+        patch.object(
+            sdk_usage_module, "_version", side_effect=RuntimeError("no version")
+        ),
+    ):
+        assert await init_client(client=client) is client
+    assert _usage(client) == []
+    await build_judge_tasks(**_judge_kwargs())
+    assert _usage(client) == []
+    await shutdown()
+
+
+async def test_config_invoke_does_not_report_internal_judge_tasks() -> None:
+    """``skip_judges`` builds judge tasks through the internal path."""
+    judged = {
+        **_ENABLED_CONFIG,
+        "judgeConfiguration": {"judges": [{"key": "judge", "samplingRate": 1}]},
+    }
+    installed = await _install(judged)
+    try:
+
+        async def _handler(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {"output": "ok"}
+
+        result = await config(
+            key="flag",
+            handler=ProviderHandler(fn=_handler, provides_for=("OpenAI", "messages")),
+            skip_judges=True,
+        ).invoke("q", CONTEXT)
+        assert result.judge_tasks
+        assert _helpers(installed) == ["client.config.invoke"]
+    finally:
+        await shutdown()
+
+
+@pytest.mark.parametrize("method", ["invoke", "stream"])
+async def test_helpers_called_from_user_handler_and_tool_still_report(
+    method: str,
+) -> None:
+    """Code the application passes in is outside the SDK, under invoke and stream alike."""
+    installed = await _install(_ENABLED_CONFIG)
+    try:
+
+        async def _lookup() -> str:
+            await build_judge_tasks(**_judge_kwargs())
+            return "found"
+
+        async def _handler(
+            _config: Any,
+            _input: Any,
+            tool_handlers: dict[str, Any],
+            *_a: Any,
+            **_k: Any,
+        ) -> dict[str, Any]:
+            create_handler(("OpenAI", "messages"), _handler)
+            return {"output": await tool_handlers["lookup"]()}
+
+        instance = config(
+            key="flag",
+            handler=ProviderHandler(fn=_handler, provides_for=("OpenAI", "messages")),
+            tool_handlers={"lookup": _lookup},
+        )
+        if method == "invoke":
+            await instance.invoke("q", CONTEXT)
+        else:
+            async for _ in instance.stream("q", CONTEXT):
+                pass
+
+        assert _helpers(installed) == [
+            f"client.config.{method}",
+            "client.createHandler",
+            "client.buildJudgeTasks",
+        ]
+        tool_calls = [
+            call
+            for call in installed.track.call_args_list
+            if call.args[0] == "$ld:ai:tool_call"
+        ]
+        assert len(tool_calls) == 1
+        assert tool_calls[0].args[2]["toolKey"] == "lookup"
+        for field in _USAGE_FIELDS:
+            assert field not in tool_calls[0].args[2]
+    finally:
+        await shutdown()
+
+
+def _graph_variation(key: str, _ctx: Any, _default: Any) -> Any:
+    if key == "graph-key":
+        return {"root": "root-node", "edges": {"root-node": [{"key": "leaf-node"}]}}
+    return {**_ENABLED_CONFIG, "provider": {"name": "TestProvider"}}
+
+
+@pytest.mark.parametrize("method", ["invoke", "stream"])
+async def test_graph_events_gain_no_usage_fields(method: str) -> None:
+    installed = await _install()
+    installed.variation = AsyncMock(side_effect=_graph_variation)
+    try:
+
+        async def _handler(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        instance = graph(
+            "graph-key",
+            handlers=[
+                ProviderHandler(fn=_handler, provides_for=("TestProvider", "messages"))
+            ],
+        )
+        if method == "invoke":
+            await instance.invoke("q", CONTEXT)
+        else:
+            async for _ in instance.stream("q", CONTEXT):
+                pass
+
+        assert _helpers(installed) == [f"client.graph.{method}"]
+        graph_calls = [
+            call
+            for call in installed.track.call_args_list
+            if str(call.args[0]).startswith("$ld:ai:graph:")
+        ]
+        assert "$ld:ai:graph:invocation_success" in [c.args[0] for c in graph_calls]
+        for call in graph_calls:
+            for field in _USAGE_FIELDS:
+                assert field not in call.args[2]
+    finally:
+        await shutdown()
 
 
 async def test_generation_events_gain_no_usage_fields() -> None:

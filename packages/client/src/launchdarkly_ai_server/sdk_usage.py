@@ -2,14 +2,15 @@
 
 One ``$ld:ai:sdk:usage`` event per helper per client. A call made before a
 client exists is held and sent on the next init, on the same path as sdk-info.
-A call made from inside another helper does not report.
+
+Only a call from outside the SDK reports. Each reporting helper has a
+non-reporting internal version, and SDK code calls that version instead, so
+this module never needs to know who the caller is.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
+import threading
 from typing import Any
 
 from .sdk_info import SDK_INFO_CONTEXT
@@ -20,7 +21,12 @@ _SDK_NAME = "launchdarkly-ai-server"
 
 _pending: set[str] = set()
 _reported: set[str] = set()
-_depth: ContextVar[int] = ContextVar("ld_ai_sdk_usage_depth", default=0)
+# Guards _pending and _reported. A helper is marked reported under the lock
+# before it is delivered, so concurrent first calls send it once. The client is
+# read under the lock too: init sets the client and then flushes, and the flush
+# waits here, so a helper held just as init runs is still sent by that flush.
+# Delivery runs outside the lock so a slow track() does not block other callers.
+_lock = threading.Lock()
 
 
 def _peek_client() -> Any:
@@ -59,67 +65,38 @@ def report_usage(helper: str) -> None:
     """Record a public helper.
 
     Sends immediately when a client exists, otherwise holds the helper until
-    :func:`flush_sdk_usage`. No-ops when already reported or when called from
-    inside :func:`within_sdk`.
+    :func:`flush_sdk_usage`. No-ops when already reported or held. Never raises.
     """
     try:
-        if _depth.get() > 0:
-            return
-        if helper in _reported or helper in _pending:
-            return
-        client = _peek_client()
-        if client is None:
-            _pending.add(helper)
-            return
+        with _lock:
+            client = _peek_client()
+            if helper in _reported or helper in _pending:
+                return
+            if client is None:
+                _pending.add(helper)
+                return
+            _reported.add(helper)
         _deliver(client, helper)
-        _reported.add(helper)
     except Exception:
-        _pending.discard(helper)
-        _reported.add(helper)
-
-
-@contextmanager
-def within_sdk() -> Iterator[None]:
-    """Mark the body as an internal SDK call so nested helpers do not report."""
-    token = _depth.set(_depth.get() + 1)
-    try:
-        yield
-    finally:
-        _depth.reset(token)
-
-
-def call_within_sdk(fn: Callable[[], Any]) -> Any:
-    """Call ``fn`` inside the SDK scope.
-
-    A wrapper reports itself, then uses this so the helpers it calls do not
-    report. When ``fn`` returns an awaitable, the scope stays active until that
-    awaitable finishes: an async function does not run until it is awaited, and
-    the scope has to cover that run.
-    """
-    with within_sdk():
-        result = fn()
-    if isinstance(result, Awaitable):
-
-        async def _drive() -> Any:
-            with within_sdk():
-                return await result
-
-        return _drive()
-    return result
+        with _lock:
+            _pending.discard(helper)
+            _reported.add(helper)
 
 
 def flush_sdk_usage(client: Any) -> None:
     """Send every helper that was recorded before a client existed."""
-    if not _pending:
-        return
-    held = list(_pending)
-    _pending.clear()
+    with _lock:
+        if not _pending:
+            return
+        held = list(_pending)
+        _pending.clear()
+        _reported.update(held)
     for helper in held:
         _deliver(client, helper)
-        _reported.add(helper)
 
 
 def reset_sdk_usage() -> None:
     """Drop the reported set so the next client hears each helper again."""
-    _reported.clear()
-    _pending.clear()
+    with _lock:
+        _reported.clear()
+        _pending.clear()

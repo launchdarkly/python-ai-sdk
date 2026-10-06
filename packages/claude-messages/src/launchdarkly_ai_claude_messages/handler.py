@@ -11,11 +11,10 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
-    call_within_sdk,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
@@ -25,7 +24,6 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
-    within_sdk,
 )
 
 from .spans import (
@@ -353,14 +351,6 @@ _MAX_STEPS = 10
 
 
 def create_claude_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
-    report_usage("claude-messages.createClaudeMessagesHandler")
-    with within_sdk():
-        return _create_claude_messages_handler(capture_content=capture_content)
-
-
-def _create_claude_messages_handler(
-    *, capture_content: bool = False
-) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
 
     Requires ``anthropic`` to be installed as a peer dependency.
@@ -370,6 +360,14 @@ def _create_claude_messages_handler(
     meaning models, token counts, timings and tool names, until a caller asks for more. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
+    report_usage("claude-messages.createClaudeMessagesHandler")
+    return _create_claude_messages_handler(capture_content=capture_content)
+
+
+def _create_claude_messages_handler(
+    *, capture_content: bool = False
+) -> ProviderHandler:
+    """Non-reporting :func:`create_claude_messages_handler`, used by this package's wrappers."""
     import importlib
 
     anthropic_mod = importlib.import_module("anthropic")
@@ -468,7 +466,7 @@ def _create_claude_messages_handler(
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("Anthropic", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -722,10 +720,8 @@ def claude_messages(
     report_usage("claude-messages.claudeMessages")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return call_within_sdk(
-        lambda: config(
-            key=config_key,
-            handler=create_claude_messages_handler(capture_content=capture_content),
-            **kwargs,
-        ).invoke(user_input, context, variables=variables)
-    )
+    return _config(
+        key=config_key,
+        handler=_create_claude_messages_handler(capture_content=capture_content),
+        **kwargs,
+    ).invoke(user_input, context, variables=variables)

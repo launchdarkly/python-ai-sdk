@@ -1,5 +1,6 @@
 """Tests for TESTING.md §3.27 — openai-agents."""
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -75,3 +76,41 @@ async def test_helper_sends_one_usage_event(
         "helper": helper,
     }
     assert calls[0].args[3] == 1
+
+
+def _helpers(client: MagicMock) -> list[str]:
+    return [
+        entry.args[2].get("helper")
+        for entry in client.track.call_args_list
+        if entry.args[0] == "$ld:ai:sdk:usage"
+    ]
+
+
+async def _drain(stream: Any) -> None:
+    try:
+        async for _ in stream:
+            pass
+    except Exception:
+        return
+
+
+async def test_graph_wrapper_invoke_and_stream_report_only_the_wrapper(
+    client: MagicMock,
+) -> None:
+    """The returned graph's methods are not separate ``client.graph.*`` calls."""
+    instance = openai_graph("k")
+    await _settle(instance.invoke("q", CONTEXT))
+    await _drain(instance.stream("q", CONTEXT))
+    assert _helpers(client) == ["openai-agents.openaiGraph"]
+
+
+async def test_native_adapter_invoke_reports_only_the_adapter(
+    client: MagicMock,
+) -> None:
+    async def _definition() -> Any:
+        return SimpleNamespace(enabled=False, key="k")
+
+    runner = to_openai_agents(_definition(), {"context": CONTEXT})
+    with pytest.raises(ValueError, match="disabled"):
+        await runner.invoke("q")
+    assert _helpers(client) == ["openai-agents.toOpenAIAgents"]

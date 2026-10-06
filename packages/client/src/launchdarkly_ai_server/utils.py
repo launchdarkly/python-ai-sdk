@@ -30,6 +30,16 @@ def create_handler(
     ``provides_for`` metadata and optional streaming implementation.
     """
     report_usage("client.createHandler")
+    return _create_handler(provides_for, fn, stream_fn, capture_content)
+
+
+def _create_handler(
+    provides_for: tuple[str, Literal["agent", "messages"]],
+    fn: _HandlerFn,
+    stream_fn: _StreamFn | None = None,
+    capture_content: bool = False,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_handler`, used by the package factories."""
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,

@@ -35,11 +35,10 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
-    call_within_sdk,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     end_span_once,
     end_unfinished_spans,
     parse_template,
@@ -48,7 +47,6 @@ from launchdarkly_ai_server import (
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
-    within_sdk,
 )
 
 from .spans import (
@@ -506,17 +504,17 @@ def _build_query_options(
 
 
 def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHandler:
-    report_usage("claude-agents.createClaudeAgentsHandler")
-    with within_sdk():
-        return _create_claude_agents_handler(capture_content=capture_content)
-
-
-def _create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic's Claude via the claude-agent-sdk.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. See TELEMETRY-CONTRACT.md section 7.
     """
+    report_usage("claude-agents.createClaudeAgentsHandler")
+    return _create_claude_agents_handler(capture_content=capture_content)
+
+
+def _create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHandler:
+    """Non-reporting :func:`create_claude_agents_handler`, used by this package's wrappers."""
 
     async def _call_impl(
         config: AiConfigRep,
@@ -703,7 +701,7 @@ def _create_claude_agents_handler(*, capture_content: bool = False) -> ProviderH
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("Anthropic", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -898,10 +896,8 @@ def claude_agents(
     report_usage("claude-agents.claudeAgents")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return call_within_sdk(
-        lambda: config(
-            key=config_key,
-            handler=create_claude_agents_handler(capture_content=capture_content),
-            **kwargs,
-        ).invoke(user_input, context, variables=variables)
-    )
+    return _config(
+        key=config_key,
+        handler=_create_claude_agents_handler(capture_content=capture_content),
+        **kwargs,
+    ).invoke(user_input, context, variables=variables)

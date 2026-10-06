@@ -136,7 +136,7 @@ class TestConfigSingleHandler:
         assert result.track_data["modelKey"] == "my-model"
         assert result.track_data["modelVersion"] == 3
         assert isinstance(result.track_data["modelVersion"], int)
-        assert mock_ld_client.track.call_args_list
+        assert _generation_calls(mock_ld_client)
         for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
@@ -183,7 +183,7 @@ class TestConfigSingleHandler:
         m = config(key="flag", handler=_make_handler(stream_chunks=["a", "b"]))
         async for _ in m.stream("q", CONTEXT):
             pass
-        assert mock_ld_client.track.call_args_list
+        assert _generation_calls(mock_ld_client)
         for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
