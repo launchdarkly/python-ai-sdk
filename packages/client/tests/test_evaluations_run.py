@@ -3848,8 +3848,36 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
         ([{"rowIdx": 1, "input": "hi"}], "has rowIdx 1"),
         ([{"rowIdx": True, "input": "hi"}], "has rowIdx True"),
         (["just a string"], "must be a DatasetRow or a mapping"),
-        ([{"input": 7}], "input must be a string"),
-        ([{"variables": ["a"]}], "variables must be a mapping"),
+        ([{"input": 7}], "input must be a non-empty string"),
+        ([{}], "row 0 input must be a non-empty string"),
+        ([{"input": ""}], "input must be a non-empty string"),
+        ([DatasetRow(row_index=0)], "input must be a non-empty string"),
+        ([{"input": "hi", "expectedOutput": 7}], "expectedOutput must be a string"),
+        ([{"input": "hi", "variables": ["a"]}], "variables must be a mapping"),
+        (
+            [{"input": "hi"}, {"input": "hi", "variables": {"score": float("nan")}}],
+            "row 1 variables must be JSON-encodable without NaN",
+        ),
+        (
+            [{"input": "hi", "metadata": {"limit": float("inf")}}],
+            "metadata must be JSON-encodable without NaN",
+        ),
+        (
+            [{"input": "hi", "variables": {"nested": [{"x": float("-inf")}]}}],
+            "variables must be JSON-encodable",
+        ),
+        (
+            [{"input": "hi", "metadata": {"tags": {"a", "b"}}}],
+            "metadata must be JSON-encodable",
+        ),
+        (
+            [DatasetRow(row_index=0, input="hi", variables={"when": datetime.now()})],
+            "variables must be JSON-encodable",
+        ),
+        (
+            [{"input": "hi", "variables": {("a", "b"): 1}}],
+            "variables must be JSON-encodable",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -3899,7 +3927,12 @@ async def test_failed_inline_upload_stops_the_run_before_generation(
     stub_sdk_client: MagicMock,
 ) -> None:
     transport = SequencedTransport(
-        [INLINE_EVALUATION, INLINE_RUN, response(400, {"message": "bad rows"})]
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(400, {"message": "bad rows"}),
+            response(204),
+        ]
     )
     handler = AsyncMock()
 
@@ -3917,6 +3950,69 @@ async def test_failed_inline_upload_stops_the_run_before_generation(
 
     handler.assert_not_awaited()
     stub_sdk_client.track.assert_not_called()
+    cancel = transport.requests[-1]
+    assert cancel["method"] == "POST"
+    assert cancel["url"].endswith(
+        "/projects/proj/evaluations/evaluation-id/runs/run-id/cancel"
+    )
+    assert cancel["body"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_is_cancelled_when_a_later_upload_batch_fails() -> None:
+    transport = SequencedTransport(
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(200, {}),
+            response(400, {"message": "bad rows"}),
+            response(204),
+        ]
+    )
+    handler = AsyncMock()
+
+    with pytest.raises(
+        EvaluationsError, match=r"rows 500-500 of 501 to evaluation run run-id"
+    ):
+        await init_evaluations(
+            project_key="proj", api_key="token", transport=transport
+        ).run(
+            key="inline-eval",
+            dataset=[{"input": f"row {index}"} for index in range(501)],
+            handler=handler,
+            generation=INLINE_GENERATION,
+        )
+
+    handler.assert_not_awaited()
+    assert sum(is_upload(request) for request in transport.requests) == 2
+    assert transport.requests[-1]["url"].endswith("/runs/run-id/cancel")
+
+
+@pytest.mark.asyncio
+async def test_failed_cancel_does_not_mask_the_upload_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = SequencedTransport(
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(400, {"message": "bad rows"}),
+            response(409, {"message": "already terminal"}),
+        ]
+    )
+
+    with pytest.raises(EvaluationsError, match="Failed to upload inline dataset"):
+        await init_evaluations(
+            project_key="proj", api_key="token", transport=transport
+        ).run(
+            key="inline-eval",
+            dataset=[{"input": "hello"}],
+            handler=echo_handler,
+            generation=INLINE_GENERATION,
+        )
+
+    assert transport.requests[-1]["url"].endswith("/runs/run-id/cancel")
+    assert "Failed to cancel evaluation run run-id" in caplog.text
 
 
 @pytest.mark.asyncio

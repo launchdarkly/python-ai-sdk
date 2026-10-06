@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
@@ -57,9 +58,11 @@ def _render_inline_row(row: DatasetRow) -> DatasetRow:
 def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]:
     """Validate caller-supplied rows, returning them raw and indexed by position.
 
-    Pure, so a malformed row fails before any records are created. The values
-    stay unrendered: they are uploaded as stored rows, which the server renders
-    the same way it renders a hosted dataset's.
+    Pure, so a malformed row fails before any records are created. Each row
+    is held to the upload schema, so the server cannot reject a batch the
+    harness has already accepted. The values stay unrendered: they are
+    uploaded as stored rows, which the server renders the same way it renders
+    a hosted dataset's.
     """
     if not rows:
         raise EvaluationsError("Inline dataset is empty")
@@ -99,25 +102,40 @@ def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]
             raise EvaluationsError(
                 f"Inline dataset row {position} must be a DatasetRow or a mapping"
             )
-        for field_name in ("input", "expectedOutput"):
-            value = values.get(field_name)
-            if value is not None and not isinstance(value, str):
-                raise EvaluationsError(
-                    f"Inline dataset row {position} {field_name} must be a string"
-                )
+        row_input = values.get("input")
+        if not isinstance(row_input, str) or not row_input:
+            raise EvaluationsError(
+                f"Inline dataset row {position} input must be a non-empty string"
+            )
+        expected_output = values.get("expectedOutput")
+        if expected_output is not None and not isinstance(expected_output, str):
+            raise EvaluationsError(
+                f"Inline dataset row {position} expectedOutput must be a string"
+            )
         for field_name in ("variables", "metadata"):
             value = values.get(field_name)
-            if value is not None and not isinstance(value, Mapping):
+            if value is None:
+                continue
+            if not isinstance(value, Mapping):
                 raise EvaluationsError(
                     f"Inline dataset row {position} {field_name} must be a mapping"
                 )
+            # NaN and Infinity are rejected: json.dumps would otherwise emit
+            # them as bare tokens, which are not valid JSON.
+            try:
+                json.dumps(value, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                raise EvaluationsError(
+                    f"Inline dataset row {position} {field_name} must be "
+                    f"JSON-encodable without NaN or Infinity: {error}"
+                ) from error
         variables = values.get("variables")
         metadata = values.get("metadata")
         normalized.append(
             DatasetRow(
                 row_index=position,
-                input=values.get("input"),
-                expected_output=values.get("expectedOutput"),
+                input=row_input,
+                expected_output=expected_output,
                 variables=dict(variables) if variables else {},
                 metadata=dict(metadata) if metadata is not None else None,
             )
@@ -395,13 +413,22 @@ class EvaluationsModule:
             # Must finish before any event is tracked: the run starts with a
             # placeholder row count of 1, so a result counted before the rows
             # land would mark the run complete.
-            await asyncio.to_thread(
-                self._runner._upload_dataset_rows,
-                self._project_key,
-                evaluation.id,
-                evaluation_run.id,
-                inline_rows,
-            )
+            try:
+                await asyncio.to_thread(
+                    self._runner._upload_dataset_rows,
+                    self._project_key,
+                    evaluation.id,
+                    evaluation_run.id,
+                    inline_rows,
+                )
+            except Exception:
+                # The API cannot mark a run failed; cancelling is the only
+                # terminal state a client can set, and it keeps the run from
+                # sitting PENDING with a partial dataset.
+                await self._cancel_run_after_failed_upload(
+                    self._project_key, evaluation.id, evaluation_run.id
+                )
+                raise
         config = self._runner._build_handler_config(generation, run_tools)
         results = await self._runner._run_rows(
             dataset_rows,
@@ -593,6 +620,24 @@ class EvaluationsModule:
                 raise EvaluationsError(f"{name} must be a number")
             if seconds < 0:
                 raise EvaluationsError(f"{name} must not be negative")
+
+    async def _cancel_run_after_failed_upload(
+        self, project_key: str, evaluation_id: str, run_id: str
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self._runner._cancel_evaluation_run,
+                project_key,
+                evaluation_id,
+                run_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to cancel evaluation run %s after its inline dataset "
+                "upload failed",
+                run_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _validate_dataset_source(

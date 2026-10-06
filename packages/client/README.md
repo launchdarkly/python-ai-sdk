@@ -98,7 +98,7 @@ result = await evals.run(
 )
 ```
 
-The rows are uploaded to the run, in batches of up to 500, before any generation starts. They are uploaded unrendered, and `{{...}}` placeholders render exactly as they do for a stored dataset. A malformed row fails the run before any records are created. Events from an inline run carry no dataset id.
+The rows are uploaded to the run, in batches of up to 500, before any generation starts. They are uploaded unrendered, and `{{...}}` placeholders render exactly as they do for a stored dataset. Every row needs a non-empty `input`, and `variables` and `metadata` must be JSON-encodable with no NaN or Infinity; a malformed row fails the run before any records are created. If an upload batch is rejected, the harness cancels the run — the API offers no way to mark it failed — and raises the upload error. Events from an inline run carry no dataset id.
 
 ### Score rows with judges and scorers
 

@@ -572,6 +572,20 @@ class EvaluationsRunner:
                     f"{run_id}: {error}"
                 ) from error
 
+    def _cancel_evaluation_run(
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+    ) -> None:
+        """Cancel a run, retried like a GET: replaying a cancel cannot change
+        its outcome."""
+        path = (
+            f"projects/{_segment(project_key)}/evaluations/"
+            f"{_segment(evaluation_id)}/runs/{_segment(run_id)}/cancel"
+        )
+        self._api.post(path, idempotent=True)
+
     def _run_ref(self, raw: Mapping[str, Any]) -> EvaluationRunRef:
         return EvaluationRunRef(
             id=require_string(raw, "id", "evaluation run"),
