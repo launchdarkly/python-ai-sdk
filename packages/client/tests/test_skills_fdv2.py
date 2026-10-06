@@ -82,6 +82,14 @@ SKILL_BODY = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
 
 
 def _hash(content: str) -> str:
+    """Convenience for building fixtures whose ``content_hash`` is correct.
+
+    Deliberately the same expression the implementation hashes with, which is
+    what makes it useless as an oracle: a change to the hashing rule moves
+    every fixture built here along with it, and nothing in this file would
+    fail. The rule is pinned independently, against the digests LaunchDarkly's
+    delivery service computes, in ``TestContentHashContract`` in ``test_skills.py``.
+    """
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 

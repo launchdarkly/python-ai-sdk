@@ -60,7 +60,15 @@ pytestmark = pytest.mark.usefixtures("reset_skill_state")
 
 
 def _hash(content: str) -> str:
-    """sha256, lowercase hex, over verbatim utf-8 bytes."""
+    """Convenience for building fixtures whose ``content_hash`` is correct.
+
+    Deliberately the same expression the implementation hashes with, which is
+    what makes it useless as an oracle: a change to the hashing rule moves
+    every fixture built here along with it, and nothing in this file would
+    fail. The rule is pinned independently, against the digests LaunchDarkly's
+    delivery service computes, in ``TestContentHashContract`` below — whose literal digests
+    must never be replaced by a call to this helper.
+    """
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
