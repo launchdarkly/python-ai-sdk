@@ -3719,7 +3719,7 @@ async def test_inline_dataset_uploads_rows_before_any_event_and_omits_dataset_id
         project_key="proj", api_key="token", transport=logging_transport
     ).run(
         key="inline-eval",
-        rows=[
+        dataset=[
             {
                 "input": "How do I reset my password?",
                 "expectedOutput": "Use the link.",
@@ -3794,7 +3794,7 @@ async def test_inline_dataset_uploads_in_batches_of_500() -> None:
         project_key="proj", api_key="token", transport=transport
     ).run(
         key="inline-eval",
-        rows=[{"rowIdx": index, "input": f"row {index}"} for index in range(1001)],
+        dataset=[{"rowIdx": index, "input": f"row {index}"} for index in range(1001)],
         handler=echo_handler,
         generation=INLINE_GENERATION,
     )
@@ -3818,7 +3818,7 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
         project_key="proj", api_key="token", transport=transport
     ).run(
         key="inline-eval",
-        rows=[{"input": "hello"}],
+        dataset=[{"input": "hello"}],
         handler=echo_handler,
         generation=INLINE_GENERATION,
         criteria=[Scorer(name="non-empty", fn=lambda row, output: bool(output))],
@@ -3863,7 +3863,7 @@ async def test_malformed_inline_rows_fail_before_any_request(
     with pytest.raises(EvaluationsError, match=message):
         await evals.run(
             key="inline-eval",
-            rows=dataset,
+            dataset=dataset,
             handler=echo_handler,
             generation=INLINE_GENERATION,
         )
@@ -3885,7 +3885,7 @@ async def test_inline_upload_is_retried_after_a_server_error() -> None:
 
     result = await evals.run(
         key="inline-eval",
-        rows=[{"input": "hello"}],
+        dataset=[{"input": "hello"}],
         handler=echo_handler,
         generation=INLINE_GENERATION,
     )
@@ -3910,7 +3910,7 @@ async def test_failed_inline_upload_stops_the_run_before_generation(
             project_key="proj", api_key="token", transport=transport
         ).run(
             key="inline-eval",
-            rows=[{"input": "hello"}],
+            dataset=[{"input": "hello"}],
             handler=handler,
             generation=INLINE_GENERATION,
         )
@@ -3964,19 +3964,18 @@ async def test_hosted_dataset_event_identity_is_unchanged(
 
 
 @pytest.mark.parametrize(
-    ("sources", "message"),
+    ("dataset", "message"),
     [
-        ({}, "Pass dataset, a LaunchDarkly dataset key, or rows"),
-        ({"dataset": "golden", "rows": [{"input": "hi"}]}, "mutually exclusive"),
-        ({"dataset": "golden", "rows": []}, "mutually exclusive"),
-        ({"dataset": [{"input": "hi"}]}, "pass inline rows with rows="),
-        ({"rows": "golden"}, "pass a LaunchDarkly dataset key with dataset="),
-        ({"rows": {"input": "hi"}}, "rows must be a sequence of rows"),
+        ("", "dataset must not be blank"),
+        ("   ", "dataset must not be blank"),
+        (None, "dataset must be a LaunchDarkly dataset key or a sequence"),
+        ({"input": "hi"}, "dataset must be a LaunchDarkly dataset key or a sequence"),
+        (7, "dataset must be a LaunchDarkly dataset key or a sequence"),
     ],
 )
 @pytest.mark.asyncio
-async def test_exactly_one_dataset_source_is_required_before_any_request(
-    sources: dict[str, Any], message: str
+async def test_invalid_dataset_source_fails_before_any_request(
+    dataset: Any, message: str
 ) -> None:
     evals = init_evaluations(
         project_key="proj", api_key="token", transport=failing_transport
@@ -3985,7 +3984,21 @@ async def test_exactly_one_dataset_source_is_required_before_any_request(
     with pytest.raises(EvaluationsError, match=message):
         await evals.run(
             key="inline-eval",
+            dataset=dataset,
             handler=echo_handler,
             generation=INLINE_GENERATION,
-            **sources,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dataset_is_required() -> None:
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
+
+    with pytest.raises(TypeError, match="dataset"):
+        await evals.run(  # type: ignore[call-arg]
+            key="inline-eval",
+            handler=echo_handler,
+            generation=INLINE_GENERATION,
         )
