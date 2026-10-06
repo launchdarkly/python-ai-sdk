@@ -1559,7 +1559,8 @@ class FDv2SkillStore:
         has skills; see ``diagnostics``.
 
         Returns ``False`` on timeout, or early if delivery ends first (``close``,
-        or a failure that will not be retried).
+        or a failure that will not be retried). A store that gave up waits again
+        once ``start()`` runs delivery again; only ``close`` is final.
         """
         self._released.wait(timeout=timeout)
         return self._first_payload.is_set()
