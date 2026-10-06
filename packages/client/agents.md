@@ -264,7 +264,8 @@ payload assigned to it, and chose a non-400 4xx because LD SDKs treat those as t
 `_classify_status` returns a `_FatalTransportError` and the normal give-up path runs:
 `failed` and `last_error` are set, `wait_for_skills` returns `False` at once, and
 `connection_failures` is left untouched (it counts consecutive *recoverable* failures; an
-existing count is kept, not zeroed).
+existing count is kept, not zeroed, until `start()` runs delivery again and `_rearm_waiters`
+resets it).
 
 **The 422 message matches the TypeScript SDK's word for word, and stays short.** It names the
 one cause a customer can fix — a view-scoped SDK key — and refers every other case to

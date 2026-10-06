@@ -1503,12 +1503,14 @@ class FDv2SkillStore:
     def _rearm_waiters(self) -> None:
         """
         Resets per-run state for a store being started again after it gave up:
-        the ended-delivery flag, ``failed``, and the failure count. A payload
-        already held still answers ``wait_for_skills``. Call with the lock held.
+        the ended-delivery flag, ``failed``, and the failure count, including
+        the one ``diagnostics`` reports. A payload already held still answers
+        ``wait_for_skills``. Call with the lock held.
         """
         self._delivery_ended.clear()
         self._failed_reason = None
         self._failures = 0
+        self._reader.diagnostics.connection_failures = 0
         self._backoff_attempts = 0
         if not self._first_payload.is_set():
             self._released.clear()
@@ -1557,7 +1559,8 @@ class FDv2SkillStore:
         has skills; see ``diagnostics``.
 
         Returns ``False`` on timeout, or early if delivery ends first (``close``,
-        or a failure that will not be retried).
+        or a failure that will not be retried). A store that gave up waits again
+        once ``start()`` runs delivery again; only ``close`` is final.
         """
         self._released.wait(timeout=timeout)
         return self._first_payload.is_set()

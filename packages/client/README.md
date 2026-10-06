@@ -628,8 +628,8 @@ HTTP 422 when it will not serve one.
 - **Not the empty case:** an environment with zero skills is served an empty payload that
   commits normally.
 - **Recovery:** once the cause is fixed, call `start()` on the same store. Only `close()` is
-  final: a restart clears `failed`, resets the backoff, and held content stays readable
-  throughout. Restarting the process also works.
+  final: a restart clears `failed`, resets the backoff and `connection_failures`, and held
+  content stays readable throughout. Restarting the process also works.
 
 **Nothing above the store changes.** The accessors, verification, and `write_skills` see raw
 objects through the `SkillStore` interface and cannot tell which store produced them.
