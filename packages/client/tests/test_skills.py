@@ -372,6 +372,14 @@ class TestPackageExports:
         for name in EXPERIMENTAL_SKILLS_SURFACE:
             assert hasattr(experimental, name), name
 
+    def test_experimental_module_defines_no_other_public_name(self) -> None:
+        """``__all__`` is what ``import *`` and the docs follow, but a public
+        name defined on the module and left out of it is still importable."""
+        from launchdarkly_ai_server.experimental import skills as experimental
+
+        public = {name for name in dir(experimental) if not name.startswith("_")}
+        assert public == EXPERIMENTAL_SKILLS_SURFACE
+
     def test_no_skills_name_is_exported_from_the_package_root(self) -> None:
         import launchdarkly_ai_server as package
         import launchdarkly_ai_server.experimental.skills
@@ -768,6 +776,22 @@ class TestStoreConfiguration:
         set_skill_store(store)
 
         set_skill_store(None)
+
+        assert await get_skill("a") is not None
+
+    @pytest.mark.parametrize("not_a_store", ["x", {}, 0, object()])
+    async def test_set_skill_store_rejects_a_non_store(
+        self, make_raw_skill: Any, not_a_store: Any
+    ) -> None:
+        """A value without the store methods fails where it is passed, not as a
+        ``store_unavailable`` on the first accessor call, and leaves the
+        configured store in place."""
+        store = InMemorySkillStore()
+        store.put(make_raw_skill(key="a"))
+        set_skill_store(store)
+
+        with pytest.raises(TypeError, match="SkillStore"):
+            set_skill_store(not_a_store)
 
         assert await get_skill("a") is not None
 

@@ -164,8 +164,21 @@ async def init_client(
     - Pass *client* directly (BYOC) to skip the LaunchDarkly Python SDK path.
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
 
+    Options (each overrides the environment variable in parentheses):
+
+    - ``sdkKey`` (``LD_SDK_KEY``): the server-side SDK key.
+    - ``baseUri`` (``LD_BASE_URI``), ``streamUri`` (``LD_STREAM_URI``),
+      ``eventsUri`` (``LD_EVENTS_URI``): LaunchDarkly service URIs, passed to
+      the SDK config. Not used on the BYOC path.
+    - ``otlpEndpoint`` (``OTEL_EXPORTER_OTLP_ENDPOINT``): where spans are
+      exported.
+    - ``serviceName`` (``LD_SERVICE_NAME``): the ``service.name`` resource
+      attribute.
+    - ``environment`` (``LD_ENVIRONMENT``): the ``deployment.environment``
+      resource attribute.
+
     Idempotent: later calls return the existing client and ignore every option.
-    An option this function does not read is logged as a warning and ignored.
+    An option not listed above is logged as a warning and ignored.
 
     Returns the initialized ``LDClientInterface`` instance.
     """

@@ -200,6 +200,20 @@ asyncio.run(main())
 | `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. |
 | `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
 
+`init_client` reads these option keys. Each overrides the environment variable of the same
+purpose (see [Environment Variables](#environment-variables)); any other key is logged as a
+warning and ignored.
+
+| Option | Environment variable | Description |
+|---|---|---|
+| `sdkKey` | `LD_SDK_KEY` | LaunchDarkly server-side SDK key |
+| `baseUri` | `LD_BASE_URI` | Polling base URI. Not used with `client=...` |
+| `streamUri` | `LD_STREAM_URI` | Streaming URI. Not used with `client=...` |
+| `eventsUri` | `LD_EVENTS_URI` | Events URI. Not used with `client=...` |
+| `otlpEndpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint spans are exported to |
+| `serviceName` | `LD_SERVICE_NAME` | OTel `service.name` resource attribute |
+| `environment` | `LD_ENVIRONMENT` | `deployment.environment` resource attribute |
+
 ### `config(**args)`
 
 The primary entry point for AI config invocations. Accepts either a single handler or a list of handlers and routes to the correct one at invoke-time based on the flag variation's provider and mode.
@@ -385,6 +399,10 @@ async def main():
 
     # 1. Which skills does this config reference? Pure projection — no I/O.
     info = await inspect_config("doc-agent", {"kind": "user", "key": "user-123"})
+    if info["config"] is None:
+        # The config could not be resolved. Stop here: an empty reference list
+        # passed to write_skills would prune every skill it manages.
+        return
     refs = skill_refs(info["config"])          # [SkillReference(key='pdf-extraction', version=2)]
 
     # 2. Fetch content. Returns None rather than raising when a skill is unavailable.
@@ -717,7 +735,9 @@ that skips verification.
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `set_skill_store(store)`. It applies on every call, before or after
-`init_client`, and `None` is ignored rather than clearing a configured store. With none
+`init_client`, and `None` is ignored rather than clearing a configured store. Anything else
+without callable `get_object` and `all_objects` raises `TypeError`. Replacing a store does not
+close the previous one, and a running watcher keeps the store it started with. With none
 configured, the accessors raise `RuntimeError` explaining what to do, and `write_skills`
 reports the failure (or raises, with `on_unavailable="raise"`). `shutdown()` clears it.
 

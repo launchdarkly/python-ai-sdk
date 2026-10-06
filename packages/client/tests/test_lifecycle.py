@@ -525,6 +525,26 @@ class TestShutdown:
         await shutdown()
         await shutdown()  # must not raise
 
+    async def test_a_failure_clearing_experimental_state_is_logged_not_raised(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Experimental behaviour must not break a core call (TESTING.md §0.3)."""
+        stub = _make_stub_client()
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        with (
+            patch.object(
+                lifecycle_module.skills,
+                "_clear_state",
+                side_effect=RuntimeError("clear failed"),
+            ),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await shutdown()  # must not raise
+        stub.close.assert_called_once()
+        assert lifecycle_module._client is None
+        assert "Could not clear the Agent Skills state" in caplog.messages
+
     async def test_completes_teardown_even_if_flush_throws(self) -> None:
         stub = _make_stub_client()
         stub.flush = AsyncMock(side_effect=RuntimeError("flush failed"))

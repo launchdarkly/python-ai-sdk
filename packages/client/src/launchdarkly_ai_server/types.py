@@ -93,7 +93,8 @@ AiConfigRep = dict[str, Any]
 """
 Raw AI config dict as returned by ``parse_ai_config``. Fields include
 ``model``, ``provider``, at least one of ``instructions`` / ``messages``, and an
-optional ``skills`` array of ``{key, version}`` references (see ``skill_refs``).
+optional ``skills`` array of ``{key, version}`` references (see
+``launchdarkly_ai_server.experimental.skills.skill_refs``).
 """
 
 VariationMeta = dict[str, Any]

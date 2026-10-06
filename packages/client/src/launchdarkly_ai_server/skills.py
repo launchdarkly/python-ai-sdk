@@ -55,12 +55,32 @@ def set_skill_store(store: SkillStore | None) -> None:
     initialized client can be given a store afterwards. ``None`` is ignored and
     never clears a configured store; ``shutdown()`` does that.
 
+    Replacing a store does not close the previous one; close it yourself if it
+    holds a connection. A running ``watch_skills`` keeps listening to the store
+    it started with, so close the watcher and start a new one to follow the
+    replacement.
+
     Args:
         store: ``FDv2SkillStore`` to receive skills from LaunchDarkly, or
             ``InMemorySkillStore`` for local development and tests.
+
+    Raises:
+        TypeError: If *store* is not ``None`` and has no callable
+            ``get_object`` and ``all_objects``.
     """
-    if store is not None:
-        _set_store(store)
+    if store is None:
+        return
+    missing = [
+        name
+        for name in ("get_object", "all_objects")
+        if not callable(getattr(store, name, None))
+    ]
+    if missing:
+        raise TypeError(
+            f"set_skill_store needs a SkillStore; {type(store).__name__} has no "
+            f"callable {' or '.join(missing)}."
+        )
+    _set_store(store)
 
 
 class InMemorySkillStore:
