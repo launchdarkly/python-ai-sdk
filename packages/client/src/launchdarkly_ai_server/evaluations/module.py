@@ -508,6 +508,9 @@ def init_evaluations(
     transport: Transport = urllib_transport,
 ) -> EvaluationsModule:
     """Resolve credentials and construct the evaluations module."""
+    from ..sdk_usage import report_usage
+
+    report_usage("client.init_evaluations")
     token = api_token or _env("LD_API_TOKEN")
     if not token:
         raise EvaluationsError(

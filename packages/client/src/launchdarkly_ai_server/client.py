@@ -73,6 +73,19 @@ class ConfigInstance:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> ProviderResponse[Any]:
+        from .sdk_usage import report_usage, within_sdk
+
+        report_usage("client.config.invoke")
+        with within_sdk():
+            return await self._invoke_body(user_input, context, variables, history)
+
+    async def _invoke_body(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ProviderResponse[Any]:
         resolved_handler_list = resolve_handlers(
             self._registry, self._normalize_handlers()
         )
@@ -165,6 +178,9 @@ class ConfigInstance:
         call has already exited. Binding here — at call time — is what lets a caller hand the
         generator off and iterate it later.
         """
+        from .sdk_usage import report_usage
+
+        report_usage("client.config.stream")
         return bind_conversation_id(
             self._stream_events(user_input, context, variables, history)
         )

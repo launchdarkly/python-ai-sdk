@@ -17,6 +17,7 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    call_within_sdk,
     compose_history,
     config,
     create_handler,
@@ -27,8 +28,10 @@ from launchdarkly_ai_server import (
     lang_chain_span_messages,
     lang_chain_span_usage,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
+    within_sdk,
 )
 
 from .messages import to_lang_chain_messages
@@ -254,6 +257,14 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 
 
 def create_langchain_agents_handler(
+    llm: Any = None, *, capture_content: bool = False
+) -> ProviderHandler:
+    report_usage("langchain-agents.createLangChainAgentsHandler")
+    with within_sdk():
+        return _create_langchain_agents_handler(llm, capture_content=capture_content)
+
+
+def _create_langchain_agents_handler(
     llm: Any = None, *, capture_content: bool = False
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
@@ -570,10 +581,13 @@ def langchain_agents(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("langchain-agents.langchainAgents")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
-        key=config_key,
-        handler=create_langchain_agents_handler(capture_content=capture_content),
-        **kwargs,
-    ).invoke(user_input, context, variables=variables)
+    return call_within_sdk(
+        lambda: config(
+            key=config_key,
+            handler=create_langchain_agents_handler(capture_content=capture_content),
+            **kwargs,
+        ).invoke(user_input, context, variables=variables)
+    )

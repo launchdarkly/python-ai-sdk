@@ -63,6 +63,7 @@ from .registry import (
     resolve_tools,
 )
 from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
+from .sdk_usage import call_within_sdk, report_usage, within_sdk
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -239,6 +240,9 @@ __all__ = [  # noqa: RUF022
     "SDK_INFO_CONTEXT",
     "SDK_INFO_EVENT",
     "register_ai_sdk_package",
+    "call_within_sdk",
+    "report_usage",
+    "within_sdk",
     # judges
     "build_judge_tasks",
     "run_judge",

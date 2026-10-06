@@ -22,6 +22,15 @@ from launchdarkly_ai_server import (
 # ---------------------------------------------------------------------------
 
 CONTEXT = {"kind": "user", "key": "u1"}
+_SDK_BOOKKEEPING = {"$ld:ai:sdk:usage", "$ld:ai:sdk:info"}
+
+
+def _generation_calls(client: MagicMock) -> list[Any]:
+    return [
+        call
+        for call in client.track.call_args_list
+        if call[0][0] not in _SDK_BOOKKEEPING
+    ]
 
 
 def _make_client(response: Any = "Hello", usage: dict | None = None) -> MagicMock:
@@ -128,7 +137,7 @@ class TestConfigSingleHandler:
         assert result.track_data["modelVersion"] == 3
         assert isinstance(result.track_data["modelVersion"], int)
         assert mock_ld_client.track.call_args_list
-        for call in mock_ld_client.track.call_args_list:
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
             assert payload["modelVersion"] == 3
@@ -141,7 +150,7 @@ class TestConfigSingleHandler:
         assert result.track_data is not None
         assert "modelKey" not in result.track_data
         assert "modelVersion" not in result.track_data
-        for call in mock_ld_client.track.call_args_list:
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert "modelKey" not in payload
             assert "modelVersion" not in payload
@@ -175,7 +184,7 @@ class TestConfigSingleHandler:
         async for _ in m.stream("q", CONTEXT):
             pass
         assert mock_ld_client.track.call_args_list
-        for call in mock_ld_client.track.call_args_list:
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
             assert payload["modelVersion"] == 3

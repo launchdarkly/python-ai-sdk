@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
+from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
 from .types import InitClientOptions
 from .utils import model_stamps_from_meta
 
@@ -142,6 +143,7 @@ async def init_client(
     # Idempotent — if already initialized, return the existing client
     if _client is not None:
         flush_ai_sdk_info(_client)
+        flush_sdk_usage(_client)
         return _client
 
     # BYOC path — pre-initialized client
@@ -149,6 +151,7 @@ async def init_client(
         _client = client
         _setup_telemetry(opts.get("sdkKey", "byoc"), opts)
         flush_ai_sdk_info(_client)
+        flush_sdk_usage(_client)
         return _client
 
     # Resolve SDK key
@@ -196,6 +199,7 @@ async def init_client(
     _client = ld_client
     _setup_telemetry(sdk_key, opts)
     flush_ai_sdk_info(_client)
+    flush_sdk_usage(_client)
     return _client
 
 
@@ -213,6 +217,7 @@ async def shutdown() -> None:
     _client = None
     _tracer_provider = None
     reset_ai_sdk_info()
+    reset_sdk_usage()
 
     if local_provider is not None:
         try:
@@ -270,6 +275,7 @@ async def inspect_config(
     - ``config`` (dict | None): the parsed AI config, or None when disabled/invalid
     - ``meta`` (dict | None): the variation metadata, or None when unreachable
     """
+    report_usage("client.inspectConfig")
     from .types_validation import parse_ai_config
     from .utils import to_ld_context  # late import avoids circular dependency
 

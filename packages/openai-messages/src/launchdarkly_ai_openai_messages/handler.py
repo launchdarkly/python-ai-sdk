@@ -12,6 +12,7 @@ from launchdarkly_ai_server import (
     RunUsage,
     SpanMessage,
     SpanMessagePart,
+    call_within_sdk,
     compose_history,
     config,
     content_to_text,
@@ -22,9 +23,11 @@ from launchdarkly_ai_server import (
     image_block_to_url,
     is_content_blocks,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    within_sdk,
 )
 
 from .spans import (
@@ -211,6 +214,14 @@ async def _run_model_turn(
 
 
 def create_openai_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+    report_usage("openai-messages.createOpenAIHandler")
+    with within_sdk():
+        return _create_openai_messages_handler(capture_content=capture_content)
+
+
+def _create_openai_messages_handler(
+    *, capture_content: bool = False
+) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for OpenAI (responses API).
     Requires ``openai`` to be installed as a peer dependency.
@@ -641,10 +652,13 @@ def openai_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("openai-messages.openaiMessages")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
-        key=config_key,
-        handler=create_openai_messages_handler(capture_content=capture_content),
-        **kwargs,
-    ).invoke(user_input, context, variables=variables)
+    return call_within_sdk(
+        lambda: config(
+            key=config_key,
+            handler=create_openai_messages_handler(capture_content=capture_content),
+            **kwargs,
+        ).invoke(user_input, context, variables=variables)
+    )

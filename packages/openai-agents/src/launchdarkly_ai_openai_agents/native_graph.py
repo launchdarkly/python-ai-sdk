@@ -20,6 +20,7 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     to_ld_context,
 )
 
@@ -102,6 +103,7 @@ def to_openai_agents(
             {"context": ctx},
         ).invoke("I was double charged")
     """
+    report_usage("openai-agents.toOpenAIAgents")
     _opts = opts or {}
 
     async def invoke(

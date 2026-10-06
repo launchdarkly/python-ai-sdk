@@ -11,6 +11,7 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    call_within_sdk,
     compose_history,
     config,
     content_to_text,
@@ -19,10 +20,12 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     is_content_blocks,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
+    within_sdk,
 )
 
 from .spans import (
@@ -350,6 +353,14 @@ _MAX_STEPS = 10
 
 
 def create_claude_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+    report_usage("claude-messages.createClaudeMessagesHandler")
+    with within_sdk():
+        return _create_claude_messages_handler(capture_content=capture_content)
+
+
+def _create_claude_messages_handler(
+    *, capture_content: bool = False
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
 
     Requires ``anthropic`` to be installed as a peer dependency.
@@ -708,10 +719,13 @@ def claude_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("claude-messages.claudeMessages")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
-        key=config_key,
-        handler=create_claude_messages_handler(capture_content=capture_content),
-        **kwargs,
-    ).invoke(user_input, context, variables=variables)
+    return call_within_sdk(
+        lambda: config(
+            key=config_key,
+            handler=create_claude_messages_handler(capture_content=capture_content),
+            **kwargs,
+        ).invoke(user_input, context, variables=variables)
+    )

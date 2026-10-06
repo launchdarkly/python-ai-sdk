@@ -30,6 +30,7 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     RunUsage,
     SpanUsage,
+    call_within_sdk,
     compose_history,
     config,
     content_to_text,
@@ -39,10 +40,12 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     image_block_to_url,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     text_message,
+    within_sdk,
 )
 
 from .spans import (
@@ -458,6 +461,12 @@ def _usage_from_error(error: BaseException) -> SpanUsage | None:
 
 
 def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
+    report_usage("openai-agents.createOpenAIAgentHandler")
+    with within_sdk():
+        return _create_openai_agent_handler(capture_content=capture_content)
+
+
+def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
@@ -712,10 +721,13 @@ def openai_agents(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("openai-agents.openaiAgents")
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
-        key=config_key,
-        handler=create_openai_agent_handler(capture_content=capture_content),
-        **kwargs,
-    ).invoke(user_input, context, variables=variables)
+    return call_within_sdk(
+        lambda: config(
+            key=config_key,
+            handler=create_openai_agent_handler(capture_content=capture_content),
+            **kwargs,
+        ).invoke(user_input, context, variables=variables)
+    )

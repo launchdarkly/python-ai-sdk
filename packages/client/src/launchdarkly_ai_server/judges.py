@@ -11,6 +11,7 @@ from .judge_scoring import (
     numeric_score,
     parse_judge_response,
 )
+from .sdk_usage import report_usage
 from .types import (
     AiConfigRep,
     JudgeResult,
@@ -232,6 +233,7 @@ async def build_judge_tasks(
     ``samplingRate`` causes them to be skipped are excluded from the list.
     Returns an empty list when no active judges are configured.
     """
+    report_usage("client.buildJudgeTasks")
     from .lifecycle import extract_variation
 
     judge_config_block = (
@@ -349,8 +351,9 @@ async def run_judge(
     ``get_client().track()`` on the main thread.
 
     Returns ``None`` when no compatible handler is found or the response cannot
-    be parsed as ``{"score": ..., "reasoning": ...}``.
+    be     parsed as ``{"score": ..., "reasoning": ...}``.
     """
+    report_usage("client.runJudge")
     from .tracking import execute_and_track
 
     def _matches(h: ProviderHandler) -> bool:

@@ -837,6 +837,9 @@ async def resolve_graph(
     ``context`` is a keyword-only argument, mirroring the TypeScript
     ``resolveGraph(key, { context, handlers, toolHandlers, registry })`` shape.
     """
+    from .sdk_usage import report_usage
+
+    report_usage("client.resolveGraph")
     resolved_handlers = resolve_handlers(registry, handlers)
     resolved_tools = resolve_tools(registry, tool_handlers)
     options = {
@@ -869,6 +872,9 @@ class GraphInstance:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> ProviderGraphResponse:
+        from .sdk_usage import report_usage
+
+        report_usage("client.graph.invoke")
         from opentelemetry import trace
 
         from .judges import run_judges
@@ -1068,6 +1074,9 @@ class GraphInstance:
         this call may have already exited. Binding the conversation id and capturing the OTel parent
         here — at call time — matches ``config().stream()`` and the TypeScript graph stream.
         """
+        from .sdk_usage import report_usage
+
+        report_usage("client.graph.stream")
         from opentelemetry import context as otel_context
 
         caller_context = otel_context.get_current()

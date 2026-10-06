@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .sdk_usage import report_usage
 from .types import (
     AiConfigRep,
     GraphNode,
@@ -28,6 +29,7 @@ def create_handler(
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
     ``provides_for`` metadata and optional streaming implementation.
     """
+    report_usage("client.createHandler")
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,

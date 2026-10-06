@@ -18,6 +18,7 @@ from launchdarkly_ai_server import (
     NativeTool,
     get_client,
     make_track_data,
+    report_usage,
     to_ld_context,
 )
 
@@ -207,6 +208,7 @@ def to_claude_agents(
 
     Returns an object with a ``.invoke(input, variables)`` coroutine.
     """
+    report_usage("claude-agents.toClaudeAgents")
     _opts = opts or {}
 
     async def invoke(
