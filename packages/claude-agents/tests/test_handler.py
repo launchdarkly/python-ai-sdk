@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    ClaudeAgentOptions,
     ResultMessage,
     StreamEvent,
     SystemMessage,
@@ -43,6 +44,11 @@ from launchdarkly_ai_claude_agents.handler import (
     partition_tools,
 )
 from launchdarkly_ai_server import ConversationIdSpanProcessor, conversation_id
+from tests.forwarding_spec import (
+    CLAUDE_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
 from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
@@ -2349,3 +2355,89 @@ class TestToolSpanSurvivesAContentFailure:
 
         tool = named("execute_tool ")[0]
         assert tool.end_time is not None
+
+
+#: ``ClaudeAgentOptions`` fields the handler fills with fresh objects on every call (hook
+#: closures, the tool MCP server), so they differ between calls whatever the config says. Every
+#: config-settable field is still compared.
+_PER_CALL_FIELDS = frozenset({"hooks", "mcp_servers"})
+
+
+def _comparable(options: Any) -> dict[str, Any]:
+    import dataclasses
+
+    return {
+        f.name: getattr(options, f.name)
+        for f in dataclasses.fields(options)
+        if f.name not in _PER_CALL_FIELDS
+    }
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change the
+    ``ClaudeAgentOptions`` handed to ``query`` are exactly the cross-SDK Claude Agents list, on
+    both paths."""
+
+    @staticmethod
+    def _candidates() -> frozenset[str]:
+        import dataclasses
+
+        return candidate_keys(
+            (f.name for f in dataclasses.fields(ClaudeAgentOptions)), CLAUDE_AGENTS
+        )
+
+    @staticmethod
+    def _config(parameters: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **BASE_CONFIG,
+            "model": {**BASE_CONFIG["model"], "parameters": parameters},
+        }
+
+    def _patch_query(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        return captured
+
+    async def test_invoke(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = self._patch_query(monkeypatch)
+        h = create_claude_agents_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            await h(self._config(parameters), "q")
+            return _comparable(captured["options"])
+
+        assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_AGENTS
+
+    async def test_stream(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = self._patch_query(monkeypatch)
+        h = create_claude_agents_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            await _collect(await h.stream(self._config(parameters), "q"))
+            return _comparable(captured["options"])
+
+        assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_AGENTS
+
+
+class TestMalformedObjectValuesAreDropped:
+    def test_thinking_and_output_format_that_are_not_objects_are_dropped(self) -> None:
+        from launchdarkly_ai_claude_agents.handler import _options_parameters
+
+        params = _options_parameters(
+            {
+                "model": {
+                    "parameters": {
+                        "thinking": "adaptive",
+                        "output_format": "json",
+                        "max_turns": 3,
+                    }
+                }
+            }
+        )
+        assert params == {"max_turns": 3}

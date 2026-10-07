@@ -20,8 +20,6 @@ from launchdarkly_ai_server import (
     make_track_data,
     to_ld_context,
 )
-from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
 
 try:
     from opentelemetry import trace
@@ -32,8 +30,8 @@ except ImportError:
     _HAS_OTEL = False
 
 from launchdarkly_ai_claude_agents.handler import (
-    _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
     _build_hooks,
+    _options_parameters,
     build_prompt,
     build_query_prompt,
     build_tool_mcp,
@@ -152,9 +150,7 @@ async def _run_query(
 
     hooks = _build_hooks(native_tool_map)
 
-    params = select_forwarded_parameters(
-        model_parameters(node.config), _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS
-    )
+    params = _options_parameters(node.config)
 
     options = ClaudeAgentOptions(
         **params,

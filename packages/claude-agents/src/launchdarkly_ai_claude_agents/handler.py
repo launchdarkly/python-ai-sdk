@@ -79,6 +79,9 @@ from .spans import (
 #: environment, working directory, file access, permissions, settings files, plugins, sandbox,
 #: session state) stays under the application's control, never a config's.
 #:
+#: This is the cross-SDK list for Claude Agents (TESTING.md section 1.12), shared with the native
+#: graph through :func:`_options_parameters`.
+#:
 #: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
 #: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
 #: for other providers; they are dropped like any other key not listed here.
@@ -94,6 +97,10 @@ _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
         "thinking",
     }
 )
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ClaudeAgentOptions``.
+_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS = frozenset({"output_format", "thinking"})
 
 #: Accepted by ``ClaudeAgentOptions`` but never forwarded, and why:
 #: * ``cli_path``, ``env``, ``cwd``, ``add_dirs``, ``settings``, ``setting_sources``, ``plugins``,
@@ -552,6 +559,18 @@ def _result_error(subtype: str, errors: list[str] | None) -> str:
     return f"Claude agent run ended with {subtype}{detail}"
 
 
+def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that become ``ClaudeAgentOptions`` fields: only
+    :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped. The handler
+    and the native graph both call this, so they forward the same keys.
+    """
+    return select_forwarded_parameters(
+        model_parameters(config),
+        _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
+        mapping_keys=_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS,
+    )
+
+
 def _build_query_options(
     config: AiConfigRep,
     system_prompt: str | None,
@@ -562,9 +581,7 @@ def _build_query_options(
     **extra: Any,
 ) -> ClaudeAgentOptions:
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
-    params = select_forwarded_parameters(
-        model_parameters(config), _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS
-    )
+    params = _options_parameters(config)
     kwargs: dict[str, Any] = {
         **params,
         "model": config["model"]["name"],

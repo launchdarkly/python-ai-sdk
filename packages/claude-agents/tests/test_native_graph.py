@@ -14,6 +14,11 @@ import pytest
 import launchdarkly_ai_claude_agents.native_graph as _claude_ng
 from launchdarkly_ai_claude_agents.native_graph import to_claude_agents
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
+from tests.forwarding_spec import (
+    CLAUDE_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
 from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
@@ -822,3 +827,51 @@ class TestNativeGraphModelParameters:
         for opts in captured_options:
             assert opts["max_turns"] == 7
             assert not find_leaks(opts)
+
+
+class TestNativeGraphForwardsExactlyTheCrossSdkList:
+    """The native graph builds each node's options with the handler's own forwarding, so a probe
+    of one node finds exactly the cross-SDK Claude Agents list."""
+
+    @pytest.mark.asyncio
+    async def test_root_node_options(self) -> None:
+        import dataclasses
+
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        async def call(parameters: dict[str, Any]) -> object:
+            mock_sdk = _make_sdk_mock("done")
+            nodes = {
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": "claude-3", "parameters": parameters},
+                        "instructions": "be helpful",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+            captured: list[dict[str, Any]] = []
+            mock_sdk.ClaudeAgentOptions = MagicMock(
+                side_effect=lambda **kw: (captured.append(kw), kw)[1]
+            )
+            with patch(
+                "importlib.import_module",
+                side_effect=lambda n: (
+                    mock_sdk if n == "claude_agent_sdk" else __import__(n)
+                ),
+            ):
+                await to_claude_agents(
+                    _make_def_promise(_make_graph_def(nodes=nodes))
+                ).invoke("hi")
+            return [
+                {k: v for k, v in kw.items() if k not in {"hooks", "mcp_servers"}}
+                for kw in captured
+            ]
+
+        candidates = candidate_keys(
+            (f.name for f in dataclasses.fields(ClaudeAgentOptions)), CLAUDE_AGENTS
+        )
+        assert await probe_forwarded_keys(candidates, call) == CLAUDE_AGENTS
