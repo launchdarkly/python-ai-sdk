@@ -207,7 +207,8 @@ Three layers, in increasing order of blast radius:
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
    It also validates the array, and **fails closed**: a present but malformed field
    (including `null`, or one bad entry) raises `ValueError` rather than returning a partial
-   list that would authorize a prune. `parse_ai_config` deliberately does not check `skills`,
+   list that would authorize a prune. So does a config that is not a dict, including the
+   `None` a failed `inspect_config` returns; only a dict with no `skills` key yields `[]`. `parse_ai_config` deliberately does not check `skills`,
    so an experimental field cannot fail a core config call (TESTING.md §0.3).
 2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
    through the `SkillStore` seam. Configure a store with `set_skill_store(store)`; with
