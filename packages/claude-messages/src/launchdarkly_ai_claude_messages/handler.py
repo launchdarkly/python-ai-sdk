@@ -50,13 +50,15 @@ from .spans import (
 #: ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
 #: classification stays exhaustive as the SDK's own signatures change.
 #:
-#: Only model and run settings are forwarded, and the same list serves ``invoke`` and ``stream``,
-#: so one config behaves the same whichever is called.
+#: This is the cross-SDK list for Claude Messages (TESTING.md section 1.12). A top-level
+#: ``effort`` is also accepted and moved into ``output_config.effort`` before this list applies
+#: (see :func:`_rename_effort_to_output_config`), and ``max_tokens`` defaults to 1024. The same list
+#: serves ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves
+#: the same whichever is called.
 _MESSAGES_FORWARDED_KEYS = frozenset(
     {
         "cache_control",
         "max_tokens",
-        "metadata",
         "output_config",
         "service_tier",
         "stop_sequences",
@@ -68,16 +70,23 @@ _MESSAGES_FORWARDED_KEYS = frozenset(
     }
 )
 
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to the API.
+_MESSAGES_MAPPING_KEYS = frozenset(
+    {"cache_control", "output_config", "thinking", "tool_choice"}
+)
+
 #: Accepted by the API but never forwarded, and why:
-#: * ``stream``: the handler chooses blocking vs. streaming itself, not via a kwarg.
-#: * ``output_format``: only ``.stream`` accepts it, so forwarding it would make ``invoke`` and
-#:   ``stream`` behave differently. ``output_config`` (forwarded) carries the same output format
-#:   on both.
-#: * ``inference_geo``: the region inference runs in, which decides where data is processed.
-#: * ``container``: selects server-side container state carried over from another request, not
-#:   a model setting.
-#: * ``user_profile_id``: attributes the request to a party other than the caller, an identity
-#:   setting rather than a model setting.
+#: * ``stream``: runtime wiring. The handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``output_format``: API-shape switch. Only ``.stream`` accepts it, so forwarding it would make
+#:   ``invoke`` and ``stream`` behave differently. ``output_config`` (forwarded) carries the same
+#:   output format on both.
+#: * ``inference_geo``: data location. The region inference runs in decides where data is
+#:   processed.
+#: * ``container``: server-side state. It selects container state carried over from another
+#:   request, not a model setting.
+#: * ``metadata``, ``user_profile_id``: identity and attribution. They say who the request is for,
+#:   or attribute it to a party other than the caller.
 #: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
 #:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
 #:
@@ -89,6 +98,7 @@ _MESSAGES_EXCLUDED_KEYS = frozenset(
         "output_format",
         "inference_geo",
         "container",
+        "metadata",
         "user_profile_id",
         "timeout",
         "extra_headers",
@@ -119,6 +129,18 @@ def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
         "effort": effort,
     }
     return params
+
+
+def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that reach ``messages.create``/``.stream``: ``effort``
+    moved into ``output_config``, then only :data:`_MESSAGES_FORWARDED_KEYS`, with malformed
+    object values dropped. ``invoke`` and ``stream`` both call this, so they forward the same keys.
+    """
+    return select_forwarded_parameters(
+        _rename_effort_to_output_config(model_parameters(config)),
+        _MESSAGES_FORWARDED_KEYS,
+        mapping_keys=_MESSAGES_MAPPING_KEYS,
+    )
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -272,10 +294,7 @@ async def _run_tool_loop(
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
-    extra_params = select_forwarded_parameters(
-        _rename_effort_to_output_config(model_parameters(config)),
-        _MESSAGES_FORWARDED_KEYS,
-    )
+    extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
     output = ""
@@ -568,10 +587,7 @@ async def _stream_gen(
 
     tools = _build_tools(config.get("tools") or {})
     tool_definitions = to_tool_definitions(tools)
-    extra_params = select_forwarded_parameters(
-        _rename_effort_to_output_config(model_parameters(config)),
-        _MESSAGES_FORWARDED_KEYS,
-    )
+    extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
     full_output = ""

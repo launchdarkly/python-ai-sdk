@@ -16,6 +16,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from tests.forwarding_spec import (
+    CLAUDE_MESSAGES,
+    candidate_keys,
+    probe_forwarded_keys,
+)
 from tests.never_forwarded import (
     NEVER_FORWARDED_BAG,
     NEVER_FORWARDED_KEYS,
@@ -2626,3 +2631,108 @@ class TestInvokeAndStreamForwardTheSameKeys:
         assert "output_format" not in call_kwargs
         assert call_kwargs["output_config"] == self._PARAMS["output_config"]
         assert call_kwargs["top_p"] == 0.4
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change the provider call
+    are exactly the cross-SDK Claude Messages list, on both paths."""
+
+    @staticmethod
+    def _candidates() -> frozenset[str]:
+        import inspect
+
+        from anthropic.resources.messages import AsyncMessages
+
+        accepted = {
+            name
+            for fn in (AsyncMessages.create, AsyncMessages.stream)
+            for name in inspect.signature(fn).parameters
+            if name != "self"
+        }
+        return candidate_keys(accepted, CLAUDE_MESSAGES)
+
+    def _config(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        return {**CONFIG, "model": {**CONFIG["model"], "parameters": parameters}}
+
+    async def test_invoke(self, mock_anthropic: MagicMock) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        h = create_claude_messages_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            await h(self._config(parameters), "q", {}, {})
+            return mock_anthropic.messages.create.call_args.kwargs
+
+        assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_MESSAGES
+
+    async def test_stream(self, mock_anthropic: MagicMock) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        mock_anthropic.messages.stream = MagicMock(
+            side_effect=lambda **_kw: _make_stream_context(["hi"])[0]
+        )
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_claude_messages_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            async for _event in await h.stream(self._config(parameters), "q", {}, {}):
+                pass
+            return mock_anthropic.messages.stream.call_args.kwargs
+
+        assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_MESSAGES
+
+
+class TestMalformedObjectValuesAreDropped:
+    """A key the API expects as an object, set to anything else, is dropped on both paths."""
+
+    _PARAMS: ClassVar[dict[str, Any]] = {
+        "thinking": "enabled",
+        "cache_control": "ephemeral",
+        "output_config": "json",
+        "tool_choice": "auto",
+        "top_p": 0.4,
+    }
+
+    def _config(self) -> dict[str, Any]:
+        return {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+
+    def _assert_dropped(self, kwargs: dict[str, Any]) -> None:
+        assert not {"thinking", "cache_control", "output_config", "tool_choice"} & set(
+            kwargs
+        )
+        assert kwargs["top_p"] == 0.4
+
+    async def test_invoke(self, mock_anthropic: MagicMock) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        await create_claude_messages_handler()(self._config(), "q", {}, {})
+        self._assert_dropped(mock_anthropic.messages.create.call_args.kwargs)
+
+    async def test_stream(self, mock_anthropic: MagicMock) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, _ = _make_stream_context(["hi"])
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_claude_messages_handler()
+        async for _event in await h.stream(self._config(), "q", {}, {}):
+            pass
+        self._assert_dropped(mock_anthropic.messages.stream.call_args.kwargs)
+
+    async def test_effort_still_lands_in_output_config_when_output_config_is_malformed(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"effort": "low", "output_config": "json"},
+            },
+        }
+        await create_claude_messages_handler()(config, "q", {}, {})
+        kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert kwargs["output_config"] == {"effort": "low"}
