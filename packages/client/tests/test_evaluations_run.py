@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import threading
 from collections.abc import Callable
@@ -3631,4 +3632,490 @@ async def test_a_tool_from_another_project_is_rejected() -> None:
             handler=successful_handler,
             tools=[foreign_tool],
             generation={"provider": "OpenAI", "model": "gpt-4o"},
+        )
+
+
+INLINE_EVALUATION = response(
+    201, {"id": "evaluation-id", "name": "inline-eval", "version": 1}
+)
+
+
+INLINE_RUN = response(
+    201,
+    {
+        "id": "run-id",
+        "evaluationId": "evaluation-id",
+        "source": "api",
+        "state": "PENDING",
+    },
+)
+
+
+def inline_summary(total: int) -> HttpResponse:
+    return response(
+        200,
+        {
+            "statusCounts": {
+                "total": total,
+                "passed": total,
+                "failed": 0,
+                "error": 0,
+                "pending": 0,
+            }
+        },
+    )
+
+
+async def echo_handler(
+    config: dict[str, Any],
+    user_input: str | None,
+    tool_handlers: dict[str, Callable[..., Any]],
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    return {"output": f"generated: {user_input}"}
+
+
+INLINE_GENERATION: Any = {"provider": "OpenAI", "model": "gpt-4o"}
+
+
+def is_upload(request: dict[str, Any]) -> bool:
+    return bool(
+        request["method"] == "POST" and request["url"].endswith("/dataset-rows")
+    )
+
+
+@pytest.mark.asyncio
+async def test_inline_dataset_uploads_rows_before_any_event_and_omits_dataset_id(
+    stub_sdk_client: MagicMock,
+) -> None:
+    calls: list[str] = []
+    transport = SequencedTransport(
+        [INLINE_EVALUATION, INLINE_RUN, response(200, {}), inline_summary(2)]
+    )
+
+    def logging_transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        calls.append(f"{method} {url.rsplit('/', 1)[-1]}")
+        return transport(method, url, headers, body, timeout)
+
+    stub_sdk_client.track.side_effect = lambda *args: calls.append("track")
+    received_inputs: list[str | None] = []
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        received_inputs.append(user_input)
+        return {"output": f"generated: {user_input}"}
+
+    result = await init_evaluations(
+        project_key="proj", api_key="token", transport=logging_transport
+    ).run(
+        key="inline-eval",
+        dataset=[
+            {
+                "input": "How do I reset my password?",
+                "expectedOutput": "Use the link.",
+            },
+            {
+                "input": "Where is order {{order_id}}?",
+                "variables": {"order_id": "A-17"},
+                "metadata": {"suite": "orders"},
+            },
+        ],
+        handler=handler,
+        generation=INLINE_GENERATION,
+    )
+
+    assert result.passed is True
+    assert not any("/datasets/" in request["url"] for request in transport.requests)
+    assert transport.requests[1]["url"].endswith("/evaluations/evaluation-id/runs")
+    assert transport.requests[1]["body"] == {"source": "api"}
+    upload = transport.requests[2]
+    assert upload["method"] == "POST"
+    assert upload["url"].endswith(
+        "/projects/proj/evaluations/evaluation-id/runs/run-id/dataset-rows"
+    )
+    # Rows are stored raw; the server renders them as it renders a hosted dataset.
+    assert upload["body"] == {
+        "rows": [
+            {
+                "rowIdx": 0,
+                "input": "How do I reset my password?",
+                "expectedOutput": "Use the link.",
+                "variables": {},
+                "metadata": None,
+            },
+            {
+                "rowIdx": 1,
+                "input": "Where is order {{order_id}}?",
+                "expectedOutput": None,
+                "variables": {"order_id": "A-17"},
+                "metadata": {"suite": "orders"},
+            },
+        ]
+    }
+    assert sorted(received_inputs, key=str) == [
+        "How do I reset my password?",
+        "Where is order A-17?",
+    ]
+    # Rows land before anything is counted, or the placeholder row count of 1
+    # would let the first event mark the run complete.
+    assert calls.index("track") > calls.index("POST dataset-rows")
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    assert sorted(event["rowIndex"] for event in events) == [0, 1]
+    for event in events:
+        assert "datasetId" not in event
+        assert "datasetKey" not in event
+
+
+@pytest.mark.asyncio
+async def test_inline_dataset_uploads_in_batches_of_500() -> None:
+    transport = SequencedTransport(
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(200, {}),
+            response(200, {}),
+            response(200, {}),
+            inline_summary(1001),
+        ]
+    )
+
+    await init_evaluations(
+        project_key="proj", api_key="token", transport=transport
+    ).run(
+        key="inline-eval",
+        dataset=[{"rowIdx": index, "input": f"row {index}"} for index in range(1001)],
+        handler=echo_handler,
+        generation=INLINE_GENERATION,
+    )
+
+    uploads = [
+        request["body"]["rows"] for request in transport.requests if is_upload(request)
+    ]
+    assert [len(batch) for batch in uploads] == [500, 500, 1]
+    assert [row["rowIdx"] for batch in uploads for row in batch] == list(range(1001))
+
+
+@pytest.mark.asyncio
+async def test_inline_dataset_criterion_events_omit_dataset_id(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [INLINE_EVALUATION, INLINE_RUN, response(200, {}), inline_summary(1)]
+    )
+
+    await init_evaluations(
+        project_key="proj", api_key="token", transport=transport
+    ).run(
+        key="inline-eval",
+        dataset=[{"input": "hello"}],
+        handler=echo_handler,
+        generation=INLINE_GENERATION,
+        criteria=[Scorer(name="non-empty", fn=lambda row, output: bool(output))],
+    )
+
+    criterion_events = [
+        call.args[2]
+        for call in stub_sdk_client.track.call_args_list
+        if call.args[0] == "$ld:ai:offline-evals:criterion"
+    ]
+    assert len(criterion_events) == 1
+    assert criterion_events[0]["rowIndex"] == 0
+    assert criterion_events[0]["criterionType"] == "non-empty"
+    assert "datasetId" not in criterion_events[0]
+    assert "datasetKey" not in criterion_events[0]
+
+
+@pytest.mark.parametrize(
+    ("dataset", "message"),
+    [
+        ([], "Inline dataset is empty"),
+        (
+            [{"input": "hi", "expected_output": "x"}],
+            "unknown fields: 'expected_output'",
+        ),
+        ([{"rowIdx": 1, "input": "hi"}], "has rowIdx 1"),
+        ([{"rowIdx": True, "input": "hi"}], "has rowIdx True"),
+        (["just a string"], "row 0 must be a mapping"),
+        (
+            [DatasetRow(row_index=0, input="hi")],
+            "row 0 must be a mapping",
+        ),
+        ([{"input": 7}], "input must be a non-empty string"),
+        ([{}], "row 0 input must be a non-empty string"),
+        ([{"input": ""}], "input must be a non-empty string"),
+        ([{"input": "hi", "expectedOutput": 7}], "expectedOutput must be a string"),
+        ([{"input": "hi", "variables": ["a"]}], "variables must be a mapping"),
+        (
+            [{"input": "hi"}, {"input": "hi", "variables": {"score": float("nan")}}],
+            "row 1 variables must be JSON-encodable without NaN",
+        ),
+        (
+            [{"input": "hi", "metadata": {"limit": float("inf")}}],
+            "metadata must be JSON-encodable without NaN",
+        ),
+        (
+            [{"input": "hi", "variables": {"nested": [{"x": float("-inf")}]}}],
+            "variables must be JSON-encodable",
+        ),
+        (
+            [{"input": "hi", "metadata": {"tags": {"a", "b"}}}],
+            "metadata must be JSON-encodable",
+        ),
+        (
+            [{"input": "hi", "variables": {"when": datetime.now()}}],
+            "variables must be JSON-encodable",
+        ),
+        (
+            [{"input": "hi", "variables": {("a", "b"): 1}}],
+            "variables must be JSON-encodable",
+        ),
+        (
+            [{"input": "hi", "variables": {1: "a"}}],
+            "variables must be JSON-encodable.*keys must be str, not int",
+        ),
+        (
+            [{"input": "hi", "metadata": {"nested": [{True: "x"}]}}],
+            "metadata must be JSON-encodable.*keys must be str, not bool",
+        ),
+        (
+            [{"input": "hi", "variables": {"a": {None: 1}}}],
+            "variables must be JSON-encodable.*keys must be str, not NoneType",
+        ),
+        (
+            [{"input": "hi", "metadata": {1.5: "x"}}],
+            "metadata must be JSON-encodable.*keys must be str, not float",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_inline_rows_fail_before_any_request(
+    dataset: list[Any], message: str
+) -> None:
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
+
+    with pytest.raises(EvaluationsError, match=message):
+        await evals.run(
+            key="inline-eval",
+            dataset=dataset,
+            handler=echo_handler,
+            generation=INLINE_GENERATION,
+        )
+
+
+@pytest.mark.asyncio
+async def test_inline_upload_is_retried_after_a_server_error() -> None:
+    transport = SequencedTransport(
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(503, {"message": "unavailable"}),
+            response(200, {}),
+            inline_summary(1),
+        ]
+    )
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+    evals.api._sleep = lambda _: None
+
+    result = await evals.run(
+        key="inline-eval",
+        dataset=[{"input": "hello"}],
+        handler=echo_handler,
+        generation=INLINE_GENERATION,
+    )
+
+    assert result.passed is True
+    assert sum(is_upload(request) for request in transport.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_inline_upload_stops_the_run_before_generation(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(400, {"message": "bad rows"}),
+            response(204),
+        ]
+    )
+    handler = AsyncMock()
+
+    with pytest.raises(
+        EvaluationsError, match=r"rows 0-0 of 1 to evaluation run run-id"
+    ):
+        await init_evaluations(
+            project_key="proj", api_key="token", transport=transport
+        ).run(
+            key="inline-eval",
+            dataset=[{"input": "hello"}],
+            handler=handler,
+            generation=INLINE_GENERATION,
+        )
+
+    handler.assert_not_awaited()
+    stub_sdk_client.track.assert_not_called()
+    cancel = transport.requests[-1]
+    assert cancel["method"] == "POST"
+    assert cancel["url"].endswith(
+        "/projects/proj/evaluations/evaluation-id/runs/run-id/cancel"
+    )
+    assert cancel["body"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_is_cancelled_when_a_later_upload_batch_fails() -> None:
+    transport = SequencedTransport(
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(200, {}),
+            response(400, {"message": "bad rows"}),
+            response(204),
+        ]
+    )
+    handler = AsyncMock()
+
+    with pytest.raises(
+        EvaluationsError, match=r"rows 500-500 of 501 to evaluation run run-id"
+    ):
+        await init_evaluations(
+            project_key="proj", api_key="token", transport=transport
+        ).run(
+            key="inline-eval",
+            dataset=[{"input": f"row {index}"} for index in range(501)],
+            handler=handler,
+            generation=INLINE_GENERATION,
+        )
+
+    handler.assert_not_awaited()
+    assert sum(is_upload(request) for request in transport.requests) == 2
+    assert transport.requests[-1]["url"].endswith("/runs/run-id/cancel")
+
+
+@pytest.mark.asyncio
+async def test_failed_cancel_does_not_mask_the_upload_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = SequencedTransport(
+        [
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            response(400, {"message": "bad rows"}),
+            response(409, {"message": "already terminal"}),
+        ]
+    )
+
+    with pytest.raises(EvaluationsError, match="Failed to upload inline dataset"):
+        await init_evaluations(
+            project_key="proj", api_key="token", transport=transport
+        ).run(
+            key="inline-eval",
+            dataset=[{"input": "hello"}],
+            handler=echo_handler,
+            generation=INLINE_GENERATION,
+        )
+
+    assert transport.requests[-1]["url"].endswith("/runs/run-id/cancel")
+    assert "Failed to cancel evaluation run run-id" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hosted_dataset_event_identity_is_unchanged(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "key": "golden"}),
+            response(200, dataset_page([{"rowIndex": 2, "input": "hello"}], total=1)),
+            INLINE_EVALUATION,
+            INLINE_RUN,
+            inline_summary(1),
+        ]
+    )
+
+    await init_evaluations(
+        project_key="proj", api_key="token", transport=transport
+    ).run(
+        key="inline-eval",
+        dataset="golden",
+        handler=echo_handler,
+        generation=INLINE_GENERATION,
+    )
+
+    assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
+    assert not any(is_upload(request) for request in transport.requests)
+    event = stub_sdk_client.track.call_args.args[2]
+    identity = {
+        "projectKey": "proj",
+        "evaluationId": "evaluation-id",
+        "evaluationRunId": "run-id",
+        "runId": "run-id",
+        "datasetId": "dataset-id",
+        "rowIndex": 2,
+    }
+    assert (
+        event["eventId"]
+        == hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    assert event["datasetId"] == "dataset-id"
+    assert event["datasetKey"] == "golden"
+
+
+@pytest.mark.parametrize(
+    ("dataset", "message"),
+    [
+        ("", "dataset must not be blank"),
+        ("   ", "dataset must not be blank"),
+        (None, "dataset must be a LaunchDarkly dataset key or a sequence"),
+        ({"input": "hi"}, "dataset must be a LaunchDarkly dataset key or a sequence"),
+        (7, "dataset must be a LaunchDarkly dataset key or a sequence"),
+        (
+            ({"input": text} for text in ("hi", "there")),
+            "dataset must be a LaunchDarkly dataset key or a sequence",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_dataset_source_fails_before_any_request(
+    dataset: Any, message: str
+) -> None:
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
+
+    with pytest.raises(EvaluationsError, match=message):
+        await evals.run(
+            key="inline-eval",
+            dataset=dataset,
+            handler=echo_handler,
+            generation=INLINE_GENERATION,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dataset_is_required() -> None:
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
+
+    with pytest.raises(TypeError, match="dataset"):
+        await evals.run(  # type: ignore[call-arg]
+            key="inline-eval",
+            handler=echo_handler,
+            generation=INLINE_GENERATION,
         )

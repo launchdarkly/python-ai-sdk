@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import time
+import urllib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -66,6 +67,7 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 DATASET_PAGE_SIZE = 200
+DATASET_UPLOAD_BATCH_SIZE = 500
 GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
 CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
@@ -171,6 +173,43 @@ def _select_judge_handler(
             ),
         )
     return None
+
+
+def _segment(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
+def render_row(
+    row_index: int,
+    *,
+    input_value: Any,
+    expected_value: Any,
+    variables_value: Any,
+    metadata_value: Any,
+) -> DatasetRow:
+    """Render one stored dataset row for handler invocation.
+
+    Shared by hosted and inline datasets so a row renders the same whichever
+    path supplied it.
+    """
+    variables = dict(variables_value) if isinstance(variables_value, Mapping) else {}
+    rendered_input = (
+        parse_template(input_value, variables) if isinstance(input_value, str) else None
+    )
+    rendered_expected = (
+        parse_template(expected_value, variables)
+        if isinstance(expected_value, str)
+        else None
+    )
+    variables["input"] = rendered_input
+    variables["expected_output"] = rendered_expected
+    return DatasetRow(
+        row_index=row_index,
+        input=rendered_input,
+        expected_output=rendered_expected,
+        variables=variables,
+        metadata=dict(metadata_value) if isinstance(metadata_value, Mapping) else None,
+    )
 
 
 class ConcurrencyController:
@@ -416,38 +455,13 @@ class EvaluationsRunner:
                     raise EvaluationsError(
                         "A dataset row is missing its integer rowIndex"
                     )
-                variables_value = item.get("variables")
-                variables = (
-                    dict(variables_value)
-                    if isinstance(variables_value, Mapping)
-                    else {}
-                )
-                input_value = item.get("input")
-                expected_value = item.get("expectedOutput")
-                rendered_input = (
-                    parse_template(input_value, variables)
-                    if isinstance(input_value, str)
-                    else None
-                )
-                rendered_expected = (
-                    parse_template(expected_value, variables)
-                    if isinstance(expected_value, str)
-                    else None
-                )
-                variables["input"] = rendered_input
-                variables["expected_output"] = rendered_expected
-                metadata_value = item.get("metadata")
                 rows.append(
-                    DatasetRow(
-                        row_index=row_index,
-                        input=rendered_input,
-                        expected_output=rendered_expected,
-                        variables=variables,
-                        metadata=(
-                            dict(metadata_value)
-                            if isinstance(metadata_value, Mapping)
-                            else None
-                        ),
+                    render_row(
+                        row_index,
+                        input_value=item.get("input"),
+                        expected_value=item.get("expectedOutput"),
+                        variables_value=item.get("variables"),
+                        metadata_value=item.get("metadata"),
                     )
                 )
             offset += len(items)
@@ -504,20 +518,73 @@ class EvaluationsRunner:
         self,
         project_key: str,
         evaluation_id: str,
-        dataset_id: str,
+        dataset_id: str | None,
     ) -> EvaluationRunRef:
         path = (
             f"projects/{segment(project_key)}/evaluations/{segment(evaluation_id)}/runs"
         )
-        body: dict[str, Any] = {
-            "source": "api",
-            "datasetId": dataset_id,
-        }
+        body: dict[str, Any] = {"source": "api"}
+        if dataset_id is not None:
+            body["datasetId"] = dataset_id
         raw = require_mapping(
             self._api.post(path, body=body),
             description="evaluation run",
         )
         return self._run_ref(raw)
+
+    def _upload_dataset_rows(
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+        rows: list[DatasetRow],
+    ) -> None:
+        """Upload an inline dataset's raw rows to its run, in bounded batches.
+
+        Uploads are idempotent per ``rowIdx``, so each batch is retried like a
+        GET. Batches go one at a time so a failure names exactly which rows
+        did not land.
+        """
+        path = (
+            f"projects/{_segment(project_key)}/evaluations/"
+            f"{_segment(evaluation_id)}/runs/{_segment(run_id)}/dataset-rows"
+        )
+        for start in range(0, len(rows), DATASET_UPLOAD_BATCH_SIZE):
+            batch = rows[start : start + DATASET_UPLOAD_BATCH_SIZE]
+            body = {
+                "rows": [
+                    {
+                        "rowIdx": row.row_index,
+                        "input": row.input,
+                        "expectedOutput": row.expected_output,
+                        "variables": row.variables,
+                        "metadata": row.metadata,
+                    }
+                    for row in batch
+                ]
+            }
+            try:
+                self._api.post(path, body=body, idempotent=True)
+            except EvaluationsError as error:
+                raise EvaluationsError(
+                    f"Failed to upload inline dataset rows {start}-"
+                    f"{start + len(batch) - 1} of {len(rows)} to evaluation run "
+                    f"{run_id}: {error}"
+                ) from error
+
+    def _cancel_evaluation_run(
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+    ) -> None:
+        """Cancel a run, retried like a GET: replaying a cancel cannot change
+        its outcome."""
+        path = (
+            f"projects/{_segment(project_key)}/evaluations/"
+            f"{_segment(evaluation_id)}/runs/{_segment(run_id)}/cancel"
+        )
+        self._api.post(path, idempotent=True)
 
     def _run_ref(self, raw: Mapping[str, Any]) -> EvaluationRunRef:
         return EvaluationRunRef(
@@ -654,6 +721,8 @@ class EvaluationsRunner:
                 "datasetId": dataset.id,
                 "rowIndex": result["row_index"],
             }
+            if dataset.id is None:
+                del identity["datasetId"]
             event_id = hashlib.sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
@@ -691,12 +760,13 @@ class EvaluationsRunner:
                 "emittedAt": emitted_at,
                 "evaluationKey": evaluation.key,
                 "evaluationVersion": evaluation.version,
-                "datasetKey": dataset.key,
                 "status": result["status"],
                 "startedAt": result["started_at"],
                 "generatedAt": result["generated_at"],
                 "latencyMs": result["latency_ms"],
             }
+            if dataset.key is not None:
+                payload["datasetKey"] = dataset.key
             if generated["output"] is not None:
                 payload["output"] = generated["output"]
             if generated["error"] is not None:
@@ -1002,6 +1072,8 @@ class EvaluationsRunner:
                     "rowIndex": result["row_index"],
                     "criterionType": result["criterion_type"],
                 }
+                if dataset.id is None:
+                    del identity["datasetId"]
                 event_id = hashlib.sha256(
                     json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()
