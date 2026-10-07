@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -80,36 +80,81 @@ except ImportError:  # pragma: no cover - `agents` is a hard dependency of this 
 #: ``TestModelSettingsAcceptsExactlyTheseFields`` in this package's tests asserts this
 #: classification stays exhaustive as the SDK's own dataclass changes.
 #:
-#: Excluded, and why: all client/connection configuration, never a config-controlled setting.
-#: * ``retry``: an HTTP retry count.
-#: * ``extra_headers``, ``extra_query``, ``extra_body``, ``extra_args``: raw HTTP/request overrides.
+#: This is the cross-SDK list for OpenAI Agents (TESTING.md section 1.12), less the two keys that
+#: are not ``ModelSettings`` fields: ``max_turns`` goes to the run, and ``text`` is read only for
+#: ``text.verbosity``, which becomes ``verbosity`` (see :func:`_apply_text_verbosity`).
 _MODEL_SETTINGS_FORWARDED_KEYS = frozenset(
     {
-        "context_management",
         "frequency_penalty",
-        "include_usage",
         "max_tokens",
-        "metadata",
         "parallel_tool_calls",
         "presence_penalty",
-        "prompt_cache_retention",
         "reasoning",
-        "response_include",
-        "store",
         "temperature",
         "tool_choice",
-        "top_logprobs",
         "top_p",
-        "truncation",
         "verbosity",
     }
 )
 
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ModelSettings``.
+_MODEL_SETTINGS_MAPPING_KEYS = frozenset({"reasoning"})
+
+#: Declared by ``ModelSettings`` but never forwarded, and why:
+#: * ``context_management``, ``truncation``: server-side state. They trim or compact conversation
+#:   state the server keeps.
+#: * ``store``, ``prompt_cache_retention``: data retention. They decide whether, and for how long,
+#:   the request and its cache stay on the server.
+#: * ``metadata``: identity and attribution.
+#: * ``include_usage``: runtime wiring. It changes how usage is reported back to the handler.
+#: * ``response_include``, ``top_logprobs``: API-shape switch. They add output the handler does not
+#:   read.
+#: * ``retry``: client/connection configuration, an HTTP retry count.
+#: * ``extra_headers``, ``extra_query``, ``extra_body``, ``extra_args``: raw HTTP/request overrides.
+#:
 #: Named for the drift test and for review, not read at runtime: the forwarded list above already
 #: leaves these out, so nothing needs to subtract them again.
 _MODEL_SETTINGS_EXCLUDED_KEYS = frozenset(
-    {"retry", "extra_headers", "extra_query", "extra_body", "extra_args"}
+    {
+        "context_management",
+        "truncation",
+        "store",
+        "prompt_cache_retention",
+        "metadata",
+        "include_usage",
+        "response_include",
+        "top_logprobs",
+        "retry",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+        "extra_args",
+    }
 )
+
+
+def _apply_text_verbosity(params: dict[str, Any]) -> dict[str, Any]:
+    """Moves ``text.verbosity`` to ``ModelSettings``'s top-level ``verbosity`` and drops the rest
+    of ``text``. A top-level ``verbosity`` the config already set wins, and a ``text`` that is not
+    an object is malformed and dropped.
+    """
+    text = params.pop("text", None)
+    if isinstance(text, Mapping) and "verbosity" in text and "verbosity" not in params:
+        params["verbosity"] = text["verbosity"]
+    return params
+
+
+def _model_settings_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that become ``ModelSettings`` fields. The handler and the
+    native graph both call this, so they forward the same keys. ``max_turns`` is not among them:
+    it is a ``Runner.run`` option, read separately for the run.
+    """
+    return select_forwarded_parameters(
+        _apply_text_verbosity(model_parameters(config)),
+        _MODEL_SETTINGS_FORWARDED_KEYS,
+        mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
+    )
 
 
 def _build_agent_tools(
@@ -255,9 +300,7 @@ def _build_agent_and_prompt(
     # return-shape contract.
     # `max_turns` is a `Runner.run` option, not a `ModelSettings` field, so the filter drops it here
     # and the run call reads it separately.
-    model_settings_params = select_forwarded_parameters(
-        model_parameters(config), _MODEL_SETTINGS_FORWARDED_KEYS
-    )
+    model_settings_params = _model_settings_parameters(config)
     agent = Agent(
         name="assistant",
         model=config.get("model", {}).get("name", "gpt-4o"),

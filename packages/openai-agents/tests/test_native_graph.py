@@ -16,6 +16,11 @@ from launchdarkly_ai_openai_agents.native_graph import (
     to_openai_agents,
 )
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.forwarding_spec import (
+    OPENAI_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
 from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
@@ -906,3 +911,49 @@ class TestBuildNodeToolsSyncHandlers:
             _build_node_tools(node, {"my-tool": sync_wrapper})
 
         assert await captured[0]({}) == "done"
+
+
+class TestNativeGraphForwardsExactlyTheCrossSdkList:
+    """The native graph builds each agent's ``ModelSettings`` with the handler's own forwarding
+    and reads the root's ``max_turns`` for the run, so a probe of one node finds exactly the
+    cross-SDK OpenAI Agents list."""
+
+    @pytest.mark.asyncio
+    async def test_root_agent_and_run(self) -> None:
+        import dataclasses
+
+        from agents import ModelSettings
+
+        async def call(parameters: dict[str, Any]) -> object:
+            agents_mock = _make_agents_mock(_make_run_result("out"))
+            agents_mock.ModelSettings = MagicMock(side_effect=lambda **kw: dict(kw))
+            nodes = {
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": "gpt-4o", "parameters": parameters},
+                        "instructions": "help",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+            with patch(
+                "importlib.import_module",
+                side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+            ):
+                await to_openai_agents(
+                    _make_def_promise(_make_graph_def(nodes=nodes))
+                ).invoke("hi")
+            (root_agent,) = agents_mock._created_agents
+            run_kwargs = agents_mock.Runner.run.call_args.kwargs
+            return (
+                root_agent._kw.get("model_settings"),
+                {k: v for k, v in run_kwargs.items() if k not in {"hooks", "context"}},
+            )
+
+        candidates = candidate_keys(
+            (f.name for f in dataclasses.fields(ModelSettings)), OPENAI_AGENTS
+        )
+        assert await probe_forwarded_keys(candidates, call) == OPENAI_AGENTS

@@ -27,6 +27,11 @@ from launchdarkly_ai_openai_agents.handler import (
     openai_agents,
 )
 from launchdarkly_ai_openai_agents.utils import build_output_type
+from tests.forwarding_spec import (
+    OPENAI_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
 from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
@@ -2309,3 +2314,98 @@ class TestNeverForwardedParameters:
         model_settings = captured["agent"].kwargs["model_settings"]
         assert model_settings.kwargs == {"temperature": 0.1}
         assert not find_leaks(captured["run_kwargs"])
+
+
+def _settings_and_run(captured: dict[str, Any]) -> object:
+    """What one handler call handed the SDK from the config: the ``ModelSettings`` kwargs (or
+    none) and the ``Runner`` kwargs."""
+    settings = captured["agent"].kwargs.get("model_settings")
+    return (settings.kwargs if settings is not None else None, captured["run_kwargs"])
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change ``ModelSettings``
+    or the ``Runner`` call are exactly the cross-SDK OpenAI Agents list, on both paths."""
+
+    @staticmethod
+    def _candidates() -> frozenset[str]:
+        import dataclasses
+
+        from agents import ModelSettings
+
+        return candidate_keys(
+            (f.name for f in dataclasses.fields(ModelSettings)), OPENAI_AGENTS
+        )
+
+    @staticmethod
+    def _config(parameters: dict[str, Any]) -> dict[str, Any]:
+        return _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": parameters},
+        )
+
+    async def test_invoke(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        async def call(parameters: dict[str, Any]) -> object:
+            with _patched_agents(_fake_agents_module(run=run)):
+                await create_openai_agent_handler()(
+                    self._config(parameters), "q", {}, {}
+                )
+            return _settings_and_run(captured)
+
+        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_AGENTS
+
+    async def test_stream(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def run_streamed(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            return FakeStreamedResult(
+                agent, prompt, hooks, [{"output": _text_output("hi")}], "done"
+            )
+
+        async def call(parameters: dict[str, Any]) -> object:
+            with _patched_agents(_fake_agents_module(run_streamed=run_streamed)):
+                gen = await create_openai_agent_handler().stream(
+                    self._config(parameters), "q", {}, {}
+                )
+                async for _event in gen:
+                    pass
+            return _settings_and_run(captured)
+
+        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_AGENTS
+
+
+class TestTextVerbosity:
+    def _settings(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_openai_agents.handler import _model_settings_parameters
+
+        return _model_settings_parameters({"model": {"parameters": parameters}})
+
+    def test_text_verbosity_becomes_verbosity(self) -> None:
+        assert self._settings({"text": {"verbosity": "low", "format": {}}}) == {
+            "verbosity": "low"
+        }
+
+    def test_top_level_verbosity_wins(self) -> None:
+        assert self._settings({"verbosity": "high", "text": {"verbosity": "low"}}) == {
+            "verbosity": "high"
+        }
+
+    def test_text_that_is_not_an_object_is_dropped(self) -> None:
+        assert self._settings({"text": "low", "temperature": 0.1}) == {
+            "temperature": 0.1
+        }
+
+    def test_reasoning_that_is_not_an_object_is_dropped(self) -> None:
+        assert self._settings({"reasoning": "high", "temperature": 0.1}) == {
+            "temperature": 0.1
+        }

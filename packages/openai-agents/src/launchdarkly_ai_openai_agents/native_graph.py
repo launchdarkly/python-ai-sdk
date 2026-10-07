@@ -22,11 +22,10 @@ from launchdarkly_ai_server import (
     parse_template,
     to_ld_context,
 )
-from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
 
 from .handler import (
-    _MODEL_SETTINGS_FORWARDED_KEYS,
+    _model_settings_parameters,
     _parse_message_content,
     _to_openai_agent_items,
 )
@@ -182,9 +181,7 @@ def to_openai_agents(
             agent_name = _sanitize_name(node.key)
             agent_name_to_key[agent_name] = node.key
 
-            node_model_settings_params = select_forwarded_parameters(
-                model_parameters(node.config), _MODEL_SETTINGS_FORWARDED_KEYS
-            )
+            node_model_settings_params = _model_settings_parameters(node.config)
             agent = Agent(
                 name=agent_name,
                 model=node.config.get("model", {}).get("name", "gpt-4o"),
