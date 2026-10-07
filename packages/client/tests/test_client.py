@@ -1044,6 +1044,7 @@ class TestInvokeJudgeTasks:
         assert task.collapse_messages is False
         assert task.parent_track_data is not None
         assert task.parent_track_data.get("configKey") == "flag"
+        assert task.user_input == "q"
 
     async def test_sets_collapse_messages_for_agent_fallback(
         self, mock_ld_client: MagicMock

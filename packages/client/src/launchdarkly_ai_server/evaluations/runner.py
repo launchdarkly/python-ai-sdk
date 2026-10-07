@@ -17,6 +17,7 @@ from ..judge_scoring import (
     build_message_history,
     numeric_score,
     parse_judge_response,
+    typesafe_judge_entries,
 )
 from ..lifecycle import extract_variation
 from ..trajectory import (
@@ -968,10 +969,17 @@ class EvaluationsRunner:
                 "invalid_judge_output",
                 "judge handler result must be a mapping",
             )
+        judge_output = result.get("output", result.get("response"))
         try:
-            raw_score, reason = parse_judge_response(
-                result.get("output", result.get("response"))
-            )
+            entries = typesafe_judge_entries(judge_output)
+            if entries is not None:
+                # A criterion event is one score. The remaining labels are
+                # available on the online judge_results path. The reason is the
+                # question key: ingest drops a COMPLETE judge event with an
+                # empty reason, and a Jev label has no prose verdict.
+                raw_score, reason = entries[0]["score"], entries[0]["key"]
+            else:
+                raw_score, reason = parse_judge_response(judge_output)
         except ValueError as error:
             return self._criterion_error_result(
                 base, started_clock, "invalid_judge_output", str(error)

@@ -66,4 +66,5 @@ known-first-party = [
   "launchdarkly_ai_langchain_messages",
   "launchdarkly_ai_openai_agents",
   "launchdarkly_ai_openai_messages",
+  "launchdarkly_ai_typesafe",
 ]

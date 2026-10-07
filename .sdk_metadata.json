@@ -90,6 +90,17 @@
         "aiCompletionConfig": { "introduced": "0.1" }
       }
     },
+    "python-ai-typesafe": {
+      "name": "TypeSafe Jev AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/typesafe",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-typesafe"],
+      "releases": { "tag-prefix": "launchdarkly-ai-typesafe-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" }
+      }
+    },
     "python-ai-langchain-agents": {
       "name": "LangChain Agents AI SDK for Python",
       "type": "ai-provider",

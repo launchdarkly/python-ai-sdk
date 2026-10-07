@@ -22,6 +22,7 @@ from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 from launchdarkly_ai_openai_agents import create_openai_agent_handler
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
 from launchdarkly_ai_server import global_registry
+from launchdarkly_ai_typesafe import create_typesafe_handler
 
 global_registry.register(
     handlers=[
@@ -31,6 +32,7 @@ global_registry.register(
         create_claude_messages_handler(),
         create_langchain_messages_handler(),
         create_langchain_agents_handler(),
+        create_typesafe_handler(),
     ],
     tools={
         # LD documentation agent tools

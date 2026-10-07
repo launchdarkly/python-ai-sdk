@@ -89,6 +89,17 @@
         "src/launchdarkly_ai_langchain_messages/__init__.py"
       ],
       "component": "launchdarkly-ai-langchain-messages"
+    },
+    "packages/typesafe": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_typesafe/__init__.py"
+      ],
+      "component": "launchdarkly-ai-typesafe"
     }
   }
 }

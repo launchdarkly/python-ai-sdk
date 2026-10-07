@@ -85,6 +85,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-claude-agents`](packages/claude-agents/README.md) | Anthropic | `agent` | Claude Agent SDK — agentic loop with MCP tool support |
 | [`launchdarkly-ai-langchain-messages`](packages/langchain-messages/README.md) | `*` (any) | `messages` | Any `BaseChatModel` via LangChain `bind_tools` loop |
 | [`launchdarkly-ai-langchain-agents`](packages/langchain-agents/README.md) | `*` (any) | `agent` | LangGraph `StateGraph` — managed ReAct loop |
+| [`launchdarkly-ai-typesafe`](packages/typesafe/README.md) | TypeSafe | `messages` | TypeSafe Jev judge handler |
 
 ## Quick Start
 

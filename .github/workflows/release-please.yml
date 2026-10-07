@@ -32,6 +32,7 @@ on:
           - packages/openai-messages
           - packages/langchain-agents
           - packages/langchain-messages
+          - packages/typesafe
       dry_run:
         description: 'Is this a dry run. If so no package will be published.'
         type: boolean
@@ -62,6 +63,8 @@ jobs:
       package-langchain-agents-tag-name: ${{ steps.release.outputs['packages/langchain-agents--tag_name'] }}
       package-langchain-messages-released: ${{ steps.release.outputs['packages/langchain-messages--release_created'] }}
       package-langchain-messages-tag-name: ${{ steps.release.outputs['packages/langchain-messages--tag_name'] }}
+      package-typesafe-released: ${{ steps.release.outputs['packages/typesafe--release_created'] }}
+      package-typesafe-tag-name: ${{ steps.release.outputs['packages/typesafe--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
@@ -315,6 +318,37 @@ jobs:
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/langchain-messages/dist/
+
+  release-typesafe:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-typesafe-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/typesafe
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/typesafe
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/typesafe/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/typesafe/dist/
 
   # --- Manual publish ---
 

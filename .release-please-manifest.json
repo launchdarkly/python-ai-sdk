@@ -6,5 +6,6 @@
   "packages/openai-agents": "0.2.4",
   "packages/openai-messages": "0.2.3",
   "packages/langchain-agents": "0.2.4",
-  "packages/langchain-messages": "0.2.3"
+  "packages/langchain-messages": "0.2.3",
+  "packages/typesafe": "0.1.0"
 }

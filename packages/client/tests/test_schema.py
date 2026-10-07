@@ -32,6 +32,24 @@ class TestParseAiConfig:
         result = parse_ai_config(raw)
         assert result.success is False
 
+    def test_accepts_classifiers_without_instructions(self) -> None:
+        raw = {
+            "model": {"name": "jev-latest", "parameters": {}},
+            "provider": {"name": "TypeSafe"},
+            "messages": [],
+            "classifiers": [
+                {
+                    "key": "accuracy",
+                    "eventKey": "$ld:ai:judge:jev:accuracy",
+                    "instructions": "How accurate?",
+                    "type": "score",
+                    "criteria": ["Great", "Ok", "Bad"],
+                }
+            ],
+        }
+        result = parse_ai_config(raw)
+        assert result.success is True
+
     def test_fails_with_empty_messages(self) -> None:
         raw = {
             "model": {"name": "gpt-4"},
