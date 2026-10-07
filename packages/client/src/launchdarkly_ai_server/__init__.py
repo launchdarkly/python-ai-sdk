@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.3"  # x-release-please-version
+__version__ = "0.2.4"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .content import (
@@ -30,6 +30,7 @@ from .evaluations import (
     Criterion,
     DatasetRow,
     EvalRunResult,
+    EvalTool,
     EvaluationsError,
     EvaluationsModule,
     GenerationConfig,
@@ -194,6 +195,7 @@ __all__ = [  # noqa: RUF022
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
+    "EvalTool",
     "Judge",
     "RunSummary",
     "Scorer",

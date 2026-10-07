@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.7...launchdarkly-ai-python-0.1.8) (2026-09-30)
+
+
+### Features
+
+* **evaluations:** preserve the tool trajectory for judges ([#89](https://github.com/launchdarkly/python-ai-sdk/issues/89)) ([bcaa8c8](https://github.com/launchdarkly/python-ai-sdk/commit/bcaa8c80ae3859e332ddf391e867d9beed42a0f6))
+
 ## [0.1.7](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.6...launchdarkly-ai-python-0.1.7) (2026-09-21)
 
 

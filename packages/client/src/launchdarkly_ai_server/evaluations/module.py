@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from ..lifecycle import get_client, init_client
@@ -15,23 +16,127 @@ from .api import (
     EvaluationsError,
     LDApiClient,
     Transport,
+    segment,
     urllib_transport,
 )
 from .criteria import Criterion, Judge
 from .runner import (
     EvalHandler,
     EvaluationsRunner,
-    ToolImplementation,
     _provides_for,
-    _segment,
+    render_row,
 )
-from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
+from .tools import EvalTool, ToolsClient, tool_handlers, validate_tools
+from .types import (
+    AIConfig,
+    DatasetRef,
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    InlineDatasetRow,
+    RunSummary,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
 SUMMARY_POLL_INTERVAL_SECONDS = 2.0
 SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
+INLINE_ROW_FIELDS = ("rowIdx", "input", "expectedOutput", "variables", "metadata")
+
+
+def _render_inline_row(row: DatasetRow) -> DatasetRow:
+    return render_row(
+        row.row_index,
+        input_value=row.input,
+        expected_value=row.expected_output,
+        variables_value=row.variables,
+        metadata_value=row.metadata,
+    )
+
+
+def _check_string_keys(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"keys must be str, not {type(key).__name__}")
+            _check_string_keys(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_string_keys(item)
+
+
+def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]:
+    """Validate caller-supplied rows, returning them raw and indexed by position.
+
+    Pure, so a malformed row fails before any records are created. Each row
+    is held to the upload schema, so the server cannot reject a batch the
+    harness has already accepted. The values stay unrendered: they are
+    uploaded as stored rows, which the server renders the same way it renders
+    a hosted dataset's.
+    """
+    if not rows:
+        raise EvaluationsError("Inline dataset is empty")
+    normalized: list[DatasetRow] = []
+    for position, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise EvaluationsError(f"Inline dataset row {position} must be a mapping")
+        unknown = sorted(str(key) for key in row if key not in INLINE_ROW_FIELDS)
+        if unknown:
+            raise EvaluationsError(
+                f"Inline dataset row {position} has unknown fields: "
+                + ", ".join(repr(key) for key in unknown)
+                + ". Expected any of: "
+                + ", ".join(repr(key) for key in INLINE_ROW_FIELDS)
+            )
+        row_idx = row.get("rowIdx")
+        if row_idx is not None and (isinstance(row_idx, bool) or row_idx != position):
+            raise EvaluationsError(
+                f"Inline dataset row {position} has rowIdx {row_idx!r}; "
+                "an inline row's index is its position in the list"
+            )
+        row_input = row.get("input")
+        if not isinstance(row_input, str) or not row_input:
+            raise EvaluationsError(
+                f"Inline dataset row {position} input must be a non-empty string"
+            )
+        expected_output = row.get("expectedOutput")
+        if expected_output is not None and not isinstance(expected_output, str):
+            raise EvaluationsError(
+                f"Inline dataset row {position} expectedOutput must be a string"
+            )
+        for field_name in ("variables", "metadata"):
+            value = row.get(field_name)
+            if value is None:
+                continue
+            if not isinstance(value, Mapping):
+                raise EvaluationsError(
+                    f"Inline dataset row {position} {field_name} must be a mapping"
+                )
+            # NaN and Infinity are rejected: json.dumps would otherwise emit
+            # them as bare tokens, which are not valid JSON. Non-str keys are
+            # rejected rather than coerced; json.dumps runs first so circular
+            # references fail there instead of recursing in the key check.
+            try:
+                json.dumps(value, allow_nan=False)
+                _check_string_keys(value)
+            except (TypeError, ValueError) as error:
+                raise EvaluationsError(
+                    f"Inline dataset row {position} {field_name} must be "
+                    f"JSON-encodable without NaN or Infinity: {error}"
+                ) from error
+        variables = row.get("variables")
+        metadata = row.get("metadata")
+        normalized.append(
+            DatasetRow(
+                row_index=position,
+                input=row_input,
+                expected_output=expected_output,
+                variables=dict(variables) if variables else {},
+                metadata=dict(metadata) if metadata is not None else None,
+            )
+        )
+    return normalized
 
 
 def _env(name: str) -> str | None:
@@ -98,17 +203,30 @@ class EvaluationsModule:
     def __init__(
         self,
         api_client: LDApiClient,
+        project_key: str,
         sdk_key: str | None,
         ui_base_uri: str = DEFAULT_UI_BASE_URI,
     ) -> None:
         self._api = api_client
+        self._project_key = project_key
         self._sdk_key = sdk_key
         self._ui_base_uri = ui_base_uri.rstrip("/")
         self._runner = EvaluationsRunner(api_client)
+        self._tools = ToolsClient(api_client, project_key)
 
     @property
     def api(self) -> LDApiClient:
         return self._api
+
+    @property
+    def project_key(self) -> str:
+        """Project that holds this module's evaluations, tools, and datasets."""
+        return self._project_key
+
+    @property
+    def tools(self) -> ToolsClient:
+        """Reader for tools in the LaunchDarkly tool library."""
+        return self._tools
 
     @property
     def sdk_key(self) -> str | None:
@@ -123,13 +241,12 @@ class EvaluationsModule:
     async def run(
         self,
         *,
-        project_key: str,
         key: str,
-        dataset: str,
+        dataset: str | Sequence[InlineDatasetRow],
         handler: EvalHandler,
         generation: GenerationConfig | None = None,
         ai_config: AIConfig | None = None,
-        tools: Mapping[str, ToolImplementation] | None = None,
+        tools: Sequence[EvalTool] | None = None,
         criteria: list[Criterion] | None = None,
         judge_handlers: list[EvalHandler] | None = None,
         concurrency: int = 10,
@@ -144,6 +261,21 @@ class EvaluationsModule:
         deterministic :class:`Scorer` functions — is then run against each
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
+
+        ``tools`` is a list of :class:`EvalTool`. Construct one to define a tool
+        in code. Call ``evals.tools.get(key, implementation=...)`` to use a
+        tool from the LaunchDarkly tool library, which reads the tool and pins
+        its version at that point. One list may hold both kinds. ``run`` reads
+        no tool from the API, and it checks the list before any network I/O.
+        Handlers receive a ``{key: executable}`` map either way.
+
+        ``dataset`` is either the key of a dataset stored in LaunchDarkly or
+        a sequence of inline rows. Inline rows are mappings in the
+        dataset-rows wire shape
+        (``input``, ``expectedOutput``, ``variables``, ``metadata``, optional
+        ``rowIdx``); each row's index is its position in the list. They are
+        uploaded to the run before any generation starts, and templates in
+        them render exactly as a stored dataset's do.
 
         A :class:`Judge` is an independent AI Config and may be served by a
         different provider or mode than ``generation``. ``handler`` runs a judge
@@ -171,22 +303,24 @@ class EvaluationsModule:
         if poll_timeout_seconds is None:
             poll_timeout_seconds = SUMMARY_POLL_TIMEOUT_SECONDS
         self._validate_run_args(
-            project_key=project_key,
             key=key,
-            dataset=dataset,
             handler=handler,
             concurrency=concurrency,
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
+        inline_rows = self._validate_dataset_source(dataset)
         self._validate_config_source(generation=generation, ai_config=ai_config)
+        run_tools = list(tools or [])
+        validate_tools(run_tools, self._project_key)
+        run_tool_handlers = tool_handlers(run_tools)
         pinned_tool_versions: dict[str, int] = {}
         config_label = ""
         if ai_config is not None:
             config_label = f"{ai_config.key!r}/{ai_config.variation!r}"
             ai_config_variation = await asyncio.to_thread(
                 self._runner._fetch_config_variation,
-                project_key,
+                self._project_key,
                 ai_config.key,
                 ai_config.variation,
             )
@@ -198,15 +332,25 @@ class EvaluationsModule:
                     + ", ".join(
                         repr(name) for name in ai_config_variation.tool_versions
                     )
-                    + ". Pass tools= with an implementation for each."
+                    + ". Pass tools= with an EvalTool for each."
                 )
+            # A caller who passes tools= replaces the variation's list, so an
+            # empty list runs the variation with no tools.
+            supplied = {tool.key for tool in run_tools}
+            for name in ai_config_variation.tool_versions:
+                if name not in supplied:
+                    logger.warning(
+                        "AI Config variation %s attaches tool %r, which this run "
+                        "does not use.",
+                        config_label,
+                        name,
+                    )
             pinned_tool_versions = ai_config_variation.tool_versions
             if criteria is None:
                 criteria = [
                     Judge(key=judge_key) for judge_key in ai_config_variation.judge_keys
                 ]
         generation = self._validate_generation(generation)
-        run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
         run_judge_handlers = list(judge_handlers or [])
         self._validate_criteria(run_criteria)
@@ -218,58 +362,81 @@ class EvaluationsModule:
 
         # The management API client is synchronous; running it in a worker thread
         # keeps the caller's event loop free.
-        # Tool/judge verification is deliberately first: a typo must not create records.
-        resolved_tools = await asyncio.to_thread(
-            self._runner._resolve_tools, project_key, run_tools
-        )
-        # The tool API serves only the latest version, so a variation pinned to
-        # an older one is evaluated against the current schema.
+        # Judge verification is first: a typo must not create records.
+        # A variation pins a tool version. Compare it with the version the run
+        # uses, which tools.get() already read.
+        tools_by_key = {tool.key: tool for tool in run_tools}
         for tool_key, pinned_version in pinned_tool_versions.items():
-            resolved_tool = resolved_tools.get(tool_key)
-            if resolved_tool is not None and resolved_tool.version != pinned_version:
-                logger.warning(
-                    "AI Config variation %s pins tool %r at version %d; "
-                    "evaluating against the latest version %d.",
-                    config_label,
-                    tool_key,
-                    pinned_version,
-                    resolved_tool.version,
-                )
+            tool = tools_by_key.get(tool_key)
+            if tool is None or tool.version is None or tool.version == pinned_version:
+                continue
+            logger.warning(
+                "AI Config variation %s pins tool %r at version %d; "
+                "the run uses version %d.",
+                config_label,
+                tool_key,
+                pinned_version,
+                tool.version,
+            )
         resolved_judges = await self._runner._resolve_judges(
-            project_key, ld_judges, handler, run_judge_handlers
+            self._project_key, ld_judges, handler, run_judge_handlers
         )
-        dataset_ref = await asyncio.to_thread(
-            self._runner._fetch_dataset, project_key, dataset
-        )
-        rows = await asyncio.to_thread(
-            self._runner._get_dataset_rows, project_key, dataset
-        )
+        if isinstance(dataset, str):
+            dataset_ref = await asyncio.to_thread(
+                self._runner._fetch_dataset, self._project_key, dataset
+            )
+            dataset_rows = await asyncio.to_thread(
+                self._runner._get_dataset_rows, self._project_key, dataset
+            )
+        else:
+            dataset_ref = DatasetRef(id=None, key=None)
+            dataset_rows = [_render_inline_row(row) for row in inline_rows]
         evaluation = await asyncio.to_thread(
             self._runner._create_evaluation,
-            project_key,
+            self._project_key,
             key,
             generation,
-            resolved_tools,
+            run_tools,
             run_criteria,
         )
         evaluation_run = await asyncio.to_thread(
             self._runner._create_evaluation_run,
-            project_key,
+            self._project_key,
             evaluation.id,
             dataset_ref.id,
         )
-        config = self._runner._build_handler_config(generation, resolved_tools)
+        if not isinstance(dataset, str):
+            # Must finish before any event is tracked: the run starts with a
+            # placeholder row count of 1, so a result counted before the rows
+            # land would mark the run complete.
+            try:
+                await asyncio.to_thread(
+                    self._runner._upload_dataset_rows,
+                    self._project_key,
+                    evaluation.id,
+                    evaluation_run.id,
+                    inline_rows,
+                )
+            except Exception:
+                # The API cannot mark a run failed; cancelling is the only
+                # terminal state a client can set, and it keeps the run from
+                # sitting PENDING with a partial dataset.
+                await self._cancel_run_after_failed_upload(
+                    self._project_key, evaluation.id, evaluation_run.id
+                )
+                raise
+        config = self._runner._build_handler_config(generation, run_tools)
         results = await self._runner._run_rows(
-            rows,
+            dataset_rows,
             handler,
             config,
-            run_tools,
+            run_tool_handlers,
             concurrency,
         )
         try:
             self._runner._emit_generation_events(
                 client,
-                project_key=project_key,
+                project_key=self._project_key,
                 evaluation=evaluation,
                 evaluation_run=evaluation_run,
                 dataset=dataset_ref,
@@ -278,14 +445,14 @@ class EvaluationsModule:
             if run_criteria:
                 criterion_results = await self._runner._run_criteria_for_results(
                     results,
-                    run_tools,
+                    run_tool_handlers,
                     run_criteria,
                     resolved_judges,
                     concurrency,
                 )
                 self._runner._emit_evaluation_events(
                     client,
-                    project_key=project_key,
+                    project_key=self._project_key,
                     evaluation=evaluation,
                     evaluation_run=evaluation_run,
                     dataset=dataset_ref,
@@ -298,15 +465,14 @@ class EvaluationsModule:
             if inspect.isawaitable(flush_result):
                 await flush_result
         summary = await self._poll_summary_until_terminal(
-            project_key,
             evaluation.id,
             evaluation_run.id,
             poll_interval_seconds,
             poll_timeout_seconds,
         )
         url = (
-            f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
-            f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
+            f"{self._ui_base_uri}/projects/{segment(self._project_key)}/ai/evaluations/"
+            f"{segment(evaluation.id)}/runs/{segment(evaluation_run.id)}"
         )
         return EvalRunResult(
             # failed_rows counts rows whose criteria were scored and did not
@@ -326,7 +492,6 @@ class EvaluationsModule:
 
     async def _poll_summary_until_terminal(
         self,
-        project_key: str,
         evaluation_id: str,
         run_id: str,
         poll_interval_seconds: float,
@@ -336,7 +501,7 @@ class EvaluationsModule:
         last_summary = None
         while True:
             last_summary = await asyncio.to_thread(
-                self._runner._get_summary, project_key, evaluation_id, run_id
+                self._runner._get_summary, self._project_key, evaluation_id, run_id
             )
             if _is_terminal_summary(last_summary):
                 return last_summary
@@ -429,19 +594,13 @@ class EvaluationsModule:
     @staticmethod
     def _validate_run_args(
         *,
-        project_key: str,
         key: str,
-        dataset: str,
         handler: EvalHandler,
         concurrency: int,
         poll_interval_seconds: float,
         poll_timeout_seconds: float,
     ) -> None:
-        for name, value in (
-            ("project_key", project_key),
-            ("key", key),
-            ("dataset", dataset),
-        ):
+        for name, value in (("key", key),):
             if not value.strip():
                 raise EvaluationsError(f"{name} must not be blank")
         if not callable(handler):
@@ -457,6 +616,45 @@ class EvaluationsModule:
                 raise EvaluationsError(f"{name} must be a number")
             if seconds < 0:
                 raise EvaluationsError(f"{name} must not be negative")
+
+    async def _cancel_run_after_failed_upload(
+        self, project_key: str, evaluation_id: str, run_id: str
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self._runner._cancel_evaluation_run,
+                project_key,
+                evaluation_id,
+                run_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to cancel evaluation run %s after its inline dataset "
+                "upload failed",
+                run_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _validate_dataset_source(
+        dataset: str | Sequence[InlineDatasetRow],
+    ) -> list[DatasetRow]:
+        """Validate the dataset source, returning any inline rows raw.
+
+        A ``str`` is itself a ``Sequence``, so it is always read as a dataset
+        key, never as one row per character. The list is
+        empty for a hosted dataset; an inline one is never empty.
+        """
+        if not isinstance(dataset, Sequence):
+            raise EvaluationsError(
+                "dataset must be a LaunchDarkly dataset key or a sequence of "
+                "inline rows"
+            )
+        if isinstance(dataset, str):
+            if not dataset.strip():
+                raise EvaluationsError("dataset must not be blank")
+            return []
+        return _normalize_inline_rows(dataset)
 
     @staticmethod
     def _validate_config_source(
@@ -501,18 +699,30 @@ class EvaluationsModule:
 
 
 def init_evaluations(
-    api_token: str | None = None,
+    project_key: str | None = None,
+    api_key: str | None = None,
     sdk_key: str | None = None,
     base_uri: str | None = None,
     ui_base_uri: str | None = None,
     transport: Transport = urllib_transport,
 ) -> EvaluationsModule:
-    """Resolve credentials and construct the evaluations module."""
-    token = api_token or _env("LD_API_TOKEN")
+    """Resolve credentials and construct the evaluations module.
+
+    ``project_key`` names the project that holds the evaluations, the tools,
+    and the datasets this module uses.
+    """
+    resolved_project_key = (project_key or "").strip() or _env("LD_PROJECT_KEY")
+    if not resolved_project_key:
+        raise EvaluationsError(
+            "No LaunchDarkly project key provided. Set the LD_PROJECT_KEY "
+            "environment variable or pass project_key to init_evaluations()."
+        )
+
+    token = api_key or _env("LD_API_TOKEN")
     if not token:
         raise EvaluationsError(
-            "No LaunchDarkly API access token provided. Set the LD_API_TOKEN "
-            "environment variable or pass api_token to init_evaluations()."
+            "No LaunchDarkly API key provided. Set the LD_API_TOKEN "
+            "environment variable or pass api_key to init_evaluations()."
         )
 
     resolved_sdk_key = sdk_key or _env("LD_SDK_KEY")
@@ -529,12 +739,13 @@ def init_evaluations(
             )
 
     api_client = LDApiClient(
-        api_token=token,
+        api_key=token,
         base_uri=base_uri or _env("LD_API_BASE_URI") or DEFAULT_BASE_URI,
         transport=transport,
     )
     return EvaluationsModule(
         api_client=api_client,
+        project_key=resolved_project_key,
         sdk_key=resolved_sdk_key,
         ui_base_uri=ui_base_uri or _env("LD_UI_BASE_URI") or DEFAULT_UI_BASE_URI,
     )

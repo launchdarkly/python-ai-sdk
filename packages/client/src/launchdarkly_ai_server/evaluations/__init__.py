@@ -11,6 +11,7 @@ from .api import (
 )
 from .criteria import Criterion, Judge, Scorer, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
+from .tools import EvalTool, ToolsClient
 from .types import (
     AIConfig,
     DatasetRow,
@@ -26,6 +27,7 @@ __all__ = [
     "Criterion",
     "DatasetRow",
     "EvalRunResult",
+    "EvalTool",
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
@@ -36,6 +38,7 @@ __all__ = [
     "RunSummary",
     "Scorer",
     "SuccessDirection",
+    "ToolsClient",
     "Transport",
     "Usage",
     "init_evaluations",
