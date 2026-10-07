@@ -9,6 +9,7 @@ import dataclasses
 import hashlib
 import json
 import unicodedata
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -807,7 +808,22 @@ class TestStoreConfiguration:
 
         assert await get_skill("a") is not None
 
-    @pytest.mark.parametrize("not_a_store", ["x", {}, 0, object()])
+    @pytest.mark.parametrize(
+        "not_a_store",
+        [
+            pytest.param("x", id="string"),
+            pytest.param({}, id="dict"),
+            pytest.param(0, id="int"),
+            pytest.param(object(), id="object"),
+            # One of each half, so a check that skips either method fails.
+            pytest.param(
+                SimpleNamespace(get_object=lambda *_args: None), id="only-get-object"
+            ),
+            pytest.param(
+                SimpleNamespace(all_objects=lambda _kind: {}), id="only-all-objects"
+            ),
+        ],
+    )
     async def test_set_skill_store_rejects_a_non_store(
         self, make_raw_skill: Any, not_a_store: Any
     ) -> None:
