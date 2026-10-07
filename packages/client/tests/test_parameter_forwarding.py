@@ -27,3 +27,12 @@ class TestSelectForwardedParameters:
         params = {"temperature": 0.5, "unknown": 1}
         select_forwarded_parameters(params, frozenset({"temperature"}))
         assert params == {"temperature": 0.5, "unknown": 1}
+
+    def test_drops_a_mapping_key_whose_value_is_not_a_mapping(self) -> None:
+        params = {"thinking": "enabled", "reasoning": {"effort": "low"}, "top_p": 0.5}
+        result = select_forwarded_parameters(
+            params,
+            frozenset({"thinking", "reasoning", "top_p"}),
+            mapping_keys=frozenset({"thinking", "reasoning"}),
+        )
+        assert result == {"reasoning": {"effort": "low"}, "top_p": 0.5}
