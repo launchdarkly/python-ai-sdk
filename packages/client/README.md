@@ -425,11 +425,12 @@ project library**, which puts every skill's `description` into the agent's conte
 skills no AI Config references and skills belonging to other teams. `write_skills(skill_refs(...), root)`,
 as above, writes only what the resolved variation asked for.
 
-**`skills` is a validated field.** Config parsing fails closed on a `skills` value that is not
-a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an integer
-≥ 1): the whole variation is rejected, `inspect_config` returns `config: None`, and
-`extract_variation` raises. If your variations carry a custom `skills` field of a different
-shape, rename it before upgrading.
+**`skill_refs` validates the `skills` field.** It raises `ValueError` when `skills` is present
+but is not a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an
+integer ≥ 1), including `skills: null`. One bad entry rejects the whole field, so
+`write_skills` never receives a partial list that would prune skills the config still
+references. Config parsing does not check `skills`, so a malformed field never fails
+`config().invoke()` or other core calls.
 
 **Integrity is not optional.** Content is returned only when its sha256 (lowercase hex, over
 the verbatim UTF-8 bytes) matches the delivered `contentHash`, its key and version revalidate,
@@ -722,7 +723,7 @@ that skips verification.
 
 | Export | Description |
 |---|---|
-| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent. A `skills` field that is present but not a list (including `null`) fails the config parse instead, so an unreadable field never reaches a pruning reconcile as "no skills". |
+| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent or the config is not a dict. Raises `ValueError` when the field is present but malformed (including `null`), so an unreadable field never reaches a pruning reconcile as "no skills". |
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
 | `get_skill_result(key, *, version=None)` | The same retrieval, reporting **why**: a frozen `SkillOutcome` with `.skill`, `.reason` (`ok` / `absent` / `integrity_failure` / `store_unavailable` / `wrong_version`), and `.detail`. See *Failing closed on tampering* above. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |

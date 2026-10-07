@@ -28,11 +28,7 @@ from .skills_core import (
     verify_raw_skill,
 )
 from .types import AiConfigRep, Skill, SkillOutcome, SkillReference
-from .types_validation import (
-    is_valid_skill_key,
-    is_valid_skill_version,
-    skill_key_rejection_reason,
-)
+from .types_validation import is_valid_skill_version, skills_field_rejection_reason
 
 logger = logging.getLogger(__name__)
 
@@ -208,46 +204,28 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
     Returns the skill references attached to a resolved AI Config.
 
     Pure: no network, store, or telemetry. Returns ``[]`` when the config has no
-    skills. Typical use: ``await get_skills(skill_refs(config))``.
+    ``skills`` field, or when *config* is not a dict (for example ``None`` from a
+    failed ``inspect_config``). Typical use: ``await get_skills(skill_refs(config))``.
 
-    Invalid entries (possible only in a hand-built dict; ``parse_ai_config``
-    rejects them) are dropped with a warning, because ``write_skills`` with
-    ``prune=True`` would delete a dropped skill's files.
+    The config parser does not validate ``skills``, so a malformed field does
+    not fail core config calls. It is validated here instead, and rejected
+    whole: ``write_skills`` with ``prune=True`` would delete the files of any
+    skill missing from the list, so a partial or empty list is never returned
+    for a field that is present.
+
+    Raises:
+        ValueError: If ``skills`` is present but is not a list of ``{key,
+            version}`` objects with a valid key and an integer version >= 1.
+            This includes ``skills: null``.
     """
-    if not isinstance(config, dict):
+    if not isinstance(config, dict) or "skills" not in config:
         return []
 
-    raw = config.get("skills")
-    if not isinstance(raw, list):
-        return []
-
-    refs: list[SkillReference] = []
-    for index, entry in enumerate(raw):
-        if not isinstance(entry, dict):
-            logger.warning(
-                "skills[%d] is not a {key, version} object; it was dropped "
-                "from the projection",
-                index,
-            )
-            continue
-        key = entry.get("key")
-        version = entry.get("version")
-        # Branch on the TypeGuard so ``key`` narrows to ``str``.
-        if not is_valid_skill_key(key):
-            logger.warning(
-                "skills[%d].key %s; it was dropped from the projection",
-                index,
-                skill_key_rejection_reason(key),
-            )
-        elif not is_valid_skill_version(version):
-            logger.warning(
-                "skills[%d].version must be an integer >= 1; it was dropped "
-                "from the projection",
-                index,
-            )
-        else:
-            refs.append(SkillReference(key=key, version=version))
-    return refs
+    raw = config["skills"]
+    rejection = skills_field_rejection_reason(raw)
+    if rejection is not None:
+        raise ValueError(f"Invalid skills field in AI Config: {rejection}")
+    return [SkillReference(key=entry["key"], version=entry["version"]) for entry in raw]
 
 
 # ---------------------------------------------------------------------------
