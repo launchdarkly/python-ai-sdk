@@ -569,9 +569,11 @@ any handler. The same mapping is attached as `extra["ld_skills"]` for structured
 ERROR ld.skills.integrity_failure {"action":"withheld","event":"ld.skills.integrity_failure","expected_hash":"0000…0000","language":"python","observed_hash":"5fc8…6ec0","reason":"content hash mismatch","reason_code":"hash_mismatch","skill_key":"pdf-extraction","version":2}
 ```
 
-**`ld.skills.integrity_failure` is a stability commitment.** Match on it; it will not be
-renamed. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's AI SDKs for
-the same input.
+**Match on `ld.skills.integrity_failure`.** It is the name LaunchDarkly's AI SDKs share for this
+record. While Agent Skills is experimental, the event name, its fields, and its `reason_code`
+values may change in a minor release; any such change is called out in the changelog, so review
+it before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
+AI SDKs for the same input.
 
 | Field | Description |
 |---|---|

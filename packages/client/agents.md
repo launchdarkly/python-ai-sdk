@@ -604,7 +604,9 @@ Do not undo any of these as a simplification:
   discriminate (`resolve_from_store` and `list_raw_objects` also log ERROR for a raising
   store), and the stdlib's default formatter drops `extra`, so an `extra`-only record is
   invisible under a plain `logging.basicConfig()`.
-- **`ld.skills.integrity_failure` is documented for customers to match on.** Never rename it.
+- **`ld.skills.integrity_failure` is documented for customers to match on.** Do not rename it
+  casually. The experimental stage allows a rename in a minor release, but only in every SDK
+  at once and with a changelog entry, because a rename silently breaks customers' alerts.
 - **`sort_keys=True` makes the line byte-identical across SDKs** (modulo `language`), since
   the other implementations build the object in alphabetical key order.
 - **Optional fields are omitted, never nulled**, so a SIEM field-existence check means
@@ -956,6 +958,6 @@ a conversation is out of reach at this layer either way.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
 - Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
-- Do not rename `ld.skills.integrity_failure`, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
+- Do not rename `ld.skills.integrity_failure` in one language only or without a changelog entry, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces, though the experimental stage lets either change in a minor release. See "The integrity-failure log record" above.
 - Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.
