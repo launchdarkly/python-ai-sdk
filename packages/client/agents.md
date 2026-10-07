@@ -61,7 +61,6 @@ from launchdarkly_ai_server import (
     TrackData, UsageDict, HandlerResult, HandlerStreamEvent,
     StreamEvent, StreamChunkEvent, StreamDoneEvent, ExecuteStreamEvent, ExecuteStreamDoneEvent,
     VariationMeta, InitClientOptions, JudgeResult, ParseResult, ParseSuccess, ParseFailure,
-    Skill, SkillReference, ReconcileAction, ReconcileReport,
 )
 
 # Utilities
@@ -79,14 +78,23 @@ from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_t
 # Entry points
 from launchdarkly_ai_server import config, graph, resolve_graph, init_evaluations
 
-# Agent Skills
-from launchdarkly_ai_server import (
+# Agent Skills (experimental: none of these is exported from the package root)
+from launchdarkly_ai_server.experimental.skills import (
+    set_skill_store, SkillStore, InMemorySkillStore, FDv2SkillStore, StoreDiagnostics,
     skill_refs, get_skill, get_skill_result, get_skills, all_skills, write_skills,
-    SkillStore, InMemorySkillStore, SkillOutcome,
+    watch_skills, SkillWatcher,
+    Skill, SkillReference, SkillOutcome, ReconcileAction, ReconcileReport,
     SKILL_FILENAME, MANIFEST_FILENAME, MANIFEST_VERSION,
     ReconcileActionKind, OnUnavailable, SkillOutcomeReason,  # the three closed-set unions
 )
 ```
+
+An experimental feature is exported only from its module under
+`launchdarkly_ai_server.experimental`, and its names may change in a minor release. No core
+public type, function or `init_client` option may name it. Core reaches it only through an
+internal hook (as `shutdown` clears the skill store), and an error there is logged, never
+raised into the core call. The experimental part is the SDK's API, not the LaunchDarkly data
+model: `AiConfigRep` still documents the `skills` references a config carries.
 
 `MAX_SKILL_CONTENT_BYTES` and `SKILL_OBJECT_KIND` are deliberately **not** exported; both stay
 internal to `skills_core`:
@@ -97,7 +105,7 @@ internal to `skills_core`:
   would imply otherwise. An adapter that needs it imports it from
   `launchdarkly_ai_server.skills_core`.
 
-When adding a new export, add it to `__init__.py`'s imports and `__all__`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
+When adding a new core export, add it to `__init__.py`'s imports and `__all__`. An Agent Skills export goes in `experimental/skills.py` instead, and in `EXPERIMENTAL_SKILLS_SURFACE` in `tests/test_skills.py`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
 
 ---
 
@@ -197,11 +205,13 @@ Three layers, in increasing order of blast radius:
 
 1. **Reference discovery** — `skill_refs(config)` projects the config's `skills` array into
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
-   Validation of the array itself lives in `parse_ai_config` and is **fail closed** — one
-   malformed reference fails the whole config parse.
+   It also validates the array, and **fails closed**: a present but malformed field
+   (including `null`, or one bad entry) raises `ValueError` rather than returning a partial
+   list that would authorize a prune. `parse_ai_config` deliberately does not check `skills`,
+   so an experimental field cannot fail a core config call (TESTING.md §0.3).
 2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
-   through the `SkillStore` seam. Configure a store with
-   `init_client(options={"skillStore": store})`; with none configured the accessors raise
+   through the `SkillStore` seam. Configure a store with `set_skill_store(store)`; with
+   none configured the accessors raise
    an actionable `RuntimeError`. A delivery transport can be added behind the seam
    without touching the public API.
 3. **Materialization** — `write_skills(skills, root)` writes `<root>/<key>/SKILL.md` and
@@ -519,8 +529,8 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
 - **Those two bounds live in `_key_rejection_reason`, not in the key grammar, and must not
   move.** `is_valid_skill_key` / `skill_key_rejection_reason` deliberately admit an over-long
   or reserved key, because:
-  - `parse_ai_config` fails closed on a bad `skills` entry, so a grammar rejection would
-    invalidate the *entire* AI Config for a Linux customer over a Windows-only constraint;
+  - `skill_refs` fails closed on a bad `skills` entry, so a grammar rejection would
+    reject *every* skill reference for a Linux customer over a Windows-only constraint;
   - it would also shrink `skill_refs`, which authorizes a prune, turning "fails to write on
     Windows" into "deleted on Linux".
 
@@ -638,9 +648,8 @@ three signals are emitted by the `record_*` functions there; nothing else calls 
 the allowlist is enforced in one place.
 
 **Injection goes through `skills.py`.** `_set_store`, `_set_emitter_for_testing` and
-`_clear_state` delegate to `skills_core`. `init_client`, `shutdown` and tests use those
-(`skills._set_store(store)` is the setter `init_client` uses); none should reach into
-`skills_core` directly.
+`_clear_state` delegate to `skills_core`. `set_skill_store`, `shutdown` and tests use
+those; none should reach into `skills_core` directly.
 
 ### Descriptor-pinned filesystem access
 

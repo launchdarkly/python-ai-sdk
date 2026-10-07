@@ -22,7 +22,11 @@ from typing import Any
 
 import pytest
 
-from launchdarkly_ai_server import InMemorySkillStore, init_client, watch_skills
+from launchdarkly_ai_server.experimental.skills import (
+    InMemorySkillStore,
+    set_skill_store,
+    watch_skills,
+)
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 
 pytestmark = pytest.mark.usefixtures("reset_skill_state")
@@ -50,7 +54,7 @@ class TestWatchSkills:
         store."""
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a", version=1, content="body"))
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
         try:
             written = tmp_path / "s" / "a" / "SKILL.md"
@@ -74,7 +78,7 @@ class TestWatchSkills:
         arriving inside it schedules one further pass.
         """
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.6)
         try:
             assert watcher.reconciles == 0
@@ -97,7 +101,7 @@ class TestWatchSkills:
         reconciles once and then never again.
         """
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
         try:
             store.put(make_raw_skill(key="one"))
@@ -121,7 +125,7 @@ class TestWatchSkills:
         ``write_skills`` already guards its ``timeout`` this way.
         """
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         with pytest.raises(ValueError, match="debounce"):
             await watch_skills("*", tmp_path / "s", debounce=debounce)
         # Refused before anything was attached, so there is no watcher to close.
@@ -133,7 +137,7 @@ class TestWatchSkills:
         """Not the initial report: that one is returned to the caller directly."""
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a", version=1, content="body"))
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         seen: list[Any] = []
         report, watcher = await watch_skills(
             "*", tmp_path / "s", debounce=0.05, on_reconcile=seen.append
@@ -153,7 +157,7 @@ class TestWatchSkills:
     ) -> None:
         """A watcher that died on one bad run would silently stop pruning."""
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         calls: list[int] = []
 
         def explodes_once(_report: Any) -> None:
@@ -190,7 +194,7 @@ class TestWatchSkills:
                 raise RuntimeError("store is down")
 
         store = Unavailable()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         with pytest.raises(RuntimeError, match="store is down"):
             await watch_skills(
                 "*", tmp_path / "s", on_unavailable="raise", debounce=0.05
@@ -202,7 +206,7 @@ class TestWatchSkills:
     ) -> None:
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a", version=1, content="body"))
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         report, watcher = await watch_skills(
             "*", tmp_path / "s", prune=False, debounce=0.05
         )
@@ -218,7 +222,7 @@ class TestWatchSkills:
         """The initial reconcile runs on the caller's thread, so a bad root is
         the caller's exception rather than a line in a worker thread's log."""
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         not_a_directory = tmp_path / "file"
         not_a_directory.write_text("")
         with pytest.raises(ValueError, match="not a directory"):
@@ -234,7 +238,7 @@ class TestWatchSkills:
             def all_objects(self, _kind: str) -> dict[str, Any]:
                 return {}
 
-        await init_client(options={"skillStore": NoListeners()}, client=object())
+        set_skill_store(NoListeners())
         with pytest.raises(RuntimeError, match="add_listener"):
             await watch_skills("*", tmp_path / "s")
 
@@ -276,7 +280,7 @@ class TestChangesDuringTheInitialReconcile:
 
         store = RevokesAfterSnapshot()
         store.put(make_raw_skill(key="pdf-extraction", version=1, content="body"))
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
 
         _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
         try:
@@ -295,7 +299,7 @@ class TestChangesDuringTheInitialReconcile:
         """Registering first means a reconcile that raises has to detach: the
         caller is handed an exception, not a watcher to close."""
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         not_a_directory = tmp_path / "file"
         not_a_directory.write_text("")
 
@@ -323,7 +327,7 @@ class TestWatcherDetachesOnClose:
     ) -> None:
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="pdf-extraction", version=1, content="first"))
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
         assert watcher.notify in self._skill_listeners(store)
 
@@ -344,7 +348,7 @@ class TestWatcherDetachesOnClose:
 
     async def test_close_twice_does_not_raise(self, tmp_path: Any) -> None:
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
         watcher.close()
         watcher.close()
@@ -354,7 +358,7 @@ class TestWatcherDetachesOnClose:
         self, tmp_path: Any
     ) -> None:
         store = InMemorySkillStore()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         for _ in range(5):
             _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
             assert len(self._skill_listeners(store)) == 1
@@ -381,7 +385,7 @@ class TestWatcherDetachesOnClose:
                 self.listeners.append(fn)
 
         store = AddOnly()
-        await init_client(options={"skillStore": store}, client=object())
+        set_skill_store(store)
         _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
         assert store.listeners == [watcher.notify]
 

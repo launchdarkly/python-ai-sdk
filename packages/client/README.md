@@ -200,6 +200,20 @@ asyncio.run(main())
 | `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. |
 | `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
 
+`init_client` reads these option keys. Each overrides the environment variable of the same
+purpose (see [Environment Variables](#environment-variables)); any other key is logged as a
+warning and ignored.
+
+| Option | Environment variable | Description |
+|---|---|---|
+| `sdkKey` | `LD_SDK_KEY` | LaunchDarkly server-side SDK key |
+| `baseUri` | `LD_BASE_URI` | Polling base URI. Not used with `client=...` |
+| `streamUri` | `LD_STREAM_URI` | Streaming URI. Not used with `client=...` |
+| `eventsUri` | `LD_EVENTS_URI` | Events URI. Not used with `client=...` |
+| `otlpEndpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint spans are exported to |
+| `serviceName` | `LD_SERVICE_NAME` | OTel `service.name` resource attribute |
+| `environment` | `LD_ENVIRONMENT` | `deployment.environment` resource attribute |
+
 ### `config(**args)`
 
 The primary entry point for AI config invocations. Accepts either a single handler or a list of handlers and routes to the correct one at invoke-time based on the flag variation's provider and mode.
@@ -345,7 +359,11 @@ asyncio.run(main())
 
 ---
 
-### Agent Skills
+### Agent Skills (experimental)
+
+> **Experimental.** Import Agent Skills from `launchdarkly_ai_server.experimental.skills`;
+> none of these names is exported from the package root. They may change in a minor release,
+> so review the changelog when you upgrade.
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
@@ -357,9 +375,9 @@ import asyncio
 import hashlib
 from pathlib import Path
 
-from launchdarkly_ai_server import (
-    init_client, inspect_config, skill_refs, get_skill, write_skills,
-    InMemorySkillStore,
+from launchdarkly_ai_server import init_client, inspect_config
+from launchdarkly_ai_server.experimental.skills import (
+    InMemorySkillStore, get_skill, set_skill_store, skill_refs, write_skills,
 )
 
 SKILL_MD = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
@@ -376,10 +394,15 @@ async def main():
         # hash does not match is withheld.
         "contentHash": hashlib.sha256(SKILL_MD.encode("utf-8")).hexdigest(),
     })
-    await init_client(options={"skillStore": store})
+    set_skill_store(store)
+    await init_client()
 
     # 1. Which skills does this config reference? Pure projection — no I/O.
     info = await inspect_config("doc-agent", {"kind": "user", "key": "user-123"})
+    if info["config"] is None:
+        # The config could not be resolved. Stop here: an empty reference list
+        # passed to write_skills would prune every skill it manages.
+        return
     refs = skill_refs(info["config"])          # [SkillReference(key='pdf-extraction', version=2)]
 
     # 2. Fetch content. Returns None rather than raising when a skill is unavailable.
@@ -402,11 +425,12 @@ project library**, which puts every skill's `description` into the agent's conte
 skills no AI Config references and skills belonging to other teams. `write_skills(skill_refs(...), root)`,
 as above, writes only what the resolved variation asked for.
 
-**`skills` is a validated field.** Config parsing fails closed on a `skills` value that is not
-a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an integer
-≥ 1): the whole variation is rejected, `inspect_config` returns `config: None`, and
-`extract_variation` raises. If your variations carry a custom `skills` field of a different
-shape, rename it before upgrading.
+**`skill_refs` validates the `skills` field.** It raises `ValueError` when `skills` is present
+but is not a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an
+integer ≥ 1), including `skills: null`. One bad entry rejects the whole field, so
+`write_skills` never receives a partial list that would prune skills the config still
+references. Config parsing does not check `skills`, so a malformed field never fails
+`config().invoke()` or other core calls.
 
 **Integrity is not optional.** Content is returned only when its sha256 (lowercase hex, over
 the verbatim UTF-8 bytes) matches the delivered `contentHash`, its key and version revalidate,
@@ -542,7 +566,7 @@ retrieval, verification, and telemetry as `get_skill`, but reports which of five
 happened instead of collapsing them all to `None`.
 
 ```python
-from launchdarkly_ai_server import get_skill_result
+from launchdarkly_ai_server.experimental.skills import get_skill_result
 
 outcome = await get_skill_result("pdf-extraction")
 
@@ -590,13 +614,15 @@ authenticated with the environment's server-side SDK key.
 ```python
 import os
 
-from launchdarkly_ai_server import FDv2SkillStore, init_client, watch_skills
+from launchdarkly_ai_server.experimental.skills import (
+    FDv2SkillStore, set_skill_store, watch_skills,
+)
 
 store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
 if not store.wait_for_skills(timeout=10):
     # No payload arrived. Reconciling now would find an empty store; see below.
     print(f"skill delivery has not answered yet: {store.failed or 'still waiting'}")
-await init_client(options={"skillStore": store})
+set_skill_store(store)
 
 # Materialize now, and re-materialize whenever delivery changes.
 report, watcher = await watch_skills("*", ".claude/skills")
@@ -697,7 +723,7 @@ that skips verification.
 
 | Export | Description |
 |---|---|
-| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent. A `skills` field that is present but not a list (including `null`) fails the config parse instead, so an unreadable field never reaches a pruning reconcile as "no skills". |
+| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent or the config is not a dict. Raises `ValueError` when the field is present but malformed (including `null`), so an unreadable field never reaches a pruning reconcile as "no skills". |
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
 | `get_skill_result(key, *, version=None)` | The same retrieval, reporting **why**: a frozen `SkillOutcome` with `.skill`, `.reason` (`ok` / `absent` / `integrity_failure` / `store_unavailable` / `wrong_version`), and `.detail`. See *Failing closed on tampering* above. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
@@ -709,9 +735,12 @@ that skips verification.
 | `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, so revocation takes effect within `debounce` rather than at the next restart. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
-Configure the store with `init_client(options={"skillStore": store})`. With none configured,
-the accessors raise `RuntimeError` explaining what to do, and `write_skills` reports the
-failure (or raises, with `on_unavailable="raise"`). `shutdown()` clears it.
+Configure the store with `set_skill_store(store)`. It applies on every call, before or after
+`init_client`, and `None` is ignored rather than clearing a configured store. Anything else
+without callable `get_object` and `all_objects` raises `TypeError`. Replacing a store does not
+close the previous one, and a running watcher keeps the store it started with. With none
+configured, the accessors raise `RuntimeError` explaining what to do, and `write_skills`
+reports the failure (or raises, with `on_unavailable="raise"`). `shutdown()` clears it.
 
 `ReconcileReport.actions` holds one `ReconcileAction` per outcome (`written`, `updated`,
 `skipped_current`, `removed`, or `error`), each with `key`, `version`, the resolved `path`, and

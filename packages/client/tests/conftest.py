@@ -7,7 +7,7 @@ import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 import launchdarkly_ai_server.skills as skills_module
-from launchdarkly_ai_server import InMemorySkillStore
+from launchdarkly_ai_server.experimental.skills import InMemorySkillStore
 
 
 @pytest.fixture

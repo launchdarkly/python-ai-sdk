@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 
 _LD_DEFAULT_OTLP_ENDPOINT = "https://otel.observability.app.launchdarkly.com"
 
+_INIT_CLIENT_OPTIONS = frozenset(
+    {
+        "sdkKey",
+        "baseUri",
+        "streamUri",
+        "eventsUri",
+        "otlpEndpoint",
+        "serviceName",
+        "environment",
+    }
+)
+"""Every ``init_client`` option key that is read. Any other key is warned about."""
+
 
 def _env(name: str) -> str | None:
     """Read an env var, treating blank/whitespace-only values as unset."""
@@ -150,32 +163,33 @@ async def init_client(
 
     - Pass *client* directly (BYOC) to skip the LaunchDarkly Python SDK path.
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
-    - ``options['skillStore']`` sets the store the Agent Skills accessors read
-      from. Without one, the accessors raise ``RuntimeError``.
 
-    Idempotent: later calls return the existing client and ignore every option
-    **except** ``skillStore``, which is applied on every successful call, so you
-    can add a store after initialization. A ``None`` store never clears the
-    current one (use ``shutdown()``), and a call that raises installs nothing.
+    Options (each overrides the environment variable in parentheses):
+
+    - ``sdkKey`` (``LD_SDK_KEY``): the server-side SDK key.
+    - ``baseUri`` (``LD_BASE_URI``), ``streamUri`` (``LD_STREAM_URI``),
+      ``eventsUri`` (``LD_EVENTS_URI``): LaunchDarkly service URIs, passed to
+      the SDK config. Not used on the BYOC path.
+    - ``otlpEndpoint`` (``OTEL_EXPORTER_OTLP_ENDPOINT``): where spans are
+      exported.
+    - ``serviceName`` (``LD_SERVICE_NAME``): the ``service.name`` resource
+      attribute.
+    - ``environment`` (``LD_ENVIRONMENT``): the ``deployment.environment``
+      resource attribute.
+
+    Idempotent: later calls return the existing client and ignore every option.
+    An option not listed above is logged as a warning and ignored.
 
     Returns the initialized ``LDClientInterface`` instance.
     """
-    opts = options or {}
-
-    ld_client = await _resolve_client(opts, client)
-
-    # Reached only on success, so a failed init installs no store.
-    skill_store = opts.get("skillStore")
-    if skill_store is not None:
-        skills._set_store(skill_store)
-    return ld_client
-
-
-async def _resolve_client(opts: InitClientOptions, client: Any) -> Any:
-    """
-    Returns the singleton client, initializing it on first call.
-    """
     global _client
+
+    opts = options or {}
+    unknown = sorted(str(key) for key in opts if key not in _INIT_CLIENT_OPTIONS)
+    if unknown:
+        logger.warning(
+            "Ignoring unrecognized init_client option(s): %s", ", ".join(unknown)
+        )
 
     # Idempotent — if already initialized, return the existing client
     if _client is not None:
@@ -286,13 +300,21 @@ def _release_otel_globals() -> None:
         logger.debug("Could not release the global OTel tracer provider", exc_info=True)
 
 
+def _clear_experimental_state() -> None:
+    """Clears experimental feature state. A failure is logged, never raised."""
+    try:
+        skills._clear_state()
+    except Exception:
+        logger.warning("Could not clear the Agent Skills state", exc_info=True)
+
+
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also clears the configured skill store; pass ``skillStore`` again to the
-    next ``init_client`` to keep using the skill accessors.
+    Also clears any experimental feature state, such as a configured skill
+    store.
 
     When telemetry was running, this also releases the process-global tracer
     provider so a later ``init_client`` can install its own — see
@@ -304,7 +326,7 @@ async def shutdown() -> None:
     local_provider = _tracer_provider
     owned_globals = _owns_otel_globals
 
-    skills._clear_state()
+    _clear_experimental_state()
 
     # Null the singleton before any awaits so a second call is a no-op
     _client = None
@@ -351,6 +373,8 @@ def _reset_for_testing() -> None:
     _client = None
     _tracer_provider = None
     _owns_otel_globals = False
+    # Directly, not through _clear_experimental_state: a failed reset should
+    # fail the test rather than leak state into the next one.
     skills._clear_state()
     # Mirrors shutdown(): without this a suite that inits more than once leaves
     # every later span on the first test's provider.

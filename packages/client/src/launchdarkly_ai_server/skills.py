@@ -18,6 +18,7 @@ from typing import Any
 from . import skills_core
 from .skills_core import (
     SKILL_OBJECT_KIND,
+    SkillStore,
     list_raw_objects,
     log_withholding_summary,
     newest_by_key,
@@ -27,11 +28,7 @@ from .skills_core import (
     verify_raw_skill,
 )
 from .types import AiConfigRep, Skill, SkillOutcome, SkillReference
-from .types_validation import (
-    is_valid_skill_key,
-    is_valid_skill_version,
-    skill_key_rejection_reason,
-)
+from .types_validation import is_valid_skill_version, skills_field_rejection_reason
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +36,47 @@ logger = logging.getLogger(__name__)
 # Injection points
 # ---------------------------------------------------------------------------
 #
-# Used by ``init_client`` and ``shutdown`` (and tests). The state itself lives in
-# ``skills_core``, so there is exactly one store and one emitter.
+# Used by ``set_skill_store`` and ``shutdown`` (and tests). The state itself lives
+# in ``skills_core``, so there is exactly one store and one emitter.
 _set_store = skills_core.set_store
 _set_emitter_for_testing = skills_core.set_emitter
 _clear_state = skills_core.clear_state
+
+
+def set_skill_store(store: SkillStore | None) -> None:
+    """
+    Sets the store the skill accessors and ``write_skills`` read from.
+
+    Applies on every call, including after ``init_client``, so a lazily
+    initialized client can be given a store afterwards. ``None`` is ignored and
+    never clears a configured store; ``shutdown()`` does that.
+
+    Replacing a store does not close the previous one; close it yourself if it
+    holds a connection. A running ``watch_skills`` keeps listening to the store
+    it started with, so close the watcher and start a new one to follow the
+    replacement.
+
+    Args:
+        store: ``FDv2SkillStore`` to receive skills from LaunchDarkly, or
+            ``InMemorySkillStore`` for local development and tests.
+
+    Raises:
+        TypeError: If *store* is not ``None`` and has no callable
+            ``get_object`` and ``all_objects``.
+    """
+    if store is None:
+        return
+    missing = [
+        name
+        for name in ("get_object", "all_objects")
+        if not callable(getattr(store, name, None))
+    ]
+    if missing:
+        raise TypeError(
+            f"set_skill_store needs a SkillStore; {type(store).__name__} has no "
+            f"callable {' or '.join(missing)}."
+        )
+    _set_store(store)
 
 
 class InMemorySkillStore:
@@ -171,46 +204,28 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
     Returns the skill references attached to a resolved AI Config.
 
     Pure: no network, store, or telemetry. Returns ``[]`` when the config has no
-    skills. Typical use: ``await get_skills(skill_refs(config))``.
+    ``skills`` field, or when *config* is not a dict (for example ``None`` from a
+    failed ``inspect_config``). Typical use: ``await get_skills(skill_refs(config))``.
 
-    Invalid entries (possible only in a hand-built dict; ``parse_ai_config``
-    rejects them) are dropped with a warning, because ``write_skills`` with
-    ``prune=True`` would delete a dropped skill's files.
+    The config parser does not validate ``skills``, so a malformed field does
+    not fail core config calls. It is validated here instead, and rejected
+    whole: ``write_skills`` with ``prune=True`` would delete the files of any
+    skill missing from the list, so a partial or empty list is never returned
+    for a field that is present.
+
+    Raises:
+        ValueError: If ``skills`` is present but is not a list of ``{key,
+            version}`` objects with a valid key and an integer version >= 1.
+            This includes ``skills: null``.
     """
-    if not isinstance(config, dict):
+    if not isinstance(config, dict) or "skills" not in config:
         return []
 
-    raw = config.get("skills")
-    if not isinstance(raw, list):
-        return []
-
-    refs: list[SkillReference] = []
-    for index, entry in enumerate(raw):
-        if not isinstance(entry, dict):
-            logger.warning(
-                "skills[%d] is not a {key, version} object; it was dropped "
-                "from the projection",
-                index,
-            )
-            continue
-        key = entry.get("key")
-        version = entry.get("version")
-        # Branch on the TypeGuard so ``key`` narrows to ``str``.
-        if not is_valid_skill_key(key):
-            logger.warning(
-                "skills[%d].key %s; it was dropped from the projection",
-                index,
-                skill_key_rejection_reason(key),
-            )
-        elif not is_valid_skill_version(version):
-            logger.warning(
-                "skills[%d].version must be an integer >= 1; it was dropped "
-                "from the projection",
-                index,
-            )
-        else:
-            refs.append(SkillReference(key=key, version=version))
-    return refs
+    raw = config["skills"]
+    rejection = skills_field_rejection_reason(raw)
+    if rejection is not None:
+        raise ValueError(f"Invalid skills field in AI Config: {rejection}")
+    return [SkillReference(key=entry["key"], version=entry["version"]) for entry in raw]
 
 
 # ---------------------------------------------------------------------------

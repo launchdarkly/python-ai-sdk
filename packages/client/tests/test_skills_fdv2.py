@@ -34,19 +34,18 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from launchdarkly_ai_server import (
+from launchdarkly_ai_server import skills as skills_module
+from launchdarkly_ai_server import skills_core, skills_fdv2
+from launchdarkly_ai_server.experimental.skills import (
     FDv2SkillStore,
     InMemorySkillStore,
     all_skills,
     get_skill,
     get_skill_result,
-    init_client,
-    skills_core,
-    skills_fdv2,
+    set_skill_store,
     watch_skills,
     write_skills,
 )
-from launchdarkly_ai_server import skills as skills_module
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
     DEFAULT_BASE_URI,
@@ -2479,7 +2478,7 @@ class TestFailureHandling:
             assert wait_until(lambda: store.failed is not None)
             assert store.is_initialized() is False
             assert store.wait_for_skills(timeout=0.1) is False
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             report = await write_skills("*", root)
         assert report.ok is False
         assert (stale / "SKILL.md").read_text(encoding="utf-8") == "not ours to delete"
@@ -3326,7 +3325,7 @@ class TestMissingContentHash:
         endpoint.queue_poll(full_payload(("put-object", put_skill(omit_hash=True))))
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
 
             outcome = await get_skill_result("pdf-extraction")
             assert outcome.skill is None
@@ -3349,7 +3348,7 @@ class TestMissingContentHash:
             raw = store.get_object(SKILL_OBJECT_KIND, "pdf-extraction")
             assert raw is not None
             assert "contentHash" not in raw
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             assert (await get_skill_result("pdf-extraction")).reason != "absent"
 
     def test_the_store_counts_hashless_objects(self, endpoint: Any) -> None:
@@ -3468,7 +3467,7 @@ class TestMissingContentHash:
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
             assert store.diagnostics.hashless_objects == 0
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             assert (
                 await get_skill_result("pdf-extraction")
             ).reason == "integrity_failure"
@@ -3478,7 +3477,7 @@ class TestMissingContentHash:
         endpoint.queue_poll(full_payload(("put-object", put_skill())))
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
 
             skill = await get_skill("pdf-extraction")
             assert skill is not None
@@ -3499,7 +3498,7 @@ class TestMissingContentHash:
         )
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
 
             pinned = await get_skill("pdf-extraction", version=2)
             assert pinned is not None
@@ -3529,7 +3528,7 @@ class TestMissingContentHash:
         )
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
 
             missed = await get_skill_result("pdf-extraction", version=9)
             assert missed.skill is None
@@ -3556,7 +3555,7 @@ class TestMissingContentHash:
         )
         with poll_store(endpoint) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             by_payload_version = await get_skill_result("pdf-extraction", version=42)
             assert by_payload_version.skill is None
             assert by_payload_version.reason == "absent"
@@ -3760,7 +3759,7 @@ class TestWatchSkillsOverTheTransport:
 
         with poll_store(endpoint, poll_interval=0.2) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             report, watcher = await watch_skills(
                 "*", tmp_path / "skills", debounce=0.05
             )
@@ -3786,7 +3785,7 @@ class TestWatchSkillsOverTheTransport:
 
         with poll_store(endpoint, poll_interval=0.2) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             report, watcher = await watch_skills(
                 "*", tmp_path / "skills", debounce=0.05
             )
@@ -3814,7 +3813,7 @@ class TestWatchSkillsOverTheTransport:
 
         with poll_store(endpoint, poll_interval=0.2) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
             try:
                 written = tmp_path / "s" / "pdf-extraction" / "SKILL.md"
@@ -3832,7 +3831,7 @@ class TestWatchSkillsOverTheTransport:
         endpoint.queue_poll(status=500)
         with poll_store(endpoint, poll_interval=0.05) as store:
             store.wait_for_skills(timeout=5)
-            await init_client(options={"skillStore": store}, client=object())
+            set_skill_store(store)
             _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
             try:
                 written = tmp_path / "s" / "pdf-extraction" / "SKILL.md"
@@ -4040,13 +4039,14 @@ class TestTransportLayering:
         assert _module_imports(skills_fdv2) == stdlib | within_the_feature
 
     def test_nothing_in_the_feature_imports_it(self) -> None:
-        """Only the package's own entry point names it, to re-export two types.
+        """Only the experimental entry point names it, to re-export
+        ``FDv2SkillStore`` and ``StoreDiagnostics``.
 
         That re-export is the published surface rather than a dependency: it is
-        what makes ``FDv2SkillStore`` reachable without a sub-path import. A
-        *feature* module importing the transport would be the layering
-        inverting, and the accessors would start being able to tell which store
-        answered them.
+        what makes ``FDv2SkillStore`` reachable without importing the
+        implementation module. A *feature* module importing the transport would
+        be the layering inverting, and the accessors would start being able to
+        tell which store answered them.
         """
         feature = [
             "skills.py",
@@ -4068,7 +4068,8 @@ class TestTransportLayering:
         assert importers == []
         # The positive control: the entry point does name it, so an empty result
         # above cannot be a misspelt filename list finding nothing anywhere.
-        assert "skills_fdv2" in (source_dir / "__init__.py").read_text(encoding="utf-8")
+        entry_point = source_dir / "experimental" / "skills.py"
+        assert "skills_fdv2" in entry_point.read_text(encoding="utf-8")
 
 
 class TestTransportEmitsNoTelemetry:

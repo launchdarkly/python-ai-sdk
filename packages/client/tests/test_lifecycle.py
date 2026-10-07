@@ -116,6 +116,39 @@ class TestInitClientBYOC:
         assert setup.call_count == 1
         assert setup.call_args.args[1] == {"serviceName": "first"}
 
+    async def test_warns_about_an_unrecognized_option(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A misspelt or retired option would otherwise be dropped silently."""
+        stub = _make_stub_client()
+        with (
+            patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await init_client({"serviceName": "svc", "sdkkey": "sdk-x"}, stub)
+        warnings = [r.getMessage() for r in caplog.records]
+        assert warnings == ["Ignoring unrecognized init_client option(s): sdkkey"]
+
+    async def test_does_not_warn_about_documented_options(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        stub = _make_stub_client()
+        options = {
+            "sdkKey": "sdk-x",
+            "baseUri": "https://base.example",
+            "streamUri": "https://stream.example",
+            "eventsUri": "https://events.example",
+            "otlpEndpoint": "https://otlp.example",
+            "serviceName": "svc",
+            "environment": "test",
+        }
+        with (
+            patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await init_client(options, stub)
+        assert caplog.records == []
+
     async def test_repeat_call_does_not_swap_the_client(self) -> None:
         first = _make_stub_client()
         second = _make_stub_client()
@@ -492,6 +525,26 @@ class TestShutdown:
         await shutdown()
         await shutdown()  # must not raise
 
+    async def test_a_failure_clearing_experimental_state_is_logged_not_raised(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Experimental behaviour must not break a core call (TESTING.md §0.3)."""
+        stub = _make_stub_client()
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        with (
+            patch.object(
+                lifecycle_module.skills,
+                "_clear_state",
+                side_effect=RuntimeError("clear failed"),
+            ),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await shutdown()  # must not raise
+        stub.close.assert_called_once()
+        assert lifecycle_module._client is None
+        assert "Could not clear the Agent Skills state" in caplog.messages
+
     async def test_completes_teardown_even_if_flush_throws(self) -> None:
         stub = _make_stub_client()
         stub.flush = AsyncMock(side_effect=RuntimeError("flush failed"))
@@ -731,6 +784,33 @@ class TestInspectConfig:
         assert result["config"] is not None
         assert result["config"]["model"]["name"] == "claude-3-5"  # type: ignore[index]
         assert result["meta"] is not None
+
+    async def test_a_malformed_skills_field_does_not_fail_core_calls(self) -> None:
+        """Agent Skills is experimental, so its field cannot break a core call
+        (TESTING.md §0.3). ``skill_refs`` rejects it instead."""
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(
+            return_value={
+                "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+                "model": {"name": "claude-3-5"},
+                "provider": {"name": "Anthropic"},
+                "instructions": "You are helpful.",
+                "skills": [{"key": "My_Skill", "version": 0}],
+            }
+        )
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            result = await inspect_config("my-flag", ctx)
+            extracted = await lifecycle_module.extract_variation("my-flag", ctx)
+
+        assert result["enabled"] is True
+        assert result["config"] is not None
+        assert extracted["config"]["model"]["name"] == "claude-3-5"
 
     async def test_preserves_model_key_and_version_on_meta(self) -> None:
         stub = _make_stub_client()

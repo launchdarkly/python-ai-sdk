@@ -16,7 +16,8 @@ import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 import launchdarkly_ai_server.skills as skills_module
-from launchdarkly_ai_server import (
+from launchdarkly_ai_server import get_client, init_client, shutdown
+from launchdarkly_ai_server.experimental.skills import (
     InMemorySkillStore,
     ReconcileAction,
     ReconcileReport,
@@ -24,12 +25,10 @@ from launchdarkly_ai_server import (
     SkillOutcome,
     SkillReference,
     all_skills,
-    get_client,
     get_skill,
     get_skill_result,
     get_skills,
-    init_client,
-    shutdown,
+    set_skill_store,
     skill_refs,
 )
 from launchdarkly_ai_server.skills_core import list_raw_objects, require_store
@@ -287,31 +286,59 @@ class TestSkillRefs:
         skill_refs(self._config(skills=[{"key": "a", "version": 1}]))
         assert recording_emitter.records == []
 
-    def test_dropped_entries_are_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A shortened projection is never silent.
+    def test_a_non_dict_config_returns_empty_list(self) -> None:
+        assert skill_refs(None) == []
 
-        ``parse_ai_config`` fails the whole config closed on a malformed
-        reference, so a config that reached here through it cannot contain one.
-        A hand-built dict can, and feeding the shortened list to
-        ``write_skills`` would prune the dropped skill's on-disk copy — so the
-        drop is observable rather than silent.
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            pytest.param(None, id="null"),
+            pytest.param("pdf", id="string"),
+            pytest.param({"key": "a", "version": 1}, id="object"),
+            pytest.param(3, id="number"),
+            pytest.param(["pdf-extraction"], id="non-object-entry"),
+            pytest.param([None], id="null-entry"),
+            pytest.param([{"version": 1}], id="absent-key"),
+            pytest.param([{"key": 1, "version": 1}], id="non-string-key"),
+            pytest.param([{"key": "", "version": 1}], id="empty-key"),
+            pytest.param([{"key": "Evil", "version": 1}], id="uppercase-key"),
+            pytest.param([{"key": "under_score", "version": 1}], id="underscore-key"),
+            pytest.param([{"key": "../escape", "version": 1}], id="traversal-key"),
+            pytest.param([{"key": "a" * 257, "version": 1}], id="long-key"),
+            pytest.param([{"key": "a"}], id="absent-version"),
+            pytest.param([{"key": "a", "version": 0}], id="zero-version"),
+            pytest.param([{"key": "a", "version": 2.5}], id="float-version"),
+            pytest.param([{"key": "a", "version": "2"}], id="string-version"),
+            pytest.param([{"key": "a", "version": True}], id="bool-version"),
+        ],
+    )
+    def test_a_malformed_skills_field_raises(self, malformed: Any) -> None:
+        """The parser passes ``skills`` through, so it is validated here.
+
+        Returning ``[]`` or a shortened list instead would authorize
+        ``write_skills(..., prune=True)`` to delete skills the config still
+        references. ``skills: null`` is included: read as "no skills" it would
+        prune everything.
         """
+        with pytest.raises(ValueError, match=r"skills"):
+            skill_refs(self._config(skills=malformed))
+
+    def test_one_bad_entry_rejects_the_whole_field(self) -> None:
         config = self._config(
-            skills=[
-                {"key": "good", "version": 1},
-                {"key": "bad", "version": 0},
-                {"key": "Bad-Key", "version": 1},
-                "not-an-object",
-            ]
+            skills=[{"key": "good", "version": 1}, {"key": "../bad", "version": 1}]
         )
+        with pytest.raises(ValueError, match=r"skills\[1\]\.key"):
+            skill_refs(config)
 
-        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills"):
-            refs = skill_refs(config)
+    def test_the_error_does_not_echo_the_rejected_key(self) -> None:
+        config = self._config(skills=[{"key": "Secret-Name", "version": 1}])
+        with pytest.raises(ValueError) as excinfo:
+            skill_refs(config)
+        assert "Secret-Name" not in str(excinfo.value)
 
-        assert refs == [SkillReference(key="good", version=1)]
-        assert len(caplog.records) == 3
-        # The body is never echoed, and neither is the invalid key.
-        assert all("skills[" in r.getMessage() for r in caplog.records)
+    def test_key_at_length_bound_is_accepted(self) -> None:
+        refs = skill_refs(self._config(skills=[{"key": "a" * 256, "version": 1}]))
+        assert refs == [SkillReference(key="a" * 256, version=1)]
 
     def test_requires_no_client_or_store(self, mock_ld_client: Any) -> None:
         """No store configured, no client initialized — still a pure projection."""
@@ -320,24 +347,86 @@ class TestSkillRefs:
         mock_ld_client.track.assert_not_called()
 
 
+EXPERIMENTAL_SKILLS_SURFACE = frozenset(
+    {
+        "set_skill_store",
+        "SkillStore",
+        "InMemorySkillStore",
+        "FDv2SkillStore",
+        "StoreDiagnostics",
+        "watch_skills",
+        "SkillWatcher",
+        "skill_refs",
+        "get_skill",
+        "get_skill_result",
+        "get_skills",
+        "all_skills",
+        "write_skills",
+        "Skill",
+        "SkillReference",
+        "SkillOutcome",
+        "ReconcileAction",
+        "ReconcileReport",
+        "ReconcileActionKind",
+        "OnUnavailable",
+        "SkillOutcomeReason",
+        "SKILL_FILENAME",
+        "MANIFEST_FILENAME",
+        "MANIFEST_VERSION",
+    }
+)
+"""Every name ``launchdarkly_ai_server.experimental.skills`` exports, spelled out
+so that any addition — an accessor that interprets ``Skill.content``, say —
+fails here and is seen in review."""
+
+
 class TestPackageExports:
     """
     What is and is not part of the public surface.
 
-    The literal values are spelled out on purpose: this is the one place the
-    constants themselves are asserted, so importing them to build the
+    Agent Skills is experimental: every name is exported from
+    ``launchdarkly_ai_server.experimental.skills`` and none from the package
+    root. The literal values are spelled out on purpose: this is the one place
+    the constants themselves are asserted, so importing them to build the
     expectation would make the assertion circular.
     """
+
+    def test_experimental_surface_is_exactly_the_documented_set(self) -> None:
+        """An allowlist, not a denylist of guessed names: a new export of any
+        name, including a reader over ``Skill.content``, fails this test."""
+        from launchdarkly_ai_server.experimental import skills as experimental
+
+        assert set(experimental.__all__) == EXPERIMENTAL_SKILLS_SURFACE
+        for name in EXPERIMENTAL_SKILLS_SURFACE:
+            assert hasattr(experimental, name), name
+
+    def test_experimental_module_defines_no_other_public_name(self) -> None:
+        """``__all__`` is what ``import *`` and the docs follow, but a public
+        name defined on the module and left out of it is still importable."""
+        from launchdarkly_ai_server.experimental import skills as experimental
+
+        public = {name for name in dir(experimental) if not name.startswith("_")}
+        assert public == EXPERIMENTAL_SKILLS_SURFACE
+
+    def test_no_skills_name_is_exported_from_the_package_root(self) -> None:
+        import launchdarkly_ai_server as package
+        import launchdarkly_ai_server.experimental.skills
+
+        for name in EXPERIMENTAL_SKILLS_SURFACE:
+            assert name not in package.__all__, name
+            assert not hasattr(package, name), name
 
     def test_content_cap_is_not_public_api(self) -> None:
         """The content cap stays internal to ``skills_core`` — see the
         ``MAX_SKILL_CONTENT_BYTES`` docstring there for why it is not exported."""
         import launchdarkly_ai_server as package
         from launchdarkly_ai_server import skills_core
+        from launchdarkly_ai_server.experimental import skills as experimental
 
         assert skills_core.MAX_SKILL_CONTENT_BYTES == 10485760
-        assert "MAX_SKILL_CONTENT_BYTES" not in package.__all__
-        assert not hasattr(package, "MAX_SKILL_CONTENT_BYTES")
+        for module in (package, experimental):
+            assert "MAX_SKILL_CONTENT_BYTES" not in module.__all__
+            assert not hasattr(module, "MAX_SKILL_CONTENT_BYTES")
 
     def test_object_kind_is_not_public_api(self) -> None:
         """The kind is an SDK-side interface value, not the wire contract.
@@ -350,46 +439,22 @@ class TestPackageExports:
         """
         import launchdarkly_ai_server as package
         from launchdarkly_ai_server import skills_core
+        from launchdarkly_ai_server.experimental import skills as experimental
 
         assert skills_core.SKILL_OBJECT_KIND == "skill"
-        assert "SKILL_OBJECT_KIND" not in package.__all__
-        assert not hasattr(package, "SKILL_OBJECT_KIND")
+        for module in (package, experimental):
+            assert "SKILL_OBJECT_KIND" not in module.__all__
+            assert not hasattr(module, "SKILL_OBJECT_KIND")
 
-    def test_constants_are_exported_from_the_package_root(self) -> None:
-        import launchdarkly_ai_server as package
+    def test_constants_have_their_documented_values(self) -> None:
+        from launchdarkly_ai_server.experimental import skills as experimental
 
-        assert package.SKILL_FILENAME == "SKILL.md"
-        assert package.MANIFEST_FILENAME == ".launchdarkly-skills.json"
-        assert package.MANIFEST_VERSION == 1
+        assert experimental.SKILL_FILENAME == "SKILL.md"
+        assert experimental.MANIFEST_FILENAME == ".launchdarkly-skills.json"
+        assert experimental.MANIFEST_VERSION == 1
 
-    def test_constants_are_listed_in_dunder_all(self) -> None:
-        """A name absent from ``__all__`` is not part of the public surface."""
-        import launchdarkly_ai_server as package
-
-        expected = {
-            "SKILL_FILENAME",
-            "MANIFEST_FILENAME",
-            "MANIFEST_VERSION",
-        }
-        assert expected <= set(package.__all__)
-
-    def test_closed_set_types_are_exported_from_the_package_root(self) -> None:
-        """The two closed-set unions are public API, not implementation detail.
-
-        ``ReconcileActionKind`` types the ``ReconcileAction.action`` field every
-        consumer of a report reads and switches on, and ``OnUnavailable`` types
-        a public keyword argument of ``write_skills``. ``agents.md`` forbids
-        handler packages from importing sub-path modules, so a name exported
-        only from the implementation module has no supported import path.
-        """
-        import launchdarkly_ai_server as package
-
-        assert hasattr(package, "ReconcileActionKind")
-        assert hasattr(package, "OnUnavailable")
-        assert {"ReconcileActionKind", "OnUnavailable"} <= set(package.__all__)
-
-    def test_exported_action_union_admits_exactly_the_five_actions(self) -> None:
-        """The union must match the actions a report can actually carry.
+    def test_exported_closed_set_types_admit_exactly_their_tokens(self) -> None:
+        """Each union must match the values it actually types.
 
         Spelled out rather than imported from the implementation for the same
         reason as the constants above: deriving the expectation from the thing
@@ -397,42 +462,23 @@ class TestPackageExports:
         """
         import typing
 
-        import launchdarkly_ai_server as package
+        from launchdarkly_ai_server.experimental import skills as experimental
 
-        assert set(typing.get_args(package.ReconcileActionKind)) == {
+        assert set(typing.get_args(experimental.ReconcileActionKind)) == {
             "written",
             "updated",
             "skipped_current",
             "removed",
             "error",
         }
-        assert set(typing.get_args(package.OnUnavailable)) == {"keep", "raise"}
-        assert set(typing.get_args(package.SkillOutcomeReason)) == {
+        assert set(typing.get_args(experimental.OnUnavailable)) == {"keep", "raise"}
+        assert set(typing.get_args(experimental.SkillOutcomeReason)) == {
             "absent",
             "integrity_failure",
             "ok",
             "store_unavailable",
             "wrong_version",
         }
-
-    def test_retrieval_surface_is_exported_from_the_package_root(self) -> None:
-        """A name absent from ``__all__`` is not part of the public surface."""
-        import launchdarkly_ai_server as package
-
-        expected = {
-            "skill_refs",
-            "get_skill",
-            "get_skill_result",
-            "get_skills",
-            "all_skills",
-            "SkillStore",
-            "InMemorySkillStore",
-            "Skill",
-            "SkillOutcome",
-            "SkillOutcomeReason",
-            "SkillReference",
-        }
-        assert expected <= set(package.__all__)
 
 
 class TestInMemorySkillStore:
@@ -661,17 +707,27 @@ class TestInMemorySkillStore:
 
 
 class TestStoreConfiguration:
-    """Store wiring on the lifecycle layer."""
+    """Store wiring through ``set_skill_store``."""
 
-    async def test_configured_via_init_client_option(
+    async def test_configured_via_set_skill_store(
         self, make_raw_skill: Any, mock_ld_client: Any
     ) -> None:
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
-        await init_client(options={"skillStore": store}, client=mock_ld_client)
+        await init_client(client=mock_ld_client)
+        set_skill_store(store)
         skill = await get_skill("a")
         assert skill is not None
         assert skill.key == "a"
+
+    async def test_set_skill_store_works_without_init_client(
+        self, make_raw_skill: Any
+    ) -> None:
+        """The setter does not go through ``init_client``, so it needs no client."""
+        store = InMemorySkillStore()
+        store.put(make_raw_skill(key="a"))
+        set_skill_store(store)
+        assert await get_skill("a") is not None
 
     async def test_get_skill_raises_actionably_when_no_store(self) -> None:
         with pytest.raises(RuntimeError, match="skill store"):
@@ -685,14 +741,18 @@ class TestStoreConfiguration:
         with pytest.raises(RuntimeError, match="skill store"):
             await all_skills()
 
-    async def test_the_no_store_message_names_the_delivery_store_first(self) -> None:
+    async def test_the_no_store_message_names_the_setter_and_both_stores(
+        self,
+    ) -> None:
         """
-        A deployment that hits this message must be pointed at the store that
-        receives content from LaunchDarkly, not only at the development one.
+        A deployment that hits this message must be told how to configure a
+        store, and pointed at the store that receives content from LaunchDarkly,
+        not only at the development one.
         """
         with pytest.raises(RuntimeError) as reported:
             await get_skill("a")
         message = str(reported.value)
+        assert "set_skill_store" in message
         assert "FDv2SkillStore" in message
         assert "InMemorySkillStore" in message
         assert message.index("FDv2SkillStore") < message.index("InMemorySkillStore")
@@ -702,7 +762,8 @@ class TestStoreConfiguration:
     ) -> None:
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
-        await init_client(options={"skillStore": store}, client=mock_ld_client)
+        await init_client(client=mock_ld_client)
+        set_skill_store(store)
         assert await get_skill("a") is not None
 
         await shutdown()
@@ -710,69 +771,70 @@ class TestStoreConfiguration:
         with pytest.raises(RuntimeError, match="skill store"):
             await get_skill("a")
 
-    async def test_skill_store_is_applied_on_every_init_client_call(
+    async def test_a_second_set_skill_store_replaces_the_store(
         self, make_raw_skill: Any
     ) -> None:
-        """``skillStore`` is the one option a second call applies.
+        """The setter applies on every call, including after the client exists.
 
-        ``init_client`` is idempotent for the client singleton, and on a second
-        call every other option is ignored. ``skillStore`` is applied anyway,
-        on purpose: it is what lets a client that was lazily auto-initialized,
-        or initialized without a store, be given one afterwards. Both halves are
-        asserted on the same pair of calls, because each is meaningless without
-        the other.
+        That is what lets a client that was lazily auto-initialized, or
+        initialized before a store was ready, be given one afterwards. The
+        client singleton is asserted unchanged in the same test, because the
+        setter must not reach ``init_client``'s idempotency.
         """
         first_store = InMemorySkillStore()
         first_store.put(make_raw_skill(key="first"))
         second_store = InMemorySkillStore()
         second_store.put(make_raw_skill(key="second"))
+        client = MagicMock()
 
-        first_client = MagicMock()
-        second_client = MagicMock()
+        await init_client(client=client)
+        set_skill_store(first_store)
+        set_skill_store(second_store)
 
-        await init_client(options={"skillStore": first_store}, client=first_client)
-        await init_client(options={"skillStore": second_store}, client=second_client)
-
-        # Half one: the client singleton is unchanged — the second call is a
-        # no-op for it, so the second client was discarded.
-        assert get_client() is first_client
-
-        # Half two: the store was nevertheless swapped.
+        assert get_client() is client
         assert await get_skill("second") is not None
         assert await get_skill("first") is None
 
-    async def test_init_client_without_a_store_leaves_the_configured_one(
+    async def test_set_skill_store_none_leaves_the_configured_one(
         self, make_raw_skill: Any
     ) -> None:
-        """Only a non-None ``skillStore`` replaces the configured store.
-
-        Otherwise a bare ``init_client()`` from an unrelated code path — the
-        lazy auto-init, say — would silently unconfigure skills.
-        """
+        """``None`` never clears a store; ``shutdown()`` does that."""
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
-        await init_client(options={"skillStore": store}, client=MagicMock())
+        set_skill_store(store)
 
-        await init_client(client=MagicMock())
+        set_skill_store(None)
 
         assert await get_skill("a") is not None
 
-    async def test_failed_init_client_leaves_no_store_configured(
-        self, monkeypatch: pytest.MonkeyPatch, make_raw_skill: Any
+    @pytest.mark.parametrize("not_a_store", ["x", {}, 0, object()])
+    async def test_set_skill_store_rejects_a_non_store(
+        self, make_raw_skill: Any, not_a_store: Any
     ) -> None:
-        """A raising ``init_client`` must not leave global state behind.
+        """A value without the store methods fails where it is passed, not as a
+        ``store_unavailable`` on the first accessor call, and leaves the
+        configured store in place."""
+        store = InMemorySkillStore()
+        store.put(make_raw_skill(key="a"))
+        set_skill_store(store)
 
-        Installing the store before the SDK-key check would leave the accessors
-        working against a store the application believes was never installed,
-        masking a failed initialization.
-        """
-        monkeypatch.delenv("LD_SDK_KEY", raising=False)
+        with pytest.raises(TypeError, match="SkillStore"):
+            set_skill_store(not_a_store)
+
+        assert await get_skill("a") is not None
+
+    async def test_init_client_ignores_a_skill_store_option(
+        self, make_raw_skill: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Core client options do not configure an experimental feature, and
+        the ignored option is reported rather than dropped silently."""
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
 
-        with pytest.raises(RuntimeError, match="No LaunchDarkly SDK key"):
-            await init_client(options={"skillStore": store})
+        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"):
+            await init_client(options={"skillStore": store}, client=MagicMock())
 
+        assert any("skillStore" in message for message in caplog.messages)
         with pytest.raises(RuntimeError, match="skill store"):
             await get_skill("a")
 
@@ -2480,7 +2542,8 @@ class TestTelemetryEmitter:
         store = InMemorySkillStore()
         store.put(make_raw_skill(key="a"))
         store.put(make_raw_skill(key="bad", contentHash="0" * 64))
-        await init_client(options={"skillStore": store}, client=mock_ld_client)
+        await init_client(client=mock_ld_client)
+        set_skill_store(store)
         # See the note in test_no_ld_track_calls_from_write_skills: the
         # sdk-info flush belongs to init_client, not to the accessors.
         mock_ld_client.track.reset_mock()
