@@ -68,7 +68,6 @@ from .spans import (
 _RESPONSES_FORWARDED_KEYS = frozenset(
     {
         "max_output_tokens",
-        "max_tool_calls",
         "parallel_tool_calls",
         "prompt_cache_key",
         "reasoning",
@@ -104,6 +103,8 @@ _RESPONSES_MAPPING_KEYS = frozenset({"reasoning"})
 #:   builds the input from the config's own instructions and messages, and a server-side prompt
 #:   template or a second instructions string would replace or add to it.
 #: * ``moderation``: safety configuration.
+#: * ``max_tool_calls``: cut from the cross-SDK list, because the JS ``openai`` SDK's
+#:   ``responses.create`` has no such parameter and the spec cuts a key rather than work around it.
 #: * ``text_format``: API-shape switch. Only ``.stream`` accepts it, and it is a Python type to
 #:   parse into, which a config cannot express. Structured output goes through ``text``, which the
 #:   handler owns.
@@ -131,6 +132,7 @@ _RESPONSES_EXCLUDED_KEYS = frozenset(
         "prompt",
         "instructions",
         "moderation",
+        "max_tool_calls",
         "text_format",
         "timeout",
         "extra_headers",
