@@ -2597,6 +2597,62 @@ async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
 
 
 @pytest.mark.asyncio
+async def test_a_judge_configs_output_format_never_reaches_the_judge_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The offline path owns the {score, reasoning} contract like the online paths.
+
+    A judge config's own outputFormat would have the handler constrain the judge
+    model to that schema, so its verdict could never parse.
+    """
+    transport = judge_run_transport()
+    judge_variation(
+        monkeypatch,
+        provider="Anthropic",
+        config={
+            "instructions": "Judge {{response_to_evaluate}}",
+            "outputFormat": {
+                "type": "json_schema",
+                "properties": {"message": {"type": "string"}},
+            },
+        },
+    )
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    judged: list[dict[str, Any]] = []
+
+    async def anthropic_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        judged.append(config)
+        return {"output": '{"score": 0.75, "reasoning": "ok"}'}
+
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.judge_scoring"):
+        result = await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=create_handler(("OpenAI", "messages"), _generation_only),
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[Judge(key="$ld:ai:judge:accuracy")],
+            judge_handlers=[create_handler(("Anthropic", "messages"), anthropic_judge)],
+        )
+
+    assert result.passed is True
+    assert judged
+    assert all("outputFormat" not in config for config in judged)
+    assert judged[0]["instructions"] == "Judge {{response_to_evaluate}}"
+    warnings = [r for r in caplog.records if "ignoring outputFormat" in r.message]
+    assert len(warnings) == 1
+    assert "$ld:ai:judge:accuracy" in warnings[0].message
+
+
+@pytest.mark.asyncio
 async def test_generation_handler_runs_a_judge_on_the_same_provider(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
