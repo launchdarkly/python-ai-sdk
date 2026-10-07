@@ -41,6 +41,32 @@ def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
     )
 
 
+def _handler_for(
+    handlers: list[ProviderHandler], provider: str | None, mode: str
+) -> ProviderHandler | None:
+    """Exact ``(provider, mode)`` match, then a same-mode wildcard.
+
+    A wildcard such as LangChain's ``('*', 'messages')`` must not hide a
+    handler registered for the judge's own provider.
+    """
+    exact = next(
+        (handler for handler in handlers if handler.provides_for == (provider, mode)),
+        None,
+    )
+    if exact is not None:
+        return exact
+    return next(
+        (
+            handler
+            for handler in handlers
+            if handler.provides_for
+            and handler.provides_for[0] == "*"
+            and handler.provides_for[1] == mode
+        ),
+        None,
+    )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,35 +128,18 @@ async def run_judges(
             )
 
             # Select judge handler. Priority:
-            #   1. Exact provider + mode (or wildcard provider + same mode)
-            #   2. Agent-mode handler for same provider / wildcard (messages-mode fallback)
-            #   3. Parent handler when it covers the same provider or is a wildcard
+            #   1. Exact provider + mode
+            #   2. Wildcard provider + same mode
+            #   3. Exact provider agent handler, then a wildcard agent handler
+            #   4. Parent handler when it covers the same provider or is a wildcard
             # When falling back to an agent-mode handler for a messages-mode judge
             # config, collapse messages into a single instructions block.
             judge_handler: ProviderHandler = handler
             collapse_messages = False
             if handlers:
-                exact = next(
-                    (
-                        h
-                        for h in handlers
-                        if _provider_matches(h, judge_provider)
-                        and h.provides_for
-                        and h.provides_for[1] == judge_mode
-                    ),
-                    None,
-                )
+                exact = _handler_for(handlers, judge_provider, judge_mode)
                 agent_fallback = (
-                    next(
-                        (
-                            h
-                            for h in handlers
-                            if _provider_matches(h, judge_provider)
-                            and h.provides_for
-                            and h.provides_for[1] == "agent"
-                        ),
-                        None,
-                    )
+                    _handler_for(handlers, judge_provider, "agent")
                     if not exact and judge_mode == "messages"
                     else None
                 )
@@ -179,6 +188,7 @@ async def run_judges(
                     variables={
                         "message_history": message_history,
                         "response_to_evaluate": llm_response,
+                        **({"input": user_input} if user_input else {}),
                     },
                 )
 
@@ -301,27 +311,9 @@ async def build_judge_tasks(
 
             collapse_messages = False
             if handlers:
-                exact = next(
-                    (
-                        h
-                        for h in handlers
-                        if _provider_matches(h, judge_provider)
-                        and h.provides_for
-                        and h.provides_for[1] == judge_mode
-                    ),
-                    None,
-                )
+                exact = _handler_for(handlers, judge_provider, judge_mode)
                 agent_fallback = (
-                    next(
-                        (
-                            h
-                            for h in handlers
-                            if _provider_matches(h, judge_provider)
-                            and h.provides_for
-                            and h.provides_for[1] == "agent"
-                        ),
-                        None,
-                    )
+                    _handler_for(handlers, judge_provider, "agent")
                     if not exact and judge_mode == "messages"
                     else None
                 )
@@ -387,26 +379,9 @@ async def run_judge(
     """
     from .tracking import execute_and_track
 
-    def _matches(h: ProviderHandler) -> bool:
-        return _provider_matches(h, task.judge_provider)
-
-    exact = next(
-        (
-            h
-            for h in handlers
-            if _matches(h) and h.provides_for and h.provides_for[1] == task.judge_mode
-        ),
-        None,
-    )
+    exact = _handler_for(handlers, task.judge_provider, task.judge_mode)
     agent_fallback = (
-        next(
-            (
-                h
-                for h in handlers
-                if _matches(h) and h.provides_for and h.provides_for[1] == "agent"
-            ),
-            None,
-        )
+        _handler_for(handlers, task.judge_provider, "agent")
         if task.judge_mode == "messages" and not exact
         else None
     )
@@ -443,6 +418,7 @@ async def run_judge(
                 **(task.variables or {}),
                 "message_history": message_history,
                 "response_to_evaluate": task.actual_output,
+                **({"input": task.user_input} if task.user_input else {}),
             },
         )
 

@@ -31,7 +31,8 @@ from .questions import (
     typesafe_output,
 )
 
-_TRACER = trace.get_tracer("launchdarkly-ai-typesafe")
+# The conversation processor only holds spans from tracers named "@launchdarkly/...".
+_TRACER = trace.get_tracer("@launchdarkly/ai-typesafe")
 
 
 def _sdk_question(question: Mapping[str, Any]) -> Any:

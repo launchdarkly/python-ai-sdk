@@ -194,6 +194,58 @@ class TestRunJudges:
         assert effective.get("instructions") is not None
         assert effective.get("messages") == []
 
+    async def test_exact_provider_beats_an_earlier_wildcard(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        seen: list[str] = []
+
+        def handler_for(name: str, provider: str) -> ProviderHandler:
+            async def fn(
+                config, user_input, tool_handlers, variables, history=None
+            ) -> dict:  # type: ignore[override]
+                seen.append(name)
+                return {
+                    "output": '{"score": 0.5, "reasoning": "ok"}',
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+
+            return ProviderHandler(fn=fn, provides_for=(provider, "messages"))  # type: ignore[arg-type]
+
+        wildcard = handler_for("wildcard", "*")
+        typesafe = handler_for("typesafe", "TypeSafe")
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "jev"},
+                "provider": {"name": "TypeSafe"},
+                "instructions": "judge",
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "OpenAI"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "jev", "samplingRate": 1.0}]},
+        }
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=wildcard,
+                handlers=[wildcard, typesafe],
+                user_input="question",
+                llm_response="answer",
+                base_track_data={},
+            )
+        assert seen == ["typesafe"]
+
     async def test_exact_agent_handler_fallback_collapses_messages(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -616,9 +668,12 @@ class TestTypesafeJudgeResults:
             }
         )
 
+        seen_variables: list[dict[str, Any]] = []
+
         async def fn(
             config, user_input, tool_handlers, variables, history=None
         ) -> dict:  # type: ignore[override]
+            seen_variables.append(variables)
             return {
                 "output": payload,
                 "usage": {"input_tokens": 100, "output_tokens": 20},
@@ -656,6 +711,8 @@ class TestTypesafeJudgeResults:
                 base_track_data={"runId": "x"},
             )
 
+        assert seen_variables[0]["input"] == "question"
+        assert seen_variables[0]["response_to_evaluate"] == "answer"
         assert set(result) == {
             "jev-judge.migration_intent",
             "jev-judge.migration",
@@ -713,9 +770,12 @@ class TestTypesafeJudgeResults:
             }
         )
 
+        seen_variables: list[dict[str, Any]] = []
+
         async def fn(
             config, user_input, tool_handlers, variables, history=None
         ) -> dict:  # type: ignore[override]
+            seen_variables.append(variables)
             return {
                 "output": payload,
                 "usage": {"input_tokens": 100, "output_tokens": 20},
@@ -737,6 +797,7 @@ class TestTypesafeJudgeResults:
                     "mode": "judge",
                 },
                 actual_output="answer",
+                user_input="question",
                 user_context=CONTEXT,
                 judge_provider="TypeSafe",
                 judge_mode="messages",
@@ -746,6 +807,7 @@ class TestTypesafeJudgeResults:
             [handler],
         )
         assert result is not None
+        assert seen_variables[0]["input"] == "question"
         assert result.event_key == "$ld:ai:judge:jev:migration_intent"
         assert result.score == 0.25
         assert result.response == "Unclear"
