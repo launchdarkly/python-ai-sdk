@@ -136,12 +136,32 @@ _MODEL_SETTINGS_EXCLUDED_KEYS = frozenset(
 
 def _apply_text_verbosity(params: dict[str, Any]) -> dict[str, Any]:
     """Moves ``text.verbosity`` to ``ModelSettings``'s top-level ``verbosity`` and drops the rest
-    of ``text``. A top-level ``verbosity`` the config already set wins, and a ``text`` that is not
-    an object is malformed and dropped.
+    of ``text``. An explicit ``text.verbosity`` wins over a top-level ``verbosity``, as in the JS
+    SDK, and a ``text`` that is not an object is malformed and dropped.
     """
     text = params.pop("text", None)
-    if isinstance(text, Mapping) and "verbosity" in text and "verbosity" not in params:
+    if isinstance(text, Mapping) and "verbosity" in text:
         params["verbosity"] = text["verbosity"]
+    return params
+
+
+#: The ``reasoning`` sub-keys forwarded, the same two the JS SDK keeps.
+_REASONING_KEYS = ("effort", "summary")
+
+
+def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilds a forwarded ``reasoning`` object as the SDK's own ``Reasoning`` type, the type
+    ``ModelSettings`` declares, keeping only ``effort`` and ``summary`` as the JS SDK does. Any
+    other sub-key is dropped, and so is a ``reasoning`` with neither.
+    """
+    reasoning = params.pop("reasoning", None)
+    if not isinstance(reasoning, Mapping):
+        return params
+    kept = {k: reasoning[k] for k in _REASONING_KEYS if k in reasoning}
+    if kept:
+        from openai.types.shared import Reasoning
+
+        params["reasoning"] = Reasoning(**kept)
     return params
 
 
@@ -150,10 +170,12 @@ def _model_settings_parameters(config: AiConfigRep) -> dict[str, Any]:
     native graph both call this, so they forward the same keys. ``max_turns`` is not among them:
     it is a ``Runner.run`` option, read separately for the run.
     """
-    return select_forwarded_parameters(
-        _apply_text_verbosity(model_parameters(config)),
-        _MODEL_SETTINGS_FORWARDED_KEYS,
-        mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
+    return _rebuild_reasoning(
+        select_forwarded_parameters(
+            _apply_text_verbosity(model_parameters(config)),
+            _MODEL_SETTINGS_FORWARDED_KEYS,
+            mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
+        )
     )
 
 

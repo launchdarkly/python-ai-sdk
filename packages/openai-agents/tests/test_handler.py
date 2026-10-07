@@ -2395,8 +2395,13 @@ class TestTextVerbosity:
             "verbosity": "low"
         }
 
-    def test_top_level_verbosity_wins(self) -> None:
+    def test_text_verbosity_wins_over_top_level_verbosity(self) -> None:
         assert self._settings({"verbosity": "high", "text": {"verbosity": "low"}}) == {
+            "verbosity": "low"
+        }
+
+    def test_top_level_verbosity_applies_without_text_verbosity(self) -> None:
+        assert self._settings({"verbosity": "high", "text": {"format": {}}}) == {
             "verbosity": "high"
         }
 
@@ -2409,3 +2414,73 @@ class TestTextVerbosity:
         assert self._settings({"reasoning": "high", "temperature": 0.1}) == {
             "temperature": 0.1
         }
+
+
+class TestReasoningIsRebuilt:
+    def _settings(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_openai_agents.handler import _model_settings_parameters
+
+        return _model_settings_parameters({"model": {"parameters": parameters}})
+
+    def test_becomes_the_sdk_type_with_only_effort_and_summary(self) -> None:
+        from openai.types.shared import Reasoning
+
+        settings = self._settings(
+            {"reasoning": {"effort": "low", "summary": "auto", "generate_summary": "x"}}
+        )
+        assert settings == {"reasoning": Reasoning(effort="low", summary="auto")}
+        assert settings["reasoning"].model_dump(exclude_none=True) == {
+            "effort": "low",
+            "summary": "auto",
+        }
+
+    def test_reasoning_with_neither_sub_key_is_dropped(self) -> None:
+        assert self._settings({"reasoning": {"other": 1}, "temperature": 0.1}) == {
+            "temperature": 0.1
+        }
+
+    async def test_chat_completions_model_reads_it_without_raising(self) -> None:
+        """The Chat Completions model reads ``reasoning.effort`` as an attribute and sends it as
+        ``reasoning_effort``. Runs the real model against a mocked OpenAI client."""
+        from agents import ModelSettings, ModelTracing
+        from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+        from openai.types.chat import ChatCompletion
+
+        completion = ChatCompletion.model_validate(
+            {
+                "id": "c1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hi"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(return_value=completion)
+        client.base_url = "https://api.openai.com/v1/"
+        model = OpenAIChatCompletionsModel("gpt-4o", client)
+
+        settings = ModelSettings(**self._settings({"reasoning": {"effort": "low"}}))
+        await model.get_response(
+            system_instructions=None,
+            input="q",
+            model_settings=settings,
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+        )
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "low"
