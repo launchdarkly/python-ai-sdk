@@ -482,7 +482,6 @@ class _TransferOutcome:
     committed: bool = False
     changes: list[dict[str, Any]] = field(default_factory=list)
     basis: str | None = None
-    fatal: str | None = None
     disconnect: str | None = None
     up_to_date: bool = False
     """A ``none`` intent: the content held is current. Counts as a healthy
@@ -738,14 +737,23 @@ class _ProtocolReader:
         catastrophe = bool(data.get("catastrophe")) if isinstance(data, dict) else False
         silent = bool(data.get("silent")) if isinstance(data, dict) else False
         self._abandon_in_flight()
+        if catastrophe:
+            # Recoverable, as in the base SDKs: Python's does not read the flag
+            # and Go's only logs it. Not ``recycled``, so it is counted even
+            # after a completed exchange, and logged here at ERROR because the
+            # delivery loop logs a disconnect after one at debug.
+            logger.error(
+                "The FDv2 server reported a catastrophic failure (%s); "
+                "reconnecting with backoff",
+                reason,
+            )
+            return _TransferOutcome(
+                disconnect=f"server sent a catastrophic goodbye: {reason}"
+            )
         if not silent:
             # Debug only: a goodbye after a completed exchange is a routine
             # recycle, and the delivery loop warns when one is not.
             logger.debug("FDv2 connection closing: %s", reason)
-        if catastrophe:
-            return _TransferOutcome(
-                fatal=f"server sent a catastrophic goodbye: {reason}"
-            )
         return _TransferOutcome(
             disconnect=f"server said goodbye: {reason}", recycled=True
         )
@@ -1803,8 +1811,6 @@ class FDv2SkillStore:
             self._publish_first_payload()
             if outcome.changes:
                 self._notify(outcome.changes)
-        if outcome.fatal:
-            raise _FatalTransportError(outcome.fatal)
         if outcome.disconnect:
             raise _RecoverableTransportError(
                 outcome.disconnect, recycled=outcome.recycled

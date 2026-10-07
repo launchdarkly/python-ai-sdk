@@ -868,7 +868,7 @@ class TestProtocolReader:
         assert held.get("pdf-extraction", None) is not None
         assert reader.diagnostics.objects_ignored == 4
         assert reader.diagnostics.skill_objects_received == 1
-        assert all(o.fatal is None and o.disconnect is None for o in outcomes)
+        assert all(o.disconnect is None for o in outcomes)
 
     def test_an_unknown_kind_is_ignored_rather_than_fatal(self) -> None:
         """
@@ -886,13 +886,12 @@ class TestProtocolReader:
         }
         outcomes = drive(reader, full_payload(("put-object", exotic)))
         assert len(held) == 0
-        assert all(o.fatal is None and o.disconnect is None for o in outcomes)
+        assert all(o.disconnect is None for o in outcomes)
 
     def test_an_unknown_event_name_is_ignored(self) -> None:
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
         outcome = reader.handle("some-future-event", {"anything": True})
-        assert outcome.fatal is None
         assert outcome.disconnect is None
 
     def test_a_heartbeat_does_nothing(self) -> None:
@@ -922,14 +921,21 @@ class TestProtocolReader:
         reader = _ProtocolReader(_SkillObjectSet())
         outcome = reader.handle("goodbye", {"reason": "rebalancing", "silent": False})
         assert outcome.disconnect is not None
-        assert outcome.fatal is None
+        assert outcome.recycled is True
 
-    def test_a_catastrophic_goodbye_is_fatal(self) -> None:
+    def test_a_catastrophic_goodbye_is_a_counted_disconnect(self) -> None:
+        """Not fatal: neither the Python nor the Go base SDK stops on it.
+
+        Not ``recycled`` either, so the delivery loop counts it as a failure
+        even after a completed exchange.
+        """
         reader = _ProtocolReader(_SkillObjectSet())
         outcome = reader.handle(
             "goodbye", {"reason": "no", "silent": False, "catastrophe": True}
         )
-        assert outcome.fatal is not None
+        assert outcome.disconnect is not None
+        assert "catastroph" in outcome.disconnect
+        assert outcome.recycled is False
 
     def test_transfer_none_holds_everything_and_commits_nothing(self) -> None:
         """
@@ -2690,6 +2696,48 @@ class TestFailureHandling:
         assert "goodbye" in (store.diagnostics.last_error or "")
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert any("server said goodbye" in r.getMessage() for r in warnings)
+
+    def test_a_catastrophic_goodbye_reconnects_and_is_counted(
+        self, caplog: Any
+    ) -> None:
+        """Delivery keeps going, from the basis reached, and says so at ERROR.
+
+        It follows a commit here, which would make an ordinary goodbye a quiet
+        recycle; a catastrophe is still counted and still logged.
+        """
+
+        class _CatastropheThenQuiet(_FakeRequester):
+            def __init__(self) -> None:
+                self.bases: list[str | None] = []
+
+            def stream(self, basis: str | None) -> Any:
+                self.bases.append(basis)
+                if len(self.bases) > 1:
+                    return _BlockingConnection()
+                return _ScriptedConnection(
+                    [
+                        (e["event"], e["data"])
+                        for e in full_payload(("put-object", put_skill()))
+                    ]
+                    + [("goodbye", {"reason": "meltdown", "catastrophe": True})]
+                )
+
+        requester = _CatastropheThenQuiet()
+        store = stream_store(_requester=requester)
+        with caplog.at_level("DEBUG", logger="launchdarkly_ai_server.skills_fdv2"):
+            try:
+                store.start()
+                assert wait_until(lambda: len(requester.bases) >= 2)
+                assert store.failed is None
+                assert store.diagnostics.connection_failures == 1
+                assert "catastroph" in (store.diagnostics.last_error or "")
+                assert requester.bases[1] == "basis-1"
+                assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction")
+            finally:
+                store.close()
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert any("meltdown" in r.getMessage() for r in errors)
+        assert not any("will not retry" in r.getMessage() for r in errors)
 
     def test_a_recycled_connection_reconnects_quietly(self, caplog: Any) -> None:
         # A healthy idle stream reconnects for as long as the process runs, so

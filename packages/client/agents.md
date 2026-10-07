@@ -307,6 +307,13 @@ without it and advance the basis: a lost `delete-object` would then never be ret
 and a lost `put-object` in an `xfer-full` would revoke that skill by omission. Asserted by
 `test_a_malformed_event_abandons_its_transfer_and_keeps_the_basis`.
 
+**A `goodbye` with `catastrophe: true` is a recoverable, counted disconnect, not a fatal.**
+The Python base SDK does not read the flag and the Go SDK only logs it, so stopping delivery
+on it would leave this store the only LaunchDarkly SDK that needs `start()` after a server
+incident. `_goodbye` logs it at ERROR and returns a disconnect without `recycled`, so the
+delivery loop counts it even after a completed exchange. Asserted by
+`test_a_catastrophic_goodbye_reconnects_and_is_counted`.
+
 **Reads are memory-bounded.** `_read_bounded` (poll bodies) and
 `_iter_stream_lines`/`_iter_sse` (each line and each event) enforce `MAX_RESPONSE_BYTES`
 (64 MiB). Crossing it raises `_ResponseTooLargeError`, a fatal error: nothing from that
