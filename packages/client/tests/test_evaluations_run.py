@@ -2548,6 +2548,80 @@ async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
 
 
 @pytest.mark.asyncio
+async def test_scoped_wildcard_does_not_run_a_judge_outside_its_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+
+    async def bedrock_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    scoped = create_handler(("*", "messages"), bedrock_judge)
+    scoped.providers = ("Bedrock",)  # type: ignore[attr-defined]
+
+    with pytest.raises(EvaluationsError, match="Anthropic"):
+        await evals.run(
+            project_key="proj",
+            key="support-qa",
+            dataset="golden",
+            handler=create_handler(("OpenAI", "messages"), _generation_only),
+            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            criteria=[Judge(key="$ld:ai:judge:accuracy")],
+            judge_handlers=[scoped],
+        )
+
+
+@pytest.mark.asyncio
+async def test_two_scoped_judge_handlers_divide_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(api_token="token", sdk_key="sdk-key", transport=transport)
+    chosen: list[str] = []
+
+    def judge_handler(name: str) -> Any:
+        async def run(
+            config: dict[str, Any],
+            user_input: str | None = None,
+            tool_handlers: dict[str, Callable[..., Any]] | None = None,
+            variables: dict[str, Any] | None = None,
+            history: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+            chosen.append(name)
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+        return run
+
+    bedrock = create_handler(("*", "messages"), judge_handler("bedrock"))
+    bedrock.providers = ("Bedrock",)  # type: ignore[attr-defined]
+    anthropic = create_handler(("*", "messages"), judge_handler("anthropic"))
+    anthropic.providers = ("Anthropic",)  # type: ignore[attr-defined]
+
+    result = await evals.run(
+        project_key="proj",
+        key="support-qa",
+        dataset="golden",
+        handler=create_handler(("OpenAI", "messages"), _generation_only),
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        judge_handlers=[bedrock, anthropic],
+    )
+
+    assert result.passed is True
+    assert chosen == ["anthropic"]
+
+
+@pytest.mark.asyncio
 async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,

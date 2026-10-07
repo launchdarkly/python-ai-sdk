@@ -195,6 +195,59 @@ class TestCreateHandler:
         h = create_handler(("MyProvider", "messages"), fn)
         assert h.provides_for == ("MyProvider", "messages")
 
+    def test_providers_defaults_to_none(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        h = create_handler(("*", "messages"), fn)
+        assert h.providers is None
+
+    def test_attaches_providers(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        h = create_handler(("*", "messages"), fn, providers=["Bedrock", "Anthropic"])
+        assert h.provides_for == ("*", "messages")
+        assert h.providers == ("Bedrock", "Anthropic")
+
+    def test_rejects_an_empty_provider_list(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers=[])
+
+    def test_rejects_a_blank_provider_name(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers=["Bedrock", ""])
+
     def test_returns_callable(self) -> None:
         async def fn(
             config: object,

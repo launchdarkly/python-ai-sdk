@@ -14,5 +14,13 @@ def langchain_graph(key: str, llm: Any = None, **options: Any) -> Any:
 
     Equivalent to ``graph(key, handlers=[create_langchain_agents_handler(llm)], **options)``.
     Use the base ``graph()`` directly for multi-provider graphs.
+
+    ``providers`` is forwarded to the handler, not to ``graph()``. It limits which
+    ``config.provider.name`` values the wildcard accepts.
     """
-    return graph(key, handlers=[create_langchain_agents_handler(llm)], **options)
+    providers = options.pop("providers", None)
+    return graph(
+        key,
+        handlers=[create_langchain_agents_handler(llm, providers=providers)],
+        **options,
+    )

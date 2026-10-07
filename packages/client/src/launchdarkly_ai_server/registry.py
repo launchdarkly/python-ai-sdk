@@ -9,6 +9,18 @@ from .types import NativeTool, ProviderHandler
 logger = logging.getLogger(__name__)
 
 
+def _registration_key(
+    handler: ProviderHandler,
+) -> tuple[tuple[str, str], frozenset[str] | None]:
+    """``provides_for`` plus the allowlist as a set. Order and repeated names do not make a new identity."""
+    provides_for = handler.provides_for
+    if provides_for is None:
+        raise ValueError("handler is missing provides_for")
+    providers = handler.providers
+    scope = None if providers is None else frozenset(providers)
+    return (provides_for, scope)
+
+
 class Registry:
     """
     Manages handlers and tools for ``routed_model`` and ``graph``.
@@ -42,13 +54,15 @@ class Registry:
         if handlers:
             for handler in handlers:
                 if handler.provides_for is not None:
-                    # Check for duplicate by providesFor key
-                    key = handler.provides_for
+                    # Identity is provides_for plus the provider set. Two scoped
+                    # wildcards of the same mode stay registered when their lists differ.
+                    key = _registration_key(handler)
                     existing_idx = next(
                         (
                             i
                             for i, h in enumerate(self._handlers)
-                            if h.provides_for == key
+                            if h.provides_for is not None
+                            and _registration_key(h) == key
                         ),
                         None,
                     )

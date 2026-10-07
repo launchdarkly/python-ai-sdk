@@ -355,7 +355,7 @@ Returns a `ConfigInstance` with:
 **Behavior when `.invoke()` is called:**
 
 1. Fetches and validates the `AiConfigRep` variation from LaunchDarkly using `key` and the supplied `context`. Raises if the variation is disabled or invalid.
-2. Selects the handler by matching on `[config.provider.name, normalized mode]`. Selection priority: (a) exact provider match, (b) wildcard `['*', mode]` fallback for multi-provider adapters (e.g. LangChain). Raises if no matching handler is found.
+2. Selects the handler by matching on `[config.provider.name, normalized mode]`. Selection priority: (a) exact provider match, ignoring any `providers` list; (b) a wildcard `['*', mode]` whose `providers` list contains the name, shortest list first and earlier registration on a tie; (c) an unscoped wildcard `['*', mode]`. Raises if no matching handler is found.
 3. Invokes the selected handler with the config, user input, tool handlers, variables, and history. The `context` passed to `.invoke()` is automatically merged into `variables` under the key `ldContext`, so templates can reference `{{ldContext.key}}`, `{{ldContext.email}}`, etc. If `history` is provided, it is passed to the handler as the 5th positional argument — messages-mode handlers splice it into the messages array; agent-mode handlers append it to the system prompt.
 4. Emits LaunchDarkly telemetry events: duration (`$ld:ai:duration:total`), outcome (`$ld:ai:generation:success` / `$ld:ai:generation:error`), and token counts (`$ld:ai:tokens:*`).
 5. If `judgeConfiguration` is present:
@@ -390,7 +390,7 @@ registry = Registry(
 )
 ```
 
-`.register(handlers=[], tools={})` can be called multiple times to add more handlers or tools. Duplicate `provides_for` keys or tool names produce a warning and the last registration wins.
+`.register(handlers=[], tools={})` can be called multiple times to add more handlers or tools. Handler identity is `provides_for` plus the provider set: two wildcards of the same mode with different `providers` lists both stay registered, while the same set (order-independent; repeated names collapse) or two unscoped wildcards warn and the last registration wins. Duplicate tool names do the same.
 
 `global_registry` is a pre-constructed singleton `Registry` instance.
 
@@ -441,7 +441,7 @@ async def handler(
 handler.provides_for = [provider_name: str, mode: Literal["agent", "messages"]]
 ```
 
-The `provides_for` list is how `config()` routes to the correct handler at runtime. The mode element must exactly match the normalized `meta.mode`. The provider element must either exactly match `config.provider.name` **or** be the wildcard `'*'`. A wildcard handler is chosen only when no handler with an exact provider name matches — it acts as a fallback for multi-provider adapters like LangChain. **Always attach `provides_for` using `create_handler` rather than direct attribute assignment.**
+The `provides_for` list is how `config()` routes to the correct handler at runtime. The mode element must exactly match the normalized `meta.mode`. The provider element must either exactly match `config.provider.name` **or** be the wildcard `'*'`. A wildcard handler is chosen only when no handler with an exact provider name matches — it acts as a fallback for multi-provider adapters like LangChain. Pass `providers=["Bedrock"]` to `create_handler` to limit which `config.provider.name` values that wildcard accepts; names must match exactly, and an empty list or a blank name is rejected. Omit `providers` to accept every provider. **Always attach `provides_for` using `create_handler` rather than direct attribute assignment.**
 
 ### Factory Function
 

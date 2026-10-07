@@ -96,11 +96,19 @@ def _provides_for(
     return None
 
 
-def _covers_provider(
-    provides_for: tuple[str, Literal["agent", "messages"]],
-    provider: str | None,
-) -> bool:
-    return provides_for[0] == provider or provides_for[0] == "*"
+def _covers_provider(handler: EvalHandler, provider: str | None) -> bool:
+    """Exact provider name, or a wildcard whose allowlist contains it."""
+    provides_for = _provides_for(handler)
+    if provides_for is None or provider is None:
+        return False
+    if provides_for[0] == provider:
+        return True
+    if provides_for[0] != "*":
+        return False
+    allow = getattr(handler, "providers", None)
+    if allow is None:
+        return True
+    return provider in tuple(allow)
 
 
 def _find_judge_handler(
@@ -115,19 +123,37 @@ def _find_judge_handler(
     ``config()`` already applies to a generation config. Searching in one pass
     would instead let the order the caller happened to list its handlers in
     decide, sending an OpenAI judge through a LangChain adapter that was merely
-    listed first.
+    listed first. Among wildcards that accept the name, the shortest allowlist
+    wins and an unscoped ``*`` is the last resort.
     """
-    for exact in (True, False):
-        for candidate in judge_handlers:
-            provides_for = _provides_for(candidate)
-            if provides_for is None or provides_for[1] != mode:
-                continue
-            if exact:
-                if provides_for[0] == provider:
-                    return candidate
-            elif provides_for[0] == "*":
-                return candidate
-    return None
+    for candidate in judge_handlers:
+        provides_for = _provides_for(candidate)
+        if (
+            provides_for is not None
+            and provider is not None
+            and provides_for[0] == provider
+            and provides_for[1] == mode
+        ):
+            return candidate
+
+    scoped: list[tuple[int, int, EvalHandler]] = []
+    unscoped: EvalHandler | None = None
+    for index, candidate in enumerate(judge_handlers):
+        provides_for = _provides_for(candidate)
+        if provides_for is None or provides_for[0] != "*" or provides_for[1] != mode:
+            continue
+        allow = getattr(candidate, "providers", None)
+        if allow is None:
+            if unscoped is None:
+                unscoped = candidate
+            continue
+        names = tuple(allow)
+        if provider is not None and provider in names:
+            scoped.append((len(names), index, candidate))
+    if scoped:
+        scoped.sort(key=lambda item: (item[0], item[1]))
+        return scoped[0][2]
+    return unscoped
 
 
 def _select_judge_handler(
@@ -164,7 +190,7 @@ def _select_judge_handler(
     generation_provides_for = _provides_for(handler)
     if generation_provides_for is None:
         return JudgeExecution(resolved=resolved, handler=handler)
-    if _covers_provider(generation_provides_for, resolved.provider):
+    if _covers_provider(handler, resolved.provider):
         return JudgeExecution(
             resolved=resolved,
             handler=handler,

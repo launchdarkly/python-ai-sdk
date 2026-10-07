@@ -19,11 +19,15 @@ from launchdarkly_ai_server import (
 
 def _make_handler(
     provides_for: tuple[str, str] | None = ("Test", "messages"),
+    providers: list[str] | None = None,
 ) -> ProviderHandler:
     async def fn(config, user_input, tool_handlers, variables):  # type: ignore[override]
         return {"output": "ok"}
 
-    return ProviderHandler(fn=fn, provides_for=provides_for)  # type: ignore[arg-type]
+    handler = ProviderHandler(fn=fn, provides_for=provides_for)  # type: ignore[arg-type]
+    if providers is not None:
+        handler.providers = tuple(providers)  # type: ignore[attr-defined]
+    return handler
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +66,43 @@ class TestRegistry:
         assert len(r.handlers) == 1
         assert r.handlers[0] is h2
         assert any("already registered" in m for m in caplog.messages)
+
+    def test_scoped_wildcards_with_different_lists_both_stay(self) -> None:
+        r = Registry()
+        bedrock = _make_handler(("*", "agent"), providers=["Bedrock"])
+        anthropic = _make_handler(("*", "agent"), providers=["Anthropic"])
+        r.register(handlers=[bedrock, anthropic])
+        assert r.handlers == [bedrock, anthropic]
+
+    def test_unscoped_wildcard_stays_beside_a_scoped_one(self) -> None:
+        r = Registry()
+        unscoped = _make_handler(("*", "agent"))
+        scoped = _make_handler(("*", "agent"), providers=["Bedrock"])
+        r.register(handlers=[unscoped, scoped])
+        assert r.handlers == [unscoped, scoped]
+
+    def test_same_provider_set_warns_and_replaces_regardless_of_order(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r = Registry()
+        first = _make_handler(("*", "agent"), providers=["Anthropic", "Bedrock"])
+        second = _make_handler(("*", "agent"), providers=["Bedrock", "Anthropic"])
+        with caplog.at_level(logging.WARNING):
+            r.register(handlers=[first])
+            r.register(handlers=[second])
+        assert r.handlers == [second]
+        assert any("already registered" in message for message in caplog.messages)
+
+    def test_repeated_provider_name_is_the_same_identity(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r = Registry()
+        first = _make_handler(("*", "agent"), providers=["Bedrock"])
+        second = _make_handler(("*", "agent"), providers=["Bedrock", "Bedrock"])
+        with caplog.at_level(logging.WARNING):
+            r.register(handlers=[first, second])
+        assert r.handlers == [second]
+        assert any("already registered" in message for message in caplog.messages)
 
     def test_handler_without_provides_for_always_appended(self) -> None:
         r = Registry()
@@ -116,6 +157,18 @@ class TestCompose:
         result = compose(a, b)
         assert len(result.handlers) == 1
         assert result.handlers[0] is h_b
+
+    def test_compose_keeps_scoped_wildcards_with_different_lists(self) -> None:
+        bedrock = _make_handler(("*", "agent"), providers=["Bedrock"])
+        anthropic = _make_handler(("*", "agent"), providers=["Anthropic"])
+        result = compose(Registry(handlers=[bedrock]), Registry(handlers=[anthropic]))
+        assert result.handlers == [bedrock, anthropic]
+
+    def test_compose_replaces_the_same_provider_set(self) -> None:
+        first = _make_handler(("*", "agent"), providers=["Bedrock", "Anthropic"])
+        second = _make_handler(("*", "agent"), providers=["Anthropic", "Bedrock"])
+        result = compose(Registry(handlers=[first]), Registry(handlers=[second]))
+        assert result.handlers == [second]
 
     def test_b_overrides_a_on_tool_conflict(self) -> None:
         fn_a, fn_b = AsyncMock(), AsyncMock()

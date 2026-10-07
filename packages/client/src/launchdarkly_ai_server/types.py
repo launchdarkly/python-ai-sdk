@@ -148,6 +148,7 @@ class ProviderHandler:
     - ``__call__`` — blocking invocation
     - ``stream``   — optional async-generator streaming (may be ``None``)
     - ``provides_for`` — ``(provider_name, mode)`` tuple or ``None``
+    - ``providers`` — optional allowlist consulted only when ``provides_for`` names ``"*"``
     - ``capture_content`` — whether this handler was built with content capture on
 
     ``capture_content`` is declared here so the client core can apply the handler's own content
@@ -156,6 +157,7 @@ class ProviderHandler:
     """
 
     provides_for: tuple[str, Literal["agent", "messages"]] | None
+    providers: tuple[str, ...] | None
     capture_content: bool
 
     def __init__(
@@ -164,11 +166,13 @@ class ProviderHandler:
         provides_for: tuple[str, Literal["agent", "messages"]] | None = None,
         stream_fn: _StreamFn | None = None,
         capture_content: bool = False,
+        providers: tuple[str, ...] | None = None,
     ) -> None:
         self._fn = fn
         self.provides_for = provides_for
         self._stream_fn = stream_fn
         self.capture_content = capture_content
+        self.providers = providers
 
     async def __call__(
         self,

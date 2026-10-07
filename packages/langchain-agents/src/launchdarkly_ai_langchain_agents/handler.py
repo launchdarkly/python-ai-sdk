@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -254,7 +254,10 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 
 
 def create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None,
+    *,
+    providers: Sequence[str] | None = None,
+    capture_content: bool = False,
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
 
@@ -264,6 +267,10 @@ def create_langchain_agents_handler(
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
     meaning models, token counts, timings and tool names, until a caller asks for more.
+
+    *providers* limits which ``config.provider.name`` values this wildcard accepts.
+    Omit it to match every provider. Names must match the config exactly, for example
+    ``["Bedrock"]``.
     """
 
     async def _call_impl(
@@ -417,6 +424,7 @@ def create_langchain_agents_handler(
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
         capture_content=capture_content,
+        providers=providers,
     )
 
 
@@ -567,13 +575,15 @@ def langchain_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
-    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
-    # asking for content on spans got a TypeError instead of content.
+    # Lifted out of kwargs: capture_content and providers configure the handler, variables belong
+    # to the invocation. Leaving them in would pass them to config(), which takes none of them.
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
+    providers = kwargs.pop("providers", None)
     return config(
         key=config_key,
-        handler=create_langchain_agents_handler(capture_content=capture_content),
+        handler=create_langchain_agents_handler(
+            providers=providers, capture_content=capture_content
+        ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)
