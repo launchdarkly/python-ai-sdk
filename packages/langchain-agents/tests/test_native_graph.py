@@ -22,7 +22,6 @@ from launchdarkly_ai_langchain_agents.native_graph import (
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
 from tests.forwarding_spec import (
     LANGCHAIN_CHAT_OPENAI,
-    LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
     candidate_keys,
     probe_forwarded_keys,
 )
@@ -1087,6 +1086,6 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
                 await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
             return mocks["langchain_openai"].ChatOpenAI.call_args.kwargs
 
-        expected = LANGCHAIN_CHAT_OPENAI - LANGCHAIN_CHAT_OPENAI_UNSUPPORTED
+        expected = LANGCHAIN_CHAT_OPENAI
         candidates = candidate_keys(_REAL_CHAT_OPENAI.model_fields, expected)
         assert await probe_forwarded_keys(candidates, call) == expected

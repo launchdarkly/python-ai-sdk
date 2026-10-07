@@ -39,7 +39,6 @@ from tests.forwarding_spec import (
     LANGCHAIN_CHAT_ANTHROPIC,
     LANGCHAIN_CHAT_BEDROCK_CONVERSE,
     LANGCHAIN_CHAT_OPENAI,
-    LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
     candidate_keys,
     probe_forwarded_keys,
     sample,
@@ -301,7 +300,7 @@ class TestForwardsExactlyTheCrossSdkList:
                 "openai",
                 "langchain_openai",
                 "ChatOpenAI",
-                LANGCHAIN_CHAT_OPENAI - LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
+                LANGCHAIN_CHAT_OPENAI,
             ),
             (
                 "anthropic",
@@ -329,19 +328,12 @@ class TestForwardsExactlyTheCrossSdkList:
         assert await probe_forwarded_keys(candidates, call) == expected
         assert baseline == {"model": "configured-model"}
 
-    def test_chat_openai_has_no_prompt_cache_key_field(self) -> None:
-        """Why ``prompt_cache_key`` is left off: ``ChatOpenAI`` cannot take it. When it can,
-        this fails and the key goes on the list."""
-        assert not LANGCHAIN_CHAT_OPENAI_UNSUPPORTED & _accepted_keys(
-            langchain_openai.ChatOpenAI
-        )
-
     @pytest.mark.parametrize(
         ("cls", "keys"),
         [
             (
                 langchain_openai.ChatOpenAI,
-                LANGCHAIN_CHAT_OPENAI - LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
+                LANGCHAIN_CHAT_OPENAI,
             ),
             (langchain_anthropic.ChatAnthropic, LANGCHAIN_CHAT_ANTHROPIC),
         ],
@@ -419,3 +411,11 @@ class TestMaxTokensToSampleRename:
         assert _build(
             "anthropic", {"max_tokens_to_sample": 300, "max_tokens": 200}
         ) == {"model": "configured-model", "max_tokens": 200}
+
+
+def test_prompt_cache_key_is_dropped_for_chat_openai() -> None:
+    """Cut from the cross-SDK ChatOpenAI list: a config value never reaches the constructor."""
+    assert _build("openai", {"prompt_cache_key": "cache-1", "temperature": 0.2}) == {
+        "model": "configured-model",
+        "temperature": 0.2,
+    }

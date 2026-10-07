@@ -82,8 +82,7 @@ _LANGCHAIN_RUNTIME_KEYS = frozenset(
 #: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
 #: stays exhaustive as the SDK's own pydantic model changes.
 #:
-#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12), less
-#: ``prompt_cache_key``: ``ChatOpenAI`` has no such field, so the handler cannot set it.
+#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12).
 _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -126,6 +125,9 @@ _CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 #:   config cannot set reasoning by one spelling and not the other.
 #: * ``store``: data retention. It decides whether the request is kept on the server.
 #: * ``seed``: not on the cross-SDK list.
+#: * ``prompt_cache_key``: cut from the cross-SDK list, because ``ChatOpenAI`` has no such field
+#:   and the spec cuts a key rather than work around it. It is not in the set below because
+#:   ``ChatOpenAI`` does not accept it at all, which the drift test requires of every listed key.
 #: * ``stream_usage``, ``include_response_headers``, ``disabled_params``, ``tiktoken_model_name``:
 #:   runtime wiring. They change what the handler gets back and how usage is reported to it.
 #: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.

@@ -83,7 +83,6 @@ LANGCHAIN_CHAT_OPENAI = frozenset(
         "max_tokens",
         "n",
         "presence_penalty",
-        "prompt_cache_key",
         "service_tier",
         "stop",
         "stop_sequences",
@@ -93,10 +92,6 @@ LANGCHAIN_CHAT_OPENAI = frozenset(
         "verbosity",
     }
 )
-
-#: Canonical keys ``ChatOpenAI`` (langchain-openai 1.3.3) has no field for, so the handler cannot
-#: set them and leaves them out.
-LANGCHAIN_CHAT_OPENAI_UNSUPPORTED = frozenset({"prompt_cache_key"})
 
 LANGCHAIN_CHAT_ANTHROPIC = frozenset(
     {
