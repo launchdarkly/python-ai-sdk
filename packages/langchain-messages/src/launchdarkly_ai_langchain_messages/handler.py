@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from types import SimpleNamespace
 from typing import Any
 
@@ -175,6 +175,8 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: package's tests asserts this classification stays exhaustive.
 #:
 #: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
+#: ``max_tokens_to_sample`` is renamed to ``max_tokens`` before this list applies, and a
+#: ``max_tokens`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
 _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
     {
         "betas",
@@ -194,6 +196,10 @@ _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
 #: Forwarded keys whose value must be an object. A config value of any other type is malformed
 #: and dropped rather than passed to ``ChatAnthropic``.
 _CHAT_ANTHROPIC_MAPPING_KEYS = frozenset({"output_config", "thinking"})
+
+#: Alias to the name it is renamed to before forwarding. ``ChatAnthropic`` takes both spellings
+#: of the one field, so passing both would leave which one wins to pydantic.
+_CHAT_ANTHROPIC_RENAMES = {"max_tokens_to_sample": "max_tokens"}
 
 #: Accepted by ``ChatAnthropic`` but never forwarded, and why:
 #: * ``anthropic_api_key``, ``api_key``: credentials (field plus alias).
@@ -497,9 +503,15 @@ def _model_constructor_kwargs(
     forwarded_keys: frozenset[str],
     *,
     mapping_keys: frozenset[str] = frozenset(),
+    renames: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    params = model_parameters(config)
+    for alias, name in (renames or {}).items():
+        if alias in params:
+            value = params.pop(alias)
+            params.setdefault(name, value)
     parameters = select_forwarded_parameters(
-        model_parameters(config), forwarded_keys, mapping_keys=mapping_keys
+        params, forwarded_keys, mapping_keys=mapping_keys
     )
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
@@ -526,6 +538,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
                 "claude-3-5-sonnet-20241022",
                 _CHAT_ANTHROPIC_FORWARDED_KEYS,
                 mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
+                renames=_CHAT_ANTHROPIC_RENAMES,
             )
         )
     if provider == "bedrock":

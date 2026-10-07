@@ -402,3 +402,19 @@ class TestInvokeAndStreamBuildTheSameModel:
 
         assert len(seen) == 2
         assert seen[0] == seen[1]
+
+
+class TestMaxTokensToSampleRename:
+    """``ChatAnthropic`` takes ``max_tokens_to_sample`` as an alias of ``max_tokens``. It is
+    renamed before forwarding, and ``max_tokens`` wins when both are set."""
+
+    def test_alias_becomes_max_tokens(self) -> None:
+        assert _build("anthropic", {"max_tokens_to_sample": 300}) == {
+            "model": "configured-model",
+            "max_tokens": 300,
+        }
+
+    def test_max_tokens_wins_when_both_are_set(self) -> None:
+        assert _build(
+            "anthropic", {"max_tokens_to_sample": 300, "max_tokens": 200}
+        ) == {"model": "configured-model", "max_tokens": 200}
