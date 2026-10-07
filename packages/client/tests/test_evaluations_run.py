@@ -3071,7 +3071,8 @@ def config_variation_page(**overrides: Any) -> dict[str, Any]:
         "name": "Control",
         "version": 2,
         "createdAt": 2,
-        "model": {"modelName": "gpt-4o", "parameters": {"temperature": 0.7}},
+        # The management API serves the model-config key as modelName.
+        "model": {"modelName": "OpenAI.gpt-4o", "parameters": {"temperature": 0.7}},
         "modelConfigKey": "OpenAI.gpt-4o",
         "modelConfigVersion": 3,
         "instructions": "You are a support agent.",
@@ -3425,8 +3426,12 @@ def test_ai_config_variation_from_api_layers_the_model_config() -> None:
     assert linked.tool_versions == {"lookup_order": 4}
     assert linked.judge_keys == ["security-judge"]
 
-    unlinked = AIConfigVariation.from_api(latest)
+    unlinked = AIConfigVariation.from_api(
+        {**latest, "model": {**latest["model"], "modelName": "gpt-4o-mini"}}
+    )
     assert "provider" not in unlinked.generation
+    # With no model config linked, the variation's own modelName is the model.
+    assert unlinked.generation["model"] == "gpt-4o-mini"
     assert unlinked.generation["parameters"] == {"temperature": 0.7}
 
 
