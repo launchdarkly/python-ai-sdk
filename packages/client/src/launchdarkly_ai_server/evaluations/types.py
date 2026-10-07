@@ -138,8 +138,12 @@ class AIConfigVariation:
             base_parameters = model_config.get("params")
             if isinstance(base_parameters, Mapping):
                 parameters = {**base_parameters, **parameters}
-            if not model_name:
-                model_name = model_config.get("id")
+            # A linked variation's modelName is the model-config key
+            # ("OpenAI.gpt-4o"), not a model ID the provider accepts; the
+            # model config's id is, so it wins whenever one is linked.
+            config_model_id = model_config.get("id")
+            if isinstance(config_model_id, str) and config_model_id:
+                model_name = config_model_id
 
         generation = GenerationConfig()
         if isinstance(provider, str) and provider:
