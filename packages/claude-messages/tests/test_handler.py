@@ -2556,9 +2556,14 @@ class TestStreamingInputWriteIsGuarded:
         assert "launchdarkly.stream.abandoned" not in chat.attributes
 
 
+#: Never-forwarded keys the handler sets itself from the config's instructions. ``find_leaks``
+#: still proves the config's own value for them never arrives.
+_HANDLER_SETS = frozenset({"system"})
+
+
 class TestNeverForwardedParameters:
-    """No credential, endpoint, request-injection, remote-tool, or host-process key in
-    ``model.parameters`` reaches ``messages.create`` or ``messages.stream``."""
+    """No key in the never-forwarded bag reaches ``messages.create`` or ``messages.stream`` from
+    ``model.parameters``."""
 
     async def test_invoke_forwards_none_of_them(
         self, mock_anthropic: MagicMock
@@ -2572,7 +2577,7 @@ class TestNeverForwardedParameters:
         await create_claude_messages_handler()(config, "q", {}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         assert not find_leaks(call_kwargs)
-        assert not set(call_kwargs) & NEVER_FORWARDED_KEYS
+        assert not set(call_kwargs) & (NEVER_FORWARDED_KEYS - _HANDLER_SETS)
 
     async def test_stream_forwards_none_of_them(
         self, mock_anthropic: MagicMock
@@ -2592,7 +2597,7 @@ class TestNeverForwardedParameters:
             pass
         call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
         assert not find_leaks(call_kwargs)
-        assert not set(call_kwargs) & NEVER_FORWARDED_KEYS
+        assert not set(call_kwargs) & (NEVER_FORWARDED_KEYS - _HANDLER_SETS)
 
 
 class TestInvokeAndStreamForwardTheSameKeys:

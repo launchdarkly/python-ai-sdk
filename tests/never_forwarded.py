@@ -9,8 +9,10 @@ forwarded lists against it, and each package's own tests check their real call s
 
 from __future__ import annotations
 
-#: Credentials, endpoints and connection settings, raw request injection, remote tools, and the
-#: Claude Agents host-process settings.
+#: Credentials, endpoints and connection settings, raw request injection, remote tools, the Claude
+#: Agents host-process settings, and the categories no cross-SDK allowlist (TESTING.md section 1.12)
+#: may hold: data retention, server-side state, identity and attribution, runtime wiring and
+#: API-shape switches, prompt content beyond the instructions, and safety configuration.
 NEVER_FORWARDED_KEYS = frozenset(
     {
         # Credentials.
@@ -61,6 +63,29 @@ NEVER_FORWARDED_KEYS = frozenset(
         "additional_model_request_fields",
         # Remote tools.
         "mcp_servers",
+        # Data retention.
+        "store",
+        "prompt_cache_retention",
+        # Server-side state.
+        "context_management",
+        "truncation",
+        # Identity and attribution.
+        "metadata",
+        "user",
+        "safety_identifier",
+        "request_metadata",
+        # Runtime wiring and API-shape switches.
+        "include",
+        "include_usage",
+        "response_include",
+        # Prompt content beyond the instructions.
+        "instructions",
+        "system",
+        # Safety configuration.
+        "moderation",
+        "guardrails",
+        "guardrail_config",
+        "guard_last_turn_only",
         # Claude Agents host-process settings.
         "cli_path",
         "env",
