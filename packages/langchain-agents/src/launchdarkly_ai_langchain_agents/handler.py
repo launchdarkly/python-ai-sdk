@@ -80,32 +80,30 @@ _LANGCHAIN_RUNTIME_KEYS = frozenset(
 #: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
 #: stays exhaustive as the SDK's own pydantic model changes.
 #:
-#: Only model request settings are forwarded.
+#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12), less
+#: ``prompt_cache_key``: ``ChatOpenAI`` has no such field, so the handler cannot set it.
 _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
     {
-        "context_management",
         "frequency_penalty",
-        "include",
         "logit_bias",
         "logprobs",
         "max_completion_tokens",
         "max_tokens",
         "n",
         "presence_penalty",
-        "reasoning",
-        "reasoning_effort",
-        "seed",
         "service_tier",
         "stop",
         "stop_sequences",
-        "store",
         "temperature",
         "top_logprobs",
         "top_p",
-        "truncation",
         "verbosity",
     }
 )
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ChatOpenAI``.
+_CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 
 #: Accepted by ``ChatOpenAI`` but never forwarded, and why:
 #: * ``api_key``, ``openai_api_key``, ``organization``, ``openai_organization``: credentials.
@@ -117,9 +115,17 @@ _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
 #:   ``extra_headers``/``extra_query`` or any other excluded key past this list.
 #: * ``max_retries``, ``request_timeout``, ``timeout``, ``stream_chunk_timeout``: retries and
 #:   timeouts.
-#: * ``stream_usage``, ``include_response_headers``, ``disabled_params``, ``tiktoken_model_name``,
-#:   ``use_responses_api``, ``use_previous_response_id``: which API and response shape the handler
-#:   gets back, and how usage is reported to it.
+#: * ``use_responses_api``, ``use_previous_response_id``, ``include``, ``reasoning``,
+#:   ``truncation``, ``context_management``: API-shape switch. Each one makes ``ChatOpenAI`` call
+#:   the Responses API instead of Chat Completions, which changes the API and response shape the
+#:   handler gets back. ``truncation``, ``context_management`` and ``use_previous_response_id``
+#:   also lean on server-side conversation state.
+#: * ``reasoning_effort``: the Chat Completions spelling of ``reasoning``, left out with it so a
+#:   config cannot set reasoning by one spelling and not the other.
+#: * ``store``: data retention. It decides whether the request is kept on the server.
+#: * ``seed``: not on the cross-SDK list.
+#: * ``stream_usage``, ``include_response_headers``, ``disabled_params``, ``tiktoken_model_name``:
+#:   runtime wiring. They change what the handler gets back and how usage is reported to it.
 #: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
 #:
 #: Named for the drift test and for review, not read at runtime: the forwarded list above already
@@ -153,15 +159,23 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "tiktoken_model_name",
     "use_responses_api",
     "use_previous_response_id",
+    "include",
+    "reasoning",
+    "truncation",
+    "context_management",
+    "reasoning_effort",
+    "store",
+    "seed",
 }
 
 #: Every key ``ChatAnthropic`` accepts (field names plus pydantic aliases), classified the same way
 #: as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``TestChatAnthropicAcceptsExactlyTheseKeys`` in this
 #: package's tests asserts this classification stays exhaustive.
+#:
+#: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
 _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
     {
         "betas",
-        "context_management",
         "effort",
         "max_tokens",
         "max_tokens_to_sample",
@@ -175,10 +189,16 @@ _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
     }
 )
 
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ChatAnthropic``.
+_CHAT_ANTHROPIC_MAPPING_KEYS = frozenset({"output_config", "thinking"})
+
 #: Accepted by ``ChatAnthropic`` but never forwarded, and why:
 #: * ``anthropic_api_key``, ``api_key``: credentials (field plus alias).
 #: * ``anthropic_api_url``, ``base_url``, ``anthropic_proxy``: where requests go.
 #: * ``inference_geo``: the region inference runs in, which decides where data is processed.
+#: * ``context_management``: server-side state. It has the server clear or compact earlier
+#:   context.
 #: * ``default_headers``, ``model_kwargs``: raw request injection. ``model_kwargs`` is merged
 #:   straight into the request, so it would carry any excluded key past this list.
 #: * ``mcp_servers``: attaches remote MCP servers, which then receive the conversation.
@@ -196,6 +216,7 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "base_url",
     "anthropic_proxy",
     "inference_geo",
+    "context_management",
     "default_headers",
     "model_kwargs",
     "mcp_servers",
@@ -211,24 +232,21 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: package (Bedrock support is opt-in, see ``_make_default_chat_model``), so
 #: ``TestChatBedrockConverseAcceptsExactlyTheseKeys`` in this package's tests skips itself when it
 #: is not installed rather than asserting nothing.
+#:
+#: This is the cross-SDK list for LangChain ChatBedrockConverse (TESTING.md section 1.12).
 _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS = frozenset(
     {
-        "guard_last_turn_only",
-        "guardrail_config",
-        "guardrails",
         "max_tokens",
-        "output_config",
         "performance_config",
-        "reasoning_effort",
-        "request_metadata",
         "service_tier",
-        "stop",
-        "stop_sequences",
-        "system",
         "temperature",
         "top_p",
     }
 )
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ChatBedrockConverse``.
+_CHAT_BEDROCK_CONVERSE_MAPPING_KEYS = frozenset({"performance_config"})
 
 #: Accepted by ``ChatBedrockConverse`` but never forwarded, and why:
 #: * ``bedrock_api_key``, ``api_key``, ``aws_access_key_id``, ``aws_secret_access_key``,
@@ -243,6 +261,17 @@ _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS = frozenset(
 #:   same identity as ``model_id`` (handler-owned).
 #: * ``additional_model_response_field_paths``, ``raw_blocks``, ``supports_tool_choice_values``:
 #:   the response shape and tool-calling behaviour the handler relies on.
+#: * ``guardrails``, ``guardrail_config``, ``guard_last_turn_only``: safety configuration.
+#: * ``request_metadata``: identity and attribution. It tags the request for whoever reads the
+#:   invocation logs.
+#: * ``system``: prompt content beyond instructions. It adds system prompt blocks on top of the
+#:   config's own instructions.
+#: * ``output_config``: API-shape switch. It is how ``ChatBedrockConverse`` asks for structured
+#:   output, which changes the response the handler reads.
+#: * ``reasoning_effort``: runtime wiring. ``ChatBedrockConverse`` turns it into model-specific
+#:   ``additionalModelRequestFields``, the raw request fields the handler never sets otherwise.
+#: * ``stop``, ``stop_sequences``: runtime wiring. ``ChatBedrockConverse`` merges them with the
+#:   stop sequences its own structured-output prompt relies on.
 #: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
 #:
 #: Named for the drift test and for review, not read at runtime.
@@ -269,6 +298,15 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "additional_model_response_field_paths",
     "raw_blocks",
     "supports_tool_choice_values",
+    "guardrails",
+    "guardrail_config",
+    "guard_last_turn_only",
+    "request_metadata",
+    "system",
+    "output_config",
+    "reasoning_effort",
+    "stop",
+    "stop_sequences",
 }
 
 
@@ -407,8 +445,12 @@ def _model_constructor_kwargs(
     config: AiConfigRep,
     fallback_name: str,
     forwarded_keys: frozenset[str],
+    *,
+    mapping_keys: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    parameters = select_forwarded_parameters(model_parameters(config), forwarded_keys)
+    parameters = select_forwarded_parameters(
+        model_parameters(config), forwarded_keys, mapping_keys=mapping_keys
+    )
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
 
@@ -423,7 +465,7 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
-    ``model.parameters`` are passed through unchanged.
+    ``model.parameters`` are filtered to that class's forwarded list first.
     """
     import importlib
 
@@ -432,7 +474,10 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
             **_model_constructor_kwargs(
-                config, "claude-3-5-sonnet-20241022", _CHAT_ANTHROPIC_FORWARDED_KEYS
+                config,
+                "claude-3-5-sonnet-20241022",
+                _CHAT_ANTHROPIC_FORWARDED_KEYS,
+                mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
             )
         )
     if provider == "bedrock":
@@ -445,12 +490,20 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
             ) from exc
         return lc_aws.ChatBedrockConverse(
             **_model_constructor_kwargs(
-                config, "", _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS
+                config,
+                "",
+                _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
+                mapping_keys=_CHAT_BEDROCK_CONVERSE_MAPPING_KEYS,
             )
         )
     lc_openai = importlib.import_module("langchain_openai")
     return lc_openai.ChatOpenAI(
-        **_model_constructor_kwargs(config, "gpt-4o", _CHAT_OPENAI_FORWARDED_KEYS)
+        **_model_constructor_kwargs(
+            config,
+            "gpt-4o",
+            _CHAT_OPENAI_FORWARDED_KEYS,
+            mapping_keys=_CHAT_OPENAI_MAPPING_KEYS,
+        )
     )
 
 

@@ -25,7 +25,7 @@ from launchdarkly_ai_server import (
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
 
-from .handler import _CHAT_OPENAI_FORWARDED_KEYS
+from .handler import _CHAT_OPENAI_FORWARDED_KEYS, _CHAT_OPENAI_MAPPING_KEYS
 from .messages import to_lang_chain_messages
 
 try:
@@ -212,7 +212,9 @@ def to_lang_graph(
                 kwargs = model_parameters(node.config)
                 if kwargs:
                     kwargs = select_forwarded_parameters(
-                        kwargs, _CHAT_OPENAI_FORWARDED_KEYS
+                        kwargs,
+                        _CHAT_OPENAI_FORWARDED_KEYS,
+                        mapping_keys=_CHAT_OPENAI_MAPPING_KEYS,
                     )
                 kwargs["model"] = model_cfg.get("name") or "gpt-4o"
                 chat_model = lc_openai.ChatOpenAI(**kwargs)

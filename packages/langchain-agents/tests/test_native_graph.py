@@ -20,6 +20,12 @@ from launchdarkly_ai_langchain_agents.native_graph import (
     to_lang_graph,
 )
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.forwarding_spec import (
+    LANGCHAIN_CHAT_OPENAI,
+    LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
+    candidate_keys,
+    probe_forwarded_keys,
+)
 from tests.never_forwarded import NEVER_FORWARDED_BAG
 
 # ---------------------------------------------------------------------------
@@ -1047,3 +1053,40 @@ class TestNativeGraphNeverForwardedParameters:
             "temperature": 0.2,
             "model": "gpt-4o",
         }
+
+
+class TestNativeGraphForwardsExactlyTheCrossSdkList:
+    """The native graph's default ``ChatOpenAI`` takes the same forwarded list as the handler's,
+    so a probe of one node finds exactly the cross-SDK ChatOpenAI list."""
+
+    @pytest.mark.asyncio
+    async def test_default_chat_openai(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+            graph_def = _make_graph_def(
+                nodes={
+                    "root": {
+                        "key": "root",
+                        "config": {
+                            "model": {"name": "gpt-4o", "parameters": parameters},
+                            "instructions": "help",
+                        },
+                        "meta": {"variationKey": "v1", "version": 1},
+                        "edges": [],
+                        "is_terminal": True,
+                    }
+                }
+            )
+
+            async def _visit(fn: Any, ctx: Any = None) -> None:
+                if graph_def.root is not None:
+                    await fn(graph_def.root)
+
+            graph_def.traverse = _visit
+            with _patch_imports(mocks):
+                await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+            return mocks["langchain_openai"].ChatOpenAI.call_args.kwargs
+
+        expected = LANGCHAIN_CHAT_OPENAI - LANGCHAIN_CHAT_OPENAI_UNSUPPORTED
+        candidates = candidate_keys(_REAL_CHAT_OPENAI.model_fields, expected)
+        assert await probe_forwarded_keys(candidates, call) == expected

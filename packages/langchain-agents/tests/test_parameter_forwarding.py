@@ -13,8 +13,10 @@ classified yet fails loudly by name, and so does a list entry that is not a real
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping
 from typing import Any, ClassVar
+from unittest.mock import MagicMock, patch
 
 import langchain_anthropic
 import langchain_openai
@@ -30,7 +32,17 @@ from launchdarkly_ai_langchain_agents.handler import (
     _CHAT_OPENAI_EXCLUDED_KEYS,
     _CHAT_OPENAI_FORWARDED_KEYS,
     _CHAT_OPENAI_OWNED_KEYS,
+    _make_default_chat_model,
     _model_constructor_kwargs,
+)
+from tests.forwarding_spec import (
+    LANGCHAIN_CHAT_ANTHROPIC,
+    LANGCHAIN_CHAT_BEDROCK_CONVERSE,
+    LANGCHAIN_CHAT_OPENAI,
+    LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
+    candidate_keys,
+    probe_forwarded_keys,
+    sample,
 )
 from tests.never_forwarded import NEVER_FORWARDED_BAG
 
@@ -248,3 +260,145 @@ class TestModelKwargsCannotSmuggleRequestKeys:
         payload = self._payload(**kwargs)
         assert "extra_headers" not in payload
         assert "extra_query" not in payload
+
+
+def _probe_config(provider: str, parameters: dict[str, Any]) -> Any:
+    return {
+        "model": {"name": "configured-model", "parameters": parameters},
+        "provider": {"name": provider},
+    }
+
+
+def _build(provider: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    """Runs ``_make_default_chat_model`` for *provider* against a recording constructor and
+    returns the kwargs it passed."""
+    ctor = MagicMock()
+    module = MagicMock(ChatOpenAI=ctor, ChatAnthropic=ctor, ChatBedrockConverse=ctor)
+    with patch("importlib.import_module", return_value=module):
+        _make_default_chat_model(_probe_config(provider, parameters))
+    kwargs: dict[str, Any] = ctor.call_args.kwargs
+    return kwargs
+
+
+def _accepted_or_empty(module_name: str, cls_name: str) -> frozenset[str]:
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return frozenset()
+    return _accepted_keys(getattr(module, cls_name))
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes each chat model constructor one key at a time: the keys that change what it is
+    built with are exactly the cross-SDK list for that class. ``invoke`` and ``stream`` both
+    build the model through ``_make_default_chat_model``, so this covers both paths."""
+
+    @pytest.mark.parametrize(
+        ("provider", "module_name", "cls_name", "expected"),
+        [
+            (
+                "openai",
+                "langchain_openai",
+                "ChatOpenAI",
+                LANGCHAIN_CHAT_OPENAI - LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
+            ),
+            (
+                "anthropic",
+                "langchain_anthropic",
+                "ChatAnthropic",
+                LANGCHAIN_CHAT_ANTHROPIC,
+            ),
+            (
+                "bedrock",
+                "langchain_aws",
+                "ChatBedrockConverse",
+                LANGCHAIN_CHAT_BEDROCK_CONVERSE,
+            ),
+        ],
+    )
+    async def test_forwarded_keys(
+        self, provider: str, module_name: str, cls_name: str, expected: frozenset[str]
+    ) -> None:
+        baseline = _build(provider, {})
+
+        async def call(parameters: dict[str, Any]) -> object:
+            return _build(provider, parameters)
+
+        candidates = candidate_keys(_accepted_or_empty(module_name, cls_name), expected)
+        assert await probe_forwarded_keys(candidates, call) == expected
+        assert baseline == {"model": "configured-model"}
+
+    def test_chat_openai_has_no_prompt_cache_key_field(self) -> None:
+        """Why ``prompt_cache_key`` is left off: ``ChatOpenAI`` cannot take it. When it can,
+        this fails and the key goes on the list."""
+        assert not LANGCHAIN_CHAT_OPENAI_UNSUPPORTED & _accepted_keys(
+            langchain_openai.ChatOpenAI
+        )
+
+    @pytest.mark.parametrize(
+        ("cls", "keys"),
+        [
+            (
+                langchain_openai.ChatOpenAI,
+                LANGCHAIN_CHAT_OPENAI - LANGCHAIN_CHAT_OPENAI_UNSUPPORTED,
+            ),
+            (langchain_anthropic.ChatAnthropic, LANGCHAIN_CHAT_ANTHROPIC),
+        ],
+    )
+    def test_the_real_class_accepts_every_forwarded_key(
+        self, cls: Any, keys: frozenset[str]
+    ) -> None:
+        for key in sorted(keys):
+            cls(model="m", api_key="sk-test-not-a-real-key", **{key: sample(key)})
+
+
+class TestMalformedObjectValuesAreDropped:
+    @pytest.mark.parametrize(
+        ("provider", "parameters"),
+        [
+            ("openai", {"logit_bias": "none"}),
+            ("anthropic", {"thinking": "enabled", "output_config": "json"}),
+            ("bedrock", {"performance_config": "optimized"}),
+        ],
+    )
+    def test_dropped(self, provider: str, parameters: dict[str, Any]) -> None:
+        kwargs = _build(provider, {**parameters, "temperature": 0.2})
+        assert kwargs == {"model": "configured-model", "temperature": 0.2}
+
+
+class _Built(Exception):
+    """Stops a run once the chat model has been built."""
+
+
+class TestInvokeAndStreamBuildTheSameModel:
+    """Both paths hand the same config to ``_make_default_chat_model``, so the probe above
+    covers both."""
+
+    async def test_same_config_reaches_the_builder(self) -> None:
+        import launchdarkly_ai_langchain_agents.handler as handler_mod
+        from launchdarkly_ai_langchain_agents import create_langchain_agents_handler
+
+        config = {
+            "model": {
+                "name": "gpt-4o",
+                "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.2, "top_p": 0.5},
+            },
+            "provider": {"name": "openai"},
+            "instructions": "help",
+        }
+        seen: list[Any] = []
+
+        def _builder(cfg: Any, *_rest: Any) -> Any:
+            seen.append(cfg)
+            raise _Built
+
+        with patch.object(handler_mod, "_make_default_chat_model", _builder):
+            h = create_langchain_agents_handler()
+            with pytest.raises(_Built):
+                await h(config, "q")
+            with pytest.raises(_Built):
+                async for _event in await h.stream(config, "q"):
+                    pass
+
+        assert len(seen) == 2
+        assert seen[0] == seen[1]
