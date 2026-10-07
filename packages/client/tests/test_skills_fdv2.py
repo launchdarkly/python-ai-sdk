@@ -2707,6 +2707,82 @@ class TestFailureHandling:
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
         assert [r for r in caplog.records if "reconnecting in" in r.getMessage()]
 
+    def test_a_malformed_event_abandons_its_transfer_and_keeps_the_basis(
+        self,
+    ) -> None:
+        """A corrupted event fails the connection; it is not skipped.
+
+        Skipping it would let the ``payload-transferred`` after it commit the
+        rest of the transfer and advance the basis past it, so a lost
+        ``delete-object`` would leave a revoked skill served indefinitely: the
+        reconnect asks only for changes since that basis.
+        """
+        initial = full_payload(
+            ("put-object", put_skill("a", object_version=1)),
+            ("put-object", put_skill("revoked", object_version=1)),
+            state="basis-1",
+        )
+        retransmission = events(
+            ("server-intent", server_intent("xfer-changes")),
+            ("put-object", put_skill("fresh", object_version=1)),
+            ("delete-object", delete_skill("revoked", object_version=1)),
+            ("payload-transferred", transferred("basis-2")),
+        )
+
+        def sse(payload_events: list[dict[str, Any]], *, truncate: int = -1) -> bytes:
+            """Serialises *payload_events*, cutting short the data at *truncate*."""
+            lines = []
+            for i, event in enumerate(payload_events):
+                data = json.dumps(event["data"])
+                if i == truncate:
+                    data = data[:-5]
+                lines.append(f"event: {event['event']}\ndata: {data}\n\n")
+            return "".join(lines).encode()
+
+        class _CorruptedThenClean(_FakeRequester):
+            def __init__(self) -> None:
+                self.bases: list[str | None] = []
+                self.held_at_reconnect: dict[str, Any] = {}
+                self.store: FDv2SkillStore | None = None
+
+            def stream(self, basis: str | None) -> Any:
+                self.bases.append(basis)
+                if len(self.bases) == 1:
+                    # The delete, at index 2 of the second transfer, is cut short.
+                    body = sse(initial + retransmission, truncate=len(initial) + 2)
+                    return _StreamConnection(_LineSource(body))
+                if len(self.bases) == 2:
+                    assert self.store is not None
+                    self.held_at_reconnect = {
+                        key: self.store.get_object(SKILL_OBJECT_KIND, key)
+                        for key in ("a", "revoked", "fresh")
+                    }
+                    return _StreamConnection(_LineSource(sse(retransmission)))
+                return _BlockingConnection()
+
+        requester = _CorruptedThenClean()
+        store = stream_store(_requester=requester)
+        requester.store = store
+        try:
+            store.start()
+            assert wait_until(lambda: len(requester.bases) >= 3)
+            # Nothing from the corrupted transfer committed: not the delete it
+            # lost, and not the put that arrived intact beside it.
+            held = requester.held_at_reconnect
+            assert held["a"] is not None
+            assert held["revoked"] is not None
+            assert held["fresh"] is None
+            # The reconnect resumed from the last committed basis.
+            assert requester.bases[:2] == [None, "basis-1"]
+            # The clean retransmission applied in full.
+            assert store.get_object(SKILL_OBJECT_KIND, "revoked") is None
+            assert store.get_object(SKILL_OBJECT_KIND, "fresh") is not None
+            assert store.diagnostics.objects_revoked == 1
+            assert requester.bases[2] == "basis-2"
+            assert store.failed is None
+        finally:
+            store.close()
+
     def test_a_connection_that_never_answered_still_warns(self, caplog: Any) -> None:
         # The quiet path is earned by answering. A connection that failed before
         # it told us anything is the case the warning exists for.
@@ -3197,6 +3273,12 @@ class TestTransportMemoryBound:
     def test_multi_line_data_under_the_cap_still_decodes(self) -> None:
         source = _LineSource(b'event: put-object\ndata: {"a":\ndata: 1}\n\n')
         assert list(_iter_sse(source)) == [("put-object", {"a": 1})]
+        assert source.closed
+
+    def test_an_event_whose_data_is_not_json_drops_the_connection(self) -> None:
+        source = _LineSource(b'event: delete-object\ndata: {"key": "a:1\n\n')
+        with pytest.raises(_RecoverableTransportError, match="not JSON"):
+            list(_iter_sse(source))
         assert source.closed
 
 

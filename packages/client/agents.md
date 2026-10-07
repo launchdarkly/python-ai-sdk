@@ -299,6 +299,14 @@ resumes in place once the cause is fixed, clearing the terminal reason through
   answer) surfaces as an `HTTPError` that `_classify_status` maps to a fatal, non-retried
   failure.
 
+**A stream event whose data is not JSON drops the connection; it is never skipped.**
+`_iter_sse` raises `_RecoverableTransportError`, as the base SDK's FDv2 stream interrupts on
+a `JSONDecodeError`, so the in-flight payload is abandoned and the reconnect sends the last
+committed basis. Skipping the event would let the `payload-transferred` after it commit
+without it and advance the basis: a lost `delete-object` would then never be retransmitted,
+and a lost `put-object` in an `xfer-full` would revoke that skill by omission. Asserted by
+`test_a_malformed_event_abandons_its_transfer_and_keeps_the_basis`.
+
 **Reads are memory-bounded.** `_read_bounded` (poll bodies) and
 `_iter_stream_lines`/`_iter_sse` (each line and each event) enforce `MAX_RESPONSE_BYTES`
 (64 MiB). Crossing it raises `_ResponseTooLargeError`, a fatal error: nothing from that

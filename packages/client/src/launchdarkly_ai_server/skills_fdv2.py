@@ -1235,6 +1235,13 @@ def _iter_sse(response: Any) -> Any:
     newlines, blank line dispatches, ``:`` comments skipped. An event over
     ``MAX_RESPONSE_BYTES`` raises a fatal error and the in-flight payload is
     abandoned.
+
+    An event whose data is not JSON raises ``_RecoverableTransportError``, as
+    the base SDK's FDv2 stream does: the in-flight payload is abandoned and the
+    reconnect resumes from the last committed basis. Skipping the event instead
+    would let the ``payload-transferred`` after it commit the transfer without
+    it and advance the basis past it, so a lost ``delete-object`` would never be
+    retransmitted.
     """
     limit = MAX_RESPONSE_BYTES
     try:
@@ -1248,13 +1255,13 @@ def _iter_sse(response: Any) -> Any:
                     payload = "\n".join(data_lines)
                     try:
                         parsed = json.loads(payload) if payload else None
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            "Discarding FDv2 '%s' event whose data was not JSON", name
-                        )
-                        parsed = None
-                    else:
-                        yield name, parsed
+                    except json.JSONDecodeError as exc:
+                        raise _RecoverableTransportError(
+                            f"an FDv2 '{name}' event's data was not JSON ({exc}); "
+                            "the connection was dropped and nothing from the "
+                            "in-flight payload was applied"
+                        ) from exc
+                    yield name, parsed
                 name = None
                 data_lines = []
                 event_bytes = 0
