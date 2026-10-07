@@ -18,6 +18,7 @@ ROOT_SURFACE = frozenset(
         "Criterion",
         "DatasetRow",
         "EvalRunResult",
+        "EvalTool",
         "EvaluationsError",
         "EvaluationsModule",
         "ExecuteStreamDoneEvent",
