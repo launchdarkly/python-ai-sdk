@@ -205,8 +205,10 @@ Three layers, in increasing order of blast radius:
 
 1. **Reference discovery** — `skill_refs(config)` projects the config's `skills` array into
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
-   Validation of the array itself lives in `parse_ai_config` and is **fail closed** — one
-   malformed reference fails the whole config parse.
+   It also validates the array, and **fails closed**: a present but malformed field
+   (including `null`, or one bad entry) raises `ValueError` rather than returning a partial
+   list that would authorize a prune. `parse_ai_config` deliberately does not check `skills`,
+   so an experimental field cannot fail a core config call (TESTING.md §0.3).
 2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
    through the `SkillStore` seam. Configure a store with `set_skill_store(store)`; with
    none configured the accessors raise
@@ -527,8 +529,8 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
 - **Those two bounds live in `_key_rejection_reason`, not in the key grammar, and must not
   move.** `is_valid_skill_key` / `skill_key_rejection_reason` deliberately admit an over-long
   or reserved key, because:
-  - `parse_ai_config` fails closed on a bad `skills` entry, so a grammar rejection would
-    invalidate the *entire* AI Config for a Linux customer over a Windows-only constraint;
+  - `skill_refs` fails closed on a bad `skills` entry, so a grammar rejection would
+    reject *every* skill reference for a Linux customer over a Windows-only constraint;
   - it would also shrink `skill_refs`, which authorizes a prune, turning "fails to write on
     Windows" into "deleted on Linux".
 

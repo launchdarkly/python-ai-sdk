@@ -63,12 +63,13 @@ def _parse_tool(raw: Any, key: str) -> str | None:
     return None
 
 
-def _parse_skills(raw: Any) -> str | None:
+def skills_field_rejection_reason(raw: Any) -> str | None:
     """
-    Validates the optional ``skills`` array. Returns an error message or ``None``.
+    Why a present ``skills`` field is malformed, or ``None`` when it is valid.
 
-    Fails closed: one malformed reference fails the whole config, rather than
-    silently materializing a partial skill set.
+    Used by ``skill_refs``, not by ``parse_ai_config``: Agent Skills is
+    experimental, and a malformed field must not fail a core config call.
+    One malformed reference rejects the whole field, never a partial list.
     """
     if not isinstance(raw, list):
         return "skills must be an array of {key, version} objects"
@@ -148,11 +149,8 @@ def parse_ai_config(raw: Any) -> ParseResult:
             error={"message": "outputFormat must be an object (JSON Schema)"},
         )
 
-    # ``in``, not ``is not None``: ``skills: null`` must fail the parse. Read as
-    # "no skills", a ``prune=True`` reconcile would delete skill files on disk.
-    if "skills" in raw:
-        err = _parse_skills(raw["skills"])
-        if err:
-            return ParseFailure(success=False, error={"message": err})
+    # ``skills`` is passed through unvalidated. Agent Skills is experimental, so
+    # a malformed field must not fail a core config call (TESTING.md §0.3);
+    # ``skill_refs`` rejects it where the references are used.
 
     return ParseSuccess(success=True, data=raw)

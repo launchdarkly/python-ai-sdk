@@ -3563,11 +3563,11 @@ class TestWindowsReservedNames:
         """The layer choice, asserted — this is the whole point of it.
 
         The constraint lives in the filesystem layer and must not migrate into
-        the key grammar. At the grammar level a rejection would fail the *entire*
-        AI Config — model, provider, instructions, tools — for a Linux customer
-        over a Windows-only constraint, and would shrink ``skill_refs``, which is
-        what authorizes a prune: "this skill fails to write on Windows" would
-        become "this skill gets deleted on Linux".
+        the key grammar. At the grammar level a rejection would make
+        ``skill_refs`` reject *every* reference for a Linux customer over a
+        Windows-only constraint, and a grammar that dropped entries instead
+        would shrink the list that authorizes a prune: "this skill fails to
+        write on Windows" would become "this skill gets deleted on Linux".
         """
         assert is_valid_skill_key(reserved) is True
 

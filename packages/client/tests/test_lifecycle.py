@@ -785,6 +785,33 @@ class TestInspectConfig:
         assert result["config"]["model"]["name"] == "claude-3-5"  # type: ignore[index]
         assert result["meta"] is not None
 
+    async def test_a_malformed_skills_field_does_not_fail_core_calls(self) -> None:
+        """Agent Skills is experimental, so its field cannot break a core call
+        (TESTING.md §0.3). ``skill_refs`` rejects it instead."""
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(
+            return_value={
+                "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+                "model": {"name": "claude-3-5"},
+                "provider": {"name": "Anthropic"},
+                "instructions": "You are helpful.",
+                "skills": [{"key": "My_Skill", "version": 0}],
+            }
+        )
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            result = await inspect_config("my-flag", ctx)
+            extracted = await lifecycle_module.extract_variation("my-flag", ctx)
+
+        assert result["enabled"] is True
+        assert result["config"] is not None
+        assert extracted["config"]["model"]["name"] == "claude-3-5"
+
     async def test_preserves_model_key_and_version_on_meta(self) -> None:
         stub = _make_stub_client()
         stub.variation = AsyncMock(

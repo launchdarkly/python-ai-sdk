@@ -286,31 +286,59 @@ class TestSkillRefs:
         skill_refs(self._config(skills=[{"key": "a", "version": 1}]))
         assert recording_emitter.records == []
 
-    def test_dropped_entries_are_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A shortened projection is never silent.
+    def test_a_non_dict_config_returns_empty_list(self) -> None:
+        assert skill_refs(None) == []
 
-        ``parse_ai_config`` fails the whole config closed on a malformed
-        reference, so a config that reached here through it cannot contain one.
-        A hand-built dict can, and feeding the shortened list to
-        ``write_skills`` would prune the dropped skill's on-disk copy — so the
-        drop is observable rather than silent.
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            pytest.param(None, id="null"),
+            pytest.param("pdf", id="string"),
+            pytest.param({"key": "a", "version": 1}, id="object"),
+            pytest.param(3, id="number"),
+            pytest.param(["pdf-extraction"], id="non-object-entry"),
+            pytest.param([None], id="null-entry"),
+            pytest.param([{"version": 1}], id="absent-key"),
+            pytest.param([{"key": 1, "version": 1}], id="non-string-key"),
+            pytest.param([{"key": "", "version": 1}], id="empty-key"),
+            pytest.param([{"key": "Evil", "version": 1}], id="uppercase-key"),
+            pytest.param([{"key": "under_score", "version": 1}], id="underscore-key"),
+            pytest.param([{"key": "../escape", "version": 1}], id="traversal-key"),
+            pytest.param([{"key": "a" * 257, "version": 1}], id="long-key"),
+            pytest.param([{"key": "a"}], id="absent-version"),
+            pytest.param([{"key": "a", "version": 0}], id="zero-version"),
+            pytest.param([{"key": "a", "version": 2.5}], id="float-version"),
+            pytest.param([{"key": "a", "version": "2"}], id="string-version"),
+            pytest.param([{"key": "a", "version": True}], id="bool-version"),
+        ],
+    )
+    def test_a_malformed_skills_field_raises(self, malformed: Any) -> None:
+        """The parser passes ``skills`` through, so it is validated here.
+
+        Returning ``[]`` or a shortened list instead would authorize
+        ``write_skills(..., prune=True)`` to delete skills the config still
+        references. ``skills: null`` is included: read as "no skills" it would
+        prune everything.
         """
+        with pytest.raises(ValueError, match=r"skills"):
+            skill_refs(self._config(skills=malformed))
+
+    def test_one_bad_entry_rejects_the_whole_field(self) -> None:
         config = self._config(
-            skills=[
-                {"key": "good", "version": 1},
-                {"key": "bad", "version": 0},
-                {"key": "Bad-Key", "version": 1},
-                "not-an-object",
-            ]
+            skills=[{"key": "good", "version": 1}, {"key": "../bad", "version": 1}]
         )
+        with pytest.raises(ValueError, match=r"skills\[1\]\.key"):
+            skill_refs(config)
 
-        with caplog.at_level("WARNING", logger="launchdarkly_ai_server.skills"):
-            refs = skill_refs(config)
+    def test_the_error_does_not_echo_the_rejected_key(self) -> None:
+        config = self._config(skills=[{"key": "Secret-Name", "version": 1}])
+        with pytest.raises(ValueError) as excinfo:
+            skill_refs(config)
+        assert "Secret-Name" not in str(excinfo.value)
 
-        assert refs == [SkillReference(key="good", version=1)]
-        assert len(caplog.records) == 3
-        # The body is never echoed, and neither is the invalid key.
-        assert all("skills[" in r.getMessage() for r in caplog.records)
+    def test_key_at_length_bound_is_accepted(self) -> None:
+        refs = skill_refs(self._config(skills=[{"key": "a" * 256, "version": 1}]))
+        assert refs == [SkillReference(key="a" * 256, version=1)]
 
     def test_requires_no_client_or_store(self, mock_ld_client: Any) -> None:
         """No store configured, no client initialized — still a pure projection."""
