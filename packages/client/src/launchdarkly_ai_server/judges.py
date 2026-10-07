@@ -10,6 +10,7 @@ from .judge_scoring import (
     build_message_history,
     numeric_score,
     parse_judge_response,
+    typesafe_judge_entries,
 )
 from .types import (
     AiConfigRep,
@@ -145,6 +146,13 @@ async def run_judges(
                         and handler.provides_for is not None
                         and handler.provides_for[1] == "agent"
                     )
+                else:
+                    logger.warning(
+                        "Judge '%s' skipped: no handler provides for provider %r",
+                        judge_key,
+                        judge_provider,
+                    )
+                    continue
 
             effective_judge_config = (
                 _collapse_messages_to_instructions(judge_ai_config)
@@ -174,9 +182,35 @@ async def run_judges(
                     },
                 )
 
+                usage = to_usage_dict(result["usage"])
+                entries = typesafe_judge_entries(result["response"])
+                if entries is not None:
+                    # One Jev call. Every label is returned with that call's
+                    # full usage, and each label is tracked under its eventKey.
+                    from .lifecycle import get_client
+
+                    client = get_client()
+                    for entry in entries:
+                        result_key = f"{judge_key}.{entry['key']}"
+                        score = entry["score"]
+                        judge_results[result_key] = JudgeResult(
+                            usage=usage,
+                            response=entry["reason"],
+                            score=score,
+                            event_key=entry["eventKey"],
+                        )
+                        record_evaluation(score, None, result_key)
+                        client.track(
+                            entry["eventKey"],
+                            to_ld_context(client, user_context),
+                            {**base_track_data, "judgeConfigKey": result_key},
+                            score,
+                        )
+                    continue
+
                 score, reasoning = parse_judge_response(result["response"])
                 judge_results[judge_key] = JudgeResult(
-                    usage=to_usage_dict(result["usage"]),
+                    usage=usage,
                     response=reasoning,
                     score=score,
                 )
@@ -412,6 +446,50 @@ async def run_judge(
             },
         )
 
+        usage = to_usage_dict(result["usage"])
+        try:
+            entries = typesafe_judge_entries(result["response"])
+        except ValueError:
+            return None
+        if entries is not None:
+            first = entries[0]
+            result_key = f"{task.config_key}.{first['key']}"
+            expanded = {
+                f"{task.config_key}.{entry['key']}": JudgeResult(
+                    usage=usage,
+                    response=entry["reason"],
+                    score=entry["score"],
+                    event_key=entry["eventKey"],
+                )
+                for entry in entries
+            }
+            metrics = [
+                {
+                    "eventKey": entry["eventKey"],
+                    "score": entry["score"],
+                    "judgeConfigKey": f"{task.config_key}.{entry['key']}",
+                }
+                for entry in entries
+            ]
+            for entry in entries:
+                record_evaluation(
+                    entry["score"], None, f"{task.config_key}.{entry['key']}"
+                )
+            typesafe_track_data: TrackData = {
+                **omit_model_stamps(task.parent_track_data),
+                **result["track_data"],
+                "judgeConfigKey": result_key,
+            }
+            return JudgeRunResult(
+                score=first["score"],
+                response=first["reason"],
+                usage=usage,
+                track_data=typesafe_track_data,
+                results=expanded,
+                metrics=metrics,
+                event_key=first["eventKey"],
+            )
+
         try:
             score, reasoning = parse_judge_response(result["response"])
         except ValueError:
@@ -427,10 +505,6 @@ async def run_judge(
                 metric_score,
                 reasoning if judge_handler.capture_content else None,
             )
-        raw_usage = result["usage"]
-
-        usage = to_usage_dict(raw_usage)
-
         # A judge without a pinned model config must not inherit the parent's
         # modelKey / modelVersion; every other parent-only key (graphKey, ...)
         # is still carried over.

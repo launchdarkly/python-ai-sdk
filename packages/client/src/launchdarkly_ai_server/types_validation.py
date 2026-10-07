@@ -52,8 +52,10 @@ def parse_ai_config(raw: Any) -> ParseResult:
     has_instructions = isinstance(raw.get("instructions"), str)
     messages = raw.get("messages")
     has_messages = isinstance(messages, list) and len(messages) > 0
+    classifiers = raw.get("classifiers")
+    has_classifiers = isinstance(classifiers, list) and len(classifiers) > 0
 
-    if not has_instructions and not has_messages:
+    if not has_instructions and not has_messages and not has_classifiers:
         return ParseFailure(
             success=False,
             error={
