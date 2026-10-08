@@ -108,6 +108,20 @@ _EVENT_HEARTBEAT = "heart-beat"
 _EVENT_GOODBYE = "goodbye"
 _EVENT_ERROR = "error"
 
+# The events whose data ``_FDv2Reader.handle`` reads. Only these are parsed, so
+# a ``heart-beat`` or an unknown event with data that is not JSON is ignored,
+# as ``ldclient``'s FDv2 stream ignores it.
+_EVENTS_WITH_DATA = frozenset(
+    (
+        _EVENT_SERVER_INTENT,
+        _EVENT_PUT_OBJECT,
+        _EVENT_DELETE_OBJECT,
+        _EVENT_PAYLOAD_TRANSFERRED,
+        _EVENT_GOODBYE,
+        _EVENT_ERROR,
+    )
+)
+
 _INTENT_TRANSFER_FULL = "xfer-full"
 _INTENT_TRANSFER_CHANGES = "xfer-changes"
 _INTENT_TRANSFER_NONE = "none"
@@ -482,7 +496,6 @@ class _TransferOutcome:
     committed: bool = False
     changes: list[dict[str, Any]] = field(default_factory=list)
     basis: str | None = None
-    fatal: str | None = None
     disconnect: str | None = None
     up_to_date: bool = False
     """A ``none`` intent: the content held is current. Counts as a healthy
@@ -738,14 +751,23 @@ class _ProtocolReader:
         catastrophe = bool(data.get("catastrophe")) if isinstance(data, dict) else False
         silent = bool(data.get("silent")) if isinstance(data, dict) else False
         self._abandon_in_flight()
+        if catastrophe:
+            # Recoverable, as in the base SDKs: Python's does not read the flag
+            # and Go's only logs it. Not ``recycled``, so it is counted even
+            # after a completed exchange, and logged here at ERROR because the
+            # delivery loop logs a disconnect after one at debug.
+            logger.error(
+                "The FDv2 server reported a catastrophic failure (%s); "
+                "reconnecting with backoff",
+                reason,
+            )
+            return _TransferOutcome(
+                disconnect=f"server sent a catastrophic goodbye: {reason}"
+            )
         if not silent:
             # Debug only: a goodbye after a completed exchange is a routine
             # recycle, and the delivery loop warns when one is not.
             logger.debug("FDv2 connection closing: %s", reason)
-        if catastrophe:
-            return _TransferOutcome(
-                fatal=f"server sent a catastrophic goodbye: {reason}"
-            )
         return _TransferOutcome(
             disconnect=f"server said goodbye: {reason}", recycled=True
         )
@@ -1235,6 +1257,17 @@ def _iter_sse(response: Any) -> Any:
     newlines, blank line dispatches, ``:`` comments skipped. An event over
     ``MAX_RESPONSE_BYTES`` raises a fatal error and the in-flight payload is
     abandoned.
+
+    A known event whose data is not JSON, empty data included, is logged at
+    WARNING and raises ``_RecoverableTransportError``, as the base SDK's FDv2
+    stream does (``json.loads("")`` raises there too): the
+    in-flight payload is abandoned and the reconnect resumes from the last
+    committed basis. Skipping the event instead would let the
+    ``payload-transferred`` after it commit the transfer without it and advance
+    the basis past it, so a lost ``delete-object`` would never be retransmitted.
+    The warning is logged here because the delivery loop logs a disconnect
+    after a completed exchange at debug. Any other event is yielded with
+    ``None`` data, unparsed.
     """
     limit = MAX_RESPONSE_BYTES
     try:
@@ -1246,15 +1279,19 @@ def _iter_sse(response: Any) -> Any:
             if line == "":
                 if name is not None:
                     payload = "\n".join(data_lines)
-                    try:
-                        parsed = json.loads(payload) if payload else None
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            "Discarding FDv2 '%s' event whose data was not JSON", name
-                        )
-                        parsed = None
-                    else:
-                        yield name, parsed
+                    parsed = None
+                    if name in _EVENTS_WITH_DATA:
+                        try:
+                            parsed = json.loads(payload)
+                        except json.JSONDecodeError as exc:
+                            message = (
+                                f"an FDv2 '{name}' event's data was not JSON "
+                                f"({exc}); the connection was dropped and "
+                                "nothing from the in-flight payload was applied"
+                            )
+                            logger.warning("%s; reconnecting", message)
+                            raise _RecoverableTransportError(message) from exc
+                    yield name, parsed
                 name = None
                 data_lines = []
                 event_bytes = 0
@@ -1796,8 +1833,6 @@ class FDv2SkillStore:
             self._publish_first_payload()
             if outcome.changes:
                 self._notify(outcome.changes)
-        if outcome.fatal:
-            raise _FatalTransportError(outcome.fatal)
         if outcome.disconnect:
             raise _RecoverableTransportError(
                 outcome.disconnect, recycled=outcome.recycled

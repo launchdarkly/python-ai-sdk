@@ -459,8 +459,9 @@ async def main():
     # 1. Which skills does this config reference? Pure projection — no I/O.
     info = await inspect_config("doc-agent", {"kind": "user", "key": "user-123"})
     if info["config"] is None:
-        # The config could not be resolved. Stop here: an empty reference list
-        # passed to write_skills would prune every skill it manages.
+        # The config could not be resolved. skill_refs raises ValueError on
+        # None rather than return [], which write_skills would read as "prune
+        # every skill it manages". Stop here and keep what is on disk.
         return
     refs = skill_refs(info["config"])          # [SkillReference(key='pdf-extraction', version=2)]
 
@@ -488,7 +489,9 @@ as above, writes only what the resolved variation asked for.
 but is not a list of `{key, version}` objects (key matching `^[a-z0-9][a-z0-9-]*$`, version an
 integer ≥ 1), including `skills: null`. One bad entry rejects the whole field, so
 `write_skills` never receives a partial list that would prune skills the config still
-references. Config parsing does not check `skills`, so a malformed field never fails
+references. It also raises when the config itself is not a dict, including the `None` a failed
+`inspect_config` returns, so an outage cannot reach `write_skills` as an empty list and prune
+every managed skill. A config with no `skills` field returns `[]`. Config parsing does not check `skills`, so a malformed field never fails
 `config().invoke()` or other core calls.
 
 **Integrity is not optional.** Content is returned only when its sha256 (lowercase hex, over
@@ -566,9 +569,11 @@ any handler. The same mapping is attached as `extra["ld_skills"]` for structured
 ERROR ld.skills.integrity_failure {"action":"withheld","event":"ld.skills.integrity_failure","expected_hash":"0000…0000","language":"python","observed_hash":"5fc8…6ec0","reason":"content hash mismatch","reason_code":"hash_mismatch","skill_key":"pdf-extraction","version":2}
 ```
 
-**`ld.skills.integrity_failure` is a stability commitment.** Match on it; it will not be
-renamed. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's AI SDKs for
-the same input.
+**Match on `ld.skills.integrity_failure`.** It is the name LaunchDarkly's AI SDKs share for this
+record. While Agent Skills is experimental, the event name, its fields, and its `reason_code`
+values may change in a minor release; any such change gets a changelog entry under
+**Experimental**, so review it before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
+AI SDKs for the same input.
 
 | Field | Description |
 |---|---|
@@ -782,7 +787,7 @@ that skips verification.
 
 | Export | Description |
 |---|---|
-| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent or the config is not a dict. Raises `ValueError` when the field is present but malformed (including `null`), so an unreadable field never reaches a pruning reconcile as "no skills". |
+| `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent. Raises `ValueError` when the config is not a dict (including the `None` a failed `inspect_config` returns) or the field is present but malformed (including `null`), so neither reaches a pruning reconcile as "no skills". |
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
 | `get_skill_result(key, *, version=None)` | The same retrieval, reporting **why**: a frozen `SkillOutcome` with `.skill`, `.reason` (`ok` / `absent` / `integrity_failure` / `store_unavailable` / `wrong_version`), and `.detail`. See *Failing closed on tampering* above. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |

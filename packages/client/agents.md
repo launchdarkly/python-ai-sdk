@@ -207,7 +207,8 @@ Three layers, in increasing order of blast radius:
    typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
    It also validates the array, and **fails closed**: a present but malformed field
    (including `null`, or one bad entry) raises `ValueError` rather than returning a partial
-   list that would authorize a prune. `parse_ai_config` deliberately does not check `skills`,
+   list that would authorize a prune. So does a config that is not a dict, including the
+   `None` a failed `inspect_config` returns; only a dict with no `skills` key yields `[]`. `parse_ai_config` deliberately does not check `skills`,
    so an experimental field cannot fail a core config call (TESTING.md §0.3).
 2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
    through the `SkillStore` seam. Configure a store with `set_skill_store(store)`; with
@@ -298,6 +299,38 @@ resumes in place once the cause is fixed, clearing the terminal reason through
   `Authorization` onto the redirected request. Any 3xx except 304 (a poll's not-modified
   answer) surfaces as an `HTTPError` that `_classify_status` maps to a fatal, non-retried
   failure.
+
+**A known stream event whose data is not JSON drops the connection; it is never skipped.**
+`_iter_sse` logs a WARNING and raises `_RecoverableTransportError`, as the base SDK's FDv2
+stream interrupts on a `JSONDecodeError`, so the in-flight payload is abandoned and the
+reconnect sends the last committed basis. Skipping the event would let the
+`payload-transferred` after it commit without it and advance the basis: a lost
+`delete-object` would then never be retransmitted, and a lost `put-object` in an `xfer-full`
+would revoke that skill by omission. The warning is logged in `_iter_sse` because `_run` logs
+a disconnect after a completed exchange at debug. Both cases are asserted by
+`test_a_malformed_event_abandons_its_transfer_and_keeps_the_basis`. Only the events in
+`_EVENTS_WITH_DATA` (the ones `handle` reads) are parsed: a `heart-beat` or an unknown event
+is yielded with `None` data, so its data cannot drop the connection, as `ldclient` parses only
+inside its known-event branches. Empty data on a known event is not JSON either, and drops the
+connection the same way: read as `None`, a `delete-object` would be ignored and a
+`payload-transferred` would commit with no selector.
+
+**A put or delete that is valid JSON but has no usable `key` is warned and ignored, for the
+experimental stage.** Its transfer still commits, so a keyless `delete-object` loses its
+revocation and a keyless `put-object` in an `xfer-full` revokes that skill by omission (and
+`write_skills("*")` prunes it). `ldclient` interrupts the stream instead. Interrupting is not
+strictly safer, because a server that keeps resending the object would then block every later
+change, so the choice is to be revisited before 1.0 (TESTING.md §3.25). Pinned by
+`test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits` and
+`test_a_put_with_no_usable_key_in_an_xfer_full_revokes_by_omission`; changing the rule should fail
+them.
+
+**A `goodbye` with `catastrophe: true` is a recoverable, counted disconnect, not a fatal.**
+The Python base SDK does not read the flag and the Go SDK only logs it, so stopping delivery
+on it would leave this store the only LaunchDarkly SDK that needs `start()` after a server
+incident. `_goodbye` logs it at ERROR and returns a disconnect without `recycled`, so the
+delivery loop counts it even after a completed exchange. Asserted by
+`test_a_catastrophic_goodbye_reconnects_and_is_counted`.
 
 **Reads are memory-bounded.** `_read_bounded` (poll bodies) and
 `_iter_stream_lines`/`_iter_sse` (each line and each event) enforce `MAX_RESPONSE_BYTES`
@@ -588,7 +621,9 @@ Do not undo any of these as a simplification:
   discriminate (`resolve_from_store` and `list_raw_objects` also log ERROR for a raising
   store), and the stdlib's default formatter drops `extra`, so an `extra`-only record is
   invisible under a plain `logging.basicConfig()`.
-- **`ld.skills.integrity_failure` is documented for customers to match on.** Never rename it.
+- **`ld.skills.integrity_failure` is documented for customers to match on.** Do not rename it
+  casually. The experimental stage allows a rename in a minor release, but only in every SDK
+  at once and with a changelog entry, because a rename silently breaks customers' alerts.
 - **`sort_keys=True` makes the line byte-identical across SDKs** (modulo `language`), since
   the other implementations build the object in alphabetical key order.
 - **Optional fields are omitted, never nulled**, so a SIEM field-existence check means
@@ -940,6 +975,6 @@ a conversation is out of reach at this layer either way.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
 - Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
-- Do not rename `ld.skills.integrity_failure`, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
+- Do not rename `ld.skills.integrity_failure` in one language only or without a changelog entry, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces, though the experimental stage lets either change in a minor release. See "The integrity-failure log record" above.
 - Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.

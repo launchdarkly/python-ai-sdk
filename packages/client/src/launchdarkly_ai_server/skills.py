@@ -204,21 +204,30 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
     Returns the skill references attached to a resolved AI Config.
 
     Pure: no network, store, or telemetry. Returns ``[]`` when the config has no
-    ``skills`` field, or when *config* is not a dict (for example ``None`` from a
-    failed ``inspect_config``). Typical use: ``await get_skills(skill_refs(config))``.
+    ``skills`` field. Typical use: ``await get_skills(skill_refs(config))``.
 
     The config parser does not validate ``skills``, so a malformed field does
     not fail core config calls. It is validated here instead, and rejected
     whole: ``write_skills`` with ``prune=True`` would delete the files of any
     skill missing from the list, so a partial or empty list is never returned
-    for a field that is present.
+    for a field that is present. A *config* that is not a dict, such as the
+    ``None`` a failed ``inspect_config`` returns, is rejected for the same
+    reason: read as "no skills", it would prune every managed skill.
 
     Raises:
-        ValueError: If ``skills`` is present but is not a list of ``{key,
-            version}`` objects with a valid key and an integer version >= 1.
-            This includes ``skills: null``.
+        ValueError: If *config* is not a dict (including ``None``), or if
+            ``skills`` is present but is not a list of ``{key, version}``
+            objects with a valid key and an integer version >= 1. This
+            includes ``skills: null``.
     """
-    if not isinstance(config, dict) or "skills" not in config:
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"skill_refs was given {type(config).__name__}, not an AI Config. "
+            "A failed inspect_config returns None as its config; handle that "
+            "before deriving skill references, because an empty list passed to "
+            "write_skills would prune every skill it manages."
+        )
+    if "skills" not in config:
         return []
 
     raw = config["skills"]

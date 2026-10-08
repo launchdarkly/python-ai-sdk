@@ -287,8 +287,23 @@ class TestSkillRefs:
         skill_refs(self._config(skills=[{"key": "a", "version": 1}]))
         assert recording_emitter.records == []
 
-    def test_a_non_dict_config_returns_empty_list(self) -> None:
-        assert skill_refs(None) == []
+    @pytest.mark.parametrize(
+        "config",
+        [
+            pytest.param(None, id="none"),
+            pytest.param([], id="list"),
+            pytest.param("doc-agent", id="string"),
+        ],
+    )
+    def test_a_config_that_is_not_a_dict_raises(self, config: Any) -> None:
+        """``None`` is what a failed ``inspect_config`` returns as its config.
+
+        Read as "no skills", it would let ``write_skills(skill_refs(config),
+        root)``, which prunes by default, delete every managed skill during an
+        outage.
+        """
+        with pytest.raises(ValueError, match="not an AI Config"):
+            skill_refs(config)
 
     @pytest.mark.parametrize(
         "malformed",
