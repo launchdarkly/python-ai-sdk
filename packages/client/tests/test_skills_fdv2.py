@@ -200,13 +200,18 @@ def full_payload(
     )
 
 
-def sse_body(payload_events: list[dict[str, Any]], *, truncate: int = -1) -> bytes:
-    """Serialises *payload_events* as SSE, cutting short the data at *truncate*."""
+def sse_body(
+    payload_events: list[dict[str, Any]], *, truncate: int = -1, blank: bool = False
+) -> bytes:
+    """Serialises *payload_events* as SSE, corrupting the data at *truncate*.
+
+    The data there is cut short, or emptied when *blank* is set.
+    """
     lines = []
     for i, event in enumerate(payload_events):
         data = json.dumps(event["data"])
         if i == truncate:
-            data = data[:-5]
+            data = "" if blank else data[:-5]
         lines.append(f"event: {event['event']}\ndata: {data}\n\n")
     return "".join(lines).encode()
 
@@ -904,6 +909,66 @@ class TestProtocolReader:
         reader = _ProtocolReader(held)
         outcome = reader.handle("some-future-event", {"anything": True})
         assert outcome.disconnect is None
+
+    def test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits(
+        self,
+    ) -> None:
+        """Pins TESTING.md §3.25's experimental-stage rule: ignored, not fatal.
+
+        The revocation it carried is lost, so ``revoked`` stays served. Base
+        ``ldclient`` interrupts the stream instead; the choice is to be
+        revisited before 1.0, and changing it should fail this test.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(
+            reader,
+            full_payload(
+                ("put-object", put_skill("a", object_version=1)),
+                ("put-object", put_skill("revoked", object_version=1)),
+            ),
+        )
+        keyless = delete_skill("revoked", object_version=1)
+        del keyless["key"]
+        outcomes = drive(
+            reader,
+            events(
+                ("server-intent", server_intent("xfer-changes")),
+                ("put-object", put_skill("fresh", object_version=1)),
+                ("delete-object", keyless),
+                ("payload-transferred", transferred("basis-2")),
+            ),
+        )
+        assert all(o.disconnect is None for o in outcomes)
+        assert outcomes[-1].committed
+        assert held.get("revoked", None) is not None
+        assert held.get("fresh", None) is not None
+
+    def test_a_put_with_no_usable_key_in_an_xfer_full_revokes_by_omission(
+        self,
+    ) -> None:
+        """Pins the other half of the same rule.
+
+        The skill the put carried is missing from the full transfer, so it is
+        revoked, and ``write_skills("*")`` would prune it.
+        """
+        held = _SkillObjectSet()
+        reader = _ProtocolReader(held)
+        drive(reader, full_payload(("put-object", put_skill("a", object_version=1))))
+        keyless = put_skill("a", object_version=1)
+        del keyless["key"]
+        outcomes = drive(
+            reader,
+            full_payload(
+                ("put-object", put_skill("b", object_version=1)),
+                ("put-object", keyless),
+                state="basis-2",
+            ),
+        )
+        assert all(o.disconnect is None for o in outcomes)
+        assert outcomes[-1].committed
+        assert held.get("a", None) is None
+        assert held.get("b", None) is not None
 
     def test_a_heartbeat_does_nothing(self) -> None:
         reader = _ProtocolReader(_SkillObjectSet())
@@ -2780,7 +2845,14 @@ class TestFailureHandling:
         assert [r for r in caplog.records if "reconnecting in" in r.getMessage()]
 
     @pytest.mark.parametrize(
-        ("initial_keys", "retransmission", "held_at_reconnect", "after", "revoked"),
+        (
+            "initial_keys",
+            "retransmission",
+            "held_at_reconnect",
+            "after",
+            "revoked",
+            "blank",
+        ),
         [
             pytest.param(
                 ("a", "revoked"),
@@ -2793,6 +2865,7 @@ class TestFailureHandling:
                 {"a": True, "revoked": True, "fresh": False},
                 {"a": True, "revoked": False, "fresh": True},
                 1,
+                False,
                 id="delete-object-in-xfer-changes",
             ),
             pytest.param(
@@ -2806,7 +2879,22 @@ class TestFailureHandling:
                 {"a": True, "b": False},
                 {"a": True, "b": True},
                 0,
+                False,
                 id="put-object-in-xfer-full",
+            ),
+            pytest.param(
+                ("a", "revoked"),
+                events(
+                    ("server-intent", server_intent("xfer-changes")),
+                    ("put-object", put_skill("fresh", object_version=1)),
+                    ("delete-object", delete_skill("revoked", object_version=1)),
+                    ("payload-transferred", transferred("basis-2")),
+                ),
+                {"a": True, "revoked": True, "fresh": False},
+                {"a": True, "revoked": False, "fresh": True},
+                1,
+                True,
+                id="empty-delete-object-in-xfer-changes",
             ),
         ],
     )
@@ -2818,10 +2906,11 @@ class TestFailureHandling:
         held_at_reconnect: dict[str, bool],
         after: dict[str, bool],
         revoked: int,
+        blank: bool,
     ) -> None:
         """A corrupted event fails the connection; it is not skipped.
 
-        The event at index 2 of the second transfer is cut short. Skipping it
+        The event at index 2 of the second transfer is cut short, or emptied. Skipping it
         would let the ``payload-transferred`` after it commit the rest of the
         transfer and advance the basis past it: a lost ``delete-object`` would
         leave a revoked skill served indefinitely, because the reconnect asks
@@ -2845,7 +2934,9 @@ class TestFailureHandling:
             def stream(self, basis: str | None) -> Any:
                 self.bases.append(basis)
                 if len(self.bases) == 1:
-                    body = sse_body(initial + retransmission, truncate=len(initial) + 2)
+                    body = sse_body(
+                        initial + retransmission, truncate=len(initial) + 2, blank=blank
+                    )
                     return _StreamConnection(_LineSource(body))
                 if len(self.bases) == 2:
                     assert self.store is not None
@@ -3400,6 +3491,27 @@ class TestTransportMemoryBound:
             f'event: {name}\ndata: {{"reason": "x", "catastrophe": true}}\n\n'.encode()
         )
         assert list(_iter_sse(source)) == [(name, {"reason": "x", "catastrophe": True})]
+
+    @pytest.mark.parametrize("data_line", [b"", b"data:\n"], ids=["absent", "blank"])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "server-intent",
+            "put-object",
+            "delete-object",
+            "payload-transferred",
+            "goodbye",
+            "error",
+        ],
+    )
+    def test_an_event_handle_reads_with_no_data_drops_the_connection(
+        self, name: str, data_line: bytes
+    ) -> None:
+        # Empty data is not JSON. Read as None, a delete would be ignored and a
+        # payload-transferred would commit with no selector.
+        source = _LineSource(f"event: {name}\n".encode() + data_line + b"\n")
+        with pytest.raises(_RecoverableTransportError, match="not JSON"):
+            list(_iter_sse(source))
 
     @pytest.mark.parametrize("name", ["heart-beat", "x-future-event"])
     def test_an_event_handle_does_not_read_is_not_parsed(self, name: str) -> None:
