@@ -2714,7 +2714,8 @@ class TestFailureHandling:
         """Delivery keeps going, from the basis reached, and says so at ERROR.
 
         It follows a commit here, which would make an ordinary goodbye a quiet
-        recycle; a catastrophe is still counted and still logged.
+        recycle; a catastrophe is still counted and still logged. It is also
+        ``silent``, which a catastrophe's ERROR ignores (unlike Go's).
         """
 
         class _CatastropheThenQuiet(_FakeRequester):
@@ -2732,7 +2733,14 @@ class TestFailureHandling:
                         sse_body(
                             full_payload(("put-object", put_skill()))
                             + events(
-                                ("goodbye", {"reason": "meltdown", "catastrophe": True})
+                                (
+                                    "goodbye",
+                                    {
+                                        "reason": "meltdown",
+                                        "catastrophe": True,
+                                        "silent": True,
+                                    },
+                                )
                             )
                         )
                     )
