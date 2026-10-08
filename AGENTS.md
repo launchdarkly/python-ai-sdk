@@ -87,6 +87,7 @@ graph TD
   claude["launchdarkly-ai-claude-agents"]
   openai["launchdarkly-ai-openai-agents"]
   langchain["launchdarkly-ai-langchain-agents"]
+ litellm["launchdarkly-ai-litellm-agents"]
   newHandler["launchdarkly-ai-new-provider\n(future)"]
  end
  subgraph tier0 ["Tier 0 — Core"]
@@ -110,7 +111,7 @@ graph TD
 
 - **Tier 0 — Core** (`launchdarkly-ai-server`): The foundation. Owns all LaunchDarkly integration, telemetry orchestration, shared data types, and the primary entry points (`config()`, `graph()`, `resolve_graph()`). Has no dependency on any other `launchdarkly-ai-*` package.
 - **Tier 0 — Convenience barrel** (`launchdarkly-ai-python`): A pure re-export package that makes all of `launchdarkly-ai-server` available under a shorter install name. No new logic — intended as the default install for most Python applications.
-- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages.
+- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, `launchdarkly-ai-litellm-agents`, `launchdarkly-ai-litellm-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages.
 - **Tier 2 — Consumer applications** (e.g. `main.py`, downstream projects): Imports from one or more handler packages and either `launchdarkly-ai-python` or `launchdarkly-ai-server`. Owns tool implementations and orchestration logic. No `launchdarkly-ai-*` package should ever depend on Tier 2 code.
 
 ### Rules
@@ -375,7 +376,7 @@ Requires `handlers` (either in `options` or via `options.registry`) to be set.
 
 Resolves an agent graph's topology and node configs without executing it. The returned `GraphDefinition` carries `enabled`; callers should branch on it before traversing.
 
-This is the entry point that framework-native runners (`to_claude_agents`, `to_openai_agents`, `to_lang_graph`) use to build their own execution structure.
+This is the entry point that framework-native runners (`to_claude_agents`, `to_openai_agents`, `to_lang_graph`, `to_litellm_agents`) use to build their own execution structure.
 
 ### `Registry` / `global_registry` / `compose`
 
@@ -657,7 +658,7 @@ def my_provider(
 
 For example, `claude_agents(config_key, user_input, context)` is equivalent to `config(key=config_key, handler=create_claude_agents_handler()).invoke(user_input, context)`.
 
-The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`.
+The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`, `litellm_agents`, `litellm_messages`.
 
 ### Graph Export (optional)
 
@@ -668,7 +669,7 @@ def claude_graph(key: str, **options) -> GraphInstance:
     return graph(key, handlers=[create_claude_agents_handler()], **options)
 ```
 
-Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`.
+Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`.
 
 ### Native Graph Adapter (optional)
 
@@ -678,6 +679,7 @@ Current adapters:
 - `to_claude_agents(def_coro, opts)` — exported from `launchdarkly_ai_claude_agents`
 - `to_openai_agents(def_coro, opts)` — exported from `launchdarkly_ai_openai_agents`
 - `to_lang_graph(def_coro, opts)` — exported from `launchdarkly_ai_langchain_agents`
+- `to_litellm_agents(def_coro, opts)` — exported from `launchdarkly_ai_litellm_agents`
 
 ---
 

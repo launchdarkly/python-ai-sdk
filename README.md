@@ -25,7 +25,7 @@ That call is the whole integration. Everything it does is configured in LaunchDa
 - Run agents and multi-step graphs, where each step can use a different provider
 - Score output quality with judges, including scoring that stays off the request path
 - See cost, latency, token usage, errors, and full conversations with no instrumentation code
-- Keep the providers and frameworks you already run: OpenAI, Anthropic, LangChain, or your own handler
+- Keep the providers and frameworks you already run: OpenAI, Anthropic, LangChain, LiteLLM, or your own handler
 
 - [What you get](#what-you-get)
 - [How It Works](#how-it-works)
@@ -85,6 +85,8 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-claude-agents`](packages/claude-agents/README.md) | Anthropic | `agent` | Claude Agent SDK — agentic loop with MCP tool support |
 | [`launchdarkly-ai-langchain-messages`](packages/langchain-messages/README.md) | `*` (any) | `messages` | Any `BaseChatModel` via LangChain `bind_tools` loop |
 | [`launchdarkly-ai-langchain-agents`](packages/langchain-agents/README.md) | `*` (any) | `agent` | LangGraph `StateGraph` — managed ReAct loop |
+| [`launchdarkly-ai-litellm-messages`](packages/litellm-messages/README.md) | `*` (any) | `messages` | In-process LiteLLM `acompletion` tool loop |
+| [`launchdarkly-ai-litellm-agents`](packages/litellm-agents/README.md) | `*` (any) | `agent` | OpenAI Agents SDK with LiteLLM models |
 
 ## Quick Start
 
@@ -110,6 +112,9 @@ No code changes are needed — `init_client()` detects whether the OTel packages
 cp .env.example .env
 # Fill in LD_SDK_KEY and the API key for your provider
 ```
+
+LiteLLM runs in-process in Python, so no proxy endpoint is required. Set the
+provider credentials required by the model names in your AI Config.
 
 ### 3. Call a model
 
@@ -149,6 +154,8 @@ asyncio.run(main())
 | `claude_agents` | `launchdarkly-ai-claude-agents` | `claude-agent-sdk` | Claude Agent SDK (MCP) |
 | `langchain_messages` | `launchdarkly-ai-langchain-messages` | `langchain-core` | LangChain `bind_tools` loop |
 | `langchain_agents` | `launchdarkly-ai-langchain-agents` | `langgraph` | LangGraph `StateGraph` |
+| `litellm_messages` | `launchdarkly-ai-litellm-messages` | `litellm` | LiteLLM `acompletion` |
+| `litellm_agents` | `launchdarkly-ai-litellm-agents` | `openai-agents[litellm]` | OpenAI Agents via LiteLLM |
 
 ---
 
@@ -250,7 +257,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Provider packages also export single-provider conveniences (`claude_graph`, `openai_graph`, `langchain_graph`) that pre-bind their handler.
+Provider packages also export conveniences (`claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`) that pre-bind their handler.
 
 ---
 
@@ -306,6 +313,22 @@ from launchdarkly_ai_openai_agents import to_openai_agents
 
 ctx = {"kind": "user", "key": "user-123"}
 result = await to_openai_agents(
+    resolve_graph("support-graph", context=ctx),
+    {"tool_handlers": registry.tools, "context": ctx},
+).invoke("I was double charged")
+```
+
+##### `to_litellm_agents` — OpenAI Agents SDK over LiteLLM
+
+Builds the same native Agents SDK handoff tree while creating each evaluated
+node model through LiteLLM in-process.
+
+```python
+from launchdarkly_ai_server import resolve_graph
+from launchdarkly_ai_litellm_agents import to_litellm_agents
+
+ctx = {"kind": "user", "key": "user-123"}
+result = await to_litellm_agents(
     resolve_graph("support-graph", context=ctx),
     {"tool_handlers": registry.tools, "context": ctx},
 ).invoke("I was double charged")
@@ -597,6 +620,9 @@ uv run python main.py [example] [flag-key] [user-input]
 | `graph-history` | `uv run python main.py graph-history` | `graph().invoke()` with multimodal `history` forwarded to the root node |
 | `openai-only` | `uv run python main.py openai-only` | `config()` with a custom `Registry` restricted to OpenAI handlers |
 | `streaming` | `uv run python main.py streaming` | `config().stream()` — token-by-token output |
+| `litellm` | `uv run python main.py litellm` | `config()` routing both messages and agents through LiteLLM |
+| `litellm-agents` | `uv run python main.py litellm-agents` | `litellm_agents()` with in-process LiteLLM routing |
+| `litellm-messages` | `uv run python main.py litellm-messages` | `litellm_messages()` with in-process LiteLLM routing |
 
 **Examples:**
 
@@ -636,7 +662,9 @@ python-ai-sdk/
 │   ├── openai-agents/   # launchdarkly-ai-openai-agents
 │   ├── openai-messages/ # launchdarkly-ai-openai-messages
 │   ├── langchain-agents/   # launchdarkly-ai-langchain-agents
-│   └── langchain-messages/ # launchdarkly-ai-langchain-messages
+│   ├── langchain-messages/ # launchdarkly-ai-langchain-messages
+│   ├── litellm-agents/     # launchdarkly-ai-litellm-agents
+│   └── litellm-messages/   # launchdarkly-ai-litellm-messages
 ├── .env.example         # Template — copy to .env and fill in your values
 └── agents.md            # Architecture reference for AI agents and contributors
 ```
