@@ -28,6 +28,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 |---|---|
 | `src/launchdarkly_ai_claude_messages/handler.py` | All implementation — message building, tool schema conversion, tool-use loop, telemetry |
 | `src/launchdarkly_ai_claude_messages/__init__.py` | Package exports |
+| `src/launchdarkly_ai_claude_messages/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 

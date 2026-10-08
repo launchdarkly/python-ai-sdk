@@ -837,6 +837,9 @@ async def resolve_graph(
     ``context`` is a keyword-only argument, mirroring the TypeScript
     ``resolveGraph(key, { context, handlers, toolHandlers, registry })`` shape.
     """
+    from .sdk_usage import report_usage
+
+    report_usage("client.resolveGraph")
     resolved_handlers = resolve_handlers(registry, handlers)
     resolved_tools = resolve_tools(registry, tool_handlers)
     options = {
@@ -869,6 +872,19 @@ class GraphInstance:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> ProviderGraphResponse:
+        from .sdk_usage import report_usage
+
+        report_usage("client.graph.invoke")
+        return await self._invoke(user_input, context, variables, history)
+
+    async def _invoke(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ProviderGraphResponse:
+        """Non-reporting :meth:`invoke`."""
         from opentelemetry import trace
 
         from .judges import run_judges
@@ -1066,8 +1082,22 @@ class GraphInstance:
         Deliberately not an ``async def`` with ``yield``: a generator body does not run until the
         first ``__anext__``, by which point a ``conversation_id`` / caller span scope wrapped around
         this call may have already exited. Binding the conversation id and capturing the OTel parent
-        here — at call time — matches ``config().stream()`` and the TypeScript graph stream.
+        here — at call time — matches ``config().stream()`` and the TypeScript graph stream. The
+        usage report also runs here, on the call, before any iteration.
         """
+        from .sdk_usage import report_usage
+
+        report_usage("client.graph.stream")
+        return self._stream(user_input, context, variables, history)
+
+    def _stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        """Non-reporting :meth:`stream`: binds the conversation id and OTel parent at call time."""
         from opentelemetry import context as otel_context
 
         caller_context = otel_context.get_current()
@@ -1289,6 +1319,32 @@ class GraphInstance:
             end_span_once(span, ended, abandoned=True, cancelled=cancelled)
 
 
+class _InternalGraphInstance(GraphInstance):
+    """A ``GraphInstance`` whose ``invoke`` and ``stream`` do not report usage.
+
+    Returned by :func:`_graph` for SDK graph wrappers: the wrapper reports itself, and the
+    graph calls made through the object it returns are not separate helper calls.
+    """
+
+    async def invoke(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ProviderGraphResponse:
+        return await self._invoke(user_input, context, variables, history)
+
+    def stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[GraphStreamEvent, None]:
+        return self._stream(user_input, context, variables, history)
+
+
 def graph(
     key: str,
     *,
@@ -1309,3 +1365,21 @@ def graph(
         "graph_judge": graph_judge,
     }
     return GraphInstance(key=key, options=options)
+
+
+def _graph(
+    key: str,
+    *,
+    handlers: list[ProviderHandler] | None = None,
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    registry: Any = None,
+    graph_judge: str | None = None,
+) -> GraphInstance:
+    """Non-reporting :func:`graph` for SDK graph wrappers."""
+    options = {
+        "handlers": handlers,
+        "tool_handlers": tool_handlers,
+        "registry": registry,
+        "graph_judge": graph_judge,
+    }
+    return _InternalGraphInstance(key=key, options=options)

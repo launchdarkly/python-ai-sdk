@@ -711,6 +711,9 @@ def init_evaluations(
     ``project_key`` names the project that holds the evaluations, the tools,
     and the datasets this module uses.
     """
+    from ..sdk_usage import report_usage
+
+    report_usage("client.init_evaluations")
     resolved_project_key = (project_key or "").strip() or _env("LD_PROJECT_KEY")
     if not resolved_project_key:
         raise EvaluationsError(

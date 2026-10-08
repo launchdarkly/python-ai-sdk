@@ -31,6 +31,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 | `src/launchdarkly_ai_claude_agents/native_graph.py` | `to_claude_agents()` native graph adapter |
 | `src/launchdarkly_ai_claude_agents/builtins.py` | Pre-constructed `NativeTool` sentinels for Claude built-in tools |
 | `src/launchdarkly_ai_claude_agents/__init__.py` | Package exports |
+| `src/launchdarkly_ai_claude_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 

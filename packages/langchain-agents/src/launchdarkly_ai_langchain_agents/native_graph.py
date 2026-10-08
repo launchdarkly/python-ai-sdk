@@ -20,9 +20,11 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     to_ld_context,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .messages import to_lang_chain_messages
 
 try:
@@ -132,6 +134,7 @@ def to_lang_graph(
             {"context": ctx},
         ).invoke("I was double charged")
     """
+    report_usage("langchain-agents.toLangGraph", PACKAGE_NAME, __version__)
     _opts = opts or {}
 
     async def invoke(
