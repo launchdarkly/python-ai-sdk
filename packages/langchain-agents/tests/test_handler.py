@@ -2376,7 +2376,6 @@ class TestModelSource:
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "max_tokens": 512,
-            "tools": [{"name": "openai-tool"}],
             "model": "gpt-4o",
         }
 

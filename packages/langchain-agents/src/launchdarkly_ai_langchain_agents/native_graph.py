@@ -208,6 +208,8 @@ def to_lang_graph(
                 model_cfg = node.config.get("model") or {}
                 raw = model_cfg.get("parameters")
                 kwargs = dict(raw) if isinstance(raw, dict) else {}
+                # Tools are bound from the node config. A tools key here is forwarded raw and rejected.
+                kwargs.pop("tools", None)
                 kwargs["model"] = model_cfg.get("name") or "gpt-4o"
                 chat_model = lc_openai.ChatOpenAI(**kwargs)
 
