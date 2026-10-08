@@ -6,7 +6,7 @@ import json
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
-from agents import ModelSettings
+from agents import ModelSettings, RunConfig
 from agents.agent_output import AgentOutputSchemaBase
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.lifecycle import RunHooksBase
@@ -48,10 +48,8 @@ _MODEL_SETTING_FIELDS = {
     "store",
     "include_usage",
     "top_logprobs",
-    "extra_headers",
-    "extra_query",
-    "extra_body",
 }
+_RUN_CONFIG = RunConfig(tracing_disabled=True)
 
 
 def _json_schema(output_format: dict[str, Any]) -> dict[str, Any]:
@@ -100,41 +98,35 @@ class _JsonSchemaOutput(AgentOutputSchemaBase):
 def _model_config(config_value: AiConfigRep) -> tuple[str, dict[str, Any]]:
     model = config_value.get("model") or {}
     raw = model.get("parameters")
-    parameters = dict(raw) if isinstance(raw, dict) else {}
-    for field in (
-        "model",
-        "messages",
-        "tools",
-        "stream",
-        "stream_options",
-        "response_format",
-        "output_format",
-    ):
-        parameters.pop(field, None)
+    allowed = _MODEL_SETTING_FIELDS | {"max_turns"}
+    parameters = (
+        {key: value for key, value in raw.items() if key in allowed}
+        if isinstance(raw, dict)
+        else {}
+    )
     return str(model.get("name") or ""), parameters
 
 
-def _default_model_factory(name: str, parameters: dict[str, Any]) -> Any:
-    return LitellmModel(
-        model=name,
-        base_url=parameters.get("base_url"),
-        api_key=parameters.get("api_key"),
-    )
+def _litellm_model(
+    name: str, *, base_url: str | None = None, api_key: str | None = None
+) -> Any:
+    # Connection settings come from the handler, never from model.parameters.
+    kwargs: dict[str, Any] = {"model": name}
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+    return LitellmModel(**kwargs)
 
 
 def _model_settings(parameters: dict[str, Any]) -> ModelSettings:
-    known = {
-        key: value for key, value in parameters.items() if key in _MODEL_SETTING_FIELDS
-    }
-    extras = {
-        key: value
-        for key, value in parameters.items()
-        if key
-        not in _MODEL_SETTING_FIELDS | {"max_turns", "base_url", "api_key", "model"}
-    }
-    if extras:
-        known["extra_args"] = extras
-    return ModelSettings(**known)
+    return ModelSettings(
+        **{
+            key: value
+            for key, value in parameters.items()
+            if key in _MODEL_SETTING_FIELDS
+        }
+    )
 
 
 def _instructions(config_value: AiConfigRep, variables: dict[str, Any]) -> str | None:
@@ -490,8 +482,15 @@ def create_litellm_agents_handler(
     *,
     model_factory: ModelFactory | None = None,
     capture_content: bool = False,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> ProviderHandler:
-    factory = model_factory or _default_model_factory
+    if model_factory is None:
+
+        def model_factory(name: str, _parameters: dict[str, Any]) -> Any:
+            return _litellm_model(name, base_url=base_url, api_key=api_key)
+
+    factory = model_factory
 
     async def call(
         config_value: AiConfigRep,
@@ -525,7 +524,11 @@ def create_litellm_agents_handler(
                     messages=[text_message("user", str(prompt))],
                 )
             result = await importlib.import_module("agents").Runner.run(
-                agent, prompt, max_turns=max_turns, hooks=hooks
+                agent,
+                prompt,
+                max_turns=max_turns,
+                hooks=hooks,
+                run_config=_RUN_CONFIG,
             )
             output = result.final_output
             if capture_content:
@@ -610,7 +613,7 @@ async def _stream(
                 messages=[text_message("user", str(prompt))],
             )
         streamed = importlib.import_module("agents").Runner.run_streamed(
-            agent, prompt, max_turns=max_turns, hooks=hooks
+            agent, prompt, max_turns=max_turns, hooks=hooks, run_config=_RUN_CONFIG
         )
         collected = ""
         async for event in streamed.stream_events():
@@ -674,10 +677,15 @@ def litellm_agents(
     variables = kwargs.pop("variables", None)
     capture_content = bool(kwargs.pop("capture_content", False))
     model_factory = kwargs.pop("model_factory", None)
+    base_url = kwargs.pop("base_url", None)
+    api_key = kwargs.pop("api_key", None)
     return config(
         key=config_key,
         handler=create_litellm_agents_handler(
-            model_factory=model_factory, capture_content=capture_content
+            model_factory=model_factory,
+            capture_content=capture_content,
+            base_url=base_url,
+            api_key=api_key,
         ),
         **kwargs,
     ).invoke(user_input, context, variables)

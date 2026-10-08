@@ -15,6 +15,7 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanUsage,
     config,
+    content_to_text,
     create_handler,
     end_span_once,
     image_block_to_url,
@@ -39,14 +40,24 @@ def _json_schema(output_format: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-_OWNED_PARAMETERS = {
-    "model",
-    "messages",
-    "tools",
-    "stream",
-    "stream_options",
-    "response_format",
-}
+# Generation settings only. Connection and credential keys (api_base, api_key,
+# base_url, extra_headers, aws_*, vertex_*, ...) stay out: LiteLLM reads them
+# as call arguments, and an AI Config must not choose where the provider key goes.
+_FORWARDED_PARAMETERS = frozenset(
+    {
+        "frequency_penalty",
+        "max_completion_tokens",
+        "max_tokens",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning_effort",
+        "seed",
+        "stop",
+        "temperature",
+        "tool_choice",
+        "top_p",
+    }
+)
 _MAX_TOOL_TURNS = 10
 
 
@@ -147,6 +158,21 @@ def _build_tools(
     ]
 
 
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return content_to_text(content)
+    return "" if content is None else str(content)
+
+
+def _span_messages(messages: list[dict[str, Any]]) -> list[Any]:
+    return [
+        text_message(str(message["role"]), _message_text(message.get("content")))
+        for message in messages
+    ]
+
+
 def _request(
     config_value: AiConfigRep,
     messages: list[dict[str, Any]],
@@ -156,9 +182,15 @@ def _request(
 ) -> dict[str, Any]:
     model = config_value.get("model") or {}
     raw_parameters = model.get("parameters")
-    parameters = dict(raw_parameters) if isinstance(raw_parameters, dict) else {}
-    for field in _OWNED_PARAMETERS:
-        parameters.pop(field, None)
+    parameters = (
+        {
+            key: value
+            for key, value in raw_parameters.items()
+            if key in _FORWARDED_PARAMETERS
+        }
+        if isinstance(raw_parameters, dict)
+        else {}
+    )
     parameters.update(
         {
             "model": _model_name(config_value),
@@ -358,10 +390,7 @@ def create_litellm_messages_handler(
                 set_input_content_attributes(
                     root,
                     True,
-                    messages=[
-                        text_message(str(message["role"]), str(message["content"]))
-                        for message in messages
-                    ],
+                    messages=_span_messages(messages),
                 )
             for _ in range(_MAX_TOOL_TURNS + 1):
                 model_span = _model_span(config_value, parent)
@@ -371,12 +400,7 @@ def create_litellm_messages_handler(
                         set_input_content_attributes(
                             model_span,
                             True,
-                            messages=[
-                                text_message(
-                                    str(message["role"]), str(message["content"])
-                                )
-                                for message in messages
-                            ],
+                            messages=_span_messages(messages),
                         )
                     response = await completion(
                         **_request(config_value, messages, tools, stream=False)
@@ -494,15 +518,13 @@ async def _stream(
     full_output = ""
     ended: set[int] = set()
     open_model: Any = None
+    cancelled = False
     try:
         if capture_content:
             set_input_content_attributes(
                 root,
                 True,
-                messages=[
-                    text_message(str(message["role"]), str(message["content"]))
-                    for message in messages
-                ],
+                messages=_span_messages(messages),
             )
         for _ in range(_MAX_TOOL_TURNS + 1):
             model_span = _model_span(config_value, parent)
@@ -513,10 +535,7 @@ async def _stream(
                     set_input_content_attributes(
                         model_span,
                         True,
-                        messages=[
-                            text_message(str(message["role"]), str(message["content"]))
-                            for message in messages
-                        ],
+                        messages=_span_messages(messages),
                     )
                 provider_stream = await completion(
                     **_request(config_value, messages, tools, stream=True)
@@ -607,6 +626,9 @@ async def _stream(
                 )
             )
         raise RuntimeError("Tool loop exceeded the maximum number of turns")
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as exc:
         if usage_reported:
             root.set_attribute("gen_ai.response.model", _model_name(config_value))
@@ -622,11 +644,11 @@ async def _stream(
                 pass
         if not completed:
             if open_model is not None:
-                end_span_once(open_model, ended, abandoned=True)
+                end_span_once(open_model, ended, abandoned=True, cancelled=cancelled)
             if usage_reported:
                 root.set_attribute("gen_ai.response.model", _model_name(config_value))
                 set_usage_span_attributes(root, total)
-            end_span_once(root, ended, abandoned=True)
+            end_span_once(root, ended, abandoned=True, cancelled=cancelled)
 
 
 def litellm_messages(

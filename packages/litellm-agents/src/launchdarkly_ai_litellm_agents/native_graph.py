@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import re
 import time
@@ -9,7 +10,7 @@ import types
 import uuid
 from typing import Any
 
-from agents.extensions.models.litellm_model import LitellmModel
+from agents import RunConfig
 
 from launchdarkly_ai_server import (
     GraphDefinition,
@@ -23,6 +24,7 @@ from launchdarkly_ai_server import (
 
 from .handler import (
     ModelFactory,
+    _litellm_model,
     _map_agent_content,
     _model_config,
     _model_settings,
@@ -40,14 +42,6 @@ except ImportError:
 
 def _name(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", value)[:64]
-
-
-def _default_factory(name: str, parameters: dict[str, Any]) -> Any:
-    return LitellmModel(
-        model=name,
-        base_url=parameters.get("base_url"),
-        api_key=parameters.get("api_key"),
-    )
 
 
 def _instructions(node: GraphNode, variables: dict[str, Any]) -> str | None:
@@ -85,7 +79,13 @@ def to_litellm_agents(
 
         agents = importlib.import_module("agents")
         RunHooks = agents.RunHooks
-        factory: ModelFactory = options.get("model_factory") or _default_factory
+        base_url = options.get("base_url")
+        api_key = options.get("api_key")
+
+        def default_factory(name: str, _parameters: dict[str, Any]) -> Any:
+            return _litellm_model(name, base_url=base_url, api_key=api_key)
+
+        factory: ModelFactory = options.get("model_factory") or default_factory
         tool_handlers = options.get("tool_handlers") or {}
         values = variables or {}
         built: dict[str, Any] = {}
@@ -195,14 +195,27 @@ def to_litellm_agents(
                             make_track_data(from_node, graph.key, run_id),
                             1,
                         )
-                to_key = agent_name_to_key.get(to_agent.name)
-                if to_key and to_key not in path:
-                    path.append(to_key)
 
             async def on_agent_start(self, context: Any, agent: Any) -> None:
                 node_key = agent_name_to_key.get(agent.name)
-                if node_key and node_key not in path:
-                    path.append(node_key)
+                if not node_key or node_key in path:
+                    return
+                index = len(path)
+                path.append(node_key)
+                if not ld_context:
+                    return
+                node = graph.get_node(node_key)
+                if node:
+                    get_client().track(
+                        "$ld:ai:graph:node",
+                        ld_context,
+                        {
+                            **make_track_data(node, graph.key, run_id),
+                            "nodeKey": node_key,
+                            "index": index,
+                        },
+                        1,
+                    )
 
         if _HAS_OTEL:
             span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
@@ -214,7 +227,10 @@ def to_litellm_agents(
 
         try:
             result = await agents.Runner.run(
-                built[graph.root.key], runner_input, hooks=_LDHooks()
+                built[graph.root.key],
+                runner_input,
+                hooks=_LDHooks(),
+                run_config=RunConfig(tracing_disabled=True),
             )
             if span:
                 span.set_status(SpanStatusCode.OK)
@@ -242,7 +258,6 @@ def to_litellm_agents(
                 client.track(
                     "$ld:ai:graph:total_tokens", ld_context, root_td, total_tokens
                 )
-                client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
                 client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
             return {
                 "response": str(result.final_output or ""),
@@ -252,6 +267,10 @@ def to_litellm_agents(
                     "total": total_tokens,
                 },
             }
+        except asyncio.CancelledError:
+            if span is not None:
+                span.set_attribute("launchdarkly.run.cancelled", True)
+            raise
         except BaseException as exc:
             if span and isinstance(exc, Exception):
                 span.record_exception(exc)

@@ -1,5 +1,7 @@
 # `launchdarkly-ai-litellm-agents`
 
+**Experimental.** This package stays on 0.x until the Python and JavaScript LiteLLM integrations match.
+
 Provider-agnostic LaunchDarkly AI Config and graph handlers built on the OpenAI
 Agents SDK's `LitellmModel`.
 

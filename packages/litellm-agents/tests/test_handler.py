@@ -153,7 +153,39 @@ class TestFactoryAndModelBinding:
             await create_litellm_agents_handler()(CONFIG, "q", {}, {"name": "Ada"})
         litellm_model.assert_called_once()
         assert litellm_model.call_args.kwargs["model"] == "anthropic/claude-sonnet-4"
+        assert "base_url" not in litellm_model.call_args.kwargs
+        assert "api_key" not in litellm_model.call_args.kwargs
         assert FakeAgent.created[0]["model"] is litellm_model.return_value
+
+    async def test_config_cannot_redirect_the_provider_key(self) -> None:
+        agents = _agents_module()
+        litellm_model = MagicMock(return_value=object())
+        config = {
+            **CONFIG,
+            "model": {
+                "name": "anthropic/claude-sonnet-4",
+                "parameters": {
+                    "temperature": 0.2,
+                    "api_base": "http://127.0.0.1:9",
+                    "api_key": "provider-secret",
+                    "base_url": "http://127.0.0.1:9",
+                    "extra_headers": {"X-Smuggled": "1"},
+                },
+            },
+        }
+        with (
+            _patch_agents(agents),
+            patch.object(handler_mod, "LitellmModel", litellm_model),
+        ):
+            await create_litellm_agents_handler(
+                base_url="https://proxy.example", api_key="handler-key"
+            )(config, "q")
+        assert litellm_model.call_args.kwargs["base_url"] == "https://proxy.example"
+        assert litellm_model.call_args.kwargs["api_key"] == "handler-key"
+        settings = FakeAgent.created[0]["model_settings"]
+        assert settings.temperature == 0.2
+        assert not settings.extra_args
+        assert not settings.extra_headers
 
     async def test_model_factory_is_evaluated_per_call_and_instance_scoped(
         self,
@@ -399,6 +431,7 @@ class TestLifecycleAndTelemetry:
             *,
             max_turns: int,
             hooks: Any,
+            **_kwargs: Any,
         ) -> Any:
             await hooks.on_llm_start(
                 SimpleNamespace(), agent, agent.instructions, prompt
@@ -459,6 +492,7 @@ class TestLifecycleAndTelemetry:
             *,
             max_turns: int,
             hooks: Any,
+            **_kwargs: Any,
         ) -> Any:
             await hooks.on_llm_start(
                 SimpleNamespace(), agent, agent.instructions, prompt

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import launchdarkly_ai_litellm_agents.graph as graph_mod
+import launchdarkly_ai_litellm_agents.handler as handler_mod
 import launchdarkly_ai_litellm_agents.native_graph as native_graph_mod
 from launchdarkly_ai_litellm_agents import litellm_graph, to_litellm_agents
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
@@ -314,7 +315,7 @@ class TestNativeGraphAdapter:
                     agents if name == "agents" else real_import(name)
                 ),
             ),
-            patch.object(native_graph_mod, "LitellmModel", litellm_model),
+            patch.object(handler_mod, "LitellmModel", litellm_model),
         ):
             await to_litellm_agents(_definition_awaitable()).invoke("hello")
         assert {call["model"] for call in created_models} == {
@@ -369,29 +370,32 @@ class TestNativeGraphAdapter:
         fallback.assert_not_called()
 
     async def test_success_path_emits_invocation_success_and_tokens(self) -> None:
-        track_calls: list[str] = []
+        track_calls: list[tuple[str, dict[str, Any]]] = []
         mock_ld_client = MagicMock()
         mock_ld_client.track = MagicMock(
-            side_effect=lambda evt, ctx, data, val: track_calls.append(evt)
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
         )
+
+        async def run(
+            agent: Any, _prompt: Any, hooks: Any = None, **_kwargs: Any
+        ) -> Any:
+            await hooks.on_agent_start(None, agent)
+            return SimpleNamespace(
+                final_output="done",
+                context_wrapper=SimpleNamespace(
+                    usage=SimpleNamespace(
+                        input_tokens=4, output_tokens=2, total_tokens=6
+                    )
+                ),
+            )
+
         agents = SimpleNamespace(
             Agent=MagicMock(
                 side_effect=lambda **kwargs: SimpleNamespace(
                     name=kwargs["name"], **kwargs
                 )
             ),
-            Runner=SimpleNamespace(
-                run=AsyncMock(
-                    return_value=SimpleNamespace(
-                        final_output="done",
-                        context_wrapper=SimpleNamespace(
-                            usage=SimpleNamespace(
-                                input_tokens=4, output_tokens=2, total_tokens=6
-                            )
-                        ),
-                    )
-                )
-            ),
+            Runner=SimpleNamespace(run=run),
             handoff=MagicMock(side_effect=lambda target: target),
             FunctionTool=MagicMock(),
             RunHooks=_FakeRunHooks,
@@ -413,8 +417,13 @@ class TestNativeGraphAdapter:
                     "context": {"kind": "user", "key": "test"},
                 },
             ).invoke("hello")
-        assert "$ld:ai:graph:invocation_success" in track_calls
-        assert "$ld:ai:graph:total_tokens" in track_calls
+        events = [name for name, _data in track_calls]
+        assert "$ld:ai:graph:invocation_success" in events
+        assert "$ld:ai:graph:total_tokens" in events
+        assert "$ld:ai:graph:path" not in events
+        nodes = [data for name, data in track_calls if name == "$ld:ai:graph:node"]
+        assert [data["nodeKey"] for data in nodes] == ["root"]
+        assert nodes[0]["index"] == 0
 
     async def test_error_path_emits_invocation_failure_and_rethrows(self) -> None:
         track_calls: list[str] = []
@@ -487,6 +496,7 @@ class TestNativeGraphAdapter:
                     opts={"model_factory": lambda *_: object()},
                 ).invoke("hello")
         span.end.assert_called_once_with()
+        span.set_attribute.assert_any_call("launchdarkly.run.cancelled", True)
 
     async def test_disabled_graph_fails_before_runner_or_model_creation(self) -> None:
         model_factory = MagicMock()

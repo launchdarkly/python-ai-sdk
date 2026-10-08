@@ -5,6 +5,7 @@ These imports are intentionally unresolved at the test-first checkpoint.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -187,6 +188,9 @@ class TestFactoryAndTransport:
                     "tools": ["wrong"],
                     "stream": True,
                     "response_format": {"type": "wrong"},
+                    "api_base": "http://127.0.0.1:9",
+                    "api_key": "provider-secret",
+                    "extra_headers": {"X-Smuggled": "1"},
                 },
             },
         }
@@ -198,6 +202,9 @@ class TestFactoryAndTransport:
         assert request.get("tools") != ["wrong"]
         assert request["stream"] is False
         assert "response_format" not in request
+        assert "api_base" not in request
+        assert "api_key" not in request
+        assert "extra_headers" not in request
 
 
 class TestPromptMapping:
@@ -470,6 +477,27 @@ class TestStreaming:
             break
         await gen.aclose()
         assert stream.closed is True
+
+    async def test_cancelled_stream_is_marked_cancelled_not_abandoned(self) -> None:
+        class CancellingStream(FakeStream):
+            async def _iterate(self) -> AsyncIterator[Any]:
+                yield _chunk(text="one")
+                raise asyncio.CancelledError
+
+        recorder = SpanRecorder()
+        completion = AsyncMock(return_value=CancellingStream([]))
+        with (
+            patch.object(handler_mod, "trace", recorder),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _events(
+                await create_litellm_messages_handler(completion=completion).stream(
+                    CONFIG, "q"
+                )
+            )
+        root = recorder.spans[0]
+        assert root.attributes.get("launchdarkly.run.cancelled") is True
+        assert "launchdarkly.stream.abandoned" not in root.attributes
 
     async def test_stream_error_closes_transport_and_propagates(self) -> None:
         class BrokenStream(FakeStream):
