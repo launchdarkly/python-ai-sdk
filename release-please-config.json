@@ -90,5 +90,25 @@
       ],
       "component": "launchdarkly-ai-langchain-messages"
     }
-  }
+  },
+  "changelog-sections": [
+    { "type": "feat", "scope": "skills", "section": "Experimental" },
+    { "type": "fix", "scope": "skills", "section": "Experimental" },
+    { "type": "perf", "scope": "skills", "section": "Experimental" },
+    { "type": "feat", "scope": "evaluations", "section": "Experimental" },
+    { "type": "fix", "scope": "evaluations", "section": "Experimental" },
+    { "type": "perf", "scope": "evaluations", "section": "Experimental" },
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance Improvements" },
+    { "type": "deps", "section": "Dependencies" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "style", "section": "Styles", "hidden": true },
+    { "type": "chore", "section": "Miscellaneous Chores", "hidden": true },
+    { "type": "refactor", "section": "Code Refactoring", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "build", "section": "Build System", "hidden": true },
+    { "type": "ci", "section": "Continuous Integration", "hidden": true }
+  ]
 }
