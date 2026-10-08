@@ -300,13 +300,18 @@ resumes in place once the cause is fixed, clearing the terminal reason through
   answer) surfaces as an `HTTPError` that `_classify_status` maps to a fatal, non-retried
   failure.
 
-**A stream event whose data is not JSON drops the connection; it is never skipped.**
-`_iter_sse` raises `_RecoverableTransportError`, as the base SDK's FDv2 stream interrupts on
-a `JSONDecodeError`, so the in-flight payload is abandoned and the reconnect sends the last
-committed basis. Skipping the event would let the `payload-transferred` after it commit
-without it and advance the basis: a lost `delete-object` would then never be retransmitted,
-and a lost `put-object` in an `xfer-full` would revoke that skill by omission. Asserted by
-`test_a_malformed_event_abandons_its_transfer_and_keeps_the_basis`.
+**A known stream event whose data is not JSON drops the connection; it is never skipped.**
+`_iter_sse` logs a WARNING and raises `_RecoverableTransportError`, as the base SDK's FDv2
+stream interrupts on a `JSONDecodeError`, so the in-flight payload is abandoned and the
+reconnect sends the last committed basis. Skipping the event would let the
+`payload-transferred` after it commit without it and advance the basis: a lost
+`delete-object` would then never be retransmitted, and a lost `put-object` in an `xfer-full`
+would revoke that skill by omission. The warning is logged in `_iter_sse` because `_run` logs
+a disconnect after a completed exchange at debug. Both cases are asserted by
+`test_a_malformed_event_abandons_its_transfer_and_keeps_the_basis`. Only the events in
+`_EVENTS_WITH_DATA` (the ones `handle` reads) are parsed: a `heart-beat` or an unknown event
+is yielded with `None` data, so its data cannot drop the connection, as `ldclient` parses only
+inside its known-event branches.
 
 **A `goodbye` with `catastrophe: true` is a recoverable, counted disconnect, not a fatal.**
 The Python base SDK does not read the flag and the Go SDK only logs it, so stopping delivery

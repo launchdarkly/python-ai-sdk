@@ -2755,27 +2755,62 @@ class TestFailureHandling:
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
         assert [r for r in caplog.records if "reconnecting in" in r.getMessage()]
 
+    @pytest.mark.parametrize(
+        ("initial_keys", "retransmission", "held_at_reconnect", "after", "revoked"),
+        [
+            pytest.param(
+                ("a", "revoked"),
+                events(
+                    ("server-intent", server_intent("xfer-changes")),
+                    ("put-object", put_skill("fresh", object_version=1)),
+                    ("delete-object", delete_skill("revoked", object_version=1)),
+                    ("payload-transferred", transferred("basis-2")),
+                ),
+                {"a": True, "revoked": True, "fresh": False},
+                {"a": True, "revoked": False, "fresh": True},
+                1,
+                id="delete-object-in-xfer-changes",
+            ),
+            pytest.param(
+                ("a",),
+                events(
+                    ("server-intent", server_intent("xfer-full")),
+                    ("put-object", put_skill("b", object_version=1)),
+                    ("put-object", put_skill("a", object_version=1)),
+                    ("payload-transferred", transferred("basis-2")),
+                ),
+                {"a": True, "b": False},
+                {"a": True, "b": True},
+                0,
+                id="put-object-in-xfer-full",
+            ),
+        ],
+    )
     def test_a_malformed_event_abandons_its_transfer_and_keeps_the_basis(
         self,
+        caplog: Any,
+        initial_keys: tuple[str, ...],
+        retransmission: list[dict[str, Any]],
+        held_at_reconnect: dict[str, bool],
+        after: dict[str, bool],
+        revoked: int,
     ) -> None:
         """A corrupted event fails the connection; it is not skipped.
 
-        Skipping it would let the ``payload-transferred`` after it commit the
-        rest of the transfer and advance the basis past it, so a lost
-        ``delete-object`` would leave a revoked skill served indefinitely: the
-        reconnect asks only for changes since that basis.
+        The event at index 2 of the second transfer is cut short. Skipping it
+        would let the ``payload-transferred`` after it commit the rest of the
+        transfer and advance the basis past it: a lost ``delete-object`` would
+        leave a revoked skill served indefinitely, because the reconnect asks
+        only for changes since that basis, and a lost ``put-object`` in an
+        ``xfer-full`` would revoke that skill by omission. The drop follows a
+        commit on the same connection, so the delivery loop logs it at debug;
+        the reader warns.
         """
         initial = full_payload(
-            ("put-object", put_skill("a", object_version=1)),
-            ("put-object", put_skill("revoked", object_version=1)),
+            *(("put-object", put_skill(key, object_version=1)) for key in initial_keys),
             state="basis-1",
         )
-        retransmission = events(
-            ("server-intent", server_intent("xfer-changes")),
-            ("put-object", put_skill("fresh", object_version=1)),
-            ("delete-object", delete_skill("revoked", object_version=1)),
-            ("payload-transferred", transferred("basis-2")),
-        )
+        keys = held_at_reconnect.keys()
 
         def sse(payload_events: list[dict[str, Any]], *, truncate: int = -1) -> bytes:
             """Serialises *payload_events*, cutting short the data at *truncate*."""
@@ -2790,20 +2825,19 @@ class TestFailureHandling:
         class _CorruptedThenClean(_FakeRequester):
             def __init__(self) -> None:
                 self.bases: list[str | None] = []
-                self.held_at_reconnect: dict[str, Any] = {}
+                self.held_at_reconnect: dict[str, bool] = {}
                 self.store: FDv2SkillStore | None = None
 
             def stream(self, basis: str | None) -> Any:
                 self.bases.append(basis)
                 if len(self.bases) == 1:
-                    # The delete, at index 2 of the second transfer, is cut short.
                     body = sse(initial + retransmission, truncate=len(initial) + 2)
                     return _StreamConnection(_LineSource(body))
                 if len(self.bases) == 2:
                     assert self.store is not None
                     self.held_at_reconnect = {
-                        key: self.store.get_object(SKILL_OBJECT_KIND, key)
-                        for key in ("a", "revoked", "fresh")
+                        key: self.store.get_object(SKILL_OBJECT_KIND, key) is not None
+                        for key in keys
                     }
                     return _StreamConnection(_LineSource(sse(retransmission)))
                 return _BlockingConnection()
@@ -2811,25 +2845,30 @@ class TestFailureHandling:
         requester = _CorruptedThenClean()
         store = stream_store(_requester=requester)
         requester.store = store
-        try:
-            store.start()
-            assert wait_until(lambda: len(requester.bases) >= 3)
-            # Nothing from the corrupted transfer committed: not the delete it
-            # lost, and not the put that arrived intact beside it.
-            held = requester.held_at_reconnect
-            assert held["a"] is not None
-            assert held["revoked"] is not None
-            assert held["fresh"] is None
-            # The reconnect resumed from the last committed basis.
-            assert requester.bases[:2] == [None, "basis-1"]
-            # The clean retransmission applied in full.
-            assert store.get_object(SKILL_OBJECT_KIND, "revoked") is None
-            assert store.get_object(SKILL_OBJECT_KIND, "fresh") is not None
-            assert store.diagnostics.objects_revoked == 1
-            assert requester.bases[2] == "basis-2"
-            assert store.failed is None
-        finally:
-            store.close()
+        with caplog.at_level("DEBUG", logger="launchdarkly_ai_server.skills_fdv2"):
+            try:
+                store.start()
+                assert wait_until(lambda: len(requester.bases) >= 3)
+                # Nothing from the corrupted transfer committed: not the event
+                # it lost, and not the put that arrived intact beside it.
+                assert requester.held_at_reconnect == held_at_reconnect
+                # The reconnect resumed from the last committed basis.
+                assert requester.bases[:2] == [None, "basis-1"]
+                # The clean retransmission applied in full.
+                assert {
+                    key: store.get_object(SKILL_OBJECT_KIND, key) is not None
+                    for key in keys
+                } == after
+                assert store.diagnostics.objects_revoked == revoked
+                assert requester.bases[2] == "basis-2"
+                assert store.failed is None
+            finally:
+                store.close()
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        corrupted = retransmission[2]["event"]
+        assert any(f"'{corrupted}' event's data was not JSON" in w for w in warnings), (
+            warnings
+        )
 
     def test_a_connection_that_never_answered_still_warns(self, caplog: Any) -> None:
         # The quiet path is earned by answering. A connection that failed before
@@ -3328,6 +3367,16 @@ class TestTransportMemoryBound:
         with pytest.raises(_RecoverableTransportError, match="not JSON"):
             list(_iter_sse(source))
         assert source.closed
+
+    @pytest.mark.parametrize("name", ["heart-beat", "x-future-event"])
+    def test_an_event_handle_does_not_read_is_not_parsed(self, name: str) -> None:
+        # Unknown events are ignored by contract, so data that is not JSON on
+        # one, or on a heart-beat, must not drop the connection.
+        source = _LineSource(
+            f"event: {name}\ndata: not json\n\n".encode()
+            + b'event: put-object\ndata: {"a": 1}\n\n'
+        )
+        assert list(_iter_sse(source)) == [(name, None), ("put-object", {"a": 1})]
 
 
 @pytest.fixture

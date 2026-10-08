@@ -108,6 +108,20 @@ _EVENT_HEARTBEAT = "heart-beat"
 _EVENT_GOODBYE = "goodbye"
 _EVENT_ERROR = "error"
 
+# The events whose data ``_FDv2Reader.handle`` reads. Only these are parsed, so
+# a ``heart-beat`` or an unknown event with data that is not JSON is ignored,
+# as ``ldclient``'s FDv2 stream ignores it.
+_EVENTS_WITH_DATA = frozenset(
+    (
+        _EVENT_SERVER_INTENT,
+        _EVENT_PUT_OBJECT,
+        _EVENT_DELETE_OBJECT,
+        _EVENT_PAYLOAD_TRANSFERRED,
+        _EVENT_GOODBYE,
+        _EVENT_ERROR,
+    )
+)
+
 _INTENT_TRANSFER_FULL = "xfer-full"
 _INTENT_TRANSFER_CHANGES = "xfer-changes"
 _INTENT_TRANSFER_NONE = "none"
@@ -1244,12 +1258,15 @@ def _iter_sse(response: Any) -> Any:
     ``MAX_RESPONSE_BYTES`` raises a fatal error and the in-flight payload is
     abandoned.
 
-    An event whose data is not JSON raises ``_RecoverableTransportError``, as
-    the base SDK's FDv2 stream does: the in-flight payload is abandoned and the
-    reconnect resumes from the last committed basis. Skipping the event instead
-    would let the ``payload-transferred`` after it commit the transfer without
-    it and advance the basis past it, so a lost ``delete-object`` would never be
-    retransmitted.
+    A known event whose data is not JSON is logged at WARNING and raises
+    ``_RecoverableTransportError``, as the base SDK's FDv2 stream does: the
+    in-flight payload is abandoned and the reconnect resumes from the last
+    committed basis. Skipping the event instead would let the
+    ``payload-transferred`` after it commit the transfer without it and advance
+    the basis past it, so a lost ``delete-object`` would never be retransmitted.
+    The warning is logged here because the delivery loop logs a disconnect
+    after a completed exchange at debug. Any other event is yielded with
+    ``None`` data, unparsed.
     """
     limit = MAX_RESPONSE_BYTES
     try:
@@ -1261,14 +1278,18 @@ def _iter_sse(response: Any) -> Any:
             if line == "":
                 if name is not None:
                     payload = "\n".join(data_lines)
-                    try:
-                        parsed = json.loads(payload) if payload else None
-                    except json.JSONDecodeError as exc:
-                        raise _RecoverableTransportError(
-                            f"an FDv2 '{name}' event's data was not JSON ({exc}); "
-                            "the connection was dropped and nothing from the "
-                            "in-flight payload was applied"
-                        ) from exc
+                    parsed = None
+                    if payload and name in _EVENTS_WITH_DATA:
+                        try:
+                            parsed = json.loads(payload)
+                        except json.JSONDecodeError as exc:
+                            message = (
+                                f"an FDv2 '{name}' event's data was not JSON "
+                                f"({exc}); the connection was dropped and "
+                                "nothing from the in-flight payload was applied"
+                            )
+                            logger.warning("%s; reconnecting", message)
+                            raise _RecoverableTransportError(message) from exc
                     yield name, parsed
                 name = None
                 data_lines = []
