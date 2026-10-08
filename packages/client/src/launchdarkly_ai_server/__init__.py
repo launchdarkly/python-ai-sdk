@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.3"  # x-release-please-version
+__version__ = "0.2.4"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .content import (
@@ -26,9 +26,11 @@ from .conversation import (
     set_conversation_id_if_absent,
 )
 from .evaluations import (
+    AIConfig,
     Criterion,
     DatasetRow,
     EvalRunResult,
+    EvalTool,
     EvaluationsError,
     EvaluationsModule,
     GenerationConfig,
@@ -73,6 +75,7 @@ from .types import (
     GraphEdge,
     GraphNode,
     GraphOptions,
+    GraphStreamEvent,
     GraphTopology,
     HandlerResult,
     HandlerStreamEvent,
@@ -136,6 +139,7 @@ __all__ = [  # noqa: RUF022
     "GraphEdge",
     "GraphNode",
     "GraphOptions",
+    "GraphStreamEvent",
     "GraphTopology",
     "HandlerResult",
     "HandlerStreamEvent",
@@ -184,12 +188,14 @@ __all__ = [  # noqa: RUF022
     "to_semconv_finish_reason",
     "VariationMeta",
     # evaluations
+    "AIConfig",
     "EvalRunResult",
     "Criterion",
     "DatasetRow",
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
+    "EvalTool",
     "Judge",
     "RunSummary",
     "Scorer",

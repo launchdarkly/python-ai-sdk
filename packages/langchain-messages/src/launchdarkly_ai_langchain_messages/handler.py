@@ -230,9 +230,8 @@ def _model_constructor_kwargs(
 ) -> dict[str, Any]:
     raw = (config.get("model") or {}).get("parameters")
     parameters = dict(raw) if isinstance(raw, dict) else {}
-    provider = str((config.get("provider") or {}).get("name") or "").lower()
-    if provider == "bedrock":
-        parameters.pop("tools", None)
+    # Tools are bound from config["tools"]. A tools key here is forwarded raw and rejected.
+    parameters.pop("tools", None)
     # Name from the config always wins over a colliding ``model`` key in the parameter bag.
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
@@ -248,7 +247,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
-    ``model.parameters`` are passed through unchanged.
+    ``model.parameters`` are passed through, except ``tools``, which is bound separately.
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
     if provider == "anthropic":

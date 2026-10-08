@@ -4,7 +4,7 @@ The core package for the LaunchDarkly AI Python SDK. It owns the LaunchDarkly cl
 
 All handler packages (`launchdarkly-ai-*`) depend on this package.
 
-> **Tip:** for the simplest install, use [`launchdarkly-ai-python`](../ai/README.md) instead. It re-exports this package's full API and is the recommended default for most applications.
+> **Tip:** for the simplest install, use [`launchdarkly-ai-python`](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/ai/README.md) instead. It re-exports this package's full API and is the recommended default for most applications.
 
 ## Installation
 
@@ -39,7 +39,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint override (default: LaunchDarkly Observability backend) |
-| `LD_API_TOKEN` | For evaluations | API access token used by the evaluations management API |
+| `LD_API_TOKEN` | For evaluations | API key used by the evaluations management API |
 | `LD_SDK_KEY` | For evaluations | SDK key whose event transport carries generation results to LaunchDarkly |
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
@@ -59,9 +59,8 @@ from launchdarkly_ai_server import init_evaluations
 
 
 async def main() -> int:
-    evals = init_evaluations()  # LD_API_TOKEN required; LD_SDK_KEY unless a client is already initialized
+    evals = init_evaluations(project_key="my-project")  # LD_API_TOKEN required; LD_SDK_KEY unless a client is already initialized
     result = await evals.run(
-        project_key="my-project",
         key="support-qa-2026-08-20",
         dataset="support-golden",
         handler=create_openai_messages_handler(),
@@ -78,9 +77,28 @@ async def main() -> int:
 sys.exit(asyncio.run(main()))
 ```
 
-`project_key` is supplied per run rather than during initialization. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
+`project_key` is supplied during initialization, either as an argument to `init_evaluations()` or through `LD_PROJECT_KEY`. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
 
 Generation and criterion events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises rather than creating a run that can never complete unless it can resolve an event transport: either an SDK key (`sdk_key` or `LD_SDK_KEY`) or a client already initialized through `init_client(client=...)`. Bringing your own client lets a process emit evaluation events without an SDK key in scope. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
+
+### Supply the dataset inline
+
+Pass a list of rows as `dataset`, instead of a dataset key, for datasets that live in code or are built at run time rather than stored in LaunchDarkly. Each row is a mapping in the upload wire shape — any of `input`, `expectedOutput`, `variables` and `metadata`, plus an optional `rowIdx` — and its index is its position in the list.
+
+```python
+result = await evals.run(
+    project_key="my-project",
+    key="support-qa-2026-08-20",
+    dataset=[
+        {"input": "How do I reset my password?", "expectedOutput": "Use the reset link."},
+        {"input": "Where is order {{order_id}}?", "variables": {"order_id": "A-17"}},
+    ],
+    handler=create_openai_messages_handler(),
+    generation={"provider": "OpenAI", "model": "gpt-4o"},
+)
+```
+
+The rows are uploaded to the run, in batches of up to 500, before any generation starts. They are uploaded unrendered, and `{{...}}` placeholders render exactly as they do for a stored dataset. Every row needs a non-empty `input`, and `variables` and `metadata` must be JSON-encodable with no NaN or Infinity; a malformed row fails the run before any records are created. If an upload batch is rejected, the harness cancels the run — the API offers no way to mark it failed — and raises the upload error. Events from an inline run carry no dataset id.
 
 ### Score rows with judges and scorers
 
@@ -96,8 +114,7 @@ def mentions_policy(row: DatasetRow, output: str | None) -> bool:
     return "refund policy" in (output or "").lower()
 
 
-result = await init_evaluations().run(
-    project_key="my-project",
+result = await init_evaluations(project_key="my-project").run(
     key="support-qa-2026-08-20",
     dataset="support-golden",
     handler=create_openai_messages_handler(),
@@ -115,6 +132,51 @@ result = await init_evaluations().run(
 `Scorer.fn` receives the `DatasetRow` the output was generated from plus the generated output, may be sync or async, and must return a bool or a number from 0 to 1; booleans become 1.0 or 0.0. `Judge.threshold` defaults to 0.5 and `Scorer.threshold` to 1.0 — a perfect score, which is what a boolean scorer wants — and both accept an optional `pass_rate_threshold`. Judge keys and scorer names share one `criterionType` namespace and must be unique within a run, case-insensitively, because that name is part of each result's deterministic event identity. `Judge.ground_truth_context` overrides what the judge is graded against when the dataset row's expected output is not it.
 
 **The SDK reports scores and never rules on them.** LaunchDarkly derives each row's verdict at ingest by comparing the score against the criterion's stored threshold and success direction, so pass/fail policy is one server-side implementation that applies to every SDK version and to runs already recorded. A judge's direction lives on its AI Config and is injected server-side, keeping the one input a verdict turns on server-attested; a `Scorer` has no LaunchDarkly-side config to read, so it declares its own `success_direction` (default `"higher_is_better"` — set `"lower_is_better"` for a scorer that counts something unwanted, like a regex hit count).
+
+#### Judge the tool trajectory
+
+A judge is shown the tool calls the row made on the way to its output, so a rubric can grade *how* the agent answered and not only *what* it answered — whether it called the right tool, in the right order, with the right arguments, and how it handled a tool that failed.
+
+The harness records this itself: it wraps your tool implementations once per row before handing them to the handler, so every handler package is covered without changes and your tools still return and raise exactly what they did before.
+
+**This is not specific to offline evaluations.** Online judges — both the inline ones sampled by `config().invoke()` and the deferred ones you run from a `JudgeTask` on a background thread — are shown the same trajectory, built by the same function. See [Judges see one conversation](#judges-see-one-conversation).
+
+The trajectory is rendered into **`{{message_history}}`** — the row input, then the trajectory, then the generated output, then the formatting instructions, in that order. There is no separate trajectory variable: `message_history` is already the transcript variable every judge reads, and judges built from the AI Library's default templates reference it, so a trajectory rubric can be written against an existing judge template with no new placeholder.
+
+```
+Tools available: lookup_order, issue_refund
+Tool calls made while producing the response, in order:
+1. lookup_order
+   arguments: {"id":"A1"}
+   result: order A1 shipped 2026-08-02
+2. issue_refund
+   arguments: {"id":"A1","amount":19.99}
+   error: refund window closed
+```
+
+A row with tools that called none of them says so explicitly, which is the finding a tool-selection rubric most needs. A run with no tools adds no block at all, so judges written before trajectories existed read exactly the history they read before.
+
+#### Judges see one conversation
+
+All three judge paths build `{{message_history}}` through a single function, `judge_scoring.build_message_history`:
+
+| Path | Entry point |
+| --- | --- |
+| Online, inline | `config().invoke()` → `run_judges` |
+| Online, deferred | `config(skip_judges=True).invoke()` → `run_judge(task, handlers)` on your own thread |
+| Offline | `init_evaluations().run(criteria=[Judge(...)])` |
+
+Each one is the input, then the tool trajectory, then the output, then the `{score, reasoning}` format block, with empty parts skipped. A judge therefore grades the same conversation wherever it runs, which is what makes a rubric portable between a production sample and a dataset replay.
+
+They did not always agree, and that is why this is a single function now: each path used to join its own history. The offline one carried the row input, the inline one carried the user input, and the deferred one carried **neither** — so a deferred judge graded a response with no request beside it. `JudgeTask` gained `user_input` and `trajectory` to close that.
+
+For the deferred path those two fields travel on the task, which stays picklable — the trajectory crosses as the rendered string, not the structured record.
+
+A **graph-level** judge (`graph_judge`) gets no trajectory: it grades a final answer produced across several nodes, and splicing their trajectories together would describe a conversation that never happened. Per-node judges inside a graph do get their own node's.
+
+Two limits keep a trajectory from spending the judge's context window: at most 50 recorded calls per row and 2000 characters per rendered argument bag or result, with anything beyond either reported as a count or marked truncated. Calls past the limit still execute — truncation drops the record, never the work. A `NativeTool` runs inside the provider, so no local wrapper sees it; such a tool is left out of the trajectory and out of the "Tools available" line, since naming a tool whose use cannot be shown would invite a judge to conclude the model ignored it.
+
+A tool result is now judge-prompt input. It stays literal for the same reason the generated output does: the judge config is handed to the handler unrendered and the handler makes exactly one template pass, so a `{{...}}` sequence coming back from a tool is never expanded into the judge prompt.
 
 **Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`, and a handler built for one provider cannot execute another's config. `handler` runs a judge when it provides for that judge's provider; pass handlers for any other providers in `judge_handlers`. Selection prefers a handler naming the judge's provider outright over a wildcard multi-provider adapter, and an agent-mode handler can serve a messages-mode judge with its messages collapsed into one instructions block. A plain callable that declares no `provides_for` routes itself, exactly as it already does for the generation config.
 
@@ -154,6 +216,48 @@ asyncio.run(main())
 | `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
 | `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. |
 | `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
+
+### Give the evaluation tools
+
+Pass `tools` to `run()` as a list of `EvalTool`. Construct one to define a tool in code. Await `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
+
+```python
+from launchdarkly_ai_server import EvalTool, init_evaluations
+
+
+def lookup_order(order_id: str) -> str:
+    return f"order {order_id} shipped"
+
+
+evals = init_evaluations(project_key="my-project")
+
+# Read from the AI library now. Pins the version. Raises now if the tool is absent.
+search_docs_tool = await evals.tools.get("search_docs", implementation=search_docs)
+
+# Defined here. Needs no tool in LaunchDarkly.
+lookup_order_tool = EvalTool(
+    key="lookup_order",
+    implementation=lookup_order,
+    schema={
+        "type": "object",
+        "properties": {"order_id": {"type": "string"}},
+        "required": ["order_id"],
+    },
+    description="Look up an order by id",
+)
+
+result = await evals.run(
+    key="support-qa-2026-08-20",
+    dataset="support-golden",
+    handler=create_openai_messages_handler(),
+    generation={"provider": "OpenAI", "model": "gpt-4o"},
+    tools=[search_docs_tool, lookup_order_tool],
+)
+```
+
+`run()` reads no tool from the API. `tools.get()` is a coroutine, so await it. It reads in a worker thread and does not block the event loop. A constructed `EvalTool` is always inline, because `source` and `version` are not constructor arguments. Only `tools.get()` produces a library tool. Handlers receive the same `{key: callable}` map whichever kind a tool is, so handler code needs no change.
+
+**The list is checked before any network I/O.** A blank key, an uppercase key, a `schema` that is not a JSON object, a schema that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued. A repeated key fails too, and keys are compared without case. A `NativeTool` is valid only for a library tool, because the provider supplies its schema.
 
 ### `config(**args)`
 

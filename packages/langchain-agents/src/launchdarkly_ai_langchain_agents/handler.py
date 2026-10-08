@@ -6,6 +6,7 @@ Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -60,8 +61,13 @@ def _build_agent_tools(
             fn = tool_handlers.get(_name)
             if not fn:
                 raise ValueError(f'No handler registered for tool "{_name}"')
-            res = await fn(kwargs)
-            return str(res)
+            # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
+            # routing records the selected edge on the call itself; awaiting a plain
+            # return value raises. Same rule as ``tracking.wrap_tool_handlers``.
+            result = fn(kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         t = tool_fn(
             name,
@@ -174,9 +180,8 @@ def _model_constructor_kwargs(
 ) -> dict[str, Any]:
     raw = (config.get("model") or {}).get("parameters")
     parameters = dict(raw) if isinstance(raw, dict) else {}
-    provider = str((config.get("provider") or {}).get("name") or "").lower()
-    if provider == "bedrock":
-        parameters.pop("tools", None)
+    # Tools are bound from config["tools"]. A tools key here is forwarded raw and rejected.
+    parameters.pop("tools", None)
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
 
@@ -191,7 +196,7 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
-    ``model.parameters`` are passed through unchanged.
+    ``model.parameters`` are passed through, except ``tools``, which is bound separately.
     """
     import importlib
 

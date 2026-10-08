@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -84,7 +84,7 @@ class LDApiClient:
 
     def __init__(
         self,
-        api_token: str,
+        api_key: str,
         base_uri: str = DEFAULT_BASE_URI,
         transport: Transport = urllib_transport,
         timeout: float = 30.0,
@@ -92,7 +92,7 @@ class LDApiClient:
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
     ) -> None:
-        self.api_token = api_token
+        self.api_key = api_key
         self.base_uri = base_uri.rstrip("/")
         self._transport = transport
         self._timeout = timeout
@@ -133,10 +133,19 @@ class LDApiClient:
         path: str,
         body: Any = None,
         params: dict[str, Any] | None = None,
+        *,
+        idempotent: bool = False,
     ) -> Any:
+        """Send one request, retrying where a replay cannot duplicate work.
+
+        ``idempotent`` marks a non-GET request the server applies at most once
+        per payload, so it may be replayed after a 5xx or transport failure.
+        """
+        retry_safe = idempotent or method.upper() in RETRY_SAFE_METHODS
         headers = {
-            "Authorization": self.api_token,
+            "Authorization": self.api_key,
             "Accept": "application/json",
+            "LD-API-Version": "20240415",
             "User-Agent": "launchdarkly-ai-evaluations-python",
         }
         payload: bytes | None = None
@@ -151,10 +160,7 @@ class LDApiClient:
                     method, self.url_for(path, params), headers, payload, self._timeout
                 )
             except (TimeoutError, urllib.error.URLError) as error:
-                if (
-                    method.upper() not in RETRY_SAFE_METHODS
-                    or attempt >= self._max_retries
-                ):
+                if not retry_safe or attempt >= self._max_retries:
                     raise EvaluationsError(
                         f"LaunchDarkly API {method} {path} failed after retries: {error}"
                     ) from error
@@ -164,7 +170,7 @@ class LDApiClient:
             # A 429 is rejected before the server acts on it, so it is safe to
             # replay for any method.
             retryable = response.status == 429 or (
-                response.status >= 500 and method.upper() in RETRY_SAFE_METHODS
+                response.status >= 500 and retry_safe
             )
             if retryable and attempt < self._max_retries:
                 self._sleep(self._retry_delay(attempt, response))
@@ -189,5 +195,29 @@ class LDApiClient:
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self.request("GET", path, params=params)
 
-    def post(self, path: str, body: Any = None) -> Any:
-        return self.request("POST", path, body=body)
+    def post(self, path: str, body: Any = None, *, idempotent: bool = False) -> Any:
+        return self.request("POST", path, body=body, idempotent=idempotent)
+
+
+def segment(value: str) -> str:
+    """Percent-encode one path segment."""
+    return urllib.parse.quote(value, safe="")
+
+
+def require_mapping(value: Any, *, description: str) -> Mapping[str, Any]:
+    """Return ``value`` as a mapping. Raises ``EvaluationsError``."""
+    if not isinstance(value, Mapping):
+        raise EvaluationsError(
+            f"LaunchDarkly returned an invalid {description} response"
+        )
+    return value
+
+
+def require_string(data: Mapping[str, Any], key: str, description: str) -> str:
+    """Return the non-empty string at ``key``. Raises ``EvaluationsError``."""
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise EvaluationsError(
+            f"LaunchDarkly {description} response is missing string field {key!r}"
+        )
+    return value

@@ -11,7 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import launchdarkly_ai_openai_agents.native_graph as _openai_ng
-from launchdarkly_ai_openai_agents.native_graph import to_openai_agents
+from launchdarkly_ai_openai_agents.native_graph import (
+    _build_node_tools,
+    to_openai_agents,
+)
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
 
 # ---------------------------------------------------------------------------
@@ -401,6 +404,7 @@ class TestToOpenAIAgentsOpenAISpecific:
                 ).invoke("hi")
 
         assert "$ld:ai:graph:invocation_success" in track_calls
+        assert "$ld:ai:graph:path" not in track_calls
 
     @pytest.mark.asyncio
     async def test_error_path_emits_invocation_failure_and_rethrows(self) -> None:
@@ -658,6 +662,12 @@ class TestToOpenAIAgentsOpenAISpecific:
         mock_span = MagicMock()
         mock_trace = MagicMock()
         mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+        ld_context = {"kind": "user", "key": "test"}
 
         with patch(
             "importlib.import_module",
@@ -665,7 +675,13 @@ class TestToOpenAIAgentsOpenAISpecific:
         ):
             with patch.object(_openai_ng, "trace", mock_trace):
                 with patch.object(_openai_ng, "_HAS_OTEL", True):
-                    await to_openai_agents(_make_def_promise(graph_def)).invoke("hi")
+                    with patch.object(
+                        _openai_ng, "get_client", return_value=mock_ld_client
+                    ):
+                        await to_openai_agents(
+                            _make_def_promise(graph_def),
+                            opts={"context": ld_context},
+                        ).invoke("hi")
 
         # Extract the path from the span set_attribute call for "launchdarkly.graph.path"
         path_val: str | None = None
@@ -681,6 +697,14 @@ class TestToOpenAIAgentsOpenAISpecific:
             f"'child' appeared {child_occurrences} times in path '{path_val}'. "
             "Each node key must appear at most once (on_agent_start must not re-add keys already in path)."
         )
+        node_events = [
+            data
+            for evt, data in track_calls
+            if evt == "$ld:ai:graph:node" and data.get("nodeKey") == "child"
+        ]
+        assert len(node_events) == 1
+        assert node_events[0]["index"] == 0
+        assert all(evt != "$ld:ai:graph:path" for evt, _ in track_calls)
 
     @pytest.mark.asyncio
     async def test_agent_handoff_hook_emits_handoff_success(self) -> None:
@@ -740,3 +764,104 @@ class TestToOpenAIAgentsOpenAISpecific:
 
         assert captured_hooks, "hooks were not passed to Runner.run"
         assert "$ld:ai:graph:handoff_success" in track_calls
+
+
+class TestBuildNodeToolsSyncHandlers:
+    """``_build_node_tools`` must accept sync handlers (native path skips wrap_tool_handlers)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_handler_returns_string(self) -> None:
+        captured: list[Any] = []
+
+        agents_mock = MagicMock()
+        agents_mock.tool = MagicMock(
+            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
+        )
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"weather": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            _build_node_tools(node, {"weather": lambda a: "sunny"})
+
+        assert captured, "tool was not registered"
+        assert await captured[0]({"city": "Paris"}) == "sunny"
+
+    @pytest.mark.asyncio
+    async def test_async_handler_is_awaited(self) -> None:
+        captured: list[Any] = []
+
+        agents_mock = MagicMock()
+        agents_mock.tool = MagicMock(
+            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
+        )
+
+        async def async_handler(args: Any) -> str:
+            return f"async:{args.get('q')}"
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"lookup": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            _build_node_tools(node, {"lookup": async_handler})
+
+        assert await captured[0]({"q": "hi"}) == "async:hi"
+
+    @pytest.mark.asyncio
+    async def test_sync_handler_returning_awaitable_is_awaited(self) -> None:
+        captured: list[Any] = []
+
+        agents_mock = MagicMock()
+        agents_mock.tool = MagicMock(
+            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
+        )
+
+        async def _inner() -> str:
+            return "done"
+
+        def sync_wrapper(_args: Any) -> Any:
+            return _inner()
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"my-tool": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            _build_node_tools(node, {"my-tool": sync_wrapper})
+
+        assert await captured[0]({}) == "done"

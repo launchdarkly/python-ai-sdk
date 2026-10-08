@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from launchdarkly_ai_langchain_agents.native_graph import _extract_usage, to_lang_graph
+from launchdarkly_ai_langchain_agents.native_graph import (
+    _build_node_tools,
+    _extract_usage,
+    to_lang_graph,
+)
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
 
 # ---------------------------------------------------------------------------
@@ -302,7 +306,11 @@ class TestToLangGraphLangChainSpecific:
                     "config": {
                         "model": {
                             "name": "gpt-4o",
-                            "parameters": {"temperature": 0.2, "max_tokens": 512},
+                            "parameters": {
+                                "temperature": 0.2,
+                                "max_tokens": 512,
+                                "tools": [{"name": "openai-tool"}],
+                            },
                         },
                         "instructions": "help",
                     },
@@ -434,6 +442,38 @@ class TestToLangGraphLangChainSpecific:
                 ).invoke("hi")
 
         assert "$ld:ai:graph:invocation_success" in track_calls
+        assert "$ld:ai:graph:path" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_node_function_emits_graph_node(self) -> None:
+        track_calls: list[tuple[str, Any, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data, val))
+        )
+
+        ai_msg = _make_ai_msg("done")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "test"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+                node_fn = mocks["_node_fns"]["root"]
+                await node_fn({"messages": []})
+
+        node_events = [item for item in track_calls if item[0] == "$ld:ai:graph:node"]
+        assert len(node_events) == 1
+        assert node_events[0][1]["nodeKey"] == "root"
+        assert node_events[0][1]["index"] == 0
+        assert node_events[0][2] == 1
 
     @pytest.mark.asyncio
     async def test_invocation_failure_tracked(self) -> None:
@@ -843,6 +883,80 @@ class TestToLangGraphLangChainSpecific:
         assert mocks["langgraph.prebuilt"].ToolNode.called, (
             "ToolNode was not called despite config.tools being non-empty"
         )
+
+
+class TestBuildNodeToolsSyncHandlers:
+    """``_build_node_tools`` must accept sync handlers (native path skips wrap_tool_handlers)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_handler_returns_string(self) -> None:
+        captured: list[Any] = []
+
+        def _capture_tool(_name: Any, fn: Any = None, **_kw: Any) -> Any:
+            captured.append(fn)
+            return fn
+
+        mock_lc_tools = MagicMock()
+        mock_lc_tools.tool = MagicMock(side_effect=_capture_tool)
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"weather": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_lc_tools if n == "langchain_core.tools" else __import__(n)
+            ),
+        ):
+            _build_node_tools(node, {"weather": lambda a: "sunny"})
+
+        assert captured, "tool was not registered"
+        assert await captured[0](city="Paris") == "sunny"
+
+    @pytest.mark.asyncio
+    async def test_async_handler_is_awaited(self) -> None:
+        captured: list[Any] = []
+
+        def _capture_tool(_name: Any, fn: Any = None, **_kw: Any) -> Any:
+            captured.append(fn)
+            return fn
+
+        mock_lc_tools = MagicMock()
+        mock_lc_tools.tool = MagicMock(side_effect=_capture_tool)
+
+        async def async_handler(args: dict[str, Any]) -> str:
+            return f"async:{args.get('q')}"
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"lookup": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_lc_tools if n == "langchain_core.tools" else __import__(n)
+            ),
+        ):
+            _build_node_tools(node, {"lookup": async_handler})
+
+        assert await captured[0](q="hi") == "async:hi"
 
 
 # ---------------------------------------------------------------------------

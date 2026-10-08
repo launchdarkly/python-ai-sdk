@@ -5,6 +5,7 @@ mirroring the TypeScript toLangGraph implementation.
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 import types
@@ -79,8 +80,12 @@ def _build_node_tools(
             fn = tool_handlers.get(_name)
             if not fn or isinstance(fn, NativeTool):
                 return ""
-            res = await fn(kwargs)
-            return str(res)
+            # Handlers may be sync or async. Same rule as handler._build_agent_tools
+            # and tracking.wrap_tool_handlers — awaiting a plain return raises.
+            result = fn(kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         t = tool_fn(
             name,
@@ -203,6 +208,8 @@ def to_lang_graph(
                 model_cfg = node.config.get("model") or {}
                 raw = model_cfg.get("parameters")
                 kwargs = dict(raw) if isinstance(raw, dict) else {}
+                # Tools are bound from the node config. A tools key here is forwarded raw and rejected.
+                kwargs.pop("tools", None)
                 kwargs["model"] = model_cfg.get("name") or "gpt-4o"
                 chat_model = lc_openai.ChatOpenAI(**kwargs)
 
@@ -242,7 +249,17 @@ def to_lang_graph(
             async def _node_fn(
                 state: WorkflowState, _node: GraphNode = node
             ) -> dict[str, Any]:
-                path.append(_node.key)
+                if _node.key not in path:
+                    index = len(path)
+                    path.append(_node.key)
+                    if ld_context:
+                        node_td = make_track_data(_node, def_obj.key, run_id)
+                        get_client().track(
+                            "$ld:ai:graph:node",
+                            ld_context,
+                            {**node_td, "nodeKey": _node.key, "index": index},
+                            1,
+                        )
                 node_start = time.monotonic()
 
                 system_prompt = _build_system_prompt(_node, vs)
@@ -408,7 +425,6 @@ def to_lang_graph(
             client.track(
                 "$ld:ai:graph:total_tokens", ld_context, root_td, total_usage["total"]
             )
-            client.track("$ld:ai:graph:path", ld_context, root_td, len(path))
             client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
 
         return {"response": final_output, "usage": total_usage}

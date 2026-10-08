@@ -55,7 +55,7 @@ asyncio.run(main())
 
 ### Agent graphs — `claude_graph()`
 
-Runs a LaunchDarkly agent graph with the Claude agent handler pre-bound. Equivalent to calling the base `graph()` with `handlers=[create_claude_agents_handler()]`. See the [core client docs](../client/README.md#graphkey-options) for the full `graph()` API.
+Runs a LaunchDarkly agent graph with the Claude agent handler pre-bound. Equivalent to calling the base `graph()` with `handlers=[create_claude_agents_handler()]`. See the [core client docs](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#graphkey-options) for the full `graph()` API.
 
 ```python
 import asyncio
