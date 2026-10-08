@@ -200,6 +200,17 @@ def full_payload(
     )
 
 
+def sse_body(payload_events: list[dict[str, Any]], *, truncate: int = -1) -> bytes:
+    """Serialises *payload_events* as SSE, cutting short the data at *truncate*."""
+    lines = []
+    for i, event in enumerate(payload_events):
+        data = json.dumps(event["data"])
+        if i == truncate:
+            data = data[:-5]
+        lines.append(f"event: {event['event']}\ndata: {data}\n\n")
+    return "".join(lines).encode()
+
+
 # ---------------------------------------------------------------------------
 # The fake endpoint
 # ---------------------------------------------------------------------------
@@ -2714,12 +2725,17 @@ class TestFailureHandling:
                 self.bases.append(basis)
                 if len(self.bases) > 1:
                     return _BlockingConnection()
-                return _ScriptedConnection(
-                    [
-                        (e["event"], e["data"])
-                        for e in full_payload(("put-object", put_skill()))
-                    ]
-                    + [("goodbye", {"reason": "meltdown", "catastrophe": True})]
+                # Through the SSE parser, so a goodbye whose data it stopped
+                # parsing would arrive as None and never be read as catastrophic.
+                return _StreamConnection(
+                    _LineSource(
+                        sse_body(
+                            full_payload(("put-object", put_skill()))
+                            + events(
+                                ("goodbye", {"reason": "meltdown", "catastrophe": True})
+                            )
+                        )
+                    )
                 )
 
         requester = _CatastropheThenQuiet()
@@ -2812,16 +2828,6 @@ class TestFailureHandling:
         )
         keys = held_at_reconnect.keys()
 
-        def sse(payload_events: list[dict[str, Any]], *, truncate: int = -1) -> bytes:
-            """Serialises *payload_events*, cutting short the data at *truncate*."""
-            lines = []
-            for i, event in enumerate(payload_events):
-                data = json.dumps(event["data"])
-                if i == truncate:
-                    data = data[:-5]
-                lines.append(f"event: {event['event']}\ndata: {data}\n\n")
-            return "".join(lines).encode()
-
         class _CorruptedThenClean(_FakeRequester):
             def __init__(self) -> None:
                 self.bases: list[str | None] = []
@@ -2831,7 +2837,7 @@ class TestFailureHandling:
             def stream(self, basis: str | None) -> Any:
                 self.bases.append(basis)
                 if len(self.bases) == 1:
-                    body = sse(initial + retransmission, truncate=len(initial) + 2)
+                    body = sse_body(initial + retransmission, truncate=len(initial) + 2)
                     return _StreamConnection(_LineSource(body))
                 if len(self.bases) == 2:
                     assert self.store is not None
@@ -2839,7 +2845,7 @@ class TestFailureHandling:
                         key: self.store.get_object(SKILL_OBJECT_KIND, key) is not None
                         for key in keys
                     }
-                    return _StreamConnection(_LineSource(sse(retransmission)))
+                    return _StreamConnection(_LineSource(sse_body(retransmission)))
                 return _BlockingConnection()
 
         requester = _CorruptedThenClean()
@@ -3367,6 +3373,25 @@ class TestTransportMemoryBound:
         with pytest.raises(_RecoverableTransportError, match="not JSON"):
             list(_iter_sse(source))
         assert source.closed
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "server-intent",
+            "put-object",
+            "delete-object",
+            "payload-transferred",
+            "goodbye",
+            "error",
+        ],
+    )
+    def test_an_event_handle_reads_is_parsed(self, name: str) -> None:
+        # Pins the parse set: an event dropped from it would reach ``handle``
+        # with None data, and a catastrophic goodbye would read as a recycle.
+        source = _LineSource(
+            f'event: {name}\ndata: {{"reason": "x", "catastrophe": true}}\n\n'.encode()
+        )
+        assert list(_iter_sse(source)) == [(name, {"reason": "x", "catastrophe": True})]
 
     @pytest.mark.parametrize("name", ["heart-beat", "x-future-event"])
     def test_an_event_handle_does_not_read_is_not_parsed(self, name: str) -> None:
