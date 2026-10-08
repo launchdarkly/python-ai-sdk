@@ -571,8 +571,8 @@ ERROR ld.skills.integrity_failure {"action":"withheld","event":"ld.skills.integr
 
 **Match on `ld.skills.integrity_failure`.** It is the name LaunchDarkly's AI SDKs share for this
 record. While Agent Skills is experimental, the event name, its fields, and its `reason_code`
-values may change in a minor release; any such change is called out in the changelog, so review
-it before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
+values may change in a minor release; any such change gets a changelog entry under
+**Experimental**, so review it before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
 AI SDKs for the same input.
 
 | Field | Description |
