@@ -31,7 +31,7 @@ _FILE_MODE = 0o644
 executable."""
 
 _DIR_MODE = 0o755
-"""Mode set explicitly on every directory this module creates, because
+"""Permission bits set explicitly on every directory this module creates, because
 ``mkdir``'s mode argument is masked by the umask: under ``0077`` a separate agent
 identity could not traverse the directory to read what is inside."""
 
@@ -161,7 +161,11 @@ def open_or_create_directory(
     # (no *at() family, i.e. Windows) there are no POSIX modes to correct.
     if created and fd is not None and _SUPPORTS_FCHMOD:
         try:
-            os.fchmod(fd, _DIR_MODE)
+            # Keep the setgid bit Linux copies from a setgid parent: fchmod sets
+            # exactly the bits given, so a bare 0755 would clear it and files
+            # written inside would stop inheriting the shared group.
+            inherited = os.fstat(fd).st_mode & stat.S_ISGID
+            os.fchmod(fd, inherited | _DIR_MODE)
         except BaseException:
             os.close(fd)
             raise

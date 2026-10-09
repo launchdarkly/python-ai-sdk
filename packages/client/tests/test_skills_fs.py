@@ -1462,6 +1462,27 @@ class TestAtomicityAndPermissions:
         assert stat.S_IMODE((root / "a").stat().st_mode) == 0o755
         assert stat.S_IMODE((root / "a" / "SKILL.md").stat().st_mode) == 0o644
 
+    async def test_created_skill_directory_keeps_an_inherited_setgid_bit(
+        self, root: Path
+    ) -> None:
+        """Linux copies a setgid parent's bit onto a new directory so files
+        inside inherit the shared group. The explicit ``0755`` must not clear
+        it; ``fchmod`` sets exactly the bits it is given."""
+        os.chmod(root, 0o2755)
+        probe = root / "probe"
+        probe.mkdir()
+        inherits = bool(probe.stat().st_mode & stat.S_ISGID)
+        probe.rmdir()
+        if not inherits:
+            pytest.skip("new directories do not inherit setgid on this platform")
+        previous = os.umask(0o077)
+        try:
+            report = await write_skills([_skill("a")], root)
+        finally:
+            os.umask(previous)
+        assert report.ok is True, _error_messages(report)
+        assert stat.S_IMODE((root / "a").stat().st_mode) == 0o2755
+
     async def test_write_goes_through_a_single_atomic_rename(
         self, root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
