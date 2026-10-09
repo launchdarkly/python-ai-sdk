@@ -3,7 +3,7 @@
 Images travel as ``image_url`` content parts with a data or remote URL — the
 standard multimodal shape every LangChain chat model accepts — rather than the
 LaunchDarkly-canonical ``{"type": "image", "source": ...}`` block, which no
-LangChain provider understands (TESTING.md Appendix A.7).
+LangChain provider understands.
 """
 
 from __future__ import annotations

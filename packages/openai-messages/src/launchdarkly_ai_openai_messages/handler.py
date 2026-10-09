@@ -51,8 +51,8 @@ from .spans import (
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
-    # difference predates this span work and changes what the model is offered, not what the span
-    # reports, so it stays as it is: the catalog recorded on the span is the catalog actually sent.
+    # difference changes what the model is offered, not what the span reports: the catalog recorded
+    # on the span is the catalog actually sent.
     return [
         {
             "type": "function",
@@ -506,8 +506,8 @@ async def _stream_gen(
             if previous_response_id:
                 stream_params["previous_response_id"] = previous_response_id
             # Tools are forwarded on every streaming turn, not only the first, unlike the blocking
-            # path and unlike the TypeScript SDK. That difference predates this span work and
-            # changes what the model is offered, not what the span reports, so it stays as it is.
+            # path and unlike the TypeScript SDK. That difference changes what the model is
+            # offered, not what the span reports.
             if tools:
                 stream_params["tools"] = tools
 

@@ -1,7 +1,7 @@
 """
 Tests for launchdarkly-ai-claude-agents handler.
 
-Rewritten against TELEMETRY-CONTRACT.md, replacing the old flat-span assertions. Uses a real
+Span assertions follow TELEMETRY-CONTRACT.md. Uses a real
 ``TracerProvider`` + ``InMemorySpanExporter`` rather than a mocked ``opentelemetry.trace`` module,
 the same choice ``@launchdarkly/ai-claude-agents``'s ``spans.test.ts`` makes: a mocked tracer cannot
 see whether parent/child wiring is right, only whether the right methods were called.
@@ -84,8 +84,8 @@ BASE_CONFIG: dict[str, Any] = {
 
 
 def _make_config(**kwargs: Any) -> dict[str, Any]:
-    """Restored from the pre-rewrite file: a couple of the restored non-telemetry tests build a
-    config inline rather than through ``BASE_CONFIG``/``TOOL_CONFIG``.
+    """For the non-telemetry tests that build a config inline rather than through
+    ``BASE_CONFIG``/``TOOL_CONFIG``.
     """
     base = {"model": {"name": "claude-opus-4-5"}, "provider": {"name": "Anthropic"}}
     base.update(kwargs)
@@ -202,7 +202,7 @@ class TestFactory:
     def test_multiple_calls_independent(self) -> None:
         assert create_claude_agents_handler() is not create_claude_agents_handler()
 
-    # --- restored from the pre-rewrite file (not telemetry) ---
+    # --- not telemetry ---
 
     def test_attaches_provides_for(self) -> None:
         h = create_claude_agents_handler()
@@ -240,8 +240,7 @@ class TestPromptConstruction:
         _, system = build_prompt(cfg, "hi", {"name": "Ada"})
         assert system == "Hello Ada."
 
-    # --- restored from the pre-rewrite file (not telemetry); byte-for-byte, only
-    # ``_make_config`` inlined since the old module-level helper was removed ---
+    # --- not telemetry ---
 
     def test_path_a_instructions(self) -> None:
         config = _make_config(instructions="You are a helper.")
@@ -368,8 +367,7 @@ class TestPartitionTools:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion — restored from the pre-rewrite file (not telemetry).
-# ``partition_tools`` kept its 3-tuple return, so these run byte-for-byte.
+# Tool conversion (not telemetry).
 # ---------------------------------------------------------------------------
 
 
@@ -396,10 +394,9 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (via build_tool_mcp) — restored from the pre-rewrite
-# file. ``build_tool_mcp`` kept its lazy ``importlib.import_module`` pattern
-# (native_graph.py depends on it), so the old SDK-mocking approach still works
-# unmodified for this one.
+# Tool execution loop (via build_tool_mcp). ``build_tool_mcp`` resolves the SDK
+# lazily through ``importlib.import_module`` (native_graph.py depends on it), so
+# this one mocks the SDK module rather than patching ``handler_mod.query``.
 # ---------------------------------------------------------------------------
 
 
@@ -415,8 +412,8 @@ class _MockResultMessageForToolMcp:
 
 
 def _patch_query_for_tool_mcp(messages: list[Any]) -> Any:
-    """Patches ``claude_agent_sdk`` for the one restored test that exercises
-    ``build_tool_mcp`` directly, which still resolves the SDK lazily.
+    """Patches ``claude_agent_sdk`` for the one test that exercises
+    ``build_tool_mcp`` directly, which resolves the SDK lazily.
     """
 
     async def _query(**kwargs: Any) -> AsyncIterator[Any]:
@@ -1058,11 +1055,10 @@ class TestStreaming:
         for s in spans():
             assert s.end_time is not None
 
-    # --- restored from the pre-rewrite file (not telemetry). Adapted from the old
-    # ``_patch_query``/``_HAS_OTEL`` mocking approach to ``monkeypatch.setattr(handler_mod,
-    # "query", ...)`` plus real SDK dataclasses, because ``query`` is now a top-level import
-    # rather than something resolved through ``importlib.import_module`` on every call, and
-    # ``handler_mod`` no longer has its own ``_HAS_OTEL`` (that flag now lives in ``spans.py``). ---
+    # --- not telemetry. These use ``monkeypatch.setattr(handler_mod, "query", ...)`` plus real
+    # SDK dataclasses, because ``query`` is a top-level import rather than something resolved
+    # through ``importlib.import_module`` on every call, and the ``_HAS_OTEL`` flag lives in
+    # ``spans.py`` rather than ``handler_mod``. ---
 
     async def test_stream_is_defined(self) -> None:
         h = create_claude_agents_handler()
@@ -1481,10 +1477,8 @@ class TestOutputFormat:
         await create_claude_agents_handler()(cfg, "q")
         assert "valid JSON" in captured["options"].system_prompt
 
-    # --- restored from the pre-rewrite file (not telemetry). Adapted from the old
-    # ``_patch_query``-plus-mocked-``ClaudeAgentOptions`` approach, since ``options`` is now a
-    # real ``ClaudeAgentOptions`` instance (attribute access) rather than a dict the old mock's
-    # ``side_effect=lambda **kw: kw`` produced. ---
+    # --- not telemetry. ``options`` is a real ``ClaudeAgentOptions`` instance, so these read it
+    # by attribute access rather than as a dict. ---
 
     async def test_absent_output_format_no_change(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1609,7 +1603,7 @@ class TestConvenienceExport:
         result = await claude_agents("cfg-key", "hi", {"key": "u1"})
         assert result == {"output": "ok"}
 
-    # --- restored from the pre-rewrite file (not telemetry); byte-for-byte ---
+    # --- not telemetry ---
 
     def test_calls_through_to_model_call(self) -> None:
         from launchdarkly_ai_claude_agents.handler import claude_agents
@@ -1669,16 +1663,14 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None prompt.
-# Restored from the pre-rewrite file (not telemetry). Adapted from the old
-# ``_patch_query``/mocked-module approach to ``monkeypatch.setattr(handler_mod, "query", ...)``,
-# since ``query`` is now resolved once at import time rather than through
-# ``importlib.import_module`` on every call.
+# None user_input must not produce None prompt (not telemetry).
+# Uses ``monkeypatch.setattr(handler_mod, "query", ...)``, since ``query`` is resolved once at
+# import time rather than through ``importlib.import_module`` on every call.
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the prompt passed to
+    """When user_input is None, the prompt passed to
     the provider must be '' (empty string), not None."""
 
     async def test_none_user_input_instructions_path_prompt_is_empty_string(
@@ -1706,8 +1698,7 @@ class TestNoneUserInput:
 
 
 # ---------------------------------------------------------------------------
-# History parameter (build_prompt) — restored from the pre-rewrite file
-# (not telemetry); byte-for-byte, calling build_prompt directly.
+# History parameter (build_prompt) — not telemetry; calls build_prompt directly.
 # ---------------------------------------------------------------------------
 
 
@@ -1886,13 +1877,13 @@ class TestBuiltinsSurviveAnEmptyToolList:
 class TestAbandonedToolSpansAreNotErrors:
     """An abandoned stream leaves an open tool span UNSET, not ERROR.
 
-    The streaming teardown reached close_open_spans, which records an exception and sets ERROR. That
-    is right for a failure and wrong for abandonment: a consumer stopping early is normal, and the
-    root and chat spans on the same path are left UNSET with launchdarkly.stream.abandoned. A tool
-    span whose PostToolUse hook never fired therefore reported an error nobody had.
+    close_open_spans records an exception and sets ERROR. That is right for a failure and wrong for
+    abandonment: a consumer stopping early is normal, and the root and chat spans on the same path
+    are left UNSET with launchdarkly.stream.abandoned. Routed through close_open_spans, a tool span
+    whose PostToolUse hook never fired would report an error nobody had.
 
-    The openai-agents and langchain-agents handlers already used the UNSET path here, so this also
-    closes a three-way disagreement about what one abandoned run looks like.
+    The openai-agents and langchain-agents handlers use the same UNSET path, so all three agree on
+    what one abandoned run looks like.
     """
 
     async def test_a_tool_span_open_at_abandonment_is_unset_and_marked(
@@ -1970,7 +1961,7 @@ class TestAbandonedToolSpansAreNotErrors:
         assert "launchdarkly.stream.abandoned" not in root_span.attributes
 
     async def test_a_failed_run_still_marks_open_tool_spans_as_errors(self) -> None:
-        # The distinction the fix rests on: failure keeps ERROR, abandonment does not.
+        # The distinction abandonment rests on: failure keeps ERROR, abandonment does not.
         from launchdarkly_ai_claude_agents.handler import build_tool_hooks
 
         hooks, close_open_spans, _, _ = build_tool_hooks({}, None, False)
@@ -1994,10 +1985,11 @@ class TestAbandonedToolSpansAreNotErrors:
 class TestAnEmptyRunDoesNotClaimItCostNothing:
     """A stream that ended with nothing reported must leave the root's usage attributes absent.
 
-    Both paths wrote the all-zero per-response sum when the stream ended without a ResultMessage and
-    without absorbing a single assistant turn. Zeros say the run cost nothing, which is a different
-    claim from not knowing what it cost, and a config-scoped cost query cannot tell the two apart
-    once the zeros are on the span. The error and abandonment paths already guarded on `reported`.
+    Neither path writes the all-zero per-response sum when the stream ends without a ResultMessage
+    and without absorbing a single assistant turn. Zeros say the run cost nothing, which is a
+    different claim from not knowing what it cost, and a config-scoped cost query cannot tell the
+    two apart once the zeros are on the span. The error and abandonment paths guard on `reported`
+    too.
     """
 
     async def test_the_blocking_path_writes_no_usage_when_nothing_reported(
@@ -2047,9 +2039,9 @@ class TestAnEmptyRunDoesNotClaimItCostNothing:
 class TestInputWritesNeverLeakASpan:
     """Serialising the prompt must not be able to strand the root span.
 
-    The input content write ran before the guard that fails the root, so a raise there left it open:
-    never ended, never exported, so the run disappeared from AI Config Monitoring along with the
-    feature_flag event it carries.
+    The input content write sits inside the guard that fails the root. Ahead of it, a raise there
+    would leave the root open: never ended, never exported, so the run would disappear from AI
+    Config Monitoring along with the feature_flag event it carries.
     """
 
     async def test_the_blocking_root_still_ends(
@@ -2097,10 +2089,10 @@ class TestInputWritesNeverLeakASpan:
 class TestCancellationEndsEverySpan:
     """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end.
 
-    ``asyncio.CancelledError`` is a ``BaseException``, so `except Exception` never sees it. Before
-    this, a cancelled run exported nothing at all: the root carries the feature_flag event and
-    every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather than
-    showing as incomplete.
+    ``asyncio.CancelledError`` is a ``BaseException``, so `except Exception` never sees it. Without
+    a `finally`, a cancelled run would export nothing at all: the root carries the feature_flag
+    event and every launchdarkly.* attribute, so the run would vanish from AI Config Monitoring
+    rather than showing as incomplete.
     """
 
     async def test_a_cancelled_run_still_exports_its_spans(
@@ -2158,9 +2150,9 @@ class TestToolSpanSurvivesAContentFailure:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # A tool result comes from the caller's own function, so it can be anything, including
-        # something json.dumps refuses. Before this the write ran after the pop and outside any guard,
-        # so the span was untracked and unended: never exported, and a reader saw a tool that started
-        # and never returned.
+        # something json.dumps refuses. If the write ran after the pop and outside any guard, the
+        # span would be untracked and unended: never exported, and a reader would see a tool that
+        # started and never returned.
         class Unserialisable:
             pass
 

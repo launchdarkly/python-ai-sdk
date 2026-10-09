@@ -50,9 +50,8 @@ from .spans import (
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK's
-    # `buildTools`. That difference predates this span work and changes what the model is offered,
-    # not what the span reports, so it stays as it is: the catalog recorded below (via
-    # `to_tool_definitions`) is the catalog actually sent.
+    # `buildTools`. That difference changes what the model is offered, not what the span reports:
+    # the catalog recorded below (via `to_tool_definitions`) is the catalog actually sent.
     return [
         {
             "type": "function",
@@ -170,16 +169,14 @@ def _with_get_type(msg: Any) -> Any:
     """Adapts one LangChain message to the interface the client's ``lang_chain_span_messages``
     narrows on.
 
-    Works around a version-skew bug in the shared client helper rather than fixing it there:
-    ``lang_chain_span_messages`` reads a message's role off ``_get_type()``, which older LangChain
-    releases exposed as the canonical accessor. The ``langchain-core`` release this package
-    actually depends on replaced it with a plain ``type`` field and dropped the method entirely, so
-    every real ``SystemMessage``/``HumanMessage``/``AIMessage`` reaching the client helper
-    unmodified is misclassified as role ``user`` with no error raised: ``getattr(raw,
-    '_get_type', None)`` returns ``None`` for a missing attribute rather than raising, and the
-    caller has no way to tell "the method is absent" from "this message really has no type".
-    Reported in this package's TELEMETRY-CONTRACT.md report rather than patched in
-    ``packages/client``, which is out of scope for this change.
+    Works around a version skew in the shared client helper: ``lang_chain_span_messages`` reads a
+    message's role off ``_get_type()``, which older LangChain releases exposed as the canonical
+    accessor. The ``langchain-core`` release this package depends on has a plain ``type`` field
+    instead and no such method, so every real ``SystemMessage``/``HumanMessage``/``AIMessage``
+    reaching the client helper unmodified is misclassified as role ``user`` with no error raised:
+    ``getattr(raw, '_get_type', None)`` returns ``None`` for a missing attribute rather than
+    raising, and the caller has no way to tell "the method is absent" from "this message really has
+    no type".
     """
     if callable(getattr(msg, "_get_type", None)):
         return msg
@@ -641,9 +638,9 @@ def _create_langchain_messages_handler(
 
             # Behind the flag, because set_output_content_attributes is a no-op without it and
             # json.dumps is not. With tools and an outputFormat on a non-OpenAI provider the output
-            # here is the parsed object, so serialising one json.dumps refuses turned a successful
-            # run into a raised TypeError for a caller who had asked for no content at all. The
-            # outputFormat-only path above already guards the same work the same way.
+            # here is the parsed object, so serialising one json.dumps refuses would turn a
+            # successful run into a raised TypeError for a caller who asked for no content at all.
+            # The outputFormat-only path above already guards the same work the same way.
             if capture_content:
                 output_str = output if isinstance(output, str) else json.dumps(output)
                 set_output_content_attributes(

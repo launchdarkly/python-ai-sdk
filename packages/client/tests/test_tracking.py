@@ -1,6 +1,5 @@
 """
-Tests for §3.8 wrap_tool_handlers.
-Reference: TESTING.md §3.8
+Tests for wrap_tool_handlers.
 """
 
 from unittest.mock import MagicMock, patch

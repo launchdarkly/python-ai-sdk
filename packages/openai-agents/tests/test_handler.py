@@ -1,11 +1,11 @@
 """
 Tests for launchdarkly-ai-openai-agents handler.
 
-TELEMETRY-CONTRACT.md sections 1-9 for the span tree, and TESTING.md §1 for the generic handler
-behaviours. Rewritten from the pre-span-work version: this handler drives the ``agents`` SDK's own
-``Runner``, which owns the per-turn loop, so a test drives spans by calling the ``RunHooks``
-callbacks (``on_llm_start`` / ``on_llm_end`` / ``on_tool_start`` / ``on_tool_end``) the way the real
-``Runner`` would, rather than by mocking a client response directly.
+TELEMETRY-CONTRACT.md sections 1-9 for the span tree, plus the generic handler behaviours. This
+handler drives the ``agents`` SDK's own ``Runner``, which owns the per-turn loop, so a test drives
+spans by calling the ``RunHooks`` callbacks (``on_llm_start`` / ``on_llm_end`` / ``on_tool_start`` /
+``on_tool_end``) the way the real ``Runner`` would, rather than by mocking a client response
+directly.
 """
 
 from __future__ import annotations
@@ -179,8 +179,8 @@ def _patched_agents(agents_mod: Any) -> Any:
 def _make_run_result(
     output: str = "hello", input_tokens: int = 10, output_tokens: int = 5
 ) -> Any:
-    """The pre-span-era flat mock result, kept for the restored non-telemetry tests that predate
-    the ``RunHooks``-driven span work and never touch spans or usage attribution."""
+    """A flat mock result, for the non-telemetry tests that never touch spans or usage
+    attribution."""
     usage = MagicMock()
     usage.input_tokens = input_tokens
     usage.output_tokens = output_tokens
@@ -201,8 +201,8 @@ async def _empty_async_gen() -> AsyncIterator[Any]:
 
 
 def _mock_agents_module(run_result: Any) -> Any:
-    """The pre-span-era fully-flat ``agents`` mock: ``Runner.run``/``run_streamed`` never invoke
-    ``hooks``. Kept for the restored tests that only care about prompt/tool wiring, not spans.
+    """A fully-flat ``agents`` mock: ``Runner.run``/``run_streamed`` never invoke ``hooks``. For
+    the tests that only care about prompt/tool wiring, not spans.
     """
     mock = MagicMock()
     mock.Agent = MagicMock(return_value=MagicMock())
@@ -333,7 +333,7 @@ def _recording() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory
+# Factory
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +355,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -501,7 +501,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 / §1.4 Tool conversion and execution
+# Tool conversion and execution
 # ---------------------------------------------------------------------------
 
 
@@ -596,7 +596,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (pre-span-era; restored, not telemetry)
+# Tool execution loop (not telemetry)
 # ---------------------------------------------------------------------------
 
 
@@ -1099,7 +1099,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling (top-level, no partial usage)
+# Error handling (top-level, no partial usage)
 # ---------------------------------------------------------------------------
 
 
@@ -1147,10 +1147,10 @@ class TestCancellationEndsEverySpan:
     """TELEMETRY-CONTRACT.md section 6: a `finally` owns every end."""
 
     async def test_a_cancelled_run_still_exports_its_spans(self) -> None:
-        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before
-        # this, a cancelled run exported nothing at all: the root carries the feature_flag event
-        # and every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather
-        # than showing as incomplete.
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Without
+        # a `finally`, a cancelled run would export nothing at all: the root carries the
+        # feature_flag event and every launchdarkly.* attribute, so the run would vanish from AI
+        # Config Monitoring rather than showing as incomplete.
         import asyncio
 
         async def never_returns(
@@ -1202,7 +1202,7 @@ class TestCancellationEndsEverySpan:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1418,7 +1418,7 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format (build_output_type)
+# Output format (build_output_type)
 # ---------------------------------------------------------------------------
 
 
@@ -1463,12 +1463,12 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None prompt
+# None user_input must not produce None prompt
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the prompt passed to
+    """When user_input is None, the prompt passed to
     Runner.run must be '' (empty string), not None."""
 
     async def test_none_user_input_instructions_path_prompt_is_empty_string(
@@ -1481,9 +1481,8 @@ class TestNoneUserInput:
         run_result = _make_run_result("ok")
         agents_mock = _mock_agents_module(run_result)
 
-        # `hooks` is accepted (and ignored) here because `_call_impl` now always passes
-        # `hooks=hooks` to `Runner.run` — a genuine signature change from the pre-span-work
-        # handler this test predates, per the assignment's adaptation rule.
+        # `hooks` is accepted (and ignored) here because `_call_impl` always passes
+        # `hooks=hooks` to `Runner.run`.
         async def _spy_run(agent: Any, prompt: Any, hooks: Any = None) -> Any:
             captured_prompts.append(prompt)
             return run_result
@@ -1819,10 +1818,10 @@ class TestAFailedRunDoesNotClaimItCostNothing:
 class TestCancellationDoesNotDependOnTelemetry:
     """Stopping the vendor's run is not telemetry, so no span may gate it.
 
-    The cancel sat inside a `span is not None` guard. Without the `otel` extra there is no root span
-    at all, so an early consumer break never cancelled the Runner and its background task kept calling
-    the model and spending money: the exact failure this teardown exists to prevent, reintroduced by
-    an install choice that has nothing to do with tracing.
+    The cancel does not sit inside a `span is not None` guard. Without the `otel` extra there is no
+    root span at all, so behind such a guard an early consumer break would never cancel the Runner
+    and its background task would keep calling the model and spending money: the exact failure this
+    teardown exists to prevent, caused by an install choice that has nothing to do with tracing.
     """
 
     async def test_an_abandoned_stream_cancels_the_runner_with_telemetry_off(
@@ -1872,9 +1871,9 @@ class TestCancellationDoesNotDependOnTelemetry:
 class TestInputWritesNeverLeakASpan:
     """Serialising the prompt must not be able to strand the root span.
 
-    The input content write ran before the guard that fails the root, so a raise there left it open:
-    never ended, never exported, so the run disappeared from AI Config Monitoring along with the
-    feature_flag event it carries.
+    The input content write sits inside the guard that fails the root. Ahead of it, a raise there
+    would leave the root open: never ended, never exported, so the run would disappear from AI
+    Config Monitoring along with the feature_flag event it carries.
     """
 
     async def test_the_blocking_root_still_ends(self) -> None:
@@ -1929,9 +1928,9 @@ class TestChatSpanIsNeverStranded:
     """on_llm_end pops the span, so nothing else can end it if the write raises.
 
     close_open_spans reaches only spans the hook object still holds. on_llm_end clears
-    open_model_span first, so a serialisation failure after that point left the chat span open with
-    nothing tracking it: never ended, never exported. The langchain-agents callback guards the
-    identical shape for the identical reason.
+    open_model_span first, so an unguarded serialisation failure after that point would leave the
+    chat span open with nothing tracking it: never ended, never exported. The langchain-agents
+    callback guards the identical shape for the identical reason.
     """
 
     async def test_an_unserialisable_completion_still_ends_the_chat_span(self) -> None:
@@ -2033,9 +2032,9 @@ class TestToolSpanSurvivesAContentFailure:
         self,
     ) -> None:
         # A tool result comes from the caller's own function, so it can be anything, including
-        # something json.dumps refuses. Before this the write ran after the pop and outside any guard,
-        # so the span was untracked and unended: never exported, and a reader saw a tool that started
-        # and never returned.
+        # something json.dumps refuses. If the write ran after the pop and outside any guard, the
+        # span would be untracked and unended: never exported, and a reader would see a tool that
+        # started and never returned.
         class Unserialisable:
             pass
 

@@ -1,6 +1,5 @@
 """
-Tests for §3.12 resolve_graph() and graph().
-Reference: TESTING.md §3.12
+Tests for resolve_graph() and graph().
 """
 
 from typing import Any
@@ -428,7 +427,7 @@ class TestGraphInvoke:
         self, mock_ld_client: MagicMock
     ) -> None:
         """Python GraphDefinition must expose 'reverse_traverse' (snake_case), not
-        'reverseTraverse' (camelCase). See TESTING.md Appendix A.2."""
+        'reverseTraverse' (camelCase)."""
         gd = await resolve_graph(
             "graph-key", context=CONTEXT, handlers=[_make_handler()]
         )
@@ -443,15 +442,14 @@ class TestGraphInvoke:
         self, mock_ld_client: MagicMock
     ) -> None:
         """Disabled GraphDefinition stub must also use 'reverse_traverse', not
-        'reverseTraverse'. See TESTING.md Appendix A.2."""
+        'reverseTraverse'."""
         mock_ld_client.variation = AsyncMock(return_value={"edges": {}})
         gd = await resolve_graph("graph-key", context=CONTEXT)
         assert hasattr(gd, "reverse_traverse")
         assert not hasattr(gd, "reverseTraverse")
 
     async def test_cache_is_bounded(self, mock_ld_client: MagicMock) -> None:
-        """GraphInstance._cache must not grow beyond MAX_GRAPH_CACHE_SIZE.
-        See TESTING.md §3.11."""
+        """GraphInstance._cache must not grow beyond MAX_GRAPH_CACHE_SIZE."""
         from launchdarkly_ai_server.graph import MAX_GRAPH_CACHE_SIZE
 
         g = graph("graph-key", handlers=[_make_handler()])
@@ -466,7 +464,7 @@ class TestGraphInvoke:
     ) -> None:
         """Two distinct dict objects with identical JSON content must share one
         cache entry. The cache key must be json.dumps(context, sort_keys=True),
-        not id(context). See TESTING.md §3.11."""
+        not id(context)."""
         g = graph("graph-key", handlers=[_make_handler()])
         ctx_a = {"kind": "user", "key": "u1"}
         ctx_b = {"kind": "user", "key": "u1"}  # distinct object, same content

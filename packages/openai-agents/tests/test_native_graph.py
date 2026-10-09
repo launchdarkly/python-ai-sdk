@@ -1,6 +1,5 @@
 """
-Tests for §2.2 native graph adapter (to_openai_agents) and OpenAI-specific specs.
-Reference: TESTING.md §2.2, §2.x.6
+Tests for the native graph adapter (to_openai_agents) and OpenAI-specific specs.
 """
 
 from __future__ import annotations
@@ -153,7 +152,7 @@ def _make_agents_mock(run_result: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.2 Generic topology
+# Generic topology
 # ---------------------------------------------------------------------------
 
 
@@ -290,7 +289,7 @@ class TestToOpenAIAgentsTopology:
 
 
 # ---------------------------------------------------------------------------
-# §2.x.6 OpenAI-specific specs
+# OpenAI-specific specs
 # ---------------------------------------------------------------------------
 
 
@@ -617,7 +616,7 @@ class TestToOpenAIAgentsOpenAISpecific:
 
     @pytest.mark.asyncio
     async def test_path_entries_are_unique(self) -> None:
-        """§2.x.6 — each node key must appear at most once in path.
+        """Each node key must appear at most once in path.
         When on_handoff adds the child key, on_agent_start must not add it again.
         """
         # Two-node graph: root -> child

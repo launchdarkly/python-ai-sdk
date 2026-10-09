@@ -1,6 +1,5 @@
 """
-Tests for §3.15a ``graph().stream()``.
-Reference: TESTING.md §3.15a, Appendix A.4 / A.13.
+Tests for ``graph().stream()``.
 """
 
 from __future__ import annotations
@@ -751,7 +750,7 @@ class TestGraphStreamMultiEdge:
 
 
 # ---------------------------------------------------------------------------
-# Conversation id + OTel parenting + abandonment (§3.15a / A.4)
+# Conversation id + OTel parenting + abandonment
 # ---------------------------------------------------------------------------
 
 

@@ -1,6 +1,5 @@
 """
-Tests for §3.5 parse_ai_config (AiConfig validation).
-Reference: TESTING.md §3.5
+Tests for parse_ai_config (AiConfig validation).
 """
 
 from launchdarkly_ai_server import parse_ai_config

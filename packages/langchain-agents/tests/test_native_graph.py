@@ -1,6 +1,5 @@
 """
-Tests for §2.2 native graph adapter (to_lang_graph) and LangChain-specific specs.
-Reference: TESTING.md §2.2, §2.x.3
+Tests for the native graph adapter (to_lang_graph) and LangChain-specific specs.
 """
 
 from __future__ import annotations
@@ -236,7 +235,7 @@ def _patch_imports(mocks: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.2 Generic topology
+# Generic topology
 # ---------------------------------------------------------------------------
 
 
@@ -280,7 +279,7 @@ class TestToLangGraphTopology:
 
 
 # ---------------------------------------------------------------------------
-# §2.x.3 LangChain-specific specs
+# LangChain-specific specs
 # ---------------------------------------------------------------------------
 
 
@@ -960,7 +959,7 @@ class TestBuildNodeToolsSyncHandlers:
 
 
 # ---------------------------------------------------------------------------
-# §2.x.3 WorkflowState annotations resolve — real StateGraph (no mock)
+# WorkflowState annotations resolve — real StateGraph (no mock)
 # ---------------------------------------------------------------------------
 
 

@@ -48,7 +48,7 @@ class TestNumberOrZero:
         assert number_or_zero(42) == 42
 
     def test_none_becomes_zero_rather_than_raising(self) -> None:
-        # The old bare int(...) raised here, taking the whole call down with it.
+        # A bare int(...) would raise here, taking the whole call down with it.
         assert number_or_zero(None) == 0
 
     def test_a_non_numeric_string_becomes_zero(self) -> None:
@@ -397,9 +397,9 @@ class TestEndSpanOnce:
 class TestToUsageDict:
     """The public UsageDict must carry everything parse_usage reported.
 
-    Both call sites used to build the dataclass by hand from three keys, so the cache breakdown
-    vanished the moment parse_usage started reporting one: a caller reading input_details off a
-    blocking call got None while the streaming path handed back the nested dict.
+    Building the dataclass by hand from three keys would drop the cache breakdown parse_usage
+    reports: a caller reading input_details off a blocking call would get None while the streaming
+    path handed back the nested dict.
     """
 
     def test_carries_the_three_totals(self) -> None:
@@ -505,7 +505,8 @@ class TestEndUnfinishedSpans:
 
     def test_ends_a_span_a_cancelled_run_left_open(self, tracer_and_exporter) -> None:
         # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Without this
-        # helper a cancelled run exported no span at all, and the root carries the feature_flag event.
+        # helper a cancelled run would export no span at all, and the root carries the feature_flag
+        # event.
         from launchdarkly_ai_server import end_unfinished_spans
 
         tracer, exporter = tracer_and_exporter

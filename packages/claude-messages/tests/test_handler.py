@@ -1,7 +1,6 @@
 """
 Tests for launchdarkly-ai-claude-messages handler.
-Covers §1.1–1.9 (generic handler tests).
-Reference: TESTING.md §1
+Covers the generic handler behaviours.
 """
 
 from __future__ import annotations
@@ -91,7 +90,7 @@ def mock_anthropic(mocker):
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory function and metadata
+# Factory function and metadata
 # ---------------------------------------------------------------------------
 
 
@@ -125,7 +124,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -281,7 +280,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -360,7 +359,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -459,7 +458,7 @@ class TestToolExecutionLoop:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Telemetry
+# Telemetry
 # ---------------------------------------------------------------------------
 # Span recording
 # ---------------------------------------------------------------------------
@@ -500,8 +499,8 @@ class RecordedSpan:
 class SpanRecorder:
     """Stands in for the ``trace`` module inside ``spans.py`` and records every span opened.
 
-    Replaces the old single-MagicMock approach, which could not see a span tree at all: every span
-    was the same object, so a parent and its children were indistinguishable.
+    A single MagicMock could not see a span tree at all: every span would be the same object, so a
+    parent and its children would be indistinguishable.
     """
 
     def __init__(self) -> None:
@@ -1011,7 +1010,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling
+# Error handling
 # ---------------------------------------------------------------------------
 
 
@@ -1125,7 +1124,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Structured output (outputFormat)
+# Structured output (outputFormat)
 # ---------------------------------------------------------------------------
 
 
@@ -1179,7 +1178,7 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1227,7 +1226,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1378,12 +1377,12 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None content
+# None user_input must not produce None content
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the user-role message
+    """When user_input is None, the user-role message
     content sent to the provider must be '' not None."""
 
     async def test_none_user_input_instructions_path_no_none_content(
@@ -1414,12 +1413,12 @@ class TestNoneUserInput:
 
 
 # ---------------------------------------------------------------------------
-# §1.10 MAX_STEPS cap
+# MAX_STEPS cap
 # ---------------------------------------------------------------------------
 
 
 class TestMaxStepsCap:
-    """TESTING.md §1.10: The tool loop must break with an error after MAX_STEPS (5) iterations."""
+    """The tool loop must break with an error after MAX_STEPS (5) iterations."""
 
     def _tool_use_response(self, id: str = "tu1") -> MagicMock:
         return _anthropic_response(
@@ -1507,7 +1506,7 @@ class TestMaxStepsCap:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)
+# Streaming telemetry (do not patch _HAS_OTEL=False)
 # ---------------------------------------------------------------------------
 
 
@@ -1832,9 +1831,9 @@ class TestToolSpanNeverLeaks:
     """A raise while recording a tool result must not leave its span open.
 
     Serialising a tool result can raise, most easily when capture_content is on and the result is
-    not JSON-serialisable. The success-side content write used to sit outside the try, so that raise
-    skipped both the finish and the failure path: only the root was marked ERROR, and the tool span
-    was never ended, so the exporter never saw it.
+    not JSON-serialisable. The success-side content write therefore sits inside the try: outside it,
+    that raise would skip both the finish and the failure path, so only the root would be marked
+    ERROR and the tool span would never end, and the exporter would never see it.
     """
 
     async def test_an_unserialisable_tool_result_still_ends_the_tool_span(
@@ -1871,10 +1870,11 @@ class TestToolSpanNeverLeaks:
 class TestOpenToolSpanIsNeverLeaked:
     """A BaseException while a tool runs must still close the execute_tool span.
 
-    The streaming `finally` closed the model span and the root, but the in-flight tool span was held
-    only by a local. `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so a
-    tool cancelled mid-flight left its span open and unexported: the trace showed a closed parent
-    above a child that never arrived, which reads as a tool still running long after the run ended.
+    The streaming `finally` closes the model span and the root, and the in-flight tool span too.
+    `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so if only a local held
+    that span, a tool cancelled mid-flight would leave it open and unexported: the trace would show
+    a closed parent above a child that never arrived, which reads as a tool still running long after
+    the run ended.
     """
 
     async def test_a_tool_cancelled_mid_flight_still_ends_its_span(
@@ -1919,10 +1919,9 @@ class TestOpenToolSpanIsNeverLeaked:
         tools = rec.named("execute_tool ")
         assert len(tools) == 1
         assert tools[0].ended == 1, "the execute_tool span leaked"
-        # `cancelled`, not `abandoned`. This test used to assert the latter, which is what the defect
-        # looked like: nothing here chose to stop reading, a CancelledError ended the run underneath
-        # the consumer. The consumer-break test above still asserts `abandoned`, which is the case
-        # that word is for.
+        # `cancelled`, not `abandoned`: nothing here chose to stop reading, a CancelledError ended
+        # the run underneath the consumer. The consumer-break test above asserts `abandoned`,
+        # which is the case that word is for.
         assert tools[0].attributes["launchdarkly.run.cancelled"] is True
         assert "launchdarkly.stream.abandoned" not in tools[0].attributes
         assert rec.root.ended == 1
@@ -1931,10 +1930,10 @@ class TestOpenToolSpanIsNeverLeaked:
 class TestBlockingChatSpanNeverLeaks:
     """The blocking path has no `finally`, so anything that raises outside the guard is unrecoverable.
 
-    The output content write and the span finish sat outside the try that fails the chat span. A raise
-    while serialising the completion left the span open and unexported, and dropped the turn from the
-    run total, so the trace showed an errored root with no model call and a cost lower than the one
-    Anthropic had already billed.
+    The output content write and the span finish sit inside the try that fails the chat span.
+    Outside it, a raise while serialising the completion would leave the span open and unexported,
+    and drop the turn from the run total, so the trace would show an errored root with no model call
+    and a cost lower than the one Anthropic had already billed.
     """
 
     async def test_an_unserialisable_completion_still_ends_the_chat_span(
@@ -2089,9 +2088,9 @@ class TestStreamingKeepsBilledTokens:
 class TestInputWritesNeverLeakASpan:
     """Serialising the prompt must not be able to strand a span.
 
-    The input content write ran before the guard that fails the span it writes to, so a raise there
-    left the root open on both paths: never ended, never exported, so the run disappeared from AI
-    Config Monitoring along with the feature_flag event it carries.
+    The input content write sits inside the guard that fails the span it writes to. Ahead of it, a
+    raise there would leave the root open on both paths: never ended, never exported, so the run
+    would disappear from AI Config Monitoring along with the feature_flag event it carries.
     """
 
     async def test_the_blocking_root_still_ends(
@@ -2192,10 +2191,10 @@ class TestCancellationEndsEverySpan:
     async def test_a_cancelled_run_still_exports_its_spans(
         self, mock_anthropic: MagicMock
     ) -> None:
-        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before this,
-        # a cancelled run exported nothing at all: the root carries the feature_flag event and every
-        # launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather than showing
-        # as incomplete.
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Without a
+        # `finally`, a cancelled run would export nothing at all: the root carries the feature_flag
+        # event and every launchdarkly.* attribute, so the run would vanish from AI Config
+        # Monitoring rather than showing as incomplete.
         import asyncio
 
         async def never_returns(*args: Any, **kwargs: Any) -> Any:

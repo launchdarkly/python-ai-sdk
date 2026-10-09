@@ -141,9 +141,9 @@ class _LCMessage:
 
 class TestToolCallArgumentsAgreeAcrossCarriers:
     def test_absent_arguments_are_omitted_not_written_as_null(self) -> None:
-        # to_canonical omits absent arguments. to_text used to write them as null, so the OpenLLMetry
-        # carrier said the model passed a null argument bag where the canonical one said it passed
-        # none. The module docstring promises the three carriers cannot disagree.
+        # to_canonical omits absent arguments, so to_text must too: writing them as null would make
+        # the OpenLLMetry carrier say the model passed a null argument bag where the canonical one
+        # says it passed none. The module docstring promises the three carriers cannot disagree.
         part = SpanMessagePart(type="tool_call", name="f")
         assert part.to_canonical() == {"type": "tool_call", "name": "f"}
         assert part.to_text() == json.dumps({"name": "f"})
@@ -162,8 +162,8 @@ class TestContentWritersToleratePeopleWithoutOpenTelemetry:
     """Handlers hold None for every span when the `otel` extra is absent."""
 
     def test_no_writer_raises_on_a_none_span(self) -> None:
-        # capture_content=True without the extra installed used to raise AttributeError from inside
-        # the telemetry path, after the provider had already billed the turn. Telemetry may report
+        # capture_content=True without the extra installed must not raise AttributeError from inside
+        # the telemetry path, after the provider has already billed the turn. Telemetry may report
         # nothing; it may not break the call it is reporting on.
         messages = [
             SpanMessage(

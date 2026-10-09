@@ -1,6 +1,6 @@
 """
 Tests for launchdarkly-ai-langchain-messages handler.
-Covers §1.1-1.10 (generic handler tests) plus TELEMETRY-CONTRACT.md sections 1-9.
+Covers the generic handler behaviours plus TELEMETRY-CONTRACT.md sections 1-9.
 """
 
 from __future__ import annotations
@@ -163,7 +163,7 @@ def _make_tracer_patch(mock_span: MagicMock) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory function and metadata
+# Factory function and metadata
 # ---------------------------------------------------------------------------
 
 
@@ -195,7 +195,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -315,7 +315,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -368,7 +368,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -577,8 +577,8 @@ class TestSpanTree:
 
 class TestRootSpanAttributes:
     async def test_gen_ai_system_is_the_literal_langchain(self) -> None:
-        # TELEMETRY-CONTRACT.md section 9: Python used to set this to the configured provider,
-        # lower-cased. TypeScript's LangChain handlers keep it the constant `langchain` regardless.
+        # TELEMETRY-CONTRACT.md section 9: the constant `langchain` regardless of the configured
+        # provider, matching TypeScript's LangChain handlers.
         ctx, rec = _recording()
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 
@@ -1016,7 +1016,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Structured output — withStructuredOutput
+# Structured output — withStructuredOutput
 # ---------------------------------------------------------------------------
 
 
@@ -1097,7 +1097,7 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1144,7 +1144,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1379,7 +1379,7 @@ class TestStreamingTelemetry:
 
 
 # ---------------------------------------------------------------------------
-# §1.10 MAX_STEPS cap
+# MAX_STEPS cap
 # ---------------------------------------------------------------------------
 
 
@@ -1736,10 +1736,10 @@ class TestChatSpanAndTeardownNeverLeak:
 class TestOpenToolSpanIsNeverLeaked:
     """A BaseException while a tool runs must still close the execute_tool span.
 
-    The streaming `finally` closed the model span and the root, but the in-flight tool span was held
-    only by a local. `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so a
-    tool cancelled mid-flight left its span open and unexported: the trace showed a closed parent
-    above a child that never arrived.
+    The streaming `finally` closes the model span and the root, and the in-flight tool span too.
+    `except Exception` does not see a `CancelledError` or a `GeneratorExit`, so if only a local held
+    that span, a tool cancelled mid-flight would leave it open and unexported: the trace would show
+    a closed parent above a child that never arrived.
     """
 
     @pytest.mark.asyncio
@@ -1778,9 +1778,9 @@ class TestOpenToolSpanIsNeverLeaked:
         tools = rec.named("execute_tool ")
         assert len(tools) == 1
         assert tools[0].ended == 1, "the execute_tool span leaked"
-        # `cancelled`, not `abandoned`. This test used to assert the latter, which is what the defect
-        # looked like: nothing here chose to stop reading, a CancelledError ended the run underneath
-        # the consumer. The consumer-break test still asserts `abandoned`, which is that word's case.
+        # `cancelled`, not `abandoned`: nothing here chose to stop reading, a CancelledError ended
+        # the run underneath the consumer. The consumer-break test asserts `abandoned`, which is
+        # that word's case.
         assert tools[0].attributes["launchdarkly.run.cancelled"] is True
         assert "launchdarkly.stream.abandoned" not in tools[0].attributes
         assert rec.root.ended == 1
@@ -1789,9 +1789,9 @@ class TestOpenToolSpanIsNeverLeaked:
 class TestStructuredTurnChatSpanNeverLeaks:
     """The structured-output turn has no `finally`, so a raise outside its guard is unrecoverable.
 
-    The output content write and the span finish sat outside the try that fails the chat span. A raise
-    while serialising the parsed object left the span open and unexported, and dropped the turn from
-    the run total even though the provider had already billed it.
+    The output content write and the span finish sit inside the try that fails the chat span.
+    Outside it, a raise while serialising the parsed object would leave the span open and
+    unexported, and drop the turn from the run total even though the provider had already billed it.
     """
 
     @pytest.mark.asyncio
@@ -1977,10 +1977,10 @@ class TestNoContentWorkWhenCaptureIsOff:
 class TestStreamingChatSpanAndTokens:
     """The streaming path must fail its span and keep its tokens when content serialisation raises.
 
-    The content write and the span finish sat outside the try that fails the chat span, and the usage
-    was accumulated after both. A raise while serialising completion content left the span for the
-    `finally` to end as abandoned, which reads as a consumer who walked away rather than as the
-    failure it was, and dropped a turn the provider had already billed.
+    If the content write and the span finish sat outside the try that fails the chat span, with the
+    usage accumulated after them, a raise while serialising completion content would leave the span
+    for the `finally` to end as abandoned, which reads as a consumer who walked away rather than as
+    the failure it was, and drop a turn the provider had already billed.
     """
 
     def _exploding_llm(self) -> Any:
@@ -2044,10 +2044,10 @@ class TestStreamingChatSpanAndTokens:
 class TestInputWritesNeverLeakASpan:
     """Serialising the prompt must not be able to strand a span.
 
-    The input content write ran before the guard that fails the span it writes to. A raise there left
-    the chat span open on the structured path, and on both root paths left the root open: never
-    ended, never exported, so the run disappeared from AI Config Monitoring along with the
-    feature_flag event it carries.
+    The input content write sits inside the guard that fails the span it writes to. Ahead of it, a
+    raise there would leave the chat span open on the structured path, and on both root paths leave
+    the root open: never ended, never exported, so the run would disappear from AI Config Monitoring
+    along with the feature_flag event it carries.
     """
 
     def _unserialisable_prompt_config(self) -> dict[str, Any]:
@@ -2105,13 +2105,13 @@ class TestInputWritesNeverLeakASpan:
 
 
 class TestChatSpanInputWritesAreGuarded:
-    """The per-turn chat span needs the same guard the root got.
+    """The per-turn chat span needs the same guard the root has.
 
-    The input write for each `chat` span ran before the try that fails it. On the blocking path a
-    raise left the child open and unexported while the root was failed, and there is no `finally`
-    there to recover it. On the streaming path the raise reached the outer `finally` with
-    open_model_span still set, so the span was ended as abandoned: a content failure that reads as a
-    consumer walking away.
+    The input write for each `chat` span sits inside the try that fails it. Ahead of it, on the
+    blocking path a raise would leave the child open and unexported while the root was failed, and
+    there is no `finally` there to recover it. On the streaming path the raise would reach the outer
+    `finally` with open_model_span still set, so the span would be ended as abandoned: a content
+    failure that reads as a consumer walking away.
     """
 
     def _exploding_input(self) -> Any:
@@ -2199,10 +2199,10 @@ class TestCancellationEndsEverySpan:
 
     @pytest.mark.asyncio
     async def test_a_cancelled_run_still_exports_its_spans(self) -> None:
-        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Before
-        # this, a cancelled run exported nothing at all: the root carries the feature_flag event and
-        # every launchdarkly.* attribute, so the run vanished from AI Config Monitoring rather than
-        # showing as incomplete.
+        # asyncio.CancelledError is a BaseException, so `except Exception` never sees it. Without
+        # a `finally`, a cancelled run would export nothing at all: the root carries the
+        # feature_flag event and every launchdarkly.* attribute, so the run would vanish from AI
+        # Config Monitoring rather than showing as incomplete.
         import asyncio
 
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
