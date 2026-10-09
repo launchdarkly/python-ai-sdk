@@ -21,8 +21,10 @@ from launchdarkly_ai_server import (
     make_track_data,
     parse_template,
     report_usage,
+    set_ld_span_attributes,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import _parse_message_content, _to_openai_agent_items
@@ -137,186 +139,207 @@ def to_openai_agents(
             else None
         )
 
+        start_time = time.monotonic()
+        run_id = str(uuid.uuid4())
         tracer_name = "@launchdarkly/ai-openai-agents"
         if _HAS_OTEL:
             span = trace.get_tracer(tracer_name).start_span("launchdarkly.graph")
-            span.set_attribute("launchdarkly.graph.key", def_obj.key)
         else:
             span = None
 
-        start_time = time.monotonic()
-        run_id = str(uuid.uuid4())
-        path: list[str] = []
-        agent_name_to_key: dict[str, str] = {}
-        agent_ctx: dict[str, Any] = {}
-        edges_from = def_obj.edges_from
+        # One try covers setup and the run, so a setup error (an agent that
+        # fails to build) is recorded on the span and tracked as an invocation
+        # failure, like a run error. The span ends exactly once, in the finally.
+        try:
+            if span:
+                set_ld_span_attributes(
+                    span,
+                    {
+                        "__ld": make_graph_track_data(def_obj.key, run_id),
+                        "ldContext": raw_ld_context,
+                    },
+                )
+            path: list[str] = []
+            agent_name_to_key: dict[str, str] = {}
+            agent_ctx: dict[str, Any] = {}
+            edges_from = def_obj.edges_from
 
-        # Post-order traversal (leaves first) using the edges_from function
-        visited: set[str] = set()
+            # Post-order traversal (leaves first) using the edges_from function
+            visited: set[str] = set()
 
-        async def _visit(node_key: str) -> None:
-            if node_key in visited:
-                return
-            visited.add(node_key)
-            for edge in edges_from(node_key):
-                await _visit(edge.target_key)
+            async def _visit(node_key: str) -> None:
+                if node_key in visited:
+                    return
+                visited.add(node_key)
+                for edge in edges_from(node_key):
+                    await _visit(edge.target_key)
 
-            node = def_obj.get_node(node_key)
-            if node is None:
-                return
+                node = def_obj.get_node(node_key)
+                if node is None:
+                    return
 
-            child_handoffs = []
-            for edge in edges_from(node_key):
-                child_agent = agent_ctx.get(edge.target_key)
-                if child_agent is None:
-                    raise ValueError(
-                        f'Child agent "{edge.target_key}" not built before parent "{node_key}"'
-                    )
-                child_handoffs.append(handoff_fn(child_agent))
+                child_handoffs = []
+                for edge in edges_from(node_key):
+                    child_agent = agent_ctx.get(edge.target_key)
+                    if child_agent is None:
+                        raise ValueError(
+                            f'Child agent "{edge.target_key}" not built before parent "{node_key}"'
+                        )
+                    child_handoffs.append(handoff_fn(child_agent))
 
-            instructions = _build_instructions(node, vs)
-            tools = _build_node_tools(node, tool_handlers)
-            agent_name = _sanitize_name(node.key)
-            agent_name_to_key[agent_name] = node.key
+                instructions = _build_instructions(node, vs)
+                tools = _build_node_tools(node, tool_handlers)
+                agent_name = _sanitize_name(node.key)
+                agent_name_to_key[agent_name] = node.key
 
-            agent = Agent(
-                name=agent_name,
-                model=node.config.get("model", {}).get("name", "gpt-4o"),
-                **({"instructions": instructions} if instructions else {}),
-                **({"tools": tools} if tools else {}),
-                **({"handoffs": child_handoffs} if child_handoffs else {}),
-            )
-            agent_ctx[node.key] = agent
+                agent = Agent(
+                    name=agent_name,
+                    model=node.config.get("model", {}).get("name", "gpt-4o"),
+                    **({"instructions": instructions} if instructions else {}),
+                    **({"tools": tools} if tools else {}),
+                    **({"handoffs": child_handoffs} if child_handoffs else {}),
+                )
+                agent_ctx[node.key] = agent
 
-        await _visit(root.key)
+            await _visit(root.key)
 
-        root_agent = agent_ctx.get(root.key)
-        if root_agent is None:
-            raise ValueError(f'Root agent "{root.key}" was not built')
+            root_agent = agent_ctx.get(root.key)
+            if root_agent is None:
+                raise ValueError(f'Root agent "{root.key}" was not built')
 
-        # Lifecycle hooks for LD tracking
-        class _LDHooks(RunHooks):  # type: ignore[misc, valid-type]
-            async def on_agent_end(self, context: Any, agent: Any, output: Any) -> None:
-                node_key = agent_name_to_key.get(agent.name)
-                if node_key and ld_context:
+            # Lifecycle hooks for LD tracking
+            class _LDHooks(RunHooks):  # type: ignore[misc, valid-type]
+                async def on_agent_end(
+                    self, context: Any, agent: Any, output: Any
+                ) -> None:
+                    node_key = agent_name_to_key.get(agent.name)
+                    if node_key and ld_context:
+                        node = def_obj.get_node(node_key)
+                        if node:
+                            td = make_track_data(node, def_obj.key, run_id)
+                            get_client().track(
+                                "$ld:ai:generation:success", ld_context, td, 1
+                            )
+
+                async def on_handoff(
+                    self, context: Any, from_agent: Any, to_agent: Any
+                ) -> None:
+                    from_key = agent_name_to_key.get(from_agent.name)
+                    if from_key and ld_context:
+                        from_node = def_obj.get_node(from_key)
+                        if from_node:
+                            td = make_track_data(from_node, def_obj.key, run_id)
+                            get_client().track(
+                                "$ld:ai:graph:handoff_success", ld_context, td, 1
+                            )
+
+                async def on_agent_start(self, context: Any, agent: Any) -> None:
+                    node_key = agent_name_to_key.get(agent.name)
+                    if not node_key or node_key in path:
+                        return
+                    index = len(path)
+                    path.append(node_key)
+                    if not ld_context:
+                        return
                     node = def_obj.get_node(node_key)
                     if node:
                         td = make_track_data(node, def_obj.key, run_id)
                         get_client().track(
-                            "$ld:ai:generation:success", ld_context, td, 1
+                            "$ld:ai:graph:node",
+                            ld_context,
+                            {**td, "nodeKey": node_key, "index": index},
+                            1,
                         )
 
-            async def on_handoff(
-                self, context: Any, from_agent: Any, to_agent: Any
-            ) -> None:
-                from_key = agent_name_to_key.get(from_agent.name)
-                if from_key and ld_context:
-                    from_node = def_obj.get_node(from_key)
-                    if from_node:
-                        td = make_track_data(from_node, def_obj.key, run_id)
-                        get_client().track(
-                            "$ld:ai:graph:handoff_success", ld_context, td, 1
-                        )
+            hooks = _LDHooks()
 
-            async def on_agent_start(self, context: Any, agent: Any) -> None:
-                node_key = agent_name_to_key.get(agent.name)
-                if not node_key or node_key in path:
-                    return
-                index = len(path)
-                path.append(node_key)
-                if not ld_context:
-                    return
-                node = def_obj.get_node(node_key)
-                if node:
-                    td = make_track_data(node, def_obj.key, run_id)
-                    get_client().track(
-                        "$ld:ai:graph:node",
-                        ld_context,
-                        {**td, "nodeKey": node_key, "index": index},
-                        1,
-                    )
+            root_prompt: str | list[dict[str, Any]] = input_text
+            if history:
+                # config.instructions takes priority over config.messages, so skip
+                # config conversation turns when instructions are set (parity with the
+                # single-node handler and TESTING.md §1.11 composition order).
+                config_messages = (
+                    []
+                    if root.config.get("instructions")
+                    else [
+                        {
+                            **message,
+                            "content": _parse_message_content(
+                                message.get("content", ""), vs
+                            ),
+                        }
+                        for message in (root.config.get("messages") or [])
+                        if message.get("role") != "system"
+                    ]
+                )
+                turns = compose_history(
+                    history=history,
+                    user_input=input_text,
+                    config_messages=config_messages,
+                )
+                root_prompt = _to_openai_agent_items(turns)
 
-        hooks = _LDHooks()
-
-        root_prompt: str | list[dict[str, Any]] = input_text
-        if history:
-            # config.instructions takes priority over config.messages, so skip
-            # config conversation turns when instructions are set (parity with the
-            # single-node handler and TESTING.md §1.11 composition order).
-            config_messages = (
-                []
-                if root.config.get("instructions")
-                else [
-                    {
-                        **message,
-                        "content": _parse_message_content(
-                            message.get("content", ""), vs
-                        ),
-                    }
-                    for message in (root.config.get("messages") or [])
-                    if message.get("role") != "system"
-                ]
-            )
-            turns = compose_history(
-                history=history,
-                user_input=input_text,
-                config_messages=config_messages,
-            )
-            root_prompt = _to_openai_agent_items(turns)
-
-        try:
             result = await Runner.run(root_agent, root_prompt, hooks=hooks)
+
+            final_output = str(result.final_output or "")
+            # Sum usage across all raw_responses
+            input_tokens = sum(
+                getattr(r.usage, "input_tokens", 0)
+                for r in result.raw_responses
+                if hasattr(r, "usage")
+            )
+            output_tokens = sum(
+                getattr(r.usage, "output_tokens", 0)
+                for r in result.raw_responses
+                if hasattr(r, "usage")
+            )
+            total_tokens = sum(
+                getattr(r.usage, "total_tokens", 0)
+                for r in result.raw_responses
+                if hasattr(r, "usage")
+            )
+
+            total_usage = {
+                "input": input_tokens,
+                "output": output_tokens,
+                "total": total_tokens,
+            }
+            duration = int((time.monotonic() - start_time) * 1000)
+
+            if span:
+                span.set_attribute("launchdarkly.graph.path", "->".join(path))
+                span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+                span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
+
+            if ld_context:
+                graph_td = make_graph_track_data(def_obj.key, run_id)
+                client = get_client()
+                client.track(
+                    "$ld:ai:graph:duration:total", ld_context, graph_td, duration
+                )
+                client.track(
+                    "$ld:ai:graph:total_tokens", ld_context, graph_td, total_tokens
+                )
+                client.track("$ld:ai:graph:invocation_success", ld_context, graph_td, 1)
+
             if span:
                 span.set_status(SpanStatusCode.OK)
+            return {"response": final_output, "usage": total_usage}
         except Exception as exc:
             if span:
                 span.record_exception(exc)
                 span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
             if ld_context:
-                td = make_track_data(root, def_obj.key, run_id)
-                get_client().track("$ld:ai:graph:invocation_failure", ld_context, td, 1)
+                get_client().track(
+                    "$ld:ai:graph:invocation_failure",
+                    ld_context,
+                    make_graph_track_data(def_obj.key, run_id),
+                    1,
+                )
             raise
-
-        final_output = str(result.final_output or "")
-        # Sum usage across all raw_responses
-        input_tokens = sum(
-            getattr(r.usage, "input_tokens", 0)
-            for r in result.raw_responses
-            if hasattr(r, "usage")
-        )
-        output_tokens = sum(
-            getattr(r.usage, "output_tokens", 0)
-            for r in result.raw_responses
-            if hasattr(r, "usage")
-        )
-        total_tokens = sum(
-            getattr(r.usage, "total_tokens", 0)
-            for r in result.raw_responses
-            if hasattr(r, "usage")
-        )
-
-        total_usage = {
-            "input": input_tokens,
-            "output": output_tokens,
-            "total": total_tokens,
-        }
-        duration = int((time.monotonic() - start_time) * 1000)
-
-        if span:
-            span.set_attribute("launchdarkly.graph.path", "->".join(path))
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-            span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
-            span.end()
-
-        if ld_context:
-            root_td = make_track_data(root, def_obj.key, run_id)
-            client = get_client()
-            client.track("$ld:ai:graph:duration:total", ld_context, root_td, duration)
-            client.track("$ld:ai:graph:total_tokens", ld_context, root_td, total_tokens)
-            client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
-
-        return {"response": final_output, "usage": total_usage}
+        finally:
+            if span:
+                span.end()
 
     return types.SimpleNamespace(invoke=invoke)

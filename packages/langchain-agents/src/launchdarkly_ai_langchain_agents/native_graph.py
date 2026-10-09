@@ -21,8 +21,10 @@ from launchdarkly_ai_server import (
     make_track_data,
     parse_template,
     report_usage,
+    set_ld_span_attributes,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
 from .messages import to_lang_chain_messages
@@ -175,261 +177,285 @@ def to_lang_graph(
             else None
         )
 
+        start_time = time.monotonic()
+        run_id = str(uuid.uuid4())
         tracer_name = "@launchdarkly/ai-langchain-agents"
         if _HAS_OTEL:
             span = trace.get_tracer(tracer_name).start_span("launchdarkly.graph")
-            span.set_attribute("launchdarkly.graph.key", def_obj.key)
         else:
             span = None
 
-        start_time = time.monotonic()
-        run_id = str(uuid.uuid4())
-        path: list[str] = []
-        total_usage = {"input": 0, "output": 0, "total": 0}
-        edges_from = def_obj.edges_from
+        # One try covers setup and the run, so a setup error (a graph that
+        # fails to compile) is recorded on the span and tracked as an invocation
+        # failure, like a run error. The span ends exactly once, in the finally.
+        try:
+            if span:
+                set_ld_span_attributes(
+                    span,
+                    {
+                        "__ld": make_graph_track_data(def_obj.key, run_id),
+                        "ldContext": raw_ld_context,
+                    },
+                )
+            path: list[str] = []
+            total_usage = {"input": 0, "output": 0, "total": 0}
+            edges_from = def_obj.edges_from
 
-        # WorkflowState must reference add_messages from module-level scope.
-        # With `from __future__ import annotations`, LangGraph resolves annotations
-        # via get_type_hints() in the *module* global namespace — a local variable
-        # would cause NameError at StateGraph(WorkflowState) time (AIC-2948).
-        class WorkflowState(TypedDict):
-            messages: Annotated[list[Any], add_messages]
+            # WorkflowState must reference add_messages from module-level scope.
+            # With `from __future__ import annotations`, LangGraph resolves annotations
+            # via get_type_hints() in the *module* global namespace — a local variable
+            # would cause NameError at StateGraph(WorkflowState) time (AIC-2948).
+            class WorkflowState(TypedDict):
+                messages: Annotated[list[Any], add_messages]
 
-        builder = StateGraph(WorkflowState)
+            builder = StateGraph(WorkflowState)
 
-        async def _traverse_node(node: GraphNode) -> None:
-            node_key = _sanitize_name(node.key)
-            outgoing = edges_from(node.key)
-            is_terminal = node.is_terminal
-            is_multi_child = len(outgoing) > 1
+            async def _traverse_node(node: GraphNode) -> None:
+                node_key = _sanitize_name(node.key)
+                outgoing = edges_from(node.key)
+                is_terminal = node.is_terminal
+                is_multi_child = len(outgoing) > 1
 
-            # Get chat model
-            if model_factory:
-                chat_model = model_factory(node)
-            else:
-                lc_openai = importlib.import_module("langchain_openai")
-                model_cfg = node.config.get("model") or {}
-                raw = model_cfg.get("parameters")
-                kwargs = dict(raw) if isinstance(raw, dict) else {}
-                # Tools are bound from the node config. A tools key here is forwarded raw and rejected.
-                kwargs.pop("tools", None)
-                kwargs["model"] = model_cfg.get("name") or "gpt-4o"
-                chat_model = lc_openai.ChatOpenAI(**kwargs)
+                # Get chat model
+                if model_factory:
+                    chat_model = model_factory(node)
+                else:
+                    lc_openai = importlib.import_module("langchain_openai")
+                    model_cfg = node.config.get("model") or {}
+                    raw = model_cfg.get("parameters")
+                    kwargs = dict(raw) if isinstance(raw, dict) else {}
+                    # Tools are bound from the node config. A tools key here is forwarded raw and rejected.
+                    kwargs.pop("tools", None)
+                    kwargs["model"] = model_cfg.get("name") or "gpt-4o"
+                    chat_model = lc_openai.ChatOpenAI(**kwargs)
 
-            regular_tools = _build_node_tools(node, tool_handlers)
+                regular_tools = _build_node_tools(node, tool_handlers)
 
-            # Handoff tools (return Command to route)
-            lc_tools = importlib.import_module("langchain_core.tools")
-            tool_fn = lc_tools.tool
-            langgraph_types = importlib.import_module("langgraph.types")
-            Command = langgraph_types.Command
+                # Handoff tools (return Command to route)
+                lc_tools = importlib.import_module("langchain_core.tools")
+                tool_fn = lc_tools.tool
+                langgraph_types = importlib.import_module("langgraph.types")
+                Command = langgraph_types.Command
 
-            handoff_tools = []
-            for edge in outgoing:
-                target_key = _sanitize_name(edge.target_key)
+                handoff_tools = []
+                for edge in outgoing:
+                    target_key = _sanitize_name(edge.target_key)
 
-                async def _handoff_exec(
-                    _target: str = target_key,
-                    _node: GraphNode = node,
-                ) -> Any:
+                    async def _handoff_exec(
+                        _target: str = target_key,
+                        _node: GraphNode = node,
+                    ) -> Any:
+                        if ld_context:
+                            td = make_track_data(_node, def_obj.key, run_id)
+                            get_client().track(
+                                "$ld:ai:graph:handoff_success", ld_context, td, 1
+                            )
+                        return Command(goto=_target)
+
+                    ht = tool_fn(
+                        f"transfer_to_{_sanitize_name(edge.target_key)}",
+                        _handoff_exec,
+                        description=f"Transfer control to the {edge.target_key} agent",
+                        args_schema={},
+                    )
+                    handoff_tools.append(ht)
+
+                all_tools = regular_tools + handoff_tools
+
+                async def _node_fn(
+                    state: WorkflowState, _node: GraphNode = node
+                ) -> dict[str, Any]:
+                    if _node.key not in path:
+                        index = len(path)
+                        path.append(_node.key)
+                        if ld_context:
+                            node_td = make_track_data(_node, def_obj.key, run_id)
+                            get_client().track(
+                                "$ld:ai:graph:node",
+                                ld_context,
+                                {**node_td, "nodeKey": _node.key, "index": index},
+                                1,
+                            )
+                    node_start = time.monotonic()
+
+                    system_prompt = _build_system_prompt(_node, vs)
+                    conv_messages: list[Any] = state.get("messages", [])
+                    full_messages = (
+                        [SystemMessage(system_prompt), *conv_messages]
+                        if system_prompt
+                        else list(conv_messages)
+                    )
+
+                    bound = (
+                        chat_model.bind_tools(
+                            all_tools,
+                            **(
+                                {"parallel_tool_calls": False} if is_multi_child else {}
+                            ),
+                        )
+                        if all_tools
+                        else chat_model
+                    )
+
+                    result_msg = await bound.ainvoke(full_messages)
+                    usage = _extract_usage(result_msg)
+                    total_usage["input"] += usage["input"]
+                    total_usage["output"] += usage["output"]
+                    total_usage["total"] += usage["total"]
+
                     if ld_context:
                         td = make_track_data(_node, def_obj.key, run_id)
-                        get_client().track(
-                            "$ld:ai:graph:handoff_success", ld_context, td, 1
-                        )
-                    return Command(goto=_target)
+                        dur = int((time.monotonic() - node_start) * 1000)
+                        client = get_client()
+                        client.track("$ld:ai:duration:total", ld_context, td, dur)
+                        client.track("$ld:ai:generation:success", ld_context, td, 1)
+                        if usage["total"] > 0:
+                            client.track(
+                                "$ld:ai:tokens:total", ld_context, td, usage["total"]
+                            )
+                        if usage["input"] > 0:
+                            client.track(
+                                "$ld:ai:tokens:input", ld_context, td, usage["input"]
+                            )
+                        if usage["output"] > 0:
+                            client.track(
+                                "$ld:ai:tokens:output", ld_context, td, usage["output"]
+                            )
 
-                ht = tool_fn(
-                    f"transfer_to_{_sanitize_name(edge.target_key)}",
-                    _handoff_exec,
-                    description=f"Transfer control to the {edge.target_key} agent",
-                    args_schema={},
-                )
-                handoff_tools.append(ht)
+                    return {"messages": [result_msg]}
 
-            all_tools = regular_tools + handoff_tools
+                builder.add_node(node_key, _node_fn)
 
-            async def _node_fn(
-                state: WorkflowState, _node: GraphNode = node
-            ) -> dict[str, Any]:
-                if _node.key not in path:
-                    index = len(path)
-                    path.append(_node.key)
-                    if ld_context:
-                        node_td = make_track_data(_node, def_obj.key, run_id)
-                        get_client().track(
-                            "$ld:ai:graph:node",
-                            ld_context,
-                            {**node_td, "nodeKey": _node.key, "index": index},
-                            1,
-                        )
-                node_start = time.monotonic()
-
-                system_prompt = _build_system_prompt(_node, vs)
-                conv_messages: list[Any] = state.get("messages", [])
-                full_messages = (
-                    [SystemMessage(system_prompt), *conv_messages]
-                    if system_prompt
-                    else list(conv_messages)
-                )
-
-                bound = (
-                    chat_model.bind_tools(
-                        all_tools,
-                        **({"parallel_tool_calls": False} if is_multi_child else {}),
-                    )
-                    if all_tools
-                    else chat_model
-                )
-
-                result_msg = await bound.ainvoke(full_messages)
-                usage = _extract_usage(result_msg)
-                total_usage["input"] += usage["input"]
-                total_usage["output"] += usage["output"]
-                total_usage["total"] += usage["total"]
-
-                if ld_context:
-                    td = make_track_data(_node, def_obj.key, run_id)
-                    dur = int((time.monotonic() - node_start) * 1000)
-                    client = get_client()
-                    client.track("$ld:ai:duration:total", ld_context, td, dur)
-                    client.track("$ld:ai:generation:success", ld_context, td, 1)
-                    if usage["total"] > 0:
-                        client.track(
-                            "$ld:ai:tokens:total", ld_context, td, usage["total"]
-                        )
-                    if usage["input"] > 0:
-                        client.track(
-                            "$ld:ai:tokens:input", ld_context, td, usage["input"]
-                        )
-                    if usage["output"] > 0:
-                        client.track(
-                            "$ld:ai:tokens:output", ld_context, td, usage["output"]
-                        )
-
-                return {"messages": [result_msg]}
-
-            builder.add_node(node_key, _node_fn)
-
-            if all_tools:
-                builder.add_node(f"{node_key}_tools", ToolNode(all_tools))
-
-            # Edge wiring
-            if node.key == root.key:
-                builder.add_edge(START, node_key)
-
-            if is_terminal:
                 if all_tools:
-                    builder.add_conditional_edges(
-                        node_key,
-                        tools_condition,
-                        {"tools": f"{node_key}_tools", "__end__": END},
-                    )
-                    builder.add_edge(f"{node_key}_tools", node_key)
+                    builder.add_node(f"{node_key}_tools", ToolNode(all_tools))
+
+                # Edge wiring
+                if node.key == root.key:
+                    builder.add_edge(START, node_key)
+
+                if is_terminal:
+                    if all_tools:
+                        builder.add_conditional_edges(
+                            node_key,
+                            tools_condition,
+                            {"tools": f"{node_key}_tools", "__end__": END},
+                        )
+                        builder.add_edge(f"{node_key}_tools", node_key)
+                    else:
+                        builder.add_edge(node_key, END)
+                elif is_multi_child:
+                    if all_tools:
+                        builder.add_conditional_edges(
+                            node_key,
+                            tools_condition,
+                            {"tools": f"{node_key}_tools", "__end__": END},
+                        )
+                        builder.add_edge(f"{node_key}_tools", node_key)
+                    else:
+                        builder.add_edge(node_key, END)
                 else:
-                    builder.add_edge(node_key, END)
-            elif is_multi_child:
-                if all_tools:
-                    builder.add_conditional_edges(
-                        node_key,
-                        tools_condition,
-                        {"tools": f"{node_key}_tools", "__end__": END},
-                    )
-                    builder.add_edge(f"{node_key}_tools", node_key)
-                else:
-                    builder.add_edge(node_key, END)
-            else:
-                child_key = _sanitize_name(outgoing[0].target_key)
-                if all_tools:
-                    builder.add_conditional_edges(
-                        node_key,
-                        tools_condition,
-                        {"tools": f"{node_key}_tools", "__end__": child_key},
-                    )
-                    builder.add_edge(f"{node_key}_tools", node_key)
-                else:
-                    builder.add_edge(node_key, child_key)
+                    child_key = _sanitize_name(outgoing[0].target_key)
+                    if all_tools:
+                        builder.add_conditional_edges(
+                            node_key,
+                            tools_condition,
+                            {"tools": f"{node_key}_tools", "__end__": child_key},
+                        )
+                        builder.add_edge(f"{node_key}_tools", node_key)
+                    else:
+                        builder.add_edge(node_key, child_key)
 
-        # Pre-order traversal (root first, to mirror TS traverse)
-        pre_visited: set[str] = set()
+            # Pre-order traversal (root first, to mirror TS traverse)
+            pre_visited: set[str] = set()
 
-        async def _pre_visit(node_key: str) -> None:
-            if node_key in pre_visited:
-                return
-            pre_visited.add(node_key)
-            node = def_obj.get_node(node_key)
-            if node:
-                await _traverse_node(node)
-            for edge in edges_from(node_key):
-                await _pre_visit(edge.target_key)
+            async def _pre_visit(node_key: str) -> None:
+                if node_key in pre_visited:
+                    return
+                pre_visited.add(node_key)
+                node = def_obj.get_node(node_key)
+                if node:
+                    await _traverse_node(node)
+                for edge in edges_from(node_key):
+                    await _pre_visit(edge.target_key)
 
-        await _pre_visit(root.key)
+            await _pre_visit(root.key)
 
-        compiled = builder.compile()
+            compiled = builder.compile()
 
-        # History is a root-only concern: it seeds the initial message state the
-        # entry node reads. Downstream nodes are reached through handoffs and see
-        # the accumulated graph state, never the original `history` array.
-        initial_messages = (
-            to_lang_chain_messages(
-                compose_history(history=history, user_input=input_text)
+            # History is a root-only concern: it seeds the initial message state the
+            # entry node reads. Downstream nodes are reached through handoffs and see
+            # the accumulated graph state, never the original `history` array.
+            initial_messages = (
+                to_lang_chain_messages(
+                    compose_history(history=history, user_input=input_text)
+                )
+                if history
+                else [HumanMessage(input_text)]
             )
-            if history
-            else [HumanMessage(input_text)]
-        )
 
-        try:
             result = await compiled.ainvoke({"messages": initial_messages})
+
+            duration = int((time.monotonic() - start_time) * 1000)
+
+            # Extract final output from last AI message
+            result_messages = (
+                result.get("messages", []) if isinstance(result, dict) else []
+            )
+            last_msg = result_messages[-1] if result_messages else None
+
+            def _content_str(msg: Any) -> str:
+                if msg is None:
+                    return ""
+                c = msg.content
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    return "".join(
+                        part.get("text", "") if isinstance(part, dict) else ""
+                        for part in c
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+                return ""
+
+            final_output = _content_str(last_msg)
+
+            if span:
+                span.set_attribute("launchdarkly.graph.path", "->".join(path))
+                span.set_attribute("gen_ai.usage.input_tokens", total_usage["input"])
+                span.set_attribute("gen_ai.usage.output_tokens", total_usage["output"])
+                span.set_attribute("gen_ai.usage.total_tokens", total_usage["total"])
+
+            if ld_context:
+                graph_td = make_graph_track_data(def_obj.key, run_id)
+                client = get_client()
+                client.track(
+                    "$ld:ai:graph:duration:total", ld_context, graph_td, duration
+                )
+                client.track(
+                    "$ld:ai:graph:total_tokens",
+                    ld_context,
+                    graph_td,
+                    total_usage["total"],
+                )
+                client.track("$ld:ai:graph:invocation_success", ld_context, graph_td, 1)
+
             if span:
                 span.set_status(SpanStatusCode.OK)
+            return {"response": final_output, "usage": total_usage}
         except Exception as exc:
             if span:
                 span.record_exception(exc)
                 span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
             if ld_context:
-                td = make_track_data(root, def_obj.key, run_id)
-                get_client().track("$ld:ai:graph:invocation_failure", ld_context, td, 1)
-            raise
-
-        duration = int((time.monotonic() - start_time) * 1000)
-
-        # Extract final output from last AI message
-        result_messages = result.get("messages", []) if isinstance(result, dict) else []
-        last_msg = result_messages[-1] if result_messages else None
-
-        def _content_str(msg: Any) -> str:
-            if msg is None:
-                return ""
-            c = msg.content
-            if isinstance(c, str):
-                return c
-            if isinstance(c, list):
-                return "".join(
-                    part.get("text", "") if isinstance(part, dict) else ""
-                    for part in c
-                    if isinstance(part, dict) and part.get("type") == "text"
+                get_client().track(
+                    "$ld:ai:graph:invocation_failure",
+                    ld_context,
+                    make_graph_track_data(def_obj.key, run_id),
+                    1,
                 )
-            return ""
-
-        final_output = _content_str(last_msg)
-
-        if span:
-            span.set_attribute("launchdarkly.graph.path", "->".join(path))
-            span.set_attribute("gen_ai.usage.input_tokens", total_usage["input"])
-            span.set_attribute("gen_ai.usage.output_tokens", total_usage["output"])
-            span.set_attribute("gen_ai.usage.total_tokens", total_usage["total"])
-            span.end()
-
-        if ld_context:
-            root_td = make_track_data(root, def_obj.key, run_id)
-            client = get_client()
-            client.track("$ld:ai:graph:duration:total", ld_context, root_td, duration)
-            client.track(
-                "$ld:ai:graph:total_tokens", ld_context, root_td, total_usage["total"]
-            )
-            client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
-
-        return {"response": final_output, "usage": total_usage}
+            raise
+        finally:
+            if span:
+                span.end()
 
     return types.SimpleNamespace(invoke=invoke)
