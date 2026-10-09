@@ -105,6 +105,7 @@ ROOT_SURFACE = frozenset(
         "parse_template",
         "parse_usage",
         "register_ai_sdk_package",
+        "report_usage",
         "resolve_graph",
         "resolve_handlers",
         "resolve_tools",

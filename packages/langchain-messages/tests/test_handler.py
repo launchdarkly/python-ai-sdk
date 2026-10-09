@@ -1109,7 +1109,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_langchain_messages.handler import langchain_messages
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1132,7 +1132,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_langchain_messages.handler import langchain_messages
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1642,8 +1642,8 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "create_langchain_messages_handler", _factory),
-            patch.object(handler_mod, "config", fake_config),
+            patch.object(handler_mod, "_create_langchain_messages_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.langchain_messages("k", "q", {}, **kwargs)
         seen["config_kwargs"] = fake_config.call_args.kwargs
@@ -2381,7 +2381,6 @@ class TestModelSource:
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "max_tokens": 512,
-            "tools": [{"name": "openai-tool"}],
             "model": "gpt-4o",
         }
 

@@ -20,9 +20,11 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     to_ld_context,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .handler import _parse_message_content, _to_openai_agent_items
 
 try:
@@ -102,6 +104,7 @@ def to_openai_agents(
             {"context": ctx},
         ).invoke("I was double charged")
     """
+    report_usage("openai-agents.toOpenAIAgents", PACKAGE_NAME, __version__)
     _opts = opts or {}
 
     async def invoke(
