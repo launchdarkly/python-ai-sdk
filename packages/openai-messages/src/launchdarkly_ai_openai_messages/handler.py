@@ -12,21 +12,23 @@ from launchdarkly_ai_server import (
     RunUsage,
     SpanMessage,
     SpanMessagePart,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     fail_span,
     finish_model_span,
@@ -219,6 +221,14 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
     meaning models, token counts, timings and tool names, until a caller asks for more.
     """
+    report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
+    return _create_openai_messages_handler(capture_content=capture_content)
+
+
+def _create_openai_messages_handler(
+    *, capture_content: bool = False
+) -> ProviderHandler:
+    """Non-reporting :func:`create_openai_messages_handler`, used by this package's wrappers."""
     import importlib
 
     openai_mod = importlib.import_module("openai")
@@ -407,7 +417,7 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("OpenAI", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -641,10 +651,11 @@ def openai_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("openai-messages.openaiMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
+    return _config(
         key=config_key,
-        handler=create_openai_messages_handler(capture_content=capture_content),
+        handler=_create_openai_messages_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

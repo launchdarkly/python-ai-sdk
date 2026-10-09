@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .sdk_usage import report_usage
 from .types import (
     AiConfigRep,
     GraphNode,
@@ -28,6 +29,17 @@ def create_handler(
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
     ``provides_for`` metadata and optional streaming implementation.
     """
+    report_usage("client.createHandler")
+    return _create_handler(provides_for, fn, stream_fn, capture_content)
+
+
+def _create_handler(
+    provides_for: tuple[str, Literal["agent", "messages"]],
+    fn: _HandlerFn,
+    stream_fn: _StreamFn | None = None,
+    capture_content: bool = False,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_handler`, used by the package factories."""
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,
@@ -597,9 +609,11 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
     Builds the standard tracking payload for a graph node event.
     Shared by all native graph adapters (openai-agents, claude-agents, langchain-agents).
     """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
     meta = node.meta if isinstance(node.meta, dict) else {}
     config = node.config if isinstance(node.config, dict) else {}
-    return {
+    track_data: dict[str, Any] = {
         "runId": run_id,
         "configKey": node.key,
         "variationKey": meta.get("variationKey", ""),
@@ -609,6 +623,40 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
         **model_stamps_from_meta(meta),
         "graphKey": graph_key,
     }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
+
+
+def make_graph_track_data(graph_key: str, run_id: str) -> dict[str, Any]:
+    """
+    Builds the tracking payload for a native graph run as a whole.
+
+    The graph flag is itself the AI Config the trace belongs to, so its key is
+    both the config key and the graph key -- the same choice ``graph.py`` makes
+    for the SDK's own graph runner. There is no model or variation to report: a
+    graph flag carries a topology, and ``GraphDefinition`` does not expose its
+    ``_ldMeta``.
+
+    Native graph adapters pass this to ``set_ld_span_attributes`` so the
+    ``launchdarkly.graph`` span can be found by an AI Config Monitoring query.
+    """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
+    track_data: dict[str, Any] = {
+        "runId": run_id,
+        "configKey": graph_key,
+        "variationKey": "",
+        "version": 1,
+        "modelName": "",
+        "providerName": "",
+        "graphKey": graph_key,
+    }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
 
 
 def _usable_context_key(value: Any) -> str | None:

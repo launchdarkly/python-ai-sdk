@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from launchdarkly_ai_langchain_agents.native_graph import _extract_usage, to_lang_graph
+from launchdarkly_ai_langchain_agents.native_graph import (
+    _build_node_tools,
+    _extract_usage,
+    to_lang_graph,
+)
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
 
 # ---------------------------------------------------------------------------
@@ -236,6 +240,55 @@ def _patch_imports(mocks: dict[str, Any]) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _recording_trace() -> tuple[Any, Any, list[Any]]:
+    """A real tracer behind the module's ``trace`` lookup, with every span's ``end`` spied.
+
+    Returns the stand-in ``trace`` module, the exporter holding finished spans, and the
+    ``end`` spies, so a test can check both what was exported and how often each span ended.
+    """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    end_spies: list[Any] = []
+
+    def _start_span(name: str, *args: Any, **kwargs: Any) -> Any:
+        span = tracer.start_span(name, *args, **kwargs)
+        span.end = MagicMock(wraps=span.end)  # type: ignore[method-assign]
+        end_spies.append(span.end)
+        return span
+
+    fake_trace = MagicMock()
+    fake_trace.get_tracer.return_value.start_span.side_effect = _start_span
+    return fake_trace, exporter, end_spies
+
+
+def _assert_one_failed_graph_span(
+    exporter: Any, end_spies: list[Any], message: str, track_calls: list[Any]
+) -> None:
+    from opentelemetry.trace import StatusCode
+
+    assert [spy.call_count for spy in end_spies] == [1]
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description == message
+    assert [e.name for e in span.events].count("exception") == 1
+    assert (span.attributes or {}).get("launchdarkly.graph.key") == "test-graph"
+
+    failures = [d for e, d in track_calls if e == "$ld:ai:graph:invocation_failure"]
+    assert len(failures) == 1
+    assert failures[0]["configKey"] == "test-graph"
+    assert failures[0]["graphKey"] == "test-graph"
+
+
 class TestToLangGraphTopology:
     @pytest.mark.asyncio
     async def test_each_graph_node_translated(self) -> None:
@@ -302,7 +355,11 @@ class TestToLangGraphLangChainSpecific:
                     "config": {
                         "model": {
                             "name": "gpt-4o",
-                            "parameters": {"temperature": 0.2, "max_tokens": 512},
+                            "parameters": {
+                                "temperature": 0.2,
+                                "max_tokens": 512,
+                                "tools": [{"name": "openai-tool"}],
+                            },
                         },
                         "instructions": "help",
                     },
@@ -435,6 +492,166 @@ class TestToLangGraphLangChainSpecific:
 
         assert "$ld:ai:graph:invocation_success" in track_calls
         assert "$ld:ai:graph:path" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_graph_span_carries_config_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The graph span must identify the config so Monitoring can link the trace."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        mock_span = MagicMock()
+        mock_trace = MagicMock()
+        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+
+        ai_msg = _make_ai_msg("done")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with _patch_imports(mocks):
+            with patch.object(ng_mod, "get_client", return_value=MagicMock()):
+                with patch.object(ng_mod, "trace", mock_trace):
+                    with patch.object(ng_mod, "_HAS_OTEL", True):
+                        await to_lang_graph(
+                            _make_def_promise(graph_def),
+                            opts={"context": ctx},
+                        ).invoke("hi")
+
+        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "test-graph"
+        assert attrs["launchdarkly.graph.key"] == "test-graph"
+        assert attrs["launchdarkly.run.id"]
+        assert "launchdarkly.variation.key" in attrs
+        assert attrs["context.contextKeys.user"] == "u1"
+
+        events = {c[0][0]: c[0][1] for c in mock_span.add_event.call_args_list}
+        assert events["feature_flag"] == {
+            "feature_flag.key": "test-graph",
+            "feature_flag.provider.name": "LaunchDarkly",
+            "feature_flag.set.id": "env-123",
+            "feature_flag.context.id": "u1",
+            "feature_flag.contextKeys": '{"user":"u1"}',
+        }
+
+    @pytest.mark.asyncio
+    async def test_tracking_events_carry_the_environment_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        payloads: list[Any] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: payloads.append(data)
+        )
+
+        ai_msg = _make_ai_msg("done")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+                node_fn = mocks["_node_fns"]["root"]
+                await node_fn({"messages": []})
+
+        assert payloads
+        for data in payloads:
+            assert data["environmentId"] == "env-123"
+
+    @pytest.mark.asyncio
+    async def test_graph_events_are_keyed_to_the_graph(self) -> None:
+        """Graph-level events carry the graph key, like the graph span and graph()."""
+        calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: calls.append((evt, data))
+        )
+
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+
+        graph_events = [
+            (e, d)
+            for e, d in calls
+            if e
+            in (
+                "$ld:ai:graph:invocation_success",
+                "$ld:ai:graph:duration:total",
+                "$ld:ai:graph:total_tokens",
+            )
+        ]
+        assert len(graph_events) == 3
+        for _, data in graph_events:
+            assert data["configKey"] == "test-graph"
+            assert data["graphKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_graph_setup_error_fails_the_graph_span(self) -> None:
+        """A compile error before the run ends one ERROR span and tracks the failure."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        fake_trace, exporter, end_spies = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+
+        class _BadCompileStateGraph:
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_node(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_edge(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_conditional_edges(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def compile(self) -> Any:
+                raise ValueError("bad graph")
+
+        mocks["langgraph.graph"].StateGraph = _BadCompileStateGraph
+        graph_def = _make_graph_def()
+
+        with _patch_imports(mocks):
+            with patch.object(ng_mod, "trace", fake_trace):
+                with patch.object(ng_mod, "_HAS_OTEL", True):
+                    with patch.object(
+                        ng_mod, "get_client", return_value=mock_ld_client
+                    ):
+                        with pytest.raises(ValueError, match="bad graph"):
+                            await to_lang_graph(
+                                _make_def_promise(graph_def),
+                                opts={"context": {"kind": "user", "key": "u1"}},
+                            ).invoke("hi")
+
+        _assert_one_failed_graph_span(exporter, end_spies, "bad graph", track_calls)
 
     @pytest.mark.asyncio
     async def test_node_function_emits_graph_node(self) -> None:
@@ -875,6 +1092,80 @@ class TestToLangGraphLangChainSpecific:
         assert mocks["langgraph.prebuilt"].ToolNode.called, (
             "ToolNode was not called despite config.tools being non-empty"
         )
+
+
+class TestBuildNodeToolsSyncHandlers:
+    """``_build_node_tools`` must accept sync handlers (native path skips wrap_tool_handlers)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_handler_returns_string(self) -> None:
+        captured: list[Any] = []
+
+        def _capture_tool(_name: Any, fn: Any = None, **_kw: Any) -> Any:
+            captured.append(fn)
+            return fn
+
+        mock_lc_tools = MagicMock()
+        mock_lc_tools.tool = MagicMock(side_effect=_capture_tool)
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"weather": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_lc_tools if n == "langchain_core.tools" else __import__(n)
+            ),
+        ):
+            _build_node_tools(node, {"weather": lambda a: "sunny"})
+
+        assert captured, "tool was not registered"
+        assert await captured[0](city="Paris") == "sunny"
+
+    @pytest.mark.asyncio
+    async def test_async_handler_is_awaited(self) -> None:
+        captured: list[Any] = []
+
+        def _capture_tool(_name: Any, fn: Any = None, **_kw: Any) -> Any:
+            captured.append(fn)
+            return fn
+
+        mock_lc_tools = MagicMock()
+        mock_lc_tools.tool = MagicMock(side_effect=_capture_tool)
+
+        async def async_handler(args: dict[str, Any]) -> str:
+            return f"async:{args.get('q')}"
+
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {"lookup": {"description": "d", "parameters": {}}},
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_lc_tools if n == "langchain_core.tools" else __import__(n)
+            ),
+        ):
+            _build_node_tools(node, {"lookup": async_handler})
+
+        assert await captured[0](q="hi") == "async:hi"
 
 
 # ---------------------------------------------------------------------------

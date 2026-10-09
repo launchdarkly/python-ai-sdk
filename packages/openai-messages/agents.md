@@ -28,6 +28,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "OpenAI"`
 |---|---|
 | `src/launchdarkly_ai_openai_messages/handler.py` | All implementation — message building, tool schema conversion, function-call loop, telemetry |
 | `src/launchdarkly_ai_openai_messages/__init__.py` | Package exports |
+| `src/launchdarkly_ai_openai_messages/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 

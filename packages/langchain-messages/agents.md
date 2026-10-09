@@ -32,6 +32,7 @@ The handler is model-agnostic — it accepts any `BaseChatModel`. The default is
 |---|---|
 | `src/launchdarkly_ai_langchain_messages/handler.py` | All implementation — message building, tool binding, invoke loop, telemetry |
 | `src/launchdarkly_ai_langchain_messages/__init__.py` | Package exports |
+| `src/launchdarkly_ai_langchain_messages/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 
