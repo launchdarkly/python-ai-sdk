@@ -10,7 +10,7 @@ import urllib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
@@ -25,10 +25,10 @@ from ..trajectory import (
     row_fields,
 )
 from ..utils import (
-    collapse_messages_to_instructions,
     normalize_mode,
     parse_template,
     parse_usage,
+    select_handler,
     to_ld_context,
 )
 from .api import (
@@ -54,7 +54,6 @@ from .tools import (
     handler_config_tools,
 )
 from .types import (
-    AIConfigVariation,
     DatasetRef,
     DatasetRow,
     EvaluationRef,
@@ -74,13 +73,15 @@ CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
 
 
+AI_CONFIG_MODES = ("agent", "completion", "judge")
+
+
 @dataclass(frozen=True)
 class JudgeExecution:
     """A resolved judge paired with the handler selected to run its config."""
 
     resolved: ResolvedJudge
     handler: EvalHandler
-    collapse_messages: bool = False
 
 
 def _provides_for(
@@ -96,81 +97,52 @@ def _provides_for(
     return None
 
 
-def _covers_provider(
-    provides_for: tuple[str, Literal["agent", "messages"]],
-    provider: str | None,
-) -> bool:
-    return provides_for[0] == provider or provides_for[0] == "*"
+def describe_handlers(handlers: Sequence[EvalHandler]) -> str:
+    """Return the ``provides_for`` of each handler, for an error message."""
+    return ", ".join(repr(_provides_for(handler)) for handler in handlers)
 
 
-def _find_judge_handler(
-    judge_handlers: list[EvalHandler],
+def select_eval_handler(
+    handlers: Sequence[EvalHandler],
     provider: str | None,
     mode: Literal["agent", "messages"],
 ) -> EvalHandler | None:
-    """Find a handler for ``provider`` in ``mode``, exact match before wildcard.
+    """Select the handler for ``provider`` and ``mode`` with the ``config()`` rule.
 
-    A wildcard handler is a fallback for multi-provider adapters, so it is only
-    chosen when no handler names the provider outright -- the priority
-    ``config()`` already applies to a generation config. Searching in one pass
-    would instead let the order the caller happened to list its handlers in
-    decide, sending an OpenAI judge through a LangChain adapter that was merely
-    listed first.
+    Returns ``None`` when no handler matches. There is no mode fallback.
     """
-    for exact in (True, False):
-        for candidate in judge_handlers:
-            provides_for = _provides_for(candidate)
-            if provides_for is None or provides_for[1] != mode:
-                continue
-            if exact:
-                if provides_for[0] == provider:
-                    return candidate
-            elif provides_for[0] == "*":
-                return candidate
-    return None
+    if not provider:
+        return None
+    try:
+        selected = select_handler(
+            {"provider": {"name": provider}},
+            {"mode": mode},
+            list(handlers),  # type: ignore[arg-type]
+        )
+    except ValueError:
+        return None
+    return cast(EvalHandler, selected)
 
 
-def _select_judge_handler(
-    resolved: ResolvedJudge,
-    handler: EvalHandler,
-    judge_handlers: list[EvalHandler],
-) -> JudgeExecution | None:
-    """Pick the handler that can run this judge's config, or ``None``.
+def prompt_mode_error(
+    config: Mapping[str, Any],
+    mode: Literal["agent", "messages"],
+) -> str | None:
+    """Return an error when the prompt field does not match the handler mode.
 
-    A judge is an independent AI Config: it may resolve to a different provider
-    and mode than the evaluation's generation config, and a handler built for
-    one provider cannot execute another's config. The priority mirrors the
-    online path (``judges.run_judges``):
-
-    1. a judge handler in the judge's mode, naming its provider outright
-       before any wildcard adapter;
-    2. an agent-mode judge handler for a messages-mode judge, whose messages
-       are collapsed into a single instructions block;
-    3. the generation handler, when it covers the judge's provider.
-
-    A handler that declares no ``provides_for`` is a plain callable doing its
-    own routing -- the same contract it already honours for the generation
-    config -- so it is treated as covering every judge.
+    A messages handler needs ``messages`` and an agent handler needs
+    ``instructions``. A config with neither field is valid. Returns ``None``
+    when the prompt matches.
     """
-    match = _find_judge_handler(judge_handlers, resolved.provider, resolved.mode)
-    if match is not None:
-        return JudgeExecution(resolved=resolved, handler=match)
-    if resolved.mode == "messages":
-        agent_fallback = _find_judge_handler(judge_handlers, resolved.provider, "agent")
-        if agent_fallback is not None:
-            return JudgeExecution(
-                resolved=resolved, handler=agent_fallback, collapse_messages=True
-            )
-    generation_provides_for = _provides_for(handler)
-    if generation_provides_for is None:
-        return JudgeExecution(resolved=resolved, handler=handler)
-    if _covers_provider(generation_provides_for, resolved.provider):
-        return JudgeExecution(
-            resolved=resolved,
-            handler=handler,
-            collapse_messages=(
-                generation_provides_for[1] == "agent" and resolved.mode == "messages"
-            ),
+    if mode == "messages" and config.get("instructions"):
+        return (
+            "prompt needs 'messages' because the handler is a messages "
+            "handler, but it has 'instructions'"
+        )
+    if mode == "agent" and config.get("messages"):
+        return (
+            "prompt needs 'instructions' because the handler is an agent "
+            "handler, but it has 'messages'"
         )
     return None
 
@@ -248,19 +220,43 @@ class EvaluationsRunner:
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
 
+    def _fetch_ai_config_mode(self, project_key: str, config_key: str) -> str:
+        """Read the mode of an AI Config from the management API.
+
+        Returns ``"agent"``, ``"completion"`` or ``"judge"``. An absent mode is
+        ``"completion"``. Raises :class:`EvaluationsError` for any other value,
+        and when the AI Config does not exist.
+        """
+        description = f"AI Config {config_key!r}"
+        path = f"projects/{segment(project_key)}/ai-configs/{segment(config_key)}"
+        try:
+            raw = require_mapping(self._api.get(path), description=description)
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly {description} was not found in project {project_key!r}"
+                ) from error
+            raise
+        mode = raw.get("mode", "completion")
+        if mode is None:
+            mode = "completion"
+        if not isinstance(mode, str) or mode not in AI_CONFIG_MODES:
+            raise EvaluationsError(
+                f"LaunchDarkly {description} has an unknown mode {mode!r}. "
+                "Expected one of: " + ", ".join(repr(m) for m in AI_CONFIG_MODES)
+            )
+        return mode
+
     def _fetch_config_variation(
         self,
         project_key: str,
         config_key: str,
         variation_key: str,
-    ) -> AIConfigVariation:
-        """Read an AI Config variation by key from the management API.
+    ) -> Mapping[str, Any]:
+        """Read the latest version of an AI Config variation by key.
 
-        Flag delivery cannot select a variation by key -- it serves whichever
-        variation targeting picks for a context -- so this reads the variation
-        definition directly. Provider and base model parameters live on the
-        linked model config, and are layered the way the served flag payload
-        layers them: model-config parameters first, variation parameters over.
+        Raises :class:`EvaluationsError` when the variation does not exist,
+        has no versions, or has a ``modelConfigKey`` that is not a string.
         """
         description = f"AI Config variation {config_key!r}/{variation_key!r}"
         path = (
@@ -285,22 +281,25 @@ class EvaluationsRunner:
         if not versions:
             raise EvaluationsError(f"LaunchDarkly {description} has no versions")
         latest = max(versions, key=lambda item: int(item["version"]))
-
-        # Absent or empty means the variation links no model config, so it has
-        # no provider -- flag delivery serves an empty provider name for it too.
-        # Anything other than a string is a response we do not understand.
-        model_config: Mapping[str, Any] | None = None
+        # Absent or empty means that the variation links no model config.
         model_config_key = latest.get("modelConfigKey")
         if model_config_key is not None and not isinstance(model_config_key, str):
             raise EvaluationsError(
                 f"LaunchDarkly {description} has a non-string modelConfigKey: "
                 f"{model_config_key!r}"
             )
-        if model_config_key:
-            model_config = self._fetch_model_config(
-                project_key, model_config_key, latest.get("modelConfigVersion")
-            )
-        return AIConfigVariation.from_api(latest, model_config)
+        return latest
+
+    def _fetch_linked_model_config(
+        self, project_key: str, variation: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        """Read the model config a variation links, or return ``None``."""
+        model_config_key = variation.get("modelConfigKey")
+        if not isinstance(model_config_key, str) or not model_config_key:
+            return None
+        return self._fetch_model_config(
+            project_key, model_config_key, variation.get("modelConfigVersion")
+        )
 
     def _fetch_model_config(
         self,
@@ -331,17 +330,16 @@ class EvaluationsRunner:
         self,
         project_key: str,
         judges: list[Judge],
-        handler: EvalHandler,
-        judge_handlers: list[EvalHandler] | None = None,
+        handlers: Sequence[EvalHandler],
     ) -> dict[str, JudgeExecution]:
-        """Resolve LD Judge configs before any evaluation records are created.
+        """Resolve LD Judge configs and select a handler for each one.
 
-        Each judge is paired with the handler that can execute its config here,
-        rather than at scoring time, so a judge no handler covers fails the run
-        before any records exist or any generation spend happens.
+        Runs before any evaluation record is created. Raises one
+        :class:`EvaluationsError` that lists every judge with no handler and
+        every judge whose prompt does not match its handler's mode.
         """
-        available_judge_handlers = list(judge_handlers or [])
         resolved: dict[str, JudgeExecution] = {}
+        problems: list[str] = []
         # variation() rejects a context without kind and key; use the same
         # context shape the emitted evaluation events are attributed to.
         context: dict[str, Any] = {"kind": "evaluation", "key": project_key}
@@ -369,9 +367,13 @@ class EvaluationsRunner:
                 if isinstance(provider_value, Mapping)
                 else None
             )
+            # Judges cannot use tools.
+            judge_config = {
+                name: value for name, value in config.items() if name != "tools"
+            }
             resolved_judge = ResolvedJudge(
                 key=judge.key,
-                config=dict(config),
+                config=judge_config,
                 variation_key=str(meta.get("variationKey") or ""),
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
@@ -381,18 +383,28 @@ class EvaluationsRunner:
                     meta.get("mode") if isinstance(meta.get("mode"), str) else None
                 ),
             )
-            execution = _select_judge_handler(
-                resolved_judge, handler, available_judge_handlers
+            handler = select_eval_handler(
+                handlers, resolved_judge.provider, resolved_judge.mode
             )
-            if execution is None:
-                raise EvaluationsError(
-                    f"No handler can run LaunchDarkly judge {judge.key!r}: its "
-                    f"config is served by provider {resolved_judge.provider!r} in "
-                    f"{resolved_judge.mode!r} mode, which neither the generation "
-                    "handler nor any judge_handlers entry provides for. Pass a "
-                    "handler for that provider to run(judge_handlers=[...])."
+            if handler is None:
+                problems.append(
+                    f"judge {judge.key!r} needs a handler for provider "
+                    f"{resolved_judge.provider!r} in {resolved_judge.mode!r} mode"
                 )
-            resolved[judge.key] = execution
+                continue
+            prompt_error = prompt_mode_error(judge_config, resolved_judge.mode)
+            if prompt_error is not None:
+                problems.append(f"judge {judge.key!r}: {prompt_error}")
+                continue
+            resolved[judge.key] = JudgeExecution(
+                resolved=resolved_judge, handler=handler
+            )
+        if problems:
+            raise EvaluationsError(
+                "Cannot run the judges of this evaluation: "
+                + "; ".join(problems)
+                + f". The handlers provide for: {describe_handlers(handlers)}."
+            )
         return resolved
 
     def _fetch_dataset(self, project_key: str, dataset_key: str) -> DatasetRef:
@@ -912,7 +924,6 @@ class EvaluationsRunner:
     async def _run_ld_judge_for_result(
         self,
         row: Mapping[str, Any],
-        tool_handlers: dict[str, ToolImplementation],
         judge: Judge,
         execution: JudgeExecution,
     ) -> dict[str, Any]:
@@ -939,19 +950,11 @@ class EvaluationsRunner:
         # parse_template pass, so ``{{...}}`` sequences inside generated output
         # or dataset values are never re-expanded into the judge prompt.
         variables = self._judge_variables(row, judge)
-        # An agent-mode handler standing in for a messages-mode judge needs the
-        # messages folded into one instructions block, exactly as the online
-        # path does before handing a judge config to an agent handler.
-        judge_config = (
-            collapse_messages_to_instructions(resolved.config)
-            if execution.collapse_messages
-            else resolved.config
-        )
         try:
             result = await execution.handler(
-                dict(judge_config),
+                dict(resolved.config),
                 row.get("output"),
-                tool_handlers,
+                {},
                 {
                     **variables,
                     "formatting_instructions": FORMATTING_INSTRUCTIONS,
@@ -1007,7 +1010,6 @@ class EvaluationsRunner:
     async def _run_criteria_for_results(
         self,
         rows: list[dict[str, Any]],
-        tool_handlers: dict[str, ToolImplementation],
         criteria: list[Criterion],
         resolved_judges: Mapping[str, JudgeExecution],
         concurrency: int,
@@ -1024,7 +1026,6 @@ class EvaluationsRunner:
                     return await self._run_scorer_for_result(row, criterion)
                 return await self._run_ld_judge_for_result(
                     row,
-                    tool_handlers,
                     criterion,
                     resolved_judges[criterion.key],
                 )
