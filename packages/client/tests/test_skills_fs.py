@@ -1446,6 +1446,22 @@ class TestAtomicityAndPermissions:
         assert not mode & stat.S_IXGRP
         assert not mode & stat.S_IXOTH
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+    async def test_created_skill_directory_is_0755_under_a_restrictive_umask(
+        self, root: Path
+    ) -> None:
+        """``mkdir``'s mode is masked by the umask, so without an explicit
+        ``fchmod`` a ``0077`` umask leaves ``<root>/<key>/`` at ``0700`` and a
+        separate agent identity cannot read the ``SKILL.md`` inside it."""
+        previous = os.umask(0o077)
+        try:
+            report = await write_skills([_skill("a")], root)
+        finally:
+            os.umask(previous)
+        assert report.ok is True, _error_messages(report)
+        assert stat.S_IMODE((root / "a").stat().st_mode) == 0o755
+        assert stat.S_IMODE((root / "a" / "SKILL.md").stat().st_mode) == 0o644
+
     async def test_write_goes_through_a_single_atomic_rename(
         self, root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

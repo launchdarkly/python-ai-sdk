@@ -64,6 +64,20 @@ class TestOpenDirectory:
             if fd is not None:
                 os.close(fd)
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+    def test_create_leaves_an_existing_directory_mode_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """The explicit ``0755`` is for directories this call creates; one that
+        was already there keeps the mode its owner chose."""
+        target = tmp_path / "existing"
+        target.mkdir()
+        target.chmod(0o700)
+        fd = open_or_create_directory(target)
+        if fd is not None:
+            os.close(fd)
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
     def test_create_refuses_an_existing_symlink(self, tmp_path: Path) -> None:
         """``Path.mkdir(exist_ok=True)`` would accept this and reopen the hole.
 
