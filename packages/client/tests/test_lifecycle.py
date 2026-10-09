@@ -28,6 +28,34 @@ def reset_singleton() -> None:
     reset_ai_sdk_info(clear_known=True)
 
 
+@pytest.fixture
+def restore_otel_globals() -> Any:
+    """Snapshot and restore the real OTel trace globals around one test.
+
+    The autouse reset only releases them when lifecycle actually installed a
+    provider, so tests that set them directly have to put them back themselves
+    or they leak into every later test in the session.
+    """
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.util._once import Once
+
+    def _install(provider: Any) -> None:
+        # The Once is only meaningful alongside the slot it guards: tripped iff a
+        # provider is installed. Restoring the *same* Once object would hand back
+        # one this test already tripped, so build a fresh one each time.
+        otel_trace._TRACER_PROVIDER = provider
+        once = Once()
+        if provider is not None:
+            once.do_once(lambda: None)
+        otel_trace._TRACER_PROVIDER_SET_ONCE = once
+
+    saved_provider = otel_trace._TRACER_PROVIDER
+    # Start from a clean slate — an earlier test may have left the guard tripped.
+    _install(None)
+    yield otel_trace
+    _install(saved_provider)
+
+
 def _make_stub_client() -> MagicMock:
     stub = MagicMock()
     stub.variation = AsyncMock(return_value=None)
@@ -72,6 +100,74 @@ class TestInitClientBYOC:
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=stub)
         assert get_client() is stub
+
+    async def test_repeat_call_does_not_rerun_telemetry_setup(self) -> None:
+        # The idempotency check sits ahead of this path on purpose. OTel's global
+        # tracer provider is once-guarded, so a second _setup_telemetry would
+        # build a provider that receives no spans while taking over the handle
+        # shutdown() flushes — silently dropping the first provider's buffer.
+        stub = _make_stub_client()
+        with patch.object(
+            lifecycle_module, "_setup_telemetry", return_value=None
+        ) as setup:
+            await init_client({"serviceName": "first"}, stub)
+            await init_client({}, stub)
+            await init_client(None, _make_stub_client())
+        assert setup.call_count == 1
+        assert setup.call_args.args[1] == {"serviceName": "first"}
+
+    async def test_warns_about_an_unrecognized_option(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A misspelt or retired option would otherwise be dropped silently."""
+        stub = _make_stub_client()
+        with (
+            patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await init_client({"serviceName": "svc", "sdkkey": "sdk-x"}, stub)
+        warnings = [r.getMessage() for r in caplog.records]
+        assert warnings == ["Ignoring unrecognized init_client option(s): sdkkey"]
+
+    async def test_does_not_warn_about_documented_options(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        stub = _make_stub_client()
+        options = {
+            "sdkKey": "sdk-x",
+            "baseUri": "https://base.example",
+            "streamUri": "https://stream.example",
+            "eventsUri": "https://events.example",
+            "otlpEndpoint": "https://otlp.example",
+            "serviceName": "svc",
+            "environment": "test",
+        }
+        with (
+            patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await init_client(options, stub)
+        assert caplog.records == []
+
+    async def test_repeat_call_does_not_swap_the_client(self) -> None:
+        first = _make_stub_client()
+        second = _make_stub_client()
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            assert await init_client(client=first) is first
+            assert await init_client(client=second) is first
+
+    async def test_a_failed_telemetry_setup_does_not_adopt_the_client(self) -> None:
+        stub = _make_stub_client()
+        with patch.object(
+            lifecycle_module, "_setup_telemetry", side_effect=ValueError("bad config")
+        ):
+            with pytest.raises(ValueError):
+                await init_client(client=stub)
+        assert lifecycle_module._client is None
+        # The caller owns a BYOC client, so a failed init must not close it.
+        stub.close.assert_not_called()
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            assert await init_client(client=stub) is stub
 
     async def test_flushes_registered_ai_package_information(self) -> None:
         stub = _make_stub_client()
@@ -172,6 +268,50 @@ class TestInitClientSDKKeyPath:
         # LDClient is only instantiated on first init; singleton is reused
         assert mock_ld.LDClient.call_count == 1
 
+    async def test_a_failed_telemetry_setup_leaves_no_client_behind(
+        self, restore_otel_globals: Any
+    ) -> None:
+        # A malformed OTEL_EXPORTER_OTLP_TIMEOUT makes the real _setup_telemetry
+        # raise. _client used to be assigned first, so the next call returned the
+        # half-built client as a silent success with no telemetry, and its
+        # connection was never closed.
+        failed = _make_stub_client()
+        healthy = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(side_effect=[failed, healthy])
+        with patch("importlib.import_module", return_value=mock_ld):
+            bad_env = {"LD_SDK_KEY": "k", "OTEL_EXPORTER_OTLP_TIMEOUT": "soon"}
+            with patch.dict(os.environ, bad_env):
+                with pytest.raises(ValueError):
+                    await init_client()
+            assert lifecycle_module._client is None
+            failed.close.assert_awaited_once()
+
+            with patch.dict(os.environ, {"LD_SDK_KEY": "k"}):
+                with patch.object(
+                    lifecycle_module, "_setup_telemetry", return_value=None
+                ):
+                    assert await init_client() is healthy
+
+    async def test_retries_after_a_failed_init_instead_of_replaying_it(self) -> None:
+        # A failure must not be cached: an app whose first call ran before its
+        # key was available would otherwise fail for the life of the process.
+        stub = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=stub)
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="SDK key"):
+                        await init_client()
+
+                    assert await init_client({"sdkKey": "late-key"}) is stub
+        mock_ld.Config.assert_called_once_with("late-key")
+        assert get_client() is stub
+
     async def test_returns_initialized_client(self) -> None:
         stub = _make_stub_client()
         mock_ld = MagicMock()
@@ -258,6 +398,113 @@ class TestShutdown:
             await init_client(client=stub2)
         assert get_client() is stub2
 
+    async def test_allows_initialization_after_a_failed_init(self) -> None:
+        stub = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=stub)
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="SDK key"):
+                        await init_client()
+                    await shutdown()
+
+                    await init_client({"sdkKey": "test-key"})
+        assert get_client() is stub
+
+    async def test_releases_the_global_tracer_provider(
+        self, restore_otel_globals: Any
+    ) -> None:
+        # Without this, the next set_tracer_provider is refused and every later
+        # span routes to the provider shutdown() just tore down.
+        otel_trace = restore_otel_globals
+        provider = MagicMock()
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=provider):
+            await init_client(client=_make_stub_client())
+        # _setup_telemetry is patched, so stand in for what it would have left,
+        # ownership flag included — this is the case where our set did take.
+        lifecycle_module._tracer_provider = provider
+        lifecycle_module._owns_otel_globals = True
+        otel_trace._TRACER_PROVIDER = provider
+        otel_trace._TRACER_PROVIDER_SET_ONCE.do_once(lambda: None)
+
+        await shutdown()
+
+        provider.shutdown.assert_called_once()
+        assert otel_trace._TRACER_PROVIDER is None
+        assert otel_trace._TRACER_PROVIDER_SET_ONCE._done is False
+
+    async def test_a_full_init_shutdown_init_cycle_lands_on_a_live_provider(
+        self, restore_otel_globals: Any
+    ) -> None:
+        # End to end over the real _setup_telemetry: the second cycle's provider
+        # must be the one the global trace API hands out, not the dead first one.
+        # The OTLP exporter is stubbed so this never reaches the network.
+        otel_trace = restore_otel_globals
+        from opentelemetry.exporter.otlp.proto.http import trace_exporter
+        from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+
+        class _NoopExporter(SpanExporter):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def export(self, spans: Any) -> Any:
+                return SpanExportResult.SUCCESS
+
+            def shutdown(self) -> None:
+                pass
+
+        seen = []
+        with patch.object(trace_exporter, "OTLPSpanExporter", _NoopExporter):
+            for name in ("cycle1", "cycle2"):
+                await init_client(
+                    {"sdkKey": "k", "serviceName": name}, _make_stub_client()
+                )
+                resource = otel_trace.get_tracer_provider().resource
+                seen.append(resource.attributes.get("service.name"))
+                await shutdown()
+        assert seen == ["cycle1", "cycle2"]
+
+    async def test_does_not_release_a_tracer_provider_another_library_registered(
+        self, restore_otel_globals: Any
+    ) -> None:
+        # Building a provider is not owning the global. When something else in
+        # the process registered first, our set_tracer_provider is refused and
+        # the global stays theirs — releasing it on shutdown would tear down the
+        # host application's tracing and leave a no-op proxy behind.
+        otel_trace = restore_otel_globals
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+
+        foreign = TracerProvider(resource=Resource.create({"service.name": "foreign"}))
+        otel_trace.set_tracer_provider(foreign)
+
+        await init_client({"sdkKey": "k", "serviceName": "ld"}, _make_stub_client())
+        assert otel_trace.get_tracer_provider() is foreign
+        assert lifecycle_module._owns_otel_globals is False
+
+        await shutdown()
+
+        assert otel_trace.get_tracer_provider() is foreign
+        assert otel_trace._TRACER_PROVIDER is foreign
+
+    async def test_does_not_release_otel_globals_when_telemetry_never_started(
+        self, restore_otel_globals: Any
+    ) -> None:
+        # setup returned None (OTel absent), so those globals are not ours to
+        # clear — another library in the process may own them.
+        otel_trace = restore_otel_globals
+        sentinel = MagicMock()
+        otel_trace._TRACER_PROVIDER = sentinel
+        otel_trace._TRACER_PROVIDER_SET_ONCE.do_once(lambda: None)
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=_make_stub_client())
+        assert lifecycle_module._owns_otel_globals is False
+        await shutdown()
+        assert otel_trace._TRACER_PROVIDER is sentinel
+
     async def test_reemits_registered_packages_after_shutdown(self) -> None:
         stub1 = _make_stub_client()
         stub2 = _make_stub_client()
@@ -277,6 +524,26 @@ class TestShutdown:
             await init_client(client=stub)
         await shutdown()
         await shutdown()  # must not raise
+
+    async def test_a_failure_clearing_experimental_state_is_logged_not_raised(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Experimental behaviour must not break a core call (TESTING.md §0.3)."""
+        stub = _make_stub_client()
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        with (
+            patch.object(
+                lifecycle_module.skills,
+                "_clear_state",
+                side_effect=RuntimeError("clear failed"),
+            ),
+            caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
+        ):
+            await shutdown()  # must not raise
+        stub.close.assert_called_once()
+        assert lifecycle_module._client is None
+        assert "Could not clear the Agent Skills state" in caplog.messages
 
     async def test_completes_teardown_even_if_flush_throws(self) -> None:
         stub = _make_stub_client()
@@ -518,6 +785,33 @@ class TestInspectConfig:
         assert result["config"]["model"]["name"] == "claude-3-5"  # type: ignore[index]
         assert result["meta"] is not None
 
+    async def test_a_malformed_skills_field_does_not_fail_core_calls(self) -> None:
+        """Agent Skills is experimental, so its field cannot break a core call
+        (TESTING.md §0.3). ``skill_refs`` rejects it instead."""
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(
+            return_value={
+                "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+                "model": {"name": "claude-3-5"},
+                "provider": {"name": "Anthropic"},
+                "instructions": "You are helpful.",
+                "skills": [{"key": "My_Skill", "version": 0}],
+            }
+        )
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            result = await inspect_config("my-flag", ctx)
+            extracted = await lifecycle_module.extract_variation("my-flag", ctx)
+
+        assert result["enabled"] is True
+        assert result["config"] is not None
+        assert extracted["config"]["model"]["name"] == "claude-3-5"
+
     async def test_preserves_model_key_and_version_on_meta(self) -> None:
         stub = _make_stub_client()
         stub.variation = AsyncMock(
@@ -600,6 +894,40 @@ class TestInspectConfig:
 
         assert result["enabled"] is True
         assert result["config"] is None
+
+    async def test_recovers_once_sdk_key_is_available_after_a_failed_lazy_init(
+        self,
+    ) -> None:
+        # inspect_config swallows the init error, so a cached failure would make
+        # an app that called it too early serve disabled configs forever.
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(
+            return_value={
+                "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+                "model": {"name": "claude-3-5"},
+                "provider": {"name": "Anthropic"},
+                "instructions": "You are helpful.",
+            }
+        )
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with patch(
+                        "launchdarkly_ai_server.utils.to_ld_context",
+                        side_effect=lambda _c, ctx: ctx,
+                    ):
+                        assert (await inspect_config("my-flag", ctx))[
+                            "enabled"
+                        ] is False
+
+                        os.environ["LD_SDK_KEY"] = "test-key"
+                        assert (await inspect_config("my-flag", ctx))["enabled"] is True
+        mock_ld.LDClient.assert_called_once()
 
     async def test_never_raises_when_variation_throws(self) -> None:
         stub = _make_stub_client()
