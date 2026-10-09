@@ -837,7 +837,8 @@ however its transport does.
 **Run `write_skills` as a different identity than the agent.** Reconcile as one user, run the
 agent as another. The reconcile sets modes explicitly rather than from your umask: skill files
 and the manifest at `0644` (via `fchmod` on the descriptor, so it cannot be redirected),
-per-skill `<root>/<key>/` directories at `0755`, and never the execute bit. Those modes only
+per-skill `<root>/<key>/` directories at `0755` (keeping a setgid bit inherited from a setgid
+root, so a shared group still propagates), and never the execute bit. Those modes only
 protect anything if the two identities differ.
 
 **What to verify, as the identity that will run the agent.** The SDK cannot check this for you

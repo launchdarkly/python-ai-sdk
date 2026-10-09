@@ -30,6 +30,11 @@ _FILE_MODE = 0o644
 """Mode set explicitly on every written file: never from the umask, never
 executable."""
 
+_DIR_MODE = 0o755
+"""Permission bits set explicitly on every directory this module creates, because
+``mkdir``'s mode argument is masked by the umask: under ``0077`` a separate agent
+identity could not traverse the directory to read what is inside."""
+
 _SUPPORTS_FCHMOD = hasattr(os, "fchmod")
 """Whether the mode can be set on the descriptor. Probed because Windows only
 has ``os.fchmod`` from CPython 3.13, and this package supports 3.12."""
@@ -134,8 +139,10 @@ def open_or_create_directory(
     # Without the *at() family the mkdir below would raise on a dir_fd.
     if not SUPPORTS_DIR_FD:
         dir_fd = None
+    created = False
     try:
-        os.mkdir(_at(directory, dir_fd), 0o755, dir_fd=dir_fd)
+        os.mkdir(_at(directory, dir_fd), _DIR_MODE, dir_fd=dir_fd)
+        created = True
     except FileExistsError:
         # os.stat(follow_symlinks=False) is the spelling os.supports_dir_fd
         # advertises; it is equivalent to os.lstat.
@@ -147,7 +154,22 @@ def open_or_create_directory(
             raise ValueError("the directory is a symlink") from None
         if not stat.S_ISDIR(mode):
             raise ValueError("the path is not a directory") from None
-    return open_directory_nofollow(directory, dir_fd=dir_fd)
+    fd = open_directory_nofollow(directory, dir_fd=dir_fd)
+    # Only a directory this call created: an existing one keeps the mode its
+    # owner gave it. fchmod on the pinned descriptor, never chmod on the path,
+    # which a swap between mkdir and open could redirect. Without a descriptor
+    # (no *at() family, i.e. Windows) there are no POSIX modes to correct.
+    if created and fd is not None and _SUPPORTS_FCHMOD:
+        try:
+            # Keep the setgid bit Linux copies from a setgid parent: fchmod sets
+            # exactly the bits given, so a bare 0755 would clear it and files
+            # written inside would stop inheriting the shared group.
+            inherited = os.fstat(fd).st_mode & stat.S_ISGID
+            os.fchmod(fd, inherited | _DIR_MODE)
+        except BaseException:
+            os.close(fd)
+            raise
+    return fd
 
 
 @contextmanager
