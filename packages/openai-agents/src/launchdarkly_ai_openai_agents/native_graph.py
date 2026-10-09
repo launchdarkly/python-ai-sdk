@@ -23,9 +23,14 @@ from launchdarkly_ai_server import (
     report_usage,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
-from .handler import _parse_message_content, _to_openai_agent_items
+from .handler import (
+    _model_settings_parameters,
+    _parse_message_content,
+    _to_openai_agent_items,
+)
 
 try:
     from opentelemetry import trace
@@ -179,9 +184,19 @@ def to_openai_agents(
             agent_name = _sanitize_name(node.key)
             agent_name_to_key[agent_name] = node.key
 
+            node_model_settings_params = _model_settings_parameters(node.config)
             agent = Agent(
                 name=agent_name,
                 model=node.config.get("model", {}).get("name", "gpt-4o"),
+                **(
+                    {
+                        "model_settings": agents_mod.ModelSettings(
+                            **node_model_settings_params
+                        )
+                    }
+                    if node_model_settings_params
+                    else {}
+                ),
                 **({"instructions": instructions} if instructions else {}),
                 **({"tools": tools} if tools else {}),
                 **({"handoffs": child_handoffs} if child_handoffs else {}),
@@ -265,7 +280,17 @@ def to_openai_agents(
             root_prompt = _to_openai_agent_items(turns)
 
         try:
-            result = await Runner.run(root_agent, root_prompt, hooks=hooks)
+            # Only the root node's `max_turns` applies. The whole graph is one `Runner.run`, and
+            # the Agents SDK counts turns once for that run, across every handoff: `max_turns` is
+            # a `Runner.run` argument, and `Agent` has no per-agent turn limit to set from a
+            # child node's config.
+            root_max_turns = model_parameters(root.config).get("max_turns")
+            root_run_kwargs = (
+                {"max_turns": root_max_turns} if root_max_turns is not None else {}
+            )
+            result = await Runner.run(
+                root_agent, root_prompt, hooks=hooks, **root_run_kwargs
+            )
             if span:
                 span.set_status(SpanStatusCode.OK)
         except Exception as exc:
