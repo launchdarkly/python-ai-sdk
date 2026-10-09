@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-messages-0.2.3...launchdarkly-ai-openai-messages-0.2.4) (2026-10-09)
+
+
+### Features
+
+* **AIC-3495:** record which public helpers an application calls ([#145](https://github.com/launchdarkly/python-ai-sdk/issues/145)) ([19d2c2b](https://github.com/launchdarkly/python-ai-sdk/commit/19d2c2baf35440af57ed57f12f0413e524de27fa))
+
 ## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-messages-0.2.2...launchdarkly-ai-openai-messages-0.2.3) (2026-09-21)
 
 
