@@ -62,14 +62,13 @@ def _track(
     definition: GraphDefinition,
     run_id: str,
     value: int | float,
+    extra: dict[str, Any] | None = None,
 ) -> None:
+    data = make_track_data(node, definition.key, run_id)
+    if extra:
+        data.update(extra)
     client = get_client()
-    client.track(
-        name,
-        to_ld_context(client, context),
-        make_track_data(node, definition.key, run_id),
-        value,
-    )
+    client.track(name, to_ld_context(client, context), data, value)
 
 
 def to_vercel_agents(
@@ -141,7 +140,18 @@ def to_vercel_agents(
         final_text = ""
         try:
             while current is not None and current.key not in path:
+                index = len(path)
                 path.append(current.key)
+                if context is not None:
+                    _track(
+                        "$ld:ai:graph:node",
+                        context,
+                        current,
+                        definition,
+                        run_id,
+                        1,
+                        {"nodeKey": current.key, "index": index},
+                    )
                 selected[current.key] = None
                 node_history = history if current.key == definition.root.key else None
                 messages = build_messages(

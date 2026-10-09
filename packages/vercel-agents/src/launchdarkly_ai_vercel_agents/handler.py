@@ -97,11 +97,9 @@ def build_request_params(config: AiConfigRep, runtime: Any = None) -> Any:
     reasoning_effort = raw.pop("reasoning_effort", raw.pop("reasoningEffort", None))
     if reasoning_effort is not None:
         kwargs["reasoning"] = runtime.ReasoningParams(effort=reasoning_effort)
-    for direct in ("metadata", "safety_identifier", "extra_headers", "extra_query"):
+    for direct in ("metadata", "safety_identifier"):
         if direct in raw:
             kwargs[direct] = raw.pop(direct)
-    if raw:
-        kwargs["extra_body"] = raw
     return runtime.InferenceRequestParams(**kwargs)
 
 

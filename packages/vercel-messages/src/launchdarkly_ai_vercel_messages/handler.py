@@ -99,11 +99,9 @@ def _request_params(config: AiConfigRep) -> Any:
     reasoning_effort = raw.pop("reasoning_effort", raw.pop("reasoningEffort", None))
     if reasoning_effort is not None:
         kwargs["reasoning"] = ai.ReasoningParams(effort=reasoning_effort)
-    for direct in ("metadata", "safety_identifier", "extra_headers", "extra_query"):
+    for direct in ("metadata", "safety_identifier"):
         if direct in raw:
             kwargs[direct] = raw.pop(direct)
-    if raw:
-        kwargs["extra_body"] = raw
     return ai.InferenceRequestParams(**kwargs)
 
 
@@ -361,7 +359,11 @@ async def _run_conversation(
     constrain_output = output_type is not None and not tools
     open_model_span: Any = None
     try:
-        for _ in range(MAX_STEPS):
+        # Tool rounds stop at MAX_STEPS. The structured follow-up is one extra
+        # turn, and it only runs after the model has stopped calling tools.
+        for step in range(MAX_STEPS + 1):
+            if step == MAX_STEPS and not constrain_output:
+                break
             model_span = start_model_span(cfg, parent)
             open_model_span = model_span
             try:

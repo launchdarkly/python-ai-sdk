@@ -247,6 +247,39 @@ class TestOwnedParameters:
         for key in owned:
             assert key not in constructor_args
 
+    @pytest.mark.asyncio
+    async def test_drops_headers_query_and_provider_options(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        config = {
+            **CONFIG,
+            "model": {
+                "name": CONFIG["model"]["name"],
+                "parameters": {
+                    "temperature": 0.2,
+                    "metadata": {"a": 1},
+                    "safety_identifier": "user-1",
+                    "extra_headers": {
+                        "Authorization": "Bearer attacker-key",
+                        "ai-language-model-id": "openai/gpt-5-pro",
+                    },
+                    "extra_query": {"x": "1"},
+                    "providerOptions": {"gateway": {"only": ["evil"]}},
+                },
+            },
+        }
+        await create_vercel_messages_handler()(config, "hello")
+        kwargs = ai_runtime.InferenceRequestParams.call_args.kwargs
+        assert kwargs["metadata"] == {"a": 1}
+        assert kwargs["safety_identifier"] == "user-1"
+        assert "extra_headers" not in kwargs
+        assert "extra_query" not in kwargs
+        assert "extra_body" not in kwargs
+        forwarded = repr(kwargs)
+        assert "attacker-key" not in forwarded
+        assert "gpt-5-pro" not in forwarded
+        assert "providerOptions" not in forwarded
+
 
 class TestMessagesAndHistory:
     @pytest.mark.asyncio
@@ -501,6 +534,35 @@ class TestToolsAndOutput:
         assert rounds[1].kwargs["tools"]
         assert "output_type" in rounds[2].kwargs
         assert rounds[2].kwargs["tools"] == []
+        assert result["output"] == '{"answer":"yes"}'
+
+    @pytest.mark.asyncio
+    async def test_structured_follow_up_runs_when_the_tool_loop_uses_every_step(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+        config = {
+            **CONFIG,
+            "outputFormat": schema,
+            "tools": {"weather": {"description": "Get weather", "parameters": {}}},
+        }
+        call = SimpleNamespace(tool_call_id="tc-1", tool_name="weather", tool_args={})
+        ai_runtime.stream.side_effect = [
+            *[FakeStream(text="", tool_calls=[call]) for _ in range(9)],
+            FakeStream(text="draft"),
+            FakeStream(text="", output='{"answer":"yes"}'),
+        ]
+        result = await create_vercel_messages_handler()(
+            config, "question", {"weather": AsyncMock(return_value="sunny")}
+        )
+        assert ai_runtime.stream.call_count == 11
+        last = ai_runtime.stream.call_args_list[-1].kwargs
+        assert "output_type" in last
+        assert last["tools"] == []
         assert result["output"] == '{"answer":"yes"}'
 
     @pytest.mark.asyncio

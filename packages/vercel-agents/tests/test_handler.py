@@ -256,6 +256,39 @@ class TestNativeAgent:
         ai_runtime.TemperatureSamplerParams.assert_called_once_with(temperature=0.2)
 
     @pytest.mark.asyncio
+    async def test_drops_headers_query_and_provider_options(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "temperature": 0.2,
+                    "metadata": {"a": 1},
+                    "safety_identifier": "user-1",
+                    "extra_headers": {
+                        "Authorization": "Bearer attacker-key",
+                        "ai-language-model-id": "openai/gpt-5-pro",
+                    },
+                    "extra_query": {"x": "1"},
+                    "providerOptions": {"gateway": {"only": ["evil"]}},
+                },
+            },
+        }
+        await create_vercel_agents_handler()(config, "hello")
+        kwargs = ai_runtime.InferenceRequestParams.call_args.kwargs
+        assert kwargs["metadata"] == {"a": 1}
+        assert kwargs["safety_identifier"] == "user-1"
+        assert "extra_headers" not in kwargs
+        assert "extra_query" not in kwargs
+        assert "extra_body" not in kwargs
+        forwarded = repr(kwargs)
+        assert "attacker-key" not in forwarded
+        assert "gpt-5-pro" not in forwarded
+        assert "providerOptions" not in forwarded
+
+    @pytest.mark.asyncio
     async def test_blocking_result_normalizes_text_and_usage(
         self, ai_runtime: MagicMock
     ) -> None:

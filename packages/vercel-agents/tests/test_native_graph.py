@@ -380,6 +380,18 @@ class TestTelemetryAndCleanup:
         assert "$ld:ai:graph:handoff_success" in event_names
         assert "$ld:ai:graph:duration:total" in event_names
         assert "$ld:ai:graph:total_tokens" in event_names
+        assert "$ld:ai:graph:path" not in event_names
+        node_events = [
+            call
+            for call in client.track.call_args_list
+            if call.args[0] == "$ld:ai:graph:node"
+        ]
+        assert [
+            (call.args[2]["nodeKey"], call.args[2]["index"], call.args[3])
+            for call in node_events
+        ] == [("root", 0, 1), ("leaf", 1, 1)]
+        assert node_events[0].args[2]["runId"] == node_events[1].args[2]["runId"]
+        assert node_events[0].args[2]["graphKey"] == "vercel-graph"
 
     @pytest.mark.asyncio
     async def test_no_context_emits_no_launchdarkly_tracking(
@@ -427,9 +439,17 @@ class TestTelemetryAndCleanup:
             await to_vercel_agents(
                 _definition(_graph()), {"context": {"kind": "user", "key": "u"}}
             ).invoke("hello")
-        assert "$ld:ai:graph:invocation_failure" in [
-            call.args[0] for call in client.track.call_args_list
+        tracked = [call.args[0] for call in client.track.call_args_list]
+        assert "$ld:ai:graph:invocation_failure" in tracked
+        node_events = [
+            call
+            for call in client.track.call_args_list
+            if call.args[0] == "$ld:ai:graph:node"
         ]
+        assert len(node_events) == 1
+        assert node_events[0].args[2]["nodeKey"] == "root"
+        assert node_events[0].args[2]["index"] == 0
+        assert node_events[0].args[3] == 1
         span.end.assert_called_once()
 
     @pytest.mark.asyncio
