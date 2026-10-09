@@ -1730,7 +1730,7 @@ class TestConvenienceExport:
             return instance
 
         monkeypatch.setattr(
-            "launchdarkly_ai_claude_agents.handler.config", _fake_config
+            "launchdarkly_ai_claude_agents.handler._config", _fake_config
         )
         result = await claude_agents("cfg-key", "hi", {"key": "u1"})
         assert result == {"output": "ok"}
@@ -1759,7 +1759,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(_handler_mod, "config", mock_config_fn):
+        with patch.object(_handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_claude_agents.handler import claude_agents
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1782,7 +1782,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(_handler_mod, "config", mock_config_fn):
+        with patch.object(_handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_claude_agents.handler import claude_agents
 
             ctx = {"kind": "user", "key": "u1"}

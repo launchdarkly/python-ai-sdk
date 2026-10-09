@@ -11,14 +11,15 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
@@ -27,6 +28,7 @@ from launchdarkly_ai_server import (
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     RawRunUsage,
     fail_span,
@@ -452,6 +454,16 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
     meaning models, token counts, timings and tool names, until a caller asks for more. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
+    report_usage(
+        "claude-messages.createClaudeMessagesHandler", PACKAGE_NAME, __version__
+    )
+    return _create_claude_messages_handler(capture_content=capture_content)
+
+
+def _create_claude_messages_handler(
+    *, capture_content: bool = False
+) -> ProviderHandler:
+    """Non-reporting :func:`create_claude_messages_handler`, used by this package's wrappers."""
     import importlib
 
     anthropic_mod = importlib.import_module("anthropic")
@@ -550,7 +562,7 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("Anthropic", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -801,10 +813,11 @@ def claude_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("claude-messages.claudeMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
+    return _config(
         key=config_key,
-        handler=create_claude_messages_handler(capture_content=capture_content),
+        handler=_create_claude_messages_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

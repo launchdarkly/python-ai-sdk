@@ -6,6 +6,7 @@ See https://launchdarkly.com/docs for usage.
 __version__ = "0.2.4"  # x-release-please-version
 
 from .client import ConfigInstance, config
+from .client import _config as _config
 from .content import (
     SpanMessage,
     SpanMessagePart,
@@ -30,6 +31,7 @@ from .evaluations import (
     Criterion,
     DatasetRow,
     EvalRunResult,
+    EvalTool,
     EvaluationsError,
     EvaluationsModule,
     GenerationConfig,
@@ -39,6 +41,7 @@ from .evaluations import (
     init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
+from .graph import _graph as _graph
 from .history import (
     any_multimodal,
     compose_history,
@@ -63,6 +66,7 @@ from .registry import (
     resolve_tools,
 )
 from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
+from .sdk_usage import report_usage
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -126,6 +130,7 @@ from .utils import (
     to_ld_context,
     to_usage_dict,
 )
+from .utils import _create_handler as _create_handler
 
 __all__ = [  # noqa: RUF022
     # types
@@ -194,6 +199,7 @@ __all__ = [  # noqa: RUF022
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
+    "EvalTool",
     "Judge",
     "RunSummary",
     "Scorer",
@@ -239,6 +245,7 @@ __all__ = [  # noqa: RUF022
     "SDK_INFO_CONTEXT",
     "SDK_INFO_EVENT",
     "register_ai_sdk_package",
+    "report_usage",
     # judges
     "build_judge_tasks",
     "run_judge",

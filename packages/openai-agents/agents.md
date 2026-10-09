@@ -31,6 +31,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "OpenAI"`
 | `src/launchdarkly_ai_openai_agents/native_graph.py` | `to_openai_agents()` native graph adapter |
 | `src/launchdarkly_ai_openai_agents/utils.py` | Shared utility helpers (e.g. `await_coroutine_or_run`) |
 | `src/launchdarkly_ai_openai_agents/__init__.py` | Package exports |
+| `src/launchdarkly_ai_openai_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 

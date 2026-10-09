@@ -34,6 +34,7 @@ The handler is model-agnostic — it accepts any `BaseChatModel`. The default is
 | `src/launchdarkly_ai_langchain_agents/graph.py` | `langchain_graph()` convenience wrapper around `graph()` |
 | `src/launchdarkly_ai_langchain_agents/native_graph.py` | `to_lang_graph()` native graph adapter |
 | `src/launchdarkly_ai_langchain_agents/__init__.py` | Package exports |
+| `src/launchdarkly_ai_langchain_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 

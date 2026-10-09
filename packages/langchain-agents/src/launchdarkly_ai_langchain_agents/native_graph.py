@@ -20,11 +20,13 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     to_ld_context,
 )
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
 
+from ._version import PACKAGE_NAME, __version__
 from .handler import _CHAT_OPENAI_FORWARDED_KEYS, _CHAT_OPENAI_MAPPING_KEYS
 from .messages import to_lang_chain_messages
 
@@ -135,6 +137,7 @@ def to_lang_graph(
             {"context": ctx},
         ).invoke("I was double charged")
     """
+    report_usage("langchain-agents.toLangGraph", PACKAGE_NAME, __version__)
     _opts = opts or {}
 
     async def invoke(
