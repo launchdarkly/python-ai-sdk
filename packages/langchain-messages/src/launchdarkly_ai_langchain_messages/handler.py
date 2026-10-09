@@ -13,9 +13,9 @@ from launchdarkly_ai_server import (
     SpanMessage,
     SpanMessagePart,
     SpanUsage,
+    _config,
+    _create_handler,
     compose_history,
-    config,
-    create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
@@ -27,11 +27,13 @@ from launchdarkly_ai_server import (
     lang_chain_span_usage,
     number_or_zero,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     fail_span,
     finish_model_span,
@@ -230,9 +232,8 @@ def _model_constructor_kwargs(
 ) -> dict[str, Any]:
     raw = (config.get("model") or {}).get("parameters")
     parameters = dict(raw) if isinstance(raw, dict) else {}
-    provider = str((config.get("provider") or {}).get("name") or "").lower()
-    if provider == "bedrock":
-        parameters.pop("tools", None)
+    # Tools are bound from config["tools"]. A tools key here is forwarded raw and rejected.
+    parameters.pop("tools", None)
     # Name from the config always wins over a colliding ``model`` key in the parameter bag.
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
@@ -248,7 +249,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
-    ``model.parameters`` are passed through unchanged.
+    ``model.parameters`` are passed through, except ``tools``, which is bound separately.
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
     if provider == "anthropic":
@@ -384,6 +385,14 @@ def create_langchain_messages_handler(
     emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
     meaning models, token counts, timings and tool names, until a caller asks for more.
     """
+    report_usage("langchain-messages.createLangChainHandler", PACKAGE_NAME, __version__)
+    return _create_langchain_messages_handler(llm, capture_content=capture_content)
+
+
+def _create_langchain_messages_handler(
+    llm: Any = None, *, capture_content: bool = False
+) -> ProviderHandler:
+    """Non-reporting :func:`create_langchain_messages_handler`, used by this package's wrappers."""
 
     async def _call_impl(
         config: AiConfigRep,
@@ -694,7 +703,7 @@ def create_langchain_messages_handler(
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("*", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -1013,12 +1022,13 @@ def langchain_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("langchain-messages.langchainMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
+    return _config(
         key=config_key,
-        handler=create_langchain_messages_handler(
-            llm=llm, capture_content=capture_content
+        handler=_create_langchain_messages_handler(
+            llm, capture_content=capture_content
         ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

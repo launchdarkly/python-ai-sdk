@@ -18,10 +18,13 @@ from launchdarkly_ai_server import (
     NativeTool,
     get_client,
     make_track_data,
+    report_usage,
     set_ld_span_attributes,
     to_ld_context,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data
+
+from ._version import PACKAGE_NAME, __version__
 
 try:
     from opentelemetry import trace
@@ -209,6 +212,7 @@ def to_claude_agents(
 
     Returns an object with a ``.invoke(input, variables)`` coroutine.
     """
+    report_usage("claude-agents.toClaudeAgents", PACKAGE_NAME, __version__)
     _opts = opts or {}
 
     async def invoke(

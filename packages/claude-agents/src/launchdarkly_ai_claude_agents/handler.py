@@ -35,19 +35,21 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     end_span_once,
     end_unfinished_spans,
     parse_template,
+    report_usage,
     set_conversation_id_if_absent,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     MCP_TOOL_PREFIX,
     TOOL_MCP_NAME,
@@ -508,6 +510,12 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. It defaults to off. See TELEMETRY-CONTRACT.md section 7.
     """
+    report_usage("claude-agents.createClaudeAgentsHandler", PACKAGE_NAME, __version__)
+    return _create_claude_agents_handler(capture_content=capture_content)
+
+
+def _create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHandler:
+    """Non-reporting :func:`create_claude_agents_handler`, used by this package's wrappers."""
 
     async def _call_impl(
         config: AiConfigRep,
@@ -694,7 +702,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             capture_content=capture_content,
         )
 
-    return create_handler(
+    return _create_handler(
         ("Anthropic", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
@@ -886,10 +894,11 @@ def claude_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
+    report_usage("claude-agents.claudeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", False)
-    return config(
+    return _config(
         key=config_key,
-        handler=create_claude_agents_handler(capture_content=capture_content),
+        handler=_create_claude_agents_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

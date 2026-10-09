@@ -5,6 +5,7 @@ tree and runs it via Runner.run, mirroring the TypeScript toOpenAIAgents.
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 import types
@@ -19,11 +20,13 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     set_ld_span_attributes,
     to_ld_context,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data
 
+from ._version import PACKAGE_NAME, __version__
 from .handler import _parse_message_content, _to_openai_agent_items
 
 try:
@@ -69,8 +72,12 @@ def _build_node_tools(
             handler = tool_handlers.get(_name)
             if not handler or isinstance(handler, NativeTool):
                 return ""
-            res = await handler(args)
-            return str(res)
+            # Handlers may be sync or async. Same rule as handler._build_agent_tools
+            # and tracking.wrap_tool_handlers — awaiting a plain return raises.
+            result = handler(args)
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         t = tool_fn(
             name=name,
@@ -99,6 +106,7 @@ def to_openai_agents(
             {"context": ctx},
         ).invoke("I was double charged")
     """
+    report_usage("openai-agents.toOpenAIAgents", PACKAGE_NAME, __version__)
     _opts = opts or {}
 
     async def invoke(

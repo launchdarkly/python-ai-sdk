@@ -5,6 +5,7 @@ mirroring the TypeScript toLangGraph implementation.
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 import types
@@ -19,11 +20,13 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     set_ld_span_attributes,
     to_ld_context,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data
 
+from ._version import PACKAGE_NAME, __version__
 from .messages import to_lang_chain_messages
 
 try:
@@ -81,8 +84,12 @@ def _build_node_tools(
             fn = tool_handlers.get(_name)
             if not fn or isinstance(fn, NativeTool):
                 return ""
-            res = await fn(kwargs)
-            return str(res)
+            # Handlers may be sync or async. Same rule as handler._build_agent_tools
+            # and tracking.wrap_tool_handlers — awaiting a plain return raises.
+            result = fn(kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         t = tool_fn(
             name,
@@ -129,6 +136,7 @@ def to_lang_graph(
             {"context": ctx},
         ).invoke("I was double charged")
     """
+    report_usage("langchain-agents.toLangGraph", PACKAGE_NAME, __version__)
     _opts = opts or {}
 
     async def invoke(
@@ -216,6 +224,8 @@ def to_lang_graph(
                     model_cfg = node.config.get("model") or {}
                     raw = model_cfg.get("parameters")
                     kwargs = dict(raw) if isinstance(raw, dict) else {}
+                    # Tools are bound from the node config. A tools key here is forwarded raw and rejected.
+                    kwargs.pop("tools", None)
                     kwargs["model"] = model_cfg.get("name") or "gpt-4o"
                     chat_model = lc_openai.ChatOpenAI(**kwargs)
 
