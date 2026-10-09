@@ -76,8 +76,11 @@ result = await evals.run(
 
 ## Experimental features
 
-Experimental features are not re-exported from this package. Import them from
-`launchdarkly_ai_server.experimental`, which this package installs. For example, Agent Skills
+Experimental features are not re-exported from this package. They live in
+`launchdarkly-ai-server`, the package this one depends on, and need a `launchdarkly-ai-server`
+release that includes them. Import them from `launchdarkly_ai_server.experimental`; if that
+import fails, upgrade `launchdarkly-ai-server` itself, since upgrading this package alone can
+leave an older `launchdarkly-ai-server` in place. For example, Agent Skills
 lives in `launchdarkly_ai_server.experimental.skills`; see the
 [Agent Skills guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#agent-skills-experimental).
 
