@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.4"  # x-release-please-version
+__version__ = "0.3.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .client import _config as _config
