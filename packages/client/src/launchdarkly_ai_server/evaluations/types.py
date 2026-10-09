@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Required, TypedDict
 
 
 @dataclass
@@ -26,8 +26,43 @@ class Usage:
         )
 
 
+GenerationMode = Literal["completion", "agent"]
+"""The mode of a generation config. It selects the handler that runs the config."""
+
+
 class GenerationConfig(TypedDict, total=False):
-    """Generation settings stored on the evaluation and passed to its handler."""
+    """Generation settings stored on the evaluation and passed to its handler.
+
+    ``provider``, ``model`` and ``mode`` are required.
+
+    ``mode`` must be the mode of a handler that you pass to ``run()``:
+
+    - ``"completion"``: the prompt is a list of ``messages``, and the handler
+      sends one request to a chat or messages API. Use it with a messages
+      handler.
+    - ``"agent"``: the prompt is one ``instructions`` string, and an agent
+      framework runs the model, for example OpenAI Agents, Claude Agents, or
+      LangChain agents. Use it with an agent handler.
+
+    If you are not sure, use the mode of the AI Config in LaunchDarkly.
+    """
+
+    provider: Required[str]
+    model: Required[str]
+    mode: Required[GenerationMode]
+    parameters: dict[str, Any]
+    instructions: str
+    messages: list[dict[str, Any]]
+    prompt_snippets: dict[str, str]
+    output_format: dict[str, Any]
+
+
+class GenerationOverrides(TypedDict, total=False):
+    """Generation settings that replace the values of an AI Config variation.
+
+    Pass these with ``ai_config``. Each field is optional. There is no
+    ``mode``, because the AI Config supplies it.
+    """
 
     provider: str
     model: str
@@ -107,7 +142,7 @@ class AIConfigVariation:
     the judges attached to the variation.
     """
 
-    generation: GenerationConfig
+    generation: GenerationOverrides
     tool_versions: dict[str, int] = field(default_factory=dict)
     judge_keys: list[str] = field(default_factory=list)
 
@@ -116,6 +151,7 @@ class AIConfigVariation:
         cls,
         data: Mapping[str, Any],
         model_config: Mapping[str, Any] | None = None,
+        mode: Literal["agent", "messages"] = "messages",
     ) -> AIConfigVariation:
         """Build from one variation version and the model config it links.
 
@@ -124,6 +160,11 @@ class AIConfigVariation:
         a pure translation of API shapes. Provider and base parameters come from
         the model config; the variation's own parameters are layered over them,
         as the served flag payload layers them.
+
+        ``mode`` is the AI Config's handler mode. It selects the prompt field:
+        ``instructions`` in agent mode and ``messages`` in messages mode. When
+        that field is empty, the other field is kept, so the prompt check can
+        reject it.
         """
         model = data.get("model")
         model = model if isinstance(model, Mapping) else {}
@@ -145,7 +186,7 @@ class AIConfigVariation:
             if isinstance(config_model_id, str) and config_model_id:
                 model_name = config_model_id
 
-        generation = GenerationConfig()
+        generation = GenerationOverrides()
         if isinstance(provider, str) and provider:
             generation["provider"] = provider
         if isinstance(model_name, str) and model_name:
@@ -154,9 +195,12 @@ class AIConfigVariation:
             generation["parameters"] = parameters
         instructions = data.get("instructions")
         messages = data.get("messages")
-        if isinstance(instructions, str) and instructions:
+        has_instructions = isinstance(instructions, str) and bool(instructions)
+        has_messages = isinstance(messages, list) and bool(messages)
+        use_instructions = has_instructions and (mode == "agent" or not has_messages)
+        if use_instructions and isinstance(instructions, str):
             generation["instructions"] = instructions
-        elif isinstance(messages, list) and messages:
+        elif has_messages and isinstance(messages, list):
             generation["messages"] = [
                 dict(message) for message in messages if isinstance(message, Mapping)
             ]

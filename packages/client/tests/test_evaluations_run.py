@@ -96,6 +96,27 @@ def dataset_page(
     return {"items": items, "totalCount": total, "_links": links}
 
 
+def tagged(
+    fn: Callable[..., Any],
+    provides_for: tuple[str, str] = ("OpenAI", "messages"),
+) -> Callable[..., Any]:
+    """Return ``fn`` with ``provides_for``, keeping its four-argument call."""
+
+    async def call(*args: Any, **kwargs: Any) -> Any:
+        return await fn(*args, **kwargs)
+
+    call.provides_for = provides_for  # type: ignore[attr-defined]
+    return call
+
+
+def prompt_text(config: dict[str, Any]) -> str:
+    """Return a config's instructions, or the content of its first message."""
+    if config.get("instructions"):
+        return str(config["instructions"])
+    messages = config.get("messages") or []
+    return str(messages[0].get("content", "")) if messages else ""
+
+
 async def successful_handler(
     config: dict[str, Any],
     user_input: str | None,
@@ -242,11 +263,12 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     result = await evals.run(
         key="support-qa-unique",
         dataset="golden",
-        handler=successful_handler,
+        handler=tagged(successful_handler, ("OpenAI", "agent")),
         tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
         generation={
             "provider": "OpenAI",
             "model": "gpt-4o",
+            "mode": "agent",
             "parameters": {"temperature": 0.2},
             "instructions": "Help the user.",
         },
@@ -419,8 +441,8 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert result.passed is False
@@ -481,8 +503,8 @@ async def test_summary_is_polled_until_rows_are_accounted(
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     summary_requests = [
@@ -542,8 +564,8 @@ async def test_summary_polling_completes_for_real_backend_summary_without_state(
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     summary_requests = [
@@ -600,8 +622,8 @@ async def test_summary_polling_ignores_missing_state_even_when_pending_is_zero(
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     summary_requests = [
@@ -653,8 +675,8 @@ async def test_summary_polling_times_out_waiting_for_rows_to_be_accounted(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
     summary_requests = [
@@ -697,8 +719,8 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         poll_interval_seconds=0,
         poll_timeout_seconds=600,
     )
@@ -713,8 +735,8 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             poll_timeout_seconds=-1,
         )
 
@@ -739,8 +761,8 @@ async def test_nan_poll_values_are_rejected(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
@@ -790,8 +812,8 @@ async def test_run_uses_a_byoc_client_when_no_sdk_key_is_configured(
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert result.passed is True
@@ -823,8 +845,8 @@ async def test_run_raises_when_no_sdk_key_and_no_initialized_client(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
 
@@ -875,8 +897,8 @@ async def test_failed_rows_fail_the_result() -> None:
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert result.summary.failed_rows == 1
@@ -892,10 +914,11 @@ async def test_run_rejects_instructions_and_messages_before_network_io() -> None
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler),
             generation={
                 "provider": "OpenAI",
                 "model": "gpt-4o",
+                "mode": "completion",
                 "instructions": "System prompt",
                 "messages": [{"role": "user", "content": "{{input}}"}],
             },
@@ -986,7 +1009,7 @@ async def test_inline_tool_runs_without_reading_the_tool_api() -> None:
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[
             EvalTool(
                 key="lookup_order",
@@ -995,7 +1018,7 @@ async def test_inline_tool_runs_without_reading_the_tool_api() -> None:
                 description="Look up an order",
             )
         ],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert result.passed is True
@@ -1048,13 +1071,13 @@ async def test_inline_tool_description_defaults_to_empty_string() -> None:
     await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[
             EvalTool(
                 key="lookup_order", implementation=lookup_order, schema=ORDER_SCHEMA
             )
         ],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert transport.requests[2]["body"]["tools"] == [
@@ -1101,7 +1124,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
     await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[
             await evals.tools.get("lookup_order", implementation=lookup_order),
             EvalTool(
@@ -1111,7 +1134,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
                 description="Refund an order",
             ),
         ],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     # Exactly one tool GET, for the library key only.
@@ -1251,9 +1274,9 @@ async def test_bad_tool_entry_is_rejected_with_zero_requests(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler),
             tools=tools,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
     assert transport.requests == []
@@ -1270,7 +1293,7 @@ async def test_native_tool_paired_with_an_inline_definition_is_rejected() -> Non
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler),
             tools=[
                 EvalTool(
                     key="lookup_order",
@@ -1278,7 +1301,7 @@ async def test_native_tool_paired_with_an_inline_definition_is_rejected() -> Non
                     schema=ORDER_SCHEMA,
                 )
             ],
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
     assert transport.requests == []
@@ -1302,11 +1325,11 @@ async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
     await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[
             await evals.tools.get("web_search", implementation=NativeTool("WebSearch"))
         ],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert recorded_paths(transport)[0] == ("GET", "projects/proj/ai-tools/web_search")
@@ -1329,7 +1352,7 @@ async def test_a_repeated_tool_key_is_rejected_with_zero_requests() -> None:
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler),
             tools=[
                 EvalTool(
                     key="lookup_order",
@@ -1342,7 +1365,7 @@ async def test_a_repeated_tool_key_is_rejected_with_zero_requests() -> None:
                     schema=ORDER_SCHEMA,
                 ),
             ],
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
     assert transport.requests == []
@@ -1382,8 +1405,8 @@ async def test_empty_dataset_fails_before_evaluation_or_run_creation() -> None:
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(successful_handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
     assert [request["method"] for request in transport.requests] == ["GET", "GET"]
@@ -1480,8 +1503,8 @@ async def test_complete_run_with_error_rows_does_not_pass(
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert set(calls) == {"bad", "good"}
@@ -1548,7 +1571,12 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
             "config": {
                 "provider": {"name": "OpenAI"},
                 "model": {"name": "gpt-4o"},
-                "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Judge {{response_to_evaluate}} against {{expected_output}}",
+                    }
+                ],
             },
             "meta": {"variationKey": "default", "version": 12},
         }
@@ -1567,15 +1595,18 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             assert user_input == "generated"
             assert variables["response_to_evaluate"] == "generated"
             assert variables["expected_output"] == "Answer A"
             # The SDK hands the judge config over unrendered; the handler owns
             # the single template pass.
-            assert config["instructions"] == (
+            assert prompt_text(config) == (
                 "Judge {{response_to_evaluate}} against {{expected_output}}"
             )
+            # Judges cannot use tools.
+            assert tool_handlers == {}
+            assert "tools" not in config
             assert variables["formatting_instructions"].startswith(
                 "Your response MUST be in valid JSON"
             )
@@ -1600,8 +1631,8 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -1696,7 +1727,12 @@ async def test_run_with_ld_judge_never_sends_a_verdict(
         config: dict[str, Any] = {
             "provider": {"name": "OpenAI"},
             "model": {"name": "gpt-4o"},
-            "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Judge {{response_to_evaluate}} against {{expected_output}}",
+                }
+            ],
         }
         if is_inverted is not None:
             config["isInverted"] = is_inverted
@@ -1719,7 +1755,7 @@ async def test_run_with_ld_judge_never_sends_a_verdict(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             return {
                 "output": '{"score": 0.86, "reasoning": "matches policy"}',
                 "usage": {"input_tokens": 640, "output_tokens": 48},
@@ -1732,8 +1768,8 @@ async def test_run_with_ld_judge_never_sends_a_verdict(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy", threshold=threshold)],
     )
 
@@ -1796,7 +1832,9 @@ async def test_judges_resolve_once_per_run_not_once_per_row(
             "config": {
                 "provider": {"name": "OpenAI"},
                 "model": {"name": "gpt-4o"},
-                "instructions": "Judge {{response_to_evaluate}}",
+                "messages": [
+                    {"role": "system", "content": "Judge {{response_to_evaluate}}"}
+                ],
             },
             "meta": {"variationKey": "default", "version": 12},
         }
@@ -1815,15 +1853,15 @@ async def test_judges_resolve_once_per_run_not_once_per_row(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             return {"output": '{"score": 0.9, "reasoning": "fine"}'}
         return {"output": "generated"}
 
     await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -1894,8 +1932,8 @@ async def test_missing_ld_judge_aborts_before_mutating_request(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[Judge(key="security-judge")],
         )
 
@@ -1953,8 +1991,8 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
     result = await evals.run(
         key="support-qa",
         dataset="support-golden-v3",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Scorer(name="refund-exists", fn=check_refund)],
     )
 
@@ -2037,7 +2075,12 @@ def accuracy_judge_variation(monkeypatch: pytest.MonkeyPatch) -> None:
             "config": {
                 "provider": {"name": "OpenAI"},
                 "model": {"name": "gpt-4o"},
-                "instructions": "Judge {{response_to_evaluate}} against {{expected_output}}",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Judge {{response_to_evaluate}} against {{expected_output}}",
+                    }
+                ],
             },
             "meta": {"variationKey": "default", "version": 12},
         }
@@ -2076,15 +2119,15 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             return {"output": judge_output}
         return {"output": "generated"}
 
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -2117,8 +2160,8 @@ async def test_generated_placeholders_are_not_expanded_into_judge_prompt(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
-            rendered = parse_template(config["instructions"], variables)
+        if "Judge" in prompt_text(config):
+            rendered = parse_template(prompt_text(config), variables)
             # The placeholder smuggled in via the generated output must stay
             # literal text after the handler's single render pass.
             assert rendered == "Judge {{expected_output}} leaked? against Answer A"
@@ -2128,8 +2171,8 @@ async def test_generated_placeholders_are_not_expanded_into_judge_prompt(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -2174,7 +2217,7 @@ async def test_missing_expected_output_renders_empty_judge_variables(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             assert variables["expected_output"] == ""
             assert variables["ground_truth_context"] == ""
             return {"output": '{"score": 1, "reasoning": "ok"}'}
@@ -2183,8 +2226,8 @@ async def test_missing_expected_output_renders_empty_judge_variables(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
     assert result.passed is True
@@ -2204,8 +2247,8 @@ async def test_duplicate_criteria_rejected_before_any_request() -> None:
         await evals.run(
             key="support-qa",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[
                 Judge(key="accuracy"),
                 Scorer(name="accuracy", fn=lambda row, output: True),
@@ -2233,8 +2276,8 @@ async def test_duplicate_criteria_rejected_case_insensitively() -> None:
         await evals.run(
             key="support-qa",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[
                 Judge(key="Accuracy"),
                 Scorer(name="accuracy", fn=lambda row, output: True),
@@ -2263,15 +2306,15 @@ async def test_errored_generation_row_emits_generation_incomplete_criterion_even
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             raise AssertionError("judges must not run for errored generations")
         raise RuntimeError("provider unavailable")
 
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -2315,7 +2358,7 @@ async def test_failed_evaluation_event_tracking_raises_after_attempting_every_re
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             return {"output": '{"score": 1, "reasoning": "ok"}'}
         return {"output": "generated"}
 
@@ -2323,8 +2366,8 @@ async def test_failed_evaluation_event_tracking_raises_after_attempting_every_re
         await evals.run(
             key="support-qa",
             dataset="golden",
-            handler=handler,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[
                 Judge(key="$ld:ai:judge:accuracy"),
                 Scorer(name="nonempty", fn=lambda row, output: bool(output)),
@@ -2374,7 +2417,17 @@ def judge_variation(
             "config": {
                 "provider": {"name": provider},
                 "model": {"name": "judge-model"},
-                **(config or {"instructions": "Judge {{response_to_evaluate}}"}),
+                **(
+                    config
+                    or {
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Judge {{response_to_evaluate}}",
+                            }
+                        ]
+                    }
+                ),
             },
             "meta": meta,
         }
@@ -2416,17 +2469,18 @@ async def test_judge_on_another_provider_fails_before_any_records_are_created(
             key="support-qa",
             dataset="golden",
             handler=create_handler(("OpenAI", "messages"), _generation_only),
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[Judge(key="$ld:ai:judge:accuracy")],
         )
 
-    assert "No handler can run LaunchDarkly judge" in str(error.value)
+    assert "Cannot run the judges" in str(error.value)
     assert "'Anthropic'" in str(error.value)
+    assert "('OpenAI', 'messages')" in str(error.value)
     assert transport.requests == []
 
 
 @pytest.mark.asyncio
-async def test_judge_handlers_route_a_judge_to_its_own_provider(
+async def test_handlers_route_a_judge_to_its_own_provider(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
 ) -> None:
@@ -2450,10 +2504,12 @@ async def test_judge_handlers_route_a_judge_to_its_own_provider(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            create_handler(("Anthropic", "messages"), anthropic_judge),
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[create_handler(("Anthropic", "messages"), anthropic_judge)],
     )
 
     assert result.passed is True
@@ -2502,10 +2558,12 @@ async def test_exact_provider_judge_handler_beats_a_wildcard_adapter(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            *([wildcard, exact] if wildcard_first else [exact, wildcard]),
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[wildcard, exact] if wildcard_first else [exact, wildcard],
     )
 
     assert result.passed is True
@@ -2537,10 +2595,12 @@ async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            create_handler(("*", "messages"), wildcard_judge),
+        ],
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[create_handler(("*", "messages"), wildcard_judge)],
     )
 
     assert result.passed is True
@@ -2548,52 +2608,107 @@ async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
 
 
 @pytest.mark.asyncio
-async def test_agent_handler_runs_a_messages_mode_judge_with_collapsed_messages(
+async def test_a_messages_mode_judge_never_runs_on_an_agent_handler(
     monkeypatch: pytest.MonkeyPatch,
-    stub_sdk_client: MagicMock,
 ) -> None:
-    """Mirrors the online path's agent-mode fallback for a messages-mode judge."""
+    """There is no mode fallback: the run fails before any record is created."""
     transport = judge_run_transport()
-    judge_variation(
-        monkeypatch,
-        provider="Anthropic",
-        mode="messages",
-        config={
-            "messages": [
-                {"role": "system", "content": "Grade strictly."},
-                {"role": "user", "content": "Judge {{response_to_evaluate}}"},
-            ]
-        },
-    )
+    judge_variation(monkeypatch, provider="OpenAI", mode="messages")
     evals = init_evaluations(
         project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
     )
-    judged: list[dict[str, Any]] = []
+    agent = AsyncMock(return_value={"output": "generated"})
 
-    async def anthropic_agent_judge(
-        config: dict[str, Any],
-        user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any]] | None = None,
-        variables: dict[str, Any] | None = None,
-        history: list[dict[str, Any]] | None = None,
+    with pytest.raises(EvaluationsError) as error:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(agent, ("OpenAI", "agent")),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "agent"},
+            criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        )
+
+    assert "'$ld:ai:judge:accuracy'" in str(error.value)
+    assert "'messages' mode" in str(error.value)
+    assert transport.requests == []
+    agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_every_judge_problem_is_reported_in_one_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
     ) -> dict[str, Any]:
-        judged.append(config)
-        return {"output": '{"score": 1, "reasoning": "ok"}'}
+        config: dict[str, Any] = {
+            "provider": {"name": "Anthropic" if key == "uncovered" else "OpenAI"},
+            "model": {"name": "judge-model"},
+        }
+        if key == "wrong-prompt":
+            config["instructions"] = "Judge {{response_to_evaluate}}"
+        else:
+            config["messages"] = [{"role": "system", "content": "Judge"}]
+        return {"config": config, "meta": {"variationKey": "default", "version": 1}}
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    transport = judge_run_transport()
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    with pytest.raises(EvaluationsError) as error:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(_generation_only),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+            criteria=[Judge(key="uncovered"), Judge(key="wrong-prompt")],
+        )
+
+    message = str(error.value)
+    assert "judge 'uncovered' needs a handler for provider 'Anthropic'" in message
+    assert "judge 'wrong-prompt': prompt needs 'messages'" in message
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_modes_route_generation_and_judge_to_their_own_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="OpenAI", mode="completion")
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    agent = AsyncMock(return_value={"output": "generated"})
+    messages = AsyncMock(return_value={"output": '{"score": 1, "reasoning": "ok"}'})
 
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=create_handler(("OpenAI", "messages"), _generation_only),
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handlers=[
+            tagged(agent, ("OpenAI", "agent")),
+            tagged(messages, ("OpenAI", "messages")),
+        ],
+        generation={
+            "provider": "OpenAI",
+            "model": "gpt-4o",
+            "mode": "agent",
+            "instructions": "Help the user.",
+        },
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
-        judge_handlers=[create_handler(("Anthropic", "agent"), anthropic_agent_judge)],
     )
 
     assert result.passed is True
-    assert judged[0]["instructions"] == (
-        "Grade strictly.\n\nJudge {{response_to_evaluate}}"
-    )
-    assert judged[0]["messages"] == []
+    assert agent.await_count == 1
+    assert agent.await_args.args[0]["instructions"] == "Help the user."
+    assert messages.await_count == 1
+    assert prompt_text(messages.await_args.args[0]) == "Judge {{response_to_evaluate}}"
 
 
 @pytest.mark.asyncio
@@ -2615,8 +2730,8 @@ async def test_generation_handler_runs_a_judge_on_the_same_provider(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        calls.append(config.get("instructions"))
-        if "Judge" in (config.get("instructions") or ""):
+        calls.append(prompt_text(config))
+        if "Judge" in prompt_text(config):
             return {"output": '{"score": 0.9, "reasoning": "ok"}'}
         return {"output": "generated"}
 
@@ -2624,7 +2739,7 @@ async def test_generation_handler_runs_a_judge_on_the_same_provider(
         key="support-qa",
         dataset="golden",
         handler=create_handler(("OpenAI", "messages"), openai_handler),
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -2633,7 +2748,7 @@ async def test_generation_handler_runs_a_judge_on_the_same_provider(
 
 
 @pytest.mark.asyncio
-async def test_judge_handlers_must_declare_the_provider_they_serve(
+async def test_every_handler_must_declare_the_provider_it_serves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unrouted judge handler would silently never be selected."""
@@ -2647,10 +2762,9 @@ async def test_judge_handlers_must_declare_the_provider_they_serve(
         await evals.run(
             key="support-qa",
             dataset="golden",
-            handler=_generation_only,
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            handlers=[tagged(_generation_only), _generation_only],
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[Judge(key="$ld:ai:judge:accuracy")],
-            judge_handlers=[_generation_only],
         )
 
     assert transport.requests == []
@@ -2702,7 +2816,7 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
         variables: dict[str, Any],
     ) -> dict[str, Any]:
         nonlocal in_flight, max_in_flight
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
             await asyncio.sleep(0.01)
@@ -2713,8 +2827,8 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
         concurrency=2,
     )
@@ -2790,7 +2904,7 @@ async def test_tool_trajectory_reaches_the_judge_via_message_history(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             seen["message_history"] = variables["message_history"]
             # The trajectory lives in message_history and nowhere else: this is
             # already the transcript variable every judge reads, so a second
@@ -2805,9 +2919,9 @@ async def test_tool_trajectory_reaches_the_judge_via_message_history(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -2855,7 +2969,7 @@ async def test_each_row_gets_only_its_own_tool_trajectory(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             histories[str(user_input)] = variables["message_history"]
             return {"output": '{"score": 1, "reasoning": "ok"}'}
         row = str(user_input).split()[-1]
@@ -2868,9 +2982,9 @@ async def test_each_row_gets_only_its_own_tool_trajectory(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
         concurrency=2,
     )
@@ -2901,7 +3015,7 @@ async def test_a_row_that_called_no_tools_says_so_to_the_judge(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             seen["message_history"] = variables["message_history"]
             return {"output": '{"score": 0, "reasoning": "should have looked it up"}'}
         return {"output": "I do not know."}
@@ -2909,11 +3023,11 @@ async def test_a_row_that_called_no_tools_says_so_to_the_judge(
     await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[
             await evals.tools.get("lookup_order", implementation=lambda args: "unused")
         ],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -2946,7 +3060,7 @@ async def test_a_run_without_tools_leaves_message_history_unchanged(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge" in config.get("instructions", ""):
+        if "Judge" in prompt_text(config):
             seen["message_history"] = variables["message_history"]
             return {"output": '{"score": 1, "reasoning": "ok"}'}
         return {"output": "generated"}
@@ -2954,8 +3068,8 @@ async def test_a_run_without_tools_leaves_message_history_unchanged(
     await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -2985,7 +3099,12 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
             "config": {
                 "provider": {"name": "OpenAI"},
                 "model": {"name": "gpt-4o"},
-                "instructions": "Judge this history: {{message_history}}",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Judge this history: {{message_history}}",
+                    }
+                ],
             },
             "meta": {"variationKey": "default", "version": 12},
         }
@@ -3004,8 +3123,8 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        if "Judge this history" in config.get("instructions", ""):
-            rendered = parse_template(config["instructions"], variables)
+        if "Judge this history" in prompt_text(config):
+            rendered = parse_template(prompt_text(config), variables)
             assert "result: {{expected_output}} leaked?" in rendered
             assert "Answer leaked?" not in rendered
             return {"output": '{"score": 1, "reasoning": "ok"}'}
@@ -3015,14 +3134,14 @@ async def test_tool_result_placeholders_are_not_expanded_into_the_judge_prompt(
     result = await evals.run(
         key="support-qa",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler),
         tools=[
             await evals.tools.get(
                 "lookup_order",
                 implementation=lambda args: "{{expected_output}} leaked?",
             )
         ],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
@@ -3063,6 +3182,9 @@ async def test_a_failed_row_keeps_the_calls_made_before_the_handler_raised() -> 
     assert results[0]["tool_calls"][0].result == "shipped"
 
 
+AGENT_AI_CONFIG = {"key": "support-agent", "mode": "agent"}
+
+
 def config_variation_page(**overrides: Any) -> dict[str, Any]:
     """A getAIConfigVariation response holding two versions of one variation."""
     latest: dict[str, Any] = {
@@ -3100,6 +3222,7 @@ MODEL_CONFIG = {
 def fetched_run_responses(variation_page: dict[str, Any]) -> list[HttpResponse]:
     """Every response a run seeded from an AI Config variation needs, in order."""
     return [
+        response(200, AGENT_AI_CONFIG),
         response(200, variation_page),
         response(200, MODEL_CONFIG),
         response(200, {"id": "dataset-id", "name": "golden"}),
@@ -3151,17 +3274,20 @@ async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> Non
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler, ("OpenAI", "agent")),
         ai_config=AIConfig(key="support-agent", variation="control"),
     )
 
     assert result.passed is True
-    assert transport.requests[0]["url"] == (
+    assert transport.requests[0]["url"].endswith(
+        "/projects/proj/ai-configs/support-agent"
+    )
+    assert transport.requests[1]["url"] == (
         "https://app.launchdarkly.com/api/v2/projects/proj/ai-configs/"
         "support-agent/variations/control"
     )
     # The pinned model-config version is the one read.
-    assert transport.requests[1]["url"].endswith(
+    assert transport.requests[2]["url"].endswith(
         "/projects/proj/ai-configs/model-configs/OpenAI.gpt-4o?version=3"
     )
     body = evaluation_post(transport)
@@ -3187,12 +3313,12 @@ async def test_explicit_generation_overrides_the_fetched_variation() -> None:
     await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler, ("OpenAI", "agent")),
         ai_config=AIConfig(key="support-agent", variation="control"),
         generation={
             "model": "gpt-4o-mini",
             "parameters": {"temperature": 0.1},
-            "messages": [{"role": "system", "content": "Candidate prompt"}],
+            "instructions": "Candidate prompt",
         },
     )
 
@@ -3201,7 +3327,7 @@ async def test_explicit_generation_overrides_the_fetched_variation() -> None:
     assert body["generationModel"] == "gpt-4o-mini"
     # parameters merge key by key rather than replacing the fetched set.
     assert body["parameters"] == {"max_tokens": 100, "temperature": 0.1}
-    # messages replace the fetched instructions instead of clashing with them.
+    # The override replaces the fetched instructions.
     assert body["messages"] == [{"role": "system", "content": "Candidate prompt"}]
 
 
@@ -3211,6 +3337,7 @@ async def test_variation_tools_without_implementations_fail_before_mutating_requ
 ):
     transport = SequencedTransport(
         [
+            response(200, AGENT_AI_CONFIG),
             response(
                 200,
                 config_variation_page(tools=[{"key": "lookup_order", "version": 4}]),
@@ -3224,11 +3351,15 @@ async def test_variation_tools_without_implementations_fail_before_mutating_requ
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
-    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
+    assert [request["method"] for request in transport.requests] == [
+        "GET",
+        "GET",
+        "GET",
+    ]
 
 
 @pytest.mark.asyncio
@@ -3237,6 +3368,7 @@ async def test_variation_judges_become_the_default_criteria(
 ) -> None:
     transport = SequencedTransport(
         [
+            response(200, AGENT_AI_CONFIG),
             response(
                 200,
                 config_variation_page(
@@ -3270,17 +3402,24 @@ async def test_variation_judges_become_the_default_criteria(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=handler,
+            handler=tagged(handler, ("OpenAI", "agent")),
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
-    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
+    assert [request["method"] for request in transport.requests] == [
+        "GET",
+        "GET",
+        "GET",
+    ]
 
 
 @pytest.mark.asyncio
 async def test_unknown_variation_fails_before_any_records_are_created() -> None:
     transport = SequencedTransport(
-        [response(404, {"code": "not_found", "message": "not found"})]
+        [
+            response(200, AGENT_AI_CONFIG),
+            response(404, {"code": "not_found", "message": "not found"}),
+        ]
     )
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
@@ -3288,11 +3427,11 @@ async def test_unknown_variation_fails_before_any_records_are_created() -> None:
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
             ai_config=AIConfig(key="support-agent", variation="missing"),
         )
 
-    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
 
 
 @pytest.mark.asyncio
@@ -3320,7 +3459,7 @@ async def test_config_source_is_validated_before_network_io(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
             **source,  # type: ignore[arg-type]
         )
 
@@ -3351,7 +3490,7 @@ async def test_tool_version_drift_from_the_variation_is_logged(
     await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler, ("OpenAI", "agent")),
         ai_config=AIConfig(key="support-agent", variation="control"),
         tools=[await evals.tools.get("lookup_order", implementation=lookup_order)],
     )
@@ -3369,7 +3508,10 @@ async def test_non_string_model_config_key_fails_loudly(
     model_config_key: object,
 ) -> None:
     transport = SequencedTransport(
-        [response(200, config_variation_page(modelConfigKey=model_config_key))]
+        [
+            response(200, AGENT_AI_CONFIG),
+            response(200, config_variation_page(modelConfigKey=model_config_key)),
+        ]
     )
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
@@ -3377,11 +3519,11 @@ async def test_non_string_model_config_key_fails_loudly(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
-    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
 
 
 @pytest.mark.asyncio
@@ -3390,7 +3532,10 @@ async def test_variation_without_a_model_config_needs_an_explicit_provider(
     model_config_key: str | None,
 ) -> None:
     transport = SequencedTransport(
-        [response(200, config_variation_page(modelConfigKey=model_config_key))]
+        [
+            response(200, AGENT_AI_CONFIG),
+            response(200, config_variation_page(modelConfigKey=model_config_key)),
+        ]
     )
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
 
@@ -3399,11 +3544,11 @@ async def test_variation_without_a_model_config_needs_an_explicit_provider(
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
             ai_config=AIConfig(key="support-agent", variation="control"),
         )
 
-    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
 
 
 def test_ai_config_variation_from_api_layers_the_model_config() -> None:
@@ -3522,9 +3667,9 @@ async def test_a_library_tool_without_a_project_is_rejected() -> None:
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
             tools=[forged],
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
     assert transport.requests == []
@@ -3571,14 +3716,14 @@ async def test_run_reads_no_tool_from_the_api() -> None:
     await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=successful_handler,
+        handler=tagged(successful_handler),
         tools=[
             library_tool,
             EvalTool(
                 key="refund_order", implementation=refund_order, schema=ORDER_SCHEMA
             ),
         ],
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     run_paths = [path for _, path in recorded_paths(transport)[requests_before_run:]]
@@ -3603,7 +3748,7 @@ async def test_an_empty_tools_list_runs_a_variation_with_no_tools() -> None:
     await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
+        handler=tagged(handler, ("OpenAI", "agent")),
         ai_config=AIConfig(key="support-agent", variation="control"),
         tools=[],
     )
@@ -3634,9 +3779,9 @@ async def test_a_tool_from_another_project_is_rejected() -> None:
         await evals.run(
             key="eval-key",
             dataset="golden",
-            handler=successful_handler,
+            handler=tagged(successful_handler),
             tools=[foreign_tool],
-            generation={"provider": "OpenAI", "model": "gpt-4o"},
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
 
@@ -3680,7 +3825,7 @@ async def echo_handler(
     return {"output": f"generated: {user_input}"}
 
 
-INLINE_GENERATION: Any = {"provider": "OpenAI", "model": "gpt-4o"}
+INLINE_GENERATION: Any = {"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"}
 
 
 def is_upload(request: dict[str, Any]) -> bool:
@@ -3735,7 +3880,7 @@ async def test_inline_dataset_uploads_rows_before_any_event_and_omits_dataset_id
                 "metadata": {"suite": "orders"},
             },
         ],
-        handler=handler,
+        handler=tagged(handler),
         generation=INLINE_GENERATION,
     )
 
@@ -3799,7 +3944,7 @@ async def test_inline_dataset_uploads_in_batches_of_500() -> None:
     ).run(
         key="inline-eval",
         dataset=[{"rowIdx": index, "input": f"row {index}"} for index in range(1001)],
-        handler=echo_handler,
+        handler=tagged(echo_handler),
         generation=INLINE_GENERATION,
     )
 
@@ -3823,7 +3968,7 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
     ).run(
         key="inline-eval",
         dataset=[{"input": "hello"}],
-        handler=echo_handler,
+        handler=tagged(echo_handler),
         generation=INLINE_GENERATION,
         criteria=[Scorer(name="non-empty", fn=lambda row, output: bool(output))],
     )
@@ -3914,7 +4059,7 @@ async def test_malformed_inline_rows_fail_before_any_request(
         await evals.run(
             key="inline-eval",
             dataset=dataset,
-            handler=echo_handler,
+            handler=tagged(echo_handler),
             generation=INLINE_GENERATION,
         )
 
@@ -3936,7 +4081,7 @@ async def test_inline_upload_is_retried_after_a_server_error() -> None:
     result = await evals.run(
         key="inline-eval",
         dataset=[{"input": "hello"}],
-        handler=echo_handler,
+        handler=tagged(echo_handler),
         generation=INLINE_GENERATION,
     )
 
@@ -3966,7 +4111,7 @@ async def test_failed_inline_upload_stops_the_run_before_generation(
         ).run(
             key="inline-eval",
             dataset=[{"input": "hello"}],
-            handler=handler,
+            handler=tagged(handler),
             generation=INLINE_GENERATION,
         )
 
@@ -4001,7 +4146,7 @@ async def test_run_is_cancelled_when_a_later_upload_batch_fails() -> None:
         ).run(
             key="inline-eval",
             dataset=[{"input": f"row {index}"} for index in range(501)],
-            handler=handler,
+            handler=tagged(handler),
             generation=INLINE_GENERATION,
         )
 
@@ -4029,7 +4174,7 @@ async def test_failed_cancel_does_not_mask_the_upload_error(
         ).run(
             key="inline-eval",
             dataset=[{"input": "hello"}],
-            handler=echo_handler,
+            handler=tagged(echo_handler),
             generation=INLINE_GENERATION,
         )
 
@@ -4056,7 +4201,7 @@ async def test_hosted_dataset_event_identity_is_unchanged(
     ).run(
         key="inline-eval",
         dataset="golden",
-        handler=echo_handler,
+        handler=tagged(echo_handler),
         generation=INLINE_GENERATION,
     )
 
@@ -4107,7 +4252,7 @@ async def test_invalid_dataset_source_fails_before_any_request(
         await evals.run(
             key="inline-eval",
             dataset=dataset,
-            handler=echo_handler,
+            handler=tagged(echo_handler),
             generation=INLINE_GENERATION,
         )
 
@@ -4121,6 +4266,369 @@ async def test_dataset_is_required() -> None:
     with pytest.raises(TypeError, match="dataset"):
         await evals.run(  # type: ignore[call-arg]
             key="inline-eval",
-            handler=echo_handler,
+            handler=tagged(echo_handler),
             generation=INLINE_GENERATION,
         )
+
+
+# Handler routing by provider and mode.
+
+COMPLETION: Any = {"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"}
+
+
+async def _echo(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return {"output": "generated"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({}, "Pass handler"),
+        ({"handler": tagged(_echo), "handlers": [tagged(_echo)]}, "not both"),
+        ({"handlers": []}, "handlers must not be empty"),
+        ({"handlers": tagged(_echo)}, "handlers must be a list"),
+        ({"handlers": [tagged(_echo), "nope"]}, r"handlers\[1\] must be callable"),
+        ({"handler": _echo}, "handler does not declare provides_for"),
+        (
+            {"handlers": [tagged(_echo), tagged(_echo)]},
+            r"handlers\[0\] and handlers\[1\] both provide for",
+        ),
+        (
+            {
+                "handlers": [
+                    tagged(_echo, ("OpenAI", "completion")),
+                    tagged(_echo, ("OpenAI", "messages")),
+                ]
+            },
+            "both provide for",
+        ),
+    ],
+)
+async def test_handler_arguments_are_validated_before_network_io(
+    arguments: dict[str, Any], message: str
+) -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=message):
+        await evals.run(
+            key="eval-key", dataset="golden", generation=COMPLETION, **arguments
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("generation", "message"),
+    [
+        (
+            {"provider": "OpenAI", "model": "gpt-4o"},
+            r"generation\.mode is required\. Set it to 'completion' or 'agent'\.",
+        ),
+        ({**COMPLETION, "mode": "messages"}, "got 'messages'"),
+        ({**COMPLETION, "mode": "judge"}, "got 'judge'"),
+        ({**COMPLETION, "mode": "Completion"}, "got 'Completion'"),
+        ({**COMPLETION, "mode": "agnet"}, "got 'agnet'"),
+        (
+            {**COMPLETION, "instructions": "Help."},
+            "generation prompt needs 'messages' because the handler is a messages",
+        ),
+        (
+            {
+                **COMPLETION,
+                "mode": "agent",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            "No handler can run generation",
+        ),
+        (
+            {**COMPLETION, "provider": "Anthropic"},
+            r"needs provider 'Anthropic' in 'completion' mode",
+        ),
+    ],
+)
+async def test_generation_mode_and_prompt_are_checked_before_network_io(
+    generation: dict[str, Any], message: str
+) -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=message):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=tagged(_echo),
+            generation=generation,
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_an_agent_handler_rejects_a_messages_prompt() -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(
+        EvaluationsError,
+        match="generation prompt needs 'instructions' because the handler is an agent",
+    ):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=tagged(_echo, ("OpenAI", "agent")),
+            generation={
+                **COMPLETION,
+                "mode": "agent",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pool", "generation", "expected"),
+    [
+        (
+            [("OpenAI", "messages"), ("Anthropic", "messages")],
+            {**COMPLETION, "provider": "Anthropic"},
+            1,
+        ),
+        (
+            [("OpenAI", "messages"), ("OpenAI", "agent")],
+            {**COMPLETION, "mode": "agent"},
+            1,
+        ),
+        ([("*", "messages"), ("OpenAI", "messages")], COMPLETION, 1),
+        ([("*", "messages")], COMPLETION, 0),
+    ],
+)
+async def test_generation_selects_its_handler_by_provider_and_mode(
+    stub_sdk_client: MagicMock,
+    pool: list[tuple[str, str]],
+    generation: dict[str, Any],
+    expected: int,
+) -> None:
+    transport = judge_run_transport()
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    stubs = [AsyncMock(return_value={"output": "generated"}) for _ in pool]
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handlers=[tagged(stub, tag) for stub, tag in zip(stubs, pool, strict=True)],
+        generation=generation,
+    )
+
+    assert [stub.await_count for stub in stubs] == [
+        1 if index == expected else 0 for index in range(len(stubs))
+    ]
+    body = evaluation_post(transport)
+    assert "mode" not in body
+    assert "generationMode" not in body
+
+
+@pytest.mark.asyncio
+async def test_judges_get_no_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(
+        monkeypatch,
+        provider="OpenAI",
+        config={
+            "messages": [
+                {"role": "system", "content": "Judge {{response_to_evaluate}}"}
+            ],
+            "tools": [{"name": "lookup_order"}],
+        },
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    calls: list[tuple[dict[str, Any], Any]] = []
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Any],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        calls.append((config, tool_handlers))
+        if "Judge" in prompt_text(config):
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": "generated"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation=COMPLETION,
+        tools=[
+            EvalTool(
+                key="lookup_order",
+                implementation=lookup_order,
+                schema={"type": "object"},
+            )
+        ],
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    (generation_config, generation_tools), (judge_config, judge_tools) = calls
+    assert "lookup_order" in generation_tools
+    assert "lookup_order" in generation_config["tools"]
+    assert judge_tools == {}
+    assert "tools" not in judge_config
+
+
+# AI Config generation source.
+
+
+def ai_config_responses(mode: Any = "agent", **variation: Any) -> list[HttpResponse]:
+    config: dict[str, Any] = {"key": "support-agent"}
+    if mode is not None:
+        config["mode"] = mode
+    return [
+        response(200, config),
+        *fetched_run_responses(config_variation_page(**variation))[1:],
+    ]
+
+
+async def _run_ai_config(
+    transport: SequencedTransport,
+    handlers: list[Any],
+    generation: dict[str, Any] | None = None,
+) -> None:
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handlers=handlers,
+        ai_config=AIConfig(key="support-agent", variation="control"),
+        generation=generation,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_ai_config_mode_no_handler_covers_fails_after_one_get() -> None:
+    transport = SequencedTransport(ai_config_responses("agent"))
+
+    with pytest.raises(
+        EvaluationsError, match="'agent' mode, which needs a handler in 'agent' mode"
+    ):
+        await _run_ai_config(transport, [tagged(_echo)])
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["chat", 3])
+async def test_unknown_ai_config_mode_fails_after_one_get(mode: Any) -> None:
+    transport = SequencedTransport(ai_config_responses(mode))
+
+    with pytest.raises(EvaluationsError, match="unknown mode"):
+        await _run_ai_config(transport, [tagged(_echo)])
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [None, "completion", "judge"])
+async def test_completion_and_judge_ai_configs_use_messages_handlers(
+    stub_sdk_client: MagicMock, mode: Any
+) -> None:
+    messages = [{"role": "system", "content": "Classify this."}]
+    transport = SequencedTransport(ai_config_responses(mode, messages=messages))
+    stub = AsyncMock(return_value={"output": "generated"})
+
+    await _run_ai_config(transport, [tagged(stub)])
+
+    # The variation has both fields; messages mode reads only messages.
+    config = stub.await_args.args[0]
+    assert config["messages"] == messages
+    assert "instructions" not in config
+
+
+@pytest.mark.asyncio
+async def test_agent_ai_config_with_both_fields_uses_instructions(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        ai_config_responses("agent", messages=[{"role": "user", "content": "x"}])
+    )
+    stub = AsyncMock(return_value={"output": "generated"})
+
+    await _run_ai_config(transport, [tagged(stub, ("OpenAI", "agent"))])
+
+    config = stub.await_args.args[0]
+    assert config["instructions"] == "You are a support agent."
+    assert "messages" not in config
+
+
+@pytest.mark.asyncio
+async def test_completion_ai_config_with_only_instructions_fails_after_two_gets() -> (
+    None
+):
+    transport = SequencedTransport(ai_config_responses("completion"))
+
+    with pytest.raises(
+        EvaluationsError,
+        match=(
+            "AI Config 'support-agent' variation 'control' is in 'completion' "
+            "mode: the prompt needs 'messages'"
+        ),
+    ):
+        await _run_ai_config(transport, [tagged(_echo)])
+
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_messages_override_makes_a_completion_variation_valid(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(ai_config_responses("completion"))
+    stub = AsyncMock(return_value={"output": "generated"})
+    override = [{"role": "system", "content": "Override"}]
+
+    await _run_ai_config(transport, [tagged(stub)], {"messages": override})
+
+    config = stub.await_args.args[0]
+    assert config["messages"] == override
+    assert "instructions" not in config
+
+
+@pytest.mark.asyncio
+async def test_ai_config_provider_no_handler_covers_fails_after_the_model_config() -> (
+    None
+):
+    transport = SequencedTransport(ai_config_responses("agent"))
+
+    with pytest.raises(EvaluationsError, match="needs provider 'OpenAI' in 'agent'"):
+        await _run_ai_config(transport, [tagged(_echo, ("Anthropic", "agent"))])
+
+    assert [request["method"] for request in transport.requests] == [
+        "GET",
+        "GET",
+        "GET",
+    ]
+    assert "/model-configs/" in transport.requests[2]["url"]
+
+
+@pytest.mark.asyncio
+async def test_overrides_cannot_set_the_mode() -> None:
+    transport = SequencedTransport([])
+
+    with pytest.raises(EvaluationsError, match="the AI Config supplies the mode"):
+        await _run_ai_config(transport, [tagged(_echo)], {"mode": "agent"})
+
+    assert transport.requests == []
