@@ -10,13 +10,15 @@ import pytest
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server.evaluations import (
     DEFAULT_BASE_URI,
-    EvalRunResult,
-    EvaluationsError,
     HttpResponse,
     LDApiClient,
     LDApiError,
-    RunSummary,
     Usage,
+)
+from launchdarkly_ai_server.experimental.evaluations import (
+    EvalRunResult,
+    EvaluationsError,
+    RunSummary,
     init_evaluations,
 )
 
@@ -485,3 +487,51 @@ def test_missing_project_key_raises_before_network_io(monkeypatch) -> None:
 
     with pytest.raises(EvaluationsError, match="LD_PROJECT_KEY"):
         init_evaluations(transport=failing_transport)
+
+
+EXPERIMENTAL_EVALUATIONS_SURFACE = frozenset(
+    {
+        "init_evaluations",
+        "EvaluationsModule",
+        "AIConfig",
+        "GenerationConfig",
+        "DatasetRow",
+        "EvalTool",
+        "Criterion",
+        "Judge",
+        "Scorer",
+        "EvalRunResult",
+        "RunSummary",
+        "EvaluationsError",
+    }
+)
+
+
+class TestPackageExports:
+    """
+    Evaluations from Code is experimental: every public name is
+    exported from ``launchdarkly_ai_server.experimental.evaluations`` and none
+    from the package root.
+    """
+
+    def test_experimental_surface_is_exactly_the_documented_set(self) -> None:
+        from launchdarkly_ai_server.experimental import evaluations as experimental
+
+        assert set(experimental.__all__) == EXPERIMENTAL_EVALUATIONS_SURFACE
+        assert len(experimental.__all__) == len(EXPERIMENTAL_EVALUATIONS_SURFACE)
+        for name in EXPERIMENTAL_EVALUATIONS_SURFACE:
+            assert hasattr(experimental, name), name
+
+    def test_experimental_module_defines_no_other_public_name(self) -> None:
+        from launchdarkly_ai_server.experimental import evaluations as experimental
+
+        public = {name for name in dir(experimental) if not name.startswith("_")}
+        assert public == EXPERIMENTAL_EVALUATIONS_SURFACE
+
+    def test_no_evaluations_name_is_exported_from_the_package_root(self) -> None:
+        import launchdarkly_ai_server as package
+        import launchdarkly_ai_server.experimental.evaluations
+
+        for name in EXPERIMENTAL_EVALUATIONS_SURFACE:
+            assert name not in package.__all__, name
+            assert not hasattr(package, name), name

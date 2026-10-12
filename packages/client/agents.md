@@ -38,7 +38,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
-| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and generation-only `EvaluationsModule.run()` orchestration |
+| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and `EvaluationsModule.run()` orchestration. Experimental: public names are exported only from `experimental/evaluations.py`, never from the package root |
 | `src/launchdarkly_ai_server/__init__.py` | Public barrel — the only surface handler packages import from |
 
 ---
@@ -76,7 +76,8 @@ from launchdarkly_ai_server import Registry, global_registry, compose, resolve_h
 from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_tool_handlers
 
 # Entry points
-from launchdarkly_ai_server import config, graph, resolve_graph, init_evaluations
+from launchdarkly_ai_server import config, graph, resolve_graph
+from launchdarkly_ai_server.experimental.evaluations import init_evaluations
 
 # Agent Skills (experimental: none of these is exported from the package root)
 from launchdarkly_ai_server.experimental.skills import (
@@ -160,6 +161,8 @@ Handlers may return any of these — the client normalizes them before emitting 
 ---
 
 ## SDK-run evaluations
+
+Evaluations from Code is experimental. Its public names are exported from `launchdarkly_ai_server.experimental.evaluations` and pinned by `TestPackageExports` in `tests/test_evaluations.py`; none may be added to the package root. `init_evaluations` reports the helper `experimental.initEvaluations`.
 
 `init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host `LD_API_BASE_URI`. Do not reuse `LD_BASE_URI`: that variable configures SDK delivery and may point at a relay proxy. Evaluation-run links use the separate `ui_base_uri` option, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; do not derive their host from `LD_API_BASE_URI`. An event transport is resolved in `init_evaluations()`, which raises before any network I/O when it finds neither an SDK key (`sdk_key` or `LD_SDK_KEY`) nor an already-initialized event-capable client: generation events are the only ingest path for row results, so a run without a transport could never complete. The lifecycle module's bring-your-own-client path (`init_client(client=...)`) therefore satisfies the check on its own, and `run()` reuses that singleton through `_resolve_client`; `run()` raises if the client disappears before it emits. Both polling arguments reject NaN, which would otherwise never compare past a deadline and hang the run. The harness always queues one `$ld:ai:offline-evals:generation` custom event per row through the standard SDK event transport and flushes before returning. No feature flag gates event emission. The harness polls the run summary endpoint until a nonzero `total_rows` has `pending_rows == 0` and `passed + failed + error` rows accounting for the total, polling every `poll_interval_seconds` (default 2s) until `poll_timeout_seconds` (default 180s); both are `run()` arguments so large datasets can widen them. The summary endpoint does not return run state, so `RunSummary` exposes row counts only.
 

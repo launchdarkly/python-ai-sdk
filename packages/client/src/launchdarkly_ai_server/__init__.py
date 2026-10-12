@@ -26,20 +26,6 @@ from .conversation import (
     conversation_id,
     set_conversation_id_if_absent,
 )
-from .evaluations import (
-    AIConfig,
-    Criterion,
-    DatasetRow,
-    EvalRunResult,
-    EvalTool,
-    EvaluationsError,
-    EvaluationsModule,
-    GenerationConfig,
-    Judge,
-    RunSummary,
-    Scorer,
-    init_evaluations,
-)
 from .graph import GraphInstance, graph, resolve_graph
 from .graph import _graph as _graph
 from .history import (
@@ -191,19 +177,6 @@ __all__ = [  # noqa: RUF022
     "text_message",
     "to_semconv_finish_reason",
     "VariationMeta",
-    # evaluations
-    "AIConfig",
-    "EvalRunResult",
-    "Criterion",
-    "DatasetRow",
-    "EvaluationsError",
-    "EvaluationsModule",
-    "GenerationConfig",
-    "EvalTool",
-    "Judge",
-    "RunSummary",
-    "Scorer",
-    "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",
