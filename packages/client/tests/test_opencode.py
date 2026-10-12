@@ -354,7 +354,9 @@ class TestCapture:
                     [tool_part("c1", "running", raw_input={"command": "ls"})]
                 ),
             )
-            events = [event async for event in await handler.stream({}, None, None, None)]
+            events = [
+                event async for event in await handler.stream({}, None, None, None)
+            ]
             assert "TOOL_CALL_ARGS" not in types_of(events)
         finally:
             lifecycle_module._reset_for_testing()
@@ -367,7 +369,9 @@ class TestCapture:
                     [tool_part("c1", "running", raw_input={"command": "ls"})]
                 ),
             )
-            events = [event async for event in await handler.stream({}, None, None, None)]
+            events = [
+                event async for event in await handler.stream({}, None, None, None)
+            ]
             args = next(event for event in events if event["type"] == "TOOL_CALL_ARGS")
             assert args["delta"] == '{"command":"ls"}'
         finally:
