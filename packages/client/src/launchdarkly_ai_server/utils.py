@@ -23,11 +23,15 @@ def create_handler(
     provides_for: tuple[str, Literal["agent", "messages"]],
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
     ``provides_for`` metadata and optional streaming implementation.
+
+    ``capture_content`` is this handler's override. ``None`` reads the process
+    default from :func:`configure` when the value is used. ``True`` or ``False``
+    overrides that default.
     """
     report_usage("client.createHandler")
     return _create_handler(provides_for, fn, stream_fn, capture_content)
@@ -37,7 +41,7 @@ def _create_handler(
     provides_for: tuple[str, Literal["agent", "messages"]],
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_handler`, used by the package factories."""
     return ProviderHandler(

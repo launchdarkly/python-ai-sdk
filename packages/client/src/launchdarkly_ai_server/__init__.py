@@ -52,6 +52,7 @@ from .history import (
 )
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
+    configure,
     extract_variation,
     get_client,
     init_client,
@@ -97,6 +98,7 @@ from .types import (
     ProviderGraphResponse,
     ProviderHandler,
     ProviderResponse,
+    SDKOptions,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -148,6 +150,7 @@ __all__ = [  # noqa: RUF022
     "HandlerResult",
     "HandlerStreamEvent",
     "InitClientOptions",
+    "SDKOptions",
     "JudgeResult",
     "JudgeRunResult",
     "JudgeTask",
@@ -237,6 +240,7 @@ __all__ = [  # noqa: RUF022
     "execute_and_track",
     "execute_and_stream",
     # lifecycle
+    "configure",
     "init_client",
     "get_client",
     "shutdown",

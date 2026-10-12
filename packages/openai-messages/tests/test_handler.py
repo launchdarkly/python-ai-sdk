@@ -1879,8 +1879,11 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in seen["config_kwargs"]
 
-    def test_defaults_to_off(self) -> None:
-        assert self._run()["capture_content"] is False
+    def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
+        assert self._run()["capture_content"] is None
+
+    def test_explicit_false_reaches_the_factory(self) -> None:
+        assert self._run(capture_content=False)["capture_content"] is False
 
 
 class TestChatSpanNeverLeaks:
