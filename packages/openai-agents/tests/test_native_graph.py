@@ -5,6 +5,7 @@ Reference: TESTING.md §2.2, §2.x.6
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -204,6 +205,23 @@ def _assert_one_failed_graph_span(
     assert len(failures) == 1
     assert failures[0]["configKey"] == "test-graph"
     assert failures[0]["graphKey"] == "test-graph"
+
+
+def _assert_two_runs_two_run_ids(
+    exporter: Any, track_calls_per_run: list[list[tuple[str, Any]]]
+) -> None:
+    """Each run's graph span carries the ``runId`` of that run's graph-level events,
+    and the two runs carry different ids."""
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 2
+    span_run_ids = [(s.attributes or {}).get("launchdarkly.run.id") for s in spans]
+    for span_run_id, run_calls in zip(span_run_ids, track_calls_per_run, strict=True):
+        assert span_run_id
+        graph_events = [d for e, d in run_calls if e.startswith("$ld:ai:graph:")]
+        assert graph_events
+        for data in graph_events:
+            assert data["runId"] == span_run_id
+    assert span_run_ids[0] != span_run_ids[1]
 
 
 class TestToOpenAIAgentsTopology:
@@ -737,6 +755,42 @@ class TestToOpenAIAgentsOpenAISpecific:
         for _, data in graph_events:
             assert data["configKey"] == "test-graph"
             assert data["graphKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_each_runner_call_gets_its_own_run_id(self) -> None:
+        """Two calls on one runner: each span shares its run's id, and the ids differ."""
+        fake_trace, exporter, _ = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+
+        agents_mock = _make_agents_mock(_make_run_result("done"))
+        graph_def = _make_graph_def()
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            with patch.object(_openai_ng, "trace", fake_trace):
+                with patch.object(_openai_ng, "_HAS_OTEL", True):
+                    with patch.object(
+                        _openai_ng, "get_client", return_value=mock_ld_client
+                    ):
+                        # A task, unlike a bare coroutine, can be awaited on each call.
+                        runner = to_openai_agents(
+                            asyncio.ensure_future(_make_def_promise(graph_def)),
+                            opts={"context": {"kind": "user", "key": "u1"}},
+                        )
+                        await runner.invoke("first")
+                        first_run_calls = len(track_calls)
+                        await runner.invoke("second")
+
+        _assert_two_runs_two_run_ids(
+            exporter,
+            [track_calls[:first_run_calls], track_calls[first_run_calls:]],
+        )
 
     @pytest.mark.asyncio
     async def test_invocation_failure_is_keyed_to_the_graph(self) -> None:
