@@ -103,7 +103,7 @@ class _Reducer:
                 continue
             kind = raw.get("type")
             properties = raw.get("properties")
-            session_id = _session_id(properties)
+            session_id = _session_id(raw)
             if session_id is not None:
                 if self._session_id is None:
                     self._session_id = session_id
@@ -235,12 +235,34 @@ class _Reducer:
             self._cache_write += number_or_zero(cache.get("write"))
 
 
-def _session_id(properties: object) -> str | None:
-    if not isinstance(properties, Mapping):
+def _string_id(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _session_id(raw: object) -> str | None:
+    """Session id from a bus event.
+
+    Deltas carry it on ``properties``. ``message.updated`` carries it on
+    ``properties.info``, and ``message.part.updated`` on ``properties.part``.
+    """
+    if not isinstance(raw, Mapping):
         return None
-    session_id = properties.get("sessionID")
-    if isinstance(session_id, str) and session_id:
-        return session_id
+    properties = raw.get("properties")
+    if not isinstance(properties, Mapping):
+        return _string_id(raw.get("sessionID"))
+    found = _string_id(properties.get("sessionID"))
+    if found is not None:
+        return found
+    info = properties.get("info")
+    if isinstance(info, Mapping):
+        found = _string_id(info.get("sessionID"))
+        if found is not None:
+            return found
+    part = properties.get("part")
+    if isinstance(part, Mapping):
+        return _string_id(part.get("sessionID"))
     return None
 
 

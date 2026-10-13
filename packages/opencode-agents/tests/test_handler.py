@@ -461,6 +461,49 @@ class TestInvocation:
         assert "AFTER" not in events[-1]["output"]
         assert "nope" not in str(events)
 
+    async def test_nested_session_ids_do_not_lock_the_run(self) -> None:
+        events = await collect(
+            [
+                bus(
+                    "message.updated",
+                    info={
+                        "id": "m1",
+                        "role": "assistant",
+                        "sessionID": "ses",
+                        "time": {"created": 1},
+                    },
+                ),
+                text_delta("m1", "p1", "Hi", session_id="ses"),
+                bus(
+                    "message.part.updated",
+                    part={
+                        "id": "px",
+                        "messageID": "mx",
+                        "sessionID": "other",
+                        "type": "text",
+                        "text": "FOREIGN",
+                    },
+                ),
+                bus(
+                    "message.updated",
+                    info={
+                        "id": "mx",
+                        "role": "assistant",
+                        "sessionID": "other",
+                        "time": {"created": 1, "completed": 2},
+                        "tokens": {"input": 9, "output": 9},
+                    },
+                ),
+                text_delta("m1", "p1", "!", session_id="ses"),
+                bus("session.idle", sessionID="ses"),
+                text_delta("m1", "p1", "AFTER", session_id="ses"),
+            ],
+        )
+        assert events[-1]["output"] == "Hi!"
+        assert "FOREIGN" not in events[-1]["output"]
+        assert "AFTER" not in events[-1]["output"]
+        assert "usage" not in events[-1]
+
     async def test_a_delta_without_part_id_is_not_repeated_by_its_snapshot(
         self,
     ) -> None:
