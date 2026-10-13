@@ -71,6 +71,7 @@ class _Reducer:
         self._emitter = TurnEmitter(capture_content=capture_content)
         self._session_id = session_id
         self._text_message_id: str | None = None
+        self._text_open = False
         self._held_tools: dict[str, list[Mapping[str, Any]]] = {}
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
@@ -109,7 +110,7 @@ class _Reducer:
                 continue
             kind = raw.get("type")
             properties = raw.get("properties")
-            session_id = _session_id(properties)
+            session_id = _session_id(raw)
             if session_id is not None:
                 if self._session_id is None:
                     self._session_id = session_id
@@ -133,6 +134,8 @@ class _Reducer:
             return []
         events = self._begin_message(message_id)
         events.extend(self._apply_text(part_id, kind, text))
+        if self._text_open and self._text_message_id == message_id:
+            events.extend(self._release_tools(message_id))
         return events
 
     def _flush_held(self, message_id: str) -> list[dict[str, Any]]:
@@ -165,16 +168,28 @@ class _Reducer:
     def _begin_message(self, message_id: str) -> list[dict[str, Any]]:
         if self._text_message_id == message_id:
             return []
-        events = self._emitter.end_text()
+        events = self._end_open_text()
         self._text_message_id = message_id
+        return events
+
+    def _end_open_text(self) -> list[dict[str, Any]]:
+        events = self._emitter.end_text()
+        self._text_message_id = None
+        self._text_open = False
+        return events
+
+    def _release_tools(self, message_id: str) -> list[dict[str, Any]]:
+        parts = self._held_tools.pop(message_id, [])
+        events: list[dict[str, Any]] = []
+        for part in parts:
+            events.extend(self._emit_tool(part))
         return events
 
     def close(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
-        # End the open assistant message before an unlabeled tool. Otherwise
-        # tool_start copies that message into parentMessageId.
-        events.extend(self._emitter.end_text())
-        self._text_message_id = None
+        # End the open assistant message before any tool whose role never
+        # arrived. tool_start copies the open text message into parentMessageId.
+        events.extend(self._end_open_text())
         for message_id, parts in list(self._held_tools.items()):
             if self._roles.get(message_id) is None:
                 for part in parts:
@@ -236,18 +251,26 @@ class _Reducer:
 
     def _chunk(self, text: str) -> list[dict[str, Any]]:
         self._deltas.append(text)
-        return self._emitter.text(text)
+        events = self._emitter.text(text)
+        if events:
+            self._text_open = True
+        return events
 
     def _tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
         message_id = part.get("messageID")
-        if isinstance(message_id, str):
-            role = self._roles.get(message_id)
-            if role is None:
-                self._held_tools.setdefault(message_id, []).append(part)
-                return []
-            if role != "assistant":
-                return []
-        return self._emit_tool(part)
+        if not isinstance(message_id, str):
+            self._held_tools.setdefault("", []).append(part)
+            return []
+        role = self._roles.get(message_id)
+        if role is None:
+            self._held_tools.setdefault(message_id, []).append(part)
+            return []
+        if role != "assistant":
+            return []
+        if self._text_open and self._text_message_id == message_id:
+            return self._emit_tool(part)
+        self._held_tools.setdefault(message_id, []).append(part)
+        return []
 
     def _emit_tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
         state = part.get("state")
@@ -286,29 +309,29 @@ class _Reducer:
         if isinstance(message_id, str) and isinstance(role, str):
             self._roles[message_id] = role
             if role == "assistant":
+                # A reserved id is not an open AG-UI message. Only text that
+                # TurnEmitter has already yielded can take a parent or be split.
                 late_completion = (
-                    finished
-                    and self._text_message_id is not None
-                    and message_id != self._text_message_id
+                    finished and self._text_open and message_id != self._text_message_id
                 )
-                # Held parts for an earlier completed message cannot be
-                # inserted without merging them into the current message or
-                # splitting that message. Drop those stale parts.
                 if late_completion:
                     self._held.pop(message_id, None)
                     self._held_tools.pop(message_id, None)
                 else:
                     events.extend(self._begin_message(message_id))
                     events.extend(self._flush_held(message_id))
-                    for part in self._held_tools.pop(message_id, []):
-                        events.extend(self._emit_tool(part))
+                    if self._text_open and self._text_message_id == message_id:
+                        events.extend(self._release_tools(message_id))
+                    elif finished:
+                        events.extend(self._release_tools(message_id))
             else:
                 self._held.pop(message_id, None)
                 self._held_tools.pop(message_id, None)
         if role != "assistant" or not isinstance(message_id, str) or not finished:
             return events
-        if message_id == self._text_message_id:
-            events.extend(self._emitter.end_text())
+        if self._text_message_id == message_id and self._text_open:
+            events.extend(self._end_open_text())
+        elif self._text_message_id == message_id:
             self._text_message_id = None
         if message_id not in self._usage_ids:
             tokens = info.get("tokens")
@@ -328,12 +351,34 @@ class _Reducer:
             self._cache_write += number_or_zero(cache.get("write"))
 
 
-def _session_id(properties: object) -> str | None:
-    if not isinstance(properties, Mapping):
+def _string_id(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _session_id(raw: object) -> str | None:
+    """Session id from a bus event.
+
+    Deltas carry it on ``properties``. ``message.updated`` carries it on
+    ``properties.info``, and ``message.part.updated`` on ``properties.part``.
+    """
+    if not isinstance(raw, Mapping):
         return None
-    session_id = properties.get("sessionID")
-    if isinstance(session_id, str) and session_id:
-        return session_id
+    properties = raw.get("properties")
+    if not isinstance(properties, Mapping):
+        return _string_id(raw.get("sessionID"))
+    found = _string_id(properties.get("sessionID"))
+    if found is not None:
+        return found
+    info = properties.get("info")
+    if isinstance(info, Mapping):
+        found = _string_id(info.get("sessionID"))
+        if found is not None:
+            return found
+    part = properties.get("part")
+    if isinstance(part, Mapping):
+        return _string_id(part.get("sessionID"))
     return None
 
 

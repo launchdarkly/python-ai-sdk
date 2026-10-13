@@ -225,6 +225,23 @@ class TestText:
         assert events[-1]["output"] == ""
         assert "disk on fire" not in str(events)
 
+    async def test_a_tool_waits_until_assistant_text_is_open(self) -> None:
+        events = await collect(
+            [
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Looking"),
+                tool_part("c1", "completed", output="file.txt"),
+                assistant_completed("m1"),
+            ]
+        )
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert events.index(text) < events.index(start)
+        assert start["parentMessageId"] == text["messageId"]
+        ended = next(event for event in events if event["type"] == "TEXT_MESSAGE_END")
+        assert ended["messageId"] == text["messageId"]
+
     async def test_a_tool_before_the_role_waits_for_the_assistant_message(self) -> None:
         events = await collect(
             [
@@ -280,6 +297,33 @@ class TestText:
             for event in events
             if event["type"].startswith("TOOL_CALL")
         )
+        assert any(
+            event["type"] == "TEXT_MESSAGE_END" and event["messageId"] == message_ids[1]
+            for event in events
+        )
+
+    async def test_a_completed_message_is_emitted_when_nothing_is_open(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m2", "p2", "Kept"),
+                assistant_completed("m2"),
+                text_delta("m1", "p1", "After"),
+                assistant_completed("m1"),
+            ]
+        )
+        contents = [
+            event for event in events if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert [event["delta"] for event in contents] == ["Kept", "After"]
+        assert contents[0]["messageId"] != contents[1]["messageId"]
+        ends = [
+            event["messageId"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_END"
+        ]
+        assert ends == [contents[0]["messageId"], contents[1]["messageId"]]
+        assert events[-1]["output"] == "KeptAfter"
 
     async def test_capture_off_hides_tool_content(self) -> None:
         built = create_opencode_handler(
