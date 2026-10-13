@@ -11,20 +11,22 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from ..client import ConfigInstance
-from ..conversation import bind_conversation_id
-from ..judges import run_judges
-from ..lifecycle import extract_variation
-from ..registry import resolve_handlers, resolve_tools
-from ..sdk_usage import report_usage
-from ..tracking import _SETTLED_EVENT, _drive_handler_stream
-from ..types import LDContext
-from ..utils import select_handler
+from .client import ConfigInstance
+from .conversation import bind_conversation_id
+from .judges import run_judges
+from .lifecycle import extract_variation
+from .registry import resolve_handlers, resolve_tools
+from .sdk_usage import report_usage
+from .tracking import _SETTLED_EVENT, _drive_handler_stream
+from .types import LDContext
+from .utils import select_handler
 
 _TEXT = frozenset({"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"})
 _TOOLS = frozenset(
     {"TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"}
 )
+
+__all__ = ["stream"]
 
 
 def stream(
@@ -41,7 +43,7 @@ def stream(
     is unchanged. This function is the opt-in reader; it is not a default, and
     it does not read or set a protocol field.
     """
-    report_usage("client.experimental.richStream")
+    report_usage("client.richStream")
     return bind_conversation_id(
         _events(config_instance, user_input, context, variables, history)
     )

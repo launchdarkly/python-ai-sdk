@@ -1,4 +1,4 @@
-"""OpenCode handler: synthetic session events, stable stream, experimental reader."""
+"""OpenCode handler: synthetic session events, stable stream, rich stream reader."""
 
 from __future__ import annotations
 
@@ -9,12 +9,17 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import ProviderHandler, SDKOptions, config, configure
-from launchdarkly_ai_server.experimental.opencode import (
+from launchdarkly_ai_opencode_agents import (
     OpenCodeSessionError,
     create_opencode_handler,
 )
-from launchdarkly_ai_server.experimental.rich_stream import stream as rich_stream
+from launchdarkly_ai_server import (
+    ProviderHandler,
+    SDKOptions,
+    config,
+    configure,
+    rich_stream,
+)
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 
@@ -71,6 +76,13 @@ def tool_part(
             "tool": name,
             "state": state,
         },
+    )
+
+
+def assistant_open(message_id: str) -> dict[str, Any]:
+    return bus(
+        "message.updated",
+        info={"id": message_id, "role": "assistant", "time": {"created": 1}},
     )
 
 
@@ -131,25 +143,23 @@ class TestSurface:
         handler = create_opencode_handler(events=source([]))
         assert handler.provides_for == ("*", "agent")
 
-    def test_names_stay_off_the_package_root(self) -> None:
-        import launchdarkly_ai_server as package
-        from launchdarkly_ai_server.experimental import opencode
+    def test_package_exports_the_handler(self) -> None:
+        import launchdarkly_ai_opencode_agents as package
 
-        assert set(opencode.__all__) == {
+        assert set(package.__all__) == {
             "OpenCodeSessionError",
             "create_opencode_handler",
+            "opencode_agents",
         }
-        public = {name for name in dir(opencode) if not name.startswith("_")}
-        assert public == set(opencode.__all__)
-        for name in opencode.__all__:
-            assert name not in package.__all__
-            assert not hasattr(package, name)
+        for name in package.__all__:
+            assert hasattr(package, name)
 
 
 class TestTextAndTools:
     async def test_text_and_a_successful_tool(self) -> None:
         events = await collect(
             [
+                assistant_open("m1"),
                 text_delta("m1", "p1", "Looking up"),
                 tool_part("c1", "running", raw_input={"command": "ls"}),
                 tool_part("c1", "running", raw_input={"command": "ls"}),
@@ -247,6 +257,7 @@ class TestTextAndTools:
         tokens = {"input": 3, "output": 4, "cache": {"read": 1, "write": 2}}
         events = await collect(
             [
+                assistant_open("m1"),
                 text_delta("m1", "p1", "Hi"),
                 assistant_completed("m1", tokens=tokens),
                 assistant_completed("m1", tokens=tokens),
@@ -262,10 +273,12 @@ class TestTextAndTools:
     async def test_text_after_a_tool_is_a_new_message(self) -> None:
         events = await collect(
             [
+                assistant_open("m1"),
                 text_delta("m1", "p1", "A"),
                 tool_part("c1", "running", raw_input={"q": 1}),
                 tool_part("c1", "completed", raw_input={"q": 1}, output="ok"),
                 assistant_completed("m1"),
+                assistant_open("m2"),
                 text_delta("m2", "p2", "B"),
                 assistant_completed("m2"),
             ],
@@ -277,6 +290,7 @@ class TestTextAndTools:
     async def test_a_text_snapshot_does_not_repeat_deltas(self) -> None:
         events = await collect(
             [
+                assistant_open("m1"),
                 text_delta("m1", "p1", "Hi"),
                 bus(
                     "message.part.updated",
@@ -297,11 +311,69 @@ class TestTextAndTools:
             {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Hi"}
         ]
 
+    async def test_a_snapshot_then_later_deltas_append(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                bus(
+                    "message.part.updated",
+                    part={"id": "p1", "messageID": "m1", "type": "text", "text": "He"},
+                ),
+                text_delta("m1", "p1", "llo"),
+                bus(
+                    "message.part.updated",
+                    part={
+                        "id": "p1",
+                        "messageID": "m1",
+                        "type": "text",
+                        "text": "Hello",
+                    },
+                ),
+                assistant_completed("m1"),
+            ],
+        )
+        contents = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert contents == ["He", "llo"]
+        assert events[-1]["output"] == "Hello"
+
+    async def test_user_text_is_not_the_assistant_reply(self) -> None:
+        events = await collect(
+            [
+                bus(
+                    "message.part.updated",
+                    part={
+                        "id": "pu",
+                        "messageID": "u1",
+                        "type": "text",
+                        "text": "secret prompt",
+                    },
+                ),
+                bus(
+                    "message.updated",
+                    info={
+                        "id": "u1",
+                        "role": "user",
+                        "time": {"created": 1, "completed": 1},
+                    },
+                ),
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ],
+        )
+        assert events[-1]["output"] == "Hi"
+        assert "secret prompt" not in str(events)
+
     async def test_session_error_raises_without_the_provider_body(self) -> None:
         handler = create_opencode_handler(
             capture_content=True,
             events=source(
                 [
+                    assistant_open("m1"),
                     text_delta("m1", "p1", "Hi"),
                     {
                         "type": "session.error",
@@ -386,6 +458,7 @@ class TestStableStream:
             capture_content=True,
             events=source(
                 [
+                    assistant_open("m1"),
                     text_delta("m1", "p1", "Looking up"),
                     tool_part("c1", "running", raw_input={"command": "ls"}),
                     tool_part(
@@ -395,6 +468,7 @@ class TestStableStream:
                         output="file.txt",
                     ),
                     assistant_completed("m1"),
+                    assistant_open("m2"),
                     text_delta("m2", "p2", "Done."),
                     assistant_completed("m2"),
                 ]
@@ -420,6 +494,7 @@ class TestStableStream:
         handler = create_opencode_handler(
             events=source(
                 [
+                    assistant_open("m1"),
                     text_delta("m1", "p1", "Hi"),
                     {"type": "session.error", "properties": {"error": {"name": "X"}}},
                 ]
@@ -483,6 +558,7 @@ class TestRichReader:
             capture_content=True,
             events=source(
                 [
+                    assistant_open("m1"),
                     text_delta("m1", "p1", "Looking up"),
                     tool_part("c1", "running", raw_input={"command": "ls"}),
                     tool_part(

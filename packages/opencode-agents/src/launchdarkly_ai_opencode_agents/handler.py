@@ -12,8 +12,17 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
 from typing import Any
 
-from ..types import AiConfigRep, ProviderHandler
-from ..utils import _create_handler, number_or_zero
+from launchdarkly_ai_server import (
+    AiConfigRep,
+    ProviderHandler,
+    _config,
+    _create_handler,
+)
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.sdk_usage import report_usage
+from launchdarkly_ai_server.utils import number_or_zero
+
+from ._version import PACKAGE_NAME, __version__
 
 _TOOL_FAILURE = "An error occurred."
 
@@ -27,14 +36,20 @@ class OpenCodeSessionError(Exception):
 
 
 class _Reducer:
-    """One pass over a session. Repeated snapshots do not emit a second event."""
+    """One pass over a session.
+
+    Text is emitted only for messages ``message.updated`` has marked assistant.
+    A part snapshot is that part's full text so far: a later delta still appends,
+    and a snapshot that repeats text already emitted adds nothing.
+    """
 
     def __init__(self, capture_content: bool) -> None:
         self._capture = capture_content
         self._open_message: str | None = None
         self._deltas: list[str] = []
-        self._delta_parts: set[str] = set()
-        self._snapshot_parts: set[str] = set()
+        self._roles: dict[str, str] = {}
+        self._held: dict[str, list[tuple[str, str, str]]] = {}
+        self._part_text: dict[str, str] = {}
         self._tools: dict[str, str] = {}
         self._usage_ids: set[str] = set()
         self._input = 0
@@ -72,6 +87,46 @@ class _Reducer:
         for event in self._end_open():
             yield event
 
+    def _accept_text(
+        self, message_id: str, part_id: str, kind: str, text: str
+    ) -> list[dict[str, Any]]:
+        role = self._roles.get(message_id)
+        if role is None:
+            self._held.setdefault(message_id, []).append((kind, part_id, text))
+            return []
+        if role != "assistant":
+            return []
+        return self._apply_text(message_id, part_id, kind, text)
+
+    def _flush_held(self, message_id: str) -> list[dict[str, Any]]:
+        held = self._held.pop(message_id, [])
+        events: list[dict[str, Any]] = []
+        for kind, part_id, text in held:
+            events.extend(self._apply_text(message_id, part_id, kind, text))
+        return events
+
+    def _apply_text(
+        self, message_id: str, part_id: str, kind: str, text: str
+    ) -> list[dict[str, Any]]:
+        if kind == "delta":
+            if part_id:
+                self._part_text[part_id] = self._part_text.get(part_id, "") + text
+            return self._text(message_id, text)
+        already = self._part_text.get(part_id, "")
+        if text.startswith(already):
+            suffix = text[len(already) :]
+            if part_id:
+                self._part_text[part_id] = text
+        elif not already:
+            suffix = text
+            if part_id:
+                self._part_text[part_id] = text
+        else:
+            return []
+        if not suffix:
+            return []
+        return self._text(message_id, suffix)
+
     def _event(self, raw: Mapping[str, Any] | object) -> list[dict[str, Any]]:
         if not isinstance(raw, Mapping):
             return []
@@ -104,11 +159,9 @@ class _Reducer:
         if not isinstance(delta, str) or not delta or not isinstance(message_id, str):
             return []
         part_id = properties.get("partID")
-        if isinstance(part_id, str):
-            if part_id in self._snapshot_parts:
-                return []
-            self._delta_parts.add(part_id)
-        return self._text(message_id, delta)
+        return self._accept_text(
+            message_id, part_id if isinstance(part_id, str) else "", "delta", delta
+        )
 
     def _text_snapshot(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
         message_id = part.get("messageID")
@@ -121,10 +174,7 @@ class _Reducer:
             or not isinstance(part_id, str)
         ):
             return []
-        if part_id in self._delta_parts or part_id in self._snapshot_parts:
-            return []
-        self._snapshot_parts.add(part_id)
-        return self._text(message_id, text)
+        return self._accept_text(message_id, part_id, "snapshot", text)
 
     def _text(self, message_id: str, delta: str) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -150,14 +200,21 @@ class _Reducer:
         return [{"type": "TEXT_MESSAGE_END", "messageId": message_id}]
 
     def _message(self, info: Mapping[str, Any]) -> list[dict[str, Any]]:
-        if info.get("role") != "assistant":
-            return []
+        message_id = info.get("id")
+        role = info.get("role")
+        events: list[dict[str, Any]] = []
+        if isinstance(message_id, str) and isinstance(role, str):
+            self._roles[message_id] = role
+            if role == "assistant":
+                events.extend(self._flush_held(message_id))
+            else:
+                self._held.pop(message_id, None)
+        if role != "assistant" or not isinstance(message_id, str):
+            return events
         completed = info.get("time")
         if not isinstance(completed, Mapping) or "completed" not in completed:
-            return []
-        message_id = info.get("id")
-        events: list[dict[str, Any]] = []
-        if isinstance(message_id, str) and message_id == self._open_message:
+            return events
+        if message_id == self._open_message:
             events.extend(self._end_open())
         if isinstance(message_id, str) and message_id not in self._usage_ids:
             tokens = info.get("tokens")
@@ -307,18 +364,43 @@ def create_opencode_handler(
     default from ``configure`` when the call runs, and ``True`` or ``False``
     overrides it. Tool argument text and tool results are omitted from the
     stream unless capture is on. ``config().stream()`` still yields assistant
-    text as ``chunk`` and one ``done``. Tool events stay on the experimental
-    reader.
+    text as ``chunk`` and one ``done``. Tool events are on
+    ``launchdarkly_ai_server.rich_stream``.
     """
-    from ..lifecycle import effective_capture_content
-    from ..sdk_usage import report_usage
-
-    report_usage("client.experimental.opencode.createHandler")
+    report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
     return _create_opencode_handler(
         capture_content=capture_content,
         events=events,
         resolve_capture=effective_capture_content,
     )
+
+
+def opencode_agents(
+    config_key: str,
+    user_input: str,
+    context: dict[str, Any],
+    **kwargs: Any,
+) -> Any:
+    """Convenience wrapper: creates a handler and calls ``config(...).invoke()``.
+
+    *events* is the session event source, the same callable
+    :func:`create_opencode_handler` takes. This does not construct an OpenCode
+    SDK client.
+    """
+    report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
+    variables = kwargs.pop("variables", None)
+    history = kwargs.pop("history", None)
+    capture_content = kwargs.pop("capture_content", None)
+    events = kwargs.pop("events", None)
+    return _config(
+        key=config_key,
+        handler=_create_opencode_handler(
+            capture_content=capture_content,
+            events=events,
+            resolve_capture=effective_capture_content,
+        ),
+        **kwargs,
+    ).invoke(user_input, context, variables, history)
 
 
 def _create_opencode_handler(
