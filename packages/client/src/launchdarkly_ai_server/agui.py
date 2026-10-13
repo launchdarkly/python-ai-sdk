@@ -104,6 +104,7 @@ class TurnEmitter:
         self._seq = 0
         self._started: set[str] = set()
         self._args: set[str] = set()
+        self._arg_text: dict[str, str] = {}
         self._ended: set[str] = set()
         self._resulted: set[str] = set()
 
@@ -159,25 +160,30 @@ class TurnEmitter:
         ):
             return []
         self._args.add(tool_call_id)
+        self._arg_text[tool_call_id] = self._arg_text.get(tool_call_id, "") + delta
         return [{"type": TOOL_CALL_ARGS, "toolCallId": tool_call_id, "delta": delta}]
 
     def tool_end(
         self, tool_call_id: str, *, arguments: Any = None
     ) -> list[dict[str, Any]]:
-        """Close the argument text. One delta is emitted when none arrived."""
+        """Close the argument text.
+
+        When nothing was streamed, one delta carries the complete arguments.
+        A streamed prefix is extended with the missing suffix of those
+        arguments, so a partial delta cannot publish truncated JSON.
+        """
         if tool_call_id not in self._started or tool_call_id in self._ended:
             return []
         events: list[dict[str, Any]] = []
-        if (
-            self.capture_content
-            and tool_call_id not in self._args
-            and arguments is not None
-        ):
+        if self.capture_content and arguments is not None:
             text = argument_text(arguments)
-            if text:
+            have = self._arg_text.get(tool_call_id, "")
+            extra = text[len(have) :] if text and text.startswith(have) else ""
+            if extra:
                 self._args.add(tool_call_id)
+                self._arg_text[tool_call_id] = have + extra
                 events.append(
-                    {"type": TOOL_CALL_ARGS, "toolCallId": tool_call_id, "delta": text}
+                    {"type": TOOL_CALL_ARGS, "toolCallId": tool_call_id, "delta": extra}
                 )
         self._ended.add(tool_call_id)
         events.append({"type": TOOL_CALL_END, "toolCallId": tool_call_id})

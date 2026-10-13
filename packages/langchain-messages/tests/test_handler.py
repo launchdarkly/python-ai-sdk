@@ -1206,6 +1206,65 @@ class TestStreaming:
         )
         assert args == '{"q":"x"}'
 
+    async def test_a_later_arg_chunk_without_an_index_keeps_the_only_id(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [{"name": "search", "id": "c1", "args": '{"q":'}]
+        second = FakeAIMessage("")
+        second.tool_call_chunks = [{"args": '"x"}'}]
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield first
+            yield second
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [event async for event in await handler.stream(CONFIG, "q")]
+        args = "".join(
+            event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
+        )
+        assert args == '{"q":"x"}'
+
+    async def test_tool_end_completes_a_truncated_argument_prefix(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [{"name": "search", "id": "c1", "args": '{"q":'}]
+        second = FakeAIMessage(
+            "",
+            tool_calls=[{"name": "search", "id": "c1", "args": {"q": "x"}}],
+        )
+        done = FakeAIMessage("ok")
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        turns = [first, second]
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            if turns:
+                yield turns.pop(0)
+                if turns:
+                    yield turns.pop(0)
+                return
+            yield done
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [
+            event
+            async for event in await handler.stream(
+                CONFIG, "q", {"search": lambda _args: "found"}
+            )
+        ]
+        args = "".join(
+            event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
+        )
+        assert args == '{"q":"x"}'
+
     async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 

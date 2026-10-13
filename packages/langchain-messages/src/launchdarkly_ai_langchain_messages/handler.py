@@ -795,6 +795,7 @@ async def _stream_gen(
             accumulated_content = ""
             accumulated_tool_calls: list[Any] = []
             tool_chunk_ids: dict[int, str] = {}
+            seen_call_ids: list[str] = []
             # The cache breakdown has to be accumulated alongside the scalars. LangChain reports it
             # per chunk in `usage_metadata.input_token_details`, and synthesizing a usage bag
             # without it would make the streaming span emit `cache_read = 0` where the blocking path
@@ -851,17 +852,20 @@ async def _stream_gen(
                             if isinstance(piece, dict)
                             else getattr(piece, "args", None)
                         )
-                        # Later chunks often omit id and carry only index plus an args slice.
-                        if (
-                            isinstance(piece_id, str)
-                            and piece_id
-                            and isinstance(piece_index, int)
-                        ):
-                            tool_chunk_ids[piece_index] = piece_id
+                        # Later chunks often omit id. They carry an index, or,
+                        # when only one call is open, just the args slice.
+                        if isinstance(piece_id, str) and piece_id:
+                            if piece_id not in seen_call_ids:
+                                seen_call_ids.append(piece_id)
+                            if isinstance(piece_index, int):
+                                tool_chunk_ids[piece_index] = piece_id
                         elif (
-                            not isinstance(piece_id, str) or not piece_id
-                        ) and isinstance(piece_index, int):
-                            piece_id = tool_chunk_ids.get(piece_index)
+                            isinstance(piece_index, int)
+                            and piece_index in tool_chunk_ids
+                        ):
+                            piece_id = tool_chunk_ids[piece_index]
+                        elif len(seen_call_ids) == 1:
+                            piece_id = seen_call_ids[0]
                         if (
                             isinstance(piece_name, str)
                             and piece_name
@@ -901,6 +905,8 @@ async def _stream_gen(
                 # path.
                 fail_span(model_span, exc, ended)
                 open_model_span = None
+                for rich in emitter.fail_open():
+                    yield rich
                 raise
 
             # The already-mapped figures, not a bag rebuilt from them: this path summed the chunks
@@ -1000,6 +1006,8 @@ async def _stream_gen(
                         str(tc.get("id") or tc["name"]), failed=True
                     ):
                         yield rich
+                    for rich in emitter.fail_open():
+                        yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
@@ -1053,6 +1061,8 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
