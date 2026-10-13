@@ -5,6 +5,7 @@ Reference: TESTING.md §2.2, §2.x.3
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from contextlib import contextmanager
@@ -287,6 +288,23 @@ def _assert_one_failed_graph_span(
     assert len(failures) == 1
     assert failures[0]["configKey"] == "test-graph"
     assert failures[0]["graphKey"] == "test-graph"
+
+
+def _assert_two_runs_two_run_ids(
+    exporter: Any, track_calls_per_run: list[list[tuple[str, Any]]]
+) -> None:
+    """Each run's graph span carries the ``runId`` of that run's graph-level events,
+    and the two runs carry different ids."""
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 2
+    span_run_ids = [(s.attributes or {}).get("launchdarkly.run.id") for s in spans]
+    for span_run_id, run_calls in zip(span_run_ids, track_calls_per_run, strict=True):
+        assert span_run_id
+        graph_events = [d for e, d in run_calls if e.startswith("$ld:ai:graph:")]
+        assert graph_events
+        for data in graph_events:
+            assert data["runId"] == span_run_id
+    assert span_run_ids[0] != span_run_ids[1]
 
 
 class TestToLangGraphTopology:
@@ -605,6 +623,40 @@ class TestToLangGraphLangChainSpecific:
         for _, data in graph_events:
             assert data["configKey"] == "test-graph"
             assert data["graphKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_each_runner_call_gets_its_own_run_id(self) -> None:
+        """Two calls on one runner: each span shares its run's id, and the ids differ."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        fake_trace, exporter, _ = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+        graph_def = _make_graph_def()
+
+        with _patch_imports(mocks):
+            with patch.object(ng_mod, "trace", fake_trace):
+                with patch.object(ng_mod, "_HAS_OTEL", True):
+                    with patch.object(
+                        ng_mod, "get_client", return_value=mock_ld_client
+                    ):
+                        # A task, unlike a bare coroutine, can be awaited on each call.
+                        runner = to_lang_graph(
+                            asyncio.ensure_future(_make_def_promise(graph_def)),
+                            opts={"context": {"kind": "user", "key": "u1"}},
+                        )
+                        await runner.invoke("first")
+                        first_run_calls = len(track_calls)
+                        await runner.invoke("second")
+
+        _assert_two_runs_two_run_ids(
+            exporter,
+            [track_calls[:first_run_calls], track_calls[first_run_calls:]],
+        )
 
     @pytest.mark.asyncio
     async def test_graph_setup_error_fails_the_graph_span(self) -> None:
