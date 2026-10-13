@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
   "launchdarkly-ai-server",
+  "opentelemetry-api>=1.25",
 ]
 description = "OpenCode agent handler for LaunchDarkly AI SDK"
 readme = "README.md"
