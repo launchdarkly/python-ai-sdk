@@ -25,6 +25,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -477,6 +478,37 @@ def _create_claude_messages_handler(
     )
 
 
+def _map_claude_event(
+    event: Any, emitter: TurnEmitter, block_ids: dict[int, str]
+) -> list[dict[str, Any]]:
+    """Map one Messages API stream event onto the AG-UI subset."""
+    kind = getattr(event, "type", None)
+    if kind == "content_block_start":
+        block = getattr(event, "content_block", None)
+        index = getattr(event, "index", None)
+        if getattr(block, "type", None) != "tool_use" or not isinstance(index, int):
+            return []
+        call_id = str(getattr(block, "id", "") or "")
+        block_ids[index] = call_id
+        return emitter.tool_start(call_id, str(getattr(block, "name", "") or ""))
+    if kind == "content_block_delta":
+        delta = getattr(event, "delta", None)
+        delta_type = getattr(delta, "type", None)
+        if delta_type == "text_delta":
+            text = getattr(delta, "text", "")
+            if not isinstance(text, str) or not text:
+                return []
+            return emitter.text(text)
+        if delta_type == "input_json_delta":
+            index = getattr(event, "index", None)
+            call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+            partial = getattr(delta, "partial_json", "")
+            if not isinstance(partial, str):
+                return []
+            return emitter.tool_args(call_id, partial)
+    return []
+
+
 async def _stream_gen(
     client: Any,
     config: AiConfigRep,
@@ -512,6 +544,8 @@ async def _stream_gen(
     conversation = list(messages)
     full_output = ""
     steps = 0
+    emitter = TurnEmitter(capture_content=capture_content)
+    block_ids: dict[int, str] = {}
 
     ended: set[int] = set()
     open_model_span: Any = None
@@ -567,15 +601,10 @@ async def _stream_gen(
                 stream = client.messages.stream(**kwargs)
                 async with stream as s:
                     async for event in s:
-                        if (
-                            hasattr(event, "type")
-                            and event.type == "content_block_delta"
-                            and hasattr(event, "delta")
-                            and getattr(event.delta, "type", None) == "text_delta"
-                        ):
-                            text = event.delta.text
-                            full_output += text
-                            yield {"type": "chunk", "text": text}
+                        for rich in _map_claude_event(event, emitter, block_ids):
+                            if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                                full_output += rich.get("delta") or ""
+                            yield rich
 
                     final_msg = await s.get_final_message()
 
@@ -614,6 +643,8 @@ async def _stream_gen(
                 raise
 
             if final_msg.stop_reason != "tool_use":
+                for rich in emitter.end_text():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -623,6 +654,17 @@ async def _stream_gen(
             steps += 1
 
             conversation.append({"role": "assistant", "content": final_msg.content})
+            for block in final_msg.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                for rich in emitter.tool_start(str(block.id), str(block.name)):
+                    yield rich
+                for rich in emitter.tool_end(
+                    str(block.id), arguments=getattr(block, "input", None)
+                ):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             tool_results = []
             for block in final_msg.content:
                 if block.type != "tool_use":
@@ -652,10 +694,14 @@ async def _stream_gen(
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     open_tool_span = None
+                    for rich in emitter.tool_result(str(block.id), failed=True):
+                        yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                for rich in emitter.tool_result(str(block.id), result):
+                    yield rich
                 tool_results.append(
                     {
                         "type": "tool_result",

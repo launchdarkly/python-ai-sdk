@@ -48,6 +48,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -197,6 +198,9 @@ def build_tool_hooks(
     native_tool_map: dict[str, Any],
     parent_context: Any,
     capture_content: bool,
+    *,
+    emitter: TurnEmitter | None = None,
+    pending: list[dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, list[HookMatcher]], ToolTelemetry, AbandonTelemetry, CancelTelemetry
 ]:
@@ -216,6 +220,11 @@ def build_tool_hooks(
     ) -> None:
         if tool_use_id is None:
             return
+        if emitter is not None and pending is not None:
+            if error is None:
+                pending.extend(emitter.tool_result(tool_use_id, result))
+            else:
+                pending.extend(emitter.tool_result(tool_use_id, failed=True))
         span = tool_spans.pop(tool_use_id, None)
         if span is None:
             return
@@ -257,6 +266,11 @@ def build_tool_hooks(
         # out of an unfiled span leaves it open with nothing tracking it: close_open_spans and the
         # teardown both walk this dict, so a span missing from it is a span that never exports.
         tool_spans[use_id] = span
+        if emitter is not None and pending is not None and use_id:
+            pending.extend(emitter.tool_start(use_id, display_name))
+            pending.extend(
+                emitter.tool_end(use_id, arguments=input_data.get("tool_input"))
+            )
         set_tool_call_content_attributes(
             span, capture_content, arguments=input_data.get("tool_input")
         )
@@ -710,6 +724,49 @@ def _create_claude_agents_handler(*, capture_content: bool = False) -> ProviderH
     )
 
 
+def _map_claude_stream_event(
+    event: dict[str, Any],
+    emitter: TurnEmitter,
+    block_ids: dict[int, str],
+    saw_args: set[str],
+) -> list[dict[str, Any]]:
+    """Map one Claude Agent SDK stream event onto the AG-UI subset."""
+    kind = event.get("type")
+    if kind == "content_block_start":
+        block = event.get("content_block") or {}
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            return []
+        index = event.get("index")
+        call_id = str(block.get("id") or "")
+        if isinstance(index, int):
+            block_ids[index] = call_id
+        return emitter.tool_start(call_id, str(block.get("name") or ""))
+    if kind == "content_block_delta":
+        delta = event.get("delta") or {}
+        if not isinstance(delta, dict):
+            return []
+        if delta.get("type") == "text_delta":
+            text = delta.get("text") or ""
+            if not isinstance(text, str) or not text:
+                return []
+            return emitter.text(text)
+        if delta.get("type") == "input_json_delta":
+            index = event.get("index")
+            call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+            partial = delta.get("partial_json") or ""
+            if isinstance(partial, str) and partial and call_id:
+                saw_args.add(call_id)
+            return emitter.tool_args(
+                call_id, partial if isinstance(partial, str) else ""
+            )
+    if kind == "content_block_stop":
+        index = event.get("index")
+        call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+        if call_id and call_id in saw_args:
+            return emitter.tool_end(call_id)
+    return []
+
+
 async def _stream_gen(
     config: AiConfigRep,
     user_input: str,
@@ -751,6 +808,10 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
+    pending: list[dict[str, Any]] = []
+    block_ids: dict[int, str] = {}
+    saw_args: set[str] = set()
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -771,7 +832,11 @@ async def _stream_gen(
         hooks = None
         if native_tool_names or mcp_allowed_tools:
             hooks, tool_telemetry, abandon_tool_spans, _ = build_tool_hooks(
-                native_tool_map, parent, capture_content
+                native_tool_map,
+                parent,
+                capture_content,
+                emitter=emitter,
+                pending=pending,
             )
 
         options = _build_query_options(
@@ -787,20 +852,23 @@ async def _stream_gen(
         full_output = ""
         gen = query(prompt=query_prompt, options=options)
         async for message in gen:
+            while pending:
+                yield pending.pop(0)
             record_conversation_id(span, message)
             record_native_tools(span, message, capture_content, catalog)
             inference.record(message)
 
             if isinstance(message, StreamEvent):
                 event = message.event
-                if (
-                    event.get("type") == "content_block_delta"
-                    and event.get("delta", {}).get("type") == "text_delta"
+                if event.get("type") == "message_start":
+                    for rich in emitter.end_text():
+                        yield rich
+                for rich in _map_claude_stream_event(
+                    event, emitter, block_ids, saw_args
                 ):
-                    text = event["delta"].get("text", "")
-                    if text:
-                        yield {"type": "chunk", "text": text}
-                        full_output += text
+                    if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                        full_output += rich.get("delta") or ""
+                    yield rich
             elif isinstance(message, ResultMessage):
                 # Before the root, so the children it parents are already closed.
                 inference.finish()
@@ -829,6 +897,12 @@ async def _stream_gen(
                 )
                 mark_ok(span)
                 end_span_once(span, ended)
+                while pending:
+                    yield pending.pop(0)
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 yield {"type": "done", "output": final_output, "usage": raw_usage}
                 return
 
@@ -852,12 +926,22 @@ async def _stream_gen(
         )
         mark_ok(span)
         end_span_once(span, ended)
+        while pending:
+            yield pending.pop(0)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         yield {"type": "done", "output": full_output, "usage": streamed_usage["total"]}
 
     except asyncio.CancelledError:
         cancelled = True
         raise
     except Exception as exc:
+        while pending:
+            yield pending.pop(0)
+        for rich in emitter.fail_open():
+            yield rich
         if tool_telemetry is not None:
             tool_telemetry(exc)
         if not root_usage_written and inference.run_usage["reported"]:
