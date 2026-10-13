@@ -964,6 +964,11 @@ async def _stream_gen(
             if not accumulated_tool_calls:
                 for rich in emitter.end_text():
                     yield rich
+                # A chunk can open a call that never becomes a complete tool
+                # call. Close it before the turn ends, or the client keeps it
+                # open across RUN_FINISHED.
+                for rich in emitter.fail_open():
+                    yield rich
                 full_output = (full_output or "") + accumulated_content
                 break
 
@@ -1031,6 +1036,10 @@ async def _stream_gen(
                         tool_call_id=tc.get("id") or tc["name"], content=str(result_val)
                     )
                 )
+            # Chunks can start a call the gathered message then omits. The
+            # calls we ran are already closed; this finishes the rest.
+            for rich in emitter.fail_open():
+                yield rich
             conversation_messages.extend(tool_results)
 
         full_output_str = (
@@ -1071,6 +1080,8 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.end_text():
+            yield rich
         for rich in emitter.fail_open():
             yield rich
         raise

@@ -1228,6 +1228,77 @@ class TestStreaming:
             event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
         )
         assert args == '{"q":"x"}'
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["toolCallId"] == "c1"
+        assert result["metadata"]["launchdarkly"]["toolFailed"] is True
+        assert events.index(result) < len(events) - 1
+        assert events[-1]["type"] == "done"
+
+    async def test_a_gathered_call_list_that_omits_a_started_call_closes_it(
+        self,
+    ) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [
+            {"name": "search", "id": "c1", "args": "{}"},
+            {"name": "other", "id": "c2", "args": "{}"},
+        ]
+        second = FakeAIMessage(
+            "",
+            tool_calls=[{"name": "search", "id": "c1", "args": {}}],
+        )
+        done = FakeAIMessage("ok")
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        turns = [[first, second], [done]]
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            for chunk in turns.pop(0):
+                yield chunk
+
+        llm.astream = _astream
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [
+            event
+            async for event in await handler.stream(
+                CONFIG, "q", {"search": lambda _args: "found"}
+            )
+        ]
+        results = {
+            event["toolCallId"]: event
+            for event in events
+            if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results["c1"]["content"] == "found"
+        assert "metadata" not in results["c1"]
+        assert results["c2"]["metadata"]["launchdarkly"]["toolFailed"] is True
+        ok = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "ok"
+        )
+        assert events.index(results["c2"]) < events.index(ok)
+
+    async def test_a_provider_error_closes_the_open_text(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield FakeAIMessage("Hello")
+            raise RuntimeError("stream broke")
+
+        llm.astream = _astream
+        seen: list[dict[str, Any]] = []
+        handler = create_langchain_messages_handler(llm=llm)
+        with pytest.raises(RuntimeError, match="stream broke"):
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        start = next(event for event in seen if event["type"] == "TEXT_MESSAGE_START")
+        end = next(event for event in seen if event["type"] == "TEXT_MESSAGE_END")
+        assert end["messageId"] == start["messageId"]
 
     async def test_tool_end_completes_a_truncated_argument_prefix(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
