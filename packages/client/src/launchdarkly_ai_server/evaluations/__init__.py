@@ -17,6 +17,8 @@ from .types import (
     DatasetRow,
     EvalRunResult,
     GenerationConfig,
+    GenerationMode,
+    GenerationOverrides,
     RunSummary,
     Usage,
 )
@@ -31,6 +33,8 @@ __all__ = [
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
+    "GenerationMode",
+    "GenerationOverrides",
     "HttpResponse",
     "Judge",
     "LDApiClient",
