@@ -1699,6 +1699,28 @@ class TestStreamingTelemetry:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
+    async def test_process_default_is_read_on_the_streaming_path(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            self._patch_stream(mock_openai, ["hi"])
+            ctx, rec = _recording()
+            from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+            with ctx:
+                async for _ in await create_openai_messages_handler().stream(
+                    CONFIG, "q"
+                ):
+                    pass
+            assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+        finally:
+            _reset_for_testing()
+
 
 # ---------------------------------------------------------------------------
 # History parameter
