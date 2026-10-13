@@ -528,6 +528,8 @@ def _map_responses_event(
 ) -> list[dict[str, Any]]:
     """Map one Responses stream event onto the AG-UI subset. Unknown events are ignored."""
     kind = getattr(event, "type", None)
+    if kind == "response.created":
+        return emitter.end_text()
     if kind == "response.output_text.delta":
         delta = getattr(event, "delta", "")
         if not isinstance(delta, str) or not delta:
@@ -669,8 +671,6 @@ async def _stream_gen(
             except Exception as exc:
                 fail_span(model_span, exc, ended)
                 open_model_span = None
-                for rich in emitter.fail_open():
-                    yield rich
                 raise
 
             tool_calls = [
@@ -727,10 +727,6 @@ async def _stream_gen(
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     open_tool_span = None
-                    for rich in emitter.tool_result(str(tc.call_id), failed=True):
-                        yield rich
-                    for rich in emitter.fail_open():
-                        yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where

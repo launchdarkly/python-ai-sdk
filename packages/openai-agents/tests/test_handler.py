@@ -1399,6 +1399,45 @@ class TestStreaming:
             event["type"] == "TOOL_CALL_END" for event in hooks.emitter.tool_end("c1")
         )
 
+    async def test_tool_end_publishes_arguments_the_consumer_has_not_read(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import _SpanningHooks
+        from launchdarkly_ai_server import create_run_usage
+
+        hooks = _SpanningHooks(CONFIG, None, True, create_run_usage())
+        hooks.emitter.tool_start("c1", "search")
+        hooks.emitter.tool_args("c1", '{"q":')
+        ctx = SimpleNamespace(
+            tool_name="search",
+            tool_call_id="c1",
+            tool_arguments='{"q":"x"}',
+        )
+        await hooks.on_tool_end(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search"), "found"
+        )
+        deltas = [
+            event["delta"]
+            for event in hooks.pending
+            if event["type"] == "TOOL_CALL_ARGS"
+        ]
+        assert "".join(['{"q":', *deltas]) == '{"q":"x"}'
+        assert any(event["type"] == "TOOL_CALL_RESULT" for event in hooks.pending)
+        assert hooks.emitter.tool_args("c1", "more") == []
+
+    def test_a_new_response_closes_text_in_read_order(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import _map_responses_event
+        from launchdarkly_ai_server.agui import TurnEmitter
+
+        emitter = TurnEmitter(capture_content=True)
+        opened = emitter.text("Let me ")
+        closed = _map_responses_event(
+            SimpleNamespace(type="response.created"), emitter, {}
+        )
+        assert closed[0]["type"] == "TEXT_MESSAGE_END"
+        assert closed[0]["messageId"] == opened[0]["messageId"]
+        nxt = emitter.text("Answer")
+        assert nxt[0]["type"] == "TEXT_MESSAGE_START"
+        assert nxt[0]["messageId"] != opened[0]["messageId"]
+
     async def test_opens_the_same_root_span_name_as_the_blocking_path(self) -> None:
         ctx, rec = _recording()
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]

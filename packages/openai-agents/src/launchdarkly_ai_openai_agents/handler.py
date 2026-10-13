@@ -257,7 +257,9 @@ class _SpanningHooks(_RunHooksBase):
     async def on_llm_start(
         self, context: Any, agent: Any, system_prompt: str | None, input_items: Any
     ) -> None:
-        self.pending.extend(self.emitter.end_text())
+        # Text is closed from response.created, in the order the consumer
+        # reads raw events. Closing here runs ahead of unread deltas and
+        # splits one turn across two messages.
         span = start_model_span(self.config, self.parent)
         self.open_model_span = span
         if self.capture_content:
@@ -351,6 +353,14 @@ class _SpanningHooks(_RunHooksBase):
         self, context: Any, agent: Any, tool: Any, result: Any
     ) -> None:
         call_id = self._tool_span_key(context, tool)
+        # The hook can run before unread argument deltas. Close with the full
+        # argument string first, so tool_result does not seal a prefix.
+        self.pending.extend(
+            self.emitter.tool_end(
+                str(call_id),
+                arguments=getattr(context, "tool_arguments", None),
+            )
+        )
         self.pending.extend(self.emitter.tool_result(str(call_id), result))
         span = self.open_tool_spans.pop(call_id, None)
         if span is None:
@@ -687,6 +697,8 @@ def _map_responses_event(
 ) -> list[dict[str, Any]]:
     """Map one Responses stream event onto the AG-UI subset. Unknown events are ignored."""
     kind = getattr(event, "type", None)
+    if kind == "response.created":
+        return emitter.end_text()
     if kind == "response.output_text.delta":
         delta = getattr(event, "delta", "")
         if not isinstance(delta, str) or not delta:
