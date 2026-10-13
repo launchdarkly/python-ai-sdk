@@ -210,6 +210,14 @@ class TurnEmitter:
         events.append(event)
         return events
 
+    def fail_open(self) -> list[dict[str, Any]]:
+        """Close every call that started and did not finish, as a masked failure."""
+        events: list[dict[str, Any]] = []
+        for call_id in list(self._started):
+            if call_id not in self._resulted:
+                events.extend(self.tool_result(call_id, failed=True))
+        return events
+
 
 class StableProjector:
     """Projects a handler stream onto ``chunk`` then one internal ``done``.

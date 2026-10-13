@@ -141,6 +141,14 @@ class TestTurnEmitter:
         assert events[-1]["content"] == "An error occurred."
         assert events[-1]["metadata"]["launchdarkly"]["toolFailed"] is True
 
+    def test_fail_open_masks_a_call_that_never_finished(self) -> None:
+        emitter = TurnEmitter(capture_content=False)
+        emitter.tool_start("a", "search")
+        events = emitter.fail_open()
+        assert [event["type"] for event in events] == [TOOL_CALL_END, TOOL_CALL_RESULT]
+        assert "content" not in events[-1]
+        assert events[-1]["metadata"]["launchdarkly"]["toolFailed"] is True
+
     def test_a_second_start_for_the_same_id_is_dropped(self) -> None:
         emitter = TurnEmitter(capture_content=True)
         assert emitter.tool_start("a", "search")
