@@ -356,7 +356,8 @@ class _SpanningHooks(_RunHooksBase):
         call_id = self._tool_span_key(context, tool)
         # The hook can run before unread argument deltas. Close with the full
         # argument string first, so tool_result does not seal a prefix.
-        self.pending.extend(self.emitter.end_text())
+        # Text stays open: this runs before unread text deltas, and closing
+        # here would start a second message for the rest of the turn.
         self.pending.extend(
             self.emitter.tool_end(
                 str(call_id),
@@ -409,6 +410,26 @@ class _SpanningHooks(_RunHooksBase):
                 self.open_model_span, ended, abandoned=True, cancelled=cancelled
             )
             self.open_model_span = None
+
+
+def _take_finished_tools(hooks: _SpanningHooks) -> list[dict[str, Any]]:
+    """Return tool events recorded by the hook, text closed before each result.
+
+    The hook runs before unread deltas from the same model call. The caller
+    applies those deltas first. Tool results then follow ``TEXT_MESSAGE_END``
+    so the client does not attach them to the next message.
+    """
+    if not hooks.pending:
+        return []
+    earlier: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    for event in hooks.pending:
+        if event.get("type") == "TOOL_CALL_RESULT":
+            results.append(event)
+        else:
+            earlier.append(event)
+    hooks.pending.clear()
+    return [*earlier, *hooks.emitter.end_text(), *results]
 
 
 def _write_failed_run_usage(
@@ -673,19 +694,24 @@ async def _stream_gen(
         full_output = ""
 
         async for event in streamed.stream_events():
-            while hooks.pending:
-                yield hooks.pending.pop(0)
-            if event.type == "raw_response_event":
-                raw = getattr(event, "data", None)
-                if raw is not None:
-                    for rich in map_responses_event(
-                        raw, hooks.emitter, hooks.item_to_call
-                    ):
-                        if rich.get("type") == "TEXT_MESSAGE_CONTENT":
-                            full_output += rich.get("delta") or ""
-                        yield rich
-        while hooks.pending:
-            yield hooks.pending.pop(0)
+            raw = (
+                getattr(event, "data", None)
+                if event.type == "raw_response_event"
+                else None
+            )
+            # The next model call is queued only after this turn's tools have
+            # run. Unread deltas from this turn are still ahead of that event,
+            # so the tool result waits until they have been applied.
+            if getattr(raw, "type", None) == "response.created":
+                for rich in _take_finished_tools(hooks):
+                    yield rich
+            if raw is not None:
+                for rich in map_responses_event(raw, hooks.emitter, hooks.item_to_call):
+                    if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                        full_output += rich.get("delta") or ""
+                    yield rich
+        for rich in _take_finished_tools(hooks):
+            yield rich
         for rich in hooks.emitter.end_text():
             yield rich
         for rich in hooks.emitter.fail_open():
@@ -723,8 +749,8 @@ async def _stream_gen(
         hooks.close_open_spans(exc)
         _write_failed_run_usage(span, config, exc, run_usage)
         fail_span(span, exc, ended)
-        while hooks.pending:
-            yield hooks.pending.pop(0)
+        for rich in _take_finished_tools(hooks):
+            yield rich
         for rich in hooks.emitter.end_text():
             yield rich
         for rich in hooks.emitter.fail_open():

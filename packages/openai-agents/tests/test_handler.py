@@ -117,6 +117,10 @@ class FakeStreamedResult:
             await self.hooks.on_llm_start(
                 MagicMock(), self.agent, self.agent.instructions, self.prompt
             )
+            yield SimpleNamespace(
+                type="raw_response_event",
+                data=SimpleNamespace(type="response.created"),
+            )
             for delta in turn.get("deltas", []):
                 yield SimpleNamespace(
                     type="raw_response_event",
@@ -134,6 +138,13 @@ class FakeStreamedResult:
                 await self.hooks.on_tool_start(ctx, self.agent, tool_obj)
                 await self.hooks.on_tool_end(
                     ctx, self.agent, tool_obj, call.get("result", "ok")
+                )
+            for delta in turn.get("late_deltas", []):
+                yield SimpleNamespace(
+                    type="raw_response_event",
+                    data=SimpleNamespace(
+                        type="response.output_text.delta", delta=delta
+                    ),
                 )
             if turn.get("error") is not None:
                 raise turn["error"]
@@ -1376,6 +1387,39 @@ class TestStreaming:
             event for event in shown if event["type"] == "TOOL_CALL_RESULT"
         )
         assert shown_result["content"] == "secret"
+        types = [event["type"] for event in shown]
+        assert types.index("TEXT_MESSAGE_CONTENT") < types.index("TEXT_MESSAGE_END")
+        assert types.index("TEXT_MESSAGE_END") < types.index("TOOL_CALL_RESULT")
+
+    async def test_unread_text_stays_on_the_message_the_tool_result_closes(
+        self,
+    ) -> None:
+        turns = [
+            {
+                "deltas": ["Hel"],
+                "tool_calls": [
+                    {"name": "search", "id": "c1", "args": {}, "result": "found"}
+                ],
+                "late_deltas": ["lo"],
+                "output": [],
+            }
+        ]
+        agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "done"))
+        with _patched_agents(agents_mod):
+            events = [
+                event
+                async for event in await create_openai_agent_handler(
+                    capture_content=True
+                ).stream(CONFIG, "q", {}, {})
+            ]
+        contents = [
+            event for event in events if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert [event["delta"] for event in contents] == ["Hel", "lo"]
+        assert contents[0]["messageId"] == contents[1]["messageId"]
+        types = [event["type"] for event in events]
+        assert types.index("TEXT_MESSAGE_END") < types.index("TOOL_CALL_RESULT")
+        assert types.index("TOOL_CALL_START") < types.index("TEXT_MESSAGE_END")
 
     async def test_a_streaming_prefix_is_not_closed_by_the_tool_hook(self) -> None:
         from launchdarkly_ai_openai_agents.handler import _SpanningHooks
@@ -1423,12 +1467,15 @@ class TestStreaming:
         assert any(event["type"] == "TOOL_CALL_RESULT" for event in hooks.pending)
         assert hooks.emitter.tool_args("c1", "more") == []
 
-    async def test_a_tool_result_closes_the_open_text_first(self) -> None:
-        from launchdarkly_ai_openai_agents.handler import _SpanningHooks
+    async def test_a_tool_hook_leaves_text_open_until_the_deltas_are_read(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import (
+            _SpanningHooks,
+            _take_finished_tools,
+        )
         from launchdarkly_ai_server import create_run_usage
 
         hooks = _SpanningHooks(CONFIG, None, True, create_run_usage())
-        hooks.emitter.text("Looking")
+        opened = hooks.emitter.text("Hel")
         ctx = SimpleNamespace(
             tool_name="search",
             tool_call_id="c1",
@@ -1440,7 +1487,13 @@ class TestStreaming:
         await hooks.on_tool_end(
             ctx, SimpleNamespace(), SimpleNamespace(name="search"), "found"
         )
-        types = [event["type"] for event in hooks.pending]
+        assert not any(event["type"] == "TEXT_MESSAGE_END" for event in hooks.pending)
+        more = hooks.emitter.text("lo")
+        assert more[0]["type"] == "TEXT_MESSAGE_CONTENT"
+        assert more[0]["messageId"] == opened[0]["messageId"]
+        released = _take_finished_tools(hooks)
+        types = [event["type"] for event in released]
+        assert types.index("TOOL_CALL_START") < types.index("TEXT_MESSAGE_END")
         assert types.index("TEXT_MESSAGE_END") < types.index("TOOL_CALL_RESULT")
 
     def test_a_new_response_closes_text_in_read_order(self) -> None:
