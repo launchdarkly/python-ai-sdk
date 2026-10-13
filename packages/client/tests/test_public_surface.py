@@ -103,8 +103,6 @@ ROOT_SURFACE = frozenset(
         "set_input_content_attributes",
         "set_ld_span_attributes",
         "set_model_identity_attributes",
-        "set_openllmetry_completion",
-        "set_openllmetry_prompt",
         "set_output_content_attributes",
         "set_tool_call_content_attributes",
         "set_tool_definition_attributes",
