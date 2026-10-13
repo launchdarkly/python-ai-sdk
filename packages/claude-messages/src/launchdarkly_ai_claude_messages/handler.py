@@ -640,6 +640,8 @@ async def _stream_gen(
             except Exception as exc:
                 fail_span(model_span, exc, ended)
                 open_model_span = None
+                for rich in emitter.fail_open():
+                    yield rich
                 raise
 
             if final_msg.stop_reason != "tool_use":
@@ -698,6 +700,8 @@ async def _stream_gen(
                     open_tool_span = None
                     for rich in emitter.tool_result(str(block.id), failed=True):
                         yield rich
+                    for rich in emitter.fail_open():
+                        yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
@@ -711,6 +715,8 @@ async def _stream_gen(
                         "content": str(result),
                     }
                 )
+            for rich in emitter.fail_open():
+                yield rich
             conversation.append({"role": "user", "content": tool_results})
 
         set_output_content_attributes(

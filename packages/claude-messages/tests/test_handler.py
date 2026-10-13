@@ -1394,6 +1394,78 @@ class TestStreaming:
             for event in events
         )
 
+    async def test_a_failed_tool_closes_its_siblings(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, final = _make_stream_context([])
+        final.stop_reason = "tool_use"
+        final.content = [
+            _tool_use_block("boom", "c1"),
+            _tool_use_block("later", "c2"),
+        ]
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+
+        def boom(_args: dict[str, Any]) -> str:
+            raise RuntimeError("nope")
+
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="nope"),
+        ):
+            handler = create_claude_messages_handler()
+            async for event in await handler.stream(
+                CONFIG, "q", {"boom": boom, "later": lambda _args: "ok"}
+            ):
+                seen.append(event)
+        results = {
+            event["toolCallId"] for event in seen if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results == {"c1", "c2"}
+
+    async def test_a_stream_error_closes_an_opened_tool(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        started = MagicMock()
+        started.type = "content_block_start"
+        started.index = 0
+        started.content_block = MagicMock(type="tool_use", id="c1", name="search")
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield started
+                raise RuntimeError("stream broke")
+
+            async def get_final_message(self) -> Any:
+                raise AssertionError("final message is not read")
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_anthropic.messages.stream = MagicMock(return_value=_mgr())
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="stream broke"),
+        ):
+            handler = create_claude_messages_handler()
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in seen
+        )
+
     async def test_all_chunks_before_done(self, mock_anthropic: MagicMock) -> None:
         import launchdarkly_ai_claude_messages.spans as spans_mod
         from launchdarkly_ai_claude_messages import create_claude_messages_handler
