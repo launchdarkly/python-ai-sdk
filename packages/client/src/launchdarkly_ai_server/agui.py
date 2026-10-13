@@ -135,6 +135,10 @@ class TurnEmitter:
         self._open = None
         return [event]
 
+    def has_started(self, tool_call_id: str) -> bool:
+        """True once this call has emitted ``TOOL_CALL_START``."""
+        return tool_call_id in self._started
+
     def tool_start(
         self, tool_call_id: str, tool_call_name: str
     ) -> list[dict[str, Any]]:

@@ -187,11 +187,14 @@ class _Reducer:
 
     def close(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
-        # End the open assistant message before any tool whose role never
-        # arrived. tool_start copies the open text message into parentMessageId.
+        # End the open assistant message before leftover tools. tool_start
+        # copies that message into parentMessageId. Then apply every held
+        # assistant call, including one that completed after the text closed,
+        # before fail_open marks a started call as a failure.
         events.extend(self._end_open_text())
         for message_id, parts in list(self._held_tools.items()):
-            if self._roles.get(message_id) is None:
+            role = self._roles.get(message_id)
+            if role is None or role == "assistant":
                 for part in parts:
                     events.extend(self._emit_tool(part))
         self._held_tools.clear()
@@ -267,10 +270,16 @@ class _Reducer:
             return []
         if role != "assistant":
             return []
+        raw_id = part.get("callID") or part.get("id") or ""
+        call_id = raw_id if isinstance(raw_id, str) else ""
+        if call_id and self._emitter.has_started(call_id):
+            return self._emit_tool(part)
         if self._text_open and self._text_message_id == message_id:
             return self._emit_tool(part)
-        self._held_tools.setdefault(message_id, []).append(part)
-        return []
+        if self._text_message_id == message_id and not self._text_open:
+            self._held_tools.setdefault(message_id, []).append(part)
+            return []
+        return self._emit_tool(part)
 
     def _emit_tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
         state = part.get("state")

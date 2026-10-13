@@ -225,6 +225,21 @@ class TestText:
         assert events[-1]["output"] == ""
         assert "disk on fire" not in str(events)
 
+    async def test_a_tool_that_finishes_after_the_text_is_not_a_failure(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                assistant_completed("m1"),
+                tool_part("c1", "completed", output="file.txt"),
+            ]
+        )
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == "file.txt"
+        assert "metadata" not in result
+        assert events[-1]["output"] == "Hi"
+
     async def test_a_tool_waits_until_assistant_text_is_open(self) -> None:
         events = await collect(
             [
