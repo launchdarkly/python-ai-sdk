@@ -27,6 +27,12 @@ from launchdarkly_ai_openai_agents.handler import (
     openai_agents,
 )
 from launchdarkly_ai_openai_agents.utils import build_output_type
+from tests.forwarding_spec import (
+    OPENAI_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # Fake `agents` SDK
@@ -153,10 +159,16 @@ def _make_run_streamed(turns: list[dict[str, Any]], final_output: str = "done") 
     return run_streamed
 
 
+class FakeModelSettings:
+    def __init__(self, **kw: Any) -> None:
+        self.kwargs = kw
+
+
 def _fake_agents_module(run: Any = None, run_streamed: Any = None) -> Any:
     mod = SimpleNamespace()
     mod.FunctionTool = FakeFunctionTool
     mod.Agent = FakeAgent
+    mod.ModelSettings = FakeModelSettings
 
     class Runner:
         pass
@@ -1422,6 +1434,148 @@ class TestStreaming:
 # ---------------------------------------------------------------------------
 
 
+class TestModelParametersForwarding:
+    async def test_snake_case_param_reaches_model_settings(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"top_p": 0.5}},
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs["top_p"] == 0.5
+
+    async def test_max_turns_from_config_reaches_runner_run(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["max_turns"] = kw.get("max_turns")
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"max_turns": 3}},
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        assert captured["max_turns"] == 3
+
+    async def test_max_turns_from_config_reaches_runner_run_streamed(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def run_streamed(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["max_turns"] = kw.get("max_turns")
+            return FakeStreamedResult(
+                agent, prompt, hooks, [{"output": _text_output("hi")}], "done"
+            )
+
+        agents_mod = _fake_agents_module(run_streamed=run_streamed)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"max_turns": 4}},
+        )
+        with _patched_agents(agents_mod):
+            events = []
+            gen = await create_openai_agent_handler().stream(config, "q", {}, {})
+            async for event in gen:
+                events.append(event)
+        assert captured["max_turns"] == 4
+
+    async def test_max_turns_not_owned_by_model_settings(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": {"max_turns": 3}},
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs.get("model_settings")
+        assert model_settings is None or "max_turns" not in model_settings.kwargs
+
+    async def test_call_unchanged_when_no_parameters_set(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            run_kwargs["kw"] = kw
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+        assert "model_settings" not in run_kwargs["agent"].kwargs
+        assert run_kwargs["kw"].get("max_turns") is None
+
+    async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(self) -> None:
+        """Neither is a field of ``agents.ModelSettings``; forwarding one unfiltered raises
+        ``TypeError`` before this filter existed."""
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {
+                    "top_p": 0.5,
+                    "stop_sequences": ["STOP"],
+                    "seed": 42,
+                },
+            },
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs["top_p"] == 0.5
+        assert "stop_sequences" not in model_settings.kwargs
+        assert "seed" not in model_settings.kwargs
+
+    async def test_transport_key_is_never_forwarded(self) -> None:
+        run_kwargs: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            run_kwargs["agent"] = agent
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {"top_p": 0.5, "extra_body": {"secret": "value"}},
+            },
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = run_kwargs["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs["top_p"] == 0.5
+        assert "extra_body" not in model_settings.kwargs
+
+
 class TestOutputFormat:
     def test_absent_output_format_no_change(self) -> None:
         assert build_output_type(None) is None
@@ -2106,3 +2260,227 @@ class TestCancelledStreamSaysCancelled:
 
         assert rec.root.attributes.get("launchdarkly.run.cancelled") is True
         assert "launchdarkly.stream.abandoned" not in rec.root.attributes
+
+
+class TestNeverForwardedParameters:
+    """No credential, endpoint, request-injection, remote-tool, or host-process key in
+    ``model.parameters`` reaches ``ModelSettings`` or the ``Runner`` call."""
+
+    async def test_invoke_forwards_none_of_them(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        agents_mod = _fake_agents_module(run=run)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.1},
+            },
+        )
+        with _patched_agents(agents_mod):
+            await create_openai_agent_handler()(config, "q", {}, {})
+        model_settings = captured["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs == {"temperature": 0.1}
+        assert not find_leaks(captured["run_kwargs"])
+
+    async def test_stream_forwards_none_of_them(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def run_streamed(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            return FakeStreamedResult(
+                agent, prompt, hooks, [{"output": _text_output("hi")}], "done"
+            )
+
+        agents_mod = _fake_agents_module(run_streamed=run_streamed)
+        config = _make_config(
+            instructions="Be helpful.",
+            model={
+                "name": "gpt-4o",
+                "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.1},
+            },
+        )
+        with _patched_agents(agents_mod):
+            gen = await create_openai_agent_handler().stream(config, "q", {}, {})
+            async for _event in gen:
+                pass
+        model_settings = captured["agent"].kwargs["model_settings"]
+        assert model_settings.kwargs == {"temperature": 0.1}
+        assert not find_leaks(captured["run_kwargs"])
+
+
+def _settings_and_run(captured: dict[str, Any]) -> object:
+    """What one handler call handed the SDK from the config: the ``ModelSettings`` kwargs (or
+    none) and the ``Runner`` kwargs."""
+    settings = captured["agent"].kwargs.get("model_settings")
+    return (settings.kwargs if settings is not None else None, captured["run_kwargs"])
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change ``ModelSettings``
+    or the ``Runner`` call are exactly the cross-SDK OpenAI Agents list, on both paths."""
+
+    @staticmethod
+    def _candidates() -> frozenset[str]:
+        import dataclasses
+
+        from agents import ModelSettings
+
+        return candidate_keys(
+            (f.name for f in dataclasses.fields(ModelSettings)), OPENAI_AGENTS
+        )
+
+    @staticmethod
+    def _config(parameters: dict[str, Any]) -> dict[str, Any]:
+        return _make_config(
+            instructions="Be helpful.",
+            model={"name": "gpt-4o", "parameters": parameters},
+        )
+
+    async def test_invoke(self) -> None:
+        captured: dict[str, Any] = {}
+
+        async def run(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            await _drive_turns(hooks, agent, prompt, [{"output": _text_output("hi")}])
+            return FakeRunResult("done")
+
+        async def call(parameters: dict[str, Any]) -> object:
+            with _patched_agents(_fake_agents_module(run=run)):
+                await create_openai_agent_handler()(
+                    self._config(parameters), "q", {}, {}
+                )
+            return _settings_and_run(captured)
+
+        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_AGENTS
+
+    async def test_stream(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def run_streamed(agent: Any, prompt: str, hooks: Any = None, **kw: Any) -> Any:
+            captured["agent"] = agent
+            captured["run_kwargs"] = kw
+            return FakeStreamedResult(
+                agent, prompt, hooks, [{"output": _text_output("hi")}], "done"
+            )
+
+        async def call(parameters: dict[str, Any]) -> object:
+            with _patched_agents(_fake_agents_module(run_streamed=run_streamed)):
+                gen = await create_openai_agent_handler().stream(
+                    self._config(parameters), "q", {}, {}
+                )
+                async for _event in gen:
+                    pass
+            return _settings_and_run(captured)
+
+        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_AGENTS
+
+
+class TestTextVerbosity:
+    def _settings(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_openai_agents.handler import _model_settings_parameters
+
+        return _model_settings_parameters({"model": {"parameters": parameters}})
+
+    def test_text_verbosity_becomes_verbosity(self) -> None:
+        assert self._settings({"text": {"verbosity": "low", "format": {}}}) == {
+            "verbosity": "low"
+        }
+
+    def test_text_verbosity_wins_over_top_level_verbosity(self) -> None:
+        assert self._settings({"verbosity": "high", "text": {"verbosity": "low"}}) == {
+            "verbosity": "low"
+        }
+
+    def test_top_level_verbosity_applies_without_text_verbosity(self) -> None:
+        assert self._settings({"verbosity": "high", "text": {"format": {}}}) == {
+            "verbosity": "high"
+        }
+
+    def test_text_that_is_not_an_object_is_dropped(self) -> None:
+        assert self._settings({"text": "low", "temperature": 0.1}) == {
+            "temperature": 0.1
+        }
+
+    def test_reasoning_that_is_not_an_object_is_dropped(self) -> None:
+        assert self._settings({"reasoning": "high", "temperature": 0.1}) == {
+            "temperature": 0.1
+        }
+
+
+class TestReasoningIsRebuilt:
+    def _settings(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_openai_agents.handler import _model_settings_parameters
+
+        return _model_settings_parameters({"model": {"parameters": parameters}})
+
+    def test_becomes_the_sdk_type_with_only_effort_and_summary(self) -> None:
+        from openai.types.shared import Reasoning
+
+        settings = self._settings(
+            {"reasoning": {"effort": "low", "summary": "auto", "generate_summary": "x"}}
+        )
+        assert settings == {"reasoning": Reasoning(effort="low", summary="auto")}
+        assert settings["reasoning"].model_dump(exclude_none=True) == {
+            "effort": "low",
+            "summary": "auto",
+        }
+
+    def test_reasoning_with_neither_sub_key_is_dropped(self) -> None:
+        assert self._settings({"reasoning": {"other": 1}, "temperature": 0.1}) == {
+            "temperature": 0.1
+        }
+
+    async def test_chat_completions_model_reads_it_without_raising(self) -> None:
+        """The Chat Completions model reads ``reasoning.effort`` as an attribute and sends it as
+        ``reasoning_effort``. Runs the real model against a mocked OpenAI client."""
+        from agents import ModelSettings, ModelTracing
+        from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+        from openai.types.chat import ChatCompletion
+
+        completion = ChatCompletion.model_validate(
+            {
+                "id": "c1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hi"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(return_value=completion)
+        client.base_url = "https://api.openai.com/v1/"
+        model = OpenAIChatCompletionsModel("gpt-4o", client)
+
+        settings = ModelSettings(**self._settings({"reasoning": {"effort": "low"}}))
+        await model.get_response(
+            system_instructions=None,
+            input="q",
+            model_settings=settings,
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+        )
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "low"

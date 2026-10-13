@@ -25,6 +25,8 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -44,12 +46,103 @@ from .spans import (
     to_tool_definitions,
 )
 
-try:
-    import anthropic as _anthropic_mod  # noqa: F401
+#: Every key ``AsyncMessages.create``/``.stream`` accept, classified by hand into exactly one of:
+#: forwarded (below), handler-owned (``model``, ``messages``, ``system``, ``tools``, set by each
+#: call site itself), or excluded (below). ``TestMessagesCreateAcceptsExactlyTheseKeys`` /
+#: ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
+#: classification stays exhaustive as the SDK's own signatures change.
+#:
+#: This is the cross-SDK list for Claude Messages (TESTING.md section 1.12). A top-level
+#: ``effort`` is also accepted and moved into ``output_config.effort`` before this list applies
+#: (see :func:`_rename_effort_to_output_config`), and ``max_tokens`` defaults to 1024. The same list
+#: serves ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves
+#: the same whichever is called.
+_MESSAGES_FORWARDED_KEYS = frozenset(
+    {
+        "cache_control",
+        "max_tokens",
+        "output_config",
+        "service_tier",
+        "stop_sequences",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "top_k",
+        "top_p",
+    }
+)
 
-    _HAS_ANTHROPIC = True
-except ImportError:
-    _HAS_ANTHROPIC = False
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to the API.
+_MESSAGES_MAPPING_KEYS = frozenset(
+    {"cache_control", "output_config", "thinking", "tool_choice"}
+)
+
+#: Accepted by the API but never forwarded, and why:
+#: * ``stream``: runtime wiring. The handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``output_format``: API-shape switch. Only ``.stream`` accepts it, so forwarding it would make
+#:   ``invoke`` and ``stream`` behave differently. ``output_config`` (forwarded) carries the same
+#:   output format on both.
+#: * ``inference_geo``: data location. The region inference runs in decides where data is
+#:   processed.
+#: * ``container``: server-side state. It selects container state carried over from another
+#:   request, not a model setting.
+#: * ``metadata``, ``user_profile_id``: identity and attribution. They say who the request is for,
+#:   or attribute it to a party other than the caller.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_MESSAGES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",
+        "output_format",
+        "inference_geo",
+        "container",
+        "metadata",
+        "user_profile_id",
+        "timeout",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+    }
+)
+
+
+def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
+    """Moves a top-level ``effort`` into ``output_config.effort``, the shape the Anthropic Messages
+    API actually accepts (there is no top-level ``effort`` parameter).
+
+    An ``output_config`` the config itself already set wins: if it carries its own ``effort``, the
+    top-level one is dropped rather than overwriting it. This handler does not itself set
+    ``output_config`` (structured output goes through a system-prompt instruction instead, see
+    ``_build_messages``), so there is nothing here to merge with yet; a future call site that starts
+    setting ``output_config`` must merge so its own keys win and a config's ``effort`` survives.
+    """
+    effort = params.pop("effort", None)
+    if effort is None:
+        return params
+    existing = params.get("output_config")
+    if isinstance(existing, dict) and "effort" in existing:
+        return params
+    params["output_config"] = {
+        **(existing if isinstance(existing, dict) else {}),
+        "effort": effort,
+    }
+    return params
+
+
+def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that reach ``messages.create``/``.stream``: ``effort``
+    moved into ``output_config``, then only :data:`_MESSAGES_FORWARDED_KEYS`, with malformed
+    object values dropped. ``invoke`` and ``stream`` both call this, so they forward the same keys.
+    """
+    return select_forwarded_parameters(
+        _rename_effort_to_output_config(model_parameters(config)),
+        _MESSAGES_FORWARDED_KEYS,
+        mapping_keys=_MESSAGES_MAPPING_KEYS,
+    )
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -203,9 +296,8 @@ async def _run_tool_loop(
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
-    )
+    extra_params = _forwarded_parameters(config)
+    max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
     output = ""
     steps = 0
@@ -224,6 +316,7 @@ async def _run_tool_loop(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,
@@ -506,9 +599,8 @@ async def _stream_gen(
 
     tools = _build_tools(config.get("tools") or {})
     tool_definitions = to_tool_definitions(tools)
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
-    )
+    extra_params = _forwarded_parameters(config)
+    max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
     full_output = ""
     steps = 0
@@ -540,6 +632,7 @@ async def _stream_gen(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,

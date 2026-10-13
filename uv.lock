@@ -844,7 +844,7 @@ wheels = [
 
 [[package]]
 name = "launchdarkly-ai-claude-agents"
-version = "0.2.3"
+version = "0.2.4"
 source = { editable = "packages/claude-agents" }
 dependencies = [
     { name = "anthropic" },
@@ -880,7 +880,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-langchain-agents"
-version = "0.2.3"
+version = "0.2.4"
 source = { editable = "packages/langchain-agents" }
 dependencies = [
     { name = "langchain-core" },
@@ -916,7 +916,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-openai-agents"
-version = "0.2.3"
+version = "0.2.4"
 source = { editable = "packages/openai-agents" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -952,7 +952,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-python"
-version = "0.1.7"
+version = "0.1.8"
 source = { editable = "packages/ai" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -972,7 +972,7 @@ provides-extras = ["otel"]
 
 [[package]]
 name = "launchdarkly-ai-server"
-version = "0.2.3"
+version = "0.2.4"
 source = { editable = "packages/client" }
 dependencies = [
     { name = "opentelemetry-api" },

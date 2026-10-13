@@ -12,7 +12,19 @@ from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+
+from tests.forwarding_spec import (
+    OPENAI_MESSAGES,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import (
+    NEVER_FORWARDED_BAG,
+    NEVER_FORWARDED_KEYS,
+    find_leaks,
+)
 
 CONFIG = {
     "model": {"name": "gpt-4o"},
@@ -1132,6 +1144,335 @@ class TestErrorHandling:
 # ---------------------------------------------------------------------------
 
 
+class TestModelParametersForwarding:
+    async def test_snake_case_param_reaches_provider(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.5}},
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["top_p"] == 0.5
+
+    async def test_config_cannot_override_model_or_input(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "model": "not-the-real-model",
+                    "input": "not-the-real-input",
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["model"] == CONFIG["model"]["name"]
+        assert kwargs["input"] != "not-the-real-input"
+
+    async def test_call_unchanged_when_no_parameters_set(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+        await h(CONFIG, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert set(kwargs.keys()) == {"model", "input"}
+
+    async def test_streaming_forwards_snake_case_param(
+        self, mock_openai: MagicMock
+    ) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["hi"])
+        )
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"top_p": 0.3}},
+        }
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+            events = [e async for e in await h.stream(config, "q")]
+        assert events
+        stream_kwargs = mock_openai.responses.stream.call_args.kwargs
+        assert stream_kwargs["top_p"] == 0.3
+
+    async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(
+        self, mock_openai: MagicMock
+    ) -> None:
+        """None of these are ``responses.create`` parameters (they are Chat-Completions-era
+        keys); forwarding one unfiltered raises ``TypeError`` before this filter existed."""
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "max_tokens": 100,
+                    "frequency_penalty": 0.1,
+                    "presence_penalty": 0.1,
+                    "seed": 42,
+                    "n": 1,
+                    "stop": ["END"],
+                    "response_format": {"type": "text"},
+                    "logit_bias": {"50256": -100},
+                    "logprobs": True,
+                    "max_completion_tokens": 50,
+                    "audio": {"voice": "alloy"},
+                    "modalities": ["text"],
+                    "prediction": {"type": "content", "content": "x"},
+                    "top_p": 0.5,
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["top_p"] == 0.5
+        for rejected in (
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+            "n",
+            "stop",
+            "response_format",
+            "logit_bias",
+            "logprobs",
+            "audio",
+            "modalities",
+            "prediction",
+        ):
+            assert rejected not in kwargs
+
+    async def test_transport_key_is_never_forwarded(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"top_p": 0.5, "extra_body": {"secret": "value"}},
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["top_p"] == 0.5
+        assert "extra_body" not in kwargs
+
+    async def test_stream_key_is_never_forwarded(self, mock_openai: MagicMock) -> None:
+        """The handler picks blocking vs. streaming by which client method it calls; a config
+        setting ``stream`` must not reach ``responses.create``, and other handler-controlled
+        transport keys (``background``, ``conversation``, ``prompt``, ``stream_options``) are
+        likewise dropped."""
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "background": True,
+                    "conversation": "conv_123",
+                    "prompt": {"id": "pmpt_123"},
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        for excluded in (
+            "stream",
+            "stream_options",
+            "background",
+            "conversation",
+            "prompt",
+        ):
+            assert excluded not in kwargs
+
+    async def test_retention_identity_and_prompt_keys_are_dropped(
+        self, mock_openai: MagicMock
+    ) -> None:
+        """Data retention, identity, prompt content and safety keys the API accepts are dropped;
+        ``prompt_cache_key`` and ``service_tier`` next to them still forward."""
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        dropped = {
+            "store": False,
+            "prompt_cache_retention": "24h",
+            "user": "user-1",
+            "safety_identifier": "safe-1",
+            "metadata": {"k": "v"},
+            "instructions": "be terse",
+            "moderation": "auto",
+        }
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    **dropped,
+                    "prompt_cache_key": "cache-1",
+                    "service_tier": "auto",
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert not set(dropped) & set(kwargs)
+        assert kwargs["prompt_cache_key"] == "cache-1"
+        assert kwargs["service_tier"] == "auto"
+
+
+class TestMaxOutputTokensRename:
+    async def test_max_tokens_renamed_to_max_output_tokens(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_tokens": 111}},
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 111
+        assert "max_tokens" not in kwargs
+
+    async def test_max_completion_tokens_renamed_to_max_output_tokens(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"max_completion_tokens": 222},
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 222
+        assert "max_completion_tokens" not in kwargs
+
+    async def test_explicit_max_output_tokens_wins_over_both(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "max_output_tokens": 333,
+                    "max_completion_tokens": 222,
+                    "max_tokens": 111,
+                },
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 333
+
+    async def test_max_completion_tokens_wins_over_max_tokens_when_both_set(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"max_completion_tokens": 222, "max_tokens": 111},
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert kwargs["max_output_tokens"] == 222
+
+
+class TestModelParametersReachTheWire:
+    """Intercepts the real outgoing HTTP request with an httpx MockTransport, rather than
+    asserting only on a mock of our own call, so this proves the renamed key actually leaves the
+    process on the wire the real ``openai`` client builds.
+    """
+
+    async def test_max_output_tokens_reaches_the_wire_for_a_config_max_tokens(
+        self,
+    ) -> None:
+        import openai
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        captured: dict[str, Any] = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_1",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "hi"}],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 2,
+                        "total_tokens": 5,
+                    },
+                },
+            )
+
+        transport = httpx.MockTransport(_handler)
+        real_client = openai.AsyncOpenAI(
+            api_key="test-key", http_client=httpx.AsyncClient(transport=transport)
+        )
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_tokens": 256}},
+        }
+        with patch("openai.AsyncOpenAI", return_value=real_client):
+            h = create_openai_messages_handler()
+        await h(config, "q", {}, {})
+
+        assert captured["body"]["max_output_tokens"] == 256
+        assert "max_tokens" not in captured["body"]
+
+
 class TestOutputFormat:
     async def test_absent_output_format_no_change(self, mock_openai: MagicMock) -> None:
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
@@ -2180,3 +2521,156 @@ class TestEmptyOutputItemsDoNotHideTheAnswer:
         chat = rec.named("chat ")[0]
         assert chat.attributes["gen_ai.completion.0.content"] == "the real answer"
         assert "gen_ai.completion.1.content" not in chat.attributes
+
+
+class TestNeverForwardedParameters:
+    """No credential, endpoint, request-injection, remote-tool, or host-process key in
+    ``model.parameters`` reaches ``responses.create`` or ``responses.stream``."""
+
+    async def test_invoke_forwards_none_of_them(self, mock_openai: MagicMock) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": dict(NEVER_FORWARDED_BAG)},
+        }
+        await create_openai_messages_handler()(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert not find_leaks(kwargs)
+        assert not set(kwargs) & NEVER_FORWARDED_KEYS
+
+    async def test_stream_forwards_none_of_them(self, mock_openai: MagicMock) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["hi"])
+        )
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": dict(NEVER_FORWARDED_BAG)},
+        }
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+            [e async for e in await h.stream(config, "q")]
+        kwargs = mock_openai.responses.stream.call_args.kwargs
+        assert not find_leaks(kwargs)
+        assert not set(kwargs) & NEVER_FORWARDED_KEYS
+
+
+class TestInvokeAndStreamForwardTheSameKeys:
+    """``response_id``, ``starting_after`` and ``text_format`` are accepted by
+    ``responses.stream`` only. Forwarding them there and not on ``create`` made one config behave
+    differently by call. They resume an existing response or name a Python type to parse into,
+    neither of which is a setting, so both paths drop them."""
+
+    _PARAMS: ClassVar[dict[str, Any]] = {
+        "response_id": "resp-other",
+        "starting_after": 3,
+        "text_format": "not-a-type",
+        "top_p": 0.4,
+    }
+
+    async def test_invoke(self, mock_openai: MagicMock) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+        await create_openai_messages_handler()(config, "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert not {"response_id", "starting_after", "text_format"} & set(kwargs)
+        assert kwargs["top_p"] == 0.4
+
+    async def test_stream(self, mock_openai: MagicMock) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["hi"])
+        )
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+            [e async for e in await h.stream(config, "q")]
+        kwargs = mock_openai.responses.stream.call_args.kwargs
+        assert not {"response_id", "starting_after", "text_format"} & set(kwargs)
+        assert kwargs["top_p"] == 0.4
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change the provider call
+    are exactly the cross-SDK OpenAI Messages list, on both paths."""
+
+    @staticmethod
+    def _candidates() -> frozenset[str]:
+        import inspect
+
+        from openai.resources.responses import AsyncResponses
+
+        accepted = {
+            name
+            for fn in (AsyncResponses.create, AsyncResponses.stream)
+            for name in inspect.signature(fn).parameters
+            if name != "self"
+        }
+        return candidate_keys(accepted, OPENAI_MESSAGES)
+
+    def _config(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        return {**CONFIG, "model": {**CONFIG["model"], "parameters": parameters}}
+
+    async def test_invoke(self, mock_openai: MagicMock) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            await h(self._config(parameters), "q", {}, {})
+            return mock_openai.responses.create.call_args.kwargs
+
+        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_MESSAGES
+
+    async def test_stream(self, mock_openai: MagicMock) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            side_effect=lambda **_kw: _make_openai_stream_context(["hi"])
+        )
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            [e async for e in await h.stream(self._config(parameters), "q")]
+            return mock_openai.responses.stream.call_args.kwargs
+
+        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_MESSAGES
+
+
+class TestMalformedObjectValuesAreDropped:
+    """``reasoning`` set to anything but an object is dropped on both paths."""
+
+    _PARAMS: ClassVar[dict[str, Any]] = {"reasoning": "high", "top_p": 0.4}
+
+    def _config(self) -> dict[str, Any]:
+        return {**CONFIG, "model": {**CONFIG["model"], "parameters": self._PARAMS}}
+
+    async def test_invoke(self, mock_openai: MagicMock) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        await create_openai_messages_handler()(self._config(), "q", {}, {})
+        kwargs = mock_openai.responses.create.call_args.kwargs
+        assert "reasoning" not in kwargs
+        assert kwargs["top_p"] == 0.4
+
+    async def test_stream(self, mock_openai: MagicMock) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["hi"])
+        )
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_openai_messages_handler()
+            [e async for e in await h.stream(self._config(), "q")]
+        kwargs = mock_openai.responses.stream.call_args.kwargs
+        assert "reasoning" not in kwargs
+        assert kwargs["top_p"] == 0.4

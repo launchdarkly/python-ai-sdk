@@ -27,6 +27,8 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -47,6 +49,129 @@ from .spans import (
     to_tool_definitions,
     tool_arguments,
 )
+
+#: Every key ``AsyncResponses.create``/``.stream`` accept, classified by hand into exactly one of:
+#: forwarded (below), handler-owned (``model``, ``input``, ``previous_response_id``, ``tools``,
+#: ``text``, set by each call site itself), or excluded (below).
+#: ``TestResponsesCreateAcceptsExactlyTheseKeys`` / ``TestResponsesStreamAcceptsExactlyTheseKeys``
+#: in this package's tests assert this classification stays exhaustive as the SDK's own signatures
+#: change. The UI offers several keys the Responses API has never accepted: ``max_tokens``,
+#: ``frequency_penalty``, ``presence_penalty``, ``seed``, ``n``, ``stop``, ``response_format``,
+#: ``logit_bias``, ``logprobs``, ``max_completion_tokens``, ``audio``, ``modalities``,
+#: ``prediction``. Of those, ``max_tokens``/``max_completion_tokens`` are renamed to
+#: ``max_output_tokens`` (see :func:`_apply_max_output_tokens_rename`); the rest are dropped.
+#:
+#: The UI writes reasoning effort as ``reasoning: {"effort": ...}``, the Responses API's own shape,
+#: so ``reasoning`` is forwarded as-is and no top-level ``reasoning_effort`` is read.
+#:
+#: This is the cross-SDK list for OpenAI Messages (TESTING.md section 1.12). The same list serves
+#: ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves the
+#: same whichever is called.
+_RESPONSES_FORWARDED_KEYS = frozenset(
+    {
+        "max_output_tokens",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "reasoning",
+        "service_tier",
+        "temperature",
+        "tool_choice",
+        "top_logprobs",
+        "top_p",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to the API.
+_RESPONSES_MAPPING_KEYS = frozenset({"reasoning"})
+
+#: Accepted by the API but never forwarded, and why:
+#: * ``stream``, ``stream_options``: runtime wiring. The handler chooses blocking vs. streaming
+#:   itself, and ``stream_options`` only means something together with ``stream=True``.
+#: * ``background``: runtime wiring. It returns before the output exists, so the handler would get
+#:   no result.
+#: * ``include``: API-shape switch. It adds output items the handler does not read, such as
+#:   encrypted reasoning or search results.
+#: * ``conversation``, ``context_management``, ``truncation``: server-side state. They carry, trim
+#:   or compact conversation state the server keeps, which conflicts with the input the handler
+#:   builds.
+#: * ``response_id``, ``starting_after``: server-side state. Only ``.stream`` accepts them, to
+#:   resume an existing response rather than start a new one, and ``invoke`` has no equivalent.
+#: * ``store``, ``prompt_cache_retention``: data retention. They decide whether, and for how long,
+#:   the request and its cache stay on the server.
+#: * ``metadata``, ``user``, ``safety_identifier``: identity and attribution. They say who the
+#:   request is for.
+#: * ``prompt``, ``instructions``: prompt content beyond the config's instructions. The handler
+#:   builds the input from the config's own instructions and messages, and a server-side prompt
+#:   template or a second instructions string would replace or add to it.
+#: * ``moderation``: safety configuration.
+#: * ``max_tool_calls``: cut from the cross-SDK list, because the JS ``openai`` SDK's
+#:   ``responses.create`` has no such parameter and the spec cuts a key rather than work around it.
+#: * ``text_format``: API-shape switch. Only ``.stream`` accepts it, and it is a Python type to
+#:   parse into, which a config cannot express. Structured output goes through ``text``, which the
+#:   handler owns.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_RESPONSES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",
+        "stream_options",
+        "background",
+        "include",
+        "conversation",
+        "context_management",
+        "truncation",
+        "response_id",
+        "starting_after",
+        "store",
+        "prompt_cache_retention",
+        "metadata",
+        "user",
+        "safety_identifier",
+        "prompt",
+        "instructions",
+        "moderation",
+        "max_tool_calls",
+        "text_format",
+        "timeout",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+    }
+)
+
+
+def _apply_max_output_tokens_rename(params: dict[str, Any]) -> dict[str, Any]:
+    """Renames the Chat-Completions-era ``max_tokens``/``max_completion_tokens`` to the Responses
+    API's ``max_output_tokens``, the only one of the three the API actually accepts.
+
+    Precedence when more than one is set: an explicit ``max_output_tokens`` wins outright, then
+    ``max_completion_tokens``, then ``max_tokens``.
+    """
+    max_tokens = params.pop("max_tokens", None)
+    max_completion_tokens = params.pop("max_completion_tokens", None)
+    if "max_output_tokens" not in params:
+        if max_completion_tokens is not None:
+            params["max_output_tokens"] = max_completion_tokens
+        elif max_tokens is not None:
+            params["max_output_tokens"] = max_tokens
+    return params
+
+
+def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that reach ``responses.create``/``.stream``:
+    ``max_tokens``/``max_completion_tokens`` renamed to ``max_output_tokens``, then only
+    :data:`_RESPONSES_FORWARDED_KEYS`, with malformed object values dropped. ``invoke`` and
+    ``stream`` both call this, so they forward the same keys.
+    """
+    return select_forwarded_parameters(
+        _apply_max_output_tokens_rename(model_parameters(config)),
+        _RESPONSES_FORWARDED_KEYS,
+        mapping_keys=_RESPONSES_MAPPING_KEYS,
+    )
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -271,7 +396,9 @@ def _create_openai_messages_handler(
                 messages=root_messages,
             )
 
+            extra_params = _forwarded_parameters(config)
             params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": input_messages,
             }
@@ -351,6 +478,7 @@ def _create_openai_messages_handler(
                     client,
                     config,
                     {
+                        **extra_params,
                         "model": config["model"]["name"],
                         "previous_response_id": response.id,
                         "input": tool_outputs,
@@ -499,7 +627,9 @@ async def _stream_gen(
                     tool_definitions=tool_definitions,
                 )
 
+            extra_params = _forwarded_parameters(config)
             stream_params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": current_input,
             }

@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
 
 from launchdarkly_ai_langchain_agents.native_graph import (
     _build_node_tools,
@@ -19,6 +20,12 @@ from launchdarkly_ai_langchain_agents.native_graph import (
     to_lang_graph,
 )
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.forwarding_spec import (
+    LANGCHAIN_CHAT_OPENAI,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -172,6 +179,7 @@ def _make_langgraph_mocks(ai_msg: Any) -> dict[str, Any]:
 
     mock_lc_openai = MagicMock()
     mock_lc_openai.ChatOpenAI = MagicMock(return_value=mock_chat_model)
+    mock_lc_openai.ChatOpenAI.model_fields = _REAL_CHAT_OPENAI.model_fields
 
     mock_gm = MagicMock()
     mock_gm.add_messages = MagicMock(return_value=MagicMock())
@@ -1010,3 +1018,78 @@ class TestWorkflowStateAnnotationsResolve:
 
         assert isinstance(result, dict)
         assert "response" in result
+
+
+class TestNativeGraphNeverForwardedParameters:
+    @pytest.mark.asyncio
+    async def test_default_chat_openai_receives_no_never_forwarded_key(self) -> None:
+        ai_msg = _make_ai_msg("final")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {
+                            "name": "gpt-4o",
+                            "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.2},
+                        },
+                        "instructions": "help",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+
+        async def _visit(fn: Any, ctx: Any = None) -> None:
+            if graph_def.root is not None:
+                await fn(graph_def.root)
+
+        graph_def.traverse = _visit
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        assert mocks["langchain_openai"].ChatOpenAI.call_args.kwargs == {
+            "temperature": 0.2,
+            "model": "gpt-4o",
+        }
+
+
+class TestNativeGraphForwardsExactlyTheCrossSdkList:
+    """The native graph's default ``ChatOpenAI`` takes the same forwarded list as the handler's,
+    so a probe of one node finds exactly the cross-SDK ChatOpenAI list."""
+
+    @pytest.mark.asyncio
+    async def test_default_chat_openai(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+            graph_def = _make_graph_def(
+                nodes={
+                    "root": {
+                        "key": "root",
+                        "config": {
+                            "model": {"name": "gpt-4o", "parameters": parameters},
+                            "instructions": "help",
+                        },
+                        "meta": {"variationKey": "v1", "version": 1},
+                        "edges": [],
+                        "is_terminal": True,
+                    }
+                }
+            )
+
+            async def _visit(fn: Any, ctx: Any = None) -> None:
+                if graph_def.root is not None:
+                    await fn(graph_def.root)
+
+            graph_def.traverse = _visit
+            with _patch_imports(mocks):
+                await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+            return mocks["langchain_openai"].ChatOpenAI.call_args.kwargs
+
+        expected = LANGCHAIN_CHAT_OPENAI
+        candidates = candidate_keys(_REAL_CHAT_OPENAI.model_fields, expected)
+        assert await probe_forwarded_keys(candidates, call) == expected

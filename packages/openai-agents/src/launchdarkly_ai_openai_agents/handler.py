@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -45,6 +45,8 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -73,6 +75,110 @@ try:
     from agents.lifecycle import RunHooksBase as _RunHooksBase
 except ImportError:  # pragma: no cover - `agents` is a hard dependency of this package
     _RunHooksBase = object  # type: ignore[assignment,misc]
+
+#: Every field ``agents.ModelSettings`` declares, classified by hand into exactly one of: forwarded
+#: (below) or excluded. ``ModelSettings`` has no handler-owned fields: ``model`` and ``max_turns``
+#: live outside it (on ``Agent``/``Runner.run``; ``max_turns`` is read separately for the run).
+#: ``TestModelSettingsAcceptsExactlyTheseFields`` in this package's tests asserts this
+#: classification stays exhaustive as the SDK's own dataclass changes.
+#:
+#: This is the cross-SDK list for OpenAI Agents (TESTING.md section 1.12), less the two keys that
+#: are not ``ModelSettings`` fields: ``max_turns`` goes to the run, and ``text`` is read only for
+#: ``text.verbosity``, which becomes ``verbosity`` (see :func:`_apply_text_verbosity`).
+_MODEL_SETTINGS_FORWARDED_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "max_tokens",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning",
+        "temperature",
+        "tool_choice",
+        "top_p",
+        "verbosity",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ModelSettings``.
+_MODEL_SETTINGS_MAPPING_KEYS = frozenset({"reasoning"})
+
+#: Declared by ``ModelSettings`` but never forwarded, and why:
+#: * ``context_management``, ``truncation``: server-side state. They trim or compact conversation
+#:   state the server keeps.
+#: * ``store``, ``prompt_cache_retention``: data retention. They decide whether, and for how long,
+#:   the request and its cache stay on the server.
+#: * ``metadata``: identity and attribution.
+#: * ``include_usage``: runtime wiring. It changes how usage is reported back to the handler.
+#: * ``response_include``, ``top_logprobs``: API-shape switch. They add output the handler does not
+#:   read.
+#: * ``retry``: client/connection configuration, an HTTP retry count.
+#: * ``extra_headers``, ``extra_query``, ``extra_body``, ``extra_args``: raw HTTP/request overrides.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_MODEL_SETTINGS_EXCLUDED_KEYS = frozenset(
+    {
+        "context_management",
+        "truncation",
+        "store",
+        "prompt_cache_retention",
+        "metadata",
+        "include_usage",
+        "response_include",
+        "top_logprobs",
+        "retry",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+        "extra_args",
+    }
+)
+
+
+def _apply_text_verbosity(params: dict[str, Any]) -> dict[str, Any]:
+    """Moves ``text.verbosity`` to ``ModelSettings``'s top-level ``verbosity`` and drops the rest
+    of ``text``. An explicit ``text.verbosity`` wins over a top-level ``verbosity``, as in the JS
+    SDK, and a ``text`` that is not an object is malformed and dropped.
+    """
+    text = params.pop("text", None)
+    if isinstance(text, Mapping) and "verbosity" in text:
+        params["verbosity"] = text["verbosity"]
+    return params
+
+
+#: The ``reasoning`` sub-keys forwarded, the same two the JS SDK keeps.
+_REASONING_KEYS = ("effort", "summary")
+
+
+def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilds a forwarded ``reasoning`` object as the SDK's own ``Reasoning`` type, the type
+    ``ModelSettings`` declares, keeping only ``effort`` and ``summary`` as the JS SDK does. Any
+    other sub-key is dropped, and so is a ``reasoning`` with neither.
+    """
+    reasoning = params.pop("reasoning", None)
+    if not isinstance(reasoning, Mapping):
+        return params
+    kept = {k: reasoning[k] for k in _REASONING_KEYS if k in reasoning}
+    if kept:
+        from openai.types.shared import Reasoning
+
+        params["reasoning"] = Reasoning(**kept)
+    return params
+
+
+def _model_settings_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that become ``ModelSettings`` fields. The handler and the
+    native graph both call this, so they forward the same keys. ``max_turns`` is not among them:
+    it is a ``Runner.run`` option, read separately for the run.
+    """
+    return _rebuild_reasoning(
+        select_forwarded_parameters(
+            _apply_text_verbosity(model_parameters(config)),
+            _MODEL_SETTINGS_FORWARDED_KEYS,
+            mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
+        )
+    )
 
 
 def _build_agent_tools(
@@ -216,9 +322,17 @@ def _build_agent_and_prompt(
     # change, not a telemetry one, so it is left alone. `_call_impl` still returns the parsed
     # `final_output` object as-is when `outputFormat` is configured, matching the pre-existing
     # return-shape contract.
+    # `max_turns` is a `Runner.run` option, not a `ModelSettings` field, so the filter drops it here
+    # and the run call reads it separately.
+    model_settings_params = _model_settings_parameters(config)
     agent = Agent(
         name="assistant",
         model=config.get("model", {}).get("name", "gpt-4o"),
+        **(
+            {"model_settings": agents_mod.ModelSettings(**model_settings_params)}
+            if model_settings_params
+            else {}
+        ),
         **({"instructions": instructions} if instructions else {}),
         **({"tools": tools} if tools else {}),
     )
@@ -510,7 +624,9 @@ def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHa
                 system_instructions=instructions,
                 messages=to_request_span_messages(prompt),
             )
-            result = await Runner.run(agent, prompt, hooks=hooks)
+            max_turns = model_parameters(config).get("max_turns")
+            run_kwargs = {"max_turns": max_turns} if max_turns is not None else {}
+            result = await Runner.run(agent, prompt, hooks=hooks, **run_kwargs)
             final_output = result.final_output
             set_output_content_attributes(
                 span,
@@ -640,7 +756,9 @@ async def _stream_gen(
             system_instructions=instructions,
             messages=to_request_span_messages(prompt),
         )
-        streamed = Runner.run_streamed(agent, prompt, hooks=hooks)
+        max_turns = model_parameters(config).get("max_turns")
+        run_kwargs = {"max_turns": max_turns} if max_turns is not None else {}
+        streamed = Runner.run_streamed(agent, prompt, hooks=hooks, **run_kwargs)
         full_output = ""
 
         async for event in streamed.stream_events():
