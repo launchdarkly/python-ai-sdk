@@ -173,14 +173,24 @@ class TestText:
                 assistant_completed("m2"),
             ],
         )
-        assert types_of(events) == ["chunk", "chunk", "done"]
-        assert [event["text"] for event in events if event["type"] == "chunk"] == [
+        assert [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ] == [
             "Looking up",
             "Done.",
         ]
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "bash"
+        assert start["parentMessageId"]
+        args = next(event for event in events if event["type"] == "TOOL_CALL_ARGS")
+        assert args["delta"] == '{"command":"ls"}'
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == "file.txt"
         assert events[-1]["output"] == "Looking upDone."
-        assert "file.txt" not in str(events)
-        assert "toolCallId" not in str(events)
+        assert types_of(events).count("TOOL_CALL_START") == 1
 
     async def test_a_failed_tool_does_not_leak_into_the_stream(self) -> None:
         events = await collect(
@@ -193,7 +203,10 @@ class TestText:
                 )
             ],
         )
-        assert types_of(events) == ["done"]
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == "An error occurred."
+        assert result["metadata"] == {"launchdarkly": {"toolFailed": True}}
+        assert events[-1]["type"] == "done"
         assert events[-1]["output"] == ""
         assert "disk on fire" not in str(events)
 
@@ -237,8 +250,12 @@ class TestText:
                 assistant_completed("m1"),
             ],
         )
-        chunks = [event for event in events if event["type"] == "chunk"]
-        assert chunks == [{"type": "chunk", "text": "Hi"}]
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert deltas == ["Hi"]
         assert events[-1]["output"] == "Hi"
 
     async def test_a_snapshot_then_later_deltas_append(self) -> None:
@@ -262,8 +279,12 @@ class TestText:
                 assistant_completed("m1"),
             ],
         )
-        chunks = [event["text"] for event in events if event["type"] == "chunk"]
-        assert chunks == ["He", "llo"]
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert deltas == ["He", "llo"]
         assert events[-1]["output"] == "Hello"
 
     async def test_user_text_is_not_the_assistant_reply(self) -> None:

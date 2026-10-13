@@ -2,7 +2,8 @@
 
 The session is a caller-supplied async iterable of OpenCode bus events. This
 module does not start a process and does not construct an OpenCode SDK client.
-The public stream is assistant text as ``chunk``, then one ``done``.
+The handler yields the AG-UI text and tool subset, then one ``done``.
+``config().stream()`` still yields ``chunk`` then ``done``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from launchdarkly_ai_server import (
     _config,
     _create_handler,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.sdk_usage import report_usage
 from launchdarkly_ai_server.utils import number_or_zero
 
@@ -35,11 +38,16 @@ class _Reducer:
 
     Text is emitted only for messages ``message.updated`` has marked assistant.
     A part snapshot is that part's full text so far: a later delta still appends,
-    and a snapshot that repeats text already emitted adds nothing. Tool parts
-    are not forwarded.
+    and a snapshot that repeats text already emitted adds nothing. The first
+    ``running`` tool state with complete ``state.input`` opens the call. OpenCode
+    runs the tool. ``state.raw`` is not diffed into argument text.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, capture_content: bool) -> None:
+        self._emitter = TurnEmitter(capture_content=capture_content)
+        self._text_message_id: str | None = None
+        self._started_tools: set[str] = set()
+        self._resulted_tools: set[str] = set()
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
         self._held: dict[str, list[tuple[str, str, str]]] = {}
@@ -87,7 +95,9 @@ class _Reducer:
             return []
         if role != "assistant":
             return []
-        return self._apply_text(part_id, kind, text)
+        events = self._begin_message(message_id)
+        events.extend(self._apply_text(part_id, kind, text))
+        return events
 
     def _flush_held(self, message_id: str) -> list[dict[str, Any]]:
         held = self._held.pop(message_id, [])
@@ -116,6 +126,19 @@ class _Reducer:
             return []
         return self._chunk(suffix)
 
+    def _begin_message(self, message_id: str) -> list[dict[str, Any]]:
+        if self._text_message_id == message_id:
+            return []
+        events = self._emitter.end_text()
+        self._text_message_id = message_id
+        return events
+
+    def close(self) -> list[dict[str, Any]]:
+        events = self._emitter.fail_open()
+        events.extend(self._emitter.end_text())
+        self._text_message_id = None
+        return events
+
     def _event(self, raw: Mapping[str, Any] | object) -> list[dict[str, Any]]:
         if not isinstance(raw, Mapping):
             return []
@@ -127,7 +150,11 @@ class _Reducer:
             return self._delta(properties)
         if kind == "message.part.updated":
             part = properties.get("part")
-            if not isinstance(part, Mapping) or part.get("type") != "text":
+            if not isinstance(part, Mapping):
+                return []
+            if part.get("type") == "tool":
+                return self._tool(part)
+            if part.get("type") != "text":
                 return []
             return self._text_snapshot(part)
         if kind == "message.updated":
@@ -163,7 +190,38 @@ class _Reducer:
 
     def _chunk(self, text: str) -> list[dict[str, Any]]:
         self._deltas.append(text)
-        return [{"type": "chunk", "text": text}]
+        return self._emitter.text(text)
+
+    def _tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
+        state = part.get("state")
+        if not isinstance(state, Mapping):
+            return []
+        status = state.get("status")
+        raw_id = part.get("callID") or part.get("id") or ""
+        call_id = raw_id if isinstance(raw_id, str) else ""
+        name = part.get("tool") if isinstance(part.get("tool"), str) else ""
+        if not call_id or status == "pending":
+            return []
+        if status == "running":
+            if "input" not in state or call_id in self._started_tools or not name:
+                return []
+            self._started_tools.add(call_id)
+            events = self._emitter.tool_start(call_id, name)
+            events.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
+            return events
+        if status not in ("completed", "error") or call_id in self._resulted_tools:
+            return []
+        opened: list[dict[str, Any]] = []
+        if call_id not in self._started_tools and name:
+            self._started_tools.add(call_id)
+            opened.extend(self._emitter.tool_start(call_id, name))
+            opened.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
+        self._resulted_tools.add(call_id)
+        if status == "error":
+            opened.extend(self._emitter.tool_result(call_id, failed=True))
+        else:
+            opened.extend(self._emitter.tool_result(call_id, state.get("output")))
+        return opened
 
     def _message(self, info: Mapping[str, Any]) -> list[dict[str, Any]]:
         message_id = info.get("id")
@@ -172,6 +230,7 @@ class _Reducer:
         if isinstance(message_id, str) and isinstance(role, str):
             self._roles[message_id] = role
             if role == "assistant":
+                events.extend(self._begin_message(message_id))
                 events.extend(self._flush_held(message_id))
             else:
                 self._held.pop(message_id, None)
@@ -180,6 +239,14 @@ class _Reducer:
         completed = info.get("time")
         if not isinstance(completed, Mapping) or "completed" not in completed:
             return events
+        completed_time = info.get("time")
+        if (
+            isinstance(completed_time, Mapping)
+            and "completed" in completed_time
+            and message_id == self._text_message_id
+        ):
+            events.extend(self._emitter.end_text())
+            self._text_message_id = None
         if message_id not in self._usage_ids:
             tokens = info.get("tokens")
             if isinstance(tokens, Mapping):
@@ -221,7 +288,8 @@ def create_opencode_handler(
     return a fresh async iterable of OpenCode session events. This function does
     not start OpenCode and does not construct an OpenCode SDK client.
 
-    The stream yields assistant text as ``chunk`` and one ``done``. *capture_content*
+    The stream yields the AG-UI text and tool subset and one ``done``.
+    ``config().stream()`` still yields ``chunk`` then ``done``. *capture_content*
     follows the other handlers: ``None`` reads the process default from
     ``configure`` when content is read, and ``True`` or ``False`` overrides it.
     """
@@ -267,8 +335,10 @@ def _create_opencode_handler(
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        reducer = _Reducer()
+        reducer = _Reducer(capture_content=effective_capture_content(capture_content))
         async for event in reducer.reduce(_open_events(events)):
+            yield event
+        for event in reducer.close():
             yield event
         done: dict[str, Any] = {"type": "done", "output": "".join(reducer.deltas)}
         usage = reducer.usage_payload()
