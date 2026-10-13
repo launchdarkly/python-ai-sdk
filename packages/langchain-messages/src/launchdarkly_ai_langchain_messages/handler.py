@@ -794,6 +794,7 @@ async def _stream_gen(
 
             accumulated_content = ""
             accumulated_tool_calls: list[Any] = []
+            tool_chunk_ids: dict[int, str] = {}
             # The cache breakdown has to be accumulated alongside the scalars. LangChain reports it
             # per chunk in `usage_metadata.input_token_details`, and synthesizing a usage bag
             # without it would make the streaming span emit `cache_read = 0` where the blocking path
@@ -840,18 +841,42 @@ async def _stream_gen(
                             if isinstance(piece, dict)
                             else getattr(piece, "id", None)
                         )
+                        piece_index = (
+                            piece.get("index")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "index", None)
+                        )
                         piece_args = (
                             piece.get("args")
                             if isinstance(piece, dict)
                             else getattr(piece, "args", None)
                         )
-                        if piece_name and piece_id:
-                            for rich in emitter.tool_start(
-                                str(piece_id), str(piece_name)
-                            ):
+                        # Later chunks often omit id and carry only index plus an args slice.
+                        if (
+                            isinstance(piece_id, str)
+                            and piece_id
+                            and isinstance(piece_index, int)
+                        ):
+                            tool_chunk_ids[piece_index] = piece_id
+                        elif (
+                            not isinstance(piece_id, str) or not piece_id
+                        ) and isinstance(piece_index, int):
+                            piece_id = tool_chunk_ids.get(piece_index)
+                        if (
+                            isinstance(piece_name, str)
+                            and piece_name
+                            and isinstance(piece_id, str)
+                            and piece_id
+                        ):
+                            for rich in emitter.tool_start(piece_id, piece_name):
                                 yield rich
-                        if piece_id and isinstance(piece_args, str) and piece_args:
-                            for rich in emitter.tool_args(str(piece_id), piece_args):
+                        if (
+                            isinstance(piece_id, str)
+                            and piece_id
+                            and isinstance(piece_args, str)
+                            and piece_args
+                        ):
+                            for rich in emitter.tool_args(piece_id, piece_args):
                                 yield rich
                     usage = getattr(chunk, "usage_metadata", None)
                     if usage:

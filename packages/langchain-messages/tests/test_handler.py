@@ -1181,6 +1181,31 @@ class TestStreaming:
         deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
         assert deltas == ["hello ", "world"]
 
+    async def test_later_tool_arg_chunks_keep_the_first_id(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [
+            {"name": "search", "id": "c1", "index": 0, "args": '{"q":'}
+        ]
+        second = FakeAIMessage("")
+        second.tool_call_chunks = [{"index": 0, "args": '"x"}'}]
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield first
+            yield second
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [event async for event in await handler.stream(CONFIG, "q")]
+        args = "".join(
+            event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
+        )
+        assert args == '{"q":"x"}'
+
     async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 
