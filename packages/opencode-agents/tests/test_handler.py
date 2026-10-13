@@ -225,6 +225,23 @@ class TestText:
         assert start["parentMessageId"] == text["messageId"]
         assert events.index(text) < events.index(start)
 
+    async def test_an_unlabeled_tool_does_not_inherit_an_open_message(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                tool_part(
+                    "c1", "running", message_id="m2", raw_input={"command": "ls"}
+                ),
+            ]
+        )
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert "parentMessageId" not in start
+        ended = next(event for event in events if event["type"] == "TEXT_MESSAGE_END")
+        assert events.index(ended) < events.index(start)
+        assert ended["messageId"] == text["messageId"]
+
     async def test_a_user_message_tool_is_not_emitted(self) -> None:
         events = await collect(
             [

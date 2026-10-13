@@ -136,14 +136,17 @@ class _Reducer:
 
     def close(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
+        # End the open assistant message before an unlabeled tool. Otherwise
+        # tool_start copies that message into parentMessageId, and fail_open
+        # then marks the call failed while it is still nested there.
+        events.extend(self._emitter.end_text())
+        self._text_message_id = None
         for message_id, parts in list(self._held_tools.items()):
             if self._roles.get(message_id) is None:
                 for part in parts:
                     events.extend(self._emit_tool(part))
         self._held_tools.clear()
         events.extend(self._emitter.fail_open())
-        events.extend(self._emitter.end_text())
-        self._text_message_id = None
         return events
 
     def _event(self, raw: Mapping[str, Any] | object) -> list[dict[str, Any]]:
