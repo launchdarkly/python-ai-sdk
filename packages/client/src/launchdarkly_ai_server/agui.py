@@ -5,9 +5,20 @@ Handlers may yield ``chunk`` or the text and tool subset below, then one
 ``RUN_STARTED`` and ``RUN_FINISHED``. ``config().stream()`` still yields
 ``chunk`` then ``done``. The SDK runs the tool loop. This stream only reports it.
 
-Argument deltas and tool results are content. :class:`TurnEmitter` omits them
-when the handler was built with ``capture_content`` off, and still emits the
-tool lifecycle.
+Contract for one run:
+
+* ``RUN_STARTED`` is first and ``RUN_FINISHED`` is last. A failure or
+  cancellation raises and does not yield ``RUN_FINISHED`` or ``RUN_ERROR``.
+* Message and tool-result ids are unique across runs. A chat UI that keeps
+  messages by id will not append a later answer onto an earlier one.
+* ``TOOL_CALL_RESULT.content`` is always a string. Argument deltas and result
+  text are omitted (sent as ``""``) when ``capture_content`` is off. A failed
+  call still sets ``metadata.launchdarkly.toolFailed``.
+* ``RUN_FINISHED`` is not sent while a tool call is open. An unfinished call
+  is closed first.
+* Tool-result text is the string the model was given, not a second encoding.
+* Optional ``thread_id`` and ``run_id`` are echoed on ``RUN_STARTED`` and
+  ``RUN_FINISHED``. When omitted, this reader mints them.
 """
 
 from __future__ import annotations
@@ -16,6 +27,7 @@ import json
 import math
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from typing import Any
 
 from .conversation import bind_conversation_id
@@ -101,7 +113,6 @@ class TurnEmitter:
     def __init__(self, *, capture_content: bool) -> None:
         self.capture_content = capture_content
         self._open: str | None = None
-        self._seq = 0
         self._started: set[str] = set()
         self._args: set[str] = set()
         self._arg_text: dict[str, str] = {}
@@ -109,12 +120,15 @@ class TurnEmitter:
         self._resulted: set[str] = set()
 
     def _mint(self, prefix: str) -> str:
-        self._seq += 1
-        return f"{prefix}-{self._seq}"
+        return f"{prefix}-{uuid.uuid4()}"
+
+    def has_argument_deltas(self, tool_call_id: str) -> bool:
+        """True once a streamed argument slice was recorded for this call."""
+        return tool_call_id in self._args
 
     def text(self, delta: str) -> list[dict[str, Any]]:
         """Append assistant text. The first slice opens the message."""
-        if not delta:
+        if not isinstance(delta, str) or not delta:
             return []
         events: list[dict[str, Any]] = []
         if self._open is None:
@@ -151,10 +165,6 @@ class TurnEmitter:
             event["parentMessageId"] = self._open
         return [event]
 
-    def has_argument_deltas(self, tool_call_id: str) -> bool:
-        """True once a streamed argument slice was recorded for this call."""
-        return tool_call_id in self._args
-
     def tool_args(self, tool_call_id: str, delta: str) -> list[dict[str, Any]]:
         if (
             not self.capture_content
@@ -173,8 +183,9 @@ class TurnEmitter:
         """Close the argument text.
 
         When nothing was streamed, one delta carries the complete arguments.
-        A streamed prefix is extended with the missing suffix of those
-        arguments, so a partial delta cannot publish truncated JSON.
+        When the complete text starts with what was already streamed, the
+        missing suffix is appended. Otherwise the streamed text wins: a
+        differently encoded complete value is not concatenated onto it.
         """
         if tool_call_id not in self._started or tool_call_id in self._ended:
             return []
@@ -208,8 +219,7 @@ class TurnEmitter:
         }
         if failed:
             event["metadata"] = {"launchdarkly": {"toolFailed": True}}
-            if self.capture_content:
-                event["content"] = _FAILURE_CONTENT
+            event["content"] = _FAILURE_CONTENT if self.capture_content else ""
         elif self.capture_content:
             content, bad = safe_tool_content(value)
             if bad:
@@ -217,6 +227,8 @@ class TurnEmitter:
                 event["metadata"] = {"launchdarkly": {"toolFailed": True}}
             else:
                 event["content"] = content
+        else:
+            event["content"] = ""
         events.append(event)
         return events
 
@@ -256,7 +268,7 @@ class StableProjector:
             return [{"type": "chunk", "text": text}]
         if typ == TEXT_MESSAGE_CONTENT:
             delta = event.get("delta") or ""
-            if not delta:
+            if not isinstance(delta, str) or not delta:
                 return []
             return [{"type": "chunk", "text": delta}]
         return []
@@ -314,16 +326,17 @@ class RunReader:
     here. The handler's ``done`` is consumed, not forwarded.
     """
 
-    def __init__(self) -> None:
-        self.thread_id = str(uuid.uuid4())
-        self.run_id = str(uuid.uuid4())
+    def __init__(
+        self, *, thread_id: str | None = None, run_id: str | None = None
+    ) -> None:
+        self.thread_id = thread_id or str(uuid.uuid4())
+        self.run_id = run_id or str(uuid.uuid4())
         self._mode: str | None = None
         self._open: str | None = None
         self._deltas: list[str] = []
         self._started: set[str] = set()
         self._ended: set[str] = set()
         self._resulted: set[str] = set()
-        self._seq = 0
 
     def start(self) -> dict[str, Any]:
         return {
@@ -334,8 +347,7 @@ class RunReader:
         }
 
     def _mint(self, prefix: str) -> str:
-        self._seq += 1
-        return f"{prefix}-{self._seq}"
+        return f"{prefix}-{uuid.uuid4()}"
 
     def feed(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         typ = event.get("type")
@@ -369,6 +381,10 @@ class RunReader:
         if self._open is not None:
             events.append({"type": TEXT_MESSAGE_END, "messageId": self._open})
             self._open = None
+        for call_id in list(self._started):
+            if call_id not in self._ended:
+                self._ended.add(call_id)
+                events.append({"type": TOOL_CALL_END, "toolCallId": call_id})
         response = done.get("response")
         if not isinstance(response, str):
             response = "".join(self._deltas)
@@ -507,6 +523,10 @@ class RunReader:
             or call_id in self._resulted
         ):
             return []
+        events: list[dict[str, Any]] = []
+        if call_id not in self._ended:
+            self._ended.add(call_id)
+            events.append({"type": TOOL_CALL_END, "toolCallId": call_id})
         self._resulted.add(call_id)
         message_id = event.get("messageId")
         if not isinstance(message_id, str) or not message_id:
@@ -515,10 +535,10 @@ class RunReader:
             "type": TOOL_CALL_RESULT,
             "messageId": message_id,
             "toolCallId": call_id,
+            "content": event.get("content")
+            if isinstance(event.get("content"), str)
+            else "",
         }
-        content = event.get("content")
-        if isinstance(content, str):
-            result["content"] = content
         metadata = event.get("metadata")
         if isinstance(metadata, dict):
             launchdarkly = metadata.get("launchdarkly")
@@ -527,7 +547,8 @@ class RunReader:
                 and launchdarkly.get("toolFailed") is True
             ):
                 result["metadata"] = {"launchdarkly": {"toolFailed": True}}
-        return [result]
+        events.append(result)
+        return events
 
 
 def stream(
@@ -537,16 +558,59 @@ def stream(
     *,
     variables: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    thread_id: str | None = None,
+    run_id: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Stream one config turn as AG-UI events.
 
-    Same arguments as ``ConfigInstance.stream``. ``RUN_STARTED`` is first and
-    ``RUN_FINISHED`` is last. A failure, including cancellation, raises and does
-    not yield ``RUN_FINISHED``.
+    Same arguments as ``ConfigInstance.stream``, plus optional ``thread_id``
+    and ``run_id`` echoed from the caller's AG-UI run. ``RUN_STARTED`` is first
+    and ``RUN_FINISHED`` is last. A failure, including cancellation, raises and
+    does not yield ``RUN_FINISHED``.
     """
     report_usage("client.agui.stream")
     return bind_conversation_id(
-        _stream_events(instance, user_input, context, variables, history)
+        _stream_events(
+            instance,
+            user_input,
+            context,
+            variables,
+            history,
+            thread_id=thread_id,
+            run_id=run_id,
+        )
+    )
+
+
+async def judge_completed_stream(
+    instance: Any,
+    sink: dict[str, Any],
+    done: dict[str, Any],
+    user_input: str | None,
+    context: LDContext,
+) -> dict[str, JudgeResult]:
+    """Run the turn's judges once the handler has finished.
+
+    A non-string response is not sent to the judge. Both ``config().stream()``
+    and :func:`stream` use this, so the two copies cannot drift.
+    """
+    from .judges import run_judges
+
+    if getattr(instance, "_skip_judges", False) or not sink:
+        return {}
+    response = done.get("response", "")
+    if not isinstance(response, str):
+        response = ""
+    return await run_judges(
+        config=sink["config"],
+        user_context=context,
+        handler=sink["handler"],
+        handlers=sink["handlers"],
+        user_input=user_input,
+        trajectory=done.get("trajectory", ""),
+        llm_response=response,
+        base_track_data=done.get("track_data", {}),
+        tool_handlers=sink["tools"],
     )
 
 
@@ -556,43 +620,33 @@ async def _stream_events(
     context: LDContext,
     variables: dict[str, Any] | None,
     history: list[dict[str, Any]] | None,
+    *,
+    thread_id: str | None = None,
+    run_id: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    from .judges import run_judges
-
     sink: dict[str, Any] = {}
-    reader = RunReader()
+    reader = RunReader(thread_id=thread_id, run_id=run_id)
     started = False
     done: dict[str, Any] | None = None
-    async for event in instance._execute_stream(
-        user_input, context, variables, history, sink
-    ):
-        if not started:
-            yield reader.start()
-            started = True
-        if event.get("type") == "done":
-            done = event
-            continue
-        for item in reader.feed(event):
-            yield item
+    async with aclosing(
+        instance._execute_stream(user_input, context, variables, history, sink)
+    ) as source:
+        async for event in source:
+            if not started:
+                yield reader.start()
+                started = True
+            if event.get("type") == "done":
+                done = event
+                continue
+            for item in reader.feed(event):
+                yield item
     if not started:
         yield reader.start()
     if done is None:
         done = {"response": "", "usage": {}, "_had_usage": False}
-    judge_results: dict[str, JudgeResult] = {}
-    if not instance._skip_judges and sink:
-        judge_results = await run_judges(
-            config=sink["config"],
-            user_context=context,
-            handler=sink["handler"],
-            handlers=sink["handlers"],
-            user_input=user_input,
-            trajectory=done.get("trajectory", ""),
-            llm_response=done.get("response", "")
-            if isinstance(done.get("response"), str)
-            else "",
-            base_track_data=done.get("track_data", {}),
-            tool_handlers=sink["tools"],
-        )
+    judge_results = await judge_completed_stream(
+        instance, sink, done, user_input, context
+    )
     for item in reader.finish(
         done,
         judge_results,

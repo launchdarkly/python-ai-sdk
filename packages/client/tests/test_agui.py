@@ -119,7 +119,7 @@ class TestTurnEmitter:
         assert _types(events) == [TOOL_CALL_START, TOOL_CALL_END, TOOL_CALL_RESULT]
         assert events[0]["toolCallName"] == "search"
         assert "parentMessageId" not in events[0]
-        assert "content" not in events[2]
+        assert events[2]["content"] == ""
         assert "delta" not in str(events)
 
     def test_failure_is_masked_and_a_string_is_not_reencoded(self) -> None:
@@ -146,7 +146,7 @@ class TestTurnEmitter:
         emitter.tool_start("a", "search")
         events = emitter.fail_open()
         assert [event["type"] for event in events] == [TOOL_CALL_END, TOOL_CALL_RESULT]
-        assert "content" not in events[-1]
+        assert events[-1]["content"] == ""
         assert events[-1]["metadata"]["launchdarkly"]["toolFailed"] is True
 
     def test_tool_end_extends_a_streamed_argument_prefix(self) -> None:
@@ -163,6 +163,25 @@ class TestTurnEmitter:
         emitter = TurnEmitter(capture_content=True)
         assert emitter.tool_start("a", "search")
         assert emitter.tool_start("a", "search") == []
+
+    def test_message_ids_differ_across_runs(self) -> None:
+        first = TurnEmitter(capture_content=False).text("a")[0]["messageId"]
+        second = TurnEmitter(capture_content=False).text("b")[0]["messageId"]
+        assert first != second
+
+    def test_tool_end_extends_a_matching_prefix_only(self) -> None:
+        emitter = TurnEmitter(capture_content=True)
+        events = emitter.tool_start("a", "search")
+        events.extend(emitter.tool_args("a", '{"q":'))
+        events.extend(emitter.tool_end("a", arguments={"q": "x"}))
+        deltas = [event["delta"] for event in events if event["type"] == TOOL_CALL_ARGS]
+        assert "".join(deltas) == '{"q":"x"}'
+
+        spaced = TurnEmitter(capture_content=True)
+        spaced.tool_start("a", "search")
+        spaced.tool_args("a", '{"q": "')
+        closed = spaced.tool_end("a", arguments={"q": "xy"})
+        assert not any(event["type"] == TOOL_CALL_ARGS for event in closed)
 
 
 class TestRunReader:
@@ -309,6 +328,40 @@ class TestRunReader:
             finished[-1]["metadata"]["launchdarkly"]["judgeResults"]["quality"]["score"]
             == 1.0
         )
+
+    def test_finish_closes_an_open_tool_before_the_run(self) -> None:
+        reader = RunReader(thread_id="thread-1", run_id="run-1")
+        events = [reader.start()]
+        events.extend(
+            reader.feed(
+                {
+                    "type": TOOL_CALL_START,
+                    "toolCallId": "a",
+                    "toolCallName": "search",
+                }
+            )
+        )
+        events.extend(reader.finish({"response": ""}, None, provider="", model=""))
+        assert [event["type"] for event in events] == [
+            RUN_STARTED,
+            TOOL_CALL_START,
+            TOOL_CALL_END,
+            RUN_FINISHED,
+        ]
+        assert events[0]["threadId"] == "thread-1"
+        assert events[-1]["runId"] == "run-1"
+
+    def test_a_result_without_an_end_closes_the_call_first(self) -> None:
+        reader = RunReader()
+        reader.feed(
+            {"type": TOOL_CALL_START, "toolCallId": "a", "toolCallName": "search"}
+        )
+        events = reader.feed({"type": TOOL_CALL_RESULT, "toolCallId": "a"})
+        assert [event["type"] for event in events] == [
+            TOOL_CALL_END,
+            TOOL_CALL_RESULT,
+        ]
+        assert events[-1]["content"] == ""
 
 
 class TestStableProjector:
@@ -468,20 +521,42 @@ class TestConfigAndReader:
     async def test_closing_early_does_not_finish_the_run(
         self, mock_ld_client: MagicMock
     ) -> None:
-        handler = _handler(
-            [
-                {"type": "chunk", "text": "Hi"},
-                {"type": "chunk", "text": " there"},
-                {
-                    "type": "done",
-                    "output": "Hi there",
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                },
-            ]
+        closed = False
+
+        async def fn_unused(
+            cfg, user_input, tool_handlers, variables, history=None
+        ) -> dict:
+            return {"output": "", "usage": {}}
+
+        async def stream_fn(
+            cfg, user_input, tool_handlers, variables, history=None
+        ) -> AsyncGenerator[dict[str, Any], None]:
+            nonlocal closed
+            try:
+                for event in [
+                    {"type": "chunk", "text": "Hi"},
+                    {"type": "chunk", "text": " there"},
+                    {
+                        "type": "done",
+                        "output": "Hi there",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                ]:
+                    yield event
+            finally:
+                closed = True
+
+        handler = ProviderHandler(
+            fn=fn_unused,
+            provides_for=("TestProvider", "messages"),
+            stream_fn=stream_fn,
+            capture_content=False,
         )
+
         gen = stream(config(key="flag", handler=handler), "q", CONTEXT)
         first = await gen.__anext__()
         second = await gen.__anext__()
         await gen.aclose()
         assert first["type"] == RUN_STARTED
         assert second["type"] == TEXT_MESSAGE_START
+        assert closed is True
