@@ -641,6 +641,8 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, last_response_model, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.end_text():
+            yield rich
         for rich in emitter.fail_open():
             yield rich
         raise

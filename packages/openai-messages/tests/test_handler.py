@@ -1517,6 +1517,44 @@ class TestStreaming:
             for event in seen
         )
 
+    async def test_a_provider_error_closes_the_open_text(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from types import SimpleNamespace
+
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        delta = SimpleNamespace(type="response.output_text.delta", delta="Hello")
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield delta
+                raise RuntimeError("stream broke")
+
+            async def get_final_response(self) -> Any:
+                raise AssertionError("final response is not read")
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_mgr())
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="stream broke"),
+        ):
+            handler = create_openai_messages_handler()
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        start = next(event for event in seen if event["type"] == "TEXT_MESSAGE_START")
+        end = next(event for event in seen if event["type"] == "TEXT_MESSAGE_END")
+        assert end["messageId"] == start["messageId"]
+
     async def test_yields_exactly_one_done_event(self, mock_openai: MagicMock) -> None:
         import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler

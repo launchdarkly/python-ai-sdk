@@ -1423,6 +1423,26 @@ class TestStreaming:
         assert any(event["type"] == "TOOL_CALL_RESULT" for event in hooks.pending)
         assert hooks.emitter.tool_args("c1", "more") == []
 
+    async def test_a_tool_result_closes_the_open_text_first(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import _SpanningHooks
+        from launchdarkly_ai_server import create_run_usage
+
+        hooks = _SpanningHooks(CONFIG, None, True, create_run_usage())
+        hooks.emitter.text("Looking")
+        ctx = SimpleNamespace(
+            tool_name="search",
+            tool_call_id="c1",
+            tool_arguments="{}",
+        )
+        await hooks.on_tool_start(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search")
+        )
+        await hooks.on_tool_end(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search"), "found"
+        )
+        types = [event["type"] for event in hooks.pending]
+        assert types.index("TEXT_MESSAGE_END") < types.index("TOOL_CALL_RESULT")
+
     def test_a_new_response_closes_text_in_read_order(self) -> None:
         from launchdarkly_ai_server.agui import TurnEmitter
         from launchdarkly_ai_server.responses import map_responses_event

@@ -356,6 +356,7 @@ class _SpanningHooks(_RunHooksBase):
         call_id = self._tool_span_key(context, tool)
         # The hook can run before unread argument deltas. Close with the full
         # argument string first, so tool_result does not seal a prefix.
+        self.pending.extend(self.emitter.end_text())
         self.pending.extend(
             self.emitter.tool_end(
                 str(call_id),
