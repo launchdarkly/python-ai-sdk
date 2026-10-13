@@ -236,12 +236,7 @@ async def execute_and_track(
     }
 
 
-# Private terminal of :func:`_drive_handler_stream`. Not a handler event and not
-# forwarded by either reader. A handler that yields this type is ignored.
-_SETTLED_EVENT = "__ld_settled"
-
-
-async def _drive_handler_stream(
+async def execute_and_stream(
     *,
     config_key: str,
     config: AiConfigRep,
@@ -253,13 +248,14 @@ async def _drive_handler_stream(
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
-) -> AsyncGenerator[dict[str, Any], None]:
-    """Run one handler stream and yield its events, then one settled record.
+) -> AsyncGenerator[ExecuteStreamEvent, None]:
+    """
+    Streaming counterpart to ``execute_and_track``. Yields ``chunk`` events
+    from the handler, then a single ``done`` event once the stream completes
+    and LD telemetry has been flushed.
 
-    The settled record carries the response, parsed usage, tracking payload and
-    trajectory. Handler ``done`` is consumed here. Telemetry matches
-    :func:`execute_and_stream`. A raise records the error metrics and propagates,
-    with no settled record.
+    Falls back to calling the blocking handler when the handler has no
+    ``stream`` implementation.
     """
     from .lifecycle import get_client
 
@@ -301,8 +297,6 @@ async def _drive_handler_stream(
     start_time = time.monotonic()
     full_text = ""
     raw_usage: dict[str, Any] = {}
-    had_usage = False
-    saw_text_message = False
 
     try:
         if handler.has_stream:
@@ -310,24 +304,13 @@ async def _drive_handler_stream(
                 config, user_input, tracked_tool_handlers, merged_variables, history
             )
             async for event in stream_gen:
-                kind = event.get("type")
-                if kind == "chunk":
-                    if not saw_text_message:
-                        full_text += event.get("text", "")
-                    yield event
-                elif kind == "TEXT_MESSAGE_CONTENT":
-                    saw_text_message = True
-                    delta = event.get("delta")
-                    if isinstance(delta, str):
-                        full_text += delta
-                    yield event
-                elif kind == "done":
+                if event.get("type") == "chunk":
+                    full_text += event.get("text", "")
+                    yield {"type": "chunk", "text": event["text"]}
+                elif event.get("type") == "done":
                     if event.get("output") is not None:
                         full_text = event["output"]
                     raw_usage = event.get("usage", {})
-                    had_usage = bool(event.get("usage"))
-                elif kind != _SETTLED_EVENT:
-                    yield event
         else:
             result = await handler(
                 config, user_input, tracked_tool_handlers, merged_variables, history
@@ -335,7 +318,6 @@ async def _drive_handler_stream(
             out = result.get("output")
             full_text = str(out) if out is not None else ""
             raw_usage = result.get("usage") or {}
-            had_usage = bool(result.get("usage"))
             if full_text:
                 yield {"type": "chunk", "text": full_text}
     except Exception:
@@ -357,77 +339,13 @@ async def _drive_handler_stream(
         client.track("$ld:ai:tokens:output", ld_ctx, track_data, usage["output"])
 
     yield {
-        "type": _SETTLED_EVENT,
+        "type": "done",
         "response": full_text,
         "usage": usage,
-        "had_usage": had_usage,
         "track_data": track_data,
         "trajectory": render_trajectory(
             recorder.invocations,
             observable_tools=exposed_tool_keys,
             omitted=recorder.omitted,
         ),
-    }
-
-
-async def execute_and_stream(
-    *,
-    config_key: str,
-    config: AiConfigRep,
-    meta: VariationMeta,
-    user_context: LDContext,
-    handler: ProviderHandler,
-    user_input: str | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
-    variables: dict[str, Any] | None = None,
-    graph_key: str | None = None,
-    history: list[dict[str, Any]] | None = None,
-) -> AsyncGenerator[ExecuteStreamEvent, None]:
-    """
-    Streaming counterpart to ``execute_and_track``. Yields ``chunk`` events
-    from the handler, then a single ``done`` event once the stream completes
-    and LD telemetry has been flushed.
-
-    Assistant text arrives as ``chunk``. ``TEXT_MESSAGE_CONTENT`` contributes
-    its ``delta`` as a ``chunk`` as well. A tool event, or any other handler
-    event, is not forwarded and does not end the turn. Only the handler's
-    ``done`` supplies output and usage. ``config().stream()`` therefore stays
-    ``chunk`` then ``done``.
-
-    Falls back to calling the blocking handler when the handler has no
-    ``stream`` implementation.
-    """
-    settled: dict[str, Any] | None = None
-    saw_text_message = False
-    async for event in _drive_handler_stream(
-        config_key=config_key,
-        config=config,
-        meta=meta,
-        user_context=user_context,
-        handler=handler,
-        user_input=user_input,
-        tool_handlers=tool_handlers,
-        variables=variables,
-        graph_key=graph_key,
-        history=history,
-    ):
-        if event.get("type") == _SETTLED_EVENT:
-            settled = event
-            continue
-        kind = event.get("type")
-        if kind == "TEXT_MESSAGE_CONTENT":
-            saw_text_message = True
-            delta = event.get("delta")
-            if isinstance(delta, str) and delta:
-                yield {"type": "chunk", "text": delta}
-        elif kind == "chunk" and not saw_text_message:
-            yield {"type": "chunk", "text": event["text"]}
-    if settled is None:
-        return
-    yield {
-        "type": "done",
-        "response": settled.get("response", ""),
-        "usage": settled.get("usage"),
-        "track_data": settled.get("track_data"),
-        "trajectory": settled.get("trajectory", ""),
     }

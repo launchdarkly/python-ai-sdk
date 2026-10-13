@@ -1,8 +1,8 @@
-"""OpenCode handler: synthetic session events, stable stream, rich stream reader."""
+"""OpenCode handler: synthetic session events, stable chunk then done stream."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,13 +13,7 @@ from launchdarkly_ai_opencode_agents import (
     OpenCodeSessionError,
     create_opencode_handler,
 )
-from launchdarkly_ai_server import (
-    ProviderHandler,
-    SDKOptions,
-    config,
-    configure,
-    rich_stream,
-)
+from launchdarkly_ai_server import SDKOptions, config, configure
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 
@@ -154,9 +148,16 @@ class TestSurface:
         for name in package.__all__:
             assert hasattr(package, name)
 
+    def test_capture_content_follows_configure(self) -> None:
+        configure(options=SDKOptions(capture_content=True))
+        omitted = create_opencode_handler(events=source([]))
+        explicit = create_opencode_handler(capture_content=False, events=source([]))
+        assert omitted.capture_content is True
+        assert explicit.capture_content is False
 
-class TestTextAndTools:
-    async def test_text_and_a_successful_tool(self) -> None:
+
+class TestText:
+    async def test_text_around_a_tool_is_chunks_then_done(self) -> None:
         events = await collect(
             [
                 assistant_open("m1"),
@@ -166,43 +167,22 @@ class TestTextAndTools:
                 tool_part(
                     "c1", "completed", raw_input={"command": "ls"}, output="file.txt"
                 ),
-                tool_part(
-                    "c1", "completed", raw_input={"command": "ls"}, output="file.txt"
-                ),
                 assistant_completed("m1"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "Done."),
+                assistant_completed("m2"),
             ],
         )
-        assert types_of(events) == [
-            "TEXT_MESSAGE_START",
-            "TEXT_MESSAGE_CONTENT",
-            "TOOL_CALL_START",
-            "TOOL_CALL_ARGS",
-            "TOOL_CALL_END",
-            "TOOL_CALL_RESULT",
-            "TEXT_MESSAGE_END",
-            "done",
+        assert types_of(events) == ["chunk", "chunk", "done"]
+        assert [event["text"] for event in events if event["type"] == "chunk"] == [
+            "Looking up",
+            "Done.",
         ]
-        assert events[0]["messageId"] == "m1"
-        assert events[1] == {
-            "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "m1",
-            "delta": "Looking up",
-        }
-        assert events[2]["toolCallId"] == "c1"
-        assert events[2]["toolCallName"] == "bash"
-        assert events[2]["parentMessageId"] == "m1"
-        assert events[3] == {
-            "type": "TOOL_CALL_ARGS",
-            "toolCallId": "c1",
-            "delta": '{"command":"ls"}',
-        }
-        assert "toolCallName" not in events[3]
-        assert events[5]["content"] == "file.txt"
-        assert events[5]["messageId"] != "c1"
-        assert "metadata" not in events[5]
-        assert events[-1]["output"] == "Looking up"
+        assert events[-1]["output"] == "Looking upDone."
+        assert "file.txt" not in str(events)
+        assert "toolCallId" not in str(events)
 
-    async def test_a_failed_tool_is_masked(self) -> None:
+    async def test_a_failed_tool_does_not_leak_into_the_stream(self) -> None:
         events = await collect(
             [
                 tool_part(
@@ -213,45 +193,15 @@ class TestTextAndTools:
                 )
             ],
         )
-        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
-        assert result["content"] == "An error occurred."
-        assert result["metadata"] == {"launchdarkly": {"toolFailed": True}}
-        assert "disk on fire" not in str(result)
-        assert "parentMessageId" not in events[0]
+        assert types_of(events) == ["done"]
+        assert events[-1]["output"] == ""
+        assert "disk on fire" not in str(events)
 
-    async def test_a_string_argument_is_not_encoded_again(self) -> None:
+    async def test_pending_tool_state_emits_nothing(self) -> None:
         events = await collect(
-            [tool_part("c1", "running", raw_input="ls")],
+            [tool_part("c1", "pending", raw_input={}, output=None)],
         )
-        args = next(event for event in events if event["type"] == "TOOL_CALL_ARGS")
-        assert args["delta"] == "ls"
-
-    async def test_nan_result_is_a_failed_tool(self) -> None:
-        events = await collect(
-            [tool_part("c1", "completed", raw_input={}, output=float("nan"))],
-        )
-        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
-        assert result["metadata"] == {"launchdarkly": {"toolFailed": True}}
-        assert result["content"] == "An error occurred."
-
-    async def test_part_id_is_the_call_id_when_call_id_is_absent(self) -> None:
-        part = tool_part("ignored", "running", raw_input={"q": 1}, part_id="part-9")
-        del part["properties"]["part"]["callID"]
-        events = await collect([part])
-        assert events[0]["toolCallId"] == "part-9"
-
-    async def test_interleaved_tools_keep_arrival_order(self) -> None:
-        events = await collect(
-            [
-                tool_part("a", "running", raw_input={"q": "a"}, name="search"),
-                tool_part("b", "running", raw_input={"q": "b"}, name="weather"),
-                tool_part("b", "completed", raw_input={"q": "b"}, output="sun"),
-                tool_part("a", "completed", raw_input={"q": "a"}, output="rows"),
-            ],
-        )
-        results = [event for event in events if event["type"] == "TOOL_CALL_RESULT"]
-        assert [event["toolCallId"] for event in results] == ["b", "a"]
-        assert [event["content"] for event in results] == ["sun", "rows"]
+        assert types_of(events) == ["done"]
 
     async def test_completed_assistant_usage_is_summed_once(self) -> None:
         tokens = {"input": 3, "output": 4, "cache": {"read": 1, "write": 2}}
@@ -270,23 +220,6 @@ class TestTextAndTools:
             "cache_creation_input_tokens": 2,
         }
 
-    async def test_text_after_a_tool_is_a_new_message(self) -> None:
-        events = await collect(
-            [
-                assistant_open("m1"),
-                text_delta("m1", "p1", "A"),
-                tool_part("c1", "running", raw_input={"q": 1}),
-                tool_part("c1", "completed", raw_input={"q": 1}, output="ok"),
-                assistant_completed("m1"),
-                assistant_open("m2"),
-                text_delta("m2", "p2", "B"),
-                assistant_completed("m2"),
-            ],
-        )
-        starts = [event for event in events if event["type"] == "TEXT_MESSAGE_START"]
-        assert [event["messageId"] for event in starts] == ["m1", "m2"]
-        assert events[-1]["output"] == "AB"
-
     async def test_a_text_snapshot_does_not_repeat_deltas(self) -> None:
         events = await collect(
             [
@@ -304,12 +237,9 @@ class TestTextAndTools:
                 assistant_completed("m1"),
             ],
         )
-        contents = [
-            event for event in events if event["type"] == "TEXT_MESSAGE_CONTENT"
-        ]
-        assert contents == [
-            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Hi"}
-        ]
+        chunks = [event for event in events if event["type"] == "chunk"]
+        assert chunks == [{"type": "chunk", "text": "Hi"}]
+        assert events[-1]["output"] == "Hi"
 
     async def test_a_snapshot_then_later_deltas_append(self) -> None:
         events = await collect(
@@ -332,12 +262,8 @@ class TestTextAndTools:
                 assistant_completed("m1"),
             ],
         )
-        contents = [
-            event["delta"]
-            for event in events
-            if event["type"] == "TEXT_MESSAGE_CONTENT"
-        ]
-        assert contents == ["He", "llo"]
+        chunks = [event["text"] for event in events if event["type"] == "chunk"]
+        assert chunks == ["He", "llo"]
         assert events[-1]["output"] == "Hello"
 
     async def test_user_text_is_not_the_assistant_reply(self) -> None:
@@ -389,73 +315,12 @@ class TestTextAndTools:
         assert "secret-body" not in str(raised.value)
         assert "done" not in seen
 
-    async def test_pending_tool_state_emits_nothing(self) -> None:
-        events = await collect(
-            [tool_part("c1", "pending", raw_input={}, output=None)],
-        )
-        assert types_of(events) == ["done"]
-
-
-class TestCapture:
-    async def test_capture_off_omits_argument_and_result_text(self) -> None:
-        handler = create_opencode_handler(
-            capture_content=False,
-            events=source(
-                [
-                    tool_part(
-                        "c1",
-                        "completed",
-                        raw_input={"command": "ls"},
-                        output="file.txt",
-                    )
-                ]
-            ),
-        )
-        events = [event async for event in await handler.stream({}, None, None, None)]
-        assert "TOOL_CALL_ARGS" not in types_of(events)
-        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
-        assert result["content"] == ""
-        assert "metadata" not in result
-
-    async def test_explicit_false_overrides_configure_true(self) -> None:
-        configure(options=SDKOptions(capture_content=True))
-        try:
-            handler = create_opencode_handler(
-                capture_content=False,
-                events=source(
-                    [tool_part("c1", "running", raw_input={"command": "ls"})]
-                ),
-            )
-            events = [
-                event async for event in await handler.stream({}, None, None, None)
-            ]
-            assert "TOOL_CALL_ARGS" not in types_of(events)
-        finally:
-            lifecycle_module._reset_for_testing()
-
-    async def test_omitted_capture_reads_configure_at_invocation(self) -> None:
-        configure(options=SDKOptions(capture_content=True))
-        try:
-            handler = create_opencode_handler(
-                events=source(
-                    [tool_part("c1", "running", raw_input={"command": "ls"})]
-                ),
-            )
-            events = [
-                event async for event in await handler.stream({}, None, None, None)
-            ]
-            args = next(event for event in events if event["type"] == "TOOL_CALL_ARGS")
-            assert args["delta"] == '{"command":"ls"}'
-        finally:
-            lifecycle_module._reset_for_testing()
-
 
 class TestStableStream:
-    async def test_tool_events_do_not_close_the_stable_stream(
+    async def test_a_tool_does_not_close_the_stream(
         self, mock_ld_client: MagicMock
     ) -> None:
         handler = create_opencode_handler(
-            capture_content=True,
             events=source(
                 [
                     assistant_open("m1"),
@@ -506,163 +371,3 @@ class TestStableStream:
                 seen.append(event)
         assert [event["type"] for event in seen] == ["chunk"]
         assert seen[0]["text"] == "Hi"
-
-    async def test_a_chunk_handler_tool_event_is_not_the_done_event(
-        self, mock_ld_client: MagicMock
-    ) -> None:
-        async def invoke(
-            config: Any,
-            user_input: str | None,
-            tool_handlers: Any,
-            variables: Any,
-            history: Any = None,
-        ) -> dict[str, Any]:
-            return {"output": "Hi", "usage": {"input_tokens": 1, "output_tokens": 1}}
-
-        async def stream_fn(
-            config: Any,
-            user_input: str | None,
-            tool_handlers: Any,
-            variables: Any,
-            history: Any = None,
-        ) -> AsyncGenerator[dict[str, Any], None]:
-            yield {
-                "type": "TOOL_CALL_START",
-                "toolCallId": "c1",
-                "toolCallName": "bash",
-            }
-            yield {"type": "chunk", "text": "Hi"}
-            yield {
-                "type": "done",
-                "output": "Hi",
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            }
-
-        handler = ProviderHandler(
-            fn=invoke, provides_for=("Acme", "agent"), stream_fn=stream_fn
-        )
-        seen = [
-            event
-            async for event in config(key="flag", handler=handler).stream("q", CONTEXT)
-        ]
-        assert [event["type"] for event in seen] == ["chunk", "done"]
-        assert seen[-1]["response"] == "Hi"
-        assert "toolCallId" not in seen[-1]
-
-
-class TestRichReader:
-    async def test_rich_reader_forwards_text_and_tools(
-        self, mock_ld_client: MagicMock
-    ) -> None:
-        handler = create_opencode_handler(
-            capture_content=True,
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Looking up"),
-                    tool_part("c1", "running", raw_input={"command": "ls"}),
-                    tool_part(
-                        "c1",
-                        "error",
-                        raw_input={"command": "ls"},
-                        output="nope",
-                    ),
-                    assistant_completed(
-                        "m1",
-                        tokens={
-                            "input": 3,
-                            "output": 4,
-                            "cache": {"read": 1, "write": 2},
-                        },
-                    ),
-                ]
-            ),
-        )
-        instance = config(key="flag", handler=handler)
-        seen = [event async for event in rich_stream(instance, "q", CONTEXT)]
-        kinds = [event["type"] for event in seen]
-        assert kinds[0] == "RUN_STARTED"
-        assert kinds[-1] == "RUN_FINISHED"
-        assert seen[0]["threadId"] == seen[-1]["threadId"]
-        assert seen[0]["runId"] == seen[-1]["runId"]
-        assert seen[0]["protocolVersion"] == "1.0"
-        assert "TEXT_MESSAGE_CONTENT" in kinds
-        assert "TOOL_CALL_RESULT" in kinds
-        result = next(event for event in seen if event["type"] == "TOOL_CALL_RESULT")
-        assert result["content"] == "An error occurred."
-        assert result["metadata"] == {"launchdarkly": {"toolFailed": True}}
-        finished = seen[-1]
-        assert finished["result"] == "Looking up"
-        assert finished["usage"] == [
-            {
-                "inputTokens": 6,
-                "outputTokens": 4,
-                "totalTokens": 10,
-                "cachedInputTokens": 1,
-                "cacheWriteInputTokens": 2,
-            }
-        ]
-        assert "metadata" not in finished
-
-    async def test_session_error_has_no_run_finished(
-        self, mock_ld_client: MagicMock
-    ) -> None:
-        handler = create_opencode_handler(
-            events=source(
-                [
-                    {"type": "session.error", "properties": {"error": {"name": "X"}}},
-                ]
-            ),
-        )
-        seen: list[str] = []
-        with pytest.raises(OpenCodeSessionError):
-            async for event in rich_stream(
-                config(key="flag", handler=handler), "q", CONTEXT
-            ):
-                seen.append(event["type"])
-        assert seen == ["RUN_STARTED"]
-        assert "RUN_FINISHED" not in seen
-
-    async def test_legacy_chunks_are_one_text_message(
-        self, mock_ld_client: MagicMock
-    ) -> None:
-        async def invoke(
-            config: Any,
-            user_input: str | None,
-            tool_handlers: Any,
-            variables: Any,
-            history: Any = None,
-        ) -> dict[str, Any]:
-            return {"output": "Hi"}
-
-        async def stream_fn(
-            config: Any,
-            user_input: str | None,
-            tool_handlers: Any,
-            variables: Any,
-            history: Any = None,
-        ) -> AsyncGenerator[dict[str, Any], None]:
-            yield {"type": "chunk", "text": "Hi"}
-            yield {"type": "TOOL_CALL_END", "toolCallId": "c1"}
-            yield {"type": "done", "output": "Hi"}
-
-        handler = ProviderHandler(
-            fn=invoke, provides_for=("Acme", "agent"), stream_fn=stream_fn
-        )
-        seen = [
-            event
-            async for event in rich_stream(
-                config(key="flag", handler=handler), "q", CONTEXT
-            )
-        ]
-        assert [event["type"] for event in seen] == [
-            "RUN_STARTED",
-            "TEXT_MESSAGE_START",
-            "TEXT_MESSAGE_CONTENT",
-            "TOOL_CALL_END",
-            "TEXT_MESSAGE_END",
-            "RUN_FINISHED",
-        ]
-        assert seen[2]["delta"] == "Hi"
-        assert seen[-1]["result"] == "Hi"
-        assert "usage" not in seen[-1]
