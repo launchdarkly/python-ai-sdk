@@ -470,6 +470,7 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -494,7 +495,6 @@ async def _stream_gen(
 
         run_usage = create_run_usage()
         full_output = ""
-        emitter = TurnEmitter(capture_content=capture_content)
 
         # agent.astream() yields state updates per graph step: { [node_name]: { messages: [...] } }
         async for step_state in agent.astream(
@@ -584,6 +584,8 @@ async def _stream_gen(
         if span_callbacks.run_usage.reported:
             finish_root_span(span, config, span_callbacks.run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through

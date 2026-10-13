@@ -151,6 +151,21 @@ def _build_messages(
     return messages
 
 
+def _merge_stream_chunk(gathered: Any, chunk: Any) -> Any:
+    """Fold one streamed chunk into the turn the way LangChain does.
+
+    ``AIMessageChunk.tool_calls`` is parsed from that chunk alone. Keeping only
+    the last chunk drops every earlier parallel call and every argument slice
+    that chunk did not repeat. Addition merges chunks by index.
+    """
+    if gathered is None:
+        return chunk
+    try:
+        return gathered + chunk
+    except TypeError:
+        return chunk
+
+
 def _assistant_output_messages(
     content: Any, tool_calls: list[Any] | None
 ) -> list[SpanMessage]:
@@ -793,7 +808,7 @@ async def _stream_gen(
             open_model_span = model_span
 
             accumulated_content = ""
-            accumulated_tool_calls: list[Any] = []
+            gathered: Any = None
             tool_chunk_ids: dict[int, str] = {}
             seen_call_ids: list[str] = []
             # The cache breakdown has to be accumulated alongside the scalars. LangChain reports it
@@ -894,9 +909,7 @@ async def _stream_gen(
                         turn_usage.cache_creation += number_or_zero(
                             details.get("cache_creation")
                         )
-                    chunk_tools = getattr(chunk, "tool_calls", None) or []
-                    if chunk_tools:
-                        accumulated_tool_calls = chunk_tools
+                    gathered = _merge_stream_chunk(gathered, chunk)
                     finish_reasons = lang_chain_finish_reasons(chunk) or finish_reasons
                 open_chunk_stream = None
             except Exception as exc:
@@ -905,8 +918,6 @@ async def _stream_gen(
                 # path.
                 fail_span(model_span, exc, ended)
                 open_model_span = None
-                for rich in emitter.fail_open():
-                    yield rich
                 raise
 
             # The already-mapped figures, not a bag rebuilt from them: this path summed the chunks
@@ -923,6 +934,11 @@ async def _stream_gen(
             # billed these tokens: a content failure is our problem and must not report the run as
             # having spent less than it did.
             run_usage.add(turn_usage if usage_reported else None)
+            accumulated_tool_calls = [
+                tc
+                for tc in (getattr(gathered, "tool_calls", None) or [])
+                if isinstance(tc, dict) and tc.get("name")
+            ]
 
             # Inside a guard for the same reason as the blocking path: a raise while serialising
             # completion content would otherwise leave this span for `finally` to end as abandoned,
@@ -1002,12 +1018,6 @@ async def _stream_gen(
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     open_tool_span = None
-                    for rich in emitter.tool_result(
-                        str(tc.get("id") or tc["name"]), failed=True
-                    ):
-                        yield rich
-                    for rich in emitter.fail_open():
-                        yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where

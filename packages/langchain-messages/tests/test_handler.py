@@ -1265,6 +1265,74 @@ class TestStreaming:
         )
         assert args == '{"q":"x"}'
 
+    async def test_parallel_chunks_use_the_gathered_tool_calls(self) -> None:
+        from langchain_core.messages import AIMessageChunk
+
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {"name": "search", "args": "", "id": "call_1", "index": 0}
+            ],
+        )
+        second = AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {"name": None, "args": '{"q":', "id": None, "index": 0},
+                {"name": "other", "args": "", "id": "call_2", "index": 1},
+            ],
+        )
+        third = AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {"name": None, "args": '"x"}', "id": None, "index": 0},
+                {"name": None, "args": "{}", "id": None, "index": 1},
+            ],
+        )
+        seen: list[dict[str, Any]] = []
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        first_turn = True
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            nonlocal first_turn
+            if first_turn:
+                first_turn = False
+                yield first
+                yield second
+                yield third
+                return
+            yield FakeAIMessage("ok")
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+
+        def search(args: dict[str, Any]) -> str:
+            seen.append(args)
+            return "found"
+
+        def other(args: dict[str, Any]) -> str:
+            seen.append(args)
+            return "also"
+
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [
+            event
+            async for event in await handler.stream(
+                CONFIG, "q", {"search": search, "other": other}
+            )
+        ]
+        starts = [
+            event["toolCallId"]
+            for event in events
+            if event["type"] == "TOOL_CALL_START"
+        ]
+        assert starts == ["call_1", "call_2"]
+        assert seen == [{"q": "x"}, {}]
+        assert events[-1]["type"] == "done"
+        assert "ok" in events[-1]["output"]
+
     async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 

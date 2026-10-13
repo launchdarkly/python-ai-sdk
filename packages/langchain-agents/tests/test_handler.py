@@ -1451,6 +1451,34 @@ class TestStreaming:
                     async for _ in await h.stream(_make_config(), "hi"):
                         pass
 
+    @pytest.mark.asyncio
+    async def test_a_failed_run_closes_started_tool_calls(self) -> None:
+        mocks = _make_langchain_mock()
+        msg = _make_ai_msg("looking")
+        msg.tool_calls = [
+            {"name": "search", "id": "c1", "args": {"q": "x"}},
+            {"name": "other", "id": "d1", "args": {"n": 1}},
+        ]
+
+        async def _astream(*_a: Any, **_kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [msg]}}
+            raise RuntimeError("tool failed")
+
+        mocks["_agent"].astream = _astream
+        seen: list[dict[str, Any]] = []
+        with (
+            _patch_lc(mocks),
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="tool failed"),
+        ):
+            handler = create_langchain_agents_handler(llm=MagicMock())
+            async for event in await handler.stream(_make_config(), "q"):
+                seen.append(event)
+        results = {
+            event["toolCallId"] for event in seen if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results == {"c1", "d1"}
+
 
 # ---------------------------------------------------------------------------
 # §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)
