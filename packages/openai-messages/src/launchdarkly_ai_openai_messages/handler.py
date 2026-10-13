@@ -28,6 +28,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.responses import map_responses_event
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -434,134 +435,6 @@ def _final_output_messages(output: str) -> list[SpanMessage]:
     ]
 
 
-_RESPONSES_ARG_DELTA = {
-    "response.function_call_arguments.delta": "delta",
-    "response.mcp_call_arguments.delta": "delta",
-    "response.custom_tool_call_input.delta": "delta",
-}
-_RESPONSES_ARG_DONE = {
-    "response.function_call_arguments.done": "arguments",
-    "response.mcp_call_arguments.done": "arguments",
-    "response.custom_tool_call_input.done": "input",
-}
-_RESPONSES_OPEN_TYPES = frozenset({"function_call", "mcp_call", "custom_tool_call"})
-_HOSTED_OUTPUT_FIELD = {
-    "mcp_call": "output",
-    "file_search_call": "results",
-    "code_interpreter_call": "outputs",
-}
-_HOSTED_TOOL_NAME = {
-    "file_search_call": "file_search",
-    "code_interpreter_call": "code_interpreter",
-}
-
-
-def _responses_call_id(event: Any, item_to_call: dict[str, str]) -> str:
-    direct = getattr(event, "call_id", None)
-    if isinstance(direct, str) and direct:
-        return direct
-    item_id = getattr(event, "item_id", None)
-    if isinstance(item_id, str) and item_id in item_to_call:
-        return item_to_call[item_id]
-    return item_id if isinstance(item_id, str) else ""
-
-
-def _json_safe(value: Any) -> Any:
-    """Plain JSON for a hosted tool payload.
-
-    File-search results and code-interpreter outputs are SDK model objects.
-    ``json.dumps`` rejects those, and a successful call would otherwise be
-    reported as a failed tool result.
-    """
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    dump = getattr(value, "model_dump", None)
-    if callable(dump):
-        try:
-            dumped = dump(mode="json")
-        except TypeError:
-            dumped = dump()
-        if dumped is not value:
-            return _json_safe(dumped)
-    return value
-
-
-def _hosted_item_result(
-    item: Any, emitter: TurnEmitter, item_to_call: dict[str, str]
-) -> list[dict[str, Any]]:
-    """Result for a hosted tool from ``response.output_item.done``.
-
-    The ``*.completed`` events only carry ``item_id``. Reading ``output`` off
-    them yields ``None``, and with capture on that becomes the string ``null``
-    and seals the call before the real item arrives.
-    """
-    item_type = getattr(item, "type", None)
-    if item_type not in _HOSTED_OUTPUT_FIELD:
-        return []
-    call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or ""
-    item_id = getattr(item, "id", None)
-    if isinstance(item_id, str) and isinstance(call_id, str) and call_id:
-        item_to_call[item_id] = call_id
-    call_id = str(call_id)
-    name = getattr(item, "name", None) or _HOSTED_TOOL_NAME.get(item_type, "")
-    events = emitter.tool_start(call_id, str(name))
-    events.extend(emitter.tool_end(call_id))
-    status = getattr(item, "status", None)
-    if status in ("failed", "incomplete") or getattr(item, "error", None):
-        events.extend(emitter.tool_result(call_id, failed=True))
-    else:
-        events.extend(
-            emitter.tool_result(
-                call_id,
-                _json_safe(getattr(item, _HOSTED_OUTPUT_FIELD[item_type], None)),
-            )
-        )
-    return events
-
-
-def _map_responses_event(
-    event: Any, emitter: TurnEmitter, item_to_call: dict[str, str]
-) -> list[dict[str, Any]]:
-    """Map one Responses stream event onto the AG-UI subset. Unknown events are ignored."""
-    kind = getattr(event, "type", None)
-    if kind == "response.created":
-        return emitter.end_text()
-    if kind == "response.output_text.delta":
-        delta = getattr(event, "delta", "")
-        if not isinstance(delta, str) or not delta:
-            return []
-        return emitter.text(delta)
-    if kind == "response.output_item.added":
-        item = getattr(event, "item", None)
-        if getattr(item, "type", None) not in _RESPONSES_OPEN_TYPES:
-            return []
-        call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or ""
-        name = getattr(item, "name", None) or ""
-        item_id = getattr(item, "id", None)
-        if isinstance(item_id, str) and isinstance(call_id, str) and call_id:
-            item_to_call[item_id] = call_id
-        return emitter.tool_start(str(call_id), str(name))
-    if kind in _RESPONSES_ARG_DELTA:
-        delta = getattr(event, "delta", "")
-        if not isinstance(delta, str):
-            return []
-        return emitter.tool_args(_responses_call_id(event, item_to_call), delta)
-    if kind in _RESPONSES_ARG_DONE:
-        arguments = getattr(event, _RESPONSES_ARG_DONE[kind], None)
-        return emitter.tool_end(
-            _responses_call_id(event, item_to_call), arguments=arguments
-        )
-    if kind == "response.mcp_call.failed":
-        return emitter.tool_result(_responses_call_id(event, item_to_call), failed=True)
-    if kind == "response.output_item.done":
-        return _hosted_item_result(getattr(event, "item", None), emitter, item_to_call)
-    return []
-
-
 async def _stream_gen(
     client: Any,
     config: AiConfigRep,
@@ -646,7 +519,7 @@ async def _stream_gen(
                 stream = client.responses.stream(**stream_params)
                 async with stream as s:
                     async for event in s:
-                        for rich in _map_responses_event(event, emitter, item_to_call):
+                        for rich in map_responses_event(event, emitter, item_to_call):
                             if rich.get("type") == "TEXT_MESSAGE_CONTENT":
                                 full_output += rich.get("delta") or ""
                             yield rich
@@ -731,7 +604,8 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
-                for rich in emitter.tool_result(str(tc.call_id), result):
+                # The model is sent str(result). The stream reports that same text.
+                for rich in emitter.tool_result(str(tc.call_id), str(result)):
                     yield rich
                 tool_outputs.append(
                     {

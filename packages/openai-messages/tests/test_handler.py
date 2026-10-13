@@ -1321,7 +1321,7 @@ class TestStreaming:
         assert start["parentMessageId"]
         assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
         result = next(event for event in hidden if event["type"] == "TOOL_CALL_RESULT")
-        assert "content" not in result
+        assert result["content"] == ""
 
         shown = await _events(True)
         args = next(event for event in shown if event["type"] == "TOOL_CALL_ARGS")
@@ -1361,76 +1361,71 @@ class TestStreaming:
         }
         assert results == {"c1", "c2"}
 
-    def test_hosted_completion_waits_for_the_output_item(self) -> None:
+    def test_parallel_argument_deltas_stay_on_their_call(self) -> None:
         from types import SimpleNamespace
 
-        from launchdarkly_ai_openai_messages.handler import _map_responses_event
         from launchdarkly_ai_server.agui import TurnEmitter
+        from launchdarkly_ai_server.responses import map_responses_event
 
         emitter = TurnEmitter(capture_content=True)
         ids: dict[str, str] = {}
-        added = SimpleNamespace(
-            type="response.output_item.added",
-            item=SimpleNamespace(
-                type="mcp_call", call_id="m1", id="item-1", name="search"
-            ),
-        )
-        completed = SimpleNamespace(
-            type="response.mcp_call.completed", item_id="item-1", output=None
-        )
-        done = SimpleNamespace(
-            type="response.output_item.done",
-            item=SimpleNamespace(
-                type="mcp_call",
-                call_id="m1",
-                id="item-1",
-                name="search",
-                status="completed",
-                output="found",
-            ),
-        )
         events: list[dict[str, Any]] = []
-        events.extend(_map_responses_event(added, emitter, ids))
-        events.extend(_map_responses_event(completed, emitter, ids))
-        events.extend(_map_responses_event(done, emitter, ids))
-        assert "null" not in str(events)
-        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
-        assert result["content"] == "found"
-        assert [event["type"] for event in events].count("TOOL_CALL_RESULT") == 1
 
-    def test_hosted_model_results_are_json_not_failures(self) -> None:
-        from types import SimpleNamespace
+        def feed(event: Any) -> None:
+            events.extend(map_responses_event(event, emitter, ids))
 
-        from launchdarkly_ai_openai_messages.handler import _map_responses_event
-        from launchdarkly_ai_server.agui import TurnEmitter
-
-        class _Row:
-            def model_dump(self, **_kwargs: Any) -> dict[str, str]:
-                return {"file_id": "f1", "text": "hit"}
-
-        def _done(item_type: str, call_id: str, field: str) -> Any:
-            return SimpleNamespace(
-                type="response.output_item.done",
+        feed(
+            SimpleNamespace(
+                type="response.output_item.added",
                 item=SimpleNamespace(
-                    type=item_type,
-                    id=call_id,
-                    status="completed",
-                    **{field: [_Row()]},
+                    type="function_call", id="fc_1", call_id="call_1", name="search"
                 ),
             )
-
-        for item_type, call_id, field in (
-            ("file_search_call", "fs1", "results"),
-            ("code_interpreter_call", "ci1", "outputs"),
-        ):
-            emitter = TurnEmitter(capture_content=True)
-            events = _map_responses_event(_done(item_type, call_id, field), emitter, {})
-            result = next(
-                event for event in events if event["type"] == "TOOL_CALL_RESULT"
+        )
+        feed(
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call", id="fc_2", call_id="call_2", name="other"
+                ),
             )
-            assert result["toolCallId"] == call_id
-            assert result["content"] == '[{"file_id":"f1","text":"hit"}]'
-            assert "metadata" not in result
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_1",
+                delta='{"q":',
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_2",
+                delta='{"n":',
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_1",
+                delta='"x"}',
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_2",
+                delta="1}",
+            )
+        )
+        by_id: dict[str, str] = {}
+        for event in events:
+            if event["type"] != "TOOL_CALL_ARGS":
+                continue
+            by_id[event["toolCallId"]] = (
+                by_id.get(event["toolCallId"], "") + event["delta"]
+            )
+        assert by_id == {"call_1": '{"q":"x"}', "call_2": '{"n":1}'}
 
     async def test_an_opened_call_without_a_function_result_is_closed(
         self, mock_openai: MagicMock
