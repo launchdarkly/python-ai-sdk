@@ -256,13 +256,22 @@ class _Reducer:
                     isinstance(completed_time, Mapping)
                     and "completed" in completed_time
                 )
-                # A completion for an earlier message must not close the
-                # message the consumer is reading now.
-                if not finished or message_id == self._text_message_id:
+                late_completion = (
+                    finished
+                    and self._text_message_id is not None
+                    and message_id != self._text_message_id
+                )
+                # Held parts for an earlier completed message cannot be
+                # inserted without either merging them into the current
+                # message or splitting that message. Drop those stale parts.
+                if late_completion:
+                    self._held.pop(message_id, None)
+                    self._held_tools.pop(message_id, None)
+                else:
                     events.extend(self._begin_message(message_id))
-                events.extend(self._flush_held(message_id))
-                for part in self._held_tools.pop(message_id, []):
-                    events.extend(self._emit_tool(part))
+                    events.extend(self._flush_held(message_id))
+                    for part in self._held_tools.pop(message_id, []):
+                        events.extend(self._emit_tool(part))
             else:
                 self._held.pop(message_id, None)
                 self._held_tools.pop(message_id, None)

@@ -232,8 +232,17 @@ class TestText:
                 text_delta("m1", "p1", "A"),
                 assistant_open("m2"),
                 text_delta("m2", "p2", "B1"),
+                text_delta("m3", "p3", "stale"),
+                tool_part(
+                    "c3",
+                    "completed",
+                    message_id="m3",
+                    raw_input={"command": "old"},
+                    output="old.txt",
+                ),
+                assistant_completed("m3"),
                 assistant_completed("m1"),
-                text_delta("m2", "p3", "B2"),
+                text_delta("m2", "p4", "B2"),
                 assistant_completed("m2"),
             ]
         )
@@ -250,6 +259,12 @@ class TestText:
         ]
         assert message_ids[1] == message_ids[2]
         assert message_ids[0] != message_ids[1]
+        assert "stale" not in texts
+        assert not any(
+            event.get("toolCallId") == "c3"
+            for event in events
+            if event["type"].startswith("TOOL_CALL")
+        )
 
     async def test_capture_off_hides_tool_content(self) -> None:
         built = create_opencode_handler(
