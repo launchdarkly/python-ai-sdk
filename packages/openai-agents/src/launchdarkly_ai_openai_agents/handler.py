@@ -847,12 +847,14 @@ async def _stream_gen(
         raise
     except Exception as exc:
         hooks.close_open_spans(exc)
-        while hooks.pending:
-            yield hooks.pending.pop(0)
-        for rich in hooks.emitter.fail_open():
-            yield rich
         _write_failed_run_usage(span, config, exc, run_usage)
         fail_span(span, exc, ended)
+        while hooks.pending:
+            yield hooks.pending.pop(0)
+        for rich in hooks.emitter.end_text():
+            yield rich
+        for rich in hooks.emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths: both already ended their spans through

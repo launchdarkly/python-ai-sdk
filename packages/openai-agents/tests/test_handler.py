@@ -1510,6 +1510,25 @@ class TestStreaming:
         assert StatusCode.ERROR in rec.root.statuses
         assert rec.root.ended == 1
 
+    async def test_a_failed_turn_closes_the_open_text_message(self) -> None:
+        err = RuntimeError("next turn failed")
+        turns = [{"deltas": ["Let me "], "error": err}]
+        agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, ""))
+        seen: list[dict[str, Any]] = []
+        with (
+            _patched_agents(agents_mod),
+            pytest.raises(RuntimeError, match="next turn failed"),
+        ):
+            async for event in await create_openai_agent_handler().stream(
+                CONFIG, "q", {}, {}
+            ):
+                seen.append(event)
+        starts = [event for event in seen if event["type"] == "TEXT_MESSAGE_START"]
+        ends = [event for event in seen if event["type"] == "TEXT_MESSAGE_END"]
+        assert len(starts) == 1
+        assert len(ends) == 1
+        assert ends[0]["messageId"] == starts[0]["messageId"]
+
     async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
         ctx, rec = _recording()
