@@ -957,10 +957,14 @@ version = "0.1.0"
 source = { editable = "packages/opencode-agents" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
+    { name = "opentelemetry-api" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "launchdarkly-ai-server", editable = "packages/client" }]
+requires-dist = [
+    { name = "launchdarkly-ai-server", editable = "packages/client" },
+    { name = "opentelemetry-api", specifier = ">=1.25" },
+]
 
 [[package]]
 name = "launchdarkly-ai-python"

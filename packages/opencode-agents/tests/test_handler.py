@@ -12,6 +12,7 @@ import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_opencode_agents import (
     OpenCodeSessionError,
     create_opencode_handler,
+    opencode_agents,
 )
 from launchdarkly_ai_server import SDKOptions, config, configure
 
@@ -34,15 +35,22 @@ def bus(kind: str, **properties: Any) -> dict[str, Any]:
     return {"type": kind, "properties": properties}
 
 
-def text_delta(message_id: str, part_id: str, delta: str) -> dict[str, Any]:
-    return bus(
-        "message.part.delta",
-        sessionID="ses",
-        messageID=message_id,
-        partID=part_id,
-        field="text",
-        delta=delta,
-    )
+def text_delta(
+    message_id: str,
+    part_id: str | None,
+    delta: str,
+    *,
+    session_id: str = "ses",
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "sessionID": session_id,
+        "messageID": message_id,
+        "field": "text",
+        "delta": delta,
+    }
+    if part_id is not None:
+        properties["partID"] = part_id
+    return bus("message.part.delta", **properties)
 
 
 def tool_part(
@@ -96,7 +104,14 @@ def assistant_completed(
 
 
 def source(events: list[dict[str, Any]]) -> Any:
-    async def _events() -> AsyncIterator[dict[str, Any]]:
+    async def _events(
+        config: Any,
+        user_input: str | None,
+        variables: Any,
+        history: Any,
+        session_id: str | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        del config, user_input, variables, history, session_id
         for event in events:
             yield event
 
@@ -157,7 +172,7 @@ class TestSurface:
 
 
 class TestText:
-    async def test_text_around_a_tool_is_chunks_then_done(self) -> None:
+    async def test_text_around_a_tool_keeps_text_and_the_call(self) -> None:
         events = await collect(
             [
                 assistant_open("m1"),
@@ -192,7 +207,7 @@ class TestText:
         assert events[-1]["output"] == "Looking upDone."
         assert types_of(events).count("TOOL_CALL_START") == 1
 
-    async def test_a_failed_tool_does_not_leak_into_the_stream(self) -> None:
+    async def test_a_failed_tool_masks_the_provider_body(self) -> None:
         events = await collect(
             [
                 tool_part(
@@ -431,7 +446,12 @@ class TestText:
                     text_delta("m1", "p1", "Hi"),
                     {
                         "type": "session.error",
-                        "properties": {"error": {"data": {"message": "secret-body"}}},
+                        "properties": {
+                            "error": {
+                                "name": "ProviderAuthError",
+                                "data": {"message": "secret-body"},
+                            }
+                        },
                     },
                 ]
             ),
@@ -440,6 +460,7 @@ class TestText:
         with pytest.raises(OpenCodeSessionError, match="session failed") as raised:
             async for event in await handler.stream({}, "hi", None, None):
                 seen.append(event["type"])
+        assert "ProviderAuthError" in str(raised.value)
         assert "secret-body" not in str(raised.value)
         assert "done" not in seen
 
@@ -499,3 +520,242 @@ class TestStableStream:
                 seen.append(event)
         assert [event["type"] for event in seen] == ["chunk"]
         assert seen[0]["text"] == "Hi"
+
+
+class TestInvocation:
+    def test_events_is_required(self) -> None:
+        with pytest.raises(TypeError):
+            create_opencode_handler()  # type: ignore[call-arg]
+
+    async def test_events_receives_the_prompt_and_the_session(self) -> None:
+        seen: dict[str, Any] = {}
+
+        async def events(
+            config: Any,
+            user_input: str | None,
+            variables: Any,
+            history: Any,
+            session_id: str | None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            seen["instructions"] = config.get("instructions")
+            seen["user_input"] = user_input
+            seen["variables"] = variables
+            seen["history"] = history
+            seen["session_id"] = session_id
+            yield assistant_open("m1")
+            yield text_delta("m1", "p1", "Hi")
+            yield assistant_completed("m1")
+
+        handler = create_opencode_handler(events=events, session_id="ses")
+        events_out = [
+            event
+            async for event in await handler.stream(
+                {"instructions": "Be brief."},
+                "Hello",
+                None,
+                {"name": "Ada"},
+                [{"role": "user", "content": "earlier"}],
+            )
+        ]
+        assert seen == {
+            "instructions": "Be brief.",
+            "user_input": "Hello",
+            "variables": {"name": "Ada"},
+            "history": [{"role": "user", "content": "earlier"}],
+            "session_id": "ses",
+        }
+        assert events_out[-1]["output"] == "Hi"
+
+    async def test_other_sessions_are_ignored_and_idle_ends_the_run(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi", session_id="ses"),
+                text_delta("m9", "p9", " OTHER", session_id="other"),
+                {
+                    "type": "session.error",
+                    "properties": {
+                        "sessionID": "other",
+                        "error": {"name": "OtherError", "data": {"message": "nope"}},
+                    },
+                },
+                text_delta("m1", "p1", "!", session_id="ses"),
+                bus("session.idle", sessionID="ses"),
+                text_delta("m1", "p1", "AFTER", session_id="ses"),
+            ],
+        )
+        assert events[-1]["output"] == "Hi!"
+        assert "OTHER" not in events[-1]["output"]
+        assert "AFTER" not in events[-1]["output"]
+        assert "nope" not in str(events)
+
+    async def test_a_delta_without_part_id_is_not_repeated_by_its_snapshot(
+        self,
+    ) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", None, "Hi"),
+                bus(
+                    "message.part.updated",
+                    part={"id": "p1", "messageID": "m1", "type": "text", "text": "Hi"},
+                ),
+                assistant_completed("m1"),
+            ],
+        )
+        contents = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert contents == ["Hi"]
+        assert events[-1]["output"] == "Hi"
+
+    async def test_skip_judges_runs_events_once(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        judged = {
+            **VARIATION,
+            "judgeConfiguration": {
+                "judges": [{"key": "judge-flag", "samplingRate": 1}]
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=judged)
+        calls: list[str | None] = []
+
+        async def events(
+            config: Any,
+            user_input: str | None,
+            variables: Any,
+            history: Any,
+            session_id: str | None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            del config, variables, history, session_id
+            calls.append(user_input)
+            yield assistant_open("m1")
+            yield text_delta("m1", "p1", "Hi")
+            yield assistant_completed("m1")
+
+        handler = create_opencode_handler(events=events, session_id="ses")
+        skipped = [
+            event
+            async for event in config(
+                key="flag", handler=handler, skip_judges=True
+            ).stream("q", CONTEXT)
+        ]
+        assert [event["type"] for event in skipped] == ["chunk", "done"]
+        assert calls == ["q"]
+
+        calls.clear()
+        await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
+        assert calls[0] == "q"
+        assert len(calls) == 2
+        assert calls[1] != "q"
+
+    async def test_the_wrapper_forwards_variables_history_and_session(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        async def events(
+            config: Any,
+            user_input: str | None,
+            variables: Any,
+            history: Any,
+            session_id: str | None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            seen["user_input"] = user_input
+            seen["name"] = (
+                variables.get("name") if isinstance(variables, dict) else None
+            )
+            seen["history"] = history
+            seen["session_id"] = session_id
+            seen["instructions"] = (
+                config.get("instructions") if isinstance(config, dict) else None
+            )
+            yield assistant_open("m1")
+            yield text_delta("m1", "p1", "Hi")
+            yield assistant_completed("m1")
+
+        result = await opencode_agents(
+            "flag",
+            "Hello",
+            CONTEXT,
+            events=events,
+            session_id="ses",
+            variables={"name": "Ada"},
+            history=[{"role": "user", "content": "earlier"}],
+            skip_judges=True,
+        )
+        assert result.response == "Hi"
+        assert seen["user_input"] == "Hello"
+        assert seen["name"] == "Ada"
+        assert seen["history"] == [{"role": "user", "content": "earlier"}]
+        assert seen["session_id"] == "ses"
+        assert seen["instructions"] == "Be brief."
+
+    async def test_a_run_opens_an_invoke_agent_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from launchdarkly_ai_opencode_agents import spans as span_module
+
+        class _Span:
+            def __init__(self, name: str, context: Any = None) -> None:
+                self.name = name
+                self.context = context
+                self.attributes: dict[str, Any] = {}
+                self.events: list[str] = []
+
+            def set_attribute(self, key: str, value: Any) -> None:
+                self.attributes[key] = value
+
+            def add_event(
+                self, name: str, attributes: dict[str, Any] | None = None
+            ) -> None:
+                self.events.append(name)
+
+            def set_status(self, code: Any, description: str | None = None) -> None:
+                return None
+
+            def record_exception(self, exc: BaseException) -> None:
+                return None
+
+            def end(self) -> None:
+                return None
+
+        class _Tracer:
+            def __init__(self) -> None:
+                self.spans: list[_Span] = []
+
+            def get_tracer(self, name: str) -> _Tracer:
+                return self
+
+            def start_span(self, name: str, context: Any = None) -> _Span:
+                span = _Span(name, context)
+                self.spans.append(span)
+                return span
+
+            def set_span_in_context(self, span: _Span) -> Any:
+                return span
+
+        tracer = _Tracer()
+        monkeypatch.setattr(span_module, "trace", tracer)
+        handler = create_opencode_handler(
+            events=source(
+                [
+                    assistant_open("m1"),
+                    text_delta("m1", "p1", "Hi"),
+                    assistant_completed("m1"),
+                ]
+            )
+        )
+        seen = [event async for event in await handler.stream({}, "hi", None, None)]
+        assert seen[-1]["output"] == "Hi"
+        assert tracer.spans[0].name == "invoke_agent"
+        assert tracer.spans[0].attributes["gen_ai.operation.name"] == "invoke_agent"
+        assert tracer.spans[0].attributes["launchdarkly.operation.type"] == "gen_ai"
+
+
+async def _drain(stream: Any) -> None:
+    async for _event in stream:
+        pass
