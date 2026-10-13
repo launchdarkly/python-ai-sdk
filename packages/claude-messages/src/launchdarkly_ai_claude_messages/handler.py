@@ -645,6 +645,8 @@ async def _stream_gen(
             if final_msg.stop_reason != "tool_use":
                 for rich in emitter.end_text():
                     yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -738,6 +740,8 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through

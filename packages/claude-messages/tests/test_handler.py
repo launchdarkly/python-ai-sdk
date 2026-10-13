@@ -1357,6 +1357,43 @@ class TestStreaming:
         )
         assert shown_result["content"] == "secret"
 
+    async def test_a_streamed_tool_without_tool_use_is_closed(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        started = MagicMock()
+        started.type = "content_block_start"
+        started.index = 0
+        started.content_block = MagicMock(type="tool_use", id="c1", name="search")
+        _ctx, final = _make_stream_context([])
+        final.stop_reason = "end_turn"
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield started
+                yield _make_stream_event("Hi")
+
+            async def get_final_message(self) -> Any:
+                return final
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_anthropic.messages.stream = MagicMock(return_value=_mgr())
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            handler = create_claude_messages_handler()
+            events = [event async for event in await handler.stream(CONFIG, "q")]
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in events
+        )
+
     async def test_all_chunks_before_done(self, mock_anthropic: MagicMock) -> None:
         import launchdarkly_ai_claude_messages.spans as spans_mod
         from launchdarkly_ai_claude_messages import create_claude_messages_handler
