@@ -44,7 +44,11 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
 
-### Run an evaluation from code
+### Run an evaluation from code (experimental)
+
+> **Experimental.** Import Evaluations from Code from `launchdarkly_ai_server.experimental.evaluations`;
+> none of these names is exported from the package root. They may change in a minor release,
+> so review the changelog when you upgrade.
 
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
@@ -55,7 +59,7 @@ import asyncio
 import sys
 
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server import init_evaluations
+from launchdarkly_ai_server.experimental.evaluations import init_evaluations
 
 
 async def main() -> int:
@@ -107,7 +111,9 @@ Pass `criteria` to `run()` to score every generated row. A `Judge` references an
 ```python
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server import DatasetRow, Judge, Scorer, init_evaluations
+from launchdarkly_ai_server.experimental.evaluations import (
+    DatasetRow, Judge, Scorer, init_evaluations,
+)
 
 
 def mentions_policy(row: DatasetRow, output: str | None) -> bool:
@@ -236,7 +242,7 @@ warning and ignored.
 Pass `tools` to `run()` as a list of `EvalTool`. Construct one to define a tool in code. Await `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
 
 ```python
-from launchdarkly_ai_server import EvalTool, init_evaluations
+from launchdarkly_ai_server.experimental.evaluations import EvalTool, init_evaluations
 
 
 def lookup_order(order_id: str) -> str:
