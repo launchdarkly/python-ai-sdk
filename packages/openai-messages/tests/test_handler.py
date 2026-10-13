@@ -1281,10 +1281,55 @@ class TestStreaming:
         with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             events = [e async for e in await h.stream(CONFIG, "q")]
-        chunks = [e for e in events if e.get("type") == "chunk"]
-        assert len(chunks) == 2
-        assert chunks[0]["text"] == "hello "
-        assert chunks[1]["text"] == "world"
+        deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["hello ", "world"]
+        assert events[0]["type"] == "TEXT_MESSAGE_START"
+        assert events[-2]["type"] == "TEXT_MESSAGE_END"
+        assert events[-1]["type"] == "done"
+
+    async def test_tool_lifecycle_hides_payloads_until_capture_is_on(
+        self, mock_openai: MagicMock
+    ) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        tool_call = _function_call_item("search", "c1", {"q": "x"})
+
+        async def search(args: dict[str, Any]) -> str:
+            return "secret"
+
+        async def _events(capture: bool) -> list[dict[str, Any]]:
+            mock_openai.responses.stream = MagicMock(
+                side_effect=[
+                    _make_openai_stream_context(["Looking"], output=[tool_call]),
+                    _make_openai_stream_context(["Done"]),
+                ]
+            )
+            with patch.object(spans_mod, "_HAS_OTEL", False):
+                handler = create_openai_messages_handler(capture_content=capture)
+                return [
+                    event
+                    async for event in await handler.stream(
+                        CONFIG, "q", {"search": search}
+                    )
+                ]
+
+        hidden = await _events(False)
+        start = next(event for event in hidden if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "search"
+        assert start["parentMessageId"]
+        assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+        result = next(event for event in hidden if event["type"] == "TOOL_CALL_RESULT")
+        assert "content" not in result
+
+        shown = await _events(True)
+        args = next(event for event in shown if event["type"] == "TOOL_CALL_ARGS")
+        assert args["delta"] == json.dumps({"q": "x"})
+        shown_result = next(
+            event for event in shown if event["type"] == "TOOL_CALL_RESULT"
+        )
+        assert shown_result["content"] == "secret"
 
     async def test_yields_exactly_one_done_event(self, mock_openai: MagicMock) -> None:
         import launchdarkly_ai_openai_messages.spans as spans_mod

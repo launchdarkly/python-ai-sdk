@@ -1325,11 +1325,57 @@ class TestStreaming:
                     CONFIG, "q", {}, {}
                 )
             ]
-        chunks = [e["text"] for e in events if e["type"] == "chunk"]
-        assert chunks == ["Hello", " world"]
+        deltas = [e["delta"] for e in events if e["type"] == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["Hello", " world"]
+        assert events[0]["type"] == "TEXT_MESSAGE_START"
+        assert any(e["type"] == "TEXT_MESSAGE_END" for e in events)
         done = [e for e in events if e["type"] == "done"]
         assert len(done) == 1
         assert done[0]["output"] == "Hello world"
+
+    async def test_tool_lifecycle_hides_payloads_until_capture_is_on(self) -> None:
+        turns = [
+            {
+                "deltas": ["Looking"],
+                "tool_calls": [
+                    {
+                        "name": "search",
+                        "id": "c1",
+                        "args": {"q": "x"},
+                        "result": "secret",
+                    }
+                ],
+                "output": [],
+            }
+        ]
+
+        async def _events(capture: bool) -> list[dict[str, Any]]:
+            agents_mod = _fake_agents_module(
+                run_streamed=_make_run_streamed(turns, "done")
+            )
+            with _patched_agents(agents_mod):
+                return [
+                    event
+                    async for event in await create_openai_agent_handler(
+                        capture_content=capture
+                    ).stream(CONFIG, "q", {}, {})
+                ]
+
+        hidden = await _events(False)
+        start = next(event for event in hidden if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "search"
+        assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+        result = next(event for event in hidden if event["type"] == "TOOL_CALL_RESULT")
+        assert "content" not in result
+
+        shown = await _events(True)
+        args = next(event for event in shown if event["type"] == "TOOL_CALL_ARGS")
+        assert args["delta"] == json.dumps({"q": "x"})
+        shown_result = next(
+            event for event in shown if event["type"] == "TOOL_CALL_RESULT"
+        )
+        assert shown_result["content"] == "secret"
 
     async def test_opens_the_same_root_span_name_as_the_blocking_path(self) -> None:
         ctx, rec = _recording()

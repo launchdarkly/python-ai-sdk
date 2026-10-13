@@ -27,6 +27,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -433,6 +434,95 @@ def _final_output_messages(output: str) -> list[SpanMessage]:
     ]
 
 
+_RESPONSES_ARG_DELTA = {
+    "response.function_call_arguments.delta": "delta",
+    "response.mcp_call_arguments.delta": "delta",
+    "response.custom_tool_call_input.delta": "delta",
+}
+_RESPONSES_ARG_DONE = {
+    "response.function_call_arguments.done": "arguments",
+    "response.mcp_call_arguments.done": "arguments",
+    "response.custom_tool_call_input.done": "input",
+}
+_RESPONSES_OPEN_TYPES = frozenset({"function_call", "mcp_call", "custom_tool_call"})
+_RESPONSES_COMPLETED = {
+    "response.file_search_call.completed": "file_search",
+    "response.code_interpreter_call.completed": "code_interpreter",
+}
+
+
+def _responses_call_id(event: Any, item_to_call: dict[str, str]) -> str:
+    direct = getattr(event, "call_id", None)
+    if isinstance(direct, str) and direct:
+        return direct
+    item_id = getattr(event, "item_id", None)
+    if isinstance(item_id, str) and item_id in item_to_call:
+        return item_to_call[item_id]
+    return item_id if isinstance(item_id, str) else ""
+
+
+def _map_responses_event(
+    event: Any, emitter: TurnEmitter, item_to_call: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Map one Responses stream event onto the AG-UI subset. Unknown events are ignored."""
+    kind = getattr(event, "type", None)
+    if kind == "response.output_text.delta":
+        delta = getattr(event, "delta", "")
+        if not isinstance(delta, str) or not delta:
+            return []
+        return emitter.text(delta)
+    if kind == "response.output_item.added":
+        item = getattr(event, "item", None)
+        if getattr(item, "type", None) not in _RESPONSES_OPEN_TYPES:
+            return []
+        call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or ""
+        name = getattr(item, "name", None) or ""
+        item_id = getattr(item, "id", None)
+        if isinstance(item_id, str) and isinstance(call_id, str) and call_id:
+            item_to_call[item_id] = call_id
+        return emitter.tool_start(str(call_id), str(name))
+    if kind in _RESPONSES_ARG_DELTA:
+        delta = getattr(event, "delta", "")
+        if not isinstance(delta, str):
+            return []
+        return emitter.tool_args(_responses_call_id(event, item_to_call), delta)
+    if kind in _RESPONSES_ARG_DONE:
+        arguments = getattr(event, _RESPONSES_ARG_DONE[kind], None)
+        return emitter.tool_end(
+            _responses_call_id(event, item_to_call), arguments=arguments
+        )
+    if kind in ("response.mcp_call.completed", "response.mcp_call.failed"):
+        call_id = _responses_call_id(event, item_to_call)
+        item = getattr(event, "item", None)
+        if not call_id and item is not None:
+            raw_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+            call_id = raw_id if isinstance(raw_id, str) else ""
+        if kind == "response.mcp_call.failed":
+            return emitter.tool_result(call_id, failed=True)
+        output = getattr(event, "output", None)
+        if output is None and item is not None:
+            output = getattr(item, "output", None)
+        return emitter.tool_result(call_id, output)
+    if kind in _RESPONSES_COMPLETED:
+        item = getattr(event, "item", None)
+        raw_id = ""
+        if item is not None:
+            candidate = getattr(item, "call_id", None) or getattr(item, "id", None)
+            raw_id = candidate if isinstance(candidate, str) else ""
+        if not raw_id:
+            candidate = getattr(event, "item_id", None)
+            raw_id = candidate if isinstance(candidate, str) else ""
+        name = _RESPONSES_COMPLETED[kind]
+        events = emitter.tool_start(raw_id, name)
+        events.extend(emitter.tool_end(raw_id))
+        output = getattr(item, "results", None) if item is not None else None
+        if output is None and item is not None:
+            output = getattr(item, "outputs", None)
+        events.extend(emitter.tool_result(raw_id, output))
+        return events
+    return []
+
+
 async def _stream_gen(
     client: Any,
     config: AiConfigRep,
@@ -485,6 +575,8 @@ async def _stream_gen(
         previous_response_id: str | None = None
         current_input: Any = input_messages
         steps = 0
+        emitter = TurnEmitter(capture_content=capture_content)
+        item_to_call: dict[str, str] = {}
 
         while True:
             model_span = start_model_span(config, parent)
@@ -515,10 +607,10 @@ async def _stream_gen(
                 stream = client.responses.stream(**stream_params)
                 async with stream as s:
                     async for event in s:
-                        if getattr(event, "type", None) == "response.output_text.delta":
-                            text = getattr(event, "delta", "")
-                            full_output += text
-                            yield {"type": "chunk", "text": text}
+                        for rich in _map_responses_event(event, emitter, item_to_call):
+                            if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                                full_output += rich.get("delta") or ""
+                            yield rich
 
                     final_resp = await s.get_final_response()
 
@@ -548,6 +640,8 @@ async def _stream_gen(
                 if getattr(item, "type", None) == "function_call"
             ]
             if not tool_calls:
+                for rich in emitter.end_text():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -557,6 +651,13 @@ async def _stream_gen(
             steps += 1
 
             previous_response_id = getattr(final_resp, "id", None)
+            for tc in tool_calls:
+                for rich in emitter.tool_start(str(tc.call_id), str(tc.name)):
+                    yield rich
+                for rich in emitter.tool_end(str(tc.call_id), arguments=tc.arguments):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             tool_outputs = []
             for tc in tool_calls:
                 tool_span = start_tool_span(tc.name, tc.call_id, parent)
@@ -585,10 +686,14 @@ async def _stream_gen(
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     open_tool_span = None
+                    for rich in emitter.tool_result(str(tc.call_id), failed=True):
+                        yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                for rich in emitter.tool_result(str(tc.call_id), result):
+                    yield rich
                 tool_outputs.append(
                     {
                         "type": "function_call_output",

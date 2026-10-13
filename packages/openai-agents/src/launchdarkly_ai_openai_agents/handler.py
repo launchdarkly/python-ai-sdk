@@ -45,6 +45,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -249,10 +250,14 @@ class _SpanningHooks(_RunHooksBase):
         self.run_usage = run_usage
         self.open_model_span: Any = None
         self.open_tool_spans: dict[str, Any] = {}
+        self.emitter = TurnEmitter(capture_content=capture_content)
+        self.pending: list[dict[str, Any]] = []
+        self.item_to_call: dict[str, str] = {}
 
     async def on_llm_start(
         self, context: Any, agent: Any, system_prompt: str | None, input_items: Any
     ) -> None:
+        self.pending.extend(self.emitter.end_text())
         span = start_model_span(self.config, self.parent)
         self.open_model_span = span
         if self.capture_content:
@@ -319,6 +324,9 @@ class _SpanningHooks(_RunHooksBase):
         # abandon_open_spans both walk this dict, so a span missing from it never ends and never
         # exports.
         self.open_tool_spans[str(call_id)] = span
+        self.pending.extend(self.emitter.tool_start(str(call_id), str(name)))
+        tool_args = getattr(context, "tool_arguments", None)
+        self.pending.extend(self.emitter.tool_end(str(call_id), arguments=tool_args))
         if self.capture_content:
             # `tool_arguments` is the raw JSON args string the model produced. Parsed here rather
             # than passed through, per TELEMETRY-CONTRACT.md section 12: arguments hold the object
@@ -335,7 +343,9 @@ class _SpanningHooks(_RunHooksBase):
     async def on_tool_end(
         self, context: Any, agent: Any, tool: Any, result: Any
     ) -> None:
-        span = self.open_tool_spans.pop(self._tool_span_key(context, tool), None)
+        call_id = self._tool_span_key(context, tool)
+        self.pending.extend(self.emitter.tool_result(str(call_id), result))
+        span = self.open_tool_spans.pop(call_id, None)
         if span is None:
             return
         # Once popped, ending it is this method's job alone: nothing else knows the span exists. A
@@ -576,6 +586,95 @@ def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHa
     )
 
 
+_RESPONSES_ARG_DELTA = {
+    "response.function_call_arguments.delta": "delta",
+    "response.mcp_call_arguments.delta": "delta",
+    "response.custom_tool_call_input.delta": "delta",
+}
+_RESPONSES_ARG_DONE = {
+    "response.function_call_arguments.done": "arguments",
+    "response.mcp_call_arguments.done": "arguments",
+    "response.custom_tool_call_input.done": "input",
+}
+_RESPONSES_OPEN_TYPES = frozenset({"function_call", "mcp_call", "custom_tool_call"})
+_RESPONSES_COMPLETED = {
+    "response.file_search_call.completed": "file_search",
+    "response.code_interpreter_call.completed": "code_interpreter",
+}
+
+
+def _responses_call_id(event: Any, item_to_call: dict[str, str]) -> str:
+    direct = getattr(event, "call_id", None)
+    if isinstance(direct, str) and direct:
+        return direct
+    item_id = getattr(event, "item_id", None)
+    if isinstance(item_id, str) and item_id in item_to_call:
+        return item_to_call[item_id]
+    return item_id if isinstance(item_id, str) else ""
+
+
+def _map_responses_event(
+    event: Any, emitter: TurnEmitter, item_to_call: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Map one Responses stream event onto the AG-UI subset. Unknown events are ignored."""
+    kind = getattr(event, "type", None)
+    if kind == "response.output_text.delta":
+        delta = getattr(event, "delta", "")
+        if not isinstance(delta, str) or not delta:
+            return []
+        return emitter.text(delta)
+    if kind == "response.output_item.added":
+        item = getattr(event, "item", None)
+        if getattr(item, "type", None) not in _RESPONSES_OPEN_TYPES:
+            return []
+        call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or ""
+        name = getattr(item, "name", None) or ""
+        item_id = getattr(item, "id", None)
+        if isinstance(item_id, str) and isinstance(call_id, str) and call_id:
+            item_to_call[item_id] = call_id
+        return emitter.tool_start(str(call_id), str(name))
+    if kind in _RESPONSES_ARG_DELTA:
+        delta = getattr(event, "delta", "")
+        if not isinstance(delta, str):
+            return []
+        return emitter.tool_args(_responses_call_id(event, item_to_call), delta)
+    if kind in _RESPONSES_ARG_DONE:
+        arguments = getattr(event, _RESPONSES_ARG_DONE[kind], None)
+        return emitter.tool_end(
+            _responses_call_id(event, item_to_call), arguments=arguments
+        )
+    if kind in ("response.mcp_call.completed", "response.mcp_call.failed"):
+        call_id = _responses_call_id(event, item_to_call)
+        item = getattr(event, "item", None)
+        if not call_id and item is not None:
+            raw_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+            call_id = raw_id if isinstance(raw_id, str) else ""
+        if kind == "response.mcp_call.failed":
+            return emitter.tool_result(call_id, failed=True)
+        output = getattr(event, "output", None)
+        if output is None and item is not None:
+            output = getattr(item, "output", None)
+        return emitter.tool_result(call_id, output)
+    if kind in _RESPONSES_COMPLETED:
+        item = getattr(event, "item", None)
+        raw_id = ""
+        if item is not None:
+            candidate = getattr(item, "call_id", None) or getattr(item, "id", None)
+            raw_id = candidate if isinstance(candidate, str) else ""
+        if not raw_id:
+            candidate = getattr(event, "item_id", None)
+            raw_id = candidate if isinstance(candidate, str) else ""
+        name = _RESPONSES_COMPLETED[kind]
+        events = emitter.tool_start(raw_id, name)
+        events.extend(emitter.tool_end(raw_id))
+        output = getattr(item, "results", None) if item is not None else None
+        if output is None and item is not None:
+            output = getattr(item, "outputs", None)
+        events.extend(emitter.tool_result(raw_id, output))
+        return events
+    return []
+
+
 def _stringify_output(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -644,16 +743,23 @@ async def _stream_gen(
         full_output = ""
 
         async for event in streamed.stream_events():
+            while hooks.pending:
+                yield hooks.pending.pop(0)
             if event.type == "raw_response_event":
                 raw = getattr(event, "data", None)
-                if (
-                    raw is not None
-                    and getattr(raw, "type", None) == "response.output_text.delta"
-                ):
-                    delta = getattr(raw, "delta", "")
-                    if isinstance(delta, str) and delta:
-                        yield {"type": "chunk", "text": delta}
-                        full_output += delta
+                if raw is not None:
+                    for rich in _map_responses_event(
+                        raw, hooks.emitter, hooks.item_to_call
+                    ):
+                        if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                            full_output += rich.get("delta") or ""
+                        yield rich
+        while hooks.pending:
+            yield hooks.pending.pop(0)
+        for rich in hooks.emitter.end_text():
+            yield rich
+        for rich in hooks.emitter.fail_open():
+            yield rich
 
         stream_completed = True
         final_output = streamed.final_output
@@ -685,6 +791,10 @@ async def _stream_gen(
         raise
     except Exception as exc:
         hooks.close_open_spans(exc)
+        while hooks.pending:
+            yield hooks.pending.pop(0)
+        for rich in hooks.emitter.fail_open():
+            yield rich
         _write_failed_run_usage(span, config, exc, run_usage)
         fail_span(span, exc, ended)
         raise
