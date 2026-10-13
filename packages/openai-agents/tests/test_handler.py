@@ -2174,3 +2174,36 @@ class TestCancelledStreamSaysCancelled:
 
         assert rec.root.attributes.get("launchdarkly.run.cancelled") is True
         assert "launchdarkly.stream.abandoned" not in rec.root.attributes
+
+
+class TestHostedToolResults:
+    def test_model_objects_are_json_not_failures(self) -> None:
+        from types import SimpleNamespace
+
+        from launchdarkly_ai_openai_agents.handler import _map_responses_event
+        from launchdarkly_ai_server.agui import TurnEmitter
+
+        class _Row:
+            def model_dump(self, **_kwargs: object) -> dict[str, str]:
+                return {"file_id": "f1", "text": "hit"}
+
+        for item_type, call_id, field in (
+            ("file_search_call", "fs1", "results"),
+            ("code_interpreter_call", "ci1", "outputs"),
+        ):
+            emitter = TurnEmitter(capture_content=True)
+            done = SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type=item_type,
+                    id=call_id,
+                    status="completed",
+                    **{field: [_Row()]},
+                ),
+            )
+            events = _map_responses_event(done, emitter, {})
+            result = next(
+                event for event in events if event["type"] == "TOOL_CALL_RESULT"
+            )
+            assert result["content"] == '[{"file_id":"f1","text":"hit"}]'
+            assert "metadata" not in result

@@ -149,6 +149,16 @@ class TestTurnEmitter:
         assert "content" not in events[-1]
         assert events[-1]["metadata"]["launchdarkly"]["toolFailed"] is True
 
+    def test_tool_end_extends_a_streamed_argument_prefix(self) -> None:
+        emitter = TurnEmitter(capture_content=True)
+        events = emitter.tool_start("a", "search")
+        events.extend(emitter.tool_args("a", '{"q":'))
+        events.extend(emitter.tool_end("a", arguments={"q": "x"}))
+        deltas = [
+            event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
+        ]
+        assert "".join(deltas) == '{"q":"x"}'
+
     def test_a_second_start_for_the_same_id_is_dropped(self) -> None:
         emitter = TurnEmitter(capture_content=True)
         assert emitter.tool_start("a", "search")

@@ -1398,6 +1398,130 @@ class TestStreaming:
         assert result["content"] == "found"
         assert [event["type"] for event in events].count("TOOL_CALL_RESULT") == 1
 
+    def test_hosted_model_results_are_json_not_failures(self) -> None:
+        from types import SimpleNamespace
+
+        from launchdarkly_ai_openai_messages.handler import _map_responses_event
+        from launchdarkly_ai_server.agui import TurnEmitter
+
+        class _Row:
+            def model_dump(self, **_kwargs: Any) -> dict[str, str]:
+                return {"file_id": "f1", "text": "hit"}
+
+        def _done(item_type: str, call_id: str, field: str) -> Any:
+            return SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type=item_type,
+                    id=call_id,
+                    status="completed",
+                    **{field: [_Row()]},
+                ),
+            )
+
+        for item_type, call_id, field in (
+            ("file_search_call", "fs1", "results"),
+            ("code_interpreter_call", "ci1", "outputs"),
+        ):
+            emitter = TurnEmitter(capture_content=True)
+            events = _map_responses_event(_done(item_type, call_id, field), emitter, {})
+            result = next(
+                event for event in events if event["type"] == "TOOL_CALL_RESULT"
+            )
+            assert result["toolCallId"] == call_id
+            assert result["content"] == '[{"file_id":"f1","text":"hit"}]'
+            assert "metadata" not in result
+
+    async def test_an_opened_call_without_a_function_result_is_closed(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from types import SimpleNamespace
+
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        added = SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call", call_id="c1", id="item-1", name="search"
+            ),
+        )
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield added
+
+            async def get_final_response(self) -> Any:
+                final = MagicMock()
+                final.output = []
+                final.status = "completed"
+                final.incomplete_details = None
+                final.usage = MagicMock(input_tokens=1, output_tokens=1)
+                final.usage.input_tokens_details = MagicMock(cached_tokens=0)
+                final.id = "resp-stream"
+                final.model = "gpt-4o"
+                return final
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_mgr())
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            handler = create_openai_messages_handler()
+            events = [event async for event in await handler.stream(CONFIG, "q")]
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in events
+        )
+
+    async def test_a_provider_error_closes_an_opened_call(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from types import SimpleNamespace
+
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        added = SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call", call_id="c1", id="item-1", name="search"
+            ),
+        )
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield added
+                raise RuntimeError("stream broke")
+
+            async def get_final_response(self) -> Any:
+                raise AssertionError("final response is not read")
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_mgr())
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="stream broke"),
+        ):
+            handler = create_openai_messages_handler()
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in seen
+        )
+
     async def test_yields_exactly_one_done_event(self, mock_openai: MagicMock) -> None:
         import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler

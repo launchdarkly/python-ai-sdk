@@ -466,6 +466,30 @@ def _responses_call_id(event: Any, item_to_call: dict[str, str]) -> str:
     return item_id if isinstance(item_id, str) else ""
 
 
+def _json_safe(value: Any) -> Any:
+    """Plain JSON for a hosted tool payload.
+
+    File-search results and code-interpreter outputs are SDK model objects.
+    ``json.dumps`` rejects those, and a successful call would otherwise be
+    reported as a failed tool result.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            dumped = dump(mode="json")
+        except TypeError:
+            dumped = dump()
+        if dumped is not value:
+            return _json_safe(dumped)
+    return value
+
+
 def _hosted_item_result(
     item: Any, emitter: TurnEmitter, item_to_call: dict[str, str]
 ) -> list[dict[str, Any]]:
@@ -492,7 +516,8 @@ def _hosted_item_result(
     else:
         events.extend(
             emitter.tool_result(
-                call_id, getattr(item, _HOSTED_OUTPUT_FIELD[item_type], None)
+                call_id,
+                _json_safe(getattr(item, _HOSTED_OUTPUT_FIELD[item_type], None)),
             )
         )
     return events
@@ -644,6 +669,8 @@ async def _stream_gen(
             except Exception as exc:
                 fail_span(model_span, exc, ended)
                 open_model_span = None
+                for rich in emitter.fail_open():
+                    yield rich
                 raise
 
             tool_calls = [
@@ -653,6 +680,8 @@ async def _stream_gen(
             ]
             if not tool_calls:
                 for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
                     yield rich
                 break
 
@@ -699,6 +728,8 @@ async def _stream_gen(
                     fail_span(tool_span, exc, ended)
                     open_tool_span = None
                     for rich in emitter.tool_result(str(tc.call_id), failed=True):
+                        yield rich
+                    for rich in emitter.fail_open():
                         yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
