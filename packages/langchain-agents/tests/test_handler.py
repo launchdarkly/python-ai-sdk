@@ -1479,6 +1479,60 @@ class TestStreaming:
         }
         assert results == {"c1", "d1"}
 
+    @pytest.mark.asyncio
+    async def test_tool_messages_close_parallel_calls(self) -> None:
+        mocks = _make_langchain_mock()
+        ai = _make_ai_msg("looking")
+        ai.tool_calls = [
+            {"name": "search", "id": "c1", "args": {"q": "x"}},
+            {"name": "other", "id": "d1", "args": {"n": 1}},
+        ]
+
+        def tool(call_id: str, content: str) -> Any:
+            message = MagicMock()
+            message.type = "tool"
+            message.tool_call_id = call_id
+            message.content = content
+            message.status = "success"
+            message.usage_metadata = None
+            return message
+
+        async def _astream(*_a: Any, **_kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [ai]}}
+            yield {"tools": {"messages": [tool("c1", "found"), tool("d1", "also")]}}
+
+        mocks["_agent"].astream = _astream
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            events = [
+                event
+                async for event in await create_langchain_agents_handler(
+                    llm=MagicMock(), capture_content=True
+                ).stream(_make_config(), "q")
+            ]
+        by_id: dict[str, list[str]] = {}
+        for event in events:
+            if not str(event.get("type", "")).startswith("TOOL_CALL"):
+                continue
+            by_id.setdefault(event["toolCallId"], []).append(event["type"])
+        assert by_id["c1"] == [
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+        ]
+        assert by_id["d1"] == [
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+        ]
+        contents = {
+            event["toolCallId"]: event["content"]
+            for event in events
+            if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert contents == {"c1": "found", "d1": "also"}
+
 
 # ---------------------------------------------------------------------------
 # §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)

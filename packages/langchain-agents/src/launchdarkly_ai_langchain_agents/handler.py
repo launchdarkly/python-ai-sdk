@@ -36,7 +36,6 @@ from launchdarkly_ai_server.agui import TurnEmitter
 from ._version import PACKAGE_NAME, __version__
 from .messages import to_lang_chain_messages
 from .spans import (
-    _tool_result_text,
     build_span_callbacks,
     fail_span,
     finish_root_span,
@@ -530,17 +529,15 @@ async def _stream_gen(
                                 call_id, arguments=tc.get("args")
                             ):
                                 yield rich
-            for call_id, name, arguments, output, failed in list(
-                span_callbacks.finished_calls
-            ):
-                for rich in emitter.tool_start(call_id, name):
-                    yield rich
-                for rich in emitter.tool_end(call_id, arguments=arguments):
-                    yield rich
-                value = _tool_result_text(output) if not failed else None
-                for rich in emitter.tool_result(call_id, value, failed=failed):
-                    yield rich
-            span_callbacks.finished_calls.clear()
+                    elif getattr(msg, "type", None) == "tool":
+                        call_id = str(getattr(msg, "tool_call_id", "") or "")
+                        if call_id:
+                            for rich in emitter.tool_result(
+                                call_id,
+                                getattr(msg, "content", None),
+                                failed=getattr(msg, "status", None) == "error",
+                            ):
+                                yield rich
             for rich in emitter.end_text():
                 yield rich
 
