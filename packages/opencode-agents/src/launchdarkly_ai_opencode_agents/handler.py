@@ -1,14 +1,12 @@
 """Reduce OpenCode session events into handler stream events.
 
 The session is a caller-supplied async iterable of OpenCode bus events. This
-module does not start a process. Tool execution stays inside OpenCode: the
-events record a call that already ran.
+module does not start a process and does not construct an OpenCode SDK client.
+The public stream is assistant text as ``chunk``, then one ``done``.
 """
 
 from __future__ import annotations
 
-import json
-import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
 from typing import Any
 
@@ -18,20 +16,17 @@ from launchdarkly_ai_server import (
     _config,
     _create_handler,
 )
-from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.sdk_usage import report_usage
 from launchdarkly_ai_server.utils import number_or_zero
 
 from ._version import PACKAGE_NAME, __version__
 
-_TOOL_FAILURE = "An error occurred."
-
 
 class OpenCodeSessionError(Exception):
     """The OpenCode session failed.
 
-    The provider error body is not included. A failed session is not a tool
-    result and does not finish the run.
+    The provider error body is not included. A failed session does not finish
+    the run.
     """
 
 
@@ -40,17 +35,15 @@ class _Reducer:
 
     Text is emitted only for messages ``message.updated`` has marked assistant.
     A part snapshot is that part's full text so far: a later delta still appends,
-    and a snapshot that repeats text already emitted adds nothing.
+    and a snapshot that repeats text already emitted adds nothing. Tool parts
+    are not forwarded.
     """
 
-    def __init__(self, capture_content: bool) -> None:
-        self._capture = capture_content
-        self._open_message: str | None = None
+    def __init__(self) -> None:
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
         self._held: dict[str, list[tuple[str, str, str]]] = {}
         self._part_text: dict[str, str] = {}
-        self._tools: dict[str, str] = {}
         self._usage_ids: set[str] = set()
         self._input = 0
         self._output = 0
@@ -84,8 +77,6 @@ class _Reducer:
                 raise OpenCodeSessionError("The OpenCode session failed.")
             for event in self._event(raw):
                 yield event
-        for event in self._end_open():
-            yield event
 
     def _accept_text(
         self, message_id: str, part_id: str, kind: str, text: str
@@ -96,22 +87,20 @@ class _Reducer:
             return []
         if role != "assistant":
             return []
-        return self._apply_text(message_id, part_id, kind, text)
+        return self._apply_text(part_id, kind, text)
 
     def _flush_held(self, message_id: str) -> list[dict[str, Any]]:
         held = self._held.pop(message_id, [])
         events: list[dict[str, Any]] = []
         for kind, part_id, text in held:
-            events.extend(self._apply_text(message_id, part_id, kind, text))
+            events.extend(self._apply_text(part_id, kind, text))
         return events
 
-    def _apply_text(
-        self, message_id: str, part_id: str, kind: str, text: str
-    ) -> list[dict[str, Any]]:
+    def _apply_text(self, part_id: str, kind: str, text: str) -> list[dict[str, Any]]:
         if kind == "delta":
             if part_id:
                 self._part_text[part_id] = self._part_text.get(part_id, "") + text
-            return self._text(message_id, text)
+            return self._chunk(text)
         already = self._part_text.get(part_id, "")
         if text.startswith(already):
             suffix = text[len(already) :]
@@ -125,7 +114,7 @@ class _Reducer:
             return []
         if not suffix:
             return []
-        return self._text(message_id, suffix)
+        return self._chunk(suffix)
 
     def _event(self, raw: Mapping[str, Any] | object) -> list[dict[str, Any]]:
         if not isinstance(raw, Mapping):
@@ -138,13 +127,9 @@ class _Reducer:
             return self._delta(properties)
         if kind == "message.part.updated":
             part = properties.get("part")
-            if not isinstance(part, Mapping):
+            if not isinstance(part, Mapping) or part.get("type") != "text":
                 return []
-            if part.get("type") == "tool":
-                return self._tool(part)
-            if part.get("type") == "text":
-                return self._text_snapshot(part)
-            return []
+            return self._text_snapshot(part)
         if kind == "message.updated":
             info = properties.get("info")
             if isinstance(info, Mapping):
@@ -176,28 +161,9 @@ class _Reducer:
             return []
         return self._accept_text(message_id, part_id, "snapshot", text)
 
-    def _text(self, message_id: str, delta: str) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
-        if self._open_message != message_id:
-            events.extend(self._end_open())
-            self._open_message = message_id
-            events.append({"type": "TEXT_MESSAGE_START", "messageId": message_id})
-        events.append(
-            {
-                "type": "TEXT_MESSAGE_CONTENT",
-                "messageId": message_id,
-                "delta": delta,
-            }
-        )
-        self._deltas.append(delta)
-        return events
-
-    def _end_open(self) -> list[dict[str, Any]]:
-        if self._open_message is None:
-            return []
-        message_id = self._open_message
-        self._open_message = None
-        return [{"type": "TEXT_MESSAGE_END", "messageId": message_id}]
+    def _chunk(self, text: str) -> list[dict[str, Any]]:
+        self._deltas.append(text)
+        return [{"type": "chunk", "text": text}]
 
     def _message(self, info: Mapping[str, Any]) -> list[dict[str, Any]]:
         message_id = info.get("id")
@@ -214,9 +180,7 @@ class _Reducer:
         completed = info.get("time")
         if not isinstance(completed, Mapping) or "completed" not in completed:
             return events
-        if message_id == self._open_message:
-            events.extend(self._end_open())
-        if isinstance(message_id, str) and message_id not in self._usage_ids:
+        if message_id not in self._usage_ids:
             tokens = info.get("tokens")
             if isinstance(tokens, Mapping):
                 self._add_usage(tokens)
@@ -232,109 +196,6 @@ class _Reducer:
             self._saw_cache = True
             self._cache_read += number_or_zero(cache.get("read"))
             self._cache_write += number_or_zero(cache.get("write"))
-
-    def _tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
-        state = part.get("state")
-        if not isinstance(state, Mapping):
-            return []
-        call_id = part.get("callID") or part.get("id")
-        name = part.get("tool")
-        if (
-            not isinstance(call_id, str)
-            or not call_id
-            or not isinstance(name, str)
-            or not name
-        ):
-            return []
-        status = state.get("status")
-        if status not in ("running", "completed", "error"):
-            return []
-        events: list[dict[str, Any]] = []
-        if self._tools.get(call_id) is None and (
-            "input" in state or status != "running"
-        ):
-            events.extend(self._open_tool(call_id, name, state.get("input")))
-            self._tools[call_id] = "open"
-        if status == "completed" and self._tools.get(call_id) == "open":
-            events.append(self._result(call_id, state.get("output", ""), failed=False))
-            self._tools[call_id] = "done"
-        elif status == "error" and self._tools.get(call_id) == "open":
-            events.append(self._result(call_id, None, failed=True))
-            self._tools[call_id] = "done"
-        return events
-
-    def _open_tool(
-        self, call_id: str, name: str, raw_input: object
-    ) -> list[dict[str, Any]]:
-        start: dict[str, Any] = {
-            "type": "TOOL_CALL_START",
-            "toolCallId": call_id,
-            "toolCallName": name,
-        }
-        if self._open_message is not None:
-            start["parentMessageId"] = self._open_message
-        events = [start]
-        if self._capture:
-            text = _argument_text(raw_input)
-            if text:
-                events.append(
-                    {"type": "TOOL_CALL_ARGS", "toolCallId": call_id, "delta": text}
-                )
-        events.append({"type": "TOOL_CALL_END", "toolCallId": call_id})
-        return events
-
-    def _result(self, call_id: str, output: object, *, failed: bool) -> dict[str, Any]:
-        content = ""
-        metadata: dict[str, Any] | None = None
-        if failed:
-            metadata = {"launchdarkly": {"toolFailed": True}}
-            if self._capture:
-                content = _TOOL_FAILURE
-        else:
-            rendered = _result_text(output)
-            if rendered is None:
-                metadata = {"launchdarkly": {"toolFailed": True}}
-                if self._capture:
-                    content = _TOOL_FAILURE
-            elif self._capture:
-                content = rendered
-        event: dict[str, Any] = {
-            "type": "TOOL_CALL_RESULT",
-            "messageId": str(uuid.uuid4()),
-            "toolCallId": call_id,
-            "content": content,
-        }
-        if metadata is not None:
-            event["metadata"] = metadata
-        return event
-
-
-def _argument_text(value: object) -> str:
-    """Argument text for one ``TOOL_CALL_ARGS`` delta. Empty when there is nothing to send."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    rendered = _json_text(value)
-    return rendered or ""
-
-
-def _result_text(value: object) -> str | None:
-    """Success content, or ``None`` when the value cannot be placed on the event."""
-    if isinstance(value, str):
-        return value
-    return _json_text(value)
-
-
-def _json_text(value: object) -> str | None:
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return None
-    try:
-        return json.dumps(
-            value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-        )
-    except (TypeError, ValueError):
-        return None
 
 
 def _open_events(
@@ -358,21 +219,14 @@ def create_opencode_handler(
     ``provides_for`` is ``('*', 'agent')``, so the handler matches an agent-mode
     variation for any provider. *events* is called on every invocation and must
     return a fresh async iterable of OpenCode session events. This function does
-    not start OpenCode.
+    not start OpenCode and does not construct an OpenCode SDK client.
 
-    *capture_content* follows the other handlers: ``None`` reads the process
-    default from ``configure`` when the call runs, and ``True`` or ``False``
-    overrides it. Tool argument text and tool results are omitted from the
-    stream unless capture is on. ``config().stream()`` still yields assistant
-    text as ``chunk`` and one ``done``. Tool events are on
-    ``launchdarkly_ai_server.rich_stream``.
+    The stream yields assistant text as ``chunk`` and one ``done``. *capture_content*
+    follows the other handlers: ``None`` reads the process default from
+    ``configure`` when content is read, and ``True`` or ``False`` overrides it.
     """
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
-    return _create_opencode_handler(
-        capture_content=capture_content,
-        events=events,
-        resolve_capture=effective_capture_content,
-    )
+    return _create_opencode_handler(capture_content=capture_content, events=events)
 
 
 def opencode_agents(
@@ -395,9 +249,7 @@ def opencode_agents(
     return _config(
         key=config_key,
         handler=_create_opencode_handler(
-            capture_content=capture_content,
-            events=events,
-            resolve_capture=effective_capture_content,
+            capture_content=capture_content, events=events
         ),
         **kwargs,
     ).invoke(user_input, context, variables, history)
@@ -407,10 +259,7 @@ def _create_opencode_handler(
     *,
     capture_content: bool | None,
     events: Callable[[], AsyncIterable[Mapping[str, Any]]] | None,
-    resolve_capture: Callable[[bool | None], bool],
 ) -> ProviderHandler:
-    content_override = capture_content
-
     async def _stream_impl(
         config: AiConfigRep,
         user_input: str | None,
@@ -418,8 +267,7 @@ def _create_opencode_handler(
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        capture = resolve_capture(content_override)
-        reducer = _Reducer(capture)
+        reducer = _Reducer()
         async for event in reducer.reduce(_open_events(events)):
             yield event
         done: dict[str, Any] = {"type": "done", "output": "".join(reducer.deltas)}
@@ -451,5 +299,5 @@ def _create_opencode_handler(
         ("*", "agent"),
         _call_impl,
         _stream_impl,
-        capture_content=content_override,
+        capture_content=capture_content,
     )

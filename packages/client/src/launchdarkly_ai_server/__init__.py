@@ -52,7 +52,6 @@ from .registry import (
     resolve_handlers,
     resolve_tools,
 )
-from .rich_stream import stream as rich_stream
 from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
 from .sdk_usage import report_usage
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
@@ -227,7 +226,6 @@ __all__ = [  # noqa: RUF022
     # client
     "config",
     "ConfigInstance",
-    "rich_stream",
     # conversation
     "ConversationIdSpanProcessor",
     "conversation_id",
