@@ -760,12 +760,15 @@ class TestGraphRunId:
     async def test_each_run_gets_its_own_run_id(
         self, mock_ld_client: MagicMock, mode: str
     ) -> None:
-        """One graph() instance, one context, two runs: one id per run, shared within it."""
+        """One graph() instance, one context, two runs: one id per run, shared by the
+        run's graph span and its graph-level events."""
         g = graph("graph-key", handlers=[_make_streaming_handler(["ok"])])
 
         run_ids: list[set[str]] = []
+        span_run_ids: list[Any] = []
         for _ in range(2):
             mock_ld_client.track.reset_mock()
+            _exporter.clear()
             if mode == "invoke":
                 await g.invoke("hi", CONTEXT)
             else:
@@ -779,10 +782,18 @@ class TestGraphRunId:
             assert "$ld:ai:graph:handoff_success" in names
             assert "$ld:ai:graph:invocation_success" in names
             run_ids.append({e[2]["runId"] for e in graph_events})
+            graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
+            assert len(graph_spans) == 1
+            span_run_ids.append(
+                (graph_spans[0].attributes or {}).get("launchdarkly.run.id")
+            )
 
         assert len(run_ids[0]) == 1
         assert len(run_ids[1]) == 1
         assert run_ids[0] != run_ids[1]
+        assert {span_run_ids[0]} == run_ids[0]
+        assert {span_run_ids[1]} == run_ids[1]
+        assert span_run_ids[0] != span_run_ids[1]
 
 
 class TestGraphStreamOtel:
