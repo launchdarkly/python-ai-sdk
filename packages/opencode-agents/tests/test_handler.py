@@ -210,6 +210,35 @@ class TestText:
         assert events[-1]["output"] == ""
         assert "disk on fire" not in str(events)
 
+    async def test_a_tool_before_the_role_waits_for_the_assistant_message(self) -> None:
+        events = await collect(
+            [
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                text_delta("m1", "p1", "Looking"),
+                assistant_open("m1"),
+                tool_part("c1", "completed", output="file.txt"),
+                assistant_completed("m1"),
+            ]
+        )
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        assert start["parentMessageId"] == text["messageId"]
+        assert events.index(text) < events.index(start)
+
+    async def test_a_user_message_tool_is_not_emitted(self) -> None:
+        events = await collect(
+            [
+                tool_part(
+                    "c1", "running", message_id="u1", raw_input={"command": "ls"}
+                ),
+                bus(
+                    "message.updated",
+                    info={"id": "u1", "role": "user", "time": {"created": 1}},
+                ),
+            ]
+        )
+        assert not any(event["type"].startswith("TOOL_CALL") for event in events)
+
     async def test_pending_tool_state_emits_nothing(self) -> None:
         events = await collect(
             [tool_part("c1", "pending", raw_input={}, output=None)],

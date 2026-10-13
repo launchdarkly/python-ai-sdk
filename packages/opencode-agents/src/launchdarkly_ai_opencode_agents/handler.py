@@ -48,6 +48,7 @@ class _Reducer:
         self._text_message_id: str | None = None
         self._started_tools: set[str] = set()
         self._resulted_tools: set[str] = set()
+        self._held_tools: dict[str, list[Mapping[str, Any]]] = {}
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
         self._held: dict[str, list[tuple[str, str, str]]] = {}
@@ -134,7 +135,13 @@ class _Reducer:
         return events
 
     def close(self) -> list[dict[str, Any]]:
-        events = self._emitter.fail_open()
+        events: list[dict[str, Any]] = []
+        for message_id, parts in list(self._held_tools.items()):
+            if self._roles.get(message_id) is None:
+                for part in parts:
+                    events.extend(self._emit_tool(part))
+        self._held_tools.clear()
+        events.extend(self._emitter.fail_open())
         events.extend(self._emitter.end_text())
         self._text_message_id = None
         return events
@@ -193,6 +200,17 @@ class _Reducer:
         return self._emitter.text(text)
 
     def _tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
+        message_id = part.get("messageID")
+        if isinstance(message_id, str):
+            role = self._roles.get(message_id)
+            if role is None:
+                self._held_tools.setdefault(message_id, []).append(part)
+                return []
+            if role != "assistant":
+                return []
+        return self._emit_tool(part)
+
+    def _emit_tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
         state = part.get("state")
         if not isinstance(state, Mapping):
             return []
@@ -232,8 +250,11 @@ class _Reducer:
             if role == "assistant":
                 events.extend(self._begin_message(message_id))
                 events.extend(self._flush_held(message_id))
+                for part in self._held_tools.pop(message_id, []):
+                    events.extend(self._emit_tool(part))
             else:
                 self._held.pop(message_id, None)
+                self._held_tools.pop(message_id, None)
         if role != "assistant" or not isinstance(message_id, str):
             return events
         completed = info.get("time")
