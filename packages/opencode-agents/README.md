@@ -5,7 +5,7 @@ OpenCode handler for `launchdarkly-ai-server`. It reduces caller-supplied OpenCo
 **`provides_for`:** `['*', 'agent']` — matches an agent-mode variation for any provider.
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-opencode-agents
+pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-opencode-agents
 ```
 
 ```python
