@@ -32,6 +32,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -755,6 +756,7 @@ async def _stream_gen(
     conversation_messages = list(initial_messages)
     full_output: Any = ""
     steps = 0
+    emitter = TurnEmitter(capture_content=capture_content)
 
     ended: set[int] = set()
     open_model_span: Any = None
@@ -824,8 +826,33 @@ async def _stream_gen(
                 async for chunk in chunk_stream:
                     text = lang_chain_content_text(chunk.content)
                     if text:
-                        yield {"type": "chunk", "text": text}
+                        for rich in emitter.text(text):
+                            yield rich
                         accumulated_content += text
+                    for piece in getattr(chunk, "tool_call_chunks", None) or []:
+                        piece_name = (
+                            piece.get("name")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "name", None)
+                        )
+                        piece_id = (
+                            piece.get("id")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "id", None)
+                        )
+                        piece_args = (
+                            piece.get("args")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "args", None)
+                        )
+                        if piece_name and piece_id:
+                            for rich in emitter.tool_start(
+                                str(piece_id), str(piece_name)
+                            ):
+                                yield rich
+                        if piece_id and isinstance(piece_args, str) and piece_args:
+                            for rich in emitter.tool_args(str(piece_id), piece_args):
+                                yield rich
                     usage = getattr(chunk, "usage_metadata", None)
                     if usage:
                         usage_reported = True
@@ -888,6 +915,8 @@ async def _stream_gen(
                 raise
 
             if not accumulated_tool_calls:
+                for rich in emitter.end_text():
+                    yield rich
                 full_output = (full_output or "") + accumulated_content
                 break
 
@@ -898,6 +927,14 @@ async def _stream_gen(
             steps += 1
 
             full_output = (full_output or "") + accumulated_content
+            for tc in accumulated_tool_calls:
+                call_id = str(tc.get("id") or tc["name"])
+                for rich in emitter.tool_start(call_id, str(tc["name"])):
+                    yield rich
+                for rich in emitter.tool_end(call_id, arguments=tc.get("args")):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             assistant_msg = AIMessage(
                 content=accumulated_content, tool_calls=accumulated_tool_calls
             )
@@ -934,10 +971,18 @@ async def _stream_gen(
                 except Exception as exc:
                     fail_span(tool_span, exc, ended)
                     open_tool_span = None
+                    for rich in emitter.tool_result(
+                        str(tc.get("id") or tc["name"]), failed=True
+                    ):
+                        yield rich
                     raise
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                for rich in emitter.tool_result(
+                    str(tc.get("id") or tc["name"]), result_val
+                ):
+                    yield rich
                 tool_results.append(
                     ToolMessage(
                         tool_call_id=tc.get("id") or tc["name"], content=str(result_val)

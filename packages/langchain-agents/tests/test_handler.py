@@ -1427,7 +1427,11 @@ class TestStreaming:
                     llm=MagicMock()
                 ).stream(_make_config(), "q")
             ]
-        assert {"type": "chunk", "text": "visible answer"} in events
+        assert any(
+            event.get("type") == "TEXT_MESSAGE_CONTENT"
+            and event.get("delta") == "visible answer"
+            for event in events
+        )
         assert events[-1]["output"] == "visible answer"
 
     @pytest.mark.asyncio
@@ -2564,5 +2568,6 @@ class TestModelSource:
             ]
         assert seen[0]["model"]["parameters"] == {"temperature": 0.2}
         assert any(
-            e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
+            e.get("type") == "TEXT_MESSAGE_CONTENT" and e.get("delta") == "streamed"
+            for e in events
         )

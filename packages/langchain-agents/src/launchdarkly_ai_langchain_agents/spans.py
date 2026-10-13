@@ -304,6 +304,8 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         self.run_usage = run_usage
         self.model_spans: dict[str, Any] = {}
         self.tool_spans: dict[str, Any] = {}
+        self._open_calls: dict[str, tuple[str, str, Any]] = {}
+        self.finished_calls: list[tuple[str, str, Any, Any, bool]] = []
 
     def _start_model(self, run_id: Any, messages: Any = None) -> None:
         key = str(run_id)
@@ -404,12 +406,23 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         # Tracked before the content write, not after. Serialising the arguments can raise, and a
         # span created but never inserted is unreachable by every cleanup path there is.
         self.tool_spans[str(run_id)] = span
+        call_id = str(tool_call_id or run_id)
+        self._open_calls[str(run_id)] = (
+            call_id,
+            str(tool_name),
+            kwargs.get("inputs") or input_str,
+        )
         set_tool_call_content_attributes(
             span, self._capture_content, arguments=kwargs.get("inputs") or input_str
         )
 
     async def on_tool_end(self, output: Any, *, run_id: Any, **kwargs: Any) -> None:
         key = str(run_id)
+        recorded = self._open_calls.pop(key, None)
+        if recorded is not None:
+            self.finished_calls.append(
+                (recorded[0], recorded[1], recorded[2], output, False)
+            )
         span = self.tool_spans.pop(key, None)
         if span is None:
             return
@@ -427,6 +440,11 @@ class SpanCallbackHandler(AsyncCallbackHandler):
         self, error: BaseException, *, run_id: Any, **kwargs: Any
     ) -> None:
         key = str(run_id)
+        recorded = self._open_calls.pop(key, None)
+        if recorded is not None:
+            self.finished_calls.append(
+                (recorded[0], recorded[1], recorded[2], None, True)
+            )
         span = self.tool_spans.pop(key, None)
         if span is None:
             return
@@ -491,6 +509,13 @@ class SpanCallbacks:
         self.callbacks = callbacks
         self.run_usage = run_usage
         self._handler = handler
+
+    @property
+    def finished_calls(self) -> list[tuple[str, str, Any, Any, bool]]:
+        if self._handler is None:
+            return []
+        calls: list[tuple[str, str, Any, Any, bool]] = self._handler.finished_calls
+        return calls
 
     def close_open_spans(self, error: BaseException) -> None:
         if self._handler is not None:

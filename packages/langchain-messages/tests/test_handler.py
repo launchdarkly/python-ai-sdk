@@ -1178,10 +1178,8 @@ class TestStreaming:
         llm = self._make_streaming_llm(["hello ", "world"])
         h = create_langchain_messages_handler(llm=llm)
         events = [e async for e in await h.stream(CONFIG, "q")]
-        chunks = [e for e in events if e.get("type") == "chunk"]
-        assert len(chunks) == 2
-        assert chunks[0]["text"] == "hello "
-        assert chunks[1]["text"] == "world"
+        deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["hello ", "world"]
 
     async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
@@ -1200,7 +1198,13 @@ class TestStreaming:
                 CONFIG, "q"
             )
         ]
-        assert {"type": "chunk", "text": "visible answer"} in events
+        assert {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": events[1]["messageId"]
+            if events[0]["type"] == "TEXT_MESSAGE_START"
+            else events[0]["messageId"],
+            "delta": "visible answer",
+        } in events
         assert events[-1]["output"] == "visible answer"
 
     async def test_yields_exactly_one_done_event(self) -> None:
@@ -2583,5 +2587,6 @@ class TestModelSource:
             ]
         assert seen[0]["model"]["parameters"] == {"temperature": 0.2}
         assert any(
-            e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
+            e.get("type") == "TEXT_MESSAGE_CONTENT" and e.get("delta") == "streamed"
+            for e in events
         )

@@ -31,10 +31,12 @@ from launchdarkly_ai_server import (
     set_input_content_attributes,
     set_output_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 
 from ._version import PACKAGE_NAME, __version__
 from .messages import to_lang_chain_messages
 from .spans import (
+    _tool_result_text,
     build_span_callbacks,
     fail_span,
     finish_root_span,
@@ -492,6 +494,7 @@ async def _stream_gen(
 
         run_usage = create_run_usage()
         full_output = ""
+        emitter = TurnEmitter(capture_content=capture_content)
 
         # agent.astream() yields state updates per graph step: { [node_name]: { messages: [...] } }
         async for step_state in agent.astream(
@@ -513,8 +516,33 @@ async def _stream_gen(
                     if getattr(msg, "type", None) == "ai":
                         text = lang_chain_content_text(msg.content)
                         if text:
-                            yield {"type": "chunk", "text": text}
+                            for rich in emitter.text(text):
+                                yield rich
                             full_output = text
+                        for tc in getattr(msg, "tool_calls", None) or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            call_id = str(tc.get("id") or tc.get("name") or "")
+                            name = str(tc.get("name") or "")
+                            for rich in emitter.tool_start(call_id, name):
+                                yield rich
+                            for rich in emitter.tool_end(
+                                call_id, arguments=tc.get("args")
+                            ):
+                                yield rich
+            for call_id, name, arguments, output, failed in list(
+                span_callbacks.finished_calls
+            ):
+                for rich in emitter.tool_start(call_id, name):
+                    yield rich
+                for rich in emitter.tool_end(call_id, arguments=arguments):
+                    yield rich
+                value = _tool_result_text(output) if not failed else None
+                for rich in emitter.tool_result(call_id, value, failed=failed):
+                    yield rich
+            span_callbacks.finished_calls.clear()
+            for rich in emitter.end_text():
+                yield rich
 
         # The same reconciliation the blocking path does, for the same reason. This walk reads
         # usage_metadata off the astream payloads, and sees nothing at all unless the graph is
