@@ -325,8 +325,15 @@ class _SpanningHooks(_RunHooksBase):
         # exports.
         self.open_tool_spans[str(call_id)] = span
         self.pending.extend(self.emitter.tool_start(str(call_id), str(name)))
-        tool_args = getattr(context, "tool_arguments", None)
-        self.pending.extend(self.emitter.tool_end(str(call_id), arguments=tool_args))
+        # The Runner can invoke this hook from its background task while
+        # argument deltas are still unread. Closing now would drop the rest
+        # and skip the full argument string, because a prefix is already
+        # recorded. arguments.done closes a call that is still streaming.
+        if not self.emitter.has_argument_deltas(str(call_id)):
+            tool_args = getattr(context, "tool_arguments", None)
+            self.pending.extend(
+                self.emitter.tool_end(str(call_id), arguments=tool_args)
+            )
         if self.capture_content:
             # `tool_arguments` is the raw JSON args string the model produced. Parsed here rather
             # than passed through, per TELEMETRY-CONTRACT.md section 12: arguments hold the object
@@ -597,9 +604,14 @@ _RESPONSES_ARG_DONE = {
     "response.custom_tool_call_input.done": "input",
 }
 _RESPONSES_OPEN_TYPES = frozenset({"function_call", "mcp_call", "custom_tool_call"})
-_RESPONSES_COMPLETED = {
-    "response.file_search_call.completed": "file_search",
-    "response.code_interpreter_call.completed": "code_interpreter",
+_HOSTED_OUTPUT_FIELD = {
+    "mcp_call": "output",
+    "file_search_call": "results",
+    "code_interpreter_call": "outputs",
+}
+_HOSTED_TOOL_NAME = {
+    "file_search_call": "file_search",
+    "code_interpreter_call": "code_interpreter",
 }
 
 
@@ -611,6 +623,38 @@ def _responses_call_id(event: Any, item_to_call: dict[str, str]) -> str:
     if isinstance(item_id, str) and item_id in item_to_call:
         return item_to_call[item_id]
     return item_id if isinstance(item_id, str) else ""
+
+
+def _hosted_item_result(
+    item: Any, emitter: TurnEmitter, item_to_call: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Result for a hosted tool from ``response.output_item.done``.
+
+    The ``*.completed`` events only carry ``item_id``. Reading ``output`` off
+    them yields ``None``, and with capture on that becomes the string ``null``
+    and seals the call before the real item arrives.
+    """
+    item_type = getattr(item, "type", None)
+    if item_type not in _HOSTED_OUTPUT_FIELD:
+        return []
+    call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or ""
+    item_id = getattr(item, "id", None)
+    if isinstance(item_id, str) and isinstance(call_id, str) and call_id:
+        item_to_call[item_id] = call_id
+    call_id = str(call_id)
+    name = getattr(item, "name", None) or _HOSTED_TOOL_NAME.get(item_type, "")
+    events = emitter.tool_start(call_id, str(name))
+    events.extend(emitter.tool_end(call_id))
+    status = getattr(item, "status", None)
+    if status in ("failed", "incomplete") or getattr(item, "error", None):
+        events.extend(emitter.tool_result(call_id, failed=True))
+    else:
+        events.extend(
+            emitter.tool_result(
+                call_id, getattr(item, _HOSTED_OUTPUT_FIELD[item_type], None)
+            )
+        )
+    return events
 
 
 def _map_responses_event(
@@ -643,35 +687,10 @@ def _map_responses_event(
         return emitter.tool_end(
             _responses_call_id(event, item_to_call), arguments=arguments
         )
-    if kind in ("response.mcp_call.completed", "response.mcp_call.failed"):
-        call_id = _responses_call_id(event, item_to_call)
-        item = getattr(event, "item", None)
-        if not call_id and item is not None:
-            raw_id = getattr(item, "call_id", None) or getattr(item, "id", None)
-            call_id = raw_id if isinstance(raw_id, str) else ""
-        if kind == "response.mcp_call.failed":
-            return emitter.tool_result(call_id, failed=True)
-        output = getattr(event, "output", None)
-        if output is None and item is not None:
-            output = getattr(item, "output", None)
-        return emitter.tool_result(call_id, output)
-    if kind in _RESPONSES_COMPLETED:
-        item = getattr(event, "item", None)
-        raw_id = ""
-        if item is not None:
-            candidate = getattr(item, "call_id", None) or getattr(item, "id", None)
-            raw_id = candidate if isinstance(candidate, str) else ""
-        if not raw_id:
-            candidate = getattr(event, "item_id", None)
-            raw_id = candidate if isinstance(candidate, str) else ""
-        name = _RESPONSES_COMPLETED[kind]
-        events = emitter.tool_start(raw_id, name)
-        events.extend(emitter.tool_end(raw_id))
-        output = getattr(item, "results", None) if item is not None else None
-        if output is None and item is not None:
-            output = getattr(item, "outputs", None)
-        events.extend(emitter.tool_result(raw_id, output))
-        return events
+    if kind == "response.mcp_call.failed":
+        return emitter.tool_result(_responses_call_id(event, item_to_call), failed=True)
+    if kind == "response.output_item.done":
+        return _hosted_item_result(getattr(event, "item", None), emitter, item_to_call)
     return []
 
 

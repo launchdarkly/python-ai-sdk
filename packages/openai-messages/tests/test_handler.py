@@ -1331,6 +1331,73 @@ class TestStreaming:
         )
         assert shown_result["content"] == "secret"
 
+    async def test_a_failed_call_closes_its_siblings(
+        self, mock_openai: MagicMock
+    ) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        calls = [
+            _function_call_item("boom", "c1", {}),
+            _function_call_item("later", "c2", {}),
+        ]
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["x"], output=calls)
+        )
+
+        def boom(_args: dict[str, Any]) -> str:
+            raise RuntimeError("nope")
+
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            handler = create_openai_messages_handler()
+            seen: list[dict[str, Any]] = []
+            with pytest.raises(RuntimeError, match="nope"):
+                async for event in await handler.stream(
+                    CONFIG, "q", {"boom": boom, "later": lambda _args: "ok"}
+                ):
+                    seen.append(event)
+        results = {
+            event["toolCallId"] for event in seen if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results == {"c1", "c2"}
+
+    def test_hosted_completion_waits_for_the_output_item(self) -> None:
+        from types import SimpleNamespace
+
+        from launchdarkly_ai_openai_messages.handler import _map_responses_event
+        from launchdarkly_ai_server.agui import TurnEmitter
+
+        emitter = TurnEmitter(capture_content=True)
+        ids: dict[str, str] = {}
+        added = SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="mcp_call", call_id="m1", id="item-1", name="search"
+            ),
+        )
+        completed = SimpleNamespace(
+            type="response.mcp_call.completed", item_id="item-1", output=None
+        )
+        done = SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="mcp_call",
+                call_id="m1",
+                id="item-1",
+                name="search",
+                status="completed",
+                output="found",
+            ),
+        )
+        events: list[dict[str, Any]] = []
+        events.extend(_map_responses_event(added, emitter, ids))
+        events.extend(_map_responses_event(completed, emitter, ids))
+        events.extend(_map_responses_event(done, emitter, ids))
+        assert "null" not in str(events)
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == "found"
+        assert [event["type"] for event in events].count("TOOL_CALL_RESULT") == 1
+
     async def test_yields_exactly_one_done_event(self, mock_openai: MagicMock) -> None:
         import launchdarkly_ai_openai_messages.spans as spans_mod
         from launchdarkly_ai_openai_messages import create_openai_messages_handler

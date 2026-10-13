@@ -150,6 +150,10 @@ class TurnEmitter:
             event["parentMessageId"] = self._open
         return [event]
 
+    def has_argument_deltas(self, tool_call_id: str) -> bool:
+        """True once a streamed argument slice was recorded for this call."""
+        return tool_call_id in self._args
+
     def tool_args(self, tool_call_id: str, delta: str) -> list[dict[str, Any]]:
         if (
             not self.capture_content

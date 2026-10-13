@@ -1377,6 +1377,28 @@ class TestStreaming:
         )
         assert shown_result["content"] == "secret"
 
+    async def test_a_streaming_prefix_is_not_closed_by_the_tool_hook(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import _SpanningHooks
+        from launchdarkly_ai_server import create_run_usage
+
+        hooks = _SpanningHooks(CONFIG, None, True, create_run_usage())
+        hooks.emitter.tool_start("c1", "search")
+        hooks.emitter.tool_args("c1", '{"q":')
+        ctx = SimpleNamespace(
+            tool_name="search",
+            tool_call_id="c1",
+            tool_arguments='{"q":"x"}',
+        )
+        await hooks.on_tool_start(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search")
+        )
+        assert not any(event["type"] == "TOOL_CALL_END" for event in hooks.pending)
+        rest = hooks.emitter.tool_args("c1", '"}')
+        assert rest[0]["delta"] == '"}'
+        assert any(
+            event["type"] == "TOOL_CALL_END" for event in hooks.emitter.tool_end("c1")
+        )
+
     async def test_opens_the_same_root_span_name_as_the_blocking_path(self) -> None:
         ctx, rec = _recording()
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
