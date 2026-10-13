@@ -7,6 +7,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .agui import HANDLER_RICH_TYPES, TEXT_MESSAGE_CONTENT, TEXT_TYPES
 from .trajectory import HANDOFF_TOOL_PREFIX, TrajectoryRecorder, render_trajectory
 from .types import (
     NATIVE_TOOL_KEY,
@@ -250,9 +251,10 @@ async def execute_and_stream(
     history: list[dict[str, Any]] | None = None,
 ) -> AsyncGenerator[ExecuteStreamEvent, None]:
     """
-    Streaming counterpart to ``execute_and_track``. Yields ``chunk`` events
-    from the handler, then a single ``done`` event once the stream completes
-    and LD telemetry has been flushed.
+    Streaming counterpart to ``execute_and_track``. Yields ``chunk`` events,
+    the AG-UI text and tool subset when the handler emits it, then a single
+    ``done`` event once the stream completes and LD telemetry has been flushed.
+    ``config().stream()`` projects that subset back to ``chunk`` then ``done``.
 
     Falls back to calling the blocking handler when the handler has no
     ``stream`` implementation.
@@ -297,6 +299,8 @@ async def execute_and_stream(
     start_time = time.monotonic()
     full_text = ""
     raw_usage: dict[str, Any] = {}
+    had_usage = False
+    saw_text = False
 
     try:
         if handler.has_stream:
@@ -304,20 +308,38 @@ async def execute_and_stream(
                 config, user_input, tracked_tool_handlers, merged_variables, history
             )
             async for event in stream_gen:
-                if event.get("type") == "chunk":
+                typ = event.get("type")
+                if typ in TEXT_TYPES:
+                    saw_text = True
+                if typ == "chunk":
+                    if saw_text:
+                        continue
                     full_text += event.get("text", "")
                     yield {"type": "chunk", "text": event["text"]}
-                elif event.get("type") == "done":
+                elif typ == TEXT_MESSAGE_CONTENT:
+                    delta = event.get("delta") or ""
+                    if isinstance(delta, str):
+                        full_text += delta
+                    yield event
+                elif typ in HANDLER_RICH_TYPES:
+                    yield event
+                elif typ == "done":
                     if event.get("output") is not None:
                         full_text = event["output"]
-                    raw_usage = event.get("usage", {})
+                    usage_value = event.get("usage")
+                    if isinstance(usage_value, dict) and usage_value:
+                        raw_usage = usage_value
+                        had_usage = True
         else:
             result = await handler(
                 config, user_input, tracked_tool_handlers, merged_variables, history
             )
             out = result.get("output")
             full_text = str(out) if out is not None else ""
-            raw_usage = result.get("usage") or {}
+            usage_value = result.get("usage")
+            if isinstance(usage_value, dict) and usage_value:
+                raw_usage = usage_value
+                had_usage = True
             if full_text:
                 yield {"type": "chunk", "text": full_text}
     except Exception:
@@ -348,4 +370,5 @@ async def execute_and_stream(
             observable_tools=exposed_tool_keys,
             omitted=recorder.omitted,
         ),
+        "_had_usage": had_usage,
     }

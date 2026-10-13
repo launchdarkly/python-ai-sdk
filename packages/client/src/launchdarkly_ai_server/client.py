@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .agui import StableProjector
 from .conversation import bind_conversation_id
 from .judges import _build_judge_tasks, run_judges
 from .lifecycle import extract_variation
@@ -192,13 +193,20 @@ class ConfigInstance:
             self._stream_events(user_input, context, variables, history)
         )
 
-    async def _stream_events(
+    async def _execute_stream(
         self,
         user_input: str | None,
         context: LDContext,
-        variables: dict[str, Any] | None = None,
-        history: list[dict[str, Any]] | None = None,
-    ) -> AsyncGenerator[StreamEvent, None]:
+        variables: dict[str, Any] | None,
+        history: list[dict[str, Any]] | None,
+        sink: dict[str, Any],
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield handler events and the internal ``done``.
+
+        Fills *sink* with the resolved config and handler before the first event,
+        so both ``config().stream()`` and the AG-UI reader run judges from one
+        pass.
+        """
         resolved_handler_list = resolve_handlers(
             self._registry, self._normalize_handlers()
         )
@@ -211,8 +219,17 @@ class ConfigInstance:
         if not resolved_handler_list:
             raise ValueError("No handlers provided to config()")
         handler = select_handler(config, meta, resolved_handler_list)
-
-        done_event: dict[str, Any] | None = None
+        provider = ""
+        model = ""
+        if isinstance(config, dict):
+            provider = str((config.get("provider") or {}).get("name") or "")
+            model = str((config.get("model") or {}).get("name") or "")
+        sink["config"] = config
+        sink["handler"] = handler
+        sink["handlers"] = resolved_handler_list
+        sink["tools"] = resolved_tools
+        sink["provider"] = provider
+        sink["model"] = model
 
         async for event in execute_and_stream(
             config_key=self._key,
@@ -225,10 +242,23 @@ class ConfigInstance:
             variables=variables,
             history=history,
         ):
-            if event.get("type") == "chunk":
-                yield event
-            else:
-                done_event = event
+            yield event
+
+    async def _stream_events(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        sink: dict[str, Any] = {}
+        projector = StableProjector()
+        async for event in self._execute_stream(
+            user_input, context, variables, history, sink
+        ):
+            for stable in projector.feed(event):
+                yield stable
+        done_event = projector.done
 
         if done_event:
             track_data = done_event.get("track_data", {})
@@ -236,15 +266,15 @@ class ConfigInstance:
                 {}
                 if self._skip_judges
                 else await run_judges(
-                    config=config,
+                    config=sink["config"],
                     user_context=context,
-                    handler=handler,
-                    handlers=resolved_handler_list,
+                    handler=sink["handler"],
+                    handlers=sink["handlers"],
                     user_input=user_input,
                     trajectory=done_event.get("trajectory", ""),
                     llm_response=done_event.get("response", ""),
                     base_track_data=track_data,
-                    tool_handlers=resolved_tools,
+                    tool_handlers=sink["tools"],
                 )
             )
             yield {

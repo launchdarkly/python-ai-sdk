@@ -114,7 +114,12 @@ HandlerResult = dict[str, Any]
 
 
 class HandlerStreamEvent:
-    """Union of chunk / done events yielded by a handler's stream method."""
+    """Events a handler stream yields.
+
+    ``chunk`` and ``done`` remain valid. A handler may instead yield the AG-UI
+    text and tool subset (``TEXT_MESSAGE_*``, ``TOOL_CALL_*``) and one ``done``.
+    ``config().stream()`` still yields ``chunk`` then ``done``.
+    """
 
     pass
 
