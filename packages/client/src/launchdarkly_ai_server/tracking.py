@@ -5,6 +5,7 @@ import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Callable
+from contextlib import aclosing
 from typing import Any
 
 from .agui import HANDLER_RICH_TYPES, TEXT_MESSAGE_CONTENT, TEXT_TYPES
@@ -307,29 +308,33 @@ async def execute_and_stream(
             stream_gen = await handler.stream(
                 config, user_input, tracked_tool_handlers, merged_variables, history
             )
-            async for event in stream_gen:
-                typ = event.get("type")
-                if typ in TEXT_TYPES:
-                    saw_text = True
-                if typ == "chunk":
-                    if saw_text:
-                        continue
-                    full_text += event.get("text", "")
-                    yield {"type": "chunk", "text": event["text"]}
-                elif typ == TEXT_MESSAGE_CONTENT:
-                    delta = event.get("delta") or ""
-                    if isinstance(delta, str):
-                        full_text += delta
-                    yield event
-                elif typ in HANDLER_RICH_TYPES:
-                    yield event
-                elif typ == "done":
-                    if event.get("output") is not None:
-                        full_text = event["output"]
-                    usage_value = event.get("usage")
-                    if isinstance(usage_value, dict) and usage_value:
-                        raw_usage = usage_value
-                        had_usage = True
+            async with aclosing(stream_gen) as agen:
+                async for event in agen:
+                    typ = event.get("type")
+                    if typ in TEXT_TYPES:
+                        saw_text = True
+                    if typ == "chunk":
+                        if saw_text:
+                            continue
+                        text = event.get("text", "")
+                        if not isinstance(text, str):
+                            continue
+                        full_text += text
+                        yield {"type": "chunk", "text": text}
+                    elif typ == TEXT_MESSAGE_CONTENT:
+                        delta = event.get("delta") or ""
+                        if isinstance(delta, str):
+                            full_text += delta
+                        yield event
+                    elif typ in HANDLER_RICH_TYPES:
+                        yield event
+                    elif typ == "done":
+                        if event.get("output") is not None:
+                            full_text = event["output"]
+                        usage_value = event.get("usage")
+                        if isinstance(usage_value, dict) and usage_value:
+                            raw_usage = usage_value
+                            had_usage = True
         else:
             result = await handler(
                 config, user_input, tracked_tool_handlers, merged_variables, history
