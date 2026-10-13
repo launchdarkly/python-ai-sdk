@@ -1347,7 +1347,7 @@ class TestStreaming:
         assert start["parentMessageId"]
         assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
         result = next(event for event in hidden if event["type"] == "TOOL_CALL_RESULT")
-        assert "content" not in result
+        assert result["content"] == ""
 
         shown = await _events(True)
         args = next(event for event in shown if event["type"] == "TOOL_CALL_ARGS")

@@ -1937,11 +1937,7 @@ class TestAbandonedToolSpansAreNotErrors:
         monkeypatch.setattr(handler_mod, "query", _query_that_opens_a_tool)
         h = create_claude_agents_handler()
         gen = await h.stream(config, "q", {"webSearch": stub}, {})
-        assert (await gen.__anext__())["type"] in {
-            "TEXT_MESSAGE_START",
-            "TEXT_MESSAGE_CONTENT",
-            "TOOL_CALL_START",
-        }
+        assert (await gen.__anext__())["type"] == "TOOL_CALL_START"
         await gen.aclose()
 
         tools = [s for s in spans() if s.name.startswith("execute_tool ")]
@@ -2242,6 +2238,73 @@ class TestToolSpanSurvivesAContentFailure:
 
         tool = named("execute_tool ")[0]
         assert tool.end_time is not None
+
+
+async def test_a_builtin_tool_result_is_not_marked_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = StreamEvent(
+        uuid="u1",
+        session_id="sess-1",
+        event={
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu-1", "name": "Read"},
+        },
+    )
+    args = StreamEvent(
+        uuid="u2",
+        session_id="sess-1",
+        event={
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"file":"a"}'},
+        },
+    )
+    stopped = StreamEvent(
+        uuid="u3",
+        session_id="sess-1",
+        event={"type": "content_block_stop", "index": 0},
+    )
+    monkeypatch.setattr(
+        handler_mod,
+        "query",
+        _fake_query(
+            [
+                started,
+                args,
+                stopped,
+                tool_result_user_message("tu-1", "file body"),
+                result_message("done"),
+            ]
+        ),
+    )
+
+    async def _events(capture: bool) -> list[dict[str, Any]]:
+        handler = create_claude_agents_handler(capture_content=capture)
+        return [event async for event in await handler.stream(BASE_CONFIG, "q", {}, {})]
+
+    shown = await _events(True)
+    types = [event["type"] for event in shown if str(event["type"]).startswith("TOOL_")]
+    assert types == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+    ]
+    assert shown[0]["toolCallName"] == "Read" or any(
+        event.get("toolCallName") == "Read" for event in shown
+    )
+    result = next(event for event in shown if event["type"] == "TOOL_CALL_RESULT")
+    assert result["content"] == "file body"
+    assert "metadata" not in result
+
+    hidden = await _events(False)
+    assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+    hidden_result = next(
+        event for event in hidden if event["type"] == "TOOL_CALL_RESULT"
+    )
+    assert hidden_result["content"] == ""
 
 
 def test_a_streamed_mcp_tool_uses_the_config_name() -> None:

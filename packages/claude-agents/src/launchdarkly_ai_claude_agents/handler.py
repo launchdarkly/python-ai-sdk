@@ -24,6 +24,8 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     StreamEvent,
+    ToolResultBlock,
+    UserMessage,
     query,
 )
 
@@ -871,6 +873,20 @@ async def _stream_gen(
                     if rich.get("type") == "TEXT_MESSAGE_CONTENT":
                         full_output += rich.get("delta") or ""
                     yield rich
+            elif isinstance(message, UserMessage):
+                blocks = message.content if isinstance(message.content, list) else []
+                for block in blocks:
+                    if not isinstance(block, ToolResultBlock):
+                        continue
+                    # Built-in tools have no hook when the config lists none.
+                    # The SDK still yields the result, and that is what closes
+                    # the call instead of fail_open marking it failed.
+                    for rich in emitter.tool_result(
+                        str(block.tool_use_id),
+                        block.content,
+                        failed=bool(getattr(block, "is_error", False)),
+                    ):
+                        yield rich
             elif isinstance(message, ResultMessage):
                 # Before the root, so the children it parents are already closed.
                 inference.finish()
