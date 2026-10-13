@@ -225,6 +225,27 @@ class TestText:
         assert events[-1]["output"] == ""
         assert "disk on fire" not in str(events)
 
+    async def test_a_tool_for_another_message_does_not_attach_to_open_text(
+        self,
+    ) -> None:
+        events = await collect(
+            [
+                assistant_open("m2"),
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                tool_part(
+                    "c2", "running", message_id="m2", raw_input={"command": "ls"}
+                ),
+                assistant_completed("m1"),
+            ]
+        )
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        ended = next(event for event in events if event["type"] == "TEXT_MESSAGE_END")
+        assert "parentMessageId" not in start
+        assert events.index(ended) < events.index(start)
+        assert ended["messageId"] == text["messageId"]
+
     async def test_a_tool_that_finishes_after_the_text_is_not_a_failure(self) -> None:
         events = await collect(
             [

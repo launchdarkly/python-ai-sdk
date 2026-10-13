@@ -276,7 +276,9 @@ class _Reducer:
             return self._emit_tool(part)
         if self._text_open and self._text_message_id == message_id:
             return self._emit_tool(part)
-        if self._text_message_id == message_id and not self._text_open:
+        # Another message is streaming, or this message's text has not opened
+        # yet. Emitting now would parent the call to the wrong message.
+        if self._text_open or self._text_message_id == message_id:
             self._held_tools.setdefault(message_id, []).append(part)
             return []
         return self._emit_tool(part)
