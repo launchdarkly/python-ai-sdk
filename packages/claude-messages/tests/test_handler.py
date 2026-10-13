@@ -1366,7 +1366,11 @@ class TestStreaming:
         started = MagicMock()
         started.type = "content_block_start"
         started.index = 0
-        started.content_block = MagicMock(type="tool_use", id="c1", name="search")
+        block = MagicMock()
+        block.type = "tool_use"
+        block.id = "c1"
+        block.name = "search"
+        started.content_block = block
         _ctx, final = _make_stream_context([])
         final.stop_reason = "end_turn"
 
@@ -1389,6 +1393,9 @@ class TestStreaming:
         with patch.object(spans_mod, "_HAS_OTEL", False):
             handler = create_claude_messages_handler()
             events = [event async for event in await handler.stream(CONFIG, "q")]
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "search"
         assert any(
             event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
             for event in events
@@ -1435,7 +1442,11 @@ class TestStreaming:
         started = MagicMock()
         started.type = "content_block_start"
         started.index = 0
-        started.content_block = MagicMock(type="tool_use", id="c1", name="search")
+        block = MagicMock()
+        block.type = "tool_use"
+        block.id = "c1"
+        block.name = "search"
+        started.content_block = block
 
         class _Stream:
             def __aiter__(self) -> AsyncIterator[Any]:

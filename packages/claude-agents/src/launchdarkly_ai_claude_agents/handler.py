@@ -740,7 +740,9 @@ def _map_claude_stream_event(
         call_id = str(block.get("id") or "")
         if isinstance(index, int):
             block_ids[index] = call_id
-        return emitter.tool_start(call_id, str(block.get("name") or ""))
+        return emitter.tool_start(
+            call_id, tool_display_name(str(block.get("name") or ""))
+        )
     if kind == "content_block_delta":
         delta = event.get("delta") or {}
         if not isinstance(delta, dict):
@@ -938,16 +940,16 @@ async def _stream_gen(
         cancelled = True
         raise
     except Exception as exc:
-        while pending:
-            yield pending.pop(0)
-        for rich in emitter.fail_open():
-            yield rich
         if tool_telemetry is not None:
             tool_telemetry(exc)
         if not root_usage_written and inference.run_usage["reported"]:
             finish_root_span(span, config, inference.run_usage["total"])
             root_usage_written = True
         fail_span(span, exc, ended)
+        while pending:
+            yield pending.pop(0)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success path, where the result message already closed the last response.

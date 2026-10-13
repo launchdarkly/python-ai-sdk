@@ -2242,3 +2242,26 @@ class TestToolSpanSurvivesAContentFailure:
 
         tool = named("execute_tool ")[0]
         assert tool.end_time is not None
+
+
+def test_a_streamed_mcp_tool_uses_the_config_name() -> None:
+    from launchdarkly_ai_claude_agents.handler import _map_claude_stream_event
+    from launchdarkly_ai_server.agui import TurnEmitter
+
+    emitter = TurnEmitter(capture_content=True)
+    events = _map_claude_stream_event(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "tu-1",
+                "name": "mcp__tool-mcp__search",
+            },
+        },
+        emitter,
+        {},
+        set(),
+    )
+    assert events[0]["toolCallName"] == "search"
+    assert events[0]["toolCallId"] == "tu-1"
