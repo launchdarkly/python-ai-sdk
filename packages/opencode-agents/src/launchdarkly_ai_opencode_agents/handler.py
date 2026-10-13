@@ -251,7 +251,15 @@ class _Reducer:
         if isinstance(message_id, str) and isinstance(role, str):
             self._roles[message_id] = role
             if role == "assistant":
-                events.extend(self._begin_message(message_id))
+                completed_time = info.get("time")
+                finished = (
+                    isinstance(completed_time, Mapping)
+                    and "completed" in completed_time
+                )
+                # A completion for an earlier message must not close the
+                # message the consumer is reading now.
+                if not finished or message_id == self._text_message_id:
+                    events.extend(self._begin_message(message_id))
                 events.extend(self._flush_held(message_id))
                 for part in self._held_tools.pop(message_id, []):
                     events.extend(self._emit_tool(part))
@@ -260,15 +268,10 @@ class _Reducer:
                 self._held_tools.pop(message_id, None)
         if role != "assistant" or not isinstance(message_id, str):
             return events
-        completed = info.get("time")
-        if not isinstance(completed, Mapping) or "completed" not in completed:
-            return events
         completed_time = info.get("time")
-        if (
-            isinstance(completed_time, Mapping)
-            and "completed" in completed_time
-            and message_id == self._text_message_id
-        ):
+        if not isinstance(completed_time, Mapping) or "completed" not in completed_time:
+            return events
+        if message_id == self._text_message_id:
             events.extend(self._emitter.end_text())
             self._text_message_id = None
         if message_id not in self._usage_ids:

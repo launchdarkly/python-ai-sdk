@@ -225,6 +225,52 @@ class TestText:
         assert start["parentMessageId"] == text["messageId"]
         assert events.index(text) < events.index(start)
 
+    async def test_a_late_completion_does_not_split_the_open_message(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                assistant_completed("m1"),
+                text_delta("m2", "p3", "B2"),
+                assistant_completed("m2"),
+            ]
+        )
+        texts = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert texts == ["A", "B1", "B2"]
+        message_ids = [
+            event["messageId"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert message_ids[1] == message_ids[2]
+        assert message_ids[0] != message_ids[1]
+
+    async def test_capture_off_hides_tool_content(self) -> None:
+        built = create_opencode_handler(
+            capture_content=False,
+            events=source(
+                [
+                    assistant_open("m1"),
+                    tool_part("c1", "running", raw_input={"command": "ls"}),
+                    tool_part("c1", "completed", output="file.txt"),
+                    assistant_completed("m1"),
+                ]
+            ),
+        )
+        gen = await built.stream({}, "hi", None, None)
+        events = [event async for event in gen]
+        assert any(event["type"] == "TOOL_CALL_START" for event in events)
+        assert not any(event["type"] == "TOOL_CALL_ARGS" for event in events)
+        rendered = str(events)
+        assert "ls" not in rendered
+        assert "file.txt" not in rendered
+
     async def test_an_unlabeled_tool_does_not_inherit_an_open_message(self) -> None:
         events = await collect(
             [
