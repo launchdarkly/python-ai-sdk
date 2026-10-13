@@ -9,11 +9,43 @@ pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-openc
 ```
 
 ```python
-from launchdarkly_ai_opencode_agents import create_opencode_handler
-from launchdarkly_ai_server import config
+import asyncio
+from collections.abc import AsyncIterator
 
-handler = create_opencode_handler(events=session_events)
-config(key="my-agent", handler=handler).stream("Hello", {"kind": "user", "key": "user-1"})
+from launchdarkly_ai_opencode_agents import create_opencode_handler
+from launchdarkly_ai_server import config, init_client, shutdown
+
+
+async def session_events(config, user_input, variables, history, session_id):
+    """Subscribe to session_id, send user_input, and stop at session.idle."""
+    del config, variables, history
+    yield {"type": "message.updated", "properties": {"info": {"id": "m1", "role": "assistant", "time": {"created": 1}}}}
+    yield {
+        "type": "message.part.delta",
+        "properties": {
+            "sessionID": session_id,
+            "messageID": "m1",
+            "partID": "p1",
+            "field": "text",
+            "delta": "Hello",
+        },
+    }
+    yield {"type": "session.idle", "properties": {"sessionID": session_id}}
+
+
+async def main() -> None:
+    await init_client()
+    handler = create_opencode_handler(events=session_events, session_id="ses")
+    async for event in config(
+        key="my-agent", handler=handler, skip_judges=True
+    ).stream("Hello", {"kind": "user", "key": "user-1"}):
+        print(event)
+    await shutdown()
+
+
+asyncio.run(main())
 ```
 
-`events` is called on every invocation and must return a fresh async iterable of OpenCode session events. `config().stream()` yields `chunk` then `done`.
+`events` is required. Each invocation calls `events(config, user_input, variables, history, session_id)` and the return value must be a fresh async iterable of that session only. The iterable must end: return it after `session.idle`, or close it yourself. `config().stream()` yields `chunk` then `done`.
+
+Pass `skip_judges=True`. This handler matches every agent-mode provider, including a judge, and it does not run the judge prompt.

@@ -13,20 +13,40 @@ from typing import Any
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
+    SpanMessage,
+    SpanUsage,
     _config,
     _create_handler,
+    add_cached_tokens_to_input,
+    end_span_once,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    text_message,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.sdk_usage import report_usage
 from launchdarkly_ai_server.utils import number_or_zero
 
 from ._version import PACKAGE_NAME, __version__
+from .spans import fail_span, finish_root_span, mark_ok, start_root_span
+
+Events = Callable[
+    [
+        AiConfigRep,
+        str | None,
+        dict[str, Any] | None,
+        list[dict[str, Any]] | None,
+        str | None,
+    ],
+    AsyncIterable[Mapping[str, Any]],
+]
 
 
 class OpenCodeSessionError(Exception):
     """The OpenCode session failed.
 
-    The provider error body is not included. A failed session does not finish
-    the run.
+    The provider error body is not included. The error ``name`` is, when the
+    event has one. A failed session does not finish the run.
     """
 
 
@@ -35,11 +55,17 @@ class _Reducer:
 
     Text is emitted only for messages ``message.updated`` has marked assistant.
     A part snapshot is that part's full text so far: a later delta still appends,
-    and a snapshot that repeats text already emitted adds nothing. Tool parts
-    are not forwarded.
+    and a snapshot that repeats text already emitted adds nothing. A text delta
+    without ``partID`` is dropped, because the snapshot of that part cannot be
+    matched to it. Tool parts are not forwarded.
+
+    Events whose ``sessionID`` is not this session are ignored. The first
+    ``sessionID`` seen is the session when the caller did not pass one. A
+    ``session.idle`` for this session ends the iterable.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: str | None) -> None:
+        self._session_id = session_id
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
         self._held: dict[str, list[tuple[str, str, str]]] = {}
@@ -73,8 +99,20 @@ class _Reducer:
         self, events: AsyncIterable[Mapping[str, Any]]
     ) -> AsyncGenerator[dict[str, Any], None]:
         async for raw in events:
-            if isinstance(raw, Mapping) and raw.get("type") == "session.error":
-                raise OpenCodeSessionError("The OpenCode session failed.")
+            if not isinstance(raw, Mapping):
+                continue
+            kind = raw.get("type")
+            properties = raw.get("properties")
+            session_id = _session_id(properties)
+            if session_id is not None:
+                if self._session_id is None:
+                    self._session_id = session_id
+                elif session_id != self._session_id:
+                    continue
+            if kind == "session.idle":
+                return
+            if kind == "session.error":
+                raise OpenCodeSessionError(_session_error_message(properties))
             for event in self._event(raw):
                 yield event
 
@@ -98,27 +136,22 @@ class _Reducer:
 
     def _apply_text(self, part_id: str, kind: str, text: str) -> list[dict[str, Any]]:
         if kind == "delta":
-            if part_id:
-                self._part_text[part_id] = self._part_text.get(part_id, "") + text
+            self._part_text[part_id] = self._part_text.get(part_id, "") + text
             return self._chunk(text)
         already = self._part_text.get(part_id, "")
         if text.startswith(already):
             suffix = text[len(already) :]
-            if part_id:
-                self._part_text[part_id] = text
+            self._part_text[part_id] = text
         elif not already:
             suffix = text
-            if part_id:
-                self._part_text[part_id] = text
+            self._part_text[part_id] = text
         else:
             return []
         if not suffix:
             return []
         return self._chunk(suffix)
 
-    def _event(self, raw: Mapping[str, Any] | object) -> list[dict[str, Any]]:
-        if not isinstance(raw, Mapping):
-            return []
+    def _event(self, raw: Mapping[str, Any]) -> list[dict[str, Any]]:
         kind = raw.get("type")
         properties = raw.get("properties")
         if not isinstance(properties, Mapping):
@@ -141,12 +174,16 @@ class _Reducer:
             return []
         delta = properties.get("delta")
         message_id = properties.get("messageID")
-        if not isinstance(delta, str) or not delta or not isinstance(message_id, str):
-            return []
         part_id = properties.get("partID")
-        return self._accept_text(
-            message_id, part_id if isinstance(part_id, str) else "", "delta", delta
-        )
+        if (
+            not isinstance(delta, str)
+            or not delta
+            or not isinstance(message_id, str)
+            or not isinstance(part_id, str)
+            or not part_id
+        ):
+            return []
+        return self._accept_text(message_id, part_id, "delta", delta)
 
     def _text_snapshot(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
         message_id = part.get("messageID")
@@ -198,12 +235,54 @@ class _Reducer:
             self._cache_write += number_or_zero(cache.get("write"))
 
 
+def _session_id(properties: object) -> str | None:
+    if not isinstance(properties, Mapping):
+        return None
+    session_id = properties.get("sessionID")
+    if isinstance(session_id, str) and session_id:
+        return session_id
+    return None
+
+
+def _session_error_message(properties: object) -> str:
+    name = None
+    if isinstance(properties, Mapping):
+        error = properties.get("error")
+        if isinstance(error, Mapping):
+            raw_name = error.get("name")
+            if isinstance(raw_name, str) and raw_name:
+                name = raw_name
+    if name is None:
+        return "The OpenCode session failed."
+    return f"The OpenCode session failed ({name})."
+
+
+def _input_messages(
+    user_input: str | None,
+    history: list[dict[str, Any]] | None,
+) -> list[SpanMessage]:
+    messages: list[SpanMessage] = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if isinstance(role, str) and role and isinstance(content, str):
+            messages.append(text_message(role, content))
+    if isinstance(user_input, str):
+        messages.append(text_message("user", user_input))
+    return messages
+
+
 def _open_events(
-    events: Callable[[], AsyncIterable[Mapping[str, Any]]] | None,
+    events: Events,
+    config: AiConfigRep,
+    user_input: str | None,
+    variables: dict[str, Any] | None,
+    history: list[dict[str, Any]] | None,
+    session_id: str | None,
 ) -> AsyncIterable[Mapping[str, Any]]:
-    if events is None:
-        raise OpenCodeSessionError("The OpenCode handler has no session event source.")
-    produced = events()
+    produced = events(config, user_input, variables, history, session_id)
     if not hasattr(produced, "__aiter__"):
         raise TypeError("OpenCode event source must return an async iterable.")
     return produced
@@ -211,22 +290,29 @@ def _open_events(
 
 def create_opencode_handler(
     *,
+    events: Events,
+    session_id: str | None = None,
     capture_content: bool | None = None,
-    events: Callable[[], AsyncIterable[Mapping[str, Any]]] | None = None,
 ) -> ProviderHandler:
     """Return a handler that runs an OpenCode session supplied by *events*.
 
     ``provides_for`` is ``('*', 'agent')``, so the handler matches an agent-mode
-    variation for any provider. *events* is called on every invocation and must
-    return a fresh async iterable of OpenCode session events. This function does
-    not start OpenCode and does not construct an OpenCode SDK client.
+    variation for any provider. *events* is called on every invocation as
+    ``events(config, user_input, variables, history, session_id)`` and must
+    return a fresh async iterable of that session's bus events. This function
+    does not start OpenCode and does not construct an OpenCode SDK client.
 
-    The stream yields assistant text as ``chunk`` and one ``done``. *capture_content*
-    follows the other handlers: ``None`` reads the process default from
-    ``configure`` when content is read, and ``True`` or ``False`` overrides it.
+    The stream yields assistant text as ``chunk`` and one ``done``. Pass
+    ``skip_judges=True`` to ``config()``: a judge would otherwise be routed
+    here and *events* would run again on the judge prompt. *capture_content*
+    follows the other handlers.
     """
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
-    return _create_opencode_handler(capture_content=capture_content, events=events)
+    return _create_opencode_handler(
+        events=events,
+        session_id=session_id,
+        capture_content=capture_content,
+    )
 
 
 def opencode_agents(
@@ -237,19 +323,23 @@ def opencode_agents(
 ) -> Any:
     """Convenience wrapper: creates a handler and calls ``config(...).invoke()``.
 
-    *events* is the session event source, the same callable
-    :func:`create_opencode_handler` takes. This does not construct an OpenCode
-    SDK client.
+    *events* is required and is the same callable :func:`create_opencode_handler`
+    takes. *variables*, *history*, *session_id*, and *capture_content* configure
+    that call. This does not construct an OpenCode SDK client. Pass
+    ``skip_judges=True`` so a judged config does not run *events* again.
     """
     report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     history = kwargs.pop("history", None)
     capture_content = kwargs.pop("capture_content", None)
-    events = kwargs.pop("events", None)
+    session_id = kwargs.pop("session_id", None)
+    events = kwargs.pop("events")
     return _config(
         key=config_key,
         handler=_create_opencode_handler(
-            capture_content=capture_content, events=events
+            events=events,
+            session_id=session_id,
+            capture_content=capture_content,
         ),
         **kwargs,
     ).invoke(user_input, context, variables, history)
@@ -257,9 +347,13 @@ def opencode_agents(
 
 def _create_opencode_handler(
     *,
+    events: Events,
+    session_id: str | None,
     capture_content: bool | None,
-    events: Callable[[], AsyncIterable[Mapping[str, Any]]] | None,
 ) -> ProviderHandler:
+    content_override = capture_content
+    bound_session = session_id
+
     async def _stream_impl(
         config: AiConfigRep,
         user_input: str | None,
@@ -267,14 +361,49 @@ def _create_opencode_handler(
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        reducer = _Reducer()
-        async for event in reducer.reduce(_open_events(events)):
-            yield event
-        done: dict[str, Any] = {"type": "done", "output": "".join(reducer.deltas)}
-        usage = reducer.usage_payload()
-        if usage is not None:
-            done["usage"] = usage
-        yield done
+        capture = effective_capture_content(content_override)
+        span = start_root_span(config, variables or {})
+        ended: set[int] = set()
+        reducer = _Reducer(bound_session)
+        try:
+            instructions = (
+                config.get("instructions") if isinstance(config, dict) else None
+            )
+            set_input_content_attributes(
+                span,
+                capture,
+                system_instructions=instructions
+                if isinstance(instructions, str)
+                else None,
+                messages=_input_messages(user_input, history),
+            )
+            async for event in reducer.reduce(
+                _open_events(
+                    events, config, user_input, variables, history, bound_session
+                )
+            ):
+                yield event
+            output = "".join(reducer.deltas)
+            if output:
+                set_output_content_attributes(
+                    span, capture, [text_message("assistant", output)]
+                )
+            usage = reducer.usage_payload()
+            finish_root_span(
+                span,
+                config,
+                add_cached_tokens_to_input(usage) if usage is not None else SpanUsage(),
+            )
+            mark_ok(span)
+            done: dict[str, Any] = {"type": "done", "output": output}
+            if usage is not None:
+                done["usage"] = usage
+            yield done
+        except Exception as exc:
+            fail_span(span, exc, ended)
+            raise
+        finally:
+            end_span_once(span, ended)
 
     async def _call_impl(
         config: AiConfigRep,
@@ -299,5 +428,5 @@ def _create_opencode_handler(
         ("*", "agent"),
         _call_impl,
         _stream_impl,
-        capture_content=capture_content,
+        capture_content=content_override,
     )
