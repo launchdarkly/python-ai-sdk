@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .agui import StableProjector
 from .conversation import bind_conversation_id, bind_span_context
 from .registry import resolve_handlers, resolve_tools
 from .types import (
@@ -509,6 +510,7 @@ async def _build_graph(
                 "graphKey": key,
             }
 
+            projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
                 config=node.config,
@@ -521,17 +523,17 @@ async def _build_graph(
                 graph_key=key,
                 history=opts.get("history"),
             ):
-                if event.get("type") == "chunk":
+                for stable in projector.feed(event):
                     yield {
                         "type": "chunk",
-                        "text": event["text"],
+                        "text": stable["text"],
                         "nodeKey": node.key,
                     }
-                else:
-                    response = event.get("response", "")
-                    usage = event.get("usage") or usage
-                    track_data = event.get("track_data") or track_data
-                    trajectory = event.get("trajectory") or trajectory
+            if projector.done:
+                response = projector.done.get("response", "")
+                usage = projector.done.get("usage") or usage
+                track_data = projector.done.get("track_data") or track_data
+                trajectory = projector.done.get("trajectory") or trajectory
 
             judge_results = await run_judges(
                 config=node.config,
@@ -648,6 +650,7 @@ async def _build_graph(
 
             merged_tool_handlers = {**(tool_handlers or {}), **handoff_handlers}
 
+            projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
                 config=routed_config,
@@ -660,17 +663,17 @@ async def _build_graph(
                 graph_key=key,
                 history=opts.get("history"),
             ):
-                if event.get("type") == "chunk":
+                for stable in projector.feed(event):
                     yield {
                         "type": "chunk",
-                        "text": event["text"],
+                        "text": stable["text"],
                         "nodeKey": node.key,
                     }
-                else:
-                    response = event.get("response", "")
-                    usage = event.get("usage") or usage
-                    track_data = event.get("track_data") or track_data
-                    trajectory = event.get("trajectory") or trajectory
+            if projector.done:
+                response = projector.done.get("response", "")
+                usage = projector.done.get("usage") or usage
+                track_data = projector.done.get("track_data") or track_data
+                trajectory = projector.done.get("trajectory") or trajectory
 
             # Judge against the node's original config, not the routing-augmented one.
             judge_results = await run_judges(
