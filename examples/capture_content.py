@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 
-import examples.register  # noqa: F401 – side-effect: populate global_registry
 from examples.utils import new_context, write_output
 from launchdarkly_ai_server import (
     SDKOptions,
@@ -41,6 +40,14 @@ async def run(key: str, user_input: str) -> None:
 
 
 async def _main(key: str, user_input: str) -> None:
+    # Provider clients snapshot API keys at construction. Load .env before
+    # examples.register builds them, then set the process default before any
+    # AI call. The handlers themselves take no capture_content argument.
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    import examples.register  # noqa: F401 – side-effect: populate global_registry
+
     configure(options=SDKOptions(capture_content=True))
     await init_client()
     try:
@@ -53,9 +60,6 @@ if __name__ == "__main__":
     import asyncio
     import sys
 
-    from dotenv import load_dotenv
-
-    load_dotenv()
     key = sys.argv[1].strip() if len(sys.argv) > 1 else _DEFAULT_KEY
     user_input = sys.argv[2].strip() if len(sys.argv) > 2 else _DEFAULT_USER_INPUT
     asyncio.run(_main(key, user_input))
