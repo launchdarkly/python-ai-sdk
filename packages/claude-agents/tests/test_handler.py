@@ -144,6 +144,47 @@ def result_message(
     )
 
 
+# Measured against Agent SDK 0.3.220 with a rejected key, and the same for a key without credits: an
+# API failure does not fail the run. The CLI emits a synthetic assistant message whose ``model`` is
+# the literal ``<synthetic>`` and whose content is the error text, then a result that says
+# ``success`` but sets ``is_error``. The CLI emits the same kind of synthetic message after a
+# response stops at ``max_output_tokens``, and that run can still succeed.
+ZERO_USAGE: dict[str, Any] = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+}
+
+
+def synthetic_message(
+    text: str = "Credit balance is too low", message_id: str = "msg_synthetic"
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="<synthetic>",
+        error="billing_error",
+        usage=dict(ZERO_USAGE),
+        message_id=message_id,
+        stop_reason="stop_sequence",
+        session_id="sess-1",
+    )
+
+
+def api_error_result_message(text: str = "Credit balance is too low") -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=0,
+        is_error=True,
+        num_turns=1,
+        session_id="sess-1",
+        usage=dict(ZERO_USAGE),
+        result=text,
+        api_error_status=400,
+    )
+
+
 def init_message(
     session_id: str = "sess-1", tools: list[str] | None = None
 ) -> SystemMessage:
@@ -959,6 +1000,95 @@ class TestErrorHandling:
         assert root().status.status_code == StatusCode.ERROR
         assert attrs["gen_ai.usage.input_tokens"] == 40000
         assert attrs["gen_ai.usage.output_tokens"] == 500
+
+    async def test_api_error_under_success_subtype_fails_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query(
+                [init_message(), synthetic_message(), api_error_result_message()]
+            ),
+        )
+        with pytest.raises(RuntimeError, match=r"400.*Credit balance is too low"):
+            await create_claude_agents_handler(capture_content=True)(BASE_CONFIG, "q")
+        # The synthetic message is not a model response, so it gets no chat span.
+        assert [s.name for s in spans()] == ["invoke_agent"]
+        assert root().status.status_code == StatusCode.ERROR
+        [exception] = [e for e in root().events if e.name == "exception"]
+        assert "Credit balance is too low" in exception.attributes["exception.message"]
+        # The error text is not model output.
+        assert "gen_ai.output.messages" not in root().attributes
+
+    async def test_streamed_api_error_fails_the_run_without_a_done_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query(
+                [init_message(), synthetic_message(), api_error_result_message()]
+            ),
+        )
+        events: list[Any] = []
+        with pytest.raises(RuntimeError, match=r"400.*Credit balance is too low"):
+            gen = await create_claude_agents_handler(capture_content=True).stream(
+                BASE_CONFIG, "q", {}, {}
+            )
+            async for event in gen:
+                events.append(event)
+        assert events == []
+        assert [s.name for s in spans()] == ["invoke_agent"]
+        assert root().status.status_code == StatusCode.ERROR
+        assert "gen_ai.output.messages" not in root().attributes
+
+    async def test_success_result_with_is_error_false_is_a_successful_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query([assistant_message(), result_message("fine")]),
+        )
+        result = await create_claude_agents_handler()(BASE_CONFIG, "q")
+        assert result["output"] == "fine"
+        assert root().status.status_code == StatusCode.OK
+
+    async def test_synthetic_message_is_left_out_of_every_chat_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A synthetic message can share the real response's id, so grouping on it would append the
+        # error text to that response's output.
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query(
+                [
+                    assistant_message(10, 2, "msg_1", [TextBlock(text="first half")]),
+                    synthetic_message("API Error: output token maximum", "msg_1"),
+                    tool_result_user_message(),
+                    assistant_message(12, 3, "msg_2", [TextBlock(text="second half")]),
+                    result_message("second half"),
+                ]
+            ),
+        )
+        result = await create_claude_agents_handler(capture_content=True)(
+            BASE_CONFIG, "q"
+        )
+        assert result["output"] == "second half"
+        chats = named("chat ")
+        assert [c.name for c in chats] == [
+            "chat claude-opus-4-5",
+            "chat claude-opus-4-5",
+        ]
+        for chat in chats:
+            assert "output token maximum" not in str(
+                chat.attributes.get("gen_ai.output.messages")
+            )
+            assert "output token maximum" not in str(
+                chat.attributes.get("gen_ai.input.messages")
+            )
 
     async def test_reports_responses_that_arrived_when_the_sdk_throws(
         self, monkeypatch: pytest.MonkeyPatch

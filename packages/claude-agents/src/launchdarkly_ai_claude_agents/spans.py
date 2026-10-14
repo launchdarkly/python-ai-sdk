@@ -213,6 +213,18 @@ def record_native_tools(
         set_tool_definition_attributes(span, capture, catalog.current)
 
 
+def _is_synthetic(message: AssistantMessage) -> bool:
+    """Whether an assistant message is one the CLI wrote itself rather than one the model returned.
+
+    Measured against Agent SDK 0.3.220: a failed API call surfaces as an assistant message whose
+    ``model`` is the literal ``<synthetic>``, whose content is the error text and whose usage is
+    zero, and the CLI emits the same after a response stops at ``max_output_tokens``. Keyed on
+    ``model`` rather than on the message's ``error`` field because the latter is set on both, and
+    only the run's result says whether the run failed.
+    """
+    return message.model == "<synthetic>"
+
+
 def marks_local_work(message: Any) -> bool:
     """Whether a non-assistant message marks the end of local work, and so the start of the window
     that will produce the next response.
@@ -444,7 +456,11 @@ class InferenceSpans:
     def record(self, message: Any) -> None:
         """Feed every message of the run, in order."""
         if isinstance(message, AssistantMessage):
-            self._absorb(message)
+            # Not a model response, so no span, no turn in the conversation and no usage. It can
+            # share the real response's id, which would otherwise append the error text to that
+            # response's output.
+            if not _is_synthetic(message):
+                self._absorb(message)
             return
         if isinstance(message, UserMessage):
             self._absorb_user_turn(message)
