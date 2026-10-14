@@ -217,10 +217,11 @@ asyncio.run(main())
 
 | Export | Description |
 |---|---|
+| `configure(options=...)` | Set process-wide behavior defaults. Keyword-only. Separate from `init_client`. |
 | `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. |
 | `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery. |
 | `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
-| `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. |
+| `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. Restores the built-in SDK defaults. |
 | `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
 
 `init_client` reads these option keys. Each overrides the environment variable of the same
@@ -236,6 +237,22 @@ warning and ignored.
 | `otlpEndpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint spans are exported to |
 | `serviceName` | `LD_SERVICE_NAME` | OTel `service.name` resource attribute |
 | `environment` | `LD_ENVIRONMENT` | `deployment.environment` resource attribute |
+
+### Process-wide defaults
+
+`configure` sets behavior for the process. It does not initialize the LaunchDarkly client; call `init_client` for that. Handlers built without an explicit `capture_content` read this value when they run, so one startup call covers every handler. An explicit `True` or `False` on a handler factory or convenience wrapper overrides it. Call `configure` from process startup, not from request data. It can be replaced until the first AI invocation; after that only the same options are accepted. `shutdown()` restores the built-in default, which is off.
+
+```python
+from launchdarkly_ai_server import SDKOptions, configure, init_client, shutdown
+
+async def main():
+    configure(options=SDKOptions(capture_content=True))
+    await init_client({"sdkKey": "sdk-...", "serviceName": "my-service"})
+    # create_*_handler() with no capture_content argument follows the default above.
+    await shutdown()
+```
+
+`SDKOptions` is the extension point for further process-wide defaults.
 
 ### Give the evaluation tools
 
