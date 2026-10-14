@@ -1573,6 +1573,25 @@ class TestStreamingTelemetry:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
+    @pytest.mark.asyncio
+    async def test_process_default_is_read_on_the_streaming_path(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            ctx, rec = _recording()
+            llm = _FakeToolModel(replies=[_ai_message("hi")])
+            with ctx:
+                async for _ in await create_langchain_agents_handler(llm).stream(
+                    BASE_CONFIG, "q", {}, {}
+                ):
+                    pass
+            assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+        finally:
+            _reset_for_testing()
+
 
 # ---------------------------------------------------------------------------
 # §1.9 Output format
@@ -1849,8 +1868,11 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in seen["config_kwargs"]
 
-    def test_defaults_to_off(self) -> None:
-        assert self._run()["capture_content"] is False
+    def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
+        assert self._run()["capture_content"] is None
+
+    def test_explicit_false_reaches_the_factory(self) -> None:
+        assert self._run(capture_content=False)["capture_content"] is False
 
 
 class TestCallbackSpansNeverLeak:

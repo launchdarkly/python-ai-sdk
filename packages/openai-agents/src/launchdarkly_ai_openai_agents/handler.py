@@ -45,6 +45,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -459,19 +460,26 @@ def _usage_from_error(error: BaseException) -> SpanUsage | None:
     return to_span_usage(usage)
 
 
-def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_openai_agent_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
     report_usage("openai-agents.createOpenAIAgentHandler", PACKAGE_NAME, __version__)
     return _create_openai_agent_handler(capture_content=capture_content)
 
 
-def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
+def _create_openai_agent_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """Non-reporting :func:`create_openai_agent_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -480,6 +488,8 @@ def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHa
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         agents_mod = importlib.import_module("agents")
@@ -565,14 +575,14 @@ def _create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHa
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
     return _create_handler(
         ("OpenAI", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -722,7 +732,7 @@ def openai_agents(
     # asking for content on spans got a TypeError instead of content.
     report_usage("openai-agents.openaiAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
         handler=_create_openai_agent_handler(capture_content=capture_content),

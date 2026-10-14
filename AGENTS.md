@@ -140,10 +140,11 @@ The client manages a singleton connection to LaunchDarkly and the associated tel
 
 | Export | Description |
 |---|---|
-| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. |
+| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. Does not take behavior defaults. |
 | `init_client(client=...)` | **BYOC overload** — accepts a pre-initialized `LDClientInterface`. Stores it directly without calling the SDK. Flushes pending `$ld:ai:sdk:info` events. |
+| `configure(*, options)` | Sets process-wide behavior defaults on the lifecycle singleton. `options` is a frozen `SDKOptions` (`capture_content: bool = False`). Keyword-only. Handlers read it at invocation. An explicit factory or wrapper `capture_content` overrides it. Replaceable until the first AI invocation; an identical value is allowed after. Not read from request data. |
 | `get_client()` | Returns the initialized `LDClientInterface`. Throws if initialization has not completed. |
-| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. |
+| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. Restores the built-in SDK defaults. |
 | `register_ai_sdk_package(name, version)` | Records a LaunchDarkly AI package identity. Handler and convenience packages call this at import time. |
 
 ### Core Data Types
@@ -554,9 +555,12 @@ providers out of three. `SpanUsage` is the type that means the folding is alread
 
 #### Content is off by default
 
-Every factory takes `capture_content: bool = False`. Guard at the
-call site as well as inside the helper: the helper's guard makes a forgotten call site harmless, and
-the call site's guard avoids serialising JSON that would then be discarded, once per turn, in a loop.
+Every factory takes `capture_content: bool | None = None`. `None` reads `configure()` at
+invocation, which is off until a process sets `SDKOptions(capture_content=True)`. An explicit
+`True` or `False` overrides that default. Guard at the call site as well as inside the helper: the
+helper's guard makes a forgotten call site harmless, and the call site's guard avoids serialising
+JSON that would then be discarded, once per turn, in a loop. Resolve the bool when the handler
+runs, not when it is constructed.
 
 #### Finish reasons have three mechanisms, not one
 

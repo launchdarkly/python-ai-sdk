@@ -12,12 +12,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from launchdarkly_ai_server import NativeTool, create_handler
-from launchdarkly_ai_server.evaluations import (
+from launchdarkly_ai_server.evaluations import HttpResponse
+from launchdarkly_ai_server.experimental.evaluations import (
     AIConfig,
     DatasetRow,
     EvalTool,
     EvaluationsError,
-    HttpResponse,
     Judge,
     Scorer,
     init_evaluations,

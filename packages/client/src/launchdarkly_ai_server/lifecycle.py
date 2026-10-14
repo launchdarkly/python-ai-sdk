@@ -9,7 +9,7 @@ from typing import Any
 from . import skills
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
-from .types import InitClientOptions
+from .types import InitClientOptions, SDKOptions
 from .utils import model_stamps_from_meta
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,56 @@ _tracer_provider: Any = None
 # is once-guarded, so when another library registered first ours is refused and
 # the global stays theirs. Only the owner may release it on shutdown.
 _owns_otel_globals: bool = False
+# Process-wide behavior defaults. Separate from ``_client``: ``init_client`` only
+# builds the LaunchDarkly client and telemetry, and ``configure`` can run before
+# that exists. ``_ai_invoked`` latches on the first handler call so a later
+# ``configure`` cannot change what an in-flight process already started using.
+_sdk_options: SDKOptions = SDKOptions()
+_ai_invoked: bool = False
+
+
+def configure(*, options: SDKOptions) -> None:
+    """Sets process-wide SDK behavior defaults.
+
+    Call once from process startup, before the first AI invocation, with an
+    :class:`SDKOptions` value the process owns. Do not build it from request
+    data. Handlers constructed without an explicit ``capture_content`` read the
+    configured value when they run, including handlers built before this call.
+
+    A later call may replace the options until the first AI invocation. After
+    that, only an identical ``options`` value is accepted. ``shutdown()``
+    restores the built-in defaults and allows configuration again.
+
+    ``init_client`` is unchanged: it only initializes the LaunchDarkly client
+    and telemetry.
+    """
+    global _sdk_options
+    if not isinstance(options, SDKOptions):
+        raise TypeError("configure() options must be an SDKOptions")
+    if _ai_invoked and options != _sdk_options:
+        raise RuntimeError(
+            "SDK options cannot change after the first AI invocation. "
+            "shutdown() restores the built-in defaults."
+        )
+    _sdk_options = options
+
+
+def effective_capture_content(override: bool | None) -> bool:
+    """Resolves content capture for one invocation.
+
+    An explicit ``True`` or ``False`` — from a convenience wrapper, then from
+    the handler factory — wins. ``None`` reads the configured default, which
+    itself defaults to ``False``.
+    """
+    if override is not None:
+        return override
+    return _sdk_options.capture_content
+
+
+def note_ai_invocation() -> None:
+    """Latches the process so ``configure`` can no longer change options."""
+    global _ai_invoked
+    _ai_invoked = True
 
 
 def get_client() -> Any:
@@ -318,13 +368,13 @@ async def shutdown() -> None:
     even if the client was never initialized or already shut down.
 
     Also clears any experimental feature state, such as a configured skill
-    store.
+    store, and restores process-wide SDK defaults from ``configure``.
 
     When telemetry was running, this also releases the process-global tracer
     provider so a later ``init_client`` can install its own — see
     ``_release_otel_globals``.
     """
-    global _client, _tracer_provider, _owns_otel_globals
+    global _client, _tracer_provider, _owns_otel_globals, _sdk_options, _ai_invoked
 
     local_client = _client
     local_provider = _tracer_provider
@@ -332,10 +382,14 @@ async def shutdown() -> None:
 
     _clear_experimental_state()
 
-    # Null the singleton before any awaits so a second call is a no-op
+    # Null the singleton before any awaits so a second call is a no-op.
+    # Options reset even when no client was initialized: configure() does not
+    # require one, and shutdown is what puts the process back to built-in defaults.
     _client = None
     _tracer_provider = None
     _owns_otel_globals = False
+    _sdk_options = SDKOptions()
+    _ai_invoked = False
     reset_ai_sdk_info()
     reset_sdk_usage()
 
@@ -373,11 +427,13 @@ def _set_client_for_testing(c: Any) -> None:
 
 def _reset_for_testing() -> None:
     """Test helper — clear all singleton state."""
-    global _client, _tracer_provider, _owns_otel_globals
+    global _client, _tracer_provider, _owns_otel_globals, _sdk_options, _ai_invoked
     owned_globals = _owns_otel_globals
     _client = None
     _tracer_provider = None
     _owns_otel_globals = False
+    _sdk_options = SDKOptions()
+    _ai_invoked = False
     # Directly, not through _clear_experimental_state: a failed reset should
     # fail the test rather than leak state into the next one.
     skills._clear_state()
