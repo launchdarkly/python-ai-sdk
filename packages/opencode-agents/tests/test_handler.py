@@ -319,7 +319,7 @@ class TestText:
             for event in events
             if event["type"] == "TEXT_MESSAGE_CONTENT"
         ]
-        assert texts == ["A", "B1", "B2"]
+        assert texts == ["A", "B1", "B2", "stale"]
         message_ids = [
             event["messageId"]
             for event in events
@@ -327,16 +327,34 @@ class TestText:
         ]
         assert message_ids[1] == message_ids[2]
         assert message_ids[0] != message_ids[1]
-        assert "stale" not in texts
-        assert not any(
-            event.get("toolCallId") == "c3"
+        assert message_ids[3] != message_ids[1]
+        open_end = next(
+            event
             for event in events
-            if event["type"].startswith("TOOL_CALL")
+            if event["type"] == "TEXT_MESSAGE_END"
+            and event["messageId"] == message_ids[1]
         )
-        assert any(
-            event["type"] == "TEXT_MESSAGE_END" and event["messageId"] == message_ids[1]
+        stale = next(
+            event
             for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "stale"
         )
+        assert events.index(open_end) < events.index(stale)
+        start = next(
+            event
+            for event in events
+            if event["type"] == "TOOL_CALL_START" and event["toolCallId"] == "c3"
+        )
+        result = next(
+            event
+            for event in events
+            if event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c3"
+        )
+        assert result["content"] == "old.txt"
+        assert "metadata" not in result
+        assert start.get("parentMessageId") == message_ids[3]
+        assert events.index(open_end) < events.index(start)
+        assert events[-1]["output"] == "AB1B2stale"
 
     async def test_a_completed_message_is_emitted_when_nothing_is_open(self) -> None:
         events = await collect(

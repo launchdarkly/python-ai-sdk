@@ -76,6 +76,9 @@ class _Reducer:
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
         self._held: dict[str, list[tuple[str, str, str]]] = {}
+        self._parked: list[
+            tuple[str, list[tuple[str, str, str]], list[Mapping[str, Any]]]
+        ] = []
         self._part_text: dict[str, str] = {}
         self._usage_ids: set[str] = set()
         self._input = 0
@@ -176,6 +179,40 @@ class _Reducer:
         events = self._emitter.end_text()
         self._text_message_id = None
         self._text_open = False
+        events.extend(self._flush_parked())
+        return events
+
+    def _flush_parked(self) -> list[dict[str, Any]]:
+        """Emit messages completed while other text was open, after that text ends."""
+        parked = self._parked
+        self._parked = []
+        events: list[dict[str, Any]] = []
+        for message_id, held, tools in parked:
+            events.extend(self._emit_parked(message_id, held, tools))
+        return events
+
+    def _emit_parked(
+        self,
+        message_id: str,
+        held: list[tuple[str, str, str]],
+        tools: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        if held:
+            events.extend(self._begin_message(message_id))
+            for kind, part_id, text in held:
+                events.extend(self._apply_text(part_id, kind, text))
+        if self._text_open and self._text_message_id == message_id:
+            for part in tools:
+                events.extend(self._emit_tool(part))
+            events.extend(self._emitter.end_text())
+            self._text_message_id = None
+            self._text_open = False
+            return events
+        for part in tools:
+            events.extend(self._emit_tool(part))
+        if self._text_message_id == message_id:
+            self._text_message_id = None
         return events
 
     def _release_tools(self, message_id: str) -> list[dict[str, Any]]:
@@ -326,8 +363,12 @@ class _Reducer:
                     finished and self._text_open and message_id != self._text_message_id
                 )
                 if late_completion:
-                    self._held.pop(message_id, None)
-                    self._held_tools.pop(message_id, None)
+                    # Keep the open message intact. The held text and tools
+                    # still happened; emit them once that text ends.
+                    held = self._held.pop(message_id, [])
+                    tools = self._held_tools.pop(message_id, [])
+                    if held or tools:
+                        self._parked.append((message_id, held, tools))
                 else:
                     events.extend(self._begin_message(message_id))
                     events.extend(self._flush_held(message_id))
