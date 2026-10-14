@@ -1009,6 +1009,68 @@ class TestContentCapture:
         prompt_written = json.dumps(rec.root.attributes)
         assert "my question" in prompt_written
 
+    async def test_process_default_is_read_when_the_handler_runs(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            # Built before configure, with no capture flag. Vega's startup call
+            # has to reach this handler when it later runs.
+            handler = create_openai_agent_handler()
+            configure(options=SDKOptions(capture_content=True))
+            ctx, rec = _recording()
+            agents_mod = _fake_agents_module(
+                run=_make_run([{"output": _text_output("answer")}])
+            )
+            with ctx, _patched_agents(agents_mod):
+                await handler(CONFIG, "my question", {}, {})
+            assert "my question" in json.dumps(rec.root.attributes)
+        finally:
+            _reset_for_testing()
+
+    async def test_explicit_false_overrides_a_process_default_of_on(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            ctx, rec = _recording()
+            agents_mod = _fake_agents_module(
+                run=_make_run([{"output": _text_output("answer")}])
+            )
+            with ctx, _patched_agents(agents_mod):
+                await create_openai_agent_handler(capture_content=False)(
+                    CONFIG, "my question", {}, {}
+                )
+            for span in rec.spans:
+                assert "gen_ai.input.messages" not in span.attributes
+                assert "my question" not in json.dumps(span.attributes)
+        finally:
+            _reset_for_testing()
+
+    async def test_process_default_is_read_on_the_streaming_path(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
+            ctx, rec = _recording()
+            agents_mod = _fake_agents_module(
+                run_streamed=_make_run_streamed(turns, "hi")
+            )
+            with ctx, _patched_agents(agents_mod):
+                async for _ in await create_openai_agent_handler().stream(
+                    CONFIG, "stream question", {}, {}
+                ):
+                    pass
+            assert "stream question" in json.dumps(rec.root.attributes)
+        finally:
+            _reset_for_testing()
+
     async def test_tool_call_arguments_and_result_gated(self) -> None:
         turns = [
             {
@@ -1899,7 +1961,7 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in fake_config.call_args.kwargs
 
-    async def test_defaults_to_off(self) -> None:
+    async def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
         import launchdarkly_ai_openai_agents.handler as handler_mod
 
         seen: dict[str, Any] = {}
@@ -1915,6 +1977,25 @@ class TestConvenienceWrapperForwardsCaptureContent:
             patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.openai_agents("k", "q", {})
+
+        assert seen["capture_content"] is None
+
+    async def test_explicit_false_reaches_the_factory(self) -> None:
+        import launchdarkly_ai_openai_agents.handler as handler_mod
+
+        seen: dict[str, Any] = {}
+
+        def _factory(*, capture_content: bool | None = None) -> Any:
+            seen["capture_content"] = capture_content
+            return MagicMock()
+
+        fake_config = MagicMock()
+        fake_config.return_value.invoke = MagicMock(return_value="ok")
+        with (
+            patch.object(handler_mod, "_create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
+        ):
+            handler_mod.openai_agents("k", "q", {}, capture_content=False)
 
         assert seen["capture_content"] is False
 
