@@ -547,6 +547,11 @@ async def _stream_gen(
             for rich in emitter.end_text():
                 yield rich
 
+        # A step can start a call the graph never answers with a tool message.
+        # Close it before the run finishes, or the client keeps it open.
+        for rich in emitter.fail_open():
+            yield rich
+
         # The same reconciliation the blocking path does, for the same reason. This walk reads
         # usage_metadata off the astream payloads, and sees nothing at all unless the graph is
         # streaming updates rather than value snapshots. The callbacks read the LLMResult and also

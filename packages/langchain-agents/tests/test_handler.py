@@ -1533,6 +1533,29 @@ class TestStreaming:
         }
         assert contents == {"c1": "found", "d1": "also"}
 
+    @pytest.mark.asyncio
+    async def test_a_successful_run_closes_a_call_with_no_tool_message(self) -> None:
+        mocks = _make_langchain_mock()
+        ai = _make_ai_msg("looking")
+        ai.tool_calls = [{"name": "search", "id": "c1", "args": {"q": "x"}}]
+
+        async def _astream(*_a: Any, **_kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [ai]}}
+
+        mocks["_agent"].astream = _astream
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            events = [
+                event
+                async for event in await create_langchain_agents_handler(
+                    llm=MagicMock()
+                ).stream(_make_config(), "q")
+            ]
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["toolCallId"] == "c1"
+        assert result["metadata"]["launchdarkly"]["toolFailed"] is True
+        assert events[-1]["type"] == "done"
+        assert events.index(result) < len(events) - 1
+
 
 # ---------------------------------------------------------------------------
 # §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)
