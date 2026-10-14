@@ -37,6 +37,7 @@ _ROW_INDEX = 3
 _CONVERSATION_ID = "faa03308-8fe7-5805-8c07-f82a3dbdb3f1"
 _TOOL_ARGUMENTS = '{"order_id": "A1"}'
 _TOOL_RESULT = "shipped"
+_TOOL_ARGUMENTS_RENDERED = '{"order_id":"A1"}'
 
 
 @pytest.fixture
@@ -204,8 +205,28 @@ def assert_row_attributes(attributes: Any) -> None:
     assert_no_verdict(attributes)
 
 
+def spans_by_name(exporter: InMemorySpanExporter) -> dict[str, list[Any]]:
+    by_name: dict[str, list[Any]] = {}
+    for span in exporter.get_finished_spans():
+        by_name.setdefault(span.name, []).append(span)
+    return by_name
+
+
+def parent_of(span: Any) -> int | None:
+    return span.parent.span_id if span.parent is not None else None
+
+
+def lookup_order_tool() -> EvalTool:
+    return EvalTool(
+        key="lookup_order",
+        implementation=lambda args: _TOOL_RESULT,
+        schema={"type": "object"},
+        description="Look up an order",
+    )
+
+
 @pytest.mark.asyncio
-async def test_plain_function_exports_evaluate_span_on_the_sdk_key_provider(
+async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
     span_export: tuple[InMemorySpanExporter, list[str]],
@@ -235,25 +256,93 @@ async def test_plain_function_exports_evaluate_span_on_the_sdk_key_provider(
         if "Judge" in config.get("instructions", ""):
             return {
                 "output": '{"score": 0.9, "reasoning": "Correct and concise."}',
+                "usage": {"input_tokens": 30, "output_tokens": 9},
             }
+        assert tool_handlers["lookup_order"]({"order_id": "A1"}) == _TOOL_RESULT
         return {"output": "shipped", "usage": {"input_tokens": 10, "output_tokens": 4}}
 
     result = await evals.run(
         key="support-qa",
         dataset="golden",
         handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        tools=[lookup_order_tool()],
+        generation={
+            "provider": "OpenAI",
+            "model": "gpt-4o",
+            "instructions": "Answer about {{input}}",
+        },
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
     assert result.passed is True
     spans = exporter.get_finished_spans()
-    assert [span.name for span in spans] == ["evaluate $ld:ai:judge:accuracy"]
-    evaluate = spans[0]
-    assert evaluate.resource is not None
-    assert evaluate.resource.attributes["highlight.project_id"] == "sdk-key"
-    assert_row_attributes(evaluate.attributes)
-    assert evaluate.attributes["gen_ai.operation.name"] == "evaluate"
+    assert {span.context.trace_id for span in spans} == {spans[0].context.trace_id}
+    by_name = spans_by_name(exporter)
+    assert sorted(by_name) == [
+        "chat gpt-4o",
+        "evaluate $ld:ai:judge:accuracy",
+        "execute_tool lookup_order",
+        "launchdarkly.dataset_row",
+    ]
+    for span in spans:
+        assert span.resource is not None
+        assert span.resource.attributes["highlight.project_id"] == "sdk-key"
+        assert_row_attributes(span.attributes)
+        assert span.status.status_code == StatusCode.OK
+
+    (row,) = by_name["launchdarkly.dataset_row"]
+    assert row.parent is None
+    assert "gen_ai.operation.name" not in (row.attributes or {})
+    (evaluate,) = by_name["evaluate $ld:ai:judge:accuracy"]
+    (tool,) = by_name["execute_tool lookup_order"]
+    generation_chat, judge_chat = sorted(
+        by_name["chat gpt-4o"], key=lambda span: span.start_time
+    )
+    for child in (generation_chat, tool, evaluate):
+        assert parent_of(child) == row.context.span_id
+    assert parent_of(judge_chat) == evaluate.context.span_id
+
+    attributes = generation_chat.attributes or {}
+    assert attributes["gen_ai.operation.name"] == "chat"
+    assert attributes["gen_ai.provider.name"] == "openai"
+    assert attributes["gen_ai.request.model"] == "gpt-4o"
+    assert attributes["gen_ai.usage.input_tokens"] == 10
+    assert attributes["gen_ai.usage.output_tokens"] == 4
+    assert json.loads(str(attributes["gen_ai.system_instructions"])) == [
+        {"type": "text", "content": "Answer about Where is order A1?"}
+    ]
+    assert json.loads(str(attributes["gen_ai.input.messages"])) == [
+        {"role": "user", "parts": [{"type": "text", "content": "Where is order A1?"}]}
+    ]
+    assert json.loads(str(attributes["gen_ai.output.messages"])) == [
+        {
+            "role": "assistant",
+            "parts": [
+                {
+                    "type": "tool_call",
+                    "id": "call_1",
+                    "name": "lookup_order",
+                    "arguments": _TOOL_ARGUMENTS_RENDERED,
+                },
+                {"type": "text", "content": "shipped"},
+            ],
+        }
+    ]
+    assert json.loads(str(attributes["gen_ai.tool.definitions"]))[0]["name"] == (
+        "lookup_order"
+    )
+
+    tool_attributes = tool.attributes or {}
+    assert tool_attributes["gen_ai.operation.name"] == "execute_tool"
+    assert tool_attributes["gen_ai.tool.name"] == "lookup_order"
+    assert tool_attributes["gen_ai.tool.call.id"] == "call_1"
+    assert tool_attributes["gen_ai.tool.call.arguments"] == _TOOL_ARGUMENTS_RENDERED
+    assert tool_attributes["gen_ai.tool.call.result"] == _TOOL_RESULT
+
+    evaluate_attributes = evaluate.attributes or {}
+    assert evaluate_attributes["gen_ai.operation.name"] == "evaluate"
+    assert evaluate_attributes["gen_ai.request.model"] == "gpt-4o"
+    assert "gen_ai.input.messages" not in evaluate_attributes
     event = next(
         item for item in evaluate.events if item.name == "gen_ai.evaluation.result"
     )
@@ -262,8 +351,27 @@ async def test_plain_function_exports_evaluate_span_on_the_sdk_key_provider(
     assert event.attributes["gen_ai.evaluation.score.value"] == 0.9
     assert event.attributes["gen_ai.evaluation.explanation"] == "Correct and concise."
     assert_no_verdict(event.attributes)
-    assert "gen_ai.input.messages" not in (evaluate.attributes or {})
-    assert "gen_ai.output.messages" not in (evaluate.attributes or {})
+
+    judge_attributes = judge_chat.attributes or {}
+    assert judge_attributes["gen_ai.operation.name"] == "chat"
+    assert json.loads(str(judge_attributes["gen_ai.system_instructions"])) == [
+        {"type": "text", "content": "Judge shipped"}
+    ]
+    assert json.loads(str(judge_attributes["gen_ai.input.messages"])) == [
+        {"role": "user", "parts": [{"type": "text", "content": "shipped"}]}
+    ]
+    assert json.loads(str(judge_attributes["gen_ai.output.messages"])) == [
+        {
+            "role": "assistant",
+            "parts": [
+                {
+                    "type": "text",
+                    "content": '{"score": 0.9, "reasoning": "Correct and concise."}',
+                }
+            ],
+        }
+    ]
+    assert judge_attributes["gen_ai.usage.input_tokens"] == 30
 
     payloads = [call.args[2] for call in stub_sdk_client.track.call_args_list]
     names = [call.args[0] for call in stub_sdk_client.track.call_args_list]
@@ -278,6 +386,8 @@ async def test_plain_function_exports_evaluate_span_on_the_sdk_key_provider(
         assert "metadata" not in payload
         assert "verdict" not in payload
         assert "passed" not in payload
+        assert _TOOL_ARGUMENTS_RENDERED not in json.dumps(payload)
+        assert "Where is order A1?" not in json.dumps(payload)
     generation = payloads[0]
     assert generation["output"] == "shipped"
     assert "message" not in generation
@@ -285,6 +395,57 @@ async def test_plain_function_exports_evaluate_span_on_the_sdk_key_provider(
     assert criterion["score"] == 0.9
     assert criterion["reason"] == "Correct and concise."
     assert flushed == ["client", "traces"]
+
+
+@pytest.mark.asyncio
+async def test_plain_function_that_raises_records_the_failed_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    span_export: tuple[InMemorySpanExporter, list[str]],
+) -> None:
+    exporter, _flushed = span_export
+    patch_judge(monkeypatch)
+    evals = init_evaluations(
+        project_key="proj",
+        api_key="token",
+        sdk_key="sdk-key",
+        transport=one_row_transport(),
+    )
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        tool_handlers["lookup_order"]({"order_id": "A1"})
+        raise RuntimeError("model refused")
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=handler,
+        tools=[lookup_order_tool()],
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    by_name = spans_by_name(exporter)
+    (row,) = by_name["launchdarkly.dataset_row"]
+    assert row.status.status_code == StatusCode.ERROR
+    (chat,) = by_name["chat gpt-4o"]
+    assert chat.status.status_code == StatusCode.ERROR
+    assert chat.status.description == "model refused"
+    attributes = chat.attributes or {}
+    assert attributes["error.type"] == "RuntimeError"
+    assert "gen_ai.output.messages" not in attributes
+    assert "gen_ai.input.messages" in attributes
+    (tool,) = by_name["execute_tool lookup_order"]
+    assert (tool.attributes or {})["gen_ai.tool.call.result"] == _TOOL_RESULT
+    (evaluate,) = by_name["evaluate $ld:ai:judge:accuracy"]
+    assert evaluate.status.status_code == StatusCode.ERROR
+    assert (evaluate.attributes or {})["error.type"] == "generation_incomplete"
+    assert parent_of(evaluate) == row.context.span_id
 
 
 @pytest.mark.asyncio
@@ -367,6 +528,13 @@ async def test_handler_spans_carry_the_row_and_the_tool_call(
         assert by_name[name]
         for span in by_name[name]:
             assert_row_attributes(span.attributes)
+    # The handler traced itself, so the runner adds no chat or tool span.
+    assert len(by_name["chat gpt-4o"]) == 2
+    assert len(by_name["execute_tool lookup_order"]) == 1
+    (row,) = by_name["launchdarkly.dataset_row"]
+    assert {
+        span.context.trace_id for span in spans if span.name != "POST /v1/chat"
+    } == {row.context.trace_id}
     tool = by_name["execute_tool lookup_order"][0]
     assert tool.attributes is not None
     assert tool.attributes["gen_ai.tool.name"] == "lookup_order"
@@ -420,8 +588,7 @@ async def test_errored_judge_span_has_no_result_event(
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
-    evaluate = exporter.get_finished_spans()[0]
-    assert evaluate.name == "evaluate $ld:ai:judge:accuracy"
+    (evaluate,) = spans_by_name(exporter)["evaluate $ld:ai:judge:accuracy"]
     assert evaluate.status.status_code == StatusCode.ERROR
     assert evaluate.attributes is not None
     assert evaluate.attributes["error.type"] == "invalid_judge_output"

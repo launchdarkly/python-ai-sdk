@@ -426,6 +426,7 @@ class EvaluationsModule:
                 )
                 raise
         config = self._runner._build_handler_config(generation, run_tools)
+        row_spans: dict[int, Any] = {}
         try:
             results = await self._runner._run_rows(
                 dataset_rows,
@@ -434,6 +435,7 @@ class EvaluationsModule:
                 run_tool_handlers,
                 concurrency,
                 evaluation_run_id=evaluation_run.id,
+                row_spans=row_spans,
             )
             self._runner._emit_generation_events(
                 client,
@@ -451,6 +453,7 @@ class EvaluationsModule:
                     resolved_judges,
                     concurrency,
                     evaluation_run_id=evaluation_run.id,
+                    row_spans=row_spans,
                 )
                 self._runner._emit_evaluation_events(
                     client,
@@ -464,6 +467,8 @@ class EvaluationsModule:
             # Generation results already queued on the SDK event buffer must
             # reach LaunchDarkly even when the criteria phase fails. Spans
             # follow on the provider init_client already registered.
+            for row_span in row_spans.values():
+                row_span.end()
             try:
                 flush_result = client.flush()
                 if inspect.isawaitable(flush_result):
