@@ -59,12 +59,12 @@ class _Reducer:
     without ``partID`` is dropped, because the snapshot of that part cannot be
     matched to it. Tool parts are not forwarded.
 
-    Events whose ``sessionID`` is not this session are ignored. The first
-    ``sessionID`` seen is the session when the caller did not pass one. A
-    ``session.idle`` for this session ends the iterable.
+    Events whose ``sessionID`` is not *session_id* are ignored. A missing
+    ``sessionID`` is kept. The reducer does not adopt the first session it
+    sees. A ``session.idle`` for this session ends the iterable.
     """
 
-    def __init__(self, session_id: str | None) -> None:
+    def __init__(self, session_id: str) -> None:
         self._session_id = session_id
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
@@ -104,11 +104,8 @@ class _Reducer:
             kind = raw.get("type")
             properties = raw.get("properties")
             session_id = _session_id(raw)
-            if session_id is not None:
-                if self._session_id is None:
-                    self._session_id = session_id
-                elif session_id != self._session_id:
-                    continue
+            if session_id is not None and session_id != self._session_id:
+                continue
             if kind == "session.idle":
                 return
             if kind == "session.error":
@@ -313,7 +310,7 @@ def _open_events(
 def create_opencode_handler(
     *,
     events: Events,
-    session_id: str | None = None,
+    session_id: str,
     capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Return a handler that runs an OpenCode session supplied by *events*.
@@ -321,8 +318,10 @@ def create_opencode_handler(
     ``provides_for`` is ``('*', 'agent')``, so the handler matches an agent-mode
     variation for any provider. *events* is called on every invocation as
     ``events(config, user_input, variables, history, session_id)`` and must
-    return a fresh async iterable of that session's bus events. This function
-    does not start OpenCode and does not construct an OpenCode SDK client.
+    return a fresh async iterable of that session's bus events. *session_id*
+    is required. The reducer ignores every other session and does not adopt
+    the first one it sees. This function does not start OpenCode and does not
+    construct an OpenCode SDK client.
 
     The stream yields assistant text as ``chunk`` and one ``done``. Pass
     ``skip_judges=True`` to ``config()``: a judge would otherwise be routed
@@ -332,7 +331,7 @@ def create_opencode_handler(
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
     return _create_opencode_handler(
         events=events,
-        session_id=session_id,
+        session_id=_require_session_id(session_id),
         capture_content=capture_content,
     )
 
@@ -354,7 +353,7 @@ def opencode_agents(
     variables = kwargs.pop("variables", None)
     history = kwargs.pop("history", None)
     capture_content = kwargs.pop("capture_content", None)
-    session_id = kwargs.pop("session_id", None)
+    session_id = _require_session_id(kwargs.pop("session_id", None))
     events = kwargs.pop("events")
     return _config(
         key=config_key,
@@ -367,10 +366,16 @@ def opencode_agents(
     ).invoke(user_input, context, variables, history)
 
 
+def _require_session_id(session_id: object) -> str:
+    if not isinstance(session_id, str) or not session_id:
+        raise TypeError("The OpenCode handler requires a session_id.")
+    return session_id
+
+
 def _create_opencode_handler(
     *,
     events: Events,
-    session_id: str | None,
+    session_id: str,
     capture_content: bool | None,
 ) -> ProviderHandler:
     content_override = capture_content

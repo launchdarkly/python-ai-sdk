@@ -64,7 +64,7 @@ def _usage(client: MagicMock) -> list[Any]:
 
 
 async def test_create_handler_sends_one_usage_event(installed: MagicMock) -> None:
-    create_opencode_handler(events=_events)
+    create_opencode_handler(events=_events, session_id="ses")
     calls = _usage(installed)
     assert [entry.args[2].get("helper") for entry in calls] == [
         "opencode-agents.createOpenCodeHandler"
@@ -82,7 +82,7 @@ async def test_create_handler_sends_one_usage_event(installed: MagicMock) -> Non
 
 
 async def test_wrapper_sends_one_usage_event(installed: MagicMock) -> None:
-    await _settle(opencode_agents("k", "q", CONTEXT, events=_events))
+    await _settle(opencode_agents("k", "q", CONTEXT, events=_events, session_id="ses"))
     calls = _usage(installed)
     assert [entry.args[2].get("helper") for entry in calls] == [
         "opencode-agents.opencodeAgents"

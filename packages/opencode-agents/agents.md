@@ -30,7 +30,7 @@ A run opens one `invoke_agent` span and sets `launchdarkly.operation.type`. Tool
 
 ## Call shape
 
-`create_opencode_handler(*, events, session_id=None, capture_content=None)` returns a `ProviderHandler`. `events` is required. Each invocation calls `events(config, user_input, variables, history, session_id)` and expects a fresh async iterable.
+`create_opencode_handler(*, events, session_id, capture_content=None)` returns a `ProviderHandler`. `events` and `session_id` are required. Each invocation calls `events(config, user_input, variables, history, session_id)` and expects a fresh async iterable.
 
 Assistant text is emitted only after `message.updated` marks that message `role == "assistant"`. A part snapshot is the full text of that part so far; a later delta appends. A text delta without `partID` is dropped.
 
@@ -40,4 +40,4 @@ The AI Config, user input, variables, and history are arguments to `events`. A c
 
 `provides_for` is `('*', 'agent')`, so a judge is routed here too. Pass `skip_judges=True` until this handler runs the prompt it is given. Otherwise `events` runs again on the judge prompt and the score is wrong.
 
-The reducer keeps one session. Pass `session_id`, or the first `sessionID` on an event wins. Other sessions are dropped, including their `session.error`. `session.idle` for this session ends the run. If the iterable is a server-wide stream and you neither send `session.idle` nor close it, `done` never arrives. Filter and terminate the iterable in `events` when you own the subscription.
+`session_id` is required. The reducer does not adopt the first session on a shared stream. Other sessions are dropped, including their `session.error`. `session.idle` for this session ends the run. If the iterable is a server-wide stream and you neither send `session.idle` nor close it, `done` never arrives.
