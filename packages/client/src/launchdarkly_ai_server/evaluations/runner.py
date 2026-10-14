@@ -7,11 +7,23 @@ import json
 import logging
 import time
 import urllib
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+from ..conversation import (
+    GEN_AI_CONVERSATION_ID,
+    LD_EVALUATION_RUN_ID,
+    LD_EVALUATION_RUN_ROW_INDEX,
+    bind_evaluation_row,
+    conversation_id_for_evaluation_row,
+    record_evaluation_result,
+)
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
     build_message_history,
@@ -240,6 +252,55 @@ class ConcurrencyController:
         retry_after: float | None = None,
     ) -> None:
         del provider, retry_after
+
+
+@contextmanager
+def _criterion_span(run_id: str, row_index: int, criterion_type: str) -> Iterator[Any]:
+    """Open ``evaluate {criterion}`` on the SDK tracer.
+
+    Correlation attributes are set here as well as by the span processor, so a
+    plain function still exports them when the processor is the one
+    ``init_client`` registered. This does not build an exporter.
+    """
+    tracer = trace.get_tracer("@launchdarkly/ai-server")
+    with tracer.start_as_current_span(f"evaluate {criterion_type}") as span:
+        span.set_attribute("gen_ai.operation.name", "evaluate")
+        span.set_attribute(
+            GEN_AI_CONVERSATION_ID,
+            conversation_id_for_evaluation_row(run_id, row_index),
+        )
+        span.set_attribute(LD_EVALUATION_RUN_ID, run_id)
+        span.set_attribute(LD_EVALUATION_RUN_ROW_INDEX, row_index)
+        yield span
+
+
+def _finish_criterion_span(span: Any, result: Mapping[str, Any]) -> None:
+    """Record ``gen_ai.evaluation.result`` with no verdict.
+
+    An ERROR criterion sets span status ERROR and ``error.type``, and does not
+    add a result event. Nothing here writes ``launchdarkly.run.id``.
+    """
+    if result.get("status") == "COMPLETE":
+        score = result.get("score")
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            span.set_status(Status(StatusCode.ERROR))
+            span.set_attribute("error.type", "invalid_score")
+            return
+        reason = result.get("reason")
+        explanation = reason if isinstance(reason, str) and reason else None
+        record_evaluation_result(
+            span,
+            str(result.get("criterion_type") or ""),
+            float(score),
+            explanation,
+        )
+        return
+    span.set_status(Status(StatusCode.ERROR))
+    error = result.get("error")
+    if isinstance(error, Mapping):
+        code = error.get("code")
+        if isinstance(code, str) and code:
+            span.set_attribute("error.type", code)
 
 
 class EvaluationsRunner:
@@ -635,6 +696,8 @@ class EvaluationsRunner:
         config: dict[str, Any],
         tool_handlers: dict[str, ToolImplementation],
         concurrency: int,
+        *,
+        evaluation_run_id: str,
     ) -> list[dict[str, Any]]:
         controller = ConcurrencyController(concurrency)
 
@@ -647,9 +710,10 @@ class EvaluationsRunner:
             started = datetime.now(UTC)
             started_clock = time.perf_counter()
             try:
-                result = await handler(
-                    config, row.input, row_tool_handlers, dict(row.variables)
-                )
+                with bind_evaluation_row(evaluation_run_id, row.row_index):
+                    result = await handler(
+                        config, row.input, row_tool_handlers, dict(row.variables)
+                    )
                 if not isinstance(result, Mapping):
                     raise TypeError("handler result must be a mapping")
                 completed = datetime.now(UTC)
@@ -1011,6 +1075,8 @@ class EvaluationsRunner:
         criteria: list[Criterion],
         resolved_judges: Mapping[str, JudgeExecution],
         concurrency: int,
+        *,
+        evaluation_run_id: str,
     ) -> list[dict[str, Any]]:
         """Run every (row, criterion) pair, bounded by the run's concurrency."""
         controller = ConcurrencyController(concurrency)
@@ -1020,14 +1086,23 @@ class EvaluationsRunner:
         ) -> dict[str, Any]:
             await controller.acquire()
             try:
-                if isinstance(criterion, Scorer):
-                    return await self._run_scorer_for_result(row, criterion)
-                return await self._run_ld_judge_for_result(
-                    row,
-                    tool_handlers,
-                    criterion,
-                    resolved_judges[criterion.key],
-                )
+                row_index = row.get("row_index")
+                index = row_index if isinstance(row_index, int) else 0
+                with bind_evaluation_row(evaluation_run_id, index):
+                    with _criterion_span(
+                        evaluation_run_id, index, criterion.criterion_type
+                    ) as span:
+                        if isinstance(criterion, Scorer):
+                            event = await self._run_scorer_for_result(row, criterion)
+                        else:
+                            event = await self._run_ld_judge_for_result(
+                                row,
+                                tool_handlers,
+                                criterion,
+                                resolved_judges[criterion.key],
+                            )
+                        _finish_criterion_span(span, event)
+                        return event
             finally:
                 controller.release()
 
