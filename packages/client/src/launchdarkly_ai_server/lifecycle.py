@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any
 
+from . import skills
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
 from .types import InitClientOptions
@@ -14,6 +15,19 @@ from .utils import model_stamps_from_meta
 logger = logging.getLogger(__name__)
 
 _LD_DEFAULT_OTLP_ENDPOINT = "https://otel.observability.app.launchdarkly.com"
+
+_INIT_CLIENT_OPTIONS = frozenset(
+    {
+        "sdkKey",
+        "baseUri",
+        "streamUri",
+        "eventsUri",
+        "otlpEndpoint",
+        "serviceName",
+        "environment",
+    }
+)
+"""Every ``init_client`` option key that is read. Any other key is warned about."""
 
 
 def _env(name: str) -> str | None:
@@ -24,6 +38,11 @@ def _env(name: str) -> str | None:
 
 _client: Any = None
 _tracer_provider: Any = None
+# True only when *this* SDK's call to trace.set_tracer_provider actually took
+# effect. "We built a provider" is not the same as "we own the global": the set
+# is once-guarded, so when another library registered first ours is refused and
+# the global stays theirs. Only the owner may release it on shutdown.
+_owns_otel_globals: bool = False
 
 
 def get_client() -> Any:
@@ -49,7 +68,7 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
     - Registers W3C trace context and baggage propagators.
     - Configures GZIP compression on the OTLP exporter.
     """
-    global _tracer_provider
+    global _tracer_provider, _owns_otel_globals
 
     opts = options or {}
 
@@ -113,6 +132,18 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
             pass
 
         trace.set_tracer_provider(provider)
+        # The set is refused, with a warning from OTel, when another library got
+        # there first. Record whether it actually took: shutdown must not release
+        # a global it never owned, and the caller's telemetry options are moot if
+        # someone else's provider is the one handing out tracers.
+        _owns_otel_globals = trace.get_tracer_provider() is provider
+        if not _owns_otel_globals:
+            logger.warning(
+                "An OpenTelemetry tracer provider was already registered by "
+                "something else in this process, so LaunchDarkly's telemetry "
+                "configuration is not in effect; spans will go wherever that "
+                "provider sends them."
+            )
         _tracer_provider = provider
         return provider
 
@@ -134,11 +165,32 @@ async def init_client(
     - Pass *client* directly (BYOC) to skip the LaunchDarkly Python SDK path.
     - Otherwise, reads ``LD_SDK_KEY`` from env or ``options['sdkKey']``.
 
+    Options (each overrides the environment variable in parentheses):
+
+    - ``sdkKey`` (``LD_SDK_KEY``): the server-side SDK key.
+    - ``baseUri`` (``LD_BASE_URI``), ``streamUri`` (``LD_STREAM_URI``),
+      ``eventsUri`` (``LD_EVENTS_URI``): LaunchDarkly service URIs, passed to
+      the SDK config. Not used on the BYOC path.
+    - ``otlpEndpoint`` (``OTEL_EXPORTER_OTLP_ENDPOINT``): where spans are
+      exported.
+    - ``serviceName`` (``LD_SERVICE_NAME``): the ``service.name`` resource
+      attribute.
+    - ``environment`` (``LD_ENVIRONMENT``): the ``deployment.environment``
+      resource attribute.
+
+    Idempotent: later calls return the existing client and ignore every option.
+    An option not listed above is logged as a warning and ignored.
+
     Returns the initialized ``LDClientInterface`` instance.
     """
     global _client
 
     opts = options or {}
+    unknown = sorted(str(key) for key in opts if key not in _INIT_CLIENT_OPTIONS)
+    if unknown:
+        logger.warning(
+            "Ignoring unrecognized init_client option(s): %s", ", ".join(unknown)
+        )
 
     # Idempotent — if already initialized, return the existing client
     if _client is not None:
@@ -148,8 +200,13 @@ async def init_client(
 
     # BYOC path — pre-initialized client
     if client is not None:
-        _client = client
+        # Adopted only after telemetry setup succeeds. ``_client`` is the
+        # idempotency guard above, so assigning it first meant a setup that
+        # raised (a malformed OTEL_EXPORTER_OTLP_TIMEOUT does) left it set: the
+        # next call returned it as a silent success with no telemetry, hiding
+        # the config error. The caller owns this client, so it is not closed.
         _setup_telemetry(opts.get("sdkKey", "byoc"), opts)
+        _client = client
         flush_ai_sdk_info(_client)
         flush_sdk_usage(_client)
         return _client
@@ -196,34 +253,102 @@ async def init_client(
     # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
     ld_client = client_cls(ld_config, start_wait=10)
 
+    # As on the BYOC path: only a fully set-up client becomes the singleton. We
+    # built this one, so close it on failure — it holds a streaming connection
+    # that would otherwise outlive the attempt.
+    try:
+        _setup_telemetry(sdk_key, opts)
+    except Exception:
+        try:
+            close_result = ld_client.close()
+            if inspect.isawaitable(close_result):
+                await close_result
+        except Exception:
+            pass
+        raise
     _client = ld_client
-    _setup_telemetry(sdk_key, opts)
     flush_ai_sdk_info(_client)
     flush_sdk_usage(_client)
     return _client
+
+
+def _release_otel_globals() -> None:
+    """
+    Releases the process-global tracer provider that ``_setup_telemetry``
+    installed, so a later ``init_client`` can install its own.
+
+    ``trace.set_tracer_provider`` is guarded by a ``Once``: a second call logs
+    "Overriding of current TracerProvider is not allowed" and keeps the provider
+    already in place. Without this, an init/shutdown/init cycle would leave every
+    span routed to the provider that was already shut down, and export nothing.
+
+    opentelemetry-python exposes no public API to unset it, so this reaches for
+    the module globals — both the slot and the ``Once`` that guards it, since
+    clearing the slot alone leaves the guard tripped and the next set a no-op.
+
+    Callers must gate this on ``_owns_otel_globals``. Having built a provider is
+    not enough: when another library registered first, our set was refused and
+    the global is still theirs, so releasing it here would tear down the host
+    application's tracing and leave the global a no-op proxy.
+
+    The global text map propagator needs no equivalent: ``set_global_textmap``
+    is a plain assignment with no ``Once``, so the next setup overwrites it.
+    """
+    try:
+        from opentelemetry import trace
+        from opentelemetry.util._once import Once
+
+        trace._TRACER_PROVIDER = None
+        trace._TRACER_PROVIDER_SET_ONCE = Once()
+    except Exception:  # pragma: no cover - defensive, OTel absent or restructured
+        logger.debug("Could not release the global OTel tracer provider", exc_info=True)
+
+
+def _clear_experimental_state() -> None:
+    """Clears experimental feature state. A failure is logged, never raised."""
+    try:
+        skills._clear_state()
+    except Exception:
+        logger.warning("Could not clear the Agent Skills state", exc_info=True)
 
 
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
+
+    Also clears any experimental feature state, such as a configured skill
+    store.
+
+    When telemetry was running, this also releases the process-global tracer
+    provider so a later ``init_client`` can install its own — see
+    ``_release_otel_globals``.
     """
-    global _client, _tracer_provider
+    global _client, _tracer_provider, _owns_otel_globals
 
     local_client = _client
     local_provider = _tracer_provider
+    owned_globals = _owns_otel_globals
+
+    _clear_experimental_state()
 
     # Null the singleton before any awaits so a second call is a no-op
     _client = None
     _tracer_provider = None
+    _owns_otel_globals = False
     reset_ai_sdk_info()
     reset_sdk_usage()
 
     if local_provider is not None:
+        # Shut the provider down either way — we built it, and it owns an
+        # exporter and a batch timer — but only release the global registration
+        # when it was ours to take.
         try:
             local_provider.shutdown()
         except Exception:
             pass
+        if owned_globals:
+            _release_otel_globals()
 
     if local_client is not None:
         try:
@@ -248,9 +373,18 @@ def _set_client_for_testing(c: Any) -> None:
 
 def _reset_for_testing() -> None:
     """Test helper — clear all singleton state."""
-    global _client, _tracer_provider
+    global _client, _tracer_provider, _owns_otel_globals
+    owned_globals = _owns_otel_globals
     _client = None
     _tracer_provider = None
+    _owns_otel_globals = False
+    # Directly, not through _clear_experimental_state: a failed reset should
+    # fail the test rather than leak state into the next one.
+    skills._clear_state()
+    # Mirrors shutdown(): without this a suite that inits more than once leaves
+    # every later span on the first test's provider.
+    if owned_globals:
+        _release_otel_globals()
 
 
 async def inspect_config(

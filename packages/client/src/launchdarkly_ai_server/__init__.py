@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.4"  # x-release-please-version
+__version__ = "0.3.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .client import _config as _config
@@ -25,20 +25,6 @@ from .conversation import (
     ConversationIdSpanProcessor,
     conversation_id,
     set_conversation_id_if_absent,
-)
-from .evaluations import (
-    AIConfig,
-    Criterion,
-    DatasetRow,
-    EvalRunResult,
-    EvalTool,
-    EvaluationsError,
-    EvaluationsModule,
-    GenerationConfig,
-    Judge,
-    RunSummary,
-    Scorer,
-    init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
 from .graph import _graph as _graph
@@ -124,8 +110,6 @@ from .utils import (
     parse_usage,
     set_ld_span_attributes,
     set_model_identity_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
     set_usage_span_attributes,
     to_ld_context,
     to_usage_dict,
@@ -191,19 +175,6 @@ __all__ = [  # noqa: RUF022
     "text_message",
     "to_semconv_finish_reason",
     "VariationMeta",
-    # evaluations
-    "AIConfig",
-    "EvalRunResult",
-    "Criterion",
-    "DatasetRow",
-    "EvaluationsError",
-    "EvaluationsModule",
-    "GenerationConfig",
-    "EvalTool",
-    "Judge",
-    "RunSummary",
-    "Scorer",
-    "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",
@@ -214,8 +185,6 @@ __all__ = [  # noqa: RUF022
     "parse_template",
     "parse_usage",
     "set_ld_span_attributes",
-    "set_openllmetry_completion",
-    "set_openllmetry_prompt",
     "to_ld_context",
     # history
     "compose_history",
