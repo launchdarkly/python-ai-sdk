@@ -181,10 +181,18 @@ class ProviderHandler:
 
     @property
     def capture_content(self) -> bool:
-        """Effective content capture: an explicit override, else the process default."""
+        """Effective content capture: an explicit override, else the process default.
+
+        Assigning ``True`` or ``False`` sets this handler's override, the same as
+        passing it to the factory. It does not change the process default.
+        """
         from .lifecycle import effective_capture_content
 
         return effective_capture_content(self._capture_content_override)
+
+    @capture_content.setter
+    def capture_content(self, value: bool) -> None:
+        self._capture_content_override = value
 
     async def __call__(
         self,

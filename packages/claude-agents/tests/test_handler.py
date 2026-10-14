@@ -903,6 +903,31 @@ class TestContentCapture:
         assert "gen_ai.output.messages" in chat.attributes
         assert "gen_ai.system_instructions" in root().attributes
 
+    async def test_process_default_is_read_on_the_streaming_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            monkeypatch.setattr(
+                handler_mod,
+                "query",
+                _fake_query(
+                    [stream_event("Hi"), assistant_message(), result_message("Hi")]
+                ),
+            )
+            await _collect(
+                await create_claude_agents_handler().stream(BASE_CONFIG, "q", {}, {})
+            )
+            assert any(
+                "gen_ai.input.messages" in (span.attributes or {}) for span in spans()
+            )
+        finally:
+            _reset_for_testing()
+
 
 # ---------------------------------------------------------------------------
 # Errors, and the failure path — section 6

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -76,6 +76,15 @@ def test_judge_gate_uses_the_effective_bool() -> None:
     assert (reasoning if _handler(False).capture_content else None) is None
 
 
+def test_assigning_capture_content_sets_the_override() -> None:
+    configure(options=SDKOptions(capture_content=True))
+    handler = _handler()
+    handler.capture_content = False
+    assert handler.capture_content is False
+    handler.capture_content = True
+    assert handler.capture_content is True
+
+
 def test_configure_is_keyword_only() -> None:
     with pytest.raises(TypeError):
         configure(SDKOptions())  # type: ignore[misc]
@@ -135,6 +144,103 @@ async def test_shutdown_restores_the_builtin_default() -> None:
     assert _handler().capture_content is False
     configure(options=SDKOptions(capture_content=True))
     assert _handler().capture_content is True
+
+
+async def test_run_judges_writes_the_explanation_from_the_configured_default() -> None:
+    """The judge explanation follows the handler's effective capture flag.
+
+    Goes through ``run_judges``, not a copy of the ``if capture_content``
+    expression, and reads ``gen_ai.evaluation.explanation`` off the span.
+    """
+    import random
+
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from launchdarkly_ai_server import run_judges
+    from launchdarkly_ai_server.conversation import ConversationIdSpanProcessor
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(ConversationIdSpanProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("@launchdarkly/ai-server")
+
+    async def fn(
+        config: Any,
+        user_input: str | None = None,
+        tool_handlers: dict[str, Any] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        span = tracer.start_span("invoke_agent")
+        span.end()
+        return {
+            "output": '{"score": 0.9, "reasoning": "good"}',
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    client = MagicMock()
+    client.track = MagicMock()
+    client.variation = AsyncMock(
+        return_value={
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "judge",
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+    )
+    lifecycle_module._set_client_for_testing(client)
+    configure(options=SDKOptions(capture_content=True))
+    parent = {
+        "model": {"name": "gpt-4"},
+        "provider": {"name": "TestProvider"},
+        "instructions": "hi",
+        "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+    }
+
+    def explanation() -> str | None:
+        spans = [
+            span
+            for span in exporter.get_finished_spans()
+            if span.name == "invoke_agent"
+        ]
+        assert spans, "judge invoke_agent span was not exported"
+        value = (spans[-1].attributes or {}).get("gen_ai.evaluation.explanation")
+        return value if isinstance(value, str) else None
+
+    with patch.object(random, "random", return_value=0.0):
+        await run_judges(
+            config=parent,
+            user_context={"kind": "user", "key": "u1"},
+            handler=ProviderHandler(fn, provides_for=("TestProvider", "messages")),
+            user_input="q",
+            llm_response="r",
+            base_track_data={"runId": "x"},
+        )
+    assert explanation() == "good"
+
+    exporter.clear()
+    with patch.object(random, "random", return_value=0.0):
+        await run_judges(
+            config=parent,
+            user_context={"kind": "user", "key": "u1"},
+            handler=ProviderHandler(
+                fn, provides_for=("TestProvider", "messages"), capture_content=False
+            ),
+            user_input="q",
+            llm_response="r",
+            base_track_data={"runId": "x"},
+        )
+    assert explanation() is None
 
 
 async def test_init_client_does_not_carry_behavior_defaults(
