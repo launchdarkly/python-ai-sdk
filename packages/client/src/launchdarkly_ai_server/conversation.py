@@ -36,6 +36,7 @@ _EVALUATION_CONVERSATION_NAMESPACE = uuid.UUID("6f0c2a4e-3b6d-4d0e-9c1a-2e6b7f8a
 _CONV_KEY = otel_context.create_key("launchdarkly.gen_ai.conversation.id")
 _EVAL_KEY = otel_context.create_key("launchdarkly.judge.evaluation")
 _EVAL_ROW_KEY = otel_context.create_key("launchdarkly.evaluation_run.row")
+_OBSERVER_KEY = otel_context.create_key("launchdarkly.evaluation_run.observer")
 
 
 @dataclass
@@ -139,6 +140,29 @@ def bind_evaluation_row(run_id: str, row_index: int | None) -> Iterator[None]:
     token = otel_context.attach(ctx)
     try:
         yield
+    finally:
+        otel_context.detach(token)
+
+
+@dataclass
+class HandlerSpanObserver:
+    """Counts SDK spans started while :func:`observe_handler_spans` is bound."""
+
+    count: int = 0
+
+
+@contextmanager
+def observe_handler_spans() -> Iterator[HandlerSpanObserver]:
+    """Count the SDK spans a handler opens inside this block.
+
+    The offline runner describes a plain-function handler's call itself, and
+    must not when a provider handler already traced it. Counting relies on
+    :class:`ConversationIdSpanProcessor`, which ``init_client`` registers.
+    """
+    observer = HandlerSpanObserver()
+    token = otel_context.attach(otel_context.set_value(_OBSERVER_KEY, observer))
+    try:
+        yield observer
     finally:
         otel_context.detach(token)
 
@@ -348,6 +372,10 @@ class ConversationIdSpanProcessor(_SpanProcessorBase):
         )
         if conv and _is_launchdarkly_span(span):
             set_conversation_id_if_absent(span, conv)
+
+        observer = otel_context.get_value(_OBSERVER_KEY, ctx)
+        if isinstance(observer, HandlerSpanObserver) and _is_launchdarkly_span(span):
+            observer.count += 1
 
         row = _evaluation_row_from(ctx)
         if row and _is_launchdarkly_span(span):
