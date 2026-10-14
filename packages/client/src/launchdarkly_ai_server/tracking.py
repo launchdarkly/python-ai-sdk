@@ -4,8 +4,8 @@ import inspect
 import os
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable
-from contextlib import aclosing
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 from .agui import HANDLER_RICH_TYPES, TEXT_MESSAGE_CONTENT, TEXT_TYPES
@@ -21,6 +21,22 @@ from .types import (
     VariationMeta,
 )
 from .utils import model_stamps_from_meta, parse_usage, to_ld_context
+
+
+@asynccontextmanager
+async def _closing_stream(stream: Any) -> AsyncIterator[Any]:
+    """Close a handler stream when it implements ``aclose``.
+
+    ``contextlib.aclosing`` always awaits ``aclose``. A handler may return a
+    plain async iterator, which has no such method, and that call then raises
+    ``AttributeError`` after the loop has already succeeded.
+    """
+    try:
+        yield stream
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
 
 def _try_get_environment_id() -> str | None:
@@ -308,7 +324,7 @@ async def execute_and_stream(
             stream_gen = await handler.stream(
                 config, user_input, tracked_tool_handlers, merged_variables, history
             )
-            async with aclosing(stream_gen) as agen:
+            async with _closing_stream(stream_gen) as agen:
                 async for event in agen:
                     typ = event.get("type")
                     if typ in TEXT_TYPES:

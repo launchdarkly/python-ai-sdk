@@ -25,6 +25,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -351,14 +352,18 @@ def _is_coroutine(fn: Any) -> bool:
 _MAX_STEPS = 10
 
 
-def create_claude_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_claude_messages_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
 
     Requires ``anthropic`` to be installed as a peer dependency.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more. Turning this
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
     report_usage(
@@ -368,9 +373,10 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
 
 
 def _create_claude_messages_handler(
-    *, capture_content: bool = False
+    *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_claude_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
     import importlib
 
     anthropic_mod = importlib.import_module("anthropic")
@@ -383,6 +389,8 @@ def _create_claude_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         th = tool_handlers or {}
         vs = variables or {}
 
@@ -466,14 +474,14 @@ def _create_claude_messages_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
     return _create_handler(
         ("Anthropic", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -722,7 +730,7 @@ def claude_messages(
     # asking for content on spans got a TypeError instead of content.
     report_usage("claude-messages.claudeMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
         handler=_create_claude_messages_handler(capture_content=capture_content),

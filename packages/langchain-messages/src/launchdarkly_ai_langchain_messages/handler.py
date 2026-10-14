@@ -33,6 +33,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -387,7 +388,7 @@ async def _run_structured_turn(
 
 
 def create_langchain_messages_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
@@ -398,17 +399,20 @@ def create_langchain_messages_handler(
     config's model name and parameters.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
     report_usage("langchain-messages.createLangChainHandler", PACKAGE_NAME, __version__)
     return _create_langchain_messages_handler(llm, capture_content=capture_content)
 
 
 def _create_langchain_messages_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_langchain_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -417,6 +421,8 @@ def _create_langchain_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         th = tool_handlers or {}
@@ -716,14 +722,14 @@ def _create_langchain_messages_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
     return _create_handler(
         ("*", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -1125,7 +1131,7 @@ def langchain_messages(
     # asking for content on spans got a TypeError instead of content.
     report_usage("langchain-messages.langchainMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
         handler=_create_langchain_messages_handler(

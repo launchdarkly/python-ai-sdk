@@ -156,27 +156,43 @@ class ProviderHandler:
     - ``__call__`` — blocking invocation
     - ``stream``   — optional async-generator streaming (may be ``None``)
     - ``provides_for`` — ``(provider_name, mode)`` tuple or ``None``
-    - ``capture_content`` — whether this handler was built with content capture on
+    - ``capture_content`` — the effective content-capture decision for this handler
 
     ``capture_content`` is declared here so the client core can apply the handler's own content
     decision to content it writes on the handler's behalf — notably the judge's reasoning —
-    without reaching into the factory's closure.
+    without reaching into the factory's closure. ``None`` at construction reads the process
+    default from ``configure`` when the value is used. An explicit ``True`` or ``False`` is an
+    override. The property returns that effective bool, so judge and span paths share one gate.
     """
 
     provides_for: tuple[str, Literal["agent", "messages"]] | None
-    capture_content: bool
 
     def __init__(
         self,
         fn: _HandlerFn,
         provides_for: tuple[str, Literal["agent", "messages"]] | None = None,
         stream_fn: _StreamFn | None = None,
-        capture_content: bool = False,
+        capture_content: bool | None = None,
     ) -> None:
         self._fn = fn
         self.provides_for = provides_for
         self._stream_fn = stream_fn
-        self.capture_content = capture_content
+        self._capture_content_override = capture_content
+
+    @property
+    def capture_content(self) -> bool:
+        """Effective content capture: an explicit override, else the process default.
+
+        Assigning ``True`` or ``False`` sets this handler's override, the same as
+        passing it to the factory. It does not change the process default.
+        """
+        from .lifecycle import effective_capture_content
+
+        return effective_capture_content(self._capture_content_override)
+
+    @capture_content.setter
+    def capture_content(self, value: bool) -> None:
+        self._capture_content_override = value
 
     async def __call__(
         self,
@@ -186,6 +202,9 @@ class ProviderHandler:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> HandlerResult:
+        from .lifecycle import note_ai_invocation
+
+        note_ai_invocation()
         return await self._fn(config, user_input, tool_handlers, variables, history)
 
     async def stream(
@@ -198,6 +217,9 @@ class ProviderHandler:
     ) -> AsyncGenerator[dict[str, Any], None]:
         if self._stream_fn is None:
             raise NotImplementedError("This handler does not support streaming")
+        from .lifecycle import note_ai_invocation
+
+        note_ai_invocation()
         return self._stream_fn(config, user_input, tool_handlers, variables, history)
 
     @property
@@ -582,6 +604,26 @@ ModelArgs = dict[str, Any]
 RoutedModelArgs = dict[str, Any]
 GraphOptions = dict[str, Any]
 GraphArgs = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SDKOptions:
+    """Process-wide behavior defaults, applied by :func:`configure`.
+
+    ``capture_content`` is the default for writing prompts, model output, tool
+    arguments, tool results, and judge explanations. It is a default, not a
+    ceiling: an explicit ``True`` or ``False`` on a handler factory or a
+    convenience wrapper overrides it. Further process-wide defaults are added
+    as fields on this object.
+    """
+
+    capture_content: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capture_content, bool):
+            raise TypeError("SDKOptions.capture_content must be a bool")
+
+
 InitClientOptions = dict[str, Any]
 
 # ---------------------------------------------------------------------------
