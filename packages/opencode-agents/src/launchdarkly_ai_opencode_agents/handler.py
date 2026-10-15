@@ -133,6 +133,9 @@ class _Reducer:
             return []
         if role != "assistant":
             return []
+        if self._text_open and message_id != self._text_message_id:
+            self._held.setdefault(message_id, []).append((kind, part_id, text))
+            return []
         events = self._begin_message(message_id)
         events.extend(self._apply_text(part_id, kind, text))
         if self._text_open and self._text_message_id == message_id:
@@ -227,6 +230,12 @@ class _Reducer:
         # assistant call, including one that completed after the text closed,
         # before fail_open marks a started call as a failure.
         events.extend(self._end_open_text())
+        for message_id, held in list(self._held.items()):
+            if self._roles.get(message_id) != "assistant" or not held:
+                continue
+            tools = self._held_tools.pop(message_id, [])
+            events.extend(self._emit_parked(message_id, held, tools))
+            self._held.pop(message_id, None)
         for message_id, parts in list(self._held_tools.items()):
             role = self._roles.get(message_id)
             if role is None or role == "assistant":

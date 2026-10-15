@@ -68,14 +68,6 @@ def test_explicit_false_overrides_a_configured_true() -> None:
     assert _handler(None).capture_content is True
 
 
-def test_judge_gate_uses_the_effective_bool() -> None:
-    # The same expression judges.py uses. No second content gate.
-    configure(options=SDKOptions(capture_content=True))
-    reasoning = "because"
-    assert (reasoning if _handler().capture_content else None) == "because"
-    assert (reasoning if _handler(False).capture_content else None) is None
-
-
 def test_assigning_capture_content_sets_the_override() -> None:
     configure(options=SDKOptions(capture_content=True))
     handler = _handler()

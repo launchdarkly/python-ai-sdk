@@ -360,6 +360,67 @@ class TestText:
         assert events.index(open_end) < events.index(start)
         assert events[-1]["output"] == "AB1B2stale"
 
+    async def test_late_text_does_not_split_the_open_message(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                bus(
+                    "message.part.updated",
+                    part={"id": "p1", "messageID": "m1", "type": "text", "text": "A"},
+                ),
+                text_delta("m1", "p1", "X"),
+                text_delta("m2", "p2", "B2"),
+                assistant_completed("m2"),
+            ]
+        )
+        b_ids = [
+            event["messageId"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+            and event["delta"] in ("B1", "B2")
+        ]
+        assert b_ids == [b_ids[0], b_ids[0]]
+        late = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "X"
+        )
+        assert late["messageId"] != b_ids[0]
+        assert events[-1]["output"] == "AB1B2X"
+
+    async def test_unfinished_assistant_text_is_emitted_at_session_end(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                text_delta("m1", "p1", " later"),
+            ]
+        )
+        b = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "B1"
+        )
+        later = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == " later"
+        )
+        ended = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_END"
+            and event["messageId"] == b["messageId"]
+        )
+        assert later["messageId"] != b["messageId"]
+        assert events.index(ended) < events.index(later)
+        assert events[-1]["output"] == "AB1 later"
+
     async def test_a_completed_message_is_emitted_when_nothing_is_open(self) -> None:
         events = await collect(
             [
