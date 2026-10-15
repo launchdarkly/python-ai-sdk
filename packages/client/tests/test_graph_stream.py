@@ -755,6 +755,47 @@ class TestGraphStreamMultiEdge:
 # ---------------------------------------------------------------------------
 
 
+class TestGraphRunId:
+    @pytest.mark.parametrize("mode", ["invoke", "stream"])
+    async def test_each_run_gets_its_own_run_id(
+        self, mock_ld_client: MagicMock, mode: str
+    ) -> None:
+        """One graph() instance, one context, two runs: one id per run, shared by the
+        run's graph span and its graph-level events."""
+        g = graph("graph-key", handlers=[_make_streaming_handler(["ok"])])
+
+        run_ids: list[set[str]] = []
+        span_run_ids: list[Any] = []
+        for _ in range(2):
+            mock_ld_client.track.reset_mock()
+            _exporter.clear()
+            if mode == "invoke":
+                await g.invoke("hi", CONTEXT)
+            else:
+                await _collect(g.stream("hi", CONTEXT))
+            graph_events = [
+                c[0]
+                for c in mock_ld_client.track.call_args_list
+                if c[0][0].startswith("$ld:ai:graph:")
+            ]
+            names = {e[0] for e in graph_events}
+            assert "$ld:ai:graph:handoff_success" in names
+            assert "$ld:ai:graph:invocation_success" in names
+            run_ids.append({e[2]["runId"] for e in graph_events})
+            graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
+            assert len(graph_spans) == 1
+            span_run_ids.append(
+                (graph_spans[0].attributes or {}).get("launchdarkly.run.id")
+            )
+
+        assert len(run_ids[0]) == 1
+        assert len(run_ids[1]) == 1
+        assert run_ids[0] != run_ids[1]
+        assert {span_run_ids[0]} == run_ids[0]
+        assert {span_run_ids[1]} == run_ids[1]
+        assert span_run_ids[0] != span_run_ids[1]
+
+
 class TestGraphStreamOtel:
     async def test_stamps_conversation_id_when_bound_at_call_time(
         self, mock_ld_client: MagicMock
@@ -817,6 +858,37 @@ class TestGraphStreamOtel:
         gctx = graph_spans[0].get_span_context()
         for hs in handler_spans:
             assert hs.get_span_context().trace_id == gctx.trace_id
+
+    @pytest.mark.parametrize("mode", ["invoke", "stream"])
+    async def test_graph_span_carries_config_identity(
+        self, mock_ld_client: MagicMock, mode: str
+    ) -> None:
+        """The graph() span is found by config key, like a native adapter's."""
+        g = graph("graph-key", handlers=[_make_streaming_handler(["ok"])])
+        if mode == "invoke":
+            await g.invoke("hi", CONTEXT)
+        else:
+            await _collect(g.stream("hi", CONTEXT))
+
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
+        assert len(graph_spans) == 1
+        attrs = graph_spans[0].attributes or {}
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "graph-key"
+        assert attrs["launchdarkly.graph.key"] == "graph-key"
+
+        success = [
+            c[0][2]
+            for c in mock_ld_client.track.call_args_list
+            if c[0][0] == "$ld:ai:graph:invocation_success"
+        ]
+        assert len(success) == 1
+        assert attrs["launchdarkly.run.id"] == success[0]["runId"]
+        assert attrs["launchdarkly.variation.key"] == success[0]["variationKey"]
+
+        flag_events = [e for e in graph_spans[0].events if e.name == "feature_flag"]
+        assert len(flag_events) == 1
+        assert (flag_events[0].attributes or {})["feature_flag.key"] == "graph-key"
 
     async def test_graph_parent_captured_at_stream_call_time(
         self, mock_ld_client: MagicMock
