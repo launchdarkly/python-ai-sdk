@@ -391,6 +391,30 @@ class TestText:
         assert late["messageId"] != b_ids[0]
         assert events[-1]["output"] == "AB1B2X"
 
+    async def test_a_later_snapshot_does_not_repeat_held_text(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                text_delta("m1", "p1", "X"),
+                assistant_completed("m2"),
+                bus(
+                    "message.part.updated",
+                    part={"id": "p1", "messageID": "m1", "type": "text", "text": "AX"},
+                ),
+                assistant_completed("m1"),
+            ]
+        )
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert deltas == ["A", "B1", "X"]
+        assert events[-1]["output"] == "AB1X"
+
     async def test_unfinished_assistant_text_is_emitted_at_session_end(self) -> None:
         events = await collect(
             [

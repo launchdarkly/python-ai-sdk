@@ -137,6 +137,7 @@ class _Reducer:
             self._held.setdefault(message_id, []).append((kind, part_id, text))
             return []
         events = self._begin_message(message_id)
+        events.extend(self._flush_held(message_id))
         events.extend(self._apply_text(part_id, kind, text))
         if self._text_open and self._text_message_id == message_id:
             events.extend(self._release_tools(message_id))
