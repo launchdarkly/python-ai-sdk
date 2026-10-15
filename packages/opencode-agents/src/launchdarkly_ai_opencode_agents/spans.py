@@ -1,9 +1,9 @@
 """Span construction for the OpenCode handler.
 
-The public stream is ``chunk`` then ``done``. This module opens the
-``invoke_agent`` root the other handlers open, plus the ``chat`` and
-``execute_tool`` constructors the shared parity checks call. The reducer does
-not emit tool events, so a run only starts the root.
+``config().stream()`` is ``chunk`` then ``done``. The handler stream is the
+AG-UI text and tool subset. This module opens the ``invoke_agent`` root, plus
+the ``chat`` and ``execute_tool`` constructors the shared parity checks call.
+A run starts the root.
 """
 
 from __future__ import annotations

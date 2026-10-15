@@ -26,7 +26,7 @@ Call `init_client()` before `config()`, the same way as the other handlers. The 
 
 ## OTel
 
-A run opens one `invoke_agent` span and sets `launchdarkly.operation.type`. Tool parts are not forwarded and do not open `execute_tool` spans. `config().stream()` is `chunk` then `done`.
+A run opens one `invoke_agent` span and sets `launchdarkly.operation.type`. The handler stream is the AG-UI text and tool subset. `config().stream()` is `chunk` then `done`.
 
 ## Call shape
 
