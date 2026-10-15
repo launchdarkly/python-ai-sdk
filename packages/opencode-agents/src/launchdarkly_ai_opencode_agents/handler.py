@@ -2,7 +2,8 @@
 
 The session is a caller-supplied async iterable of OpenCode bus events. This
 module does not start a process and does not construct an OpenCode SDK client.
-The public stream is assistant text as ``chunk``, then one ``done``.
+The handler yields the AG-UI text and tool subset, then one ``done``.
+``config().stream()`` still yields ``chunk`` then ``done``.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.sdk_usage import report_usage
 from launchdarkly_ai_server.utils import number_or_zero
@@ -56,19 +58,28 @@ class _Reducer:
     Text is emitted only for messages ``message.updated`` has marked assistant.
     A part snapshot is that part's full text so far: a later delta still appends,
     and a snapshot that repeats text already emitted adds nothing. A text delta
-    without ``partID`` is dropped, because the snapshot of that part cannot be
-    matched to it. Tool parts are not forwarded.
+    without ``partID`` is dropped. The first ``running`` tool state with complete
+    ``state.input`` opens the call. OpenCode runs the tool. ``state.raw`` is not
+    diffed into argument text.
 
     Events whose ``sessionID`` is not *session_id* are ignored. A missing
     ``sessionID`` is kept. The reducer does not adopt the first session it
     sees. A ``session.idle`` for this session ends the iterable.
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, *, capture_content: bool, session_id: str) -> None:
+        self._emitter = TurnEmitter(capture_content=capture_content)
         self._session_id = session_id
+        self._started: set[str] = set()
+        self._text_message_id: str | None = None
+        self._text_open = False
+        self._held_tools: dict[str, list[Mapping[str, Any]]] = {}
         self._deltas: list[str] = []
         self._roles: dict[str, str] = {}
         self._held: dict[str, list[tuple[str, str, str]]] = {}
+        self._parked: list[
+            tuple[str, list[tuple[str, str, str]], list[Mapping[str, Any]]]
+        ] = []
         self._part_text: dict[str, str] = {}
         self._usage_ids: set[str] = set()
         self._input = 0
@@ -122,7 +133,15 @@ class _Reducer:
             return []
         if role != "assistant":
             return []
-        return self._apply_text(part_id, kind, text)
+        if self._text_open and message_id != self._text_message_id:
+            self._held.setdefault(message_id, []).append((kind, part_id, text))
+            return []
+        events = self._begin_message(message_id)
+        events.extend(self._flush_held(message_id))
+        events.extend(self._apply_text(part_id, kind, text))
+        if self._text_open and self._text_message_id == message_id:
+            events.extend(self._release_tools(message_id))
+        return events
 
     def _flush_held(self, message_id: str) -> list[dict[str, Any]]:
         held = self._held.pop(message_id, [])
@@ -133,20 +152,99 @@ class _Reducer:
 
     def _apply_text(self, part_id: str, kind: str, text: str) -> list[dict[str, Any]]:
         if kind == "delta":
-            self._part_text[part_id] = self._part_text.get(part_id, "") + text
+            if part_id:
+                self._part_text[part_id] = self._part_text.get(part_id, "") + text
             return self._chunk(text)
         already = self._part_text.get(part_id, "")
         if text.startswith(already):
             suffix = text[len(already) :]
-            self._part_text[part_id] = text
+            if part_id:
+                self._part_text[part_id] = text
         elif not already:
             suffix = text
-            self._part_text[part_id] = text
+            if part_id:
+                self._part_text[part_id] = text
         else:
             return []
         if not suffix:
             return []
         return self._chunk(suffix)
+
+    def _begin_message(self, message_id: str) -> list[dict[str, Any]]:
+        if self._text_message_id == message_id:
+            return []
+        events = self._end_open_text()
+        self._text_message_id = message_id
+        return events
+
+    def _end_open_text(self) -> list[dict[str, Any]]:
+        events = self._emitter.end_text()
+        self._text_message_id = None
+        self._text_open = False
+        events.extend(self._flush_parked())
+        return events
+
+    def _flush_parked(self) -> list[dict[str, Any]]:
+        """Emit messages completed while other text was open, after that text ends."""
+        parked = self._parked
+        self._parked = []
+        events: list[dict[str, Any]] = []
+        for message_id, held, tools in parked:
+            events.extend(self._emit_parked(message_id, held, tools))
+        return events
+
+    def _emit_parked(
+        self,
+        message_id: str,
+        held: list[tuple[str, str, str]],
+        tools: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        if held:
+            events.extend(self._begin_message(message_id))
+            for kind, part_id, text in held:
+                events.extend(self._apply_text(part_id, kind, text))
+        if self._text_open and self._text_message_id == message_id:
+            for part in tools:
+                events.extend(self._emit_tool(part))
+            events.extend(self._emitter.end_text())
+            self._text_message_id = None
+            self._text_open = False
+            return events
+        for part in tools:
+            events.extend(self._emit_tool(part))
+        if self._text_message_id == message_id:
+            self._text_message_id = None
+        return events
+
+    def _release_tools(self, message_id: str) -> list[dict[str, Any]]:
+        parts = self._held_tools.pop(message_id, [])
+        events: list[dict[str, Any]] = []
+        for part in parts:
+            events.extend(self._emit_tool(part))
+        return events
+
+    def close(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        # End the open assistant message before leftover tools. tool_start
+        # copies that message into parentMessageId. Then apply every held
+        # assistant call, including one that completed after the text closed,
+        # before fail_open marks a started call as a failure.
+        events.extend(self._end_open_text())
+        for message_id, held in list(self._held.items()):
+            if self._roles.get(message_id) != "assistant" or not held:
+                continue
+            tools = self._held_tools.pop(message_id, [])
+            events.extend(self._emit_parked(message_id, held, tools))
+            self._held.pop(message_id, None)
+        for message_id, parts in list(self._held_tools.items()):
+            role = self._roles.get(message_id)
+            if role is None or role == "assistant":
+                for part in parts:
+                    events.extend(self._emit_tool(part))
+        self._held_tools.clear()
+        events.extend(self._emitter.fail_open())
+        return events
 
     def _event(self, raw: Mapping[str, Any]) -> list[dict[str, Any]]:
         kind = raw.get("type")
@@ -157,7 +255,11 @@ class _Reducer:
             return self._delta(properties)
         if kind == "message.part.updated":
             part = properties.get("part")
-            if not isinstance(part, Mapping) or part.get("type") != "text":
+            if not isinstance(part, Mapping):
+                return []
+            if part.get("type") == "tool":
+                return self._tool(part)
+            if part.get("type") != "text":
                 return []
             return self._text_snapshot(part)
         if kind == "message.updated":
@@ -197,23 +299,105 @@ class _Reducer:
 
     def _chunk(self, text: str) -> list[dict[str, Any]]:
         self._deltas.append(text)
-        return [{"type": "chunk", "text": text}]
+        events = self._emitter.text(text)
+        if events:
+            self._text_open = True
+        return events
+
+    def _tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
+        message_id = part.get("messageID")
+        if not isinstance(message_id, str):
+            self._held_tools.setdefault("", []).append(part)
+            return []
+        role = self._roles.get(message_id)
+        if role is None:
+            self._held_tools.setdefault(message_id, []).append(part)
+            return []
+        if role != "assistant":
+            return []
+        raw_id = part.get("callID") or part.get("id") or ""
+        call_id = raw_id if isinstance(raw_id, str) else ""
+        if call_id and call_id in self._started:
+            return self._emit_tool(part)
+        if self._text_open and self._text_message_id == message_id:
+            return self._emit_tool(part)
+        # Another message is streaming, or this message's text has not opened
+        # yet. Emitting now would parent the call to the wrong message.
+        if self._text_open or self._text_message_id == message_id:
+            self._held_tools.setdefault(message_id, []).append(part)
+            return []
+        return self._emit_tool(part)
+
+    def _emit_tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
+        state = part.get("state")
+        if not isinstance(state, Mapping):
+            return []
+        status = state.get("status")
+        raw_id = part.get("callID") or part.get("id") or ""
+        call_id = raw_id if isinstance(raw_id, str) else ""
+        name = part.get("tool") if isinstance(part.get("tool"), str) else ""
+        if not call_id or status == "pending":
+            return []
+        if status == "running":
+            if "input" not in state or not name:
+                return []
+            events = self._emitter.tool_start(call_id, name)
+            if any(event.get("type") == "TOOL_CALL_START" for event in events):
+                self._started.add(call_id)
+            events.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
+            return events
+        if status not in ("completed", "error"):
+            return []
+        opened: list[dict[str, Any]] = []
+        if name:
+            started = self._emitter.tool_start(call_id, name)
+            if any(event.get("type") == "TOOL_CALL_START" for event in started):
+                self._started.add(call_id)
+            opened.extend(started)
+            opened.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
+        if status == "error":
+            opened.extend(self._emitter.tool_result(call_id, failed=True))
+        else:
+            opened.extend(self._emitter.tool_result(call_id, state.get("output")))
+        return opened
 
     def _message(self, info: Mapping[str, Any]) -> list[dict[str, Any]]:
         message_id = info.get("id")
         role = info.get("role")
         events: list[dict[str, Any]] = []
+        completed_time = info.get("time")
+        finished = isinstance(completed_time, Mapping) and "completed" in completed_time
         if isinstance(message_id, str) and isinstance(role, str):
             self._roles[message_id] = role
             if role == "assistant":
-                events.extend(self._flush_held(message_id))
+                # A reserved id is not an open AG-UI message. Only text that
+                # TurnEmitter has already yielded can take a parent or be split.
+                late_completion = (
+                    finished and self._text_open and message_id != self._text_message_id
+                )
+                if late_completion:
+                    # Keep the open message intact. The held text and tools
+                    # still happened; emit them once that text ends.
+                    held = self._held.pop(message_id, [])
+                    tools = self._held_tools.pop(message_id, [])
+                    if held or tools:
+                        self._parked.append((message_id, held, tools))
+                else:
+                    events.extend(self._begin_message(message_id))
+                    events.extend(self._flush_held(message_id))
+                    if self._text_open and self._text_message_id == message_id:
+                        events.extend(self._release_tools(message_id))
+                    elif finished:
+                        events.extend(self._release_tools(message_id))
             else:
                 self._held.pop(message_id, None)
-        if role != "assistant" or not isinstance(message_id, str):
+                self._held_tools.pop(message_id, None)
+        if role != "assistant" or not isinstance(message_id, str) or not finished:
             return events
-        completed = info.get("time")
-        if not isinstance(completed, Mapping) or "completed" not in completed:
-            return events
+        if self._text_message_id == message_id and self._text_open:
+            events.extend(self._end_open_text())
+        elif self._text_message_id == message_id:
+            self._text_message_id = None
         if message_id not in self._usage_ids:
             tokens = info.get("tokens")
             if isinstance(tokens, Mapping):
@@ -323,7 +507,8 @@ def create_opencode_handler(
     the first one it sees. This function does not start OpenCode and does not
     construct an OpenCode SDK client.
 
-    The stream yields assistant text as ``chunk`` and one ``done``. Pass
+    The stream yields the AG-UI text and tool subset and one ``done``.
+    ``config().stream()`` still yields ``chunk`` then ``done``. Pass
     ``skip_judges=True`` to ``config()``: a judge would otherwise be routed
     here and *events* would run again on the judge prompt. *capture_content*
     follows the other handlers.
@@ -346,8 +531,8 @@ def opencode_agents(
 
     *events* is required and is the same callable :func:`create_opencode_handler`
     takes. *variables*, *history*, *session_id*, and *capture_content* configure
-    that call. This does not construct an OpenCode SDK client. Pass
-    ``skip_judges=True`` so a judged config does not run *events* again.
+    that call. Pass ``skip_judges=True`` so a judged config does not run
+    *events* again.
     """
     report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
@@ -391,7 +576,7 @@ def _create_opencode_handler(
         capture = effective_capture_content(content_override)
         span = start_root_span(config, variables or {})
         ended: set[int] = set()
-        reducer = _Reducer(bound_session)
+        reducer = _Reducer(capture_content=capture, session_id=bound_session)
         try:
             instructions = (
                 config.get("instructions") if isinstance(config, dict) else None
@@ -409,6 +594,8 @@ def _create_opencode_handler(
                     events, config, user_input, variables, history, bound_session
                 )
             ):
+                yield event
+            for event in reducer.close():
                 yield event
             output = "".join(reducer.deltas)
             if output:

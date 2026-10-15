@@ -176,7 +176,7 @@ class TestSurface:
 
 
 class TestText:
-    async def test_text_around_a_tool_is_chunks_then_done(self) -> None:
+    async def test_text_around_a_tool_keeps_text_and_the_call(self) -> None:
         events = await collect(
             [
                 assistant_open("m1"),
@@ -192,16 +192,26 @@ class TestText:
                 assistant_completed("m2"),
             ],
         )
-        assert types_of(events) == ["chunk", "chunk", "done"]
-        assert [event["text"] for event in events if event["type"] == "chunk"] == [
+        assert [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ] == [
             "Looking up",
             "Done.",
         ]
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "bash"
+        assert start["parentMessageId"]
+        args = next(event for event in events if event["type"] == "TOOL_CALL_ARGS")
+        assert args["delta"] == '{"command":"ls"}'
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == "file.txt"
         assert events[-1]["output"] == "Looking upDone."
-        assert "file.txt" not in str(events)
-        assert "toolCallId" not in str(events)
+        assert types_of(events).count("TOOL_CALL_START") == 1
 
-    async def test_a_failed_tool_does_not_leak_into_the_stream(self) -> None:
+    async def test_a_failed_tool_masks_the_provider_body(self) -> None:
         events = await collect(
             [
                 tool_part(
@@ -212,9 +222,303 @@ class TestText:
                 )
             ],
         )
-        assert types_of(events) == ["done"]
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == "An error occurred."
+        assert result["metadata"] == {"launchdarkly": {"toolFailed": True}}
+        assert events[-1]["type"] == "done"
         assert events[-1]["output"] == ""
         assert "disk on fire" not in str(events)
+
+    async def test_a_tool_for_another_message_does_not_attach_to_open_text(
+        self,
+    ) -> None:
+        events = await collect(
+            [
+                assistant_open("m2"),
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                tool_part(
+                    "c2", "running", message_id="m2", raw_input={"command": "ls"}
+                ),
+                assistant_completed("m1"),
+            ]
+        )
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        ended = next(event for event in events if event["type"] == "TEXT_MESSAGE_END")
+        assert "parentMessageId" not in start
+        assert events.index(ended) < events.index(start)
+        assert ended["messageId"] == text["messageId"]
+
+    async def test_a_tool_that_finishes_after_the_text_is_not_a_failure(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                assistant_completed("m1"),
+                tool_part("c1", "completed", output="file.txt"),
+            ]
+        )
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == "file.txt"
+        assert "metadata" not in result
+        assert events[-1]["output"] == "Hi"
+
+    async def test_a_tool_waits_until_assistant_text_is_open(self) -> None:
+        events = await collect(
+            [
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Looking"),
+                tool_part("c1", "completed", output="file.txt"),
+                assistant_completed("m1"),
+            ]
+        )
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert events.index(text) < events.index(start)
+        assert start["parentMessageId"] == text["messageId"]
+        ended = next(event for event in events if event["type"] == "TEXT_MESSAGE_END")
+        assert ended["messageId"] == text["messageId"]
+
+    async def test_a_tool_before_the_role_waits_for_the_assistant_message(self) -> None:
+        events = await collect(
+            [
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                text_delta("m1", "p1", "Looking"),
+                assistant_open("m1"),
+                tool_part("c1", "completed", output="file.txt"),
+                assistant_completed("m1"),
+            ]
+        )
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        assert start["parentMessageId"] == text["messageId"]
+        assert events.index(text) < events.index(start)
+
+    async def test_a_late_completion_does_not_split_the_open_message(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                text_delta("m3", "p3", "stale"),
+                tool_part(
+                    "c3",
+                    "completed",
+                    message_id="m3",
+                    raw_input={"command": "old"},
+                    output="old.txt",
+                ),
+                assistant_completed("m3"),
+                assistant_completed("m1"),
+                text_delta("m2", "p4", "B2"),
+                assistant_completed("m2"),
+            ]
+        )
+        texts = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert texts == ["A", "B1", "B2", "stale"]
+        message_ids = [
+            event["messageId"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert message_ids[1] == message_ids[2]
+        assert message_ids[0] != message_ids[1]
+        assert message_ids[3] != message_ids[1]
+        open_end = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_END"
+            and event["messageId"] == message_ids[1]
+        )
+        stale = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "stale"
+        )
+        assert events.index(open_end) < events.index(stale)
+        start = next(
+            event
+            for event in events
+            if event["type"] == "TOOL_CALL_START" and event["toolCallId"] == "c3"
+        )
+        result = next(
+            event
+            for event in events
+            if event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c3"
+        )
+        assert result["content"] == "old.txt"
+        assert "metadata" not in result
+        assert start.get("parentMessageId") == message_ids[3]
+        assert events.index(open_end) < events.index(start)
+        assert events[-1]["output"] == "AB1B2stale"
+
+    async def test_late_text_does_not_split_the_open_message(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                bus(
+                    "message.part.updated",
+                    part={"id": "p1", "messageID": "m1", "type": "text", "text": "A"},
+                ),
+                text_delta("m1", "p1", "X"),
+                text_delta("m2", "p2", "B2"),
+                assistant_completed("m2"),
+            ]
+        )
+        b_ids = [
+            event["messageId"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+            and event["delta"] in ("B1", "B2")
+        ]
+        assert b_ids == [b_ids[0], b_ids[0]]
+        late = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "X"
+        )
+        assert late["messageId"] != b_ids[0]
+        assert events[-1]["output"] == "AB1B2X"
+
+    async def test_a_later_snapshot_does_not_repeat_held_text(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                text_delta("m1", "p1", "X"),
+                assistant_completed("m2"),
+                bus(
+                    "message.part.updated",
+                    part={"id": "p1", "messageID": "m1", "type": "text", "text": "AX"},
+                ),
+                assistant_completed("m1"),
+            ]
+        )
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert deltas == ["A", "B1", "X"]
+        assert events[-1]["output"] == "AB1X"
+
+    async def test_unfinished_assistant_text_is_emitted_at_session_end(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "A"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "B1"),
+                text_delta("m1", "p1", " later"),
+            ]
+        )
+        b = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "B1"
+        )
+        later = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == " later"
+        )
+        ended = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_END"
+            and event["messageId"] == b["messageId"]
+        )
+        assert later["messageId"] != b["messageId"]
+        assert events.index(ended) < events.index(later)
+        assert events[-1]["output"] == "AB1 later"
+
+    async def test_a_completed_message_is_emitted_when_nothing_is_open(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m2", "p2", "Kept"),
+                assistant_completed("m2"),
+                text_delta("m1", "p1", "After"),
+                assistant_completed("m1"),
+            ]
+        )
+        contents = [
+            event for event in events if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert [event["delta"] for event in contents] == ["Kept", "After"]
+        assert contents[0]["messageId"] != contents[1]["messageId"]
+        ends = [
+            event["messageId"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_END"
+        ]
+        assert ends == [contents[0]["messageId"], contents[1]["messageId"]]
+        assert events[-1]["output"] == "KeptAfter"
+
+    async def test_capture_off_hides_tool_content(self) -> None:
+        built = create_opencode_handler(
+            capture_content=False,
+            session_id="ses",
+            events=source(
+                [
+                    assistant_open("m1"),
+                    tool_part("c1", "running", raw_input={"command": "ls"}),
+                    tool_part("c1", "completed", output="file.txt"),
+                    assistant_completed("m1"),
+                ]
+            ),
+        )
+        gen = await built.stream({}, "hi", None, None)
+        events = [event async for event in gen]
+        assert any(event["type"] == "TOOL_CALL_START" for event in events)
+        assert not any(event["type"] == "TOOL_CALL_ARGS" for event in events)
+        rendered = str(events)
+        assert "ls" not in rendered
+        assert "file.txt" not in rendered
+
+    async def test_an_unlabeled_tool_does_not_inherit_an_open_message(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                tool_part(
+                    "c1", "running", message_id="m2", raw_input={"command": "ls"}
+                ),
+            ]
+        )
+        text = next(event for event in events if event["type"] == "TEXT_MESSAGE_START")
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert "parentMessageId" not in start
+        ended = next(event for event in events if event["type"] == "TEXT_MESSAGE_END")
+        assert events.index(ended) < events.index(start)
+        assert ended["messageId"] == text["messageId"]
+
+    async def test_a_user_message_tool_is_not_emitted(self) -> None:
+        events = await collect(
+            [
+                tool_part(
+                    "c1", "running", message_id="u1", raw_input={"command": "ls"}
+                ),
+                bus(
+                    "message.updated",
+                    info={"id": "u1", "role": "user", "time": {"created": 1}},
+                ),
+            ]
+        )
+        assert not any(event["type"].startswith("TOOL_CALL") for event in events)
 
     async def test_pending_tool_state_emits_nothing(self) -> None:
         events = await collect(
@@ -256,8 +560,12 @@ class TestText:
                 assistant_completed("m1"),
             ],
         )
-        chunks = [event for event in events if event["type"] == "chunk"]
-        assert chunks == [{"type": "chunk", "text": "Hi"}]
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert deltas == ["Hi"]
         assert events[-1]["output"] == "Hi"
 
     async def test_a_snapshot_then_later_deltas_append(self) -> None:
@@ -281,8 +589,12 @@ class TestText:
                 assistant_completed("m1"),
             ],
         )
-        chunks = [event["text"] for event in events if event["type"] == "chunk"]
-        assert chunks == ["He", "llo"]
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert deltas == ["He", "llo"]
         assert events[-1]["output"] == "Hello"
 
     async def test_user_text_is_not_the_assistant_reply(self) -> None:
@@ -563,8 +875,12 @@ class TestInvocation:
                 assistant_completed("m1"),
             ],
         )
-        chunks = [event["text"] for event in events if event["type"] == "chunk"]
-        assert chunks == ["Hi"]
+        contents = [
+            event["delta"]
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert contents == ["Hi"]
         assert events[-1]["output"] == "Hi"
 
     async def test_skip_judges_runs_events_once(
