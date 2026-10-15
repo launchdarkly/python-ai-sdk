@@ -12,7 +12,7 @@ This document tells an agent exactly how this package is implemented so it can b
 
 ## Role and Routing
 
-This is a **Tier 1 handler package**. It wraps LangGraph's `create_react_agent` (`langgraph.prebuilt`) and exposes a `ProviderHandler` that routes to flag variations where:
+This is a **Tier 1 handler package**. It wraps LangChain's `create_agent` (`langchain.agents`) and exposes a `ProviderHandler` that routes to flag variations where:
 
 ```
 provides_for = ['*', 'agent']
@@ -94,11 +94,11 @@ The `schema` field accepts a JSON Schema dict. Tool executor receives parsed arg
 ### 3. Agent Construction and Invocation
 
 ```python
-agent = create_react_agent(model=base_model, tools=tools, prompt=system_prompt)
+agent = create_agent(model=base_model, tools=tools, system_prompt=system_prompt)
 result = await agent.ainvoke({"messages": initial_messages})
 ```
 
-`create_react_agent` from `langgraph.prebuilt` builds a production-ready ReAct-style agent. The handler passes the initial messages and lets LangGraph manage all tool calls, retries, and re-prompting internally.
+`create_agent` from `langchain.agents` builds the agent; it replaces LangGraph's `create_react_agent`, deprecated in LangGraph 1.0 and removed in 2.0. The handler passes the initial messages and lets LangGraph manage all tool calls, retries, and re-prompting internally.
 
 ### 4. Extracting Output
 
@@ -188,7 +188,8 @@ Span names and attributes are described in [Implementation Details → Telemetry
 |---|---|
 | `langchain-core` | `BaseChatModel`, `HumanMessage`, `SystemMessage`, `AIMessage`, `BaseMessage`, `tool()` |
 | `langchain-openai` | `ChatOpenAI` (default model) |
-| `langgraph` | `StateGraph`, `ToolNode`, `tools_condition`, `create_react_agent` |
+| `langchain` | `create_agent` |
+| `langgraph` | `StateGraph`, `ToolNode`, `tools_condition` |
 | `launchdarkly-ai-server` | `AiConfigRep`, `Tool`, `ProviderHandler`, `parse_template` |
 | `opentelemetry-api` | `StatusCode`, `trace.get_tracer().start_span()` for span creation |
 
@@ -196,7 +197,7 @@ Span names and attributes are described in [Implementation Details → Telemetry
 
 ## Common Pitfalls
 
-- **No manual tool loop**: `create_react_agent` manages the entire reasoning loop internally. Do not add a manual tool-call loop on top — it would be redundant and would interfere with LangGraph's state graph.
+- **No manual tool loop**: `create_agent` manages the entire reasoning loop internally. Do not add a manual tool-call loop on top — it would be redundant and would interfere with LangGraph's state graph.
 - **`result["messages"]` is the full history**: the agent appends every intermediate AI message, tool call, and tool result. Always take the **last** message as the final output.
 - **`usage_metadata` may be sparse**: not every message carries usage. The accumulation loop silently skips messages where `usage_metadata` is absent. If total tokens are `0`, the underlying model doesn't report per-message usage.
 - **`add_messages` and all annotation-reducer symbols must be module-level imports.** `from __future__ import annotations` (present at the top of `native_graph.py`) causes Python to store all annotations as strings. When LangGraph calls `get_type_hints(WorkflowState)`, Python evaluates those strings in the **module's global namespace** — not in the local scope of the `invoke()` function. Any symbol that is only a local variable (e.g. imported inside `invoke()`) will raise `NameError: name 'add_messages' is not defined` at `StateGraph(WorkflowState)` time. See Appendix A.3 in `TESTING.md`.
