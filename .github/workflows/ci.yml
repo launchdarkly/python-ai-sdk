@@ -23,6 +23,18 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
+  # ─── Dependency audit ───────────────────────────────────────────────────────
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      # Audits the committed uv.lock as-is (no `uv lock` first), so a vulnerable pin fails here.
+      - run: make audit
+
   # ─── Setup ──────────────────────────────────────────────────────────────────
   setup:
     name: Install & sync

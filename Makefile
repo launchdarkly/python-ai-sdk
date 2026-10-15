@@ -1,4 +1,8 @@
-.PHONY: start test typecheck lint format format-check lint-fix build clean
+.PHONY: start test typecheck lint format format-check lint-fix build clean audit
+
+# Report known vulnerabilities in the locked dependency set (pip-audit on uv.lock)
+audit:
+	uv export --all-packages --no-emit-workspace --frozen -q | uvx pip-audit@2.9.0 --disable-pip --no-deps -r /dev/stdin
 
 # Run main.py (uv run python main.py)
 start:

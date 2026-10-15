@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: 'uv'
+    # uv workspace root: one uv.lock covers every packages/* member.
+    directory: '/'
+    schedule:
+      interval: 'daily'
+    cooldown:
+      default-days: 7
+  - package-ecosystem: 'github-actions'
+    # Workflow files stored in the
+    # default location of `.github/workflows`
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      default-days: 7
