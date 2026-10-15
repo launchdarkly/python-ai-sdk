@@ -31,6 +31,7 @@ from launchdarkly_ai_server import (
     set_input_content_attributes,
     set_output_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from ._version import PACKAGE_NAME, __version__
@@ -474,6 +475,7 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -519,8 +521,36 @@ async def _stream_gen(
                     if getattr(msg, "type", None) == "ai":
                         text = lang_chain_content_text(msg.content)
                         if text:
-                            yield {"type": "chunk", "text": text}
+                            for rich in emitter.text(text):
+                                yield rich
                             full_output = text
+                        for tc in getattr(msg, "tool_calls", None) or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            call_id = str(tc.get("id") or tc.get("name") or "")
+                            name = str(tc.get("name") or "")
+                            for rich in emitter.tool_start(call_id, name):
+                                yield rich
+                            for rich in emitter.tool_end(
+                                call_id, arguments=tc.get("args")
+                            ):
+                                yield rich
+                    elif getattr(msg, "type", None) == "tool":
+                        call_id = str(getattr(msg, "tool_call_id", "") or "")
+                        if call_id:
+                            for rich in emitter.tool_result(
+                                call_id,
+                                getattr(msg, "content", None),
+                                failed=getattr(msg, "status", None) == "error",
+                            ):
+                                yield rich
+            for rich in emitter.end_text():
+                yield rich
+
+        # A step can start a call the graph never answers with a tool message.
+        # Close it before the run finishes, or the client keeps it open.
+        for rich in emitter.fail_open():
+            yield rich
 
         # The same reconciliation the blocking path does, for the same reason. This walk reads
         # usage_metadata off the astream payloads, and sees nothing at all unless the graph is
@@ -562,6 +592,8 @@ async def _stream_gen(
         if span_callbacks.run_usage.reported:
             finish_root_span(span, config, span_callbacks.run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through

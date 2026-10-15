@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, get_args
 
+from .shutdown_hooks import register_shutdown_hook
 from .types import Skill, SkillOutcomeReason, SkillReference
 from .types_validation import is_valid_skill_key, is_valid_skill_version
 
@@ -188,6 +189,11 @@ def clear_state() -> None:
     global _store, _emitter
     _store = None
     _emitter = _NOOP_EMITTER
+
+
+# Registered on load, so core's ``shutdown()`` clears this state without
+# importing any Agent Skills module (TESTING.md §0.3).
+register_shutdown_hook("Agent Skills", clear_state)
 
 
 def get_store() -> SkillStore | None:

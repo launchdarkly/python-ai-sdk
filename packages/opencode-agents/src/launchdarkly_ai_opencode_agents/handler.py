@@ -62,14 +62,15 @@ class _Reducer:
     ``state.input`` opens the call. OpenCode runs the tool. ``state.raw`` is not
     diffed into argument text.
 
-    Events whose ``sessionID`` is not this session are ignored. The first
-    ``sessionID`` seen is the session when the caller did not pass one. A
-    ``session.idle`` for this session ends the iterable.
+    Events whose ``sessionID`` is not *session_id* are ignored. A missing
+    ``sessionID`` is kept. The reducer does not adopt the first session it
+    sees. A ``session.idle`` for this session ends the iterable.
     """
 
-    def __init__(self, *, capture_content: bool, session_id: str | None) -> None:
+    def __init__(self, *, capture_content: bool, session_id: str) -> None:
         self._emitter = TurnEmitter(capture_content=capture_content)
         self._session_id = session_id
+        self._started: set[str] = set()
         self._text_message_id: str | None = None
         self._text_open = False
         self._held_tools: dict[str, list[Mapping[str, Any]]] = {}
@@ -114,11 +115,8 @@ class _Reducer:
             kind = raw.get("type")
             properties = raw.get("properties")
             session_id = _session_id(raw)
-            if session_id is not None:
-                if self._session_id is None:
-                    self._session_id = session_id
-                elif session_id != self._session_id:
-                    continue
+            if session_id is not None and session_id != self._session_id:
+                continue
             if kind == "session.idle":
                 return
             if kind == "session.error":
@@ -309,7 +307,7 @@ class _Reducer:
             return []
         raw_id = part.get("callID") or part.get("id") or ""
         call_id = raw_id if isinstance(raw_id, str) else ""
-        if call_id and self._emitter.has_started(call_id):
+        if call_id and call_id in self._started:
             return self._emit_tool(part)
         if self._text_open and self._text_message_id == message_id:
             return self._emit_tool(part)
@@ -334,13 +332,18 @@ class _Reducer:
             if "input" not in state or not name:
                 return []
             events = self._emitter.tool_start(call_id, name)
+            if any(event.get("type") == "TOOL_CALL_START" for event in events):
+                self._started.add(call_id)
             events.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
             return events
         if status not in ("completed", "error"):
             return []
         opened: list[dict[str, Any]] = []
         if name:
-            opened.extend(self._emitter.tool_start(call_id, name))
+            started = self._emitter.tool_start(call_id, name)
+            if any(event.get("type") == "TOOL_CALL_START" for event in started):
+                self._started.add(call_id)
+            opened.extend(started)
             opened.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
         if status == "error":
             opened.extend(self._emitter.tool_result(call_id, failed=True))
@@ -481,7 +484,7 @@ def _open_events(
 def create_opencode_handler(
     *,
     events: Events,
-    session_id: str | None = None,
+    session_id: str,
     capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Return a handler that runs an OpenCode session supplied by *events*.
@@ -489,8 +492,10 @@ def create_opencode_handler(
     ``provides_for`` is ``('*', 'agent')``, so the handler matches an agent-mode
     variation for any provider. *events* is called on every invocation as
     ``events(config, user_input, variables, history, session_id)`` and must
-    return a fresh async iterable of that session's bus events. This function
-    does not start OpenCode and does not construct an OpenCode SDK client.
+    return a fresh async iterable of that session's bus events. *session_id*
+    is required. The reducer ignores every other session and does not adopt
+    the first one it sees. This function does not start OpenCode and does not
+    construct an OpenCode SDK client.
 
     The stream yields the AG-UI text and tool subset and one ``done``.
     ``config().stream()`` still yields ``chunk`` then ``done``. Pass
@@ -501,7 +506,7 @@ def create_opencode_handler(
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
     return _create_opencode_handler(
         events=events,
-        session_id=session_id,
+        session_id=_require_session_id(session_id),
         capture_content=capture_content,
     )
 
@@ -523,7 +528,7 @@ def opencode_agents(
     variables = kwargs.pop("variables", None)
     history = kwargs.pop("history", None)
     capture_content = kwargs.pop("capture_content", None)
-    session_id = kwargs.pop("session_id", None)
+    session_id = _require_session_id(kwargs.pop("session_id", None))
     events = kwargs.pop("events")
     return _config(
         key=config_key,
@@ -536,10 +541,16 @@ def opencode_agents(
     ).invoke(user_input, context, variables, history)
 
 
+def _require_session_id(session_id: object) -> str:
+    if not isinstance(session_id, str) or not session_id:
+        raise TypeError("The OpenCode handler requires a session_id.")
+    return session_id
+
+
 def _create_opencode_handler(
     *,
     events: Events,
-    session_id: str | None,
+    session_id: str,
     capture_content: bool | None,
 ) -> ProviderHandler:
     content_override = capture_content

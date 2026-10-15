@@ -119,7 +119,9 @@ def source(events: list[dict[str, Any]]) -> Any:
 
 
 async def collect(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    built = create_opencode_handler(capture_content=True, events=source(events))
+    built = create_opencode_handler(
+        capture_content=True, events=source(events), session_id="ses"
+    )
     gen = await built.stream({}, "hi", None, None)
     return [event async for event in gen]
 
@@ -149,7 +151,7 @@ def mock_ld_client() -> Iterator[MagicMock]:
 
 class TestSurface:
     def test_provides_for_is_any_provider_in_agent_mode(self) -> None:
-        handler = create_opencode_handler(events=source([]))
+        handler = create_opencode_handler(events=source([]), session_id="ses")
         assert handler.provides_for == ("*", "agent")
 
     def test_package_exports_the_handler(self) -> None:
@@ -165,8 +167,10 @@ class TestSurface:
 
     def test_capture_content_follows_configure(self) -> None:
         configure(options=SDKOptions(capture_content=True))
-        omitted = create_opencode_handler(events=source([]))
-        explicit = create_opencode_handler(capture_content=False, events=source([]))
+        omitted = create_opencode_handler(events=source([]), session_id="ses")
+        explicit = create_opencode_handler(
+            capture_content=False, events=source([]), session_id="ses"
+        )
         assert omitted.capture_content is True
         assert explicit.capture_content is False
 
@@ -382,6 +386,7 @@ class TestText:
     async def test_capture_off_hides_tool_content(self) -> None:
         built = create_opencode_handler(
             capture_content=False,
+            session_id="ses",
             events=source(
                 [
                     assistant_open("m1"),
@@ -538,6 +543,7 @@ class TestText:
     async def test_session_error_raises_without_the_provider_body(self) -> None:
         handler = create_opencode_handler(
             capture_content=True,
+            session_id="ses",
             events=source(
                 [
                     assistant_open("m1"),
@@ -568,6 +574,7 @@ class TestStableStream:
         self, mock_ld_client: MagicMock
     ) -> None:
         handler = create_opencode_handler(
+            session_id="ses",
             events=source(
                 [
                     assistant_open("m1"),
@@ -604,6 +611,7 @@ class TestStableStream:
         self, mock_ld_client: MagicMock
     ) -> None:
         handler = create_opencode_handler(
+            session_id="ses",
             events=source(
                 [
                     assistant_open("m1"),
@@ -624,6 +632,44 @@ class TestInvocation:
     def test_events_is_required(self) -> None:
         with pytest.raises(TypeError):
             create_opencode_handler()  # type: ignore[call-arg]
+
+    def test_session_id_is_required(self) -> None:
+        with pytest.raises(TypeError, match="session_id"):
+            create_opencode_handler(events=source([]))  # type: ignore[call-arg]
+        with pytest.raises(TypeError, match="session_id"):
+            create_opencode_handler(events=source([]), session_id="")
+        with pytest.raises(TypeError, match="session_id"):
+            create_opencode_handler(events=source([]), session_id=None)  # type: ignore[arg-type]
+
+    async def test_the_first_session_on_the_stream_is_not_adopted(self) -> None:
+        events = await collect(
+            [
+                bus(
+                    "message.updated",
+                    info={
+                        "id": "other",
+                        "role": "assistant",
+                        "sessionID": "other",
+                        "time": {"created": 1},
+                    },
+                ),
+                text_delta("other", "po", "their answer", session_id="other"),
+                assistant_completed("other"),
+                bus(
+                    "message.updated",
+                    info={
+                        "id": "m1",
+                        "role": "assistant",
+                        "sessionID": "ses",
+                        "time": {"created": 1},
+                    },
+                ),
+                text_delta("m1", "p1", "Hi", session_id="ses"),
+                assistant_completed("m1"),
+            ]
+        )
+        assert events[-1]["output"] == "Hi"
+        assert "their answer" not in str(events)
 
     async def test_events_receives_the_prompt_and_the_session(self) -> None:
         seen: dict[str, Any] = {}
@@ -882,13 +928,14 @@ class TestInvocation:
         tracer = _Tracer()
         monkeypatch.setattr(span_module, "trace", tracer)
         handler = create_opencode_handler(
+            session_id="ses",
             events=source(
                 [
                     assistant_open("m1"),
                     text_delta("m1", "p1", "Hi"),
                     assistant_completed("m1"),
                 ]
-            )
+            ),
         )
         seen = [event async for event in await handler.stream({}, "hi", None, None)]
         assert seen[-1]["output"] == "Hi"
