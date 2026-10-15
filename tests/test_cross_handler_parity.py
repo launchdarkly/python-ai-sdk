@@ -41,6 +41,7 @@ HANDLERS: dict[str, str] = {
     "openai-agents": "launchdarkly_ai_openai_agents.spans",
     "langchain-messages": "launchdarkly_ai_langchain_messages.spans",
     "langchain-agents": "launchdarkly_ai_langchain_agents.spans",
+    "opencode-agents": "launchdarkly_ai_opencode_agents.spans",
 }
 
 #: `claude-agents` builds its `chat` span inside an inference tracker rather than in a standalone
