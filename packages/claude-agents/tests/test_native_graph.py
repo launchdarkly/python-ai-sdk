@@ -22,10 +22,21 @@ from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, Native
 
 
 def _make_result_msg(
-    text: str = "result", input_tokens: int = 5, output_tokens: int = 3
+    text: str | None = "result",
+    input_tokens: int = 5,
+    output_tokens: int = 3,
+    subtype: str = "success",
+    is_error: bool = False,
+    errors: list[str] | None = None,
+    api_error_status: int | None = None,
 ) -> Any:
     m = MagicMock()
     m.__class__.__name__ = "ResultMessage"
+    # Set explicitly: an unset MagicMock attribute is truthy, so `is_error` would read as an error.
+    m.subtype = subtype
+    m.is_error = is_error
+    m.errors = errors
+    m.api_error_status = api_error_status
     m.result = text
     m.usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
     return m
@@ -846,6 +857,126 @@ class TestToClaudeAgentsAnthropicSpecific:
                     ).invoke("hi")
 
         assert "$ld:ai:graph:invocation_failure" in track_calls
+
+    # Measured against Agent SDK 0.3.220: an Anthropic API failure arrives as a `success` result
+    # with `is_error` set and the error text in `result`. The adapter used to return that text as
+    # the answer, and it ignored error subtypes entirely.
+    @pytest.mark.asyncio
+    async def test_root_api_error_result_fails_the_graph(self) -> None:
+        track_calls: list[str] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append(evt)
+        )
+        mock_sdk = _make_sdk_mock()
+        error_msg = _make_result_msg(
+            "Credit balance is too low", 0, 0, is_error=True, api_error_status=400
+        )
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield error_msg
+
+        mock_sdk.query = _query
+        mock_sdk.ResultMessage = type(error_msg)
+        ctx = {"kind": "user", "key": "test"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "get_client", return_value=mock_ld_client):
+                with pytest.raises(RuntimeError, match="Credit balance is too low"):
+                    await to_claude_agents(
+                        _make_def_promise(_make_graph_def()),
+                        opts={"context": ctx},
+                    ).invoke("hi")
+
+        assert "$ld:ai:graph:invocation_failure" in track_calls
+        assert "$ld:ai:graph:invocation_success" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_root_error_subtype_fails_the_graph(self) -> None:
+        mock_sdk = _make_sdk_mock()
+        error_msg = _make_result_msg(
+            None,
+            subtype="error_max_turns",
+            is_error=True,
+            errors=["turn limit reached"],
+        )
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield error_msg
+
+        mock_sdk.query = _query
+        mock_sdk.ResultMessage = type(error_msg)
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError, match=r"error_max_turns.*turn limit reached"
+            ):
+                await to_claude_agents(_make_def_promise(_make_graph_def())).invoke(
+                    "hi"
+                )
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_api_error_fails_its_tool_call(self) -> None:
+        child_node = {
+            "key": "child",
+            "config": {"model": {"name": "claude-3"}, "instructions": "child"},
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [],
+            "is_terminal": True,
+        }
+        root_node = {
+            "key": "root",
+            "config": {"model": {"name": "claude-3"}, "instructions": "root"},
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [{"source_key": "root", "target_key": "child"}],
+            "is_terminal": False,
+        }
+        graph_def = _make_graph_def(
+            nodes={"root": root_node, "child": child_node},
+            edges=[{"source_key": "root", "target_key": "child"}],
+        )
+        child_tool_fn: list[Any] = []
+
+        def _tool_factory(name: str, desc: str, schema: Any) -> Any:
+            def _dec(fn: Any) -> Any:
+                if "child" in name:
+                    child_tool_fn.append(fn)
+                return fn
+
+            return _dec
+
+        mock_sdk = _make_sdk_mock("root-done")
+        mock_sdk.tool = MagicMock(side_effect=_tool_factory)
+        error_msg = _make_result_msg(
+            "Credit balance is too low", 0, 0, is_error=True, api_error_status=400
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+            async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+                yield error_msg
+
+            mock_sdk.query = _query
+            mock_sdk.ResultMessage = type(error_msg)
+            assert child_tool_fn
+            with pytest.raises(RuntimeError, match="Credit balance is too low"):
+                await child_tool_fn[0]({"input": "sub-query"})
 
     @pytest.mark.asyncio
     async def test_returns_root_query_result(self) -> None:
