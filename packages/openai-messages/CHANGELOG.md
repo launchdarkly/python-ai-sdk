@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-messages-0.2.4...launchdarkly-ai-openai-messages-0.2.5) (2026-10-16)
+
+
+### Features
+
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+* **openai:** emit AG-UI text and tool events ([#161](https://github.com/launchdarkly/python-ai-sdk/issues/161)) ([2b1b2d4](https://github.com/launchdarkly/python-ai-sdk/commit/2b1b2d4184959afcb444effa0e92f6ca8703c93d))
+
 ## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-messages-0.2.3...launchdarkly-ai-openai-messages-0.2.4) (2026-10-09)
 
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.3.0...launchdarkly-ai-server-0.4.0) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **evaluations:** mark evaluations from code as experimental ([#157](https://github.com/launchdarkly/python-ai-sdk/issues/157))
+
+### Experimental
+
+* **evaluations:** mark evaluations from code as experimental ([#157](https://github.com/launchdarkly/python-ai-sdk/issues/157)) ([1389765](https://github.com/launchdarkly/python-ai-sdk/commit/138976570f6893ffae82aa909a79803d142d566c))
+* **skills:** Correct the HTTP 403 advice now that server-side FDv2 is available to every account ([#178](https://github.com/launchdarkly/python-ai-sdk/issues/178)) ([b17e322](https://github.com/launchdarkly/python-ai-sdk/commit/b17e3220d6576c54ba4ebc7d46f82236557dc8e5))
+
+
+### Features
+
+* **agui:** add a shared reader for handler streams ([#164](https://github.com/launchdarkly/python-ai-sdk/issues/164)) ([fc08dd5](https://github.com/launchdarkly/python-ai-sdk/commit/fc08dd5ce7ab6848934b57718e84dbd2ef2a9510))
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+* **langchain:** emit AG-UI text and tool events ([#163](https://github.com/launchdarkly/python-ai-sdk/issues/163)) ([ab5e9e1](https://github.com/launchdarkly/python-ai-sdk/commit/ab5e9e172fd33d26a15c26e84a75b01df31ea54c))
+* **openai:** emit AG-UI text and tool events ([#161](https://github.com/launchdarkly/python-ai-sdk/issues/161)) ([2b1b2d4](https://github.com/launchdarkly/python-ai-sdk/commit/2b1b2d4184959afcb444effa0e92f6ca8703c93d))
+
+
+### Bug Fixes
+
+* give native graph spans their LaunchDarkly identity ([#121](https://github.com/launchdarkly/python-ai-sdk/issues/121)) ([e863b6d](https://github.com/launchdarkly/python-ai-sdk/commit/e863b6d140bcc52ef058e1df374d40116bbaf762))
+
 ## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.4...launchdarkly-ai-server-0.3.0) (2026-10-09)
 
 

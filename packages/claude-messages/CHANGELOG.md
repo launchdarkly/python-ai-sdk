@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-messages-0.2.4...launchdarkly-ai-claude-messages-0.2.5) (2026-10-16)
+
+
+### Features
+
+* **claude:** emit AG-UI text and tool events ([#165](https://github.com/launchdarkly/python-ai-sdk/issues/165)) ([3f3a0ce](https://github.com/launchdarkly/python-ai-sdk/commit/3f3a0cea17806beba21d839847b3158821600d26))
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+
 ## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-messages-0.2.3...launchdarkly-ai-claude-messages-0.2.4) (2026-10-09)
 
 
