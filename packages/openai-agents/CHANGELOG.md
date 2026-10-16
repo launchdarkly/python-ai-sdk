@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.6](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-agents-0.2.5...launchdarkly-ai-openai-agents-0.2.6) (2026-10-16)
+
+
+### Features
+
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+* **openai:** emit AG-UI text and tool events ([#161](https://github.com/launchdarkly/python-ai-sdk/issues/161)) ([2b1b2d4](https://github.com/launchdarkly/python-ai-sdk/commit/2b1b2d4184959afcb444effa0e92f6ca8703c93d))
+
+
+### Bug Fixes
+
+* give native graph spans their LaunchDarkly identity ([#121](https://github.com/launchdarkly/python-ai-sdk/issues/121)) ([e863b6d](https://github.com/launchdarkly/python-ai-sdk/commit/e863b6d140bcc52ef058e1df374d40116bbaf762))
+
 ## [0.2.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-agents-0.2.4...launchdarkly-ai-openai-agents-0.2.5) (2026-10-09)
 
 
