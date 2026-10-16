@@ -417,6 +417,24 @@ async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge
     assert criterion["reason"] == "Correct and concise."
     assert flushed == ["client", "traces"]
 
+    # Each span is timed to the call it describes, so its window sits inside
+    # its parent's. A canned handler makes these windows microseconds wide;
+    # a duration floor would assert the machine's speed, containment asserts
+    # that the span wrapped the call.
+    for span in spans:
+        assert span.end_time > span.start_time
+    for child, parent in (
+        (generation_chat, row),
+        (tool, row),
+        (evaluate, row),
+        (judge_chat, evaluate),
+        # The tool ran inside the handler, so its window is inside the
+        # generation chat's even though the span is a sibling of it.
+        (tool, generation_chat),
+    ):
+        assert parent.start_time <= child.start_time
+        assert child.end_time <= parent.end_time
+
 
 @pytest.mark.asyncio
 async def test_plain_function_that_raises_records_the_failed_generation(
