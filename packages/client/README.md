@@ -799,9 +799,10 @@ version does not recognise, not that something failed.
 
 > **Beta caveats, worth knowing before you deploy.** Payload signing does not exist on this
 > channel yet, so delivery is TLS-only and the content hash establishes self-consistency, not
-> origin authenticity. The FDv2 protocol is opt-in per account: without it the endpoints
-> return HTTP 403, which the store reports as a fatal error explaining what to do. `ld-relay`
-> does not speak the FDv2 endpoints, so relay-only deployments cannot receive skills.
+> origin authenticity. The SDK-facing FDv2 endpoints are available to every account. An
+> account without Agent Skills access receives no skill content rather than an error status.
+> An HTTP 403 is reported as a fatal error explaining what to check. `ld-relay` does not
+> speak the FDv2 endpoints, so relay-only deployments cannot receive skills.
 
 **If every skill comes back empty, check `diagnostics.hashless_objects`.** Objects without a
 `contentHash` are withheld, so a nonzero count means skills are being withheld, not that the
