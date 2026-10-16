@@ -1167,11 +1167,25 @@ class EvaluationsRunner:
         """
         controller = ConcurrencyController(concurrency)
 
+        async def score(row: Mapping[str, Any], criterion: Criterion) -> dict[str, Any]:
+            if isinstance(criterion, Scorer):
+                return await self._run_scorer_for_result(row, criterion)
+            return await self._run_ld_judge_for_result(
+                row,
+                tool_handlers,
+                criterion,
+                resolved_judges[criterion.key],
+            )
+
         async def run_one(
             row: Mapping[str, Any], criterion: Criterion
         ) -> dict[str, Any]:
             await controller.acquire()
             try:
+                if row.get("status") != "COMPLETE":
+                    # A row that did not generate is never scored, so there is
+                    # no judge or scorer call for an ``evaluate`` span to wrap.
+                    return await score(row, criterion)
                 row_index = row.get("row_index")
                 index = row_index if isinstance(row_index, int) else 0
                 with bind_evaluation_row(evaluation_run_id, index):
@@ -1181,15 +1195,7 @@ class EvaluationsRunner:
                         criterion.criterion_type,
                         (row_spans or {}).get(index),
                     ) as span:
-                        if isinstance(criterion, Scorer):
-                            event = await self._run_scorer_for_result(row, criterion)
-                        else:
-                            event = await self._run_ld_judge_for_result(
-                                row,
-                                tool_handlers,
-                                criterion,
-                                resolved_judges[criterion.key],
-                            )
+                        event = await score(row, criterion)
                         _finish_criterion_span(span, event)
                         return event
             finally:

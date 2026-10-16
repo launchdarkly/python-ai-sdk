@@ -160,7 +160,9 @@ def one_row_transport() -> SequencedTransport:
     )
 
 
-def patch_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+def patch_judge(
+    monkeypatch: pytest.MonkeyPatch, prompt: dict[str, Any] | None = None
+) -> None:
     async def fake_extract_variation(
         key: str, context: dict[str, Any]
     ) -> dict[str, Any]:
@@ -169,7 +171,7 @@ def patch_judge(monkeypatch: pytest.MonkeyPatch) -> None:
             "config": {
                 "provider": {"name": "OpenAI"},
                 "model": {"name": "gpt-4o"},
-                "instructions": "Judge {{response_to_evaluate}}",
+                **(prompt or {"instructions": "Judge {{response_to_evaluate}}"}),
             },
             "meta": {"variationKey": "default", "version": 12},
         }
@@ -233,7 +235,15 @@ async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge
 ) -> None:
     exporter, flushed = span_export
     forbid_new_exporter(monkeypatch)
-    patch_judge(monkeypatch)
+    patch_judge(
+        monkeypatch,
+        {
+            "messages": [
+                {"role": "system", "content": "Judge {{response_to_evaluate}}"},
+                {"role": "user", "content": "Transcript:\n{{message_history}}"},
+            ]
+        },
+    )
 
     async def client_flush() -> None:
         flushed.append("client")
@@ -253,7 +263,7 @@ async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge
         variables: dict[str, Any],
     ) -> dict[str, Any]:
         assert "__ld" not in variables
-        if "Judge" in config.get("instructions", ""):
+        if config.get("messages"):
             return {
                 "output": '{"score": 0.9, "reasoning": "Correct and concise."}',
                 "usage": {"input_tokens": 30, "output_tokens": 9},
@@ -357,9 +367,20 @@ async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge
     assert json.loads(str(judge_attributes["gen_ai.system_instructions"])) == [
         {"type": "text", "content": "Judge shipped"}
     ]
-    assert json.loads(str(judge_attributes["gen_ai.input.messages"])) == [
-        {"role": "user", "parts": [{"type": "text", "content": "shipped"}]}
-    ]
+    history_turn, judged_turn = json.loads(
+        str(judge_attributes["gen_ai.input.messages"])
+    )
+    assert history_turn["role"] == "user"
+    (history_part,) = history_turn["parts"]
+    history = history_part["content"]
+    assert history.startswith("Transcript:\n")
+    assert "{{message_history}}" not in history
+    for fragment in ("Where is order A1?", "lookup_order", _TOOL_RESULT, "shipped"):
+        assert fragment in history
+    assert judged_turn == {
+        "role": "user",
+        "parts": [{"type": "text", "content": "shipped"}],
+    }
     assert json.loads(str(judge_attributes["gen_ai.output.messages"])) == [
         {
             "role": "assistant",
@@ -418,8 +439,12 @@ async def test_plain_function_that_raises_records_the_failed_generation(
         tool_handlers: dict[str, Callable[..., Any]],
         variables: dict[str, Any],
     ) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
         tool_handlers["lookup_order"]({"order_id": "A1"})
         raise RuntimeError("model refused")
+
+    calls = 0
 
     await evals.run(
         key="support-qa",
@@ -442,10 +467,15 @@ async def test_plain_function_that_raises_records_the_failed_generation(
     assert "gen_ai.input.messages" in attributes
     (tool,) = by_name["execute_tool lookup_order"]
     assert (tool.attributes or {})["gen_ai.tool.call.result"] == _TOOL_RESULT
-    (evaluate,) = by_name["evaluate $ld:ai:judge:accuracy"]
-    assert evaluate.status.status_code == StatusCode.ERROR
-    assert (evaluate.attributes or {})["error.type"] == "generation_incomplete"
-    assert parent_of(evaluate) == row.context.span_id
+    assert sorted(by_name) == [
+        "chat gpt-4o",
+        "execute_tool lookup_order",
+        "launchdarkly.dataset_row",
+    ]
+    for child in (chat, tool):
+        assert parent_of(child) == row.context.span_id
+        assert child.context.trace_id == row.context.trace_id
+    assert calls == 1
 
 
 @pytest.mark.asyncio
