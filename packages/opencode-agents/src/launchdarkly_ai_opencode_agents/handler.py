@@ -460,6 +460,20 @@ def _session_error_message(properties: object) -> str:
     return f"The OpenCode session failed ({name})."
 
 
+def _is_judge_evaluation() -> bool:
+    """Whether this call is a judge evaluation, not the agent's own session.
+
+    ``provides_for`` stays ``('*', 'agent')``, so judge selection still lands
+    here. The judge prompt is not this OpenCode session. Calling *events* for
+    it would answer the judge with that session.
+    """
+    from opentelemetry import context as otel_context
+
+    from launchdarkly_ai_server.conversation import _EVAL_KEY
+
+    return otel_context.get_value(_EVAL_KEY) is not None
+
+
 def _input_messages(
     user_input: str | None,
     history: list[dict[str, Any]] | None,
@@ -508,10 +522,12 @@ def create_opencode_handler(
     construct an OpenCode SDK client.
 
     The stream yields the AG-UI text and tool subset and one ``done``.
-    ``config().stream()`` still yields ``chunk`` then ``done``. Pass
-    ``skip_judges=True`` to ``config()``: a judge would otherwise be routed
-    here and *events* would run again on the judge prompt. *capture_content*
-    follows the other handlers.
+    ``config().stream()`` still yields ``chunk`` then ``done``. Judge
+    selection still lands here, because ``provides_for`` is ``('*', 'agent')``.
+    The handler does not run that prompt: the call raises without calling
+    *events*, and the judge does not score. Pass ``skip_judges=True`` to
+    ``config()`` to skip that attempt before it is selected.
+    *capture_content* follows the other handlers.
     """
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
     return _create_opencode_handler(
@@ -531,8 +547,8 @@ def opencode_agents(
 
     *events* is required and is the same callable :func:`create_opencode_handler`
     takes. *variables*, *history*, *session_id*, and *capture_content* configure
-    that call. Pass ``skip_judges=True`` so a judged config does not run
-    *events* again.
+    that call. A judged config does not call *events* again: a judge
+    evaluation raises, and the judge does not score.
     """
     report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
@@ -573,6 +589,8 @@ def _create_opencode_handler(
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
+        if _is_judge_evaluation():
+            raise RuntimeError("The OpenCode handler does not run judge prompts.")
         capture = effective_capture_content(content_override)
         span = start_root_span(config, variables or {})
         ended: set[int] = set()

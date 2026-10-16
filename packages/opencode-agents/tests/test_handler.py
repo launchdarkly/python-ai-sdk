@@ -919,10 +919,14 @@ class TestInvocation:
         assert calls == ["q"]
 
         calls.clear()
-        await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
-        assert calls[0] == "q"
-        assert len(calls) == 2
-        assert calls[1] != "q"
+        judged_run = [
+            event
+            async for event in config(key="flag", handler=handler).stream("q", CONTEXT)
+        ]
+        assert calls == ["q"]
+        assert judged_run[-1]["type"] == "done"
+        assert judged_run[-1]["response"] == "Hi"
+        assert not judged_run[-1].get("judge_results")
 
     async def test_the_wrapper_forwards_variables_history_and_session(
         self, mock_ld_client: MagicMock

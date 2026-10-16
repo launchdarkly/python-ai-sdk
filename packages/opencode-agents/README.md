@@ -36,9 +36,9 @@ async def session_events(config, user_input, variables, history, session_id):
 async def main() -> None:
     await init_client()
     handler = create_opencode_handler(events=session_events, session_id="ses")
-    async for event in config(
-        key="my-agent", handler=handler, skip_judges=True
-    ).stream("Hello", {"kind": "user", "key": "user-1"}):
+    async for event in config(key="my-agent", handler=handler).stream(
+        "Hello", {"kind": "user", "key": "user-1"}
+    ):
         print(event)
     await shutdown()
 
@@ -48,4 +48,4 @@ asyncio.run(main())
 
 `events` is required. Each invocation calls `events(config, user_input, variables, history, session_id)` and the return value must be a fresh async iterable of that session only. The iterable must end: return it after `session.idle`, or close it yourself. The handler yields AG-UI text and tool events. `config().stream()` yields `chunk` then `done`.
 
-Pass `skip_judges=True`. This handler matches every agent-mode provider, including a judge, and it does not run the judge prompt.
+This handler matches every agent-mode provider, so judge selection can land here. It does not run the judge prompt: that call raises without calling `events`, and the judge does not score.
