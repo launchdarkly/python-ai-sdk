@@ -27,7 +27,9 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.responses import map_responses_event
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -476,6 +478,7 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
     try:
         tools = _build_tools(config.get("tools") or {})
         input_messages = _build_input_messages(config, user_input, variables, history)
@@ -493,6 +496,7 @@ async def _stream_gen(
         previous_response_id: str | None = None
         current_input: Any = input_messages
         steps = 0
+        item_to_call: dict[str, str] = {}
 
         while True:
             model_span = start_model_span(config, parent)
@@ -523,10 +527,10 @@ async def _stream_gen(
                 stream = client.responses.stream(**stream_params)
                 async with stream as s:
                     async for event in s:
-                        if getattr(event, "type", None) == "response.output_text.delta":
-                            text = getattr(event, "delta", "")
-                            full_output += text
-                            yield {"type": "chunk", "text": text}
+                        for rich in map_responses_event(event, emitter, item_to_call):
+                            if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                                full_output += rich.get("delta") or ""
+                            yield rich
 
                     final_resp = await s.get_final_response()
 
@@ -556,6 +560,10 @@ async def _stream_gen(
                 if getattr(item, "type", None) == "function_call"
             ]
             if not tool_calls:
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -565,6 +573,13 @@ async def _stream_gen(
             steps += 1
 
             previous_response_id = getattr(final_resp, "id", None)
+            for tc in tool_calls:
+                for rich in emitter.tool_start(str(tc.call_id), str(tc.name)):
+                    yield rich
+                for rich in emitter.tool_end(str(tc.call_id), arguments=tc.arguments):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             tool_outputs = []
             for tc in tool_calls:
                 tool_span = start_tool_span(tc.name, tc.call_id, parent)
@@ -597,6 +612,9 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                # The model is sent str(result). The stream reports that same text.
+                for rich in emitter.tool_result(str(tc.call_id), str(result)):
+                    yield rich
                 tool_outputs.append(
                     {
                         "type": "function_call_output",
@@ -631,6 +649,10 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, last_response_model, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through

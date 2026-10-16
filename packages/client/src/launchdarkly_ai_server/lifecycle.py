@@ -6,9 +6,9 @@ import logging
 import os
 from typing import Any
 
-from . import skills
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
+from .shutdown_hooks import run_shutdown_hooks
 from .types import InitClientOptions, SDKOptions
 from .utils import model_stamps_from_meta
 
@@ -375,21 +375,14 @@ def _flush_tracer_provider() -> None:
         logger.debug("Could not flush OpenTelemetry spans", exc_info=True)
 
 
-def _clear_experimental_state() -> None:
-    """Clears experimental feature state. A failure is logged, never raised."""
-    try:
-        skills._clear_state()
-    except Exception:
-        logger.warning("Could not clear the Agent Skills state", exc_info=True)
-
-
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also clears any experimental feature state, such as a configured skill
-    store, and restores process-wide SDK defaults from ``configure``.
+    Also runs the registered shutdown hooks, which clear the state of any
+    experimental feature in use, and restores process-wide SDK defaults from
+    ``configure``.
 
     When telemetry was running, this also releases the process-global tracer
     provider so a later ``init_client`` can install its own — see
@@ -401,7 +394,7 @@ async def shutdown() -> None:
     local_provider = _tracer_provider
     owned_globals = _owns_otel_globals
 
-    _clear_experimental_state()
+    run_shutdown_hooks()
 
     # Null the singleton before any awaits so a second call is a no-op.
     # Options reset even when no client was initialized: configure() does not
@@ -455,9 +448,8 @@ def _reset_for_testing() -> None:
     _owns_otel_globals = False
     _sdk_options = SDKOptions()
     _ai_invoked = False
-    # Directly, not through _clear_experimental_state: a failed reset should
-    # fail the test rather than leak state into the next one.
-    skills._clear_state()
+    # A failed reset should fail the test rather than leak state into the next one.
+    run_shutdown_hooks(raise_errors=True)
     # Mirrors shutdown(): without this a suite that inits more than once leaves
     # every later span on the first test's provider.
     if owned_globals:

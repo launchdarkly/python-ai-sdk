@@ -4,12 +4,15 @@ Reference: TESTING.md §3.9
 """
 
 import os
+import subprocess
+import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
+import launchdarkly_ai_server.shutdown_hooks as shutdown_hooks
 from launchdarkly_ai_server import get_client, init_client, inspect_config, shutdown
 from launchdarkly_ai_server.lifecycle import _reset_for_testing
 from launchdarkly_ai_server.sdk_info import (
@@ -532,18 +535,38 @@ class TestShutdown:
         stub = _make_stub_client()
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=stub)
+        later = MagicMock()
+
+        def failing() -> None:
+            raise RuntimeError("clear failed")
+
         with (
-            patch.object(
-                lifecycle_module.skills,
-                "_clear_state",
-                side_effect=RuntimeError("clear failed"),
-            ),
+            patch.dict(shutdown_hooks._hooks, clear=False),
             caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
         ):
+            shutdown_hooks.register_shutdown_hook("Failing Feature", failing)
+            shutdown_hooks.register_shutdown_hook("Later Feature", later)
             await shutdown()  # must not raise
         stub.close.assert_called_once()
         assert lifecycle_module._client is None
-        assert "Could not clear the Agent Skills state" in caplog.messages
+        assert "Could not clear the Failing Feature state" in caplog.messages
+        later.assert_called_once()  # one failing hook does not skip the rest
+
+    def test_core_does_not_import_experimental_code(self) -> None:
+        """Core never hooks into experimental code (TESTING.md §0.3)."""
+        script = (
+            "import asyncio, sys\n"
+            "import launchdarkly_ai_server\n"
+            "asyncio.run(launchdarkly_ai_server.shutdown())\n"
+            "loaded = sorted(m for m in sys.modules if m.startswith("
+            "('launchdarkly_ai_server.skills', 'launchdarkly_ai_server.evaluations',"
+            " 'launchdarkly_ai_server.experimental')))\n"
+            "print(','.join(loaded))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, check=True
+        )
+        assert result.stdout.strip() == ""
 
     async def test_completes_teardown_even_if_flush_throws(self) -> None:
         stub = _make_stub_client()

@@ -1024,8 +1024,13 @@ class TestStreaming:
         )
         h = create_claude_agents_handler()
         events = await _collect(await h.stream(BASE_CONFIG, "q", {}, {}))
-        assert [e["type"] for e in events] == ["chunk", "done"]
-        assert events[0]["text"] == "Hi"
+        assert [e["type"] for e in events] == [
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "done",
+        ]
+        assert events[1]["delta"] == "Hi"
         assert events[-1]["output"] == "Hi"
 
     async def test_emits_same_span_tree_as_blocking_path(
@@ -1075,7 +1080,7 @@ class TestStreaming:
         gen = await h.stream(BASE_CONFIG, "q", {}, {})
         # Consume only the first chunk, then abandon the generator without exhausting it.
         first = await gen.__anext__()
-        assert first["type"] == "chunk"
+        assert first["type"] == "TEXT_MESSAGE_START"
         await gen.aclose()
 
         assert root().status.status_code == StatusCode.UNSET
@@ -1120,9 +1125,8 @@ class TestStreaming:
         h = create_claude_agents_handler()
         events = [e async for e in await h.stream(BASE_CONFIG, "hi")]
 
-        chunks = [e for e in events if e.get("type") == "chunk"]
-        assert len(chunks) == 2
-        assert chunks[0]["text"] == "hello "
+        deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["hello ", "world"]
 
     async def test_all_chunks_before_done(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1136,8 +1140,13 @@ class TestStreaming:
         events = [e async for e in await h.stream(BASE_CONFIG, "hi")]
 
         done_idx = next(i for i, e in enumerate(events) if e.get("type") == "done")
-        chunk_indices = [i for i, e in enumerate(events) if e.get("type") == "chunk"]
-        assert all(ci < done_idx for ci in chunk_indices)
+        text_indices = [
+            i
+            for i, e in enumerate(events)
+            if e.get("type")
+            in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}
+        ]
+        assert all(ci < done_idx for ci in text_indices)
 
     async def test_yields_exactly_one_done_event(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1229,7 +1238,7 @@ class TestQueryGeneratorLifecycle:
         h = create_claude_agents_handler()
         gen = await h.stream(BASE_CONFIG, "q", {}, {})
         first = await gen.__anext__()
-        assert first["type"] == "chunk"
+        assert first["type"] == "TEXT_MESSAGE_START"
         await gen.aclose()
 
         assert closed["value"] is True
@@ -1953,7 +1962,7 @@ class TestAbandonedToolSpansAreNotErrors:
         monkeypatch.setattr(handler_mod, "query", _query_that_opens_a_tool)
         h = create_claude_agents_handler()
         gen = await h.stream(config, "q", {"webSearch": stub}, {})
-        assert (await gen.__anext__())["type"] == "chunk"
+        assert (await gen.__anext__())["type"] == "TOOL_CALL_START"
         await gen.aclose()
 
         tools = [s for s in spans() if s.name.startswith("execute_tool ")]
@@ -2254,3 +2263,93 @@ class TestToolSpanSurvivesAContentFailure:
 
         tool = named("execute_tool ")[0]
         assert tool.end_time is not None
+
+
+async def test_a_builtin_tool_result_is_not_marked_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = StreamEvent(
+        uuid="u1",
+        session_id="sess-1",
+        event={
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu-1", "name": "Read"},
+        },
+    )
+    args = StreamEvent(
+        uuid="u2",
+        session_id="sess-1",
+        event={
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"file":"a"}'},
+        },
+    )
+    stopped = StreamEvent(
+        uuid="u3",
+        session_id="sess-1",
+        event={"type": "content_block_stop", "index": 0},
+    )
+    monkeypatch.setattr(
+        handler_mod,
+        "query",
+        _fake_query(
+            [
+                started,
+                args,
+                stopped,
+                tool_result_user_message("tu-1", "file body"),
+                result_message("done"),
+            ]
+        ),
+    )
+
+    async def _events(capture: bool) -> list[dict[str, Any]]:
+        handler = create_claude_agents_handler(capture_content=capture)
+        return [event async for event in await handler.stream(BASE_CONFIG, "q", {}, {})]
+
+    shown = await _events(True)
+    types = [event["type"] for event in shown if str(event["type"]).startswith("TOOL_")]
+    assert types == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+    ]
+    assert shown[0]["toolCallName"] == "Read" or any(
+        event.get("toolCallName") == "Read" for event in shown
+    )
+    result = next(event for event in shown if event["type"] == "TOOL_CALL_RESULT")
+    assert result["content"] == "file body"
+    assert "metadata" not in result
+
+    hidden = await _events(False)
+    assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+    hidden_result = next(
+        event for event in hidden if event["type"] == "TOOL_CALL_RESULT"
+    )
+    assert hidden_result["content"] == ""
+
+
+def test_a_streamed_mcp_tool_uses_the_config_name() -> None:
+    from launchdarkly_ai_claude_agents.handler import _map_claude_stream_event
+    from launchdarkly_ai_server.agui import TurnEmitter
+
+    emitter = TurnEmitter(capture_content=True)
+    events = _map_claude_stream_event(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "tu-1",
+                "name": "mcp__tool-mcp__search",
+            },
+        },
+        emitter,
+        {},
+        set(),
+    )
+    assert events[0]["toolCallName"] == "search"
+    assert events[0]["toolCallId"] == "tu-1"

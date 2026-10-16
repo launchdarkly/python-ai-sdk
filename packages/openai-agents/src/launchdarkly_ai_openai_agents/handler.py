@@ -45,7 +45,9 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.responses import map_responses_event
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -250,10 +252,16 @@ class _SpanningHooks(_RunHooksBase):
         self.run_usage = run_usage
         self.open_model_span: Any = None
         self.open_tool_spans: dict[str, Any] = {}
+        self.emitter = TurnEmitter(capture_content=capture_content)
+        self.pending: list[dict[str, Any]] = []
+        self.item_to_call: dict[str, str] = {}
 
     async def on_llm_start(
         self, context: Any, agent: Any, system_prompt: str | None, input_items: Any
     ) -> None:
+        # Text is closed from response.created, in the order the consumer
+        # reads raw events. Closing here runs ahead of unread deltas and
+        # splits one turn across two messages.
         span = start_model_span(self.config, self.parent)
         self.open_model_span = span
         if self.capture_content:
@@ -320,6 +328,16 @@ class _SpanningHooks(_RunHooksBase):
         # abandon_open_spans both walk this dict, so a span missing from it never ends and never
         # exports.
         self.open_tool_spans[str(call_id)] = span
+        self.pending.extend(self.emitter.tool_start(str(call_id), str(name)))
+        # The Runner can invoke this hook from its background task while
+        # argument deltas are still unread. Closing now would drop the rest
+        # and skip the full argument string, because a prefix is already
+        # recorded. arguments.done closes a call that is still streaming.
+        if not self.emitter.has_argument_deltas(str(call_id)):
+            tool_args = getattr(context, "tool_arguments", None)
+            self.pending.extend(
+                self.emitter.tool_end(str(call_id), arguments=tool_args)
+            )
         if self.capture_content:
             # `tool_arguments` is the raw JSON args string the model produced. Parsed here rather
             # than passed through, per TELEMETRY-CONTRACT.md section 12: arguments hold the object
@@ -336,7 +354,19 @@ class _SpanningHooks(_RunHooksBase):
     async def on_tool_end(
         self, context: Any, agent: Any, tool: Any, result: Any
     ) -> None:
-        span = self.open_tool_spans.pop(self._tool_span_key(context, tool), None)
+        call_id = self._tool_span_key(context, tool)
+        # The hook can run before unread argument deltas. Close with the full
+        # argument string first, so tool_result does not seal a prefix.
+        # Text stays open: this runs before unread text deltas, and closing
+        # here would start a second message for the rest of the turn.
+        self.pending.extend(
+            self.emitter.tool_end(
+                str(call_id),
+                arguments=getattr(context, "tool_arguments", None),
+            )
+        )
+        self.pending.extend(self.emitter.tool_result(str(call_id), str(result)))
+        span = self.open_tool_spans.pop(call_id, None)
         if span is None:
             return
         # Once popped, ending it is this method's job alone: nothing else knows the span exists. A
@@ -381,6 +411,26 @@ class _SpanningHooks(_RunHooksBase):
                 self.open_model_span, ended, abandoned=True, cancelled=cancelled
             )
             self.open_model_span = None
+
+
+def _take_finished_tools(hooks: _SpanningHooks) -> list[dict[str, Any]]:
+    """Return tool events recorded by the hook, text closed before each result.
+
+    The hook runs before unread deltas from the same model call. The caller
+    applies those deltas first. Tool results then follow ``TEXT_MESSAGE_END``
+    so the client does not attach them to the next message.
+    """
+    if not hooks.pending:
+        return []
+    earlier: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    for event in hooks.pending:
+        if event.get("type") == "TOOL_CALL_RESULT":
+            results.append(event)
+        else:
+            earlier.append(event)
+    hooks.pending.clear()
+    return [*earlier, *hooks.emitter.end_text(), *results]
 
 
 def _write_failed_run_usage(
@@ -654,16 +704,28 @@ async def _stream_gen(
         full_output = ""
 
         async for event in streamed.stream_events():
-            if event.type == "raw_response_event":
-                raw = getattr(event, "data", None)
-                if (
-                    raw is not None
-                    and getattr(raw, "type", None) == "response.output_text.delta"
-                ):
-                    delta = getattr(raw, "delta", "")
-                    if isinstance(delta, str) and delta:
-                        yield {"type": "chunk", "text": delta}
-                        full_output += delta
+            raw = (
+                getattr(event, "data", None)
+                if event.type == "raw_response_event"
+                else None
+            )
+            # The next model call is queued only after this turn's tools have
+            # run. Unread deltas from this turn are still ahead of that event,
+            # so the tool result waits until they have been applied.
+            if getattr(raw, "type", None) == "response.created":
+                for rich in _take_finished_tools(hooks):
+                    yield rich
+            if raw is not None:
+                for rich in map_responses_event(raw, hooks.emitter, hooks.item_to_call):
+                    if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                        full_output += rich.get("delta") or ""
+                    yield rich
+        for rich in _take_finished_tools(hooks):
+            yield rich
+        for rich in hooks.emitter.end_text():
+            yield rich
+        for rich in hooks.emitter.fail_open():
+            yield rich
 
         stream_completed = True
         final_output = streamed.final_output
@@ -697,6 +759,12 @@ async def _stream_gen(
         hooks.close_open_spans(exc)
         _write_failed_run_usage(span, config, exc, run_usage)
         fail_span(span, exc, ended)
+        for rich in _take_finished_tools(hooks):
+            yield rich
+        for rich in hooks.emitter.end_text():
+            yield rich
+        for rich in hooks.emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths: both already ended their spans through

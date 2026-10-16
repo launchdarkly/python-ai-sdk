@@ -686,8 +686,13 @@ three signals are emitted by the `record_*` functions there; nothing else calls 
 the allowlist is enforced in one place.
 
 **Injection goes through `skills.py`.** `_set_store`, `_set_emitter_for_testing` and
-`_clear_state` delegate to `skills_core`. `set_skill_store`, `shutdown` and tests use
-those; none should reach into `skills_core` directly.
+`_clear_state` delegate to `skills_core`. `set_skill_store` and tests use those; none
+should reach into `skills_core` directly.
+
+**Core never imports this feature.** `skills_core` registers `clear_state` with
+`shutdown_hooks.register_shutdown_hook` when it loads, and `shutdown()` runs the registered
+hooks. `lifecycle.py` imports no skills module (TESTING.md §0.3, pinned by
+`test_core_does_not_import_experimental_code`).
 
 ### Descriptor-pinned filesystem access
 

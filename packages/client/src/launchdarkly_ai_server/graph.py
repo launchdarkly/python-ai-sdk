@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
+from .agui import StableProjector
 from .conversation import bind_conversation_id, bind_span_context
 from .registry import resolve_handlers, resolve_tools
 from .types import (
@@ -27,12 +28,23 @@ from .types import (
     UsageDict,
     VariationMeta,
 )
-from .utils import end_span_once, model_stamps_from_meta, select_handler, to_ld_context
+from .utils import (
+    end_span_once,
+    model_stamps_from_meta,
+    select_handler,
+    set_ld_span_attributes,
+    to_ld_context,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_TRAVERSAL_DEPTH = 100
 MAX_GRAPH_CACHE_SIZE = 512
+
+# graph() caches a built graph per context, track data included. Each run passes its own copy
+# with a fresh runId through route/stream_route opts under this key, so the handoff events
+# emitted inside the cached build carry the run's id instead of the build's.
+_RUN_TRACK_DATA = "_run_track_data"
 
 
 def _sanitize_name(key: str) -> str:
@@ -109,7 +121,7 @@ async def _build_graph(
 ) -> tuple[GraphDefinition, TrackData, Callable[..., Any]]:
     from .judges import run_judges
     from .lifecycle import extract_variation, get_client
-    from .tracking import execute_and_track
+    from .tracking import _try_get_environment_id, execute_and_track
 
     result = await _fetch_graph_variation(key, context)
     # Convert once so all inner track() calls use an ldclient.Context object.
@@ -128,6 +140,9 @@ async def _build_graph(
         **model_stamps_from_meta(meta),
         "graphKey": key,
     }
+    _environment_id = _try_get_environment_id()
+    if _environment_id:
+        graph_track_data["environmentId"] = _environment_id
 
     if not enabled or not topology:
         return (
@@ -259,7 +274,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -277,7 +292,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -435,7 +450,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": next_node.key,
                     },
@@ -455,7 +470,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": chosen_key,
                     },
@@ -509,6 +524,7 @@ async def _build_graph(
                 "graphKey": key,
             }
 
+            projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
                 config=node.config,
@@ -521,17 +537,17 @@ async def _build_graph(
                 graph_key=key,
                 history=opts.get("history"),
             ):
-                if event.get("type") == "chunk":
+                for stable in projector.feed(event):
                     yield {
                         "type": "chunk",
-                        "text": event["text"],
+                        "text": stable["text"],
                         "nodeKey": node.key,
                     }
-                else:
-                    response = event.get("response", "")
-                    usage = event.get("usage") or usage
-                    track_data = event.get("track_data") or track_data
-                    trajectory = event.get("trajectory") or trajectory
+            if projector.done:
+                response = projector.done.get("response", "")
+                usage = projector.done.get("usage") or usage
+                track_data = projector.done.get("track_data") or track_data
+                trajectory = projector.done.get("trajectory") or trajectory
 
             judge_results = await run_judges(
                 config=node.config,
@@ -551,7 +567,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -580,7 +596,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -648,6 +664,7 @@ async def _build_graph(
 
             merged_tool_handlers = {**(tool_handlers or {}), **handoff_handlers}
 
+            projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
                 config=routed_config,
@@ -660,17 +677,17 @@ async def _build_graph(
                 graph_key=key,
                 history=opts.get("history"),
             ):
-                if event.get("type") == "chunk":
+                for stable in projector.feed(event):
                     yield {
                         "type": "chunk",
-                        "text": event["text"],
+                        "text": stable["text"],
                         "nodeKey": node.key,
                     }
-                else:
-                    response = event.get("response", "")
-                    usage = event.get("usage") or usage
-                    track_data = event.get("track_data") or track_data
-                    trajectory = event.get("trajectory") or trajectory
+            if projector.done:
+                response = projector.done.get("response", "")
+                usage = projector.done.get("usage") or usage
+                track_data = projector.done.get("track_data") or track_data
+                trajectory = projector.done.get("trajectory") or trajectory
 
             # Judge against the node's original config, not the routing-augmented one.
             judge_results = await run_judges(
@@ -694,7 +711,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": next_node.key,
                     },
@@ -725,7 +742,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": chosen_key,
                     },
@@ -923,14 +940,18 @@ class GraphInstance:
                     # Evict an arbitrary entry to keep the cache bounded.
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[cache_key] = built
-        graph_def, graph_track_data, _ = built
+        graph_def, built_track_data, _ = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
 
+        graph_track_data: TrackData = {**built_track_data, "runId": str(uuid.uuid4())}
+
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
-            span.set_attribute("launchdarkly.graph.key", self._key)
+            set_ld_span_attributes(
+                span, {"__ld": graph_track_data, "ldContext": context}
+            )
 
             start_time = time.monotonic()
             total_usage = {"input": 0, "output": 0, "total": 0}
@@ -960,7 +981,10 @@ class GraphInstance:
                         1,
                     )
                     entered += 1
-                    opts: dict[str, Any] = {"variables": variables}
+                    opts: dict[str, Any] = {
+                        "variables": variables,
+                        _RUN_TRACK_DATA: graph_track_data,
+                    }
                     if previous_node:
                         opts["from"] = previous_node
                     # History seeds the entry point only. After the root hop, nodes
@@ -1153,14 +1177,16 @@ class GraphInstance:
                 if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[cache_key] = built
-        graph_def, graph_track_data, stream_route = built
+        graph_def, built_track_data, stream_route = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
 
+        graph_track_data: TrackData = {**built_track_data, "runId": str(uuid.uuid4())}
+
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
-        span.set_attribute("launchdarkly.graph.key", self._key)
+        set_ld_span_attributes(span, {"__ld": graph_track_data, "ldContext": context})
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()
@@ -1191,7 +1217,10 @@ class GraphInstance:
                     1,
                 )
                 entered += 1
-                route_opts: dict[str, Any] = {"variables": variables}
+                route_opts: dict[str, Any] = {
+                    "variables": variables,
+                    _RUN_TRACK_DATA: graph_track_data,
+                }
                 if previous_node:
                     route_opts["from"] = previous_node
                 # History seeds the entry point only. After the root hop, nodes
