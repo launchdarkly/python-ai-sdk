@@ -6,6 +6,7 @@ provider HTTP calls. A multi-tenant process binds a different id per request.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
 from contextlib import aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -25,9 +26,17 @@ else:
     _SpanProcessorBase = object
 
 GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
+LD_EVALUATION_RUN_ID = "launchdarkly.evaluation_run.id"
+LD_EVALUATION_RUN_ROW_INDEX = "launchdarkly.evaluation_run.row_index"
+
+# Same namespace ai-evaluator uses for conversationId on a result row.
+# Changing it re-keys every offline evaluation conversation.
+_EVALUATION_CONVERSATION_NAMESPACE = uuid.UUID("6f0c2a4e-3b6d-4d0e-9c1a-2e6b7f8a9d01")
 
 _CONV_KEY = otel_context.create_key("launchdarkly.gen_ai.conversation.id")
 _EVAL_KEY = otel_context.create_key("launchdarkly.judge.evaluation")
+_EVAL_ROW_KEY = otel_context.create_key("launchdarkly.evaluation_run.row")
+_OBSERVER_KEY = otel_context.create_key("launchdarkly.evaluation_run.observer")
 
 
 @dataclass
@@ -79,6 +88,95 @@ def _conversation_id_from(ctx: otel_context.Context | None) -> str | None:
         return None
     value = otel_context.get_value(_CONV_KEY, ctx)
     return value if isinstance(value, str) and value else None
+
+
+def conversation_id_for_evaluation_row(run_id: str, row_index: int | None) -> str:
+    """UUID5 of ``{run_id}:{row_index}`` in the ai-evaluator namespace.
+
+    Row index ``0`` is the suffix ``:0``. A missing index is row 0, matching
+    the workers that persist a missing index that way.
+    """
+    index = 0 if row_index is None else int(row_index)
+    return str(uuid.uuid5(_EVALUATION_CONVERSATION_NAMESPACE, f"{run_id}:{index}"))
+
+
+def _evaluation_row_attributes(
+    run_id: str, row_index: int | None
+) -> dict[str, str | int]:
+    index = 0 if row_index is None else int(row_index)
+    return {
+        LD_EVALUATION_RUN_ID: str(run_id),
+        LD_EVALUATION_RUN_ROW_INDEX: index,
+    }
+
+
+def _evaluation_row_from(ctx: otel_context.Context | None) -> dict[str, Any] | None:
+    value = otel_context.get_value(_EVAL_ROW_KEY, ctx) if ctx is not None else None
+    if value is None:
+        value = otel_context.get_value(_EVAL_ROW_KEY)
+    if not isinstance(value, dict) or not value:
+        return None
+    return value
+
+
+@contextmanager
+def bind_evaluation_row(run_id: str, row_index: int | None) -> Iterator[None]:
+    """Bind one offline-evaluation row onto SDK spans started in this block.
+
+    Sets ``gen_ai.conversation.id`` to :func:`conversation_id_for_evaluation_row`
+    and ``launchdarkly.evaluation_run.id`` / ``.row_index``. Does not set
+    ``launchdarkly.run.id``; that key is the AI Config tracking id.
+
+    An outer :func:`conversation_id` is shadowed until the block exits. The
+    evaluation row id is the join key for this row.
+    """
+    index = 0 if row_index is None else int(row_index)
+    ctx = otel_context.set_value(
+        _CONV_KEY, conversation_id_for_evaluation_row(run_id, index)
+    )
+    ctx = otel_context.set_value(
+        _EVAL_ROW_KEY, _evaluation_row_attributes(run_id, index), ctx
+    )
+    token = otel_context.attach(ctx)
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+@dataclass
+class HandlerSpanObserver:
+    """Counts SDK spans started while :func:`observe_handler_spans` is bound."""
+
+    count: int = 0
+
+
+@contextmanager
+def observe_handler_spans() -> Iterator[HandlerSpanObserver]:
+    """Count the SDK spans a handler opens inside this block.
+
+    The offline runner describes a plain-function handler's call itself, and
+    must not when a provider handler already traced it. Counting relies on
+    :class:`ConversationIdSpanProcessor`, which ``init_client`` registers.
+    """
+    observer = HandlerSpanObserver()
+    token = otel_context.attach(otel_context.set_value(_OBSERVER_KEY, observer))
+    try:
+        yield observer
+    finally:
+        otel_context.detach(token)
+
+
+def record_evaluation_result(
+    span: Any, name: str, score: float, explanation: str | None = None
+) -> None:
+    """Write ``gen_ai.evaluation.result`` with no verdict and no score label.
+
+    ``explanation`` is the criterion reason. Offline evaluation always records
+    it when the reason is non-empty: that text already travels on the criterion
+    event. This does not add a prompt, a completion, or a tool payload.
+    """
+    _record_evaluation(span, name, score, explanation)
 
 
 def _record_evaluation(
@@ -256,7 +354,7 @@ async def with_judge_evaluation(name: str) -> AsyncIterator[RecordEvaluation]:
 
 
 class ConversationIdSpanProcessor(_SpanProcessorBase):
-    """Stamps ``gen_ai.conversation.id`` write-if-absent; delays judge ``invoke_agent`` end.
+    """Stamps conversation and evaluation-row attributes; delays judge ``invoke_agent`` end.
 
     Structurally a ``SpanProcessor``; the base is only real to a type checker so that an
     api-only install (no ``[otel]`` extra) still imports this module.
@@ -274,6 +372,20 @@ class ConversationIdSpanProcessor(_SpanProcessorBase):
         )
         if conv and _is_launchdarkly_span(span):
             set_conversation_id_if_absent(span, conv)
+
+        observer = otel_context.get_value(_OBSERVER_KEY, ctx)
+        if isinstance(observer, HandlerSpanObserver) and _is_launchdarkly_span(span):
+            observer.count += 1
+
+        row = _evaluation_row_from(ctx)
+        if row and _is_launchdarkly_span(span):
+            for key, value in row.items():
+                if not isinstance(key, str) or _read_attribute(span, key) is not None:
+                    continue
+                if isinstance(value, str):
+                    span.set_attribute(key, value)
+                elif isinstance(value, int) and not isinstance(value, bool):
+                    span.set_attribute(key, value)
 
         capture = otel_context.get_value(_EVAL_KEY, ctx)
         if capture is None:

@@ -354,6 +354,27 @@ def _release_otel_globals() -> None:
         logger.debug("Could not release the global OTel tracer provider", exc_info=True)
 
 
+def _flush_tracer_provider() -> None:
+    """Export spans sitting on the provider ``init_client`` already registered.
+
+    Does not build an exporter, replace the endpoint, or invent a project id.
+    The resource attribute ``highlight.project_id`` stays the SDK key that
+    ``_setup_telemetry`` stamped. A provider without ``force_flush`` — the API
+    proxy, when the SDK extra is absent — is a no-op.
+    """
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return
+    flush = getattr(trace.get_tracer_provider(), "force_flush", None)
+    if flush is None:
+        return
+    try:
+        flush()
+    except Exception:
+        logger.debug("Could not flush OpenTelemetry spans", exc_info=True)
+
+
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
