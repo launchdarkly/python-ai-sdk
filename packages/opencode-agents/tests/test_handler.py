@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -919,10 +920,14 @@ class TestInvocation:
         assert calls == ["q"]
 
         calls.clear()
-        await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
-        assert calls[0] == "q"
-        assert len(calls) == 2
-        assert calls[1] != "q"
+        judged_run = [
+            event
+            async for event in config(key="flag", handler=handler).stream("q", CONTEXT)
+        ]
+        assert calls == ["q"]
+        assert judged_run[-1]["type"] == "done"
+        assert judged_run[-1]["response"] == "Hi"
+        assert not judged_run[-1].get("judge_results")
 
     async def test_the_wrapper_forwards_variables_history_and_session(
         self, mock_ld_client: MagicMock
@@ -1027,6 +1032,109 @@ class TestInvocation:
         assert tracer.spans[0].name == "invoke_agent"
         assert tracer.spans[0].attributes["gen_ai.operation.name"] == "invoke_agent"
         assert tracer.spans[0].attributes["launchdarkly.operation.type"] == "gen_ai"
+
+    async def test_block_array_history_reaches_the_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from launchdarkly_ai_opencode_agents import spans as span_module
+
+        class _Span:
+            def __init__(self, name: str, context: Any = None) -> None:
+                self.name = name
+                self.context = context
+                self.attributes: dict[str, Any] = {}
+                self.events: list[str] = []
+
+            def set_attribute(self, key: str, value: Any) -> None:
+                self.attributes[key] = value
+
+            def add_event(
+                self, name: str, attributes: dict[str, Any] | None = None
+            ) -> None:
+                self.events.append(name)
+
+            def set_status(self, code: Any, description: str | None = None) -> None:
+                return None
+
+            def record_exception(self, exc: BaseException) -> None:
+                return None
+
+            def end(self) -> None:
+                return None
+
+        class _Tracer:
+            def __init__(self) -> None:
+                self.spans: list[_Span] = []
+
+            def get_tracer(self, name: str) -> _Tracer:
+                return self
+
+            def start_span(self, name: str, context: Any = None) -> _Span:
+                span = _Span(name, context)
+                self.spans.append(span)
+                return span
+
+            def set_span_in_context(self, span: _Span) -> Any:
+                return span
+
+        tracer = _Tracer()
+        monkeypatch.setattr(span_module, "trace", tracer)
+        handler = create_opencode_handler(
+            capture_content=True,
+            session_id="ses",
+            events=source(
+                [
+                    assistant_open("m1"),
+                    text_delta("m1", "p1", "Hi"),
+                    assistant_completed("m1"),
+                ]
+            ),
+        )
+        history = [
+            {"role": "system", "content": "do not record"},
+            {"role": "user", "content": "earlier"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see "},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.test/a.png",
+                        },
+                    },
+                    {"type": "text", "text": "this"},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "noted"}],
+            },
+        ]
+        seen = [
+            event async for event in await handler.stream({}, "", None, None, history)
+        ]
+        assert seen[-1]["output"] == "Hi"
+        recorded = json.loads(tracer.spans[0].attributes["gen_ai.input.messages"])
+        assert recorded == [
+            {
+                "role": "user",
+                "parts": [{"type": "text", "content": "earlier"}],
+            },
+            {
+                "role": "user",
+                "parts": [{"type": "text", "content": "see this"}],
+            },
+            {
+                "role": "assistant",
+                "parts": [{"type": "text", "content": "noted"}],
+            },
+        ]
+        assert (
+            "do not record" not in tracer.spans[0].attributes["gen_ai.input.messages"]
+        )
+        assert "gen_ai.prompt.3.role" not in tracer.spans[0].attributes
 
 
 async def _drain(stream: Any) -> None:
