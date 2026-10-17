@@ -11,11 +11,14 @@ halves of that contract so the paths cannot drift.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from math import isfinite
 from typing import Any
 
 from .utils import parse_json_with_possible_fences
+
+logger = logging.getLogger(__name__)
 
 FORMATTING_INSTRUCTIONS = "\n".join(
     [
@@ -85,3 +88,25 @@ def parse_judge_response(raw: Any) -> tuple[Any, str]:
         raise ValueError("Invalid JSON from judge")
     reasoning = parsed.get("reasoning") or parsed.get("reason") or ""
     return parsed.get("score"), str(reasoning)
+
+
+def without_output_format(config: Any, judge_key: str) -> Any:
+    """Return a judge config with its ``outputFormat`` removed.
+
+    A judge is an ordinary AI Config, so it can carry an ``outputFormat`` JSON
+    Schema. The verdict shape belongs to this module, not to the judge's
+    author, and every provider handler that honors ``outputFormat`` would
+    constrain the judge model to the author's schema instead, so the verdict
+    could never parse. Every judge path strips the field before a config
+    reaches a handler or a :class:`JudgeTask`, and says so once per judge.
+
+    Returns ``config`` itself when the key is absent. Never mutates it: it
+    came from ``extract_variation`` and may be cached.
+    """
+    if not isinstance(config, Mapping) or "outputFormat" not in config:
+        return config
+    logger.warning(
+        "Judge '%s': ignoring outputFormat - a judge must return {score, reasoning}.",
+        judge_key,
+    )
+    return {k: v for k, v in config.items() if k != "outputFormat"}
