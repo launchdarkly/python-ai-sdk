@@ -1,4 +1,11 @@
-.PHONY: start test typecheck lint format format-check lint-fix build clean
+.PHONY: start test typecheck lint format format-check lint-fix build clean audit
+
+# Report known vulnerabilities in the locked dependency set (pip-audit on uv.lock)
+# Exports to a file, not a pipe: make's /bin/sh has no pipefail, so a failed export would audit nothing and pass
+audit:
+	reqs=$$(mktemp) && trap 'rm -f "$$reqs"' EXIT && \
+	uv export --all-packages --no-emit-workspace --frozen -q -o "$$reqs" && \
+	uvx pip-audit@2.9.0 --disable-pip --no-deps -r "$$reqs"
 
 # Run main.py (uv run python main.py)
 start:

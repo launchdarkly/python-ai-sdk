@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: 'uv'
+    # uv workspace root: one uv.lock covers every packages/* member.
+    directory: '/'
+    schedule:
+      interval: 'daily'
+    cooldown:
+      default-days: 7
+  - package-ecosystem: 'github-actions'
+    # '/' covers .github/workflows only; the composite actions pin their own actions.
+    directories:
+      - '/'
+      - '/.github/actions/*'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      default-days: 7
