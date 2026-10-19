@@ -38,6 +38,6 @@ Assistant text is emitted only after `message.updated` marks that message `role 
 
 The AI Config, user input, variables, and history are arguments to `events`. A callable that ignores them never sees the prompt.
 
-`provides_for` is `('*', 'agent')`, so judge selection still lands here. The handler does not run that prompt. A judge evaluation raises without calling `events`, and the judge does not score.
+`provides_for` is `('*', 'agent')`, so judge selection still lands here. Pass `skip_judges=True`. The handler does not run that prompt. A judge evaluation raises without calling `events`, so the judge is tracked as a failed generation. Do not pass this handler to `run_judge`, which would raise.
 
 `session_id` is required. The reducer does not adopt the first session on a shared stream. Other sessions are dropped, including their `session.error`. `session.idle` for this session ends the run. If the iterable is a server-wide stream and you neither send `session.idle` nor close it, `done` never arrives.

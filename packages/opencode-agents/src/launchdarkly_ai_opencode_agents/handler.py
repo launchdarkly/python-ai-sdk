@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
 from typing import Any
 
+from opentelemetry import context as otel_context
+
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
@@ -27,6 +29,7 @@ from launchdarkly_ai_server import (
     text_message,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.conversation import _EVAL_KEY
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.sdk_usage import report_usage
 from launchdarkly_ai_server.utils import number_or_zero
@@ -469,10 +472,6 @@ def _is_judge_evaluation() -> bool:
     here. The judge prompt is not this OpenCode session. Calling *events* for
     it would answer the judge with that session.
     """
-    from opentelemetry import context as otel_context
-
-    from launchdarkly_ai_server.conversation import _EVAL_KEY
-
     return otel_context.get_value(_EVAL_KEY) is not None
 
 
@@ -537,11 +536,11 @@ def create_opencode_handler(
     construct an OpenCode SDK client.
 
     The stream yields the AG-UI text and tool subset and one ``done``.
-    ``config().stream()`` still yields ``chunk`` then ``done``. Judge
-    selection still lands here, because ``provides_for`` is ``('*', 'agent')``.
-    The handler does not run that prompt: the call raises without calling
-    *events*, and the judge does not score. Pass ``skip_judges=True`` to
-    ``config()`` to skip that attempt before it is selected.
+    ``config().stream()`` still yields ``chunk`` then ``done``. Pass
+    ``skip_judges=True`` to ``config()``. Judge selection lands here, because
+    ``provides_for`` is ``('*', 'agent')``, and the handler does not run the
+    judge prompt: the call raises without calling *events*, so the judge is
+    tracked as a failed generation. Do not pass this handler to ``run_judge``.
     *capture_content* follows the other handlers.
     """
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
@@ -562,8 +561,9 @@ def opencode_agents(
 
     *events* is required and is the same callable :func:`create_opencode_handler`
     takes. *variables*, *history*, *session_id*, and *capture_content* configure
-    that call. A judged config does not call *events* again: a judge
-    evaluation raises, and the judge does not score.
+    that call. Pass ``skip_judges=True``. A judge evaluation raises without
+    calling *events* again, so a judged config tracks the judge as a failed
+    generation.
     """
     report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)

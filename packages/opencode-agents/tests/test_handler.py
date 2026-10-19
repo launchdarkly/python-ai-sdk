@@ -150,6 +150,15 @@ def mock_ld_client() -> Iterator[MagicMock]:
     lifecycle_module._reset_for_testing()
 
 
+def judge_errors(client: MagicMock) -> int:
+    return sum(
+        1
+        for call in client.track.call_args_list
+        if call.args[0] == "$ld:ai:generation:error"
+        and call.args[2].get("configKey") == "judge-flag"
+    )
+
+
 class TestSurface:
     def test_provides_for_is_any_provider_in_agent_mode(self) -> None:
         handler = create_opencode_handler(events=source([]), session_id="ses")
@@ -918,6 +927,7 @@ class TestInvocation:
         ]
         assert [event["type"] for event in skipped] == ["chunk", "done"]
         assert calls == ["q"]
+        assert not judge_errors(mock_ld_client)
 
         calls.clear()
         judged_run = [
@@ -928,6 +938,9 @@ class TestInvocation:
         assert judged_run[-1]["type"] == "done"
         assert judged_run[-1]["response"] == "Hi"
         assert not judged_run[-1].get("judge_results")
+        # Without skip_judges the raise is the safety net: the judge is
+        # tracked as a failed generation instead of scoring this session.
+        assert judge_errors(mock_ld_client) == 1
 
     async def test_the_wrapper_forwards_variables_history_and_session(
         self, mock_ld_client: MagicMock
