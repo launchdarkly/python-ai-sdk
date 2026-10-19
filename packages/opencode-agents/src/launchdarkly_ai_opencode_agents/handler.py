@@ -1,16 +1,16 @@
 """Reduce OpenCode session events into handler stream events.
 
-The session is a caller-supplied async iterable of OpenCode bus events. This
-module does not start a process and does not construct an OpenCode SDK client.
-The handler yields the AG-UI text and tool subset, then one ``done``.
-``config().stream()`` still yields ``chunk`` then ``done``.
+Each call opens its own session on a running ``opencode serve``. This module
+does not start that process. The handler yields the AG-UI text and tool subset,
+then one ``done``. ``config().stream()`` still yields ``chunk`` then ``done``.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
+import httpx
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
@@ -19,6 +19,8 @@ from launchdarkly_ai_server import (
     _config,
     _create_handler,
     add_cached_tokens_to_input,
+    compose_history,
+    content_to_text,
     end_span_once,
     set_input_content_attributes,
     set_output_content_attributes,
@@ -30,18 +32,8 @@ from launchdarkly_ai_server.sdk_usage import report_usage
 from launchdarkly_ai_server.utils import number_or_zero
 
 from ._version import PACKAGE_NAME, __version__
+from .server import ModelResolver, default_model, session_events
 from .spans import fail_span, finish_root_span, mark_ok, start_root_span
-
-Events = Callable[
-    [
-        AiConfigRep,
-        str | None,
-        dict[str, Any] | None,
-        list[dict[str, Any]] | None,
-        str | None,
-    ],
-    AsyncIterable[Mapping[str, Any]],
-]
 
 
 class OpenCodeSessionError(Exception):
@@ -464,60 +456,54 @@ def _input_messages(
     user_input: str | None,
     history: list[dict[str, Any]] | None,
 ) -> list[SpanMessage]:
+    """History and *user_input* as span messages.
+
+    Block-array history is flattened the same way as the other handlers.
+    System turns stay off this list. An empty *user_input* adds nothing.
+    """
+    items = [item for item in (history or []) if isinstance(item, dict)]
     messages: list[SpanMessage] = []
-    for item in history or []:
-        if not isinstance(item, dict):
-            continue
+    for item in compose_history(history=items, user_input=user_input):
         role = item.get("role")
         content = item.get("content")
-        if isinstance(role, str) and role and isinstance(content, str):
+        if not isinstance(role, str) or not role:
+            continue
+        if isinstance(content, str):
             messages.append(text_message(role, content))
-    if isinstance(user_input, str):
-        messages.append(text_message("user", user_input))
+            continue
+        if isinstance(content, list):
+            text = content_to_text(
+                [block for block in content if isinstance(block, dict)]
+            )
+            if text:
+                messages.append(text_message(role, text))
     return messages
-
-
-def _open_events(
-    events: Events,
-    config: AiConfigRep,
-    user_input: str | None,
-    variables: dict[str, Any] | None,
-    history: list[dict[str, Any]] | None,
-    session_id: str | None,
-) -> AsyncIterable[Mapping[str, Any]]:
-    produced = events(config, user_input, variables, history, session_id)
-    if not hasattr(produced, "__aiter__"):
-        raise TypeError("OpenCode event source must return an async iterable.")
-    return produced
 
 
 def create_opencode_handler(
     *,
-    events: Events,
-    session_id: str,
+    base_url: str,
     capture_content: bool | None = None,
+    model: ModelResolver | None = None,
+    agent: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> ProviderHandler:
-    """Return a handler that runs an OpenCode session supplied by *events*.
+    """Return a handler that opens one OpenCode session per call.
 
-    ``provides_for`` is ``('*', 'agent')``, so the handler matches an agent-mode
-    variation for any provider. *events* is called on every invocation as
-    ``events(config, user_input, variables, history, session_id)`` and must
-    return a fresh async iterable of that session's bus events. *session_id*
-    is required. The reducer ignores every other session and does not adopt
-    the first one it sees. This function does not start OpenCode and does not
-    construct an OpenCode SDK client.
-
-    The stream yields the AG-UI text and tool subset and one ``done``.
-    ``config().stream()`` still yields ``chunk`` then ``done``. Pass
-    ``skip_judges=True`` to ``config()``: a judge would otherwise be routed
-    here and *events* would run again on the judge prompt. *capture_content*
-    follows the other handlers.
+    ``provides_for`` is ``('*', 'agent')``. *base_url* is a running
+    ``opencode serve``. A judge routed here gets its own session. A Vega-local
+    handler was rejected: the session boundary belongs to this package.
+    *model* overrides provider and model selection. *client* is for tests.
     """
+    if not isinstance(base_url, str) or not base_url:
+        raise TypeError("The OpenCode handler requires a base_url.")
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
     return _create_opencode_handler(
-        events=events,
-        session_id=_require_session_id(session_id),
+        base_url=base_url,
         capture_content=capture_content,
+        model=model or default_model,
+        agent=agent,
+        client=client,
     )
 
 
@@ -527,44 +513,41 @@ def opencode_agents(
     context: dict[str, Any],
     **kwargs: Any,
 ) -> Any:
-    """Convenience wrapper: creates a handler and calls ``config(...).invoke()``.
-
-    *events* is required and is the same callable :func:`create_opencode_handler`
-    takes. *variables*, *history*, *session_id*, and *capture_content* configure
-    that call. Pass ``skip_judges=True`` so a judged config does not run
-    *events* again.
-    """
+    """Convenience wrapper: creates a handler and calls ``config(...).invoke()``."""
     report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     history = kwargs.pop("history", None)
     capture_content = kwargs.pop("capture_content", None)
-    session_id = _require_session_id(kwargs.pop("session_id", None))
-    events = kwargs.pop("events")
+    base_url = kwargs.pop("base_url")
+    model = kwargs.pop("model", None)
+    agent = kwargs.pop("agent", None)
+    client = kwargs.pop("client", None)
     return _config(
         key=config_key,
         handler=_create_opencode_handler(
-            events=events,
-            session_id=session_id,
+            base_url=base_url,
             capture_content=capture_content,
+            model=model or default_model,
+            agent=agent,
+            client=client,
         ),
         **kwargs,
     ).invoke(user_input, context, variables, history)
 
 
-def _require_session_id(session_id: object) -> str:
-    if not isinstance(session_id, str) or not session_id:
-        raise TypeError("The OpenCode handler requires a session_id.")
-    return session_id
-
-
 def _create_opencode_handler(
     *,
-    events: Events,
-    session_id: str,
+    base_url: str,
     capture_content: bool | None,
+    model: ModelResolver,
+    agent: str | None,
+    client: httpx.AsyncClient | None,
 ) -> ProviderHandler:
     content_override = capture_content
-    bound_session = session_id
+    bound_url = base_url
+    resolve_model = model
+    bound_agent = agent
+    bound_client = client
 
     async def _stream_impl(
         config: AiConfigRep,
@@ -573,36 +556,41 @@ def _create_opencode_handler(
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
+        del tool_handlers
         capture = effective_capture_content(content_override)
         span = start_root_span(config, variables or {})
         ended: set[int] = set()
-        reducer = _Reducer(capture_content=capture, session_id=bound_session)
+        provider_id, model_id = resolve_model(
+            config if isinstance(config, dict) else {}
+        )
+        system = _system_text(config)
+        prompt = _user_prompt(config, user_input, history)
         try:
-            instructions = (
-                config.get("instructions") if isinstance(config, dict) else None
-            )
             set_input_content_attributes(
                 span,
                 capture,
-                system_instructions=instructions
-                if isinstance(instructions, str)
-                else None,
+                system_instructions=system,
                 messages=_input_messages(user_input, history),
             )
-            async for event in reducer.reduce(
-                _open_events(
-                    events, config, user_input, variables, history, bound_session
-                )
+            created = _Created()
+            async for event in _reduce_session(
+                created,
+                base_url=bound_url,
+                prompt=prompt,
+                system=system,
+                provider_id=provider_id,
+                model_id=model_id,
+                agent=bound_agent,
+                client=bound_client,
+                capture=capture,
             ):
                 yield event
-            for event in reducer.close():
-                yield event
-            output = "".join(reducer.deltas)
+            output = "".join(created.deltas)
             if output:
                 set_output_content_attributes(
                     span, capture, [text_message("assistant", output)]
                 )
-            usage = reducer.usage_payload()
+            usage = created.usage
             finish_root_span(
                 span,
                 config,
@@ -644,3 +632,97 @@ def _create_opencode_handler(
         _stream_impl,
         capture_content=content_override,
     )
+
+
+class _Created:
+    deltas: list[str]
+    usage: dict[str, int] | None
+
+    def __init__(self) -> None:
+        self.deltas = []
+        self.usage = None
+
+
+async def _reduce_session(
+    created: _Created,
+    *,
+    base_url: str,
+    prompt: str,
+    system: str | None,
+    provider_id: str,
+    model_id: str,
+    agent: str | None,
+    client: httpx.AsyncClient | None,
+    capture: bool,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Reduce the session ``POST /session`` created. The reducer is unchanged."""
+    session_ids: list[str] = []
+    reducer: _Reducer | None = None
+    async for raw in session_events(
+        base_url=base_url,
+        prompt=prompt,
+        system=system,
+        provider_id=provider_id,
+        model_id=model_id,
+        agent=agent,
+        session_ids=session_ids,
+        client=client,
+    ):
+        if reducer is None:
+            reducer = _Reducer(capture_content=capture, session_id=session_ids[0])
+        async for event in reducer.reduce(_once(raw)):
+            yield event
+    if reducer is None:
+        return
+    for event in reducer.close():
+        yield event
+    created.deltas = list(reducer.deltas)
+    created.usage = reducer.usage_payload()
+
+
+async def _once(raw: dict[str, Any]) -> AsyncGenerator[dict[str, Any], None]:
+    yield raw
+
+
+def _system_text(config: AiConfigRep) -> str | None:
+    if not isinstance(config, dict):
+        return None
+    instructions = config.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        return instructions
+    return None
+
+
+def _user_prompt(
+    config: AiConfigRep,
+    user_input: str | None,
+    history: list[dict[str, Any]] | None,
+) -> str:
+    messages: list[dict[str, Any]] = []
+    if isinstance(config, dict):
+        raw_messages = config.get("messages")
+        if isinstance(raw_messages, list):
+            for message in raw_messages:
+                if isinstance(message, dict) and message.get("role") != "system":
+                    messages.append(message)
+    turns = compose_history(
+        history=[item for item in (history or []) if isinstance(item, dict)],
+        user_input=user_input,
+        config_messages=messages,
+    )
+    lines: list[str] = []
+    for turn in turns:
+        role = turn.get("role")
+        text = content_to_text(turn.get("content") or "")
+        if not text:
+            continue
+        label = "Assistant" if role == "assistant" else "User"
+        lines.append(f"{label}: {text}")
+    if (
+        len(lines) == 1
+        and lines[0].startswith("User: ")
+        and not messages
+        and not history
+    ):
+        return lines[0].removeprefix("User: ")
+    return "\n\n".join(lines)
