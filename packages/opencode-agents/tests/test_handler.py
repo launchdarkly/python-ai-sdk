@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+import json
+from collections.abc import Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-
-import json
 
 import httpx
 import pytest

@@ -7,10 +7,11 @@ then one ``done``. ``config().stream()`` still yields ``chunk`` then ``done``.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterable, Mapping
 from typing import Any
 
 import httpx
+
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
