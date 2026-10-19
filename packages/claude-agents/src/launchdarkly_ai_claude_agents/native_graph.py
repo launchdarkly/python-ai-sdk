@@ -36,6 +36,7 @@ except ImportError:
 
 from launchdarkly_ai_claude_agents.handler import (
     _build_hooks,
+    _raise_if_run_failed,
     build_prompt,
     build_query_prompt,
     build_tool_mcp,
@@ -184,6 +185,9 @@ async def _run_query(
     try:
         async for message in gen:
             if isinstance(message, ResultMessage):
+                # Raising fails the graph at the root, and fails the tool call at a sub-agent,
+                # instead of answering with an empty string or with the API's error text.
+                _raise_if_run_failed(message)
                 output = message.result or ""
                 raw_usage = message.usage or {}
                 break

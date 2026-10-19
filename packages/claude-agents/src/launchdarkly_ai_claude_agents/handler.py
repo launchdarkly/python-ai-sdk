@@ -477,15 +477,30 @@ def _opening_of(prompt: str, system_prompt: str | None) -> Opening:
     )
 
 
-def _result_error(subtype: str, errors: list[str] | None) -> str:
-    """Builds the error for a non-success result message.
+def _raise_if_run_failed(message: Any) -> None:
+    """Raises when a result message reports a failed run.
 
-    ``SDKResultError`` carries no ``result`` field, so a run that hit ``error_max_turns`` or
-    ``error_max_budget_usd`` genuinely failed and has to surface as a failure rather than being
-    reported OK with zeroed usage.
+    Two shapes fail. A non-``success`` subtype carries no ``result`` field, so a run that hit
+    ``error_max_turns`` or ``error_max_budget_usd`` genuinely failed and has to surface as a failure
+    rather than being reported OK with zeroed usage.
+
+    The other is a ``success`` subtype with ``is_error`` set, which is how the CLI reports a failed
+    Anthropic API call. Measured against Agent SDK 0.3.220 with a key that had no credits: the run
+    ends ``success``, ``is_error`` true, ``api_error_status`` set, and the error text in ``result`` —
+    so a caller was handed "Credit balance is too low" as the model's answer.
     """
-    detail = f": {'; '.join(errors)}" if errors else ""
-    return f"Claude agent run ended with {subtype}{detail}"
+    if message.subtype != "success":
+        detail = f": {'; '.join(message.errors)}" if message.errors else ""
+        raise RuntimeError(f"Claude agent run ended with {message.subtype}{detail}")
+    if message.is_error is not True:
+        return
+    # ``getattr``: the field arrived with CLI v2.1.110, and older SDKs' dataclass lacks it.
+    status = getattr(message, "api_error_status", None)
+    status_text = f" (HTTP {status})" if isinstance(status, int) else ""
+    detail = f": {message.result}" if message.result else ""
+    raise RuntimeError(
+        f"Claude agent run ended with an error result{status_text}{detail}"
+    )
 
 
 def _build_query_options(
@@ -636,10 +651,7 @@ def _create_claude_agents_handler(
                         # The CLI's own run-level total is authoritative, so the except clause below
                         # must not overwrite it with the summed-per-response figure.
                         root_usage_written = True
-                        if message.subtype != "success":
-                            raise RuntimeError(
-                                _result_error(message.subtype, message.errors)
-                            )
+                        _raise_if_run_failed(message)
                         result_text = (
                             message.result
                             if isinstance(message.result, str)
@@ -903,8 +915,7 @@ async def _stream_gen(
                 raw_usage: dict[str, Any] = dict(message.usage or {})
                 finish_root_span(span, config, raw_usage)
                 root_usage_written = True
-                if message.subtype != "success":
-                    raise RuntimeError(_result_error(message.subtype, message.errors))
+                _raise_if_run_failed(message)
                 final_output = (
                     message.result if message.result is not None else full_output
                 )
