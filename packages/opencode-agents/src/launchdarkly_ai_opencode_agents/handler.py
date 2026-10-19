@@ -456,27 +456,16 @@ def _input_messages(
     user_input: str | None,
     history: list[dict[str, Any]] | None,
 ) -> list[SpanMessage]:
-    """History and *user_input* as span messages.
-
-    Block-array history is flattened the same way as the other handlers.
-    System turns stay off this list. An empty *user_input* adds nothing.
-    """
-    items = [item for item in (history or []) if isinstance(item, dict)]
     messages: list[SpanMessage] = []
-    for item in compose_history(history=items, user_input=user_input):
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
         role = item.get("role")
         content = item.get("content")
-        if not isinstance(role, str) or not role:
-            continue
-        if isinstance(content, str):
+        if isinstance(role, str) and role and isinstance(content, str):
             messages.append(text_message(role, content))
-            continue
-        if isinstance(content, list):
-            text = content_to_text(
-                [block for block in content if isinstance(block, dict)]
-            )
-            if text:
-                messages.append(text_message(role, text))
+    if isinstance(user_input, str):
+        messages.append(text_message("user", user_input))
     return messages
 
 
