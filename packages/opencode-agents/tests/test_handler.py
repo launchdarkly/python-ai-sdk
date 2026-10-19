@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import json
+
+import httpx
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
@@ -15,6 +18,7 @@ from launchdarkly_ai_opencode_agents import (
     create_opencode_handler,
     opencode_agents,
 )
+from launchdarkly_ai_opencode_agents.server import default_model
 from launchdarkly_ai_server import SDKOptions, config, configure
 
 CONTEXT = {"kind": "user", "key": "user-1"}
@@ -104,26 +108,63 @@ def assistant_completed(
     return bus("message.updated", info=info)
 
 
-def source(events: list[dict[str, Any]]) -> Any:
-    async def _events(
-        config: Any,
-        user_input: str | None,
-        variables: Any,
-        history: Any,
-        session_id: str | None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        del config, user_input, variables, history, session_id
-        for event in events:
-            yield event
+class Script:
+    """One fake `opencode serve` over ``httpx.MockTransport``."""
 
-    return _events
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.events = events
+        self.sessions: list[str] = []
+        self.messages: list[dict[str, Any]] = []
+        self.aborts: list[str] = []
+
+    def transport(self) -> httpx.MockTransport:
+        script = self
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/event" and request.method == "GET":
+                body = "".join(
+                    f"data: {json.dumps(event)}\n\n" for event in script.events
+                )
+                return httpx.Response(200, text=body)
+            if path == "/session" and request.method == "POST":
+                session_id = (
+                    "ses" if not script.sessions else f"ses-{len(script.sessions) + 1}"
+                )
+                script.sessions.append(session_id)
+                return httpx.Response(200, json={"id": session_id})
+            if path.endswith("/message") and request.method == "POST":
+                script.messages.append(json.loads(request.content.decode()))
+                return httpx.Response(200, json={})
+            if path.endswith("/abort") and request.method == "POST":
+                script.aborts.append(path)
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        return httpx.MockTransport(handle)
+
+
+def playing(events: list[dict[str, Any]], **kwargs: Any) -> tuple[Any, Script]:
+    script = Script(events)
+    client = httpx.AsyncClient(transport=script.transport(), base_url="http://opencode")
+    handler = create_opencode_handler(
+        base_url="http://opencode", client=client, **kwargs
+    )
+    return handler, script
 
 
 async def collect(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    built = create_opencode_handler(
-        capture_content=True, events=source(events), session_id="ses"
+    built, _script = playing(events, capture_content=True)
+    gen = await built.stream(
+        {
+            "instructions": "Be brief.",
+            "model": {"name": "m"},
+            "provider": {"name": "Acme"},
+        },
+        "hi",
+        None,
+        None,
     )
-    gen = await built.stream({}, "hi", None, None)
     return [event async for event in gen]
 
 
@@ -150,18 +191,23 @@ def mock_ld_client() -> Iterator[MagicMock]:
     lifecycle_module._reset_for_testing()
 
 
-def judge_errors(client: MagicMock) -> int:
-    return sum(
-        1
-        for call in client.track.call_args_list
-        if call.args[0] == "$ld:ai:generation:error"
-        and call.args[2].get("configKey") == "judge-flag"
-    )
-
-
 class TestSurface:
+    def test_model_names_map_onto_opencode_providers(self) -> None:
+        assert default_model(
+            {"provider": {"name": "Bedrock"}, "model": {"name": "claude"}}
+        ) == ("amazon-bedrock", "claude")
+        assert default_model(
+            {"provider": {"name": "Gemini"}, "model": {"name": "gemini-2"}}
+        ) == ("google", "gemini-2")
+        assert default_model(
+            {
+                "provider": {"name": "Anthropic"},
+                "model": {"name": "amazon-bedrock/claude"},
+            }
+        ) == ("amazon-bedrock", "claude")
+
     def test_provides_for_is_any_provider_in_agent_mode(self) -> None:
-        handler = create_opencode_handler(events=source([]), session_id="ses")
+        handler, _script = playing([])
         assert handler.provides_for == ("*", "agent")
 
     def test_package_exports_the_handler(self) -> None:
@@ -177,10 +223,8 @@ class TestSurface:
 
     def test_capture_content_follows_configure(self) -> None:
         configure(options=SDKOptions(capture_content=True))
-        omitted = create_opencode_handler(events=source([]), session_id="ses")
-        explicit = create_opencode_handler(
-            capture_content=False, events=source([]), session_id="ses"
-        )
+        omitted, _script = playing([])
+        explicit, _explicit_script = playing([], capture_content=False)
         assert omitted.capture_content is True
         assert explicit.capture_content is False
 
@@ -479,17 +523,14 @@ class TestText:
         assert events[-1]["output"] == "KeptAfter"
 
     async def test_capture_off_hides_tool_content(self) -> None:
-        built = create_opencode_handler(
+        built, _script = playing(
+            [
+                assistant_open("m1"),
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                tool_part("c1", "completed", output="file.txt"),
+                assistant_completed("m1"),
+            ],
             capture_content=False,
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    tool_part("c1", "running", raw_input={"command": "ls"}),
-                    tool_part("c1", "completed", output="file.txt"),
-                    assistant_completed("m1"),
-                ]
-            ),
         )
         gen = await built.stream({}, "hi", None, None)
         events = [event async for event in gen]
@@ -636,24 +677,21 @@ class TestText:
         assert "secret prompt" not in str(events)
 
     async def test_session_error_raises_without_the_provider_body(self) -> None:
-        handler = create_opencode_handler(
-            capture_content=True,
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    {
-                        "type": "session.error",
-                        "properties": {
-                            "error": {
-                                "name": "ProviderAuthError",
-                                "data": {"message": "secret-body"},
-                            }
-                        },
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                {
+                    "type": "session.error",
+                    "properties": {
+                        "error": {
+                            "name": "ProviderAuthError",
+                            "data": {"message": "secret-body"},
+                        }
                     },
-                ]
-            ),
+                },
+            ],
+            capture_content=True,
         )
         seen: list[str] = []
         with pytest.raises(OpenCodeSessionError, match="session failed") as raised:
@@ -668,25 +706,22 @@ class TestStableStream:
     async def test_a_tool_does_not_close_the_stream(
         self, mock_ld_client: MagicMock
     ) -> None:
-        handler = create_opencode_handler(
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Looking up"),
-                    tool_part("c1", "running", raw_input={"command": "ls"}),
-                    tool_part(
-                        "c1",
-                        "completed",
-                        raw_input={"command": "ls"},
-                        output="file.txt",
-                    ),
-                    assistant_completed("m1"),
-                    assistant_open("m2"),
-                    text_delta("m2", "p2", "Done."),
-                    assistant_completed("m2"),
-                ]
-            ),
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Looking up"),
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                tool_part(
+                    "c1",
+                    "completed",
+                    raw_input={"command": "ls"},
+                    output="file.txt",
+                ),
+                assistant_completed("m1"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "Done."),
+                assistant_completed("m2"),
+            ]
         )
         seen = [
             event
@@ -705,15 +740,12 @@ class TestStableStream:
     async def test_session_error_does_not_yield_stable_done(
         self, mock_ld_client: MagicMock
     ) -> None:
-        handler = create_opencode_handler(
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    {"type": "session.error", "properties": {"error": {"name": "X"}}},
-                ]
-            ),
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                {"type": "session.error", "properties": {"error": {"name": "X"}}},
+            ]
         )
         seen: list[dict[str, Any]] = []
         with pytest.raises(OpenCodeSessionError):
@@ -724,17 +756,11 @@ class TestStableStream:
 
 
 class TestInvocation:
-    def test_events_is_required(self) -> None:
+    def test_base_url_is_required(self) -> None:
         with pytest.raises(TypeError):
             create_opencode_handler()  # type: ignore[call-arg]
-
-    def test_session_id_is_required(self) -> None:
-        with pytest.raises(TypeError, match="session_id"):
-            create_opencode_handler(events=source([]))  # type: ignore[call-arg]
-        with pytest.raises(TypeError, match="session_id"):
-            create_opencode_handler(events=source([]), session_id="")
-        with pytest.raises(TypeError, match="session_id"):
-            create_opencode_handler(events=source([]), session_id=None)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="base_url"):
+            create_opencode_handler(base_url="")
 
     async def test_the_first_session_on_the_stream_is_not_adopted(self) -> None:
         events = await collect(
@@ -767,42 +793,34 @@ class TestInvocation:
         assert "their answer" not in str(events)
 
     async def test_events_receives_the_prompt_and_the_session(self) -> None:
-        seen: dict[str, Any] = {}
-
-        async def events(
-            config: Any,
-            user_input: str | None,
-            variables: Any,
-            history: Any,
-            session_id: str | None,
-        ) -> AsyncIterator[dict[str, Any]]:
-            seen["instructions"] = config.get("instructions")
-            seen["user_input"] = user_input
-            seen["variables"] = variables
-            seen["history"] = history
-            seen["session_id"] = session_id
-            yield assistant_open("m1")
-            yield text_delta("m1", "p1", "Hi")
-            yield assistant_completed("m1")
-
-        handler = create_opencode_handler(events=events, session_id="ses")
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
         events_out = [
             event
             async for event in await handler.stream(
-                {"instructions": "Be brief."},
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "claude"},
+                    "provider": {"name": "Anthropic"},
+                },
                 "Hello",
                 None,
                 {"name": "Ada"},
                 [{"role": "user", "content": "earlier"}],
             )
         ]
-        assert seen == {
-            "instructions": "Be brief.",
-            "user_input": "Hello",
-            "variables": {"name": "Ada"},
-            "history": [{"role": "user", "content": "earlier"}],
-            "session_id": "ses",
-        }
+        posted = script.messages[0]
+        assert posted["system"] == "Be brief."
+        assert posted["parts"] == [
+            {"type": "text", "text": "User: earlier\n\nUser: Hello"}
+        ]
+        assert posted["model"] == {"providerID": "anthropic", "modelID": "claude"}
+        assert script.sessions == ["ses"]
         assert events_out[-1]["output"] == "Hi"
 
     async def test_other_sessions_are_ignored_and_idle_ends_the_run(self) -> None:
@@ -893,7 +911,7 @@ class TestInvocation:
         assert contents == ["Hi"]
         assert events[-1]["output"] == "Hi"
 
-    async def test_skip_judges_runs_events_once(
+    async def test_a_judge_opens_its_own_session(
         self, mock_ld_client: MagicMock
     ) -> None:
         judged = {
@@ -903,86 +921,45 @@ class TestInvocation:
             },
         }
         mock_ld_client.variation = AsyncMock(return_value=judged)
-        calls: list[str | None] = []
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
+        assert len(script.sessions) == 2
+        assert script.sessions[0] != script.sessions[1]
+        prompts = [message["parts"][0]["text"] for message in script.messages]
+        assert prompts[0] == "q"
+        assert prompts[1] != "q"
 
-        async def events(
-            config: Any,
-            user_input: str | None,
-            variables: Any,
-            history: Any,
-            session_id: str | None,
-        ) -> AsyncIterator[dict[str, Any]]:
-            del config, variables, history, session_id
-            calls.append(user_input)
-            yield assistant_open("m1")
-            yield text_delta("m1", "p1", "Hi")
-            yield assistant_completed("m1")
-
-        handler = create_opencode_handler(events=events, session_id="ses")
-        skipped = [
-            event
-            async for event in config(
-                key="flag", handler=handler, skip_judges=True
-            ).stream("q", CONTEXT)
-        ]
-        assert [event["type"] for event in skipped] == ["chunk", "done"]
-        assert calls == ["q"]
-        assert not judge_errors(mock_ld_client)
-
-        calls.clear()
-        judged_run = [
-            event
-            async for event in config(key="flag", handler=handler).stream("q", CONTEXT)
-        ]
-        assert calls == ["q"]
-        assert judged_run[-1]["type"] == "done"
-        assert judged_run[-1]["response"] == "Hi"
-        assert not judged_run[-1].get("judge_results")
-        # Without skip_judges the raise is the safety net: the judge is
-        # tracked as a failed generation instead of scoring this session.
-        assert judge_errors(mock_ld_client) == 1
-
-    async def test_the_wrapper_forwards_variables_history_and_session(
+    async def test_the_wrapper_posts_history_on_a_fresh_session(
         self, mock_ld_client: MagicMock
     ) -> None:
-        seen: dict[str, Any] = {}
-
-        async def events(
-            config: Any,
-            user_input: str | None,
-            variables: Any,
-            history: Any,
-            session_id: str | None,
-        ) -> AsyncIterator[dict[str, Any]]:
-            seen["user_input"] = user_input
-            seen["name"] = (
-                variables.get("name") if isinstance(variables, dict) else None
-            )
-            seen["history"] = history
-            seen["session_id"] = session_id
-            seen["instructions"] = (
-                config.get("instructions") if isinstance(config, dict) else None
-            )
-            yield assistant_open("m1")
-            yield text_delta("m1", "p1", "Hi")
-            yield assistant_completed("m1")
-
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
         result = await opencode_agents(
             "flag",
             "Hello",
             CONTEXT,
-            events=events,
-            session_id="ses",
-            variables={"name": "Ada"},
+            base_url="http://opencode",
+            client=client,
             history=[{"role": "user", "content": "earlier"}],
-            skip_judges=True,
         )
         assert result.response == "Hi"
-        assert seen["user_input"] == "Hello"
-        assert seen["name"] == "Ada"
-        assert seen["history"] == [{"role": "user", "content": "earlier"}]
-        assert seen["session_id"] == "ses"
-        assert seen["instructions"] == "Be brief."
+        assert script.messages[0]["system"] == "Be brief."
+        assert "User: earlier" in script.messages[0]["parts"][0]["text"]
+        assert "User: Hello" in script.messages[0]["parts"][0]["text"]
 
     async def test_a_run_opens_an_invoke_agent_span(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1030,124 +1007,18 @@ class TestInvocation:
 
         tracer = _Tracer()
         monkeypatch.setattr(span_module, "trace", tracer)
-        handler = create_opencode_handler(
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    assistant_completed("m1"),
-                ]
-            ),
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
         )
         seen = [event async for event in await handler.stream({}, "hi", None, None)]
         assert seen[-1]["output"] == "Hi"
         assert tracer.spans[0].name == "invoke_agent"
         assert tracer.spans[0].attributes["gen_ai.operation.name"] == "invoke_agent"
         assert tracer.spans[0].attributes["launchdarkly.operation.type"] == "gen_ai"
-
-    async def test_block_array_history_reaches_the_span(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from launchdarkly_ai_opencode_agents import spans as span_module
-
-        class _Span:
-            def __init__(self, name: str, context: Any = None) -> None:
-                self.name = name
-                self.context = context
-                self.attributes: dict[str, Any] = {}
-                self.events: list[str] = []
-
-            def set_attribute(self, key: str, value: Any) -> None:
-                self.attributes[key] = value
-
-            def add_event(
-                self, name: str, attributes: dict[str, Any] | None = None
-            ) -> None:
-                self.events.append(name)
-
-            def set_status(self, code: Any, description: str | None = None) -> None:
-                return None
-
-            def record_exception(self, exc: BaseException) -> None:
-                return None
-
-            def end(self) -> None:
-                return None
-
-        class _Tracer:
-            def __init__(self) -> None:
-                self.spans: list[_Span] = []
-
-            def get_tracer(self, name: str) -> _Tracer:
-                return self
-
-            def start_span(self, name: str, context: Any = None) -> _Span:
-                span = _Span(name, context)
-                self.spans.append(span)
-                return span
-
-            def set_span_in_context(self, span: _Span) -> Any:
-                return span
-
-        tracer = _Tracer()
-        monkeypatch.setattr(span_module, "trace", tracer)
-        handler = create_opencode_handler(
-            capture_content=True,
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    assistant_completed("m1"),
-                ]
-            ),
-        )
-        history = [
-            {"role": "system", "content": "do not record"},
-            {"role": "user", "content": "earlier"},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "see "},
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "url",
-                            "url": "https://example.test/a.png",
-                        },
-                    },
-                    {"type": "text", "text": "this"},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": "noted"}],
-            },
-        ]
-        seen = [
-            event async for event in await handler.stream({}, "", None, None, history)
-        ]
-        assert seen[-1]["output"] == "Hi"
-        recorded = json.loads(tracer.spans[0].attributes["gen_ai.input.messages"])
-        assert recorded == [
-            {
-                "role": "user",
-                "parts": [{"type": "text", "content": "earlier"}],
-            },
-            {
-                "role": "user",
-                "parts": [{"type": "text", "content": "see this"}],
-            },
-            {
-                "role": "assistant",
-                "parts": [{"type": "text", "content": "noted"}],
-            },
-        ]
-        assert (
-            "do not record" not in tracer.spans[0].attributes["gen_ai.input.messages"]
-        )
-        assert "gen_ai.prompt.3.role" not in tracer.spans[0].attributes
 
 
 async def _drain(stream: Any) -> None:
