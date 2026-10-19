@@ -14,6 +14,7 @@ import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_opencode_agents import (
     OpenCodeSessionError,
     create_opencode_handler,
+    create_opencode_handlers,
     opencode_agents,
 )
 from launchdarkly_ai_opencode_agents.server import default_model
@@ -214,6 +215,7 @@ class TestSurface:
         assert set(package.__all__) == {
             "OpenCodeSessionError",
             "create_opencode_handler",
+            "create_opencode_handlers",
             "opencode_agents",
         }
         for name in package.__all__:
@@ -908,6 +910,56 @@ class TestInvocation:
         ]
         assert contents == ["Hi"]
         assert events[-1]["output"] == "Hi"
+
+    async def test_completion_route_renders_messages_into_the_system_prompt(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        completion = {
+            "model": {"name": "claude"},
+            "provider": {"name": "Anthropic"},
+            "messages": [
+                {"role": "system", "content": "Hello {{caller_email}}"},
+                {"role": "user", "content": "Be {{tone}}."},
+            ],
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "v1",
+                "version": 1,
+                "mode": "completion",
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=completion)
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
+        agent_only = create_opencode_handler(base_url="http://opencode", client=client)
+        with pytest.raises(ValueError, match="mode messages"):
+            await _drain(
+                config(key="vega-base-prompt", handler=agent_only).stream("go", CONTEXT)
+            )
+        assert script.sessions == []
+
+        handlers = create_opencode_handlers(base_url="http://opencode", client=client)
+        assert [handler.provides_for for handler in handlers] == [
+            ("*", "agent"),
+            ("*", "messages"),
+        ]
+        await _drain(
+            config(key="vega-base-prompt", handler=handlers).stream(
+                "go", CONTEXT, {"caller_email": "ada@example.com", "tone": "brief"}
+            )
+        )
+        assert script.sessions == ["ses"]
+        posted = script.messages[0]
+        assert posted["system"] == "Hello ada@example.com\n\nBe brief."
+        assert posted["parts"] == [{"type": "text", "text": "go"}]
 
     async def test_a_judge_opens_its_own_session(
         self, mock_ld_client: MagicMock

@@ -7,8 +7,8 @@ then one ``done``. ``config().stream()`` still yields ``chunk`` then ``done``.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterable, Mapping
-from typing import Any
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
+from typing import Any, Literal
 
 import httpx
 
@@ -23,6 +23,7 @@ from launchdarkly_ai_server import (
     compose_history,
     content_to_text,
     end_span_once,
+    parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
     text_message,
@@ -30,7 +31,10 @@ from launchdarkly_ai_server import (
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.sdk_usage import report_usage
-from launchdarkly_ai_server.utils import number_or_zero
+from launchdarkly_ai_server.utils import (
+    collapse_messages_to_instructions,
+    number_or_zero,
+)
 
 from ._version import PACKAGE_NAME, __version__
 from .server import ModelResolver, default_model, session_events
@@ -470,6 +474,44 @@ def _input_messages(
     return messages
 
 
+def create_opencode_handlers(
+    *,
+    base_url: str,
+    capture_content: bool | None = None,
+    model: ModelResolver | None = None,
+    agent: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> list[ProviderHandler]:
+    """Return the agent handler and a completion route over the same sessions.
+
+    The completion route collapses messages into the system prompt and renders
+    ``{{variables}}``. It does not decide where the AI Config is evaluated.
+    ``create_opencode_handler`` stays agent-only.
+    """
+    if not isinstance(base_url, str) or not base_url:
+        raise TypeError("The OpenCode handler requires a base_url.")
+    report_usage("opencode-agents.createOpenCodeHandlers", PACKAGE_NAME, __version__)
+    resolved = model or default_model
+    return [
+        _create_opencode_handler(
+            base_url=base_url,
+            capture_content=capture_content,
+            model=resolved,
+            agent=agent,
+            client=client,
+        ),
+        _create_opencode_handler(
+            base_url=base_url,
+            capture_content=capture_content,
+            model=resolved,
+            agent=agent,
+            client=client,
+            prepare=_render_completion,
+            provides_for=("*", "messages"),
+        ),
+    ]
+
+
 def create_opencode_handler(
     *,
     base_url: str,
@@ -525,6 +567,32 @@ def opencode_agents(
     ).invoke(user_input, context, variables, history)
 
 
+def _render_completion(
+    config: AiConfigRep, variables: dict[str, Any] | None
+) -> AiConfigRep:
+    """Collapse a completion variation into an agent system prompt."""
+    if not isinstance(config, dict):
+        return config
+    values = variables or {}
+    rendered: list[Any] = []
+    messages = config.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                rendered.append(
+                    {**message, "content": parse_template(message["content"], values)}
+                )
+            else:
+                rendered.append(message)
+    instructions = config.get("instructions")
+    adapted = {**config, "messages": rendered}
+    if isinstance(instructions, str) and instructions.strip():
+        adapted["instructions"] = parse_template(instructions, values)
+        return adapted
+    adapted.pop("instructions", None)
+    return collapse_messages_to_instructions(adapted)
+
+
 def _create_opencode_handler(
     *,
     base_url: str,
@@ -532,6 +600,8 @@ def _create_opencode_handler(
     model: ModelResolver,
     agent: str | None,
     client: httpx.AsyncClient | None,
+    prepare: Callable[[AiConfigRep, dict[str, Any] | None], AiConfigRep] | None = None,
+    provides_for: tuple[str, Literal["agent", "messages"]] = ("*", "agent"),
 ) -> ProviderHandler:
     content_override = capture_content
     bound_url = base_url
@@ -547,6 +617,8 @@ def _create_opencode_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         del tool_handlers
+        if prepare is not None:
+            config = prepare(config, variables)
         capture = effective_capture_content(content_override)
         span = start_root_span(config, variables or {})
         ended: set[int] = set()
@@ -617,7 +689,7 @@ def _create_opencode_handler(
         return {"output": output, "usage": usage}
 
     return _create_handler(
-        ("*", "agent"),
+        provides_for,
         _call_impl,
         _stream_impl,
         capture_content=content_override,
