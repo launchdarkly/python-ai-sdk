@@ -826,6 +826,142 @@ class TestInvocation:
         assert script.sessions == ["ses"]
         assert events_out[-1]["output"] == "Hi"
 
+    async def test_agent_instructions_render_and_history_does_not(self) -> None:
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        assert handler.provides_for == ("*", "agent")
+        events_out = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Hello {{caller_email}}",
+                    "model": {"name": "claude"},
+                    "provider": {"name": "Anthropic"},
+                },
+                "next {{caller_email}}",
+                None,
+                {"caller_email": "ada@example.com"},
+                [{"role": "user", "content": "earlier {{caller_email}}"}],
+            )
+        ]
+        posted = script.messages[0]
+        assert posted["system"] == "Hello ada@example.com"
+        assert posted["parts"] == [
+            {
+                "type": "text",
+                "text": "User: earlier {{caller_email}}\n\nUser: next {{caller_email}}",
+            }
+        ]
+        assert events_out[-1]["output"] == "Hi"
+
+    async def test_templates_render_in_instructions_and_config_messages(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from launchdarkly_ai_opencode_agents import spans as span_module
+
+        class _Span:
+            def __init__(self, name: str, context: Any = None) -> None:
+                self.name = name
+                self.attributes: dict[str, Any] = {}
+
+            def set_attribute(self, key: str, value: Any) -> None:
+                self.attributes[key] = value
+
+            def add_event(
+                self, name: str, attributes: dict[str, Any] | None = None
+            ) -> None:
+                return None
+
+            def set_status(self, code: Any, description: str | None = None) -> None:
+                return None
+
+            def record_exception(self, exc: BaseException) -> None:
+                return None
+
+            def end(self) -> None:
+                return None
+
+        class _Tracer:
+            def __init__(self) -> None:
+                self.spans: list[_Span] = []
+
+            def get_tracer(self, name: str) -> _Tracer:
+                return self
+
+            def start_span(self, name: str, context: Any = None) -> _Span:
+                span = _Span(name, context)
+                self.spans.append(span)
+                return span
+
+            def set_span_in_context(self, span: _Span) -> Any:
+                return span
+
+        tracer = _Tracer()
+        monkeypatch.setattr(span_module, "trace", tracer)
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ],
+            capture_content=True,
+        )
+        config = {
+            "instructions": "Hello {{user.name}} {{missing}}",
+            "messages": [
+                {"role": "user", "content": "Assist {{caller_email}}"},
+                {"role": "system", "content": "skip {{caller_email}}"},
+            ],
+            "model": {"name": "claude"},
+            "provider": {"name": "Anthropic"},
+        }
+        variables = {"user": {"name": "Ada"}, "caller_email": "ada@example.com"}
+        await _drain(
+            await handler.stream(
+                config,
+                "ask {{caller_email}}",
+                None,
+                variables,
+                [{"role": "user", "content": "earlier {{caller_email}}"}],
+            )
+        )
+        posted = script.messages[0]
+        assert posted["system"] == "Hello Ada {{missing}}"
+        assert posted["parts"][0]["text"] == (
+            "User: Assist ada@example.com\n\n"
+            "User: earlier {{caller_email}}\n\n"
+            "User: ask {{caller_email}}"
+        )
+        recorded = tracer.spans[0].attributes["gen_ai.system_instructions"]
+        assert "Hello Ada {{missing}}" in recorded
+        assert "{{user.name}}" not in recorded
+
+        bare, bare_script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        await _drain(
+            await bare.stream(
+                {
+                    "instructions": "Hello {{caller_email}}",
+                    "model": {"name": "claude"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        )
+        assert bare_script.messages[0]["system"] == "Hello {{caller_email}}"
+
     async def test_other_sessions_are_ignored_and_idle_ends_the_run(self) -> None:
         events = await collect(
             [

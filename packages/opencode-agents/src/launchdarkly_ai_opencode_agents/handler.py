@@ -576,7 +576,7 @@ def _create_opencode_handler(
             config if isinstance(config, dict) else {}
         )
         system = _system_text(config, variables)
-        prompt = _user_prompt(config, user_input, history)
+        prompt = _user_prompt(config, user_input, history, variables)
         try:
             set_input_content_attributes(
                 span,
@@ -723,14 +723,20 @@ def _user_prompt(
     config: AiConfigRep,
     user_input: str | None,
     history: list[dict[str, Any]] | None,
+    variables: dict[str, Any] | None = None,
 ) -> str:
+    values = variables or {}
     messages: list[dict[str, Any]] = []
     if isinstance(config, dict):
         raw_messages = config.get("messages")
         if isinstance(raw_messages, list):
             for message in raw_messages:
-                if isinstance(message, dict) and message.get("role") != "system":
-                    messages.append(message)
+                if not isinstance(message, dict) or message.get("role") == "system":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    message = {**message, "content": parse_template(content, values)}
+                messages.append(message)
     turns = compose_history(
         history=[item for item in (history or []) if isinstance(item, dict)],
         user_input=user_input,
