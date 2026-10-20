@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
 from typing import Any
 
+from opentelemetry import context as otel_context
+
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
@@ -19,12 +21,15 @@ from launchdarkly_ai_server import (
     _config,
     _create_handler,
     add_cached_tokens_to_input,
+    compose_history,
+    content_to_text,
     end_span_once,
     set_input_content_attributes,
     set_output_content_attributes,
     text_message,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.conversation import _EVAL_KEY
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.sdk_usage import report_usage
 from launchdarkly_ai_server.utils import number_or_zero
@@ -460,20 +465,43 @@ def _session_error_message(properties: object) -> str:
     return f"The OpenCode session failed ({name})."
 
 
+def _is_judge_evaluation() -> bool:
+    """Whether this call is a judge evaluation, not the agent's own session.
+
+    ``provides_for`` stays ``('*', 'agent')``, so judge selection still lands
+    here. The judge prompt is not this OpenCode session. Calling *events* for
+    it would answer the judge with that session.
+    """
+    return otel_context.get_value(_EVAL_KEY) is not None
+
+
 def _input_messages(
     user_input: str | None,
     history: list[dict[str, Any]] | None,
 ) -> list[SpanMessage]:
+    """History and *user_input* as span messages.
+
+    Block-array history is flattened the same way as the other handlers.
+    System turns stay off this list: they belong on the system instructions.
+    An empty *user_input* adds nothing, so a history turn that already holds
+    the user message is not followed by a blank one.
+    """
+    items = [item for item in (history or []) if isinstance(item, dict)]
     messages: list[SpanMessage] = []
-    for item in history or []:
-        if not isinstance(item, dict):
-            continue
+    for item in compose_history(history=items, user_input=user_input):
         role = item.get("role")
         content = item.get("content")
-        if isinstance(role, str) and role and isinstance(content, str):
+        if not isinstance(role, str) or not role:
+            continue
+        if isinstance(content, str):
             messages.append(text_message(role, content))
-    if isinstance(user_input, str):
-        messages.append(text_message("user", user_input))
+            continue
+        if isinstance(content, list):
+            text = content_to_text(
+                [block for block in content if isinstance(block, dict)]
+            )
+            if text:
+                messages.append(text_message(role, text))
     return messages
 
 
@@ -509,9 +537,11 @@ def create_opencode_handler(
 
     The stream yields the AG-UI text and tool subset and one ``done``.
     ``config().stream()`` still yields ``chunk`` then ``done``. Pass
-    ``skip_judges=True`` to ``config()``: a judge would otherwise be routed
-    here and *events* would run again on the judge prompt. *capture_content*
-    follows the other handlers.
+    ``skip_judges=True`` to ``config()``. Judge selection lands here, because
+    ``provides_for`` is ``('*', 'agent')``, and the handler does not run the
+    judge prompt: the call raises without calling *events*, so the judge is
+    tracked as a failed generation. Do not pass this handler to ``run_judge``.
+    *capture_content* follows the other handlers.
     """
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
     return _create_opencode_handler(
@@ -531,8 +561,9 @@ def opencode_agents(
 
     *events* is required and is the same callable :func:`create_opencode_handler`
     takes. *variables*, *history*, *session_id*, and *capture_content* configure
-    that call. Pass ``skip_judges=True`` so a judged config does not run
-    *events* again.
+    that call. Pass ``skip_judges=True``. A judge evaluation raises without
+    calling *events* again, so a judged config tracks the judge as a failed
+    generation.
     """
     report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
@@ -573,6 +604,8 @@ def _create_opencode_handler(
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
+        if _is_judge_evaluation():
+            raise RuntimeError("The OpenCode handler does not run judge prompts.")
         capture = effective_capture_content(content_override)
         span = start_root_span(config, variables or {})
         ended: set[int] = set()
