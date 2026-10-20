@@ -451,6 +451,27 @@ class TestConfigMultiHandler:
         result = await rm.invoke("hi", CONTEXT)
         assert result.response == "normalized"
 
+    @pytest.mark.parametrize(
+        "provides_for", [("TestProvider", "completion"), ["TestProvider", "messages"]]
+    )
+    async def test_handler_tag_is_matched_after_normalizing_its_mode(
+        self, mock_ld_client: MagicMock, provides_for: Any
+    ) -> None:
+        h = _handler_for("TestProvider", "messages", "normalized")
+        h.provides_for = provides_for
+        rm = config(key="flag", handler=[h])
+        result = await rm.invoke("hi", CONTEXT)
+        assert result.response == "normalized"
+
+    async def test_wildcard_tag_is_matched_after_normalizing_its_mode(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        h = _handler_for("*", "messages", "wildcard")
+        h.provides_for = ("*", "completion")
+        rm = config(key="flag", handler=[h])
+        result = await rm.invoke("hi", CONTEXT)
+        assert result.response == "wildcard"
+
     async def test_throws_when_no_provider(self, mock_ld_client: MagicMock) -> None:
         raw = {
             "model": {"name": "gpt-4"},

@@ -517,18 +517,17 @@ def select_handler(
 
     mode = normalize_mode(meta.get("mode") if isinstance(meta, dict) else None)
 
-    exact = next((h for h in handlers if h.provides_for == (provider, mode)), None)
+    def tag(handler: ProviderHandler) -> tuple[str, str] | None:
+        # A handler may declare its mode as "completion" or give a list.
+        if not handler.provides_for:
+            return None
+        return (handler.provides_for[0], normalize_mode(handler.provides_for[1]))
+
+    exact = next((h for h in handlers if tag(h) == (provider, mode)), None)
     if exact:
         return exact
 
-    wildcard = next(
-        (
-            h
-            for h in handlers
-            if h.provides_for and h.provides_for[0] == "*" and h.provides_for[1] == mode
-        ),
-        None,
-    )
+    wildcard = next((h for h in handlers if tag(h) == ("*", mode)), None)
     if wildcard:
         return wildcard
 

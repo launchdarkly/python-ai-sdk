@@ -4632,3 +4632,26 @@ async def test_overrides_cannot_set_the_mode() -> None:
         await _run_ai_config(transport, [tagged(_echo)], {"mode": "agent"})
 
     assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provides_for", [("OpenAI", "completion"), ["OpenAI", "messages"]]
+)
+async def test_a_completion_or_list_tagged_handler_is_selected(
+    stub_sdk_client: MagicMock, provides_for: Any
+) -> None:
+    transport = judge_run_transport()
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    stub = AsyncMock(return_value={"output": "generated"})
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(stub, provides_for),
+        generation=COMPLETION,
+    )
+
+    assert stub.await_count == 1

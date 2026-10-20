@@ -495,6 +495,8 @@ EXPERIMENTAL_EVALUATIONS_SURFACE = frozenset(
         "EvaluationsModule",
         "AIConfig",
         "GenerationConfig",
+        "GenerationMode",
+        "GenerationOverrides",
         "DatasetRow",
         "EvalTool",
         "Criterion",
