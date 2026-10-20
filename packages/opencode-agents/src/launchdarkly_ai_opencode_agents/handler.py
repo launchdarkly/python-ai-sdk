@@ -11,8 +11,6 @@ from collections.abc import AsyncGenerator, AsyncIterable, Mapping
 from contextlib import aclosing
 from typing import Any
 
-import httpx
-
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
@@ -493,17 +491,17 @@ def create_opencode_handler(
     capture_content: bool | None = None,
     model: ModelResolver | None = None,
     agent: str | None = None,
-    client: httpx.AsyncClient | None = None,
 ) -> ProviderHandler:
     """Return a handler that opens one OpenCode session per call.
 
     ``provides_for`` is ``('*', 'agent')``. *base_url* is a running
-    ``opencode serve``. A judge routed here gets its own session and runs as a
-    full OpenCode agent: the server's tools, in the server's working directory,
-    apply to the judge prompt too. This package does not offer a tool-less
-    judge agent. A Vega-local handler was rejected: the session boundary
-    belongs to this package. *model* overrides provider and model selection.
-    *client* is for tests.
+    ``opencode serve``. The handler opens its own HTTP client. A caller does
+    not pass a client or a transport. A judge routed here gets its own session
+    and runs as a full OpenCode agent: the server's tools, in the server's
+    working directory, apply to the judge prompt too. This package does not
+    offer a tool-less judge agent. A Vega-local handler was rejected: the
+    session boundary belongs to this package. *model* overrides provider and
+    model selection.
     """
     if not isinstance(base_url, str) or not base_url:
         raise TypeError("The OpenCode handler requires a base_url.")
@@ -513,7 +511,6 @@ def create_opencode_handler(
         capture_content=capture_content,
         model=model or default_model,
         agent=agent,
-        client=client,
     )
 
 
@@ -533,7 +530,6 @@ def opencode_agents(
         raise TypeError("The OpenCode handler requires a base_url.")
     model = kwargs.pop("model", None)
     agent = kwargs.pop("agent", None)
-    client = kwargs.pop("client", None)
     return _config(
         key=config_key,
         handler=_create_opencode_handler(
@@ -541,7 +537,6 @@ def opencode_agents(
             capture_content=capture_content,
             model=model or default_model,
             agent=agent,
-            client=client,
         ),
         **kwargs,
     ).invoke(user_input, context, variables, history)
@@ -553,13 +548,11 @@ def _create_opencode_handler(
     capture_content: bool | None,
     model: ModelResolver,
     agent: str | None,
-    client: httpx.AsyncClient | None,
 ) -> ProviderHandler:
     content_override = capture_content
     bound_url = base_url
     resolve_model = model
     bound_agent = agent
-    bound_client = client
 
     async def _stream_impl(
         config: AiConfigRep,
@@ -594,7 +587,6 @@ def _create_opencode_handler(
                     provider_id=provider_id,
                     model_id=model_id,
                     agent=bound_agent,
-                    client=bound_client,
                     capture=capture,
                 )
             ) as reduced:
@@ -669,7 +661,6 @@ async def _reduce_session(
     provider_id: str,
     model_id: str,
     agent: str | None,
-    client: httpx.AsyncClient | None,
     capture: bool,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Reduce the session ``POST /session`` created. The reducer is unchanged."""
@@ -684,7 +675,6 @@ async def _reduce_session(
             model_id=model_id,
             agent=agent,
             session_ids=session_ids,
-            client=client,
         )
     ) as raw_events:
         async for raw in raw_events:
