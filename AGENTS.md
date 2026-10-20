@@ -336,7 +336,7 @@ A resolved agent graph returned by `resolve_graph()`. A class with attribute acc
 | `run_node(node, input?, opts?)` | Executes a single node through the tracked `config().invoke()` path. |
 | `route(node, input?, opts?)` | Executes a node, presenting outgoing edges as handoff choices; returns the response plus the chosen `next` node. |
 | `traverse(fn, ctx?)` | Awaits each visitor in BFS order (root → leaves). Visitor may be sync or async. |
-| `reverse_traverse(fn, ctx?)` | Awaits each visitor in reverse BFS order (leaves → root). Visitor may be sync or async. |
+| `reverse_traverse(fn, ctx?)` | Awaits each visitor, every child before its parents (post-order from the root, each node once, root last). Visitor may be sync or async. |
 
 #### `GraphOptions`
 
