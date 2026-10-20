@@ -370,6 +370,27 @@ class TestInitClientSDKKeyPath:
         extra.close.assert_awaited_once()
         a.close.assert_not_called()
 
+    async def test_cancelled_call_closes_the_client_still_being_built(self) -> None:
+        # The thread can't be stopped, so the client it finishes building after the
+        # cancel holds a streaming connection that nothing else would close.
+        stub = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(
+            side_effect=lambda *_a, **_k: (time.sleep(0.2), stub)[1]
+        )
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    task = asyncio.create_task(init_client())
+                    await asyncio.sleep(0.05)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    await asyncio.sleep(0.4)
+        stub.close.assert_awaited_once()
+        assert lifecycle_module._client is None
+
 
 # ---------------------------------------------------------------------------
 # OTel degradation

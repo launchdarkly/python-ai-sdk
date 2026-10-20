@@ -303,7 +303,16 @@ async def init_client(
     ld_config = config_cls(sdk_key, **config_kwargs)
     # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
     # Built in a thread so that wait does not stall the caller's event loop.
-    ld_client = await asyncio.to_thread(client_cls, ld_config, start_wait=10)
+    build = asyncio.ensure_future(
+        asyncio.to_thread(client_cls, ld_config, start_wait=10)
+    )
+    try:
+        ld_client = await asyncio.shield(build)
+    except asyncio.CancelledError:
+        # The thread can't be stopped: close the client it finishes building, or its
+        # streaming connection outlives this cancelled call.
+        build.add_done_callback(_close_abandoned_client)
+        raise
 
     # A concurrent first call may have won while this one was connecting: keep
     # its client and close ours, so only one streaming connection survives.
@@ -335,6 +344,24 @@ async def init_client(
     flush_ai_sdk_info(_client)
     flush_sdk_usage(_client)
     return _client
+
+
+def _close_abandoned_client(build: asyncio.Future[Any]) -> None:
+    """Closes a client whose ``init_client`` call was cancelled while it was being built."""
+    if build.cancelled() or build.exception() is not None:
+        return
+    try:
+        close_result = build.result().close()
+        if inspect.isawaitable(close_result):
+            # The loop keeps only a weak reference to the task; hold it until it is done.
+            task = asyncio.ensure_future(close_result)
+            _closing_tasks.add(task)
+            task.add_done_callback(_closing_tasks.discard)
+    except Exception:
+        pass
+
+
+_closing_tasks: set[asyncio.Future[Any]] = set()
 
 
 def _release_otel_globals() -> None:
