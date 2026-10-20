@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
+from contextlib import aclosing
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
@@ -15,6 +18,7 @@ from launchdarkly_ai_opencode_agents import (
     create_opencode_handler,
     opencode_agents,
 )
+from launchdarkly_ai_opencode_agents.server import default_model
 from launchdarkly_ai_server import SDKOptions, config, configure
 
 CONTEXT = {"kind": "user", "key": "user-1"}
@@ -104,26 +108,63 @@ def assistant_completed(
     return bus("message.updated", info=info)
 
 
-def source(events: list[dict[str, Any]]) -> Any:
-    async def _events(
-        config: Any,
-        user_input: str | None,
-        variables: Any,
-        history: Any,
-        session_id: str | None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        del config, user_input, variables, history, session_id
-        for event in events:
-            yield event
+class Script:
+    """One fake `opencode serve` over ``httpx.MockTransport``."""
 
-    return _events
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.events = events
+        self.sessions: list[str] = []
+        self.messages: list[dict[str, Any]] = []
+        self.aborts: list[str] = []
+
+    def transport(self) -> httpx.MockTransport:
+        script = self
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/event" and request.method == "GET":
+                body = "".join(
+                    f"data: {json.dumps(event)}\n\n" for event in script.events
+                )
+                return httpx.Response(200, text=body)
+            if path == "/session" and request.method == "POST":
+                session_id = (
+                    "ses" if not script.sessions else f"ses-{len(script.sessions) + 1}"
+                )
+                script.sessions.append(session_id)
+                return httpx.Response(200, json={"id": session_id})
+            if path.endswith("/message") and request.method == "POST":
+                script.messages.append(json.loads(request.content.decode()))
+                return httpx.Response(200, json={})
+            if path.endswith("/abort") and request.method == "POST":
+                script.aborts.append(path)
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        return httpx.MockTransport(handle)
+
+
+def playing(events: list[dict[str, Any]], **kwargs: Any) -> tuple[Any, Script]:
+    script = Script(events)
+    client = httpx.AsyncClient(transport=script.transport(), base_url="http://opencode")
+    handler = create_opencode_handler(
+        base_url="http://opencode", client=client, **kwargs
+    )
+    return handler, script
 
 
 async def collect(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    built = create_opencode_handler(
-        capture_content=True, events=source(events), session_id="ses"
+    built, _script = playing(events, capture_content=True)
+    gen = await built.stream(
+        {
+            "instructions": "Be brief.",
+            "model": {"name": "m"},
+            "provider": {"name": "Acme"},
+        },
+        "hi",
+        None,
+        None,
     )
-    gen = await built.stream({}, "hi", None, None)
     return [event async for event in gen]
 
 
@@ -150,18 +191,23 @@ def mock_ld_client() -> Iterator[MagicMock]:
     lifecycle_module._reset_for_testing()
 
 
-def judge_errors(client: MagicMock) -> int:
-    return sum(
-        1
-        for call in client.track.call_args_list
-        if call.args[0] == "$ld:ai:generation:error"
-        and call.args[2].get("configKey") == "judge-flag"
-    )
-
-
 class TestSurface:
+    def test_model_names_map_onto_opencode_providers(self) -> None:
+        assert default_model(
+            {"provider": {"name": "Bedrock"}, "model": {"name": "claude"}}
+        ) == ("amazon-bedrock", "claude")
+        assert default_model(
+            {"provider": {"name": "Gemini"}, "model": {"name": "gemini-2"}}
+        ) == ("google", "gemini-2")
+        assert default_model(
+            {
+                "provider": {"name": "Anthropic"},
+                "model": {"name": "amazon-bedrock/claude"},
+            }
+        ) == ("amazon-bedrock", "claude")
+
     def test_provides_for_is_any_provider_in_agent_mode(self) -> None:
-        handler = create_opencode_handler(events=source([]), session_id="ses")
+        handler, _script = playing([])
         assert handler.provides_for == ("*", "agent")
 
     def test_package_exports_the_handler(self) -> None:
@@ -177,10 +223,8 @@ class TestSurface:
 
     def test_capture_content_follows_configure(self) -> None:
         configure(options=SDKOptions(capture_content=True))
-        omitted = create_opencode_handler(events=source([]), session_id="ses")
-        explicit = create_opencode_handler(
-            capture_content=False, events=source([]), session_id="ses"
-        )
+        omitted, _script = playing([])
+        explicit, _explicit_script = playing([], capture_content=False)
         assert omitted.capture_content is True
         assert explicit.capture_content is False
 
@@ -479,17 +523,14 @@ class TestText:
         assert events[-1]["output"] == "KeptAfter"
 
     async def test_capture_off_hides_tool_content(self) -> None:
-        built = create_opencode_handler(
+        built, _script = playing(
+            [
+                assistant_open("m1"),
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                tool_part("c1", "completed", output="file.txt"),
+                assistant_completed("m1"),
+            ],
             capture_content=False,
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    tool_part("c1", "running", raw_input={"command": "ls"}),
-                    tool_part("c1", "completed", output="file.txt"),
-                    assistant_completed("m1"),
-                ]
-            ),
         )
         gen = await built.stream({}, "hi", None, None)
         events = [event async for event in gen]
@@ -636,24 +677,21 @@ class TestText:
         assert "secret prompt" not in str(events)
 
     async def test_session_error_raises_without_the_provider_body(self) -> None:
-        handler = create_opencode_handler(
-            capture_content=True,
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    {
-                        "type": "session.error",
-                        "properties": {
-                            "error": {
-                                "name": "ProviderAuthError",
-                                "data": {"message": "secret-body"},
-                            }
-                        },
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                {
+                    "type": "session.error",
+                    "properties": {
+                        "error": {
+                            "name": "ProviderAuthError",
+                            "data": {"message": "secret-body"},
+                        }
                     },
-                ]
-            ),
+                },
+            ],
+            capture_content=True,
         )
         seen: list[str] = []
         with pytest.raises(OpenCodeSessionError, match="session failed") as raised:
@@ -668,25 +706,22 @@ class TestStableStream:
     async def test_a_tool_does_not_close_the_stream(
         self, mock_ld_client: MagicMock
     ) -> None:
-        handler = create_opencode_handler(
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Looking up"),
-                    tool_part("c1", "running", raw_input={"command": "ls"}),
-                    tool_part(
-                        "c1",
-                        "completed",
-                        raw_input={"command": "ls"},
-                        output="file.txt",
-                    ),
-                    assistant_completed("m1"),
-                    assistant_open("m2"),
-                    text_delta("m2", "p2", "Done."),
-                    assistant_completed("m2"),
-                ]
-            ),
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Looking up"),
+                tool_part("c1", "running", raw_input={"command": "ls"}),
+                tool_part(
+                    "c1",
+                    "completed",
+                    raw_input={"command": "ls"},
+                    output="file.txt",
+                ),
+                assistant_completed("m1"),
+                assistant_open("m2"),
+                text_delta("m2", "p2", "Done."),
+                assistant_completed("m2"),
+            ]
         )
         seen = [
             event
@@ -705,15 +740,12 @@ class TestStableStream:
     async def test_session_error_does_not_yield_stable_done(
         self, mock_ld_client: MagicMock
     ) -> None:
-        handler = create_opencode_handler(
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    {"type": "session.error", "properties": {"error": {"name": "X"}}},
-                ]
-            ),
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                {"type": "session.error", "properties": {"error": {"name": "X"}}},
+            ]
         )
         seen: list[dict[str, Any]] = []
         with pytest.raises(OpenCodeSessionError):
@@ -721,20 +753,17 @@ class TestStableStream:
                 seen.append(event)
         assert [event["type"] for event in seen] == ["chunk"]
         assert seen[0]["text"] == "Hi"
+        assert script.aborts
 
 
 class TestInvocation:
-    def test_events_is_required(self) -> None:
+    def test_base_url_is_required(self) -> None:
         with pytest.raises(TypeError):
             create_opencode_handler()  # type: ignore[call-arg]
-
-    def test_session_id_is_required(self) -> None:
-        with pytest.raises(TypeError, match="session_id"):
-            create_opencode_handler(events=source([]))  # type: ignore[call-arg]
-        with pytest.raises(TypeError, match="session_id"):
-            create_opencode_handler(events=source([]), session_id="")
-        with pytest.raises(TypeError, match="session_id"):
-            create_opencode_handler(events=source([]), session_id=None)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="base_url"):
+            create_opencode_handler(base_url="")
+        with pytest.raises(TypeError, match="base_url"):
+            opencode_agents("flag", "hi", CONTEXT)
 
     async def test_the_first_session_on_the_stream_is_not_adopted(self) -> None:
         events = await collect(
@@ -767,42 +796,34 @@ class TestInvocation:
         assert "their answer" not in str(events)
 
     async def test_events_receives_the_prompt_and_the_session(self) -> None:
-        seen: dict[str, Any] = {}
-
-        async def events(
-            config: Any,
-            user_input: str | None,
-            variables: Any,
-            history: Any,
-            session_id: str | None,
-        ) -> AsyncIterator[dict[str, Any]]:
-            seen["instructions"] = config.get("instructions")
-            seen["user_input"] = user_input
-            seen["variables"] = variables
-            seen["history"] = history
-            seen["session_id"] = session_id
-            yield assistant_open("m1")
-            yield text_delta("m1", "p1", "Hi")
-            yield assistant_completed("m1")
-
-        handler = create_opencode_handler(events=events, session_id="ses")
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
         events_out = [
             event
             async for event in await handler.stream(
-                {"instructions": "Be brief."},
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "claude"},
+                    "provider": {"name": "Anthropic"},
+                },
                 "Hello",
                 None,
                 {"name": "Ada"},
                 [{"role": "user", "content": "earlier"}],
             )
         ]
-        assert seen == {
-            "instructions": "Be brief.",
-            "user_input": "Hello",
-            "variables": {"name": "Ada"},
-            "history": [{"role": "user", "content": "earlier"}],
-            "session_id": "ses",
-        }
+        posted = script.messages[0]
+        assert posted["system"] == "Be brief."
+        assert posted["parts"] == [
+            {"type": "text", "text": "User: earlier\n\nUser: Hello"}
+        ]
+        assert posted["model"] == {"providerID": "anthropic", "modelID": "claude"}
+        assert script.sessions == ["ses"]
         assert events_out[-1]["output"] == "Hi"
 
     async def test_other_sessions_are_ignored_and_idle_ends_the_run(self) -> None:
@@ -893,7 +914,7 @@ class TestInvocation:
         assert contents == ["Hi"]
         assert events[-1]["output"] == "Hi"
 
-    async def test_skip_judges_runs_events_once(
+    async def test_a_judge_opens_its_own_session(
         self, mock_ld_client: MagicMock
     ) -> None:
         judged = {
@@ -902,87 +923,60 @@ class TestInvocation:
                 "judges": [{"key": "judge-flag", "samplingRate": 1}]
             },
         }
-        mock_ld_client.variation = AsyncMock(return_value=judged)
-        calls: list[str | None] = []
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
 
-        async def events(
-            config: Any,
-            user_input: str | None,
-            variables: Any,
-            history: Any,
-            session_id: str | None,
-        ) -> AsyncIterator[dict[str, Any]]:
-            del config, variables, history, session_id
-            calls.append(user_input)
-            yield assistant_open("m1")
-            yield text_delta("m1", "p1", "Hi")
-            yield assistant_completed("m1")
+        async def variation(key: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            if key == "judge-flag":
+                return {
+                    **VARIATION,
+                    "instructions": (
+                        "Grade {{response_to_evaluate}}. History: {{message_history}}"
+                    ),
+                }
+            return judged
 
-        handler = create_opencode_handler(events=events, session_id="ses")
-        skipped = [
-            event
-            async for event in config(
-                key="flag", handler=handler, skip_judges=True
-            ).stream("q", CONTEXT)
-        ]
-        assert [event["type"] for event in skipped] == ["chunk", "done"]
-        assert calls == ["q"]
-        assert not judge_errors(mock_ld_client)
+        mock_ld_client.variation = variation
+        await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
+        assert len(script.sessions) == 2
+        assert script.sessions[0] != script.sessions[1]
+        prompts = [message["parts"][0]["text"] for message in script.messages]
+        systems = [message.get("system", "") for message in script.messages]
+        assert prompts[0] == "q"
+        assert "{{response_to_evaluate}}" not in systems[1]
+        assert "{{message_history}}" not in systems[1]
+        assert "Hi" in systems[1]
 
-        calls.clear()
-        judged_run = [
-            event
-            async for event in config(key="flag", handler=handler).stream("q", CONTEXT)
-        ]
-        assert calls == ["q"]
-        assert judged_run[-1]["type"] == "done"
-        assert judged_run[-1]["response"] == "Hi"
-        assert not judged_run[-1].get("judge_results")
-        # Without skip_judges the raise is the safety net: the judge is
-        # tracked as a failed generation instead of scoring this session.
-        assert judge_errors(mock_ld_client) == 1
-
-    async def test_the_wrapper_forwards_variables_history_and_session(
+    async def test_the_wrapper_posts_history_on_a_fresh_session(
         self, mock_ld_client: MagicMock
     ) -> None:
-        seen: dict[str, Any] = {}
-
-        async def events(
-            config: Any,
-            user_input: str | None,
-            variables: Any,
-            history: Any,
-            session_id: str | None,
-        ) -> AsyncIterator[dict[str, Any]]:
-            seen["user_input"] = user_input
-            seen["name"] = (
-                variables.get("name") if isinstance(variables, dict) else None
-            )
-            seen["history"] = history
-            seen["session_id"] = session_id
-            seen["instructions"] = (
-                config.get("instructions") if isinstance(config, dict) else None
-            )
-            yield assistant_open("m1")
-            yield text_delta("m1", "p1", "Hi")
-            yield assistant_completed("m1")
-
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
         result = await opencode_agents(
             "flag",
             "Hello",
             CONTEXT,
-            events=events,
-            session_id="ses",
-            variables={"name": "Ada"},
+            base_url="http://opencode",
+            client=client,
             history=[{"role": "user", "content": "earlier"}],
-            skip_judges=True,
         )
         assert result.response == "Hi"
-        assert seen["user_input"] == "Hello"
-        assert seen["name"] == "Ada"
-        assert seen["history"] == [{"role": "user", "content": "earlier"}]
-        assert seen["session_id"] == "ses"
-        assert seen["instructions"] == "Be brief."
+        assert script.messages[0]["system"] == "Be brief."
+        assert "User: earlier" in script.messages[0]["parts"][0]["text"]
+        assert "User: Hello" in script.messages[0]["parts"][0]["text"]
 
     async def test_a_run_opens_an_invoke_agent_span(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1030,15 +1024,12 @@ class TestInvocation:
 
         tracer = _Tracer()
         monkeypatch.setattr(span_module, "trace", tracer)
-        handler = create_opencode_handler(
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    assistant_completed("m1"),
-                ]
-            ),
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
         )
         seen = [event async for event in await handler.stream({}, "hi", None, None)]
         assert seen[-1]["output"] == "Hi"
@@ -1092,16 +1083,13 @@ class TestInvocation:
 
         tracer = _Tracer()
         monkeypatch.setattr(span_module, "trace", tracer)
-        handler = create_opencode_handler(
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ],
             capture_content=True,
-            session_id="ses",
-            events=source(
-                [
-                    assistant_open("m1"),
-                    text_delta("m1", "p1", "Hi"),
-                    assistant_completed("m1"),
-                ]
-            ),
         )
         history = [
             {"role": "system", "content": "do not record"},
@@ -1148,6 +1136,243 @@ class TestInvocation:
             "do not record" not in tracer.spans[0].attributes["gen_ai.input.messages"]
         )
         assert "gen_ai.prompt.3.role" not in tracer.spans[0].attributes
+
+    async def test_a_failed_message_post_does_not_wait_for_the_bus(self) -> None:
+        script = _OpenBus(message_status=400)
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(base_url="http://opencode", client=client)
+
+        async def _run() -> None:
+            async for _event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            ):
+                return
+
+        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
+
+        with pytest.raises(OpenCodeHTTPError, match="400"):
+            await asyncio.wait_for(_run(), timeout=2)
+        assert script.aborts
+
+    async def test_a_cancelled_sse_read_is_awaited_before_the_stream_closes(
+        self,
+    ) -> None:
+        bus = _CloseAfterRead()
+        client = httpx.AsyncClient(
+            transport=bus.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(base_url="http://opencode", client=client)
+
+        async def _run() -> None:
+            async for _event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            ):
+                return
+
+        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
+
+        with pytest.raises(OpenCodeHTTPError, match="400"):
+            await asyncio.wait_for(_run(), timeout=2)
+        assert bus.read_finished.is_set()
+        assert bus.closed
+        assert not bus.closed_before_read_finished
+
+    async def test_breaking_aborts_without_waiting_for_gc(self) -> None:
+        script = _OpenBus()
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(base_url="http://opencode", client=client)
+
+        async def _run() -> None:
+            async with aclosing(
+                await handler.stream(
+                    {
+                        "instructions": "Be brief.",
+                        "model": {"name": "m"},
+                        "provider": {"name": "Acme"},
+                    },
+                    "hi",
+                    None,
+                    None,
+                )
+            ) as gen:
+                async for event in gen:
+                    if event["type"] == "TEXT_MESSAGE_CONTENT":
+                        break
+
+        await asyncio.wait_for(_run(), timeout=2)
+        assert script.aborts
+
+    async def test_a_late_completion_survives_the_post_returning(self) -> None:
+        script = _OpenBus(delay_tail=0.2)
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(
+            base_url="http://opencode", client=client, capture_content=True
+        )
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi!"
+        assert seen[-1]["usage"]["output_tokens"] == 4
+
+    async def test_an_idle_without_a_session_id_does_not_end_the_run(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                bus("session.idle"),
+                text_delta("m1", "p1", "!", session_id="ses"),
+                bus("session.idle", sessionID="ses"),
+            ]
+        )
+        assert events[-1]["output"] == "Hi!"
+
+
+class _CloseAfterRead(httpx.AsyncByteStream):
+    """``/event`` stays open. The message POST fails while the next read is blocked."""
+
+    def __init__(self) -> None:
+        self.second_read = asyncio.Event()
+        self.read_finished = asyncio.Event()
+        self.closed = False
+        self.closed_before_read_finished = False
+
+    def transport(self) -> httpx.MockTransport:
+        stream = self
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/event" and request.method == "GET":
+                return httpx.Response(200, stream=stream)
+            if path == "/session" and request.method == "POST":
+                return httpx.Response(200, json={"id": "ses"})
+            if path.endswith("/message") and request.method == "POST":
+                await stream.second_read.wait()
+                return httpx.Response(400, json={})
+            if path.endswith("/abort") and request.method == "POST":
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        return httpx.MockTransport(handle)
+
+    async def __aiter__(self) -> Any:
+        yield b":\n\n"
+        self.second_read.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.read_finished.set()
+            raise
+
+    async def aclose(self) -> None:
+        if not self.read_finished.is_set():
+            self.closed_before_read_finished = True
+        self.closed = True
+
+
+class _ByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: Any) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self) -> Any:
+        async for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _OpenBus:
+    """An `/event` stream that stays open, unlike a finite ``Script`` body."""
+
+    def __init__(self, *, message_status: int = 200, delay_tail: float = 0) -> None:
+        self.message_status = message_status
+        self.delay_tail = delay_tail
+        self.sessions: list[str] = []
+        self.messages: list[dict[str, Any]] = []
+        self.aborts: list[str] = []
+        self.release = asyncio.Event()
+
+    def transport(self) -> httpx.MockTransport:
+        script = self
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/event" and request.method == "GET":
+
+                async def chunks() -> Any:
+                    # A rejected message sends nothing. Events here would let
+                    # the loop notice the 400 without racing the POST.
+                    head = (
+                        []
+                        if script.message_status >= 400
+                        else [
+                            assistant_open("m1"),
+                            text_delta("m1", "p1", "Hi"),
+                        ]
+                    )
+                    for event in head:
+                        yield f"data: {json.dumps(event)}\n\n".encode()
+                    if script.delay_tail:
+                        await asyncio.sleep(script.delay_tail)
+                        tail = [
+                            text_delta("m1", "p1", "!", session_id="ses"),
+                            assistant_completed("m1", tokens={"input": 1, "output": 4}),
+                            bus("session.idle", sessionID="ses"),
+                        ]
+                        for event in tail:
+                            yield f"data: {json.dumps(event)}\n\n".encode()
+                        return
+                    await script.release.wait()
+
+                return httpx.Response(200, stream=_ByteStream(chunks()))
+            if path == "/session" and request.method == "POST":
+                script.sessions.append("ses")
+                return httpx.Response(200, json={"id": "ses"})
+            if path.endswith("/message") and request.method == "POST":
+                script.messages.append(json.loads(request.content.decode()))
+                if script.message_status >= 400:
+                    return httpx.Response(script.message_status, json={})
+                if script.delay_tail:
+                    return httpx.Response(200, json={})
+                await script.release.wait()
+                return httpx.Response(200, json={})
+            if path.endswith("/abort") and request.method == "POST":
+                script.aborts.append(path)
+                script.release.set()
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        return httpx.MockTransport(handle)
 
 
 async def _drain(stream: Any) -> None:
