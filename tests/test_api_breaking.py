@@ -148,7 +148,13 @@ def test_a_pr_without_breaking_changes_passes(repo: Path) -> None:
     assert api_breaking.check_pr(repo, "demo-sdk-1.2.0", "feat: nothing", []) == 0
 
 
-def release(repo: Path, released: str, proposed: str, breaking: bool) -> int:
+def release(
+    repo: Path,
+    released: str,
+    proposed: str,
+    breaking: bool,
+    labels: list[str] | None = None,
+) -> int:
     """Release ``released`` as tagged, then propose ``proposed`` the way a release PR does."""
     git(repo, "tag", "-d", "demo-sdk-1.2.0")
     write(
@@ -169,7 +175,7 @@ def release(repo: Path, released: str, proposed: str, breaking: bool) -> int:
         repo / ".release-please-manifest.json", json.dumps({"packages/demo": proposed})
     )
     git(repo, "commit", "-q", "-am", "release PR")
-    return api_breaking.check_release(repo, base)
+    return api_breaking.check_release(repo, base, labels)
 
 
 @pytest.mark.parametrize(
@@ -201,3 +207,12 @@ def test_a_package_with_no_release_tag_is_skipped(
     git(repo, "commit", "-q", "-am", "release PR")
     assert api_breaking.check_release(repo, f"{base}~1") == 0
     assert "no release tag demo-sdk-1.2.0" in capsys.readouterr().out
+
+
+def test_an_owner_can_judge_a_release_compatible(repo: Path) -> None:
+    # The label passes an undeclared breaking change on the release PR, as on any other PR.
+    assert release(repo, "1.2.0", "1.2.1", True, ["api-compatible"]) == 0
+
+
+def test_another_label_does_not_pass_a_breaking_release(repo: Path) -> None:
+    assert release(repo, "1.2.0", "1.2.1", True, ["docs"]) == 1

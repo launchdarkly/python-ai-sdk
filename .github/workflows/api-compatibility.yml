@@ -36,4 +36,5 @@ jobs:
         if: github.head_ref == 'release-please--branches--main'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-        run: uv run python -m scripts.api_breaking release --base "$BASE"
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: uv run python -m scripts.api_breaking release --base "$BASE" --labels "$LABELS"

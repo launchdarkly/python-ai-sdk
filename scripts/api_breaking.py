@@ -1,7 +1,7 @@
 """Fail on an undeclared breaking change to the public API.
 
     uv run python -m scripts.api_breaking pr --base <ref> --title <PR title> [--labels a,b]
-    uv run python -m scripts.api_breaking release --base <ref>
+    uv run python -m scripts.api_breaking release --base <ref> [--labels a,b]
 
 ``pr`` compares each public module with ``--base``. A breaking change passes only if
 the PR title declares it with ``!`` (``feat!: ...``, ``fix(client)!: ...``), which makes
@@ -10,7 +10,8 @@ the ``api-compatible`` label because they judge the flagged change compatible.
 
 ``release`` runs on the release PR. For each package whose version changes, it
 compares the package's public modules with its last release tag, and fails on a
-breaking change unless the new version is a major one (a minor one before 1.0.0).
+breaking change unless the new version is a major one (a minor one before 1.0.0), or
+an owner applied the ``api-compatible`` label to the release PR.
 
 Only names in ``__all__`` count. Experimental modules are skipped: an experimental
 feature may change in a minor release.
@@ -182,7 +183,7 @@ def git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
 
 
-def check_release(root: Path, base: str) -> int:
+def check_release(root: Path, base: str, labels: list[str] | None = None) -> int:
     config = json.loads((root / "release-please-config.json").read_text())["packages"]
     new_versions = json.loads((root / ".release-please-manifest.json").read_text())
     old_versions = json.loads(
@@ -218,6 +219,16 @@ def check_release(root: Path, base: str) -> int:
             "It needs a major version (a minor one before 1.0.0): a merged PR that made one "
             "of them was not declared with `!` in its title."
         )
+    if failed and COMPATIBLE_LABEL in (labels or []):
+        print(
+            f"\nAn owner judged these changes compatible (`{COMPATIBLE_LABEL}` label)."
+        )
+        return 0
+    if failed:
+        print(
+            f"\nIf an owner judges these changes compatible, they apply the `{COMPATIBLE_LABEL}` "
+            "label to this release PR."
+        )
     return 1 if failed else 0
 
 
@@ -230,11 +241,12 @@ def main(argv: list[str]) -> int:
     pr.add_argument("--labels", default="")
     release = sub.add_parser("release")
     release.add_argument("--base", required=True)
+    release.add_argument("--labels", default="")
     args = parser.parse_args(argv)
+    labels = [label.strip() for label in args.labels.split(",") if label.strip()]
     if args.command == "pr":
-        labels = [label.strip() for label in args.labels.split(",") if label.strip()]
         return check_pr(ROOT, args.base, args.title, labels)
-    return check_release(ROOT, args.base)
+    return check_release(ROOT, args.base, labels)
 
 
 if __name__ == "__main__":
