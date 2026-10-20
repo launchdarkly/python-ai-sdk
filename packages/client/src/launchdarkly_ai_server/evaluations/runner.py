@@ -25,6 +25,7 @@ from ..trajectory import (
     row_fields,
 )
 from ..utils import (
+    handler_key,
     normalize_mode,
     parse_template,
     parse_usage,
@@ -87,14 +88,8 @@ class JudgeExecution:
 def _provides_for(
     handler: EvalHandler,
 ) -> tuple[str, Literal["agent", "messages"]] | None:
-    provides_for = getattr(handler, "provides_for", None)
-    if (
-        isinstance(provides_for, tuple | list)
-        and len(provides_for) == 2
-        and isinstance(provides_for[0], str)
-    ):
-        return (provides_for[0], normalize_mode(provides_for[1]))
-    return None
+    """Normalized handler identity; shares :func:`handler_key` with online."""
+    return handler_key(handler)
 
 
 def describe_handlers(handlers: Sequence[EvalHandler]) -> str:
