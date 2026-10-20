@@ -83,7 +83,8 @@ def handler_key(
     ``completion`` and ``messages`` are the same mode. A list tag is accepted
     the same as a tuple. Online and offline share this helper:
     :func:`select_handler` matches on it, :meth:`Registry.register` replaces on
-    it, and the evaluations harness rejects duplicates on it.
+    it, online judges (``run_judges`` / ``run_judge``) match on it, and the
+    evaluations harness rejects duplicates on it.
     """
     provides_for = getattr(handler, "provides_for", None)
     if (

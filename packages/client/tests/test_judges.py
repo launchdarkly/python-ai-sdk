@@ -319,6 +319,77 @@ class TestRunJudges:
 
         assert called_handlers == ["messages"]
 
+    async def test_completion_handler_matches_messages_judge_over_agent(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """completion ≡ messages: registry replace must not lose judge routing.
+
+        After registering a completion handler over a messages one, online
+        judges still need an exact mode match. Comparing raw provides_for
+        would miss completion and fall through to agent (with collapse).
+        """
+        called_handlers: list[str] = []
+
+        async def completion_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            called_handlers.append("completion")
+            return {
+                "output": '{"score": 0.9, "reasoning": "ok"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        async def agent_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            called_handlers.append("agent")
+            return {
+                "output": '{"score": 0.1, "reasoning": "fallback"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        completion_handler = ProviderHandler(
+            fn=completion_fn, provides_for=("TestProvider", "completion")
+        )  # type: ignore[arg-type]
+        agent_handler = ProviderHandler(
+            fn=agent_fn, provides_for=("TestProvider", "agent")
+        )  # type: ignore[arg-type]
+
+        judge_variation = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "messages": [{"role": "system", "content": "Judge."}],
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=agent_handler,
+                handlers=[completion_handler, agent_handler],
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+
+        assert called_handlers == ["completion"]
+
     async def test_returns_judge_result_objects_with_score_and_reasoning(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -406,6 +477,103 @@ class TestScoreGuard:
         assert numeric_score(0) == 0.0
         assert numeric_score(inf) is None
         assert numeric_score(nan) is None
+
+
+class TestRunJudgeModeAliases:
+    """run_judge must treat completion and messages as one mode."""
+
+    @pytest.mark.asyncio
+    async def test_completion_handler_matches_messages_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from contextlib import asynccontextmanager
+
+        import launchdarkly_ai_server.judges as judges_module
+        import launchdarkly_ai_server.tracking as tracking_module
+        from launchdarkly_ai_server import JudgeTask, run_judge
+
+        @asynccontextmanager
+        async def fake_with_judge_evaluation(name: str) -> Any:
+            yield lambda score, explanation=None: None
+
+        monkeypatch.setattr(
+            judges_module, "with_judge_evaluation", fake_with_judge_evaluation
+        )
+
+        async def fake_execute_and_track(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "response": '{"score": 0.8, "reasoning": "aliased"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "track_data": {"runId": "run-1"},
+            }
+
+        monkeypatch.setattr(
+            tracking_module, "execute_and_track", fake_execute_and_track
+        )
+
+        async def completion_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            raise AssertionError("execute_and_track is stubbed")
+
+        handler = ProviderHandler(
+            fn=completion_fn, provides_for=("TestProvider", "completion")
+        )  # type: ignore[arg-type]
+
+        task = JudgeTask(
+            config_key="judge-key",
+            judge_config={
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+            },
+            judge_meta={"enabled": True, "variationKey": "j1", "version": 1},
+            actual_output="response",
+            user_context=CONTEXT,
+            judge_provider="TestProvider",
+            judge_mode="messages",
+            collapse_messages=False,
+            parent_track_data={"runId": "run-1"},
+        )
+
+        result = await run_judge(task, [handler])
+
+        assert result is not None
+        assert result.score == 0.8
+        assert result.response == "aliased"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_only_unrelated_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from launchdarkly_ai_server import JudgeTask, run_judge
+
+        async def agent_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            raise AssertionError("should not run — messages task with no match")
+
+        # Agent-only list still falls back for messages tasks; use a different
+        # provider so there is truly no compatible handler.
+        handler = ProviderHandler(fn=agent_fn, provides_for=("OtherProvider", "agent"))  # type: ignore[arg-type]
+
+        task = JudgeTask(
+            config_key="judge-key",
+            judge_config={
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+            },
+            judge_meta={"enabled": True, "variationKey": "j1", "version": 1},
+            actual_output="response",
+            user_context=CONTEXT,
+            judge_provider="TestProvider",
+            judge_mode="messages",
+            collapse_messages=False,
+            parent_track_data={"runId": "run-1"},
+        )
+
+        assert await run_judge(task, [handler]) is None
 
 
 class TestRunJudgeScoreReporting:
