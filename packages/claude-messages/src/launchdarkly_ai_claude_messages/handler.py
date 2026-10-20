@@ -25,6 +25,8 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -351,14 +353,18 @@ def _is_coroutine(fn: Any) -> bool:
 _MAX_STEPS = 10
 
 
-def create_claude_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_claude_messages_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
 
     Requires ``anthropic`` to be installed as a peer dependency.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more. Turning this
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
     report_usage(
@@ -368,9 +374,10 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
 
 
 def _create_claude_messages_handler(
-    *, capture_content: bool = False
+    *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_claude_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
     import importlib
 
     anthropic_mod = importlib.import_module("anthropic")
@@ -383,6 +390,8 @@ def _create_claude_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         th = tool_handlers or {}
         vs = variables or {}
 
@@ -466,15 +475,46 @@ def _create_claude_messages_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
     return _create_handler(
         ("Anthropic", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
+
+
+def _map_claude_event(
+    event: Any, emitter: TurnEmitter, block_ids: dict[int, str]
+) -> list[dict[str, Any]]:
+    """Map one Messages API stream event onto the AG-UI subset."""
+    kind = getattr(event, "type", None)
+    if kind == "content_block_start":
+        block = getattr(event, "content_block", None)
+        index = getattr(event, "index", None)
+        if getattr(block, "type", None) != "tool_use" or not isinstance(index, int):
+            return []
+        call_id = str(getattr(block, "id", "") or "")
+        block_ids[index] = call_id
+        return emitter.tool_start(call_id, str(getattr(block, "name", "") or ""))
+    if kind == "content_block_delta":
+        delta = getattr(event, "delta", None)
+        delta_type = getattr(delta, "type", None)
+        if delta_type == "text_delta":
+            text = getattr(delta, "text", "")
+            if not isinstance(text, str) or not text:
+                return []
+            return emitter.text(text)
+        if delta_type == "input_json_delta":
+            index = getattr(event, "index", None)
+            call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+            partial = getattr(delta, "partial_json", "")
+            if not isinstance(partial, str):
+                return []
+            return emitter.tool_args(call_id, partial)
+    return []
 
 
 async def _stream_gen(
@@ -512,6 +552,8 @@ async def _stream_gen(
     conversation = list(messages)
     full_output = ""
     steps = 0
+    emitter = TurnEmitter(capture_content=capture_content)
+    block_ids: dict[int, str] = {}
 
     ended: set[int] = set()
     open_model_span: Any = None
@@ -567,15 +609,10 @@ async def _stream_gen(
                 stream = client.messages.stream(**kwargs)
                 async with stream as s:
                     async for event in s:
-                        if (
-                            hasattr(event, "type")
-                            and event.type == "content_block_delta"
-                            and hasattr(event, "delta")
-                            and getattr(event.delta, "type", None) == "text_delta"
-                        ):
-                            text = event.delta.text
-                            full_output += text
-                            yield {"type": "chunk", "text": text}
+                        for rich in _map_claude_event(event, emitter, block_ids):
+                            if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                                full_output += rich.get("delta") or ""
+                            yield rich
 
                     final_msg = await s.get_final_message()
 
@@ -614,6 +651,10 @@ async def _stream_gen(
                 raise
 
             if final_msg.stop_reason != "tool_use":
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -623,6 +664,17 @@ async def _stream_gen(
             steps += 1
 
             conversation.append({"role": "assistant", "content": final_msg.content})
+            for block in final_msg.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                for rich in emitter.tool_start(str(block.id), str(block.name)):
+                    yield rich
+                for rich in emitter.tool_end(
+                    str(block.id), arguments=getattr(block, "input", None)
+                ):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             tool_results = []
             for block in final_msg.content:
                 if block.type != "tool_use":
@@ -656,6 +708,8 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                for rich in emitter.tool_result(str(block.id), result):
+                    yield rich
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -663,6 +717,8 @@ async def _stream_gen(
                         "content": str(result),
                     }
                 )
+            for rich in emitter.fail_open():
+                yield rich
             conversation.append({"role": "user", "content": tool_results})
 
         set_output_content_attributes(
@@ -692,6 +748,8 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -722,7 +780,7 @@ def claude_messages(
     # asking for content on spans got a TypeError instead of content.
     report_usage("claude-messages.claudeMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
         handler=_create_claude_messages_handler(capture_content=capture_content),

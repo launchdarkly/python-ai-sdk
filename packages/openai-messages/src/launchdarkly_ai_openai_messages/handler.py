@@ -27,6 +27,9 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.responses import map_responses_event
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -212,23 +215,28 @@ async def _run_model_turn(
     return response
 
 
-def create_openai_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_openai_messages_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for OpenAI (responses API).
     Requires ``openai`` to be installed as a peer dependency.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
     report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
     return _create_openai_messages_handler(capture_content=capture_content)
 
 
 def _create_openai_messages_handler(
-    *, capture_content: bool = False
+    *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_openai_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
     import importlib
 
     openai_mod = importlib.import_module("openai")
@@ -241,6 +249,8 @@ def _create_openai_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         th = tool_handlers or {}
         vs = variables or {}
 
@@ -414,14 +424,14 @@ def _create_openai_messages_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
     return _create_handler(
         ("OpenAI", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -468,6 +478,7 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
     try:
         tools = _build_tools(config.get("tools") or {})
         input_messages = _build_input_messages(config, user_input, variables, history)
@@ -485,6 +496,7 @@ async def _stream_gen(
         previous_response_id: str | None = None
         current_input: Any = input_messages
         steps = 0
+        item_to_call: dict[str, str] = {}
 
         while True:
             model_span = start_model_span(config, parent)
@@ -515,10 +527,10 @@ async def _stream_gen(
                 stream = client.responses.stream(**stream_params)
                 async with stream as s:
                     async for event in s:
-                        if getattr(event, "type", None) == "response.output_text.delta":
-                            text = getattr(event, "delta", "")
-                            full_output += text
-                            yield {"type": "chunk", "text": text}
+                        for rich in map_responses_event(event, emitter, item_to_call):
+                            if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                                full_output += rich.get("delta") or ""
+                            yield rich
 
                     final_resp = await s.get_final_response()
 
@@ -548,6 +560,10 @@ async def _stream_gen(
                 if getattr(item, "type", None) == "function_call"
             ]
             if not tool_calls:
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -557,6 +573,13 @@ async def _stream_gen(
             steps += 1
 
             previous_response_id = getattr(final_resp, "id", None)
+            for tc in tool_calls:
+                for rich in emitter.tool_start(str(tc.call_id), str(tc.name)):
+                    yield rich
+                for rich in emitter.tool_end(str(tc.call_id), arguments=tc.arguments):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             tool_outputs = []
             for tc in tool_calls:
                 tool_span = start_tool_span(tc.name, tc.call_id, parent)
@@ -589,6 +612,9 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                # The model is sent str(result). The stream reports that same text.
+                for rich in emitter.tool_result(str(tc.call_id), str(result)):
+                    yield rich
                 tool_outputs.append(
                     {
                         "type": "function_call_output",
@@ -623,6 +649,10 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, last_response_model, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -653,7 +683,7 @@ def openai_messages(
     # asking for content on spans got a TypeError instead of content.
     report_usage("openai-messages.openaiMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
         handler=_create_openai_messages_handler(capture_content=capture_content),

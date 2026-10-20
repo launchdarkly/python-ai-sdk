@@ -259,6 +259,21 @@ class TestGraphInvoke:
         events = [c[0][0] for c in mock_ld_client.track.call_args_list]
         assert "$ld:ai:graph:invocation_success" in events
 
+    async def test_graph_events_carry_the_environment_id(
+        self, mock_ld_client: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-abc")
+        g = graph("graph-key", handlers=[_make_handler()])
+        await g.invoke("hi", CONTEXT)
+        graph_calls = [
+            c
+            for c in mock_ld_client.track.call_args_list
+            if str(c[0][0]).startswith("$ld:ai:graph:")
+        ]
+        assert graph_calls
+        for c in graph_calls:
+            assert c[0][2]["environmentId"] == "env-abc"
+
     async def test_graph_invocation_failure_tracked_on_error(
         self, mock_ld_client: MagicMock
     ) -> None:

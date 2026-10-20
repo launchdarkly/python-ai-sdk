@@ -89,6 +89,17 @@
         "src/launchdarkly_ai_langchain_messages/_version.py"
       ],
       "component": "launchdarkly-ai-langchain-messages"
+    },
+    "packages/opencode-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_opencode_agents/_version.py"
+      ],
+      "component": "launchdarkly-ai-opencode-agents"
     }
   },
   "changelog-sections": [

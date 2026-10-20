@@ -1303,10 +1303,179 @@ class TestStreaming:
         with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_claude_messages_handler()
             events = [e async for e in await h.stream(CONFIG, "q")]
-        chunks = [e for e in events if e.get("type") == "chunk"]
-        assert len(chunks) == 2
-        assert chunks[0]["text"] == "hello "
-        assert chunks[1]["text"] == "world"
+        deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["hello ", "world"]
+        assert events[0]["type"] == "TEXT_MESSAGE_START"
+        assert events[-2]["type"] == "TEXT_MESSAGE_END"
+
+    async def test_tool_lifecycle_hides_payloads_until_capture_is_on(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        block = MagicMock()
+        block.type = "tool_use"
+        block.id = "c1"
+        block.name = "search"
+        block.input = {"q": "x"}
+
+        async def search(_args: dict[str, Any]) -> str:
+            return "secret"
+
+        async def _events(capture: bool) -> list[dict[str, Any]]:
+            first_ctx, first_final = _make_stream_context(["Looking"])
+            first_final.stop_reason = "tool_use"
+            first_final.content = [block]
+            second_ctx, _second_final = _make_stream_context(["Done"])
+            mock_anthropic.messages.stream = MagicMock(
+                side_effect=[first_ctx, second_ctx]
+            )
+            with patch.object(spans_mod, "_HAS_OTEL", False):
+                handler = create_claude_messages_handler(capture_content=capture)
+                return [
+                    event
+                    async for event in await handler.stream(
+                        CONFIG, "q", {"search": search}
+                    )
+                ]
+
+        hidden = await _events(False)
+        start = next(event for event in hidden if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "search"
+        assert start["parentMessageId"]
+        assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+        result = next(event for event in hidden if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == ""
+
+        shown = await _events(True)
+        args = next(event for event in shown if event["type"] == "TOOL_CALL_ARGS")
+        assert args["delta"] == '{"q":"x"}'
+        shown_result = next(
+            event for event in shown if event["type"] == "TOOL_CALL_RESULT"
+        )
+        assert shown_result["content"] == "secret"
+
+    async def test_a_streamed_tool_without_tool_use_is_closed(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        started = MagicMock()
+        started.type = "content_block_start"
+        started.index = 0
+        block = MagicMock()
+        block.type = "tool_use"
+        block.id = "c1"
+        block.name = "search"
+        started.content_block = block
+        _ctx, final = _make_stream_context([])
+        final.stop_reason = "end_turn"
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield started
+                yield _make_stream_event("Hi")
+
+            async def get_final_message(self) -> Any:
+                return final
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_anthropic.messages.stream = MagicMock(return_value=_mgr())
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            handler = create_claude_messages_handler()
+            events = [event async for event in await handler.stream(CONFIG, "q")]
+        start = next(event for event in events if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "search"
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in events
+        )
+
+    async def test_a_failed_tool_closes_its_siblings(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, final = _make_stream_context([])
+        final.stop_reason = "tool_use"
+        final.content = [
+            _tool_use_block("boom", "c1"),
+            _tool_use_block("later", "c2"),
+        ]
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+
+        def boom(_args: dict[str, Any]) -> str:
+            raise RuntimeError("nope")
+
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="nope"),
+        ):
+            handler = create_claude_messages_handler()
+            async for event in await handler.stream(
+                CONFIG, "q", {"boom": boom, "later": lambda _args: "ok"}
+            ):
+                seen.append(event)
+        results = {
+            event["toolCallId"] for event in seen if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results == {"c1", "c2"}
+
+    async def test_a_stream_error_closes_an_opened_tool(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        started = MagicMock()
+        started.type = "content_block_start"
+        started.index = 0
+        block = MagicMock()
+        block.type = "tool_use"
+        block.id = "c1"
+        block.name = "search"
+        started.content_block = block
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield started
+                raise RuntimeError("stream broke")
+
+            async def get_final_message(self) -> Any:
+                raise AssertionError("final message is not read")
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_anthropic.messages.stream = MagicMock(return_value=_mgr())
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="stream broke"),
+        ):
+            handler = create_claude_messages_handler()
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in seen
+        )
 
     async def test_all_chunks_before_done(self, mock_anthropic: MagicMock) -> None:
         import launchdarkly_ai_claude_messages.spans as spans_mod
@@ -1653,6 +1822,28 @@ class TestStreamingTelemetry:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
+    async def test_process_default_is_read_on_the_streaming_path(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            self._patch_stream(mock_anthropic, ["hi"])
+            ctx, rec = _recording()
+            from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+            with ctx:
+                async for _ in await create_claude_messages_handler().stream(
+                    CONFIG, "q"
+                ):
+                    pass
+            assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+        finally:
+            _reset_for_testing()
+
 
 # ---------------------------------------------------------------------------
 # History parameter
@@ -1824,8 +2015,11 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in seen["config_kwargs"]
 
-    def test_defaults_to_off(self) -> None:
-        assert self._run()["capture_content"] is False
+    def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
+        assert self._run()["capture_content"] is None
+
+    def test_explicit_false_reaches_the_factory(self) -> None:
+        assert self._run(capture_content=False)["capture_content"] is False
 
 
 class TestToolSpanNeverLeaks:

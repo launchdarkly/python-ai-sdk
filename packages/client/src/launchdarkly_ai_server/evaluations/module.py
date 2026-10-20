@@ -877,7 +877,7 @@ def init_evaluations(
     """
     from ..sdk_usage import report_usage
 
-    report_usage("client.init_evaluations")
+    report_usage("experimental.initEvaluations")
     resolved_project_key = (project_key or "").strip() or _env("LD_PROJECT_KEY")
     if not resolved_project_key:
         raise EvaluationsError(
