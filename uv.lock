@@ -28,6 +28,7 @@ members = [
 dev = [
     { name = "brotlicffi", specifier = ">=1.0" },
     { name = "claude-agent-sdk", specifier = ">=0.2.110" },
+    { name = "griffelib", specifier = ">=2.1.0" },
     { name = "langchain-anthropic", specifier = ">=1.4.8" },
     { name = "langchain-aws", specifier = ">=1" },
     { name = "langchain-openai", specifier = ">=0.3" },
