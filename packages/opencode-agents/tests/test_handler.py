@@ -1330,10 +1330,16 @@ class _OpenBus:
             if path == "/event" and request.method == "GET":
 
                 async def chunks() -> Any:
-                    head = [
-                        assistant_open("m1"),
-                        text_delta("m1", "p1", "Hi"),
-                    ]
+                    # A rejected message sends nothing. Events here would let
+                    # the loop notice the 400 without racing the POST.
+                    head = (
+                        []
+                        if script.message_status >= 400
+                        else [
+                            assistant_open("m1"),
+                            text_delta("m1", "p1", "Hi"),
+                        ]
+                    )
                     for event in head:
                         yield f"data: {json.dumps(event)}\n\n".encode()
                     if script.delay_tail:
