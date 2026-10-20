@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import logging
@@ -301,7 +302,21 @@ async def init_client(
 
     ld_config = config_cls(sdk_key, **config_kwargs)
     # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
-    ld_client = client_cls(ld_config, start_wait=10)
+    # Built in a thread so that wait does not stall the caller's event loop.
+    ld_client = await asyncio.to_thread(client_cls, ld_config, start_wait=10)
+
+    # A concurrent first call may have won while this one was connecting: keep
+    # its client and close ours, so only one streaming connection survives.
+    if _client is not None:
+        try:
+            close_result = ld_client.close()
+            if inspect.isawaitable(close_result):
+                await close_result
+        except Exception:
+            pass
+        flush_ai_sdk_info(_client)
+        flush_sdk_usage(_client)
+        return _client
 
     # As on the BYOC path: only a fully set-up client becomes the singleton. We
     # built this one, so close it on failure — it holds a streaming connection
