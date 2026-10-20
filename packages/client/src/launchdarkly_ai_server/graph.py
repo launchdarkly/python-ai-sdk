@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect as _inspect
-import json
 import logging
 import re as _re
 import time
@@ -39,11 +38,10 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 MAX_TRAVERSAL_DEPTH = 100
-MAX_GRAPH_CACHE_SIZE = 512
 
-# graph() caches a built graph per context, track data included. Each run passes its own copy
+# The built graph's track data is minted before the run's runId. Each run passes its own copy
 # with a fresh runId through route/stream_route opts under this key, so the handoff events
-# emitted inside the cached build carry the run's id instead of the build's.
+# emitted inside the build carry the run's id instead of the build's.
 _RUN_TRACK_DATA = "_run_track_data"
 
 
@@ -878,9 +876,6 @@ class GraphInstance:
     ) -> None:
         self._key = key
         self._options = options
-        self._cache: dict[
-            str, tuple[GraphDefinition, TrackData, Callable[..., Any]]
-        ] = {}
 
     async def invoke(
         self,
@@ -927,19 +922,7 @@ class GraphInstance:
                 "use resolve_graph() with a framework-native runner."
             )
 
-        try:
-            cache_key: str | None = json.dumps(context, sort_keys=True)
-        except (TypeError, ValueError):
-            cache_key = None
-        if cache_key is not None and cache_key in self._cache:
-            built = self._cache[cache_key]
-        else:
-            built = await _build_graph(self._key, context, resolved_options)
-            if cache_key is not None:
-                if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
-                    # Evict an arbitrary entry to keep the cache bounded.
-                    self._cache.pop(next(iter(self._cache)))
-                self._cache[cache_key] = built
+        built = await _build_graph(self._key, context, resolved_options)
         graph_def, built_track_data, _ = built
 
         if not graph_def.enabled:
@@ -1165,18 +1148,7 @@ class GraphInstance:
                 "use resolve_graph() with a framework-native runner."
             )
 
-        try:
-            cache_key: str | None = json.dumps(context, sort_keys=True)
-        except (TypeError, ValueError):
-            cache_key = None
-        if cache_key is not None and cache_key in self._cache:
-            built = self._cache[cache_key]
-        else:
-            built = await _build_graph(self._key, context, resolved_options)
-            if cache_key is not None:
-                if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
-                    self._cache.pop(next(iter(self._cache)))
-                self._cache[cache_key] = built
+        built = await _build_graph(self._key, context, resolved_options)
         graph_def, built_track_data, stream_route = built
 
         if not graph_def.enabled:
