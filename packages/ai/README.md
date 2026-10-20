@@ -60,7 +60,8 @@ release that includes them. Import them from `launchdarkly_ai_server.experimenta
 import fails, upgrade `launchdarkly-ai-server` itself, since upgrading this package alone can
 leave an older `launchdarkly-ai-server` in place. The experimental features are:
 
-- **Agent Skills**, in `launchdarkly_ai_server.experimental.skills`; see the
+- **Agent Skills**, in `launchdarkly_ai_server.experimental.skills`. Requires
+  `launchdarkly-ai-server` 0.3.0 or later. See the
   [Agent Skills guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#agent-skills-experimental).
 - **Evaluations from Code**, in `launchdarkly_ai_server.experimental.evaluations`; see the
   [evaluations guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#run-an-evaluation-from-code-experimental).

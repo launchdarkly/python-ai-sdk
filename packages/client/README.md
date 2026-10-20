@@ -447,6 +447,11 @@ asyncio.run(main())
 > none of these names is exported from the package root. They may change in a minor release,
 > so review the changelog when you upgrade.
 
+> **Requires `launchdarkly-ai-server` 0.3.0 or later.** Earlier versions do not include Agent
+> Skills. If you install `launchdarkly-ai-python`, check the installed `launchdarkly-ai-server`
+> version too, because upgrading `launchdarkly-ai-python` alone can leave an older one in place:
+> `pip install --upgrade "launchdarkly-ai-server>=0.3.0"`.
+
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
 content, and writes them to `<root>/<key>/SKILL.md`, where agent runtimes such as the Claude
