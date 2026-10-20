@@ -44,6 +44,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
     text_message,
+    tool_result_string,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -106,7 +107,7 @@ def _build_agent_tools(
             res = handler(args)
             if inspect.isawaitable(res):
                 res = await res
-            return str(res)
+            return tool_result_string(res)
 
         t = FunctionTool(
             name=name,
@@ -365,7 +366,9 @@ class _SpanningHooks(_RunHooksBase):
                 arguments=getattr(context, "tool_arguments", None),
             )
         )
-        self.pending.extend(self.emitter.tool_result(str(call_id), str(result)))
+        self.pending.extend(
+            self.emitter.tool_result(str(call_id), tool_result_string(result))
+        )
         span = self.open_tool_spans.pop(call_id, None)
         if span is None:
             return
