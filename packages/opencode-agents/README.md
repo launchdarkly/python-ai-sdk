@@ -28,4 +28,4 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`base_url` is a running `opencode serve`. Each call opens its own session, including a judge routed to this handler. The handler yields AG-UI text and tool events. `config().stream()` yields `chunk` then `done`.
+`base_url` is a running `opencode serve`. Each call opens its own session, including a judge routed to this handler. A judge runs as a full OpenCode agent: the server's tools, in the server's working directory, apply to the judge prompt. There is no tool-less judge mode. The handler yields AG-UI text and tool events. `config().stream()` yields `chunk` then `done`.

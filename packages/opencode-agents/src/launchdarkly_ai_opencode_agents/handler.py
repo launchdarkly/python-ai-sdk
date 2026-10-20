@@ -8,6 +8,7 @@ then one ``done``. ``config().stream()`` still yields ``chunk`` then ``done``.
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterable, Mapping
+from contextlib import aclosing
 from typing import Any
 
 import httpx
@@ -23,6 +24,7 @@ from launchdarkly_ai_server import (
     compose_history,
     content_to_text,
     end_span_once,
+    parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
     text_message,
@@ -111,7 +113,9 @@ class _Reducer:
             if session_id is not None and session_id != self._session_id:
                 continue
             if kind == "session.idle":
-                return
+                if session_id == self._session_id:
+                    return
+                continue
             if kind == "session.error":
                 raise OpenCodeSessionError(_session_error_message(properties))
             for event in self._event(raw):
@@ -494,9 +498,12 @@ def create_opencode_handler(
     """Return a handler that opens one OpenCode session per call.
 
     ``provides_for`` is ``('*', 'agent')``. *base_url* is a running
-    ``opencode serve``. A judge routed here gets its own session. A Vega-local
-    handler was rejected: the session boundary belongs to this package.
-    *model* overrides provider and model selection. *client* is for tests.
+    ``opencode serve``. A judge routed here gets its own session and runs as a
+    full OpenCode agent: the server's tools, in the server's working directory,
+    apply to the judge prompt too. This package does not offer a tool-less
+    judge agent. A Vega-local handler was rejected: the session boundary
+    belongs to this package. *model* overrides provider and model selection.
+    *client* is for tests.
     """
     if not isinstance(base_url, str) or not base_url:
         raise TypeError("The OpenCode handler requires a base_url.")
@@ -521,7 +528,9 @@ def opencode_agents(
     variables = kwargs.pop("variables", None)
     history = kwargs.pop("history", None)
     capture_content = kwargs.pop("capture_content", None)
-    base_url = kwargs.pop("base_url")
+    base_url = kwargs.pop("base_url", None)
+    if not isinstance(base_url, str) or not base_url:
+        raise TypeError("The OpenCode handler requires a base_url.")
     model = kwargs.pop("model", None)
     agent = kwargs.pop("agent", None)
     client = kwargs.pop("client", None)
@@ -566,7 +575,7 @@ def _create_opencode_handler(
         provider_id, model_id = resolve_model(
             config if isinstance(config, dict) else {}
         )
-        system = _system_text(config)
+        system = _system_text(config, variables)
         prompt = _user_prompt(config, user_input, history)
         try:
             set_input_content_attributes(
@@ -576,18 +585,21 @@ def _create_opencode_handler(
                 messages=_input_messages(user_input, history),
             )
             created = _Created()
-            async for event in _reduce_session(
-                created,
-                base_url=bound_url,
-                prompt=prompt,
-                system=system,
-                provider_id=provider_id,
-                model_id=model_id,
-                agent=bound_agent,
-                client=bound_client,
-                capture=capture,
-            ):
-                yield event
+            async with aclosing(
+                _reduce_session(
+                    created,
+                    base_url=bound_url,
+                    prompt=prompt,
+                    system=system,
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    agent=bound_agent,
+                    client=bound_client,
+                    capture=capture,
+                )
+            ) as reduced:
+                async for event in reduced:
+                    yield event
             output = "".join(created.deltas)
             if output:
                 set_output_content_attributes(
@@ -619,10 +631,12 @@ def _create_opencode_handler(
     ) -> dict[str, Any]:
         output = ""
         usage: dict[str, Any] = {}
-        async for event in _stream_impl(
-            config, user_input, tool_handlers, variables, history
-        ):
-            if event.get("type") == "done":
+        async with aclosing(
+            _stream_impl(config, user_input, tool_handlers, variables, history)
+        ) as stream:
+            async for event in stream:
+                if event.get("type") != "done":
+                    continue
                 raw_output = event.get("output")
                 output = raw_output if isinstance(raw_output, str) else ""
                 raw_usage = event.get("usage")
@@ -661,20 +675,24 @@ async def _reduce_session(
     """Reduce the session ``POST /session`` created. The reducer is unchanged."""
     session_ids: list[str] = []
     reducer: _Reducer | None = None
-    async for raw in session_events(
-        base_url=base_url,
-        prompt=prompt,
-        system=system,
-        provider_id=provider_id,
-        model_id=model_id,
-        agent=agent,
-        session_ids=session_ids,
-        client=client,
-    ):
-        if reducer is None:
-            reducer = _Reducer(capture_content=capture, session_id=session_ids[0])
-        async for event in reducer.reduce(_once(raw)):
-            yield event
+    async with aclosing(
+        session_events(
+            base_url=base_url,
+            prompt=prompt,
+            system=system,
+            provider_id=provider_id,
+            model_id=model_id,
+            agent=agent,
+            session_ids=session_ids,
+            client=client,
+        )
+    ) as raw_events:
+        async for raw in raw_events:
+            if reducer is None:
+                reducer = _Reducer(capture_content=capture, session_id=session_ids[0])
+            async with aclosing(reducer.reduce(_once(raw))) as reduced:
+                async for event in reduced:
+                    yield event
     if reducer is None:
         return
     for event in reducer.close():
@@ -687,12 +705,17 @@ async def _once(raw: dict[str, Any]) -> AsyncGenerator[dict[str, Any], None]:
     yield raw
 
 
-def _system_text(config: AiConfigRep) -> str | None:
+def _system_text(config: AiConfigRep, variables: dict[str, Any] | None) -> str | None:
+    """Agent instructions, with ``{{variables}}`` rendered.
+
+    History and the user turn are not rendered. A judge prompt is rendered
+    the same way, because a judge uses this handler.
+    """
     if not isinstance(config, dict):
         return None
     instructions = config.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
-        return instructions
+        return parse_template(instructions, variables or {})
     return None
 
 

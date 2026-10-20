@@ -38,6 +38,6 @@ Assistant text is emitted only after `message.updated` marks that message `role 
 
 The handler posts the prompt for the session it just opened. A caller that only watches a pre-existing session never sees that prompt.
 
-`provides_for` is `('*', 'agent')`, so a judge is routed here too. Each call opens its own session, so the judge prompt does not enter the agent's session and does not need `skip_judges=True`.
+`provides_for` is `('*', 'agent')`, so a judge is routed here too. Each call opens its own session, so the judge prompt does not enter the agent's session and does not need `skip_judges=True`. The judge still runs as a full OpenCode agent, with the server's tools, in the server's working directory. This package does not take a tool-less judge agent.
 
 The reducer does not adopt the first session on the bus. Other sessions are dropped, including their `session.error`. `session.idle` for this session ends the run.

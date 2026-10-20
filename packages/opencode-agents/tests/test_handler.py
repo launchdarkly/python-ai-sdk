@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
+from contextlib import aclosing
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -738,7 +740,7 @@ class TestStableStream:
     async def test_session_error_does_not_yield_stable_done(
         self, mock_ld_client: MagicMock
     ) -> None:
-        handler, _script = playing(
+        handler, script = playing(
             [
                 assistant_open("m1"),
                 text_delta("m1", "p1", "Hi"),
@@ -751,6 +753,7 @@ class TestStableStream:
                 seen.append(event)
         assert [event["type"] for event in seen] == ["chunk"]
         assert seen[0]["text"] == "Hi"
+        assert script.aborts
 
 
 class TestInvocation:
@@ -759,6 +762,8 @@ class TestInvocation:
             create_opencode_handler()  # type: ignore[call-arg]
         with pytest.raises(TypeError, match="base_url"):
             create_opencode_handler(base_url="")
+        with pytest.raises(TypeError, match="base_url"):
+            opencode_agents("flag", "hi", CONTEXT)
 
     async def test_the_first_session_on_the_stream_is_not_adopted(self) -> None:
         events = await collect(
@@ -918,7 +923,6 @@ class TestInvocation:
                 "judges": [{"key": "judge-flag", "samplingRate": 1}]
             },
         }
-        mock_ld_client.variation = AsyncMock(return_value=judged)
         handler, script = playing(
             [
                 assistant_open("m1"),
@@ -926,12 +930,27 @@ class TestInvocation:
                 assistant_completed("m1"),
             ]
         )
+
+        async def variation(key: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            if key == "judge-flag":
+                return {
+                    **VARIATION,
+                    "instructions": (
+                        "Grade {{response_to_evaluate}}. History: {{message_history}}"
+                    ),
+                }
+            return judged
+
+        mock_ld_client.variation = variation
         await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
         assert len(script.sessions) == 2
         assert script.sessions[0] != script.sessions[1]
         prompts = [message["parts"][0]["text"] for message in script.messages]
+        systems = [message.get("system", "") for message in script.messages]
         assert prompts[0] == "q"
-        assert prompts[1] != "q"
+        assert "{{response_to_evaluate}}" not in systems[1]
+        assert "{{message_history}}" not in systems[1]
+        assert "Hi" in systems[1]
 
     async def test_the_wrapper_posts_history_on_a_fresh_session(
         self, mock_ld_client: MagicMock
@@ -1117,6 +1136,165 @@ class TestInvocation:
             "do not record" not in tracer.spans[0].attributes["gen_ai.input.messages"]
         )
         assert "gen_ai.prompt.3.role" not in tracer.spans[0].attributes
+
+    async def test_a_failed_message_post_does_not_wait_for_the_bus(self) -> None:
+        script = _OpenBus(message_status=400)
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(base_url="http://opencode", client=client)
+
+        async def _run() -> None:
+            async for _event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            ):
+                return
+
+        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
+
+        with pytest.raises(OpenCodeHTTPError, match="400"):
+            await asyncio.wait_for(_run(), timeout=2)
+        assert script.aborts
+
+    async def test_breaking_aborts_without_waiting_for_gc(self) -> None:
+        script = _OpenBus()
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(base_url="http://opencode", client=client)
+
+        async def _run() -> None:
+            async with aclosing(
+                await handler.stream(
+                    {
+                        "instructions": "Be brief.",
+                        "model": {"name": "m"},
+                        "provider": {"name": "Acme"},
+                    },
+                    "hi",
+                    None,
+                    None,
+                )
+            ) as gen:
+                async for event in gen:
+                    if event["type"] == "TEXT_MESSAGE_CONTENT":
+                        break
+
+        await asyncio.wait_for(_run(), timeout=2)
+        assert script.aborts
+
+    async def test_a_late_completion_survives_the_post_returning(self) -> None:
+        script = _OpenBus(delay_tail=0.2)
+        client = httpx.AsyncClient(
+            transport=script.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(
+            base_url="http://opencode", client=client, capture_content=True
+        )
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi!"
+        assert seen[-1]["usage"]["output_tokens"] == 4
+
+    async def test_an_idle_without_a_session_id_does_not_end_the_run(self) -> None:
+        events = await collect(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                bus("session.idle"),
+                text_delta("m1", "p1", "!", session_id="ses"),
+                bus("session.idle", sessionID="ses"),
+            ]
+        )
+        assert events[-1]["output"] == "Hi!"
+
+
+class _ByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: Any) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self) -> Any:
+        async for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _OpenBus:
+    """An `/event` stream that stays open, unlike a finite ``Script`` body."""
+
+    def __init__(self, *, message_status: int = 200, delay_tail: float = 0) -> None:
+        self.message_status = message_status
+        self.delay_tail = delay_tail
+        self.sessions: list[str] = []
+        self.messages: list[dict[str, Any]] = []
+        self.aborts: list[str] = []
+        self.release = asyncio.Event()
+
+    def transport(self) -> httpx.MockTransport:
+        script = self
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/event" and request.method == "GET":
+
+                async def chunks() -> Any:
+                    head = [
+                        assistant_open("m1"),
+                        text_delta("m1", "p1", "Hi"),
+                    ]
+                    for event in head:
+                        yield f"data: {json.dumps(event)}\n\n".encode()
+                    if script.delay_tail:
+                        await asyncio.sleep(script.delay_tail)
+                        tail = [
+                            text_delta("m1", "p1", "!", session_id="ses"),
+                            assistant_completed("m1", tokens={"input": 1, "output": 4}),
+                            bus("session.idle", sessionID="ses"),
+                        ]
+                        for event in tail:
+                            yield f"data: {json.dumps(event)}\n\n".encode()
+                        return
+                    await script.release.wait()
+
+                return httpx.Response(200, stream=_ByteStream(chunks()))
+            if path == "/session" and request.method == "POST":
+                script.sessions.append("ses")
+                return httpx.Response(200, json={"id": "ses"})
+            if path.endswith("/message") and request.method == "POST":
+                script.messages.append(json.loads(request.content.decode()))
+                if script.message_status >= 400:
+                    return httpx.Response(script.message_status, json={})
+                if script.delay_tail:
+                    return httpx.Response(200, json={})
+                await script.release.wait()
+                return httpx.Response(200, json={})
+            if path.endswith("/abort") and request.method == "POST":
+                script.aborts.append(path)
+                script.release.set()
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        return httpx.MockTransport(handle)
 
 
 async def _drain(stream: Any) -> None:

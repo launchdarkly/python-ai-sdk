@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 import httpx
 
-DRAIN_SECONDS = 0.05
+# After the message POST returns, keep reading until this session's
+# ``session.idle``. A quiet bus ends the turn only after this fallback, so a
+# late ``message.updated`` is not dropped the way a 50 ms drain dropped it.
+DRAIN_FALLBACK_SECONDS = 5.0
+# Session create and abort. The message POST blocks for the whole turn, so
+# its timeout is longer, and still finite.
+HTTP_TIMEOUT_SECONDS = 30.0
+MESSAGE_TIMEOUT_SECONDS = 600.0
 
 ModelResolver = Callable[[dict[str, Any]], tuple[str, str]]
 
@@ -54,24 +61,30 @@ async def session_events(
     agent: str | None,
     session_ids: list[str],
     client: httpx.AsyncClient | None = None,
-) -> AsyncIterator[dict[str, Any]]:
+) -> AsyncGenerator[dict[str, Any], None]:
     """Open one session and yield its bus events.
 
     The event stream is opened before the message post. The post runs
-    concurrently with the read. ``session.idle`` ends the turn. A returned
-    post is followed by a brief drain. Leaving early cancels the post and
-    aborts the session.
+    concurrently with the read. This session's ``session.idle`` ends the
+    turn. A failed message POST raises without waiting for another bus
+    frame. Leaving early cancels the post and aborts the session.
     """
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=None)
+    http = client or httpx.AsyncClient(
+        timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=MESSAGE_TIMEOUT_SECONDS)
+    )
     base = base_url.rstrip("/")
     post: asyncio.Task[httpx.Response] | None = None
     session_id: str | None = None
     succeeded = False
     try:
-        async with http.stream("GET", f"{base}/event") as sse:
+        async with http.stream(
+            "GET",
+            f"{base}/event",
+            timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=None),
+        ) as sse:
             sse.raise_for_status()
-            created = await http.post(f"{base}/session")
+            created = await http.post(f"{base}/session", timeout=HTTP_TIMEOUT_SECONDS)
             if created.status_code >= 400:
                 raise OpenCodeHTTPError(f"POST /session -> {created.status_code}")
             session_id = _session_id(created.json())
@@ -85,7 +98,11 @@ async def session_events(
             if agent:
                 body["agent"] = agent
             post = asyncio.create_task(
-                http.post(f"{base}/session/{session_id}/message", json=body)
+                http.post(
+                    f"{base}/session/{session_id}/message",
+                    json=body,
+                    timeout=MESSAGE_TIMEOUT_SECONDS,
+                )
             )
             async for event in _read_until_done(sse, post, session_id):
                 yield event
@@ -99,8 +116,15 @@ async def session_events(
         if not succeeded and session_id is not None:
             if post is not None and not post.done():
                 post.cancel()
+                try:
+                    await post
+                except BaseException:
+                    pass
             try:
-                await http.post(f"{base}/session/{session_id}/abort")
+                await http.post(
+                    f"{base}/session/{session_id}/abort",
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                )
             except Exception:
                 pass
         if owns_client:
@@ -111,28 +135,71 @@ async def _read_until_done(
     response: httpx.Response,
     post: asyncio.Task[httpx.Response],
     session_id: str,
-) -> AsyncIterator[dict[str, Any]]:
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Read the bus until this session is idle, or the message POST fails.
+
+    The next SSE line is raced against the post task. A status of 400 or
+    higher raises immediately, even when ``/event`` stays open. After the
+    post returns successfully, reading continues until this session's
+    ``session.idle`` or ``DRAIN_FALLBACK_SECONDS`` of silence. An idle event
+    with no session id does not end the turn.
+    """
     lines = response.aiter_lines()
-    while True:
-        timeout = DRAIN_SECONDS if post.done() else None
-        try:
-            if timeout is None:
-                line = await lines.__anext__()
-            else:
-                line = await asyncio.wait_for(lines.__anext__(), timeout)
-        except StopAsyncIteration:
-            return
-        except TimeoutError:
-            return
-        event = _parse_frame(line)
-        if event is None:
-            continue
-        yield event
-        if event.get("type") != "session.idle":
-            continue
-        owner = _frame_session(event)
-        if owner is None or owner == session_id:
-            return
+    line_task: asyncio.Task[str | None] | None = None
+    try:
+        while True:
+            if post.done():
+                _raise_if_message_failed(post, session_id)
+            if line_task is None:
+                line_task = asyncio.create_task(_next_line(lines))
+            waiting: set[asyncio.Task[Any]] = {line_task}
+            if not post.done():
+                waiting.add(post)
+            finished, _pending = await asyncio.wait(
+                waiting,
+                timeout=DRAIN_FALLBACK_SECONDS if post.done() else None,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not finished:
+                return
+            if post in finished:
+                _raise_if_message_failed(post, session_id)
+            if line_task not in finished:
+                continue
+            line = line_task.result()
+            line_task = None
+            if line is None:
+                return
+            event = _parse_frame(line)
+            if event is None:
+                continue
+            yield event
+            if (
+                event.get("type") == "session.idle"
+                and _frame_session(event) == session_id
+            ):
+                return
+    finally:
+        if line_task is not None and not line_task.done():
+            line_task.cancel()
+
+
+async def _next_line(lines: Any) -> str | None:
+    try:
+        line = await lines.__anext__()
+    except StopAsyncIteration:
+        return None
+    return line if isinstance(line, str) else None
+
+
+def _raise_if_message_failed(
+    post: asyncio.Task[httpx.Response], session_id: str
+) -> None:
+    response = post.result()
+    if response.status_code >= 400:
+        raise OpenCodeHTTPError(
+            f"POST /session/{session_id}/message -> {response.status_code}"
+        )
 
 
 def _session_id(body: object) -> str:
