@@ -180,8 +180,16 @@ async def _read_until_done(
             ):
                 return
     finally:
+        # Cancel and await before the caller closes GET /event. A bare cancel
+        # leaves this read running into the closed stream. The quiet-bus
+        # return and a failed message POST both leave it pending.
         if line_task is not None and not line_task.done():
             line_task.cancel()
+        if line_task is not None:
+            try:
+                await line_task
+            except asyncio.CancelledError:
+                pass
 
 
 async def _next_line(lines: Any) -> str | None:

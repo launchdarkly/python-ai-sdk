@@ -1163,6 +1163,36 @@ class TestInvocation:
             await asyncio.wait_for(_run(), timeout=2)
         assert script.aborts
 
+    async def test_a_cancelled_sse_read_is_awaited_before_the_stream_closes(
+        self,
+    ) -> None:
+        bus = _CloseAfterRead()
+        client = httpx.AsyncClient(
+            transport=bus.transport(), base_url="http://opencode"
+        )
+        handler = create_opencode_handler(base_url="http://opencode", client=client)
+
+        async def _run() -> None:
+            async for _event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            ):
+                return
+
+        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
+
+        with pytest.raises(OpenCodeHTTPError, match="400"):
+            await asyncio.wait_for(_run(), timeout=2)
+        assert bus.read_finished.is_set()
+        assert bus.closed
+        assert not bus.closed_before_read_finished
+
     async def test_breaking_aborts_without_waiting_for_gc(self) -> None:
         script = _OpenBus()
         client = httpx.AsyncClient(
@@ -1225,6 +1255,48 @@ class TestInvocation:
             ]
         )
         assert events[-1]["output"] == "Hi!"
+
+
+class _CloseAfterRead(httpx.AsyncByteStream):
+    """``/event`` stays open. The message POST fails while the next read is blocked."""
+
+    def __init__(self) -> None:
+        self.second_read = asyncio.Event()
+        self.read_finished = asyncio.Event()
+        self.closed = False
+        self.closed_before_read_finished = False
+
+    def transport(self) -> httpx.MockTransport:
+        stream = self
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/event" and request.method == "GET":
+                return httpx.Response(200, stream=stream)
+            if path == "/session" and request.method == "POST":
+                return httpx.Response(200, json={"id": "ses"})
+            if path.endswith("/message") and request.method == "POST":
+                await stream.second_read.wait()
+                return httpx.Response(400, json={})
+            if path.endswith("/abort") and request.method == "POST":
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        return httpx.MockTransport(handle)
+
+    async def __aiter__(self) -> Any:
+        yield b":\n\n"
+        self.second_read.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.read_finished.set()
+            raise
+
+    async def aclose(self) -> None:
+        if not self.read_finished.is_set():
+            self.closed_before_read_finished = True
+        self.closed = True
 
 
 class _ByteStream(httpx.AsyncByteStream):
