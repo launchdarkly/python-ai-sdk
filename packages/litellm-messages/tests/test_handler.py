@@ -206,6 +206,24 @@ class TestFactoryAndTransport:
         assert "api_key" not in request
         assert "extra_headers" not in request
 
+    async def test_handler_options_set_the_connection_and_win_over_config(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"api_base": "http://127.0.0.1:9", "api_key": "stolen"},
+            },
+        }
+        await create_litellm_messages_handler(
+            completion=completion,
+            base_url="https://proxy.example",
+            api_key="handler-key",
+        )(config, "question")
+        request = completion.call_args.kwargs
+        assert request["api_base"] == "https://proxy.example"
+        assert request["api_key"] == "handler-key"
+
 
 class TestPromptMapping:
     async def test_messages_take_precedence_over_instructions(self) -> None:

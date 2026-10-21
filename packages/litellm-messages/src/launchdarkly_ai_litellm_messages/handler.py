@@ -183,6 +183,8 @@ def _request(
     tools: list[dict[str, Any]],
     *,
     stream: bool,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     model = config_value.get("model") or {}
     raw_parameters = model.get("parameters")
@@ -202,6 +204,11 @@ def _request(
             "stream": stream,
         }
     )
+    # Connection settings come from the handler, never from model.parameters (see above).
+    if base_url is not None:
+        parameters["api_base"] = base_url
+    if api_key is not None:
+        parameters["api_key"] = api_key
     if tools:
         parameters["tools"] = tools
     if stream:
@@ -366,12 +373,17 @@ def create_litellm_messages_handler(
     *,
     completion: Completion | None = None,
     capture_content: bool | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> ProviderHandler:
     report_usage(
         "litellm-messages.createLiteLLMMessagesHandler", PACKAGE_NAME, __version__
     )
     return _create_litellm_messages_handler(
-        completion=completion, capture_content=capture_content
+        completion=completion,
+        capture_content=capture_content,
+        base_url=base_url,
+        api_key=api_key,
     )
 
 
@@ -379,6 +391,8 @@ def _create_litellm_messages_handler(
     *,
     completion: Completion | None = None,
     capture_content: bool | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_litellm_messages_handler`, used by this package's wrappers."""
     content_override = capture_content
@@ -423,7 +437,14 @@ def _create_litellm_messages_handler(
                             messages=_span_messages(messages),
                         )
                     response = await completion(
-                        **_request(config_value, messages, tools, stream=False)
+                        **_request(
+                            config_value,
+                            messages,
+                            tools,
+                            stream=False,
+                            base_url=base_url,
+                            api_key=api_key,
+                        )
                     )
                     turn_usage = _usage(response)
                     usage_reported = usage_reported or _usage_reported(response)
@@ -507,6 +528,8 @@ def _create_litellm_messages_handler(
             variables or {},
             history,
             capture_content=effective_capture_content(content_override),
+            base_url=base_url,
+            api_key=api_key,
         )
 
     return _create_handler(
@@ -526,6 +549,8 @@ async def _stream(
     history: list[dict[str, Any]] | None,
     *,
     capture_content: bool,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     messages = _build_messages(config_value, user_input, variables, history)
     tools = _build_tools(config_value, handlers)
@@ -558,7 +583,14 @@ async def _stream(
                         messages=_span_messages(messages),
                     )
                 provider_stream = await completion(
-                    **_request(config_value, messages, tools, stream=True)
+                    **_request(
+                        config_value,
+                        messages,
+                        tools,
+                        stream=True,
+                        base_url=base_url,
+                        api_key=api_key,
+                    )
                 )
                 fragments: dict[int, dict[str, Any]] = {}
                 turn_text = ""
@@ -679,9 +711,13 @@ def litellm_messages(
 ) -> Any:
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
+    base_url = kwargs.pop("base_url", None)
+    api_key = kwargs.pop("api_key", None)
     report_usage("litellm-messages.litellmMessages", PACKAGE_NAME, __version__)
     return _config(
         key=config_key,
-        handler=_create_litellm_messages_handler(capture_content=capture_content),
+        handler=_create_litellm_messages_handler(
+            capture_content=capture_content, base_url=base_url, api_key=api_key
+        ),
         **kwargs,
     ).invoke(user_input, context, variables)

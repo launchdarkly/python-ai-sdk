@@ -331,6 +331,22 @@ class TestAgentToolsAndRun:
     def test_unusable_reasoning_is_dropped(self, reasoning: Any) -> None:
         assert handler_mod._model_settings({"reasoning": reasoning}).reasoning is None
 
+    def test_model_config_reads_either_spelling_and_snake_case_wins(self) -> None:
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {
+                    "topP": 0.4,
+                    "maxTurns": 5,
+                    "top_p": 0.9,
+                },
+            },
+        }
+        _, parameters = handler_mod._model_config(config)
+        assert parameters["top_p"] == 0.9
+        assert parameters["max_turns"] == 5
+
     async def test_history_uses_agents_sdk_structured_input(self) -> None:
         run = AsyncMock(
             return_value=SimpleNamespace(

@@ -16,6 +16,11 @@ credentials required by the models in your AI Config, such as
 `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. Standard LiteLLM configuration,
 gateways, and model aliases are supported.
 
+To route every call through a specific endpoint or key instead (for example a
+LiteLLM proxy), pass `base_url` / `api_key` to `create_litellm_messages_handler`.
+These come from your code, never from the AI Config's `model.parameters` — an
+AI Config variation cannot redirect the request.
+
 ## Usage
 
 ```python

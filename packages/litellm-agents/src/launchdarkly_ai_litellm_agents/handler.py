@@ -97,15 +97,34 @@ class _JsonSchemaOutput(AgentOutputSchemaBase):
         return json.loads(json_str)
 
 
+# AI Configs are authored in snake_case, but a caller may also pass camelCase (spec §2.x.1:
+# "either spelling is read"). snake_case wins when a bag sets both.
+_CAMEL_TO_SNAKE_FIELDS = {
+    "topP": "top_p",
+    "maxTurns": "max_turns",
+    "frequencyPenalty": "frequency_penalty",
+    "presencePenalty": "presence_penalty",
+    "toolChoice": "tool_choice",
+    "parallelToolCalls": "parallel_tool_calls",
+    "maxTokens": "max_tokens",
+}
+
+
+def _normalized_parameters(raw: dict[str, Any]) -> dict[str, Any]:
+    result = dict(raw)
+    for camel, snake in _CAMEL_TO_SNAKE_FIELDS.items():
+        if camel in result:
+            value = result.pop(camel)
+            result.setdefault(snake, value)
+    return result
+
+
 def _model_config(config_value: AiConfigRep) -> tuple[str, dict[str, Any]]:
     model = config_value.get("model") or {}
     raw = model.get("parameters")
     allowed = _MODEL_SETTING_FIELDS | {"max_turns"}
-    parameters = (
-        {key: value for key, value in raw.items() if key in allowed}
-        if isinstance(raw, dict)
-        else {}
-    )
+    normalized = _normalized_parameters(raw) if isinstance(raw, dict) else {}
+    parameters = {key: value for key, value in normalized.items() if key in allowed}
     return str(model.get("name") or ""), parameters
 
 
