@@ -1,9 +1,8 @@
 """LaunchDarkly AI SDK integration for TypeSafe Jev."""
 
-__version__ = "0.1.0"  # x-release-please-version
-
 from launchdarkly_ai_server import register_ai_sdk_package
 
+from ._version import PACKAGE_NAME, __version__
 from .handler import create_typesafe_handler
 from .questions import (
     TypesafeQuestionError,
@@ -22,4 +21,4 @@ __all__ = [
     "score_from_answer",
 ]
 
-register_ai_sdk_package("launchdarkly-ai-typesafe", __version__)
+register_ai_sdk_package(PACKAGE_NAME, __version__)

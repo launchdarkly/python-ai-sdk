@@ -13,7 +13,8 @@ from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
-    create_handler,
+    _create_handler,
+    report_usage,
     set_input_content_attributes,
     set_ld_span_attributes,
     set_model_identity_attributes,
@@ -23,6 +24,7 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.utils import SpanUsage
 
+from ._version import PACKAGE_NAME, __version__
 from .questions import (
     build_typesafe_state,
     extract_typesafe_questions,
@@ -84,6 +86,7 @@ def create_typesafe_handler(*, capture_content: bool = False) -> ProviderHandler
     ``TypeSafe`` selects this handler. ``TYPESAFE_API_KEY`` is read by the
     TypeSafe client from the environment.
     """
+    report_usage("typesafe.createTypesafeHandler", PACKAGE_NAME, __version__)
 
     async def _call(
         config: AiConfigRep,
@@ -158,6 +161,6 @@ def create_typesafe_handler(*, capture_content: bool = False) -> ProviderHandler
             chat.end()
             root.end()
 
-    return create_handler(
+    return _create_handler(
         ("TypeSafe", "messages"), _call, capture_content=capture_content
     )
