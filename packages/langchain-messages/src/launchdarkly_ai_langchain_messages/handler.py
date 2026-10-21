@@ -87,7 +87,9 @@ _LANGCHAIN_RUNTIME_KEYS = frozenset(
 #: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
 #: stays exhaustive as the SDK's own pydantic model changes.
 #:
-#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12). ``seed`` is
+#: marked not supported in TypeScript there: the JS ``ChatOpenAI`` takes it only as a per-call
+#: option, while this handler sets it on the constructor, which has a ``seed`` field.
 _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -97,6 +99,7 @@ _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
         "max_tokens",
         "n",
         "presence_penalty",
+        "seed",
         "service_tier",
         "stop",
         "stop_sequences",
@@ -129,7 +132,6 @@ _CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 #: * ``reasoning_effort``: the Chat Completions spelling of ``reasoning``, left out with it so a
 #:   config cannot set reasoning by one spelling and not the other.
 #: * ``store``: data retention. It decides whether the request is kept on the server.
-#: * ``seed``: not on the cross-SDK list.
 #: * ``prompt_cache_key``: cut from the cross-SDK list, because ``ChatOpenAI`` has no such field
 #:   and the spec cuts a key rather than work around it. It is not in the set below because
 #:   ``ChatOpenAI`` does not accept it at all, which the drift test requires of every listed key.
@@ -174,7 +176,6 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "context_management",
     "reasoning_effort",
     "store",
-    "seed",
 }
 
 #: Every key ``ChatAnthropic`` accepts (field names plus pydantic aliases), classified the same way
