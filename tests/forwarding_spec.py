@@ -104,6 +104,31 @@ LITELLM_AGENTS = frozenset(
     }
 )
 
+#: The Vercel AI SDK list as the Python ``ai`` library sends it, for both Vercel handlers and the
+#: vercel-agents native graph. It drops ``stop_sequences``, which the Python library has no field
+#: for, and adds ``max_tool_calls``, ``parallel_tool_calls``, ``prompt_cache_key`` and
+#: ``service_tier``, which it takes as typed request params.
+VERCEL = frozenset(
+    {
+        "frequency_penalty",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "max_tokens",
+        "max_tool_calls",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "prompt_cache_key",
+        "reasoning",
+        "reasoning_effort",
+        "seed",
+        "service_tier",
+        "temperature",
+        "tool_choice",
+        "top_k",
+        "top_p",
+    }
+)
+
 LANGCHAIN_CHAT_OPENAI = frozenset(
     {
         "frequency_penalty",
