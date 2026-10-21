@@ -1109,7 +1109,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_langchain_messages.handler import langchain_messages
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1132,7 +1132,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_langchain_messages.handler import langchain_messages
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1178,10 +1178,231 @@ class TestStreaming:
         llm = self._make_streaming_llm(["hello ", "world"])
         h = create_langchain_messages_handler(llm=llm)
         events = [e async for e in await h.stream(CONFIG, "q")]
-        chunks = [e for e in events if e.get("type") == "chunk"]
-        assert len(chunks) == 2
-        assert chunks[0]["text"] == "hello "
-        assert chunks[1]["text"] == "world"
+        deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["hello ", "world"]
+
+    async def test_later_tool_arg_chunks_keep_the_first_id(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [
+            {"name": "search", "id": "c1", "index": 0, "args": '{"q":'}
+        ]
+        second = FakeAIMessage("")
+        second.tool_call_chunks = [{"index": 0, "args": '"x"}'}]
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield first
+            yield second
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [event async for event in await handler.stream(CONFIG, "q")]
+        args = "".join(
+            event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
+        )
+        assert args == '{"q":"x"}'
+
+    async def test_a_later_arg_chunk_without_an_index_keeps_the_only_id(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [{"name": "search", "id": "c1", "args": '{"q":'}]
+        second = FakeAIMessage("")
+        second.tool_call_chunks = [{"args": '"x"}'}]
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield first
+            yield second
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [event async for event in await handler.stream(CONFIG, "q")]
+        args = "".join(
+            event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
+        )
+        assert args == '{"q":"x"}'
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["toolCallId"] == "c1"
+        assert result["metadata"]["launchdarkly"]["toolFailed"] is True
+        assert events.index(result) < len(events) - 1
+        assert events[-1]["type"] == "done"
+
+    async def test_a_gathered_call_list_that_omits_a_started_call_closes_it(
+        self,
+    ) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [
+            {"name": "search", "id": "c1", "args": "{}"},
+            {"name": "other", "id": "c2", "args": "{}"},
+        ]
+        second = FakeAIMessage(
+            "",
+            tool_calls=[{"name": "search", "id": "c1", "args": {}}],
+        )
+        done = FakeAIMessage("ok")
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        turns = [[first, second], [done]]
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            for chunk in turns.pop(0):
+                yield chunk
+
+        llm.astream = _astream
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [
+            event
+            async for event in await handler.stream(
+                CONFIG, "q", {"search": lambda _args: "found"}
+            )
+        ]
+        results = {
+            event["toolCallId"]: event
+            for event in events
+            if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results["c1"]["content"] == "found"
+        assert "metadata" not in results["c1"]
+        assert results["c2"]["metadata"]["launchdarkly"]["toolFailed"] is True
+        ok = next(
+            event
+            for event in events
+            if event["type"] == "TEXT_MESSAGE_CONTENT" and event["delta"] == "ok"
+        )
+        assert events.index(results["c2"]) < events.index(ok)
+
+    async def test_a_provider_error_closes_the_open_text(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield FakeAIMessage("Hello")
+            raise RuntimeError("stream broke")
+
+        llm.astream = _astream
+        seen: list[dict[str, Any]] = []
+        handler = create_langchain_messages_handler(llm=llm)
+        with pytest.raises(RuntimeError, match="stream broke"):
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        start = next(event for event in seen if event["type"] == "TEXT_MESSAGE_START")
+        end = next(event for event in seen if event["type"] == "TEXT_MESSAGE_END")
+        assert end["messageId"] == start["messageId"]
+
+    async def test_tool_end_completes_a_truncated_argument_prefix(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = FakeAIMessage("")
+        first.tool_call_chunks = [{"name": "search", "id": "c1", "args": '{"q":'}]
+        second = FakeAIMessage(
+            "",
+            tool_calls=[{"name": "search", "id": "c1", "args": {"q": "x"}}],
+        )
+        done = FakeAIMessage("ok")
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        turns = [first, second]
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            if turns:
+                yield turns.pop(0)
+                if turns:
+                    yield turns.pop(0)
+                return
+            yield done
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [
+            event
+            async for event in await handler.stream(
+                CONFIG, "q", {"search": lambda _args: "found"}
+            )
+        ]
+        args = "".join(
+            event["delta"] for event in events if event["type"] == "TOOL_CALL_ARGS"
+        )
+        assert args == '{"q":"x"}'
+
+    async def test_parallel_chunks_use_the_gathered_tool_calls(self) -> None:
+        from langchain_core.messages import AIMessageChunk
+
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        first = AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {"name": "search", "args": "", "id": "call_1", "index": 0}
+            ],
+        )
+        second = AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {"name": None, "args": '{"q":', "id": None, "index": 0},
+                {"name": "other", "args": "", "id": "call_2", "index": 1},
+            ],
+        )
+        third = AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {"name": None, "args": '"x"}', "id": None, "index": 0},
+                {"name": None, "args": "{}", "id": None, "index": 1},
+            ],
+        )
+        seen: list[dict[str, Any]] = []
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=llm)
+        first_turn = True
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            nonlocal first_turn
+            if first_turn:
+                first_turn = False
+                yield first
+                yield second
+                yield third
+                return
+            yield FakeAIMessage("ok")
+
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=FakeAIMessage(""))
+
+        def search(args: dict[str, Any]) -> str:
+            seen.append(args)
+            return "found"
+
+        def other(args: dict[str, Any]) -> str:
+            seen.append(args)
+            return "also"
+
+        handler = create_langchain_messages_handler(llm=llm, capture_content=True)
+        events = [
+            event
+            async for event in await handler.stream(
+                CONFIG, "q", {"search": search, "other": other}
+            )
+        ]
+        starts = [
+            event["toolCallId"]
+            for event in events
+            if event["type"] == "TOOL_CALL_START"
+        ]
+        assert starts == ["call_1", "call_2"]
+        assert seen == [{"q": "x"}, {}]
+        assert events[-1]["type"] == "done"
+        assert "ok" in events[-1]["output"]
 
     async def test_streams_text_while_ignoring_thinking_blocks(self) -> None:
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
@@ -1200,7 +1421,13 @@ class TestStreaming:
                 CONFIG, "q"
             )
         ]
-        assert {"type": "chunk", "text": "visible answer"} in events
+        assert {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": events[1]["messageId"]
+            if events[0]["type"] == "TEXT_MESSAGE_START"
+            else events[0]["messageId"],
+            "delta": "visible answer",
+        } in events
         assert events[-1]["output"] == "visible answer"
 
     async def test_yields_exactly_one_done_event(self) -> None:
@@ -1376,6 +1603,28 @@ class TestStreamingTelemetry:
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
+
+    async def test_process_default_is_read_on_the_streaming_path(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            ctx, rec = _recording()
+            from launchdarkly_ai_langchain_messages import (
+                create_langchain_messages_handler,
+            )
+
+            llm = self._make_streaming_llm(["hi"])
+            with ctx:
+                async for _ in await create_langchain_messages_handler(llm=llm).stream(
+                    CONFIG, "q"
+                ):
+                    pass
+            assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+        finally:
+            _reset_for_testing()
 
 
 # ---------------------------------------------------------------------------
@@ -1642,8 +1891,8 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "create_langchain_messages_handler", _factory),
-            patch.object(handler_mod, "config", fake_config),
+            patch.object(handler_mod, "_create_langchain_messages_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.langchain_messages("k", "q", {}, **kwargs)
         seen["config_kwargs"] = fake_config.call_args.kwargs
@@ -1655,8 +1904,11 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in seen["config_kwargs"]
 
-    def test_defaults_to_off(self) -> None:
-        assert self._run()["capture_content"] is False
+    def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
+        assert self._run()["capture_content"] is None
+
+    def test_explicit_false_reaches_the_factory(self) -> None:
+        assert self._run(capture_content=False)["capture_content"] is False
 
 
 class TestChatSpanAndTeardownNeverLeak:
@@ -2583,5 +2835,6 @@ class TestModelSource:
             ]
         assert seen[0]["model"]["parameters"] == {"temperature": 0.2}
         assert any(
-            e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
+            e.get("type") == "TEXT_MESSAGE_CONTENT" and e.get("delta") == "streamed"
+            for e in events
         )

@@ -31,7 +31,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_claude_agents/__init__.py"
+        "src/launchdarkly_ai_claude_agents/_version.py"
       ],
       "component": "launchdarkly-ai-claude-agents"
     },
@@ -42,7 +42,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_claude_messages/__init__.py"
+        "src/launchdarkly_ai_claude_messages/_version.py"
       ],
       "component": "launchdarkly-ai-claude-messages"
     },
@@ -53,9 +53,20 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_openai_agents/__init__.py"
+        "src/launchdarkly_ai_openai_agents/_version.py"
       ],
       "component": "launchdarkly-ai-openai-agents"
+    },
+    "packages/litellm-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_litellm_agents/_version.py"
+      ],
+      "component": "launchdarkly-ai-litellm-agents"
     },
     "packages/openai-messages": {
       "release-type": "python",
@@ -64,9 +75,20 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_openai_messages/__init__.py"
+        "src/launchdarkly_ai_openai_messages/_version.py"
       ],
       "component": "launchdarkly-ai-openai-messages"
+    },
+    "packages/litellm-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_litellm_messages/_version.py"
+      ],
+      "component": "launchdarkly-ai-litellm-messages"
     },
     "packages/langchain-agents": {
       "release-type": "python",
@@ -75,7 +97,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_langchain_agents/__init__.py"
+        "src/launchdarkly_ai_langchain_agents/_version.py"
       ],
       "component": "launchdarkly-ai-langchain-agents"
     },
@@ -86,31 +108,40 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_langchain_messages/__init__.py"
+        "src/launchdarkly_ai_langchain_messages/_version.py"
       ],
       "component": "launchdarkly-ai-langchain-messages"
     },
-    "packages/litellm-agents": {
+    "packages/opencode-agents": {
       "release-type": "python",
       "versioning": "default",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_litellm_agents/__init__.py"
+        "src/launchdarkly_ai_opencode_agents/_version.py"
       ],
-      "component": "launchdarkly-ai-litellm-agents"
-    },
-    "packages/litellm-messages": {
-      "release-type": "python",
-      "versioning": "default",
-      "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
-      "include-v-in-tag": false,
-      "extra-files": [
-        "src/launchdarkly_ai_litellm_messages/__init__.py"
-      ],
-      "component": "launchdarkly-ai-litellm-messages"
+      "component": "launchdarkly-ai-opencode-agents"
     }
-  }
+  },
+  "changelog-sections": [
+    { "type": "feat", "scope": "skills", "section": "Experimental" },
+    { "type": "fix", "scope": "skills", "section": "Experimental" },
+    { "type": "perf", "scope": "skills", "section": "Experimental" },
+    { "type": "feat", "scope": "evaluations", "section": "Experimental" },
+    { "type": "fix", "scope": "evaluations", "section": "Experimental" },
+    { "type": "perf", "scope": "evaluations", "section": "Experimental" },
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance Improvements" },
+    { "type": "deps", "section": "Dependencies" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "style", "section": "Styles", "hidden": true },
+    { "type": "chore", "section": "Miscellaneous Chores", "hidden": true },
+    { "type": "refactor", "section": "Code Refactoring", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "build", "section": "Build System", "hidden": true },
+    { "type": "ci", "section": "Continuous Integration", "hidden": true }
+  ]
 }

@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.4...launchdarkly-ai-server-0.3.0) (2026-10-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **evaluations:** take tools as a list of EvalTool, with inline definitions ([#105](https://github.com/launchdarkly/python-ai-sdk/issues/105))
+* **evaluations:** rename Tool to EvalTool, freeze it, and make tools.get async
+* **evaluations:** take tools as a list of Tool
+
+### Experimental
+
+* **evaluations:** let tools= override a variation's tools ([90b293c](https://github.com/launchdarkly/python-ai-sdk/commit/90b293c17b461c5459dfbd9b7d5e6a9a288d6a89))
+* **evaluations:** Model resolution for remote AI config fetch ([#147](https://github.com/launchdarkly/python-ai-sdk/issues/147)) ([0b4df05](https://github.com/launchdarkly/python-ai-sdk/commit/0b4df05e6d4b5883b44c90c291644cbbf9c53140))
+* **evaluations:** rename Tool to EvalTool, freeze it, and make tools.get async ([4b8a819](https://github.com/launchdarkly/python-ai-sdk/commit/4b8a81936b9345048be7c05cd9842e07a32a421d))
+* **evaluations:** take tools as a list of EvalTool, with inline definitions ([#105](https://github.com/launchdarkly/python-ai-sdk/issues/105)) ([cad1547](https://github.com/launchdarkly/python-ai-sdk/commit/cad1547154270695c0e9a8673a4daa12a8161a35))
+* **evaluations:** take tools as a list of Tool ([0a92b13](https://github.com/launchdarkly/python-ai-sdk/commit/0a92b13a75869361c28a6efb5cf6b94bfdb5907c))
+* **skills:** add experimental Agent Skills under `launchdarkly_ai_server.experimental.skills` ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Features
+
+* **AIC-3495:** record which public helpers an application calls ([#145](https://github.com/launchdarkly/python-ai-sdk/issues/145)) ([19d2c2b](https://github.com/launchdarkly/python-ai-sdk/commit/19d2c2baf35440af57ed57f12f0413e524de27fa))
+* **client:** warn about unrecognized `init_client` options instead of ignoring them silently ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Bug Fixes
+
+* **client:** `init_client` adopts a client only after telemetry setup succeeds, and closes a client it built when setup fails ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+* **client:** `shutdown()` releases the global OpenTelemetry tracer provider the SDK registered, so a later `init_client` exports spans again ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Documentation
+
+* **evaluations:** call the credential an API key, not a token ([7a238e5](https://github.com/launchdarkly/python-ai-sdk/commit/7a238e573f3aaeed62963ccd4338ffb14c9ca573))
+
 ## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.3...launchdarkly-ai-server-0.2.4) (2026-09-30)
 
 
