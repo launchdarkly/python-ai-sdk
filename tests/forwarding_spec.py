@@ -34,6 +34,7 @@ OPENAI_MESSAGES = frozenset(
         "max_output_tokens",
         "max_completion_tokens",
         "max_tokens",
+        "max_tool_calls",
         "parallel_tool_calls",
         "prompt_cache_key",
         "reasoning",

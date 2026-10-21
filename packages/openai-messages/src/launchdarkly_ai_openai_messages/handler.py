@@ -70,10 +70,13 @@ from .spans import (
 #:
 #: This is the cross-SDK list for OpenAI Messages (TESTING.md section 1.12). The same list serves
 #: ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves the
-#: same whichever is called.
+#: same whichever is called. ``max_tool_calls`` is marked not supported in TypeScript there: the JS
+#: ``openai`` SDK's ``responses.create`` has no such parameter, while this SDK's ``create`` and
+#: ``stream`` both take it.
 _RESPONSES_FORWARDED_KEYS = frozenset(
     {
         "max_output_tokens",
+        "max_tool_calls",
         "parallel_tool_calls",
         "prompt_cache_key",
         "reasoning",
@@ -109,8 +112,6 @@ _RESPONSES_MAPPING_KEYS = frozenset({"reasoning"})
 #:   builds the input from the config's own instructions and messages, and a server-side prompt
 #:   template or a second instructions string would replace or add to it.
 #: * ``moderation``: safety configuration.
-#: * ``max_tool_calls``: cut from the cross-SDK list, because the JS ``openai`` SDK's
-#:   ``responses.create`` has no such parameter and the spec cuts a key rather than work around it.
 #: * ``text_format``: API-shape switch. Only ``.stream`` accepts it, and it is a Python type to
 #:   parse into, which a config cannot express. Structured output goes through ``text``, which the
 #:   handler owns.
@@ -138,7 +139,6 @@ _RESPONSES_EXCLUDED_KEYS = frozenset(
         "prompt",
         "instructions",
         "moderation",
-        "max_tool_calls",
         "text_format",
         "timeout",
         "extra_headers",
