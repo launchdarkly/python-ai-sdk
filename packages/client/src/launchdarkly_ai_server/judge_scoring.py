@@ -65,6 +65,55 @@ def numeric_score(score: Any) -> float | None:
     return value if isfinite(value) else None
 
 
+def typesafe_judge_entries(raw: Any) -> list[dict[str, Any]] | None:
+    """Parse a TypeSafe handler payload into question key, score, event key, and reason.
+
+    Returns ``None`` when ``raw`` is not a TypeSafe multi-result payload, so a
+    classic ``{"score", "reasoning"}`` judge stays on :func:`parse_judge_response`.
+    Raises ``ValueError`` when the payload claims to be TypeSafe but is malformed.
+    """
+    parsed: Any
+    if isinstance(raw, str):
+        parsed = parse_json_with_possible_fences(raw)
+    elif isinstance(raw, Mapping):
+        parsed = raw
+    else:
+        parsed = None
+    if not isinstance(parsed, Mapping) or parsed.get("kind") != "typesafe":
+        return None
+    results = parsed.get("results")
+    if not isinstance(results, list) or not results:
+        raise ValueError("TypeSafe judge output is missing results")
+    entries: list[dict[str, Any]] = []
+    for item in results:
+        if (
+            not isinstance(item, Mapping)
+            or not isinstance(item.get("key"), str)
+            or not item["key"]
+        ):
+            raise ValueError("TypeSafe judge result is missing a key")
+        score = numeric_score(item.get("score"))
+        if score is None:
+            raise ValueError(
+                f"TypeSafe judge result {item['key']!r} is missing a finite score"
+            )
+        event_key = item.get("eventKey")
+        if not isinstance(event_key, str) or not event_key:
+            raise ValueError(
+                f"TypeSafe judge result {item['key']!r} is missing an eventKey"
+            )
+        reason = item.get("reason")
+        entries.append(
+            {
+                "key": item["key"],
+                "score": score,
+                "eventKey": event_key,
+                "reason": reason if isinstance(reason, str) else "",
+            }
+        )
+    return entries
+
+
 def parse_judge_response(raw: Any) -> tuple[Any, str]:
     """Parse a judge model response into ``(score, reasoning)``.
 

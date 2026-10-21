@@ -30,14 +30,14 @@ A run opens one `invoke_agent` span and sets `launchdarkly.operation.type`. The 
 
 ## Call shape
 
-`create_opencode_handler(*, events, session_id, capture_content=None)` returns a `ProviderHandler`. `events` and `session_id` are required. Each invocation calls `events(config, user_input, variables, history, session_id)` and expects a fresh async iterable.
+`create_opencode_handler(*, base_url, capture_content=None, model=None, agent=None)` returns a `ProviderHandler`. `base_url` is a running `opencode serve`. The handler owns the HTTP client. Each call opens its own session.
 
 Assistant text is emitted only after `message.updated` marks that message `role == "assistant"`. A part snapshot is the full text of that part so far; a later delta appends. A text delta without `partID` is dropped.
 
 ## Common pitfalls
 
-The AI Config, user input, variables, and history are arguments to `events`. A callable that ignores them never sees the prompt.
+The handler posts the prompt for the session it just opened. A caller that only watches a pre-existing session never sees that prompt.
 
-`provides_for` is `('*', 'agent')`, so a judge is routed here too. Pass `skip_judges=True` until this handler runs the prompt it is given. Otherwise `events` runs again on the judge prompt and the score is wrong.
+`provides_for` is `('*', 'agent')`, so a judge is routed here too. Each call opens its own session, so the judge prompt does not enter the agent's session and does not need `skip_judges=True`. The judge still runs as a full OpenCode agent, with the server's tools, in the server's working directory. This package does not take a tool-less judge agent.
 
-`session_id` is required. The reducer does not adopt the first session on a shared stream. Other sessions are dropped, including their `session.error`. `session.idle` for this session ends the run. If the iterable is a server-wide stream and you neither send `session.idle` nor close it, `done` never arrives.
+The reducer does not adopt the first session on the bus. Other sessions are dropped, including their `session.error`. `session.idle` for this session ends the run.

@@ -194,6 +194,58 @@ class TestRunJudges:
         assert effective.get("instructions") is not None
         assert effective.get("messages") == []
 
+    async def test_exact_provider_beats_an_earlier_wildcard(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        seen: list[str] = []
+
+        def handler_for(name: str, provider: str) -> ProviderHandler:
+            async def fn(
+                config, user_input, tool_handlers, variables, history=None
+            ) -> dict:  # type: ignore[override]
+                seen.append(name)
+                return {
+                    "output": '{"score": 0.5, "reasoning": "ok"}',
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+
+            return ProviderHandler(fn=fn, provides_for=(provider, "messages"))  # type: ignore[arg-type]
+
+        wildcard = handler_for("wildcard", "*")
+        typesafe = handler_for("typesafe", "TypeSafe")
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "jev"},
+                "provider": {"name": "TypeSafe"},
+                "instructions": "judge",
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "OpenAI"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "jev", "samplingRate": 1.0}]},
+        }
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=wildcard,
+                handlers=[wildcard, typesafe],
+                user_input="question",
+                llm_response="answer",
+                base_track_data={},
+            )
+        assert seen == ["typesafe"]
+
     async def test_exact_agent_handler_fallback_collapses_messages(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -481,7 +533,7 @@ class TestRunJudgeScoreReporting:
 
 
 class TestRunJudgeTrackData:
-    """§3.13 run_judge result track_data must not inherit the parent's model stamps."""
+    """§3.13 run_judge result track_data carries the evaluated (parent) config identity."""
 
     PARENT: ClassVar[dict[str, Any]] = {
         "runId": "parent-run",
@@ -548,42 +600,227 @@ class TestRunJudgeTrackData:
         )
         return await run_judge(task, [handler])
 
-    async def test_does_not_inherit_parent_model_stamps(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_matches_inline_track_data(
+        self, monkeypatch: pytest.MonkeyPatch, mock_ld_client: MagicMock
     ) -> None:
-        result = await self._run(
-            monkeypatch,
-            {
-                "runId": "judge-run",
-                "configKey": "judge-key",
-                "variationKey": "j1",
-                "version": 1,
-                "modelName": "claude",
-                "providerName": "TestProvider",
-            },
-        )
-        assert result is not None
-        assert "modelKey" not in result.track_data
-        assert "modelVersion" not in result.track_data
-        assert result.track_data["judgeConfigKey"] == "judge-key"
-        assert result.track_data["graphKey"] == "g1"
+        # The judge's own track_data differs on every identity key; none of it
+        # may leak into the result, which must equal what run_judges tracks.
+        import random
 
-    async def test_keeps_judge_own_model_stamps(
-        self, monkeypatch: pytest.MonkeyPatch
+        judge_track_data = {
+            "runId": "judge-run",
+            "configKey": "judge-key",
+            "variationKey": "j1",
+            "version": 3,
+            "modelName": "claude",
+            "providerName": "TestProvider",
+            "modelKey": "judge-model",
+            "modelVersion": 2,
+        }
+        result = await self._run(monkeypatch, judge_track_data)
+        assert result is not None
+        assert result.track_data == {**self.PARENT, "judgeConfigKey": "judge-key"}
+
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "claude"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+                "evaluationMetricKey": "judge-metric",
+                "_ldMeta": {"enabled": True, "variationKey": "j1", "version": 3},
+            }
+        )
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config={
+                    "model": {"name": "gpt-4o"},
+                    "provider": {"name": "TestProvider"},
+                    "instructions": "hi",
+                    "judgeConfiguration": {
+                        "judges": [{"key": "judge-key", "samplingRate": 1.0}]
+                    },
+                },
+                user_context=CONTEXT,
+                handler=_make_handler(),
+                user_input="q",
+                llm_response="response",
+                base_track_data=dict(self.PARENT),
+            )
+        inline_track_data = mock_ld_client.track.call_args.args[2]
+        assert result.track_data == inline_track_data
+
+
+class TestTypesafeJudgeResults:
+    async def test_expands_labels_and_tracks_each_event_key(
+        self, mock_ld_client: MagicMock
     ) -> None:
-        result = await self._run(
-            monkeypatch,
+        import json
+        import random
+
+        payload = json.dumps(
             {
-                "runId": "judge-run",
-                "configKey": "judge-key",
-                "variationKey": "j1",
-                "version": 1,
-                "modelName": "claude",
-                "providerName": "TestProvider",
-                "modelKey": "judge-model",
-                "modelVersion": 2,
-            },
+                "kind": "typesafe",
+                "results": [
+                    {
+                        "key": "migration_intent",
+                        "eventKey": "$ld:ai:judge:jev:migration_intent",
+                        "score": 0.25,
+                        "reason": "Unclear",
+                    },
+                    {
+                        "key": "migration",
+                        "eventKey": "$ld:ai:judge:jev:migration",
+                        "score": 0.9,
+                        "reason": "Yes",
+                    },
+                ],
+            }
+        )
+
+        seen_variables: list[dict[str, Any]] = []
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            seen_variables.append(variables)
+            return {
+                "output": payload,
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            }
+
+        handler = ProviderHandler(fn=fn, provides_for=("TypeSafe", "messages"))  # type: ignore[arg-type]
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "jev"},
+                "provider": {"name": "TypeSafe"},
+                "instructions": "judge",
+                "evaluationMetricKey": "judge-metric",
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        with patch.object(random, "random", return_value=0.0):
+            result = await run_judges(
+                config={
+                    "model": {"name": "gpt-4"},
+                    "provider": {"name": "OpenAI"},
+                    "instructions": "hi",
+                    "judgeConfiguration": {
+                        "judges": [{"key": "jev-judge", "samplingRate": 1.0}]
+                    },
+                },
+                user_context=CONTEXT,
+                handler=handler,
+                user_input="question",
+                llm_response="answer",
+                base_track_data={"runId": "x"},
+            )
+
+        assert seen_variables[0]["input"] == "question"
+        assert seen_variables[0]["response_to_evaluate"] == "answer"
+        assert set(result) == {
+            "jev-judge.migration_intent",
+            "jev-judge.migration",
+        }
+        assert result["jev-judge.migration_intent"].score == 0.25
+        assert result["jev-judge.migration"].score == 0.9
+        assert result["jev-judge.migration_intent"].response == "Unclear"
+        assert result["jev-judge.migration"].response == "Yes"
+        assert result["jev-judge.migration_intent"].usage.input == 100
+        assert result["jev-judge.migration"].usage.input == 100
+        assert result["jev-judge.migration_intent"].usage.output == 20
+        metric_calls = [
+            call
+            for call in mock_ld_client.track.call_args_list
+            if str(call.args[0]).startswith("$ld:ai:judge:jev:")
+        ]
+        token_calls = [
+            call
+            for call in mock_ld_client.track.call_args_list
+            if call.args[0] == "$ld:ai:tokens:total"
+        ]
+        assert [call.args[0] for call in metric_calls] == [
+            "$ld:ai:judge:jev:migration_intent",
+            "$ld:ai:judge:jev:migration",
+        ]
+        assert metric_calls[0].args[2]["judgeConfigKey"] == "jev-judge.migration_intent"
+        assert metric_calls[0].args[3] == 0.25
+        assert metric_calls[1].args[3] == 0.9
+        assert len(token_calls) == 1
+
+    async def test_run_judge_keeps_the_first_label_event_key(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        import json
+
+        from launchdarkly_ai_server import JudgeTask, run_judge
+
+        payload = json.dumps(
+            {
+                "kind": "typesafe",
+                "results": [
+                    {
+                        "key": "migration_intent",
+                        "eventKey": "$ld:ai:judge:jev:migration_intent",
+                        "score": 0.25,
+                        "reason": "Unclear",
+                    },
+                    {
+                        "key": "migration",
+                        "eventKey": "$ld:ai:judge:jev:migration",
+                        "score": 0.9,
+                        "reason": "Yes",
+                    },
+                ],
+            }
+        )
+
+        seen_variables: list[dict[str, Any]] = []
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            seen_variables.append(variables)
+            return {
+                "output": payload,
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            }
+
+        handler = ProviderHandler(fn=fn, provides_for=("TypeSafe", "messages"))  # type: ignore[arg-type]
+        result = await run_judge(
+            JudgeTask(
+                config_key="jev-judge",
+                judge_config={
+                    "model": {"name": "jev"},
+                    "provider": {"name": "TypeSafe"},
+                    "instructions": "judge",
+                },
+                judge_meta={
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+                actual_output="answer",
+                user_input="question",
+                user_context=CONTEXT,
+                judge_provider="TypeSafe",
+                judge_mode="messages",
+                collapse_messages=False,
+                parent_track_data={"runId": "x"},
+            ),
+            [handler],
         )
         assert result is not None
-        assert result.track_data["modelKey"] == "judge-model"
-        assert result.track_data["modelVersion"] == 2
+        assert seen_variables[0]["input"] == "question"
+        assert result.event_key == "$ld:ai:judge:jev:migration_intent"
+        assert result.score == 0.25
+        assert result.response == "Unclear"
+        assert result.track_data == {
+            "runId": "x",
+            "judgeConfigKey": "jev-judge.migration_intent",
+        }

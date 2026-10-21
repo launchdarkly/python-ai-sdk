@@ -1,6 +1,5 @@
 """Tests for TESTING.md §3.27 — opencode-agents."""
 
-from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,18 +21,6 @@ def _fake() -> MagicMock:
     client.flush = AsyncMock()
     client.close = AsyncMock()
     return client
-
-
-async def _events(
-    config: Any,
-    user_input: str | None,
-    variables: Any,
-    history: Any,
-    session_id: str | None,
-) -> AsyncIterator[dict[str, Any]]:
-    del config, user_input, variables, history, session_id
-    if False:
-        yield {}
 
 
 async def _settle(value: Any) -> None:
@@ -64,7 +51,7 @@ def _usage(client: MagicMock) -> list[Any]:
 
 
 async def test_create_handler_sends_one_usage_event(installed: MagicMock) -> None:
-    create_opencode_handler(events=_events, session_id="ses")
+    create_opencode_handler(base_url="http://127.0.0.1:9")
     calls = _usage(installed)
     assert [entry.args[2].get("helper") for entry in calls] == [
         "opencode-agents.createOpenCodeHandler"
@@ -82,7 +69,7 @@ async def test_create_handler_sends_one_usage_event(installed: MagicMock) -> Non
 
 
 async def test_wrapper_sends_one_usage_event(installed: MagicMock) -> None:
-    await _settle(opencode_agents("k", "q", CONTEXT, events=_events, session_id="ses"))
+    await _settle(opencode_agents("k", "q", CONTEXT, base_url="http://127.0.0.1:9"))
     calls = _usage(installed)
     assert [entry.args[2].get("helper") for entry in calls] == [
         "opencode-agents.opencodeAgents"
