@@ -6,19 +6,24 @@ import inspect
 import json
 import logging
 import time
-import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping
+import urllib
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
+    build_message_history,
     numeric_score,
     parse_judge_response,
 )
 from ..lifecycle import extract_variation
-from ..types import NativeTool
+from ..trajectory import (
+    TrajectoryRecorder,
+    render_row_trajectory,
+    row_fields,
+)
 from ..utils import (
     collapse_messages_to_instructions,
     normalize_mode,
@@ -26,7 +31,14 @@ from ..utils import (
     parse_usage,
     to_ld_context,
 )
-from .api import EvaluationsError, LDApiClient, LDApiError
+from .api import (
+    EvaluationsError,
+    LDApiClient,
+    LDApiError,
+    require_mapping,
+    require_string,
+    segment,
+)
 from .criteria import Criterion, Judge, Scorer
 from .events import (
     CriterionEventPayload,
@@ -34,6 +46,12 @@ from .events import (
     DeterministicScorerCriterionEventPayload,
     LDJudgeCriterionEventPayload,
     TokenUsage,
+)
+from .tools import (
+    EvalTool,
+    ToolImplementation,
+    create_wire_tools,
+    handler_config_tools,
 )
 from .types import (
     AIConfigVariation,
@@ -43,18 +61,17 @@ from .types import (
     EvaluationRunRef,
     GenerationConfig,
     ResolvedJudge,
-    ResolvedTool,
     RunSummary,
 )
 
 logger = logging.getLogger(__name__)
 
 DATASET_PAGE_SIZE = 200
+DATASET_UPLOAD_BATCH_SIZE = 500
 GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
 CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
-ToolImplementation = Callable[..., Any] | NativeTool
 
 
 @dataclass(frozen=True)
@@ -162,21 +179,37 @@ def _segment(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
 
-def _mapping(value: Any, *, description: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise EvaluationsError(
-            f"LaunchDarkly returned an invalid {description} response"
-        )
-    return value
+def render_row(
+    row_index: int,
+    *,
+    input_value: Any,
+    expected_value: Any,
+    variables_value: Any,
+    metadata_value: Any,
+) -> DatasetRow:
+    """Render one stored dataset row for handler invocation.
 
-
-def _required_string(data: Mapping[str, Any], key: str, description: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value:
-        raise EvaluationsError(
-            f"LaunchDarkly {description} response is missing string field {key!r}"
-        )
-    return value
+    Shared by hosted and inline datasets so a row renders the same whichever
+    path supplied it.
+    """
+    variables = dict(variables_value) if isinstance(variables_value, Mapping) else {}
+    rendered_input = (
+        parse_template(input_value, variables) if isinstance(input_value, str) else None
+    )
+    rendered_expected = (
+        parse_template(expected_value, variables)
+        if isinstance(expected_value, str)
+        else None
+    )
+    variables["input"] = rendered_input
+    variables["expected_output"] = rendered_expected
+    return DatasetRow(
+        row_index=row_index,
+        input=rendered_input,
+        expected_output=rendered_expected,
+        variables=variables,
+        metadata=dict(metadata_value) if isinstance(metadata_value, Mapping) else None,
+    )
 
 
 class ConcurrencyController:
@@ -231,11 +264,11 @@ class EvaluationsRunner:
         """
         description = f"AI Config variation {config_key!r}/{variation_key!r}"
         path = (
-            f"projects/{_segment(project_key)}/ai-configs/{_segment(config_key)}"
-            f"/variations/{_segment(variation_key)}"
+            f"projects/{segment(project_key)}/ai-configs/{segment(config_key)}"
+            f"/variations/{segment(variation_key)}"
         )
         try:
-            raw = _mapping(self._api.get(path), description=description)
+            raw = require_mapping(self._api.get(path), description=description)
         except LDApiError as error:
             if error.status == 404:
                 raise EvaluationsError(
@@ -276,13 +309,13 @@ class EvaluationsRunner:
         version: Any,
     ) -> Mapping[str, Any]:
         path = (
-            f"projects/{_segment(project_key)}/ai-configs/model-configs/"
-            f"{_segment(model_config_key)}"
+            f"projects/{segment(project_key)}/ai-configs/model-configs/"
+            f"{segment(model_config_key)}"
         )
         # A pinned variation names the model-config version it was built against.
         params = {"version": version} if isinstance(version, int) else None
         try:
-            return _mapping(
+            return require_mapping(
                 self._api.get(path, params=params),
                 description=f"model config {model_config_key!r}",
             )
@@ -293,44 +326,6 @@ class EvaluationsRunner:
                     f"in project {project_key!r}"
                 ) from error
             raise
-
-    def _resolve_tools(
-        self,
-        project_key: str,
-        tools: Mapping[str, ToolImplementation],
-    ) -> dict[str, ResolvedTool]:
-        resolved: dict[str, ResolvedTool] = {}
-        for key, implementation in tools.items():
-            if not callable(implementation) and not isinstance(
-                implementation, NativeTool
-            ):
-                raise EvaluationsError(
-                    f"Tool {key!r} must be callable or a NativeTool instance"
-                )
-            path = f"projects/{_segment(project_key)}/ai-tools/{_segment(key)}"
-            try:
-                raw = _mapping(self._api.get(path), description=f"tool {key!r}")
-            except LDApiError as error:
-                if error.status == 404:
-                    raise EvaluationsError(
-                        f"LaunchDarkly AI tool {key!r} was not found in project {project_key!r}"
-                    ) from error
-                raise
-            version = raw.get("version")
-            if not isinstance(version, int):
-                raise EvaluationsError(
-                    f"LaunchDarkly AI tool {key!r} has no integer version"
-                )
-            schema = raw.get("schema")
-            if not isinstance(schema, Mapping):
-                schema = {}
-            resolved[key] = ResolvedTool(
-                key=key,
-                version=version,
-                description=str(raw.get("description") or ""),
-                schema=dict(schema),
-            )
-        return resolved
 
     async def _resolve_judges(
         self,
@@ -401,16 +396,18 @@ class EvaluationsRunner:
         return resolved
 
     def _fetch_dataset(self, project_key: str, dataset_key: str) -> DatasetRef:
-        path = f"projects/{_segment(project_key)}/datasets/{_segment(dataset_key)}"
+        path = f"projects/{segment(project_key)}/datasets/{segment(dataset_key)}"
         try:
-            raw = _mapping(self._api.get(path), description=f"dataset {dataset_key!r}")
+            raw = require_mapping(
+                self._api.get(path), description=f"dataset {dataset_key!r}"
+            )
         except LDApiError as error:
             if error.status == 404:
                 raise EvaluationsError(
                     f"LaunchDarkly dataset {dataset_key!r} was not found in project {project_key!r}"
                 ) from error
             raise
-        dataset_id = _required_string(raw, "id", "dataset")
+        dataset_id = require_string(raw, "id", "dataset")
         response_key = raw.get("key", raw.get("name", dataset_key))
         return DatasetRef(id=dataset_id, key=str(response_key))
 
@@ -421,8 +418,8 @@ class EvaluationsRunner:
         *,
         offset: int,
     ) -> Mapping[str, Any]:
-        path = f"projects/{_segment(project_key)}/datasets/{_segment(dataset_key)}/rows"
-        return _mapping(
+        path = f"projects/{segment(project_key)}/datasets/{segment(dataset_key)}/rows"
+        return require_mapping(
             self._api.get(
                 path,
                 params={
@@ -452,44 +449,19 @@ class EvaluationsRunner:
             if not items:
                 break
             for item_value in items:
-                item = _mapping(item_value, description="dataset row")
+                item = require_mapping(item_value, description="dataset row")
                 row_index = item.get("rowIndex")
                 if not isinstance(row_index, int):
                     raise EvaluationsError(
                         "A dataset row is missing its integer rowIndex"
                     )
-                variables_value = item.get("variables")
-                variables = (
-                    dict(variables_value)
-                    if isinstance(variables_value, Mapping)
-                    else {}
-                )
-                input_value = item.get("input")
-                expected_value = item.get("expectedOutput")
-                rendered_input = (
-                    parse_template(input_value, variables)
-                    if isinstance(input_value, str)
-                    else None
-                )
-                rendered_expected = (
-                    parse_template(expected_value, variables)
-                    if isinstance(expected_value, str)
-                    else None
-                )
-                variables["input"] = rendered_input
-                variables["expected_output"] = rendered_expected
-                metadata_value = item.get("metadata")
                 rows.append(
-                    DatasetRow(
-                        row_index=row_index,
-                        input=rendered_input,
-                        expected_output=rendered_expected,
-                        variables=variables,
-                        metadata=(
-                            dict(metadata_value)
-                            if isinstance(metadata_value, Mapping)
-                            else None
-                        ),
+                    render_row(
+                        row_index,
+                        input_value=item.get("input"),
+                        expected_value=item.get("expectedOutput"),
+                        variables_value=item.get("variables"),
+                        metadata_value=item.get("metadata"),
                     )
                 )
             offset += len(items)
@@ -506,7 +478,7 @@ class EvaluationsRunner:
         project_key: str,
         key: str,
         generation: GenerationConfig,
-        tools: Mapping[str, ResolvedTool],
+        tools: Sequence[EvalTool],
         criteria: list[Criterion] | None = None,
     ) -> EvaluationRef:
         body: dict[str, Any] = {
@@ -527,15 +499,13 @@ class EvaluationsRunner:
         if "prompt_snippets" in generation:
             body["promptSnippets"] = generation["prompt_snippets"]
         if tools:
-            body["tools"] = [
-                {"key": tool.key, "version": tool.version} for tool in tools.values()
-            ]
+            body["tools"] = create_wire_tools(tools)
         if criteria:
             body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
 
-        path = f"projects/{_segment(project_key)}/evaluations"
-        raw = _mapping(self._api.post(path, body=body), description="evaluation")
-        evaluation_id = _required_string(raw, "id", "evaluation")
+        path = f"projects/{segment(project_key)}/evaluations"
+        raw = require_mapping(self._api.post(path, body=body), description="evaluation")
+        evaluation_id = require_string(raw, "id", "evaluation")
         response_key = raw.get("name", raw.get("label", key))
         version = raw.get("version")
         return EvaluationRef(
@@ -548,27 +518,79 @@ class EvaluationsRunner:
         self,
         project_key: str,
         evaluation_id: str,
-        dataset_id: str,
+        dataset_id: str | None,
     ) -> EvaluationRunRef:
         path = (
-            f"projects/{_segment(project_key)}/evaluations/"
-            f"{_segment(evaluation_id)}/runs"
+            f"projects/{segment(project_key)}/evaluations/{segment(evaluation_id)}/runs"
         )
-        body: dict[str, Any] = {
-            "source": "api",
-            "datasetId": dataset_id,
-        }
-        raw = _mapping(
+        body: dict[str, Any] = {"source": "api"}
+        if dataset_id is not None:
+            body["datasetId"] = dataset_id
+        raw = require_mapping(
             self._api.post(path, body=body),
             description="evaluation run",
         )
         return self._run_ref(raw)
 
+    def _upload_dataset_rows(
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+        rows: list[DatasetRow],
+    ) -> None:
+        """Upload an inline dataset's raw rows to its run, in bounded batches.
+
+        Uploads are idempotent per ``rowIdx``, so each batch is retried like a
+        GET. Batches go one at a time so a failure names exactly which rows
+        did not land.
+        """
+        path = (
+            f"projects/{_segment(project_key)}/evaluations/"
+            f"{_segment(evaluation_id)}/runs/{_segment(run_id)}/dataset-rows"
+        )
+        for start in range(0, len(rows), DATASET_UPLOAD_BATCH_SIZE):
+            batch = rows[start : start + DATASET_UPLOAD_BATCH_SIZE]
+            body = {
+                "rows": [
+                    {
+                        "rowIdx": row.row_index,
+                        "input": row.input,
+                        "expectedOutput": row.expected_output,
+                        "variables": row.variables,
+                        "metadata": row.metadata,
+                    }
+                    for row in batch
+                ]
+            }
+            try:
+                self._api.post(path, body=body, idempotent=True)
+            except EvaluationsError as error:
+                raise EvaluationsError(
+                    f"Failed to upload inline dataset rows {start}-"
+                    f"{start + len(batch) - 1} of {len(rows)} to evaluation run "
+                    f"{run_id}: {error}"
+                ) from error
+
+    def _cancel_evaluation_run(
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+    ) -> None:
+        """Cancel a run, retried like a GET: replaying a cancel cannot change
+        its outcome."""
+        path = (
+            f"projects/{_segment(project_key)}/evaluations/"
+            f"{_segment(evaluation_id)}/runs/{_segment(run_id)}/cancel"
+        )
+        self._api.post(path, idempotent=True)
+
     def _run_ref(self, raw: Mapping[str, Any]) -> EvaluationRunRef:
         return EvaluationRunRef(
-            id=_required_string(raw, "id", "evaluation run"),
-            evaluation_id=_required_string(raw, "evaluationId", "evaluation run"),
-            state=_required_string(raw, "state", "evaluation run"),
+            id=require_string(raw, "id", "evaluation run"),
+            evaluation_id=require_string(raw, "evaluationId", "evaluation run"),
+            state=require_string(raw, "state", "evaluation run"),
             status_reason=(
                 str(raw["statusReason"])
                 if raw.get("statusReason") is not None
@@ -579,19 +601,13 @@ class EvaluationsRunner:
     def _build_handler_config(
         self,
         generation: GenerationConfig,
-        tools: Mapping[str, ResolvedTool],
+        tools: Sequence[EvalTool],
     ) -> dict[str, Any]:
         parameters = generation.get("parameters")
         config: dict[str, Any] = {
             "provider": {"name": generation["provider"]},
             "model": {"name": generation["model"], "parameters": parameters},
-            "tools": {
-                key: {
-                    "description": tool.description,
-                    "parameters": tool.schema,
-                }
-                for key, tool in tools.items()
-            },
+            "tools": handler_config_tools(tools),
         }
         snippet_variables = {"snippet": generation.get("prompt_snippets", {})}
         if "instructions" in generation:
@@ -624,11 +640,15 @@ class EvaluationsRunner:
 
         async def invoke(row: DatasetRow) -> dict[str, Any]:
             await controller.acquire(config["provider"]["name"])
+            # One per row, not per run: rows generate concurrently against the
+            # same tool map, so a shared recorder would splice their calls.
+            recorder = TrajectoryRecorder()
+            row_tool_handlers = recorder.wrap(tool_handlers)
             started = datetime.now(UTC)
             started_clock = time.perf_counter()
             try:
                 result = await handler(
-                    config, row.input, tool_handlers, dict(row.variables)
+                    config, row.input, row_tool_handlers, dict(row.variables)
                 )
                 if not isinstance(result, Mapping):
                     raise TypeError("handler result must be a mapping")
@@ -644,6 +664,7 @@ class EvaluationsRunner:
                     "generated_at": completed.isoformat().replace("+00:00", "Z"),
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
                     "status": "COMPLETE",
+                    **row_fields(recorder),
                 }
                 usage = result.get("usage")
                 if isinstance(usage, Mapping):
@@ -663,6 +684,8 @@ class EvaluationsRunner:
                     "latency_ms": round((time.perf_counter() - started_clock) * 1000),
                     "status": "ERROR",
                     "error": {"code": 5001, "message": f"handler raised: {error}"},
+                    # The calls that ran are what explain why it raised.
+                    **row_fields(recorder),
                 }
             finally:
                 controller.release()
@@ -698,6 +721,8 @@ class EvaluationsRunner:
                 "datasetId": dataset.id,
                 "rowIndex": result["row_index"],
             }
+            if dataset.id is None:
+                del identity["datasetId"]
             event_id = hashlib.sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
@@ -735,12 +760,13 @@ class EvaluationsRunner:
                 "emittedAt": emitted_at,
                 "evaluationKey": evaluation.key,
                 "evaluationVersion": evaluation.version,
-                "datasetKey": dataset.key,
                 "status": result["status"],
                 "startedAt": result["started_at"],
                 "generatedAt": result["generated_at"],
                 "latencyMs": result["latency_ms"],
             }
+            if dataset.key is not None:
+                payload["datasetKey"] = dataset.key
             if generated["output"] is not None:
                 payload["output"] = generated["output"]
             if generated["error"] is not None:
@@ -776,25 +802,23 @@ class EvaluationsRunner:
             ground_truth = parse_template(ground_truth, variables)
         elif expected is not None:
             ground_truth = str(expected)
-        # message_history carries FORMATTING_INSTRUCTIONS the same way the
-        # online path builds it (judges.run_judges), because that -- not the
-        # standalone formatting_instructions variable below -- is what every
-        # judge built from the AI Library's default templates (accuracy,
-        # relevance, toxicity, and any judge cloned from them) actually
-        # references. A judge authored before this variable existed must keep
-        # getting scored without edits.
+        # The calls the row made on its way to `output`, recorded during
+        # generation. Sits between input and output in message_history, which
+        # is where it happened.
+        trajectory = render_row_trajectory(row_result)
+        # Shared builder, not an inline join: this path and both online paths
+        # must show a judge the same conversation. The trajectory goes into
+        # message_history and nowhere else -- it is already the transcript
+        # variable judges read, and a second one would just let a rubric
+        # interpolate both and pay for the trajectory twice.
         variables.update(
             {
                 "input": row_result.get("input") or "",
                 "response_to_evaluate": output if output is not None else "",
-                "message_history": "\n\n".join(
-                    str(value)
-                    for value in (
-                        row_result.get("input"),
-                        output,
-                        FORMATTING_INSTRUCTIONS,
-                    )
-                    if value
+                "message_history": build_message_history(
+                    user_input=row_result.get("input"),
+                    trajectory=trajectory,
+                    output=output,
                 ),
                 "expected_output": expected if expected is not None else "",
                 "ground_truth_context": (
@@ -1048,6 +1072,8 @@ class EvaluationsRunner:
                     "rowIndex": result["row_index"],
                     "criterionType": result["criterion_type"],
                 }
+                if dataset.id is None:
+                    del identity["datasetId"]
                 event_id = hashlib.sha256(
                     json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()
@@ -1139,9 +1165,9 @@ class EvaluationsRunner:
         self, project_key: str, evaluation_id: str, run_id: str
     ) -> RunSummary:
         path = (
-            f"projects/{_segment(project_key)}/evaluations/{_segment(evaluation_id)}"
-            f"/runs/{_segment(run_id)}/summary"
+            f"projects/{segment(project_key)}/evaluations/{segment(evaluation_id)}"
+            f"/runs/{segment(run_id)}/summary"
         )
         return RunSummary.from_wire(
-            _mapping(self._api.get(path), description="evaluation run summary")
+            require_mapping(self._api.get(path), description="evaluation run summary")
         )

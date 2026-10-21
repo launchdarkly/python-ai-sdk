@@ -103,6 +103,18 @@
         "aiTrackMetrics": { "introduced": "0.1" }
       }
     },
+    "python-ai-opencode-agents": {
+      "name": "OpenCode Agents AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/opencode-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-opencode-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-opencode-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
     "python-ai-google-adk-agents": {
       "name": "Google ADK Agents AI SDK for Python",
       "type": "ai-provider",

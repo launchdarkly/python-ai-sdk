@@ -11,13 +11,23 @@ from .api import (
 )
 from .criteria import Criterion, Judge, Scorer, SuccessDirection
 from .module import EvaluationsModule, init_evaluations
-from .types import DatasetRow, EvalRunResult, GenerationConfig, RunSummary, Usage
+from .tools import EvalTool, ToolsClient
+from .types import (
+    AIConfig,
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    RunSummary,
+    Usage,
+)
 
 __all__ = [
     "DEFAULT_BASE_URI",
+    "AIConfig",
     "Criterion",
     "DatasetRow",
     "EvalRunResult",
+    "EvalTool",
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
@@ -28,6 +38,7 @@ __all__ = [
     "RunSummary",
     "Scorer",
     "SuccessDirection",
+    "ToolsClient",
     "Transport",
     "Usage",
     "init_evaluations",

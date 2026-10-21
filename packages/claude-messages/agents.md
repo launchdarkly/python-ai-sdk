@@ -2,7 +2,7 @@
 
 > **Span shape.** This package emits `invoke_agent` → `chat {model}` → `execute_tool {name}`, with
 > tool spans as siblings of `chat`. Span construction lives in `spans.py` beside the handler.
-> Conversation content is off unless the caller passes `capture_content=True`.
+> Conversation content is off unless the caller passes `capture_content=True`, or the process sets it. See [Process-wide defaults](../client/README.md#process-wide-defaults).
 > `TELEMETRY-CONTRACT.md` at the repo root is the authority; read it before changing span code.
 
 
@@ -28,6 +28,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 |---|---|
 | `src/launchdarkly_ai_claude_messages/handler.py` | All implementation — message building, tool schema conversion, tool-use loop, telemetry |
 | `src/launchdarkly_ai_claude_messages/__init__.py` | Package exports |
+| `src/launchdarkly_ai_claude_messages/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 
