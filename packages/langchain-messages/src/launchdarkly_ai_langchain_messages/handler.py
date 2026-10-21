@@ -31,6 +31,7 @@ from launchdarkly_ai_server import (
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    tool_result_string,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -651,7 +652,7 @@ def _create_langchain_messages_handler(
                         tool_results.append(
                             ToolMessage(
                                 tool_call_id=tc.get("id") or tc["name"],
-                                content=str(result_val),
+                                content=tool_result_string(result_val),
                             )
                         )
                     conversation_messages.extend(tool_results)
@@ -1039,7 +1040,8 @@ async def _stream_gen(
                     yield rich
                 tool_results.append(
                     ToolMessage(
-                        tool_call_id=tc.get("id") or tc["name"], content=str(result_val)
+                        tool_call_id=tc.get("id") or tc["name"],
+                        content=tool_result_string(result_val),
                     )
                 )
             # Chunks can start a call the gathered message then omits. The

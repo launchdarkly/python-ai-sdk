@@ -24,6 +24,7 @@ from launchdarkly_ai_server import (
     report_usage,
     set_ld_span_attributes,
     to_ld_context,
+    tool_result_string,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data
 
@@ -80,7 +81,7 @@ def _build_node_tools(
             result = handler(args)
             if inspect.isawaitable(result):
                 result = await result
-            return str(result)
+            return tool_result_string(result)
 
         t = tool_fn(
             name=name,

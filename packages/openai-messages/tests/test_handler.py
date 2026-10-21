@@ -405,6 +405,26 @@ class TestToolExecutionLoop:
         fn2.assert_called_once()
         assert result["output"] == "final"
 
+    async def test_object_tool_result_reaches_the_model_as_json(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        tool_resp = _make_response(tool_calls=[{"name": "weather", "call_id": "c1"}])
+        final_resp = _make_response(output_text="done")
+        mock_openai.responses.create = AsyncMock(side_effect=[tool_resp, final_resp])
+        tool_fn = AsyncMock(return_value={"temp": 72, "city": "Zürich"})
+        cfg = {
+            **CONFIG,
+            "tools": {
+                "weather": {"name": "weather", "type": "function", "parameters": {}}
+            },
+        }
+        await create_openai_messages_handler()(cfg, "q", {"weather": tool_fn}, {})
+        second_input = mock_openai.responses.create.call_args_list[1].kwargs["input"]
+        outputs = [i for i in second_input if i.get("type") == "function_call_output"]
+        assert outputs[0]["output"] == '{"temp": 72, "city": "Zürich"}'
+
 
 # ---------------------------------------------------------------------------
 # §1.5 Telemetry — span recording
