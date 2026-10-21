@@ -461,11 +461,11 @@ class TestGraphWrapper:
     def test_prewires_exactly_one_wildcard_handler(self) -> None:
         graph_instance = object()
         with (
-            patch.object(graph_mod, "graph", return_value=graph_instance) as graph_fn,
+            patch.object(graph_mod, "_graph", return_value=graph_instance) as graph_fn,
             patch.object(
                 graph_mod,
-                "create_vercel_agents_handler",
-                wraps=create_vercel_agents_handler,
+                "_create_vercel_agents_handler",
+                wraps=handler_mod._create_vercel_agents_handler,
             ) as factory,
         ):
             assert vercel_graph("graph-key") is graph_instance
@@ -477,10 +477,10 @@ class TestGraphWrapper:
     def test_forwards_model_and_capture_content_to_factory(self) -> None:
         model = object()
         with (
-            patch.object(graph_mod, "graph", return_value=object()),
+            patch.object(graph_mod, "_graph", return_value=object()),
             patch.object(
                 graph_mod,
-                "create_vercel_agents_handler",
+                "_create_vercel_agents_handler",
                 return_value=MagicMock(provides_for=("*", "agent")),
             ) as factory,
         ):
@@ -493,7 +493,7 @@ class TestGraphWrapper:
         factory.assert_called_once_with(model=model, capture_content=True)
 
     def test_caller_cannot_override_handlers(self) -> None:
-        with patch.object(graph_mod, "graph", return_value=object()) as graph_fn:
+        with patch.object(graph_mod, "_graph", return_value=object()) as graph_fn:
             vercel_graph("graph-key", handlers=[MagicMock()])
         handlers = graph_fn.call_args.kwargs["handlers"]
         assert len(handlers) == 1

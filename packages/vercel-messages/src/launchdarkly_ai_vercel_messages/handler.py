@@ -18,12 +18,14 @@ from launchdarkly_ai_server import (
     NativeTool,
     ProviderHandler,
     SpanUsage,
+    _config,
+    _create_handler,
     compose_history,
-    config,
-    create_handler,
     parse_template,
+    report_usage,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .model_id import gateway_model_id
 from .spans import (
     fail_span,
@@ -434,8 +436,21 @@ async def _run_conversation(
 def create_vercel_messages_handler(
     model: ModelSource | None = None,
     *,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
+    report_usage(
+        "vercel-messages.createVercelMessagesHandler", PACKAGE_NAME, __version__
+    )
+    return _create_vercel_messages_handler(model, capture_content=capture_content)
+
+
+def _create_vercel_messages_handler(
+    model: ModelSource | None = None,
+    *,
+    capture_content: bool | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_vercel_messages_handler`, used by this package's wrappers."""
+
     async def invoke(
         cfg: AiConfigRep,
         user_input: str | None = None,
@@ -547,7 +562,7 @@ def create_vercel_messages_handler(
             if not failed:
                 span.end()
 
-    return create_handler(
+    return _create_handler(
         ("*", "messages"),
         invoke,
         stream,
@@ -561,13 +576,14 @@ def vercel_messages(
     context: LDContext,
     *,
     model: ModelSource | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
     variables: dict[str, Any] | None = None,
     **options: Any,
 ) -> Any:
-    handler = create_vercel_messages_handler(
+    report_usage("vercel-messages.vercelMessages", PACKAGE_NAME, __version__)
+    handler = _create_vercel_messages_handler(
         model=model, capture_content=capture_content
     )
-    return config(key=config_key, handler=handler, **options).invoke(
+    return _config(key=config_key, handler=handler, **options).invoke(
         user_input, context, variables=variables
     )

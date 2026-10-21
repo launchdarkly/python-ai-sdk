@@ -15,9 +15,11 @@ from launchdarkly_ai_server import (
     GraphNode,
     get_client,
     make_track_data,
+    report_usage,
     to_ld_context,
 )
 
+from ._version import PACKAGE_NAME, __version__
 from .handler import (
     ModelSource,
     build_agent_tools,
@@ -75,6 +77,7 @@ def to_vercel_agents(
     definition_promise: Any,
     opts: dict[str, Any] | None = None,
 ) -> Any:
+    report_usage("vercel-agents.toVercelAgents", PACKAGE_NAME, __version__)
     options = opts or {}
 
     async def invoke(
