@@ -114,6 +114,7 @@ ROOT_SURFACE = frozenset(
         "to_ld_context",
         "to_semconv_finish_reason",
         "to_usage_dict",
+        "tool_result_string",
         "wrap_tool_handlers",
     }
 )
