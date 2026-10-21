@@ -89,6 +89,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-litellm-agents`](packages/litellm-agents/README.md) | `*` (any) | `agent` | OpenAI Agents SDK with LiteLLM models |
 | [`launchdarkly-ai-vercel-messages`](packages/vercel-messages/README.md) | `*` (any) | `messages` | Vercel AI SDK with AI Gateway routing |
 | [`launchdarkly-ai-vercel-agents`](packages/vercel-agents/README.md) | `*` (any) | `agent` | Native Vercel `ai.Agent` loop and graph adapter |
+| [`launchdarkly-ai-google-adk-agents`](packages/google-adk-agents/README.md) | Google | `agent` | Google ADK agent loop and graph adapter |
 
 ## Quick Start
 
@@ -160,6 +161,7 @@ asyncio.run(main())
 | `litellm_agents` | `launchdarkly-ai-litellm-agents` | `openai-agents[litellm]` | OpenAI Agents via LiteLLM |
 | `vercel_messages` | `launchdarkly-ai-vercel-messages` | `ai` | Vercel AI SDK stream runtime |
 | `vercel_agents` | `launchdarkly-ai-vercel-agents` | `ai` | Native Vercel `ai.Agent` |
+| `google_adk_agents` | `launchdarkly-ai-google-adk-agents` | `google-adk` | Google ADK agent loop |
 
 ---
 
@@ -631,6 +633,7 @@ uv run python main.py [example] [flag-key] [user-input]
 | `vercel-messages` | `uv run python main.py vercel-messages` | Vercel AI SDK messages handler via AI Gateway |
 | `vercel-direct` | `uv run python main.py vercel-direct` | Vercel messages handler with a constructed OpenAI model (no Gateway) |
 | `native-graph-vercel` | `uv run python main.py native-graph-vercel` | Framework-native Vercel `ai.Agent` graph runner |
+| `google-adk-agents` | `uv run python main.py google-adk-agents` | Google ADK agent handler |
 
 **Examples:**
 

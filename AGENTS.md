@@ -682,7 +682,7 @@ def my_provider(
 
 For example, `claude_agents(config_key, user_input, context)` is equivalent to `config(key=config_key, handler=create_claude_agents_handler()).invoke(user_input, context)`.
 
-The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`, `litellm_agents`, `litellm_messages`, `vercel_agents`, `vercel_messages`.
+The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`, `litellm_agents`, `litellm_messages`, `vercel_agents`, `vercel_messages`, `google_adk_agents`.
 
 ### Graph Export (optional)
 
@@ -693,7 +693,7 @@ def claude_graph(key: str, **options) -> GraphInstance:
     return graph(key, handlers=[create_claude_agents_handler()], **options)
 ```
 
-Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`, `vercel_graph`.
+Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`, `vercel_graph`, `google_adk_graph`.
 
 ### Native Graph Adapter (optional)
 
@@ -705,6 +705,7 @@ Current adapters:
 - `to_lang_graph(def_coro, opts)` — exported from `launchdarkly_ai_langchain_agents`
 - `to_litellm_agents(def_coro, opts)` — exported from `launchdarkly_ai_litellm_agents`
 - `to_vercel_agents(def_coro, opts)` — exported from `launchdarkly_ai_vercel_agents`
+- `to_adk_agents(def_coro, opts)` — exported from `launchdarkly_ai_google_adk_agents`
 
 ---
 
