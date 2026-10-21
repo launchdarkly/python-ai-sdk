@@ -820,3 +820,7 @@ class TestTypesafeJudgeResults:
         assert result.event_key == "$ld:ai:judge:jev:migration_intent"
         assert result.score == 0.25
         assert result.response == "Unclear"
+        assert result.track_data == {
+            "runId": "x",
+            "judgeConfigKey": "jev-judge.migration_intent",
+        }

@@ -28,7 +28,6 @@ from .utils import (
 )
 from .utils import (
     normalize_mode,
-    omit_model_stamps,
     to_ld_context,
     to_usage_dict,
 )
@@ -478,9 +477,9 @@ async def run_judge(
                 record_evaluation(
                     entry["score"], None, f"{task.config_key}.{entry['key']}"
                 )
+            # The score belongs to the evaluated config. Each metric carries its own judgeConfigKey.
             typesafe_track_data: TrackData = {
-                **omit_model_stamps(task.parent_track_data),
-                **result["track_data"],
+                **task.parent_track_data,
                 "judgeConfigKey": result_key,
             }
             return JudgeRunResult(
