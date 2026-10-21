@@ -172,6 +172,7 @@ SAMPLE_VALUES: Mapping[str, Any] = {
     "max_thinking_tokens": 444,
     "max_tokens": 111,
     "max_tokens_to_sample": 555,
+    "max_tool_calls": 3,
     "max_turns": 4,
     "n": 2,
     "output_config": {"effort": "high"},
@@ -181,6 +182,8 @@ SAMPLE_VALUES: Mapping[str, Any] = {
     "presence_penalty": 0.4,
     "prompt_cache_key": "cache-1",
     "reasoning": {"effort": "low"},
+    "reasoning_effort": "low",
+    "seed": 42,
     "service_tier": "flex",
     "stop": ["STOP"],
     "stop_sequences": ["END"],
@@ -204,27 +207,35 @@ def candidate_keys(*accepted: Iterable[str]) -> frozenset[str]:
     return frozenset(keys)
 
 
-def sample(key: str) -> Any:
-    """The probe value for *key*: a valid value for a canonical key, a :func:`leaked` marker for
-    any other."""
+def sample(key: str, overrides: Mapping[str, Any] | None = None) -> Any:
+    """The probe value for *key*: *overrides*' value when it has one, else a valid value for a
+    canonical key, else a :func:`leaked` marker."""
+    if overrides is not None and key in overrides:
+        return overrides[key]
     return SAMPLE_VALUES[key] if key in SAMPLE_VALUES else leaked(key)
 
 
 async def probe_forwarded_keys(
     candidates: Iterable[str],
     call: Callable[[dict[str, Any]], Awaitable[object]],
+    *,
+    overrides: Mapping[str, Any] | None = None,
 ) -> frozenset[str]:
     """The keys among *candidates* that change what *call* hands its provider when set alone.
 
     *call* runs the handler with the given ``model.parameters`` and returns whatever it handed the
     provider. A key counts as forwarded when that result differs from the result with no
     parameters, or when setting it makes the call raise.
+
+    *overrides* replaces a :data:`SAMPLE_VALUES` entry for a handler whose library takes a
+    different valid shape for that key, such as a string ``tool_choice`` where another handler
+    takes an object.
     """
     baseline = await call({})
     forwarded: set[str] = set()
     for key in sorted(set(candidates)):
         try:
-            result = await call({key: sample(key)})
+            result = await call({key: sample(key, overrides)})
         except Exception:
             forwarded.add(key)
             continue
