@@ -169,7 +169,9 @@ class _Serve:
         httpd = _Loopback(("127.0.0.1", 0), _Request)
         httpd.script = self  # type: ignore[attr-defined]
         self._httpd = httpd
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        threading.Thread(
+            target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        ).start()
         host, port = httpd.server_address
         self.base_url = f"http://{host}:{port}"
         _servers.append(self)
@@ -1370,10 +1372,37 @@ class TestInvocation:
         assert script.aborts
 
     async def test_a_cancelled_sse_read_is_awaited_before_the_stream_closes(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The loopback socket cannot tell a cancelled read from the close that
+        # unblocks it. Record the client: ``_next_line`` must finish before
+        # GET /event is closed.
+        import httpx
+
+        from launchdarkly_ai_opencode_agents import server as server_mod
+        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
+
         bus = _CloseAfterRead()
         handler = create_opencode_handler(base_url=bus.start())
+        order: list[str] = []
+        real_next_line = server_mod._next_line
+
+        async def _recording_next_line(lines: Any) -> str | None:
+            try:
+                return await real_next_line(lines)
+            finally:
+                order.append("read_finished")
+
+        monkeypatch.setattr(server_mod, "_next_line", _recording_next_line)
+        real_aclose = httpx.Response.aclose
+
+        async def _recording_aclose(response: httpx.Response) -> None:
+            request = response.request
+            if request.method == "GET" and request.url.path == "/event":
+                order.append("response_closed")
+            await real_aclose(response)
+
+        monkeypatch.setattr(httpx.Response, "aclose", _recording_aclose)
 
         async def _run() -> None:
             async for _event in await handler.stream(
@@ -1388,12 +1417,15 @@ class TestInvocation:
             ):
                 return
 
-        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
-
         with pytest.raises(OpenCodeHTTPError, match="400"):
             await asyncio.wait_for(_run(), timeout=2)
-        assert bus.read_finished.is_set()
-        assert bus.closed
+        close_at = order.index("response_closed")
+        assert any(name == "read_finished" for name in order)
+        assert all(
+            index < close_at
+            for index, name in enumerate(order)
+            if name == "read_finished"
+        )
 
     async def test_breaking_aborts_without_waiting_for_gc(self) -> None:
         script = _OpenBus()
@@ -1457,8 +1489,6 @@ class _CloseAfterRead(_Serve):
     def __init__(self) -> None:
         super().__init__()
         self.second_read = threading.Event()
-        self.read_finished = threading.Event()
-        self.closed = False
 
     def serve_events(self, request: _Request) -> None:
         request._chunk(b":\n\n")
@@ -1471,12 +1501,9 @@ class _CloseAfterRead(_Serve):
             try:
                 peeked = sock.recv(1, socket.MSG_PEEK)
             except OSError:
-                peeked = b""
-            if peeked:
-                continue
-            self.read_finished.set()
-            self.closed = True
-            return
+                return
+            if not peeked:
+                return
 
     def serve_post(self, path: str, body: bytes) -> tuple[int, dict[str, Any]]:
         if path.endswith("/message"):
