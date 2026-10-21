@@ -104,6 +104,45 @@ class TestRegistry:
         assert r.handlers == [second]
         assert any("already registered" in message for message in caplog.messages)
 
+    def test_re_registered_handler_keeps_its_slot(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r = Registry()
+        bg = _make_handler(("*", "messages"), providers=["Bedrock", "Gemini"])
+        ba = _make_handler(("*", "messages"), providers=["Bedrock", "Anthropic"])
+        bg_again = _make_handler(("*", "messages"), providers=["Gemini", "Bedrock"])
+        with caplog.at_level(logging.WARNING):
+            r.register(handlers=[bg, ba])
+            r.register(handlers=[bg_again])
+        assert r.handlers == [bg_again, ba]
+
+    def test_exact_handlers_collide_whatever_their_provider_list(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r = Registry()
+        plain = _make_handler(("OpenAI", "messages"))
+        listed = _make_handler(("OpenAI", "messages"), providers=["OpenAI"])
+        with caplog.at_level(logging.WARNING):
+            r.register(handlers=[plain, listed])
+        assert r.handlers == [listed]
+
+    def test_duplicate_warning_lists_names_in_sorted_order(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r = Registry()
+        with caplog.at_level(logging.WARNING):
+            r.register(
+                handlers=[
+                    _make_handler(("*", "messages"), providers=["Gemini", "Bedrock"])
+                ]
+            )
+            r.register(
+                handlers=[
+                    _make_handler(("*", "messages"), providers=["Bedrock", "Gemini"])
+                ]
+            )
+        assert any("('Bedrock', 'Gemini')" in message for message in caplog.messages)
+
     def test_handler_without_provides_for_always_appended(self) -> None:
         r = Registry()
         h1 = _make_handler(None)

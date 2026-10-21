@@ -553,8 +553,41 @@ class TestConfigMultiHandler:
     ) -> None:
         mock_ld_client.variation = AsyncMock(return_value=_variation("OpenAI"))
         h = _handler_for("*", "messages", "from-bedrock", providers=["Bedrock"])
-        with pytest.raises(ValueError, match="OpenAI"):
+        with pytest.raises(
+            ValueError, match=r"^Handler for provider OpenAI not found$"
+        ):
             await config(key="flag", handler=[h]).invoke("hi", CONTEXT)
+
+    async def test_scoped_wildcard_beats_unscoped_for_a_listed_provider(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        mock_ld_client.variation = AsyncMock(return_value=_variation("Bedrock"))
+        unscoped = _handler_for("*", "messages", "any")
+        scoped = _handler_for("*", "messages", "bedrock", providers=["Bedrock"])
+        result = await config(key="flag", handler=[unscoped, scoped]).invoke(
+            "hi", CONTEXT
+        )
+        assert result.response == "bedrock"
+
+    async def test_duck_typed_wildcard_handler_is_selected(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        mock_ld_client.variation = AsyncMock(return_value=_variation("OpenAI"))
+
+        class DuckHandler:
+            provides_for = ("*", "messages")
+            providers = None
+            capture_content = False
+            stream = None
+
+            async def __call__(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "output": "duck",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+
+        result = await config(key="flag", handler=[DuckHandler()]).invoke("hi", CONTEXT)  # type: ignore[list-item]
+        assert result.response == "duck"
 
     async def test_two_scoped_wildcards_divide_providers(
         self, mock_ld_client: MagicMock

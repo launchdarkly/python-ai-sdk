@@ -4,7 +4,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from .sdk_usage import report_usage
 from .types import (
@@ -623,8 +623,8 @@ def select_handler(
     mode = normalize_mode(meta.get("mode") if isinstance(meta, dict) else None)
 
     chosen = select_mode_handler(handlers, provider, mode)
-    if isinstance(chosen, ProviderHandler):
-        return chosen
+    if chosen is not None:
+        return cast(ProviderHandler, chosen)
 
     if strict:
         has_coverage = any(

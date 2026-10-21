@@ -112,7 +112,7 @@ async def run_judges(
             # config, collapse messages into a single instructions block.
             judge_handler: ProviderHandler = handler
             collapse_messages = False
-            if handlers:
+            if handlers is not None:
                 exact = select_mode_handler(handlers, judge_provider, judge_mode)
                 agent_fallback = (
                     select_mode_handler(handlers, judge_provider, "agent")
@@ -134,6 +134,11 @@ async def run_judges(
                 else:
                     # No compatible handler — skip rather than calling a provider
                     # whose allowlist does not include this judge.
+                    logger.warning(
+                        "Judge %r skipped: no handler covers provider %r",
+                        judge_key,
+                        judge_provider,
+                    )
                     continue
 
             effective_judge_config = (
@@ -281,7 +286,7 @@ async def _build_judge_tasks(
             )
 
             collapse_messages = False
-            if handlers:
+            if handlers is not None:
                 exact = select_mode_handler(handlers, judge_provider, judge_mode)
                 agent_fallback = (
                     select_mode_handler(handlers, judge_provider, "agent")
@@ -300,6 +305,11 @@ async def _build_judge_tasks(
                     )
                 else:
                     # No compatible handler — skip, same as run_judges.
+                    logger.warning(
+                        "Judge %r skipped: no handler covers provider %r",
+                        judge_key,
+                        judge_provider,
+                    )
                     continue
 
             evaluation_metric_key = (

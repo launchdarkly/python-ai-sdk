@@ -11,14 +11,19 @@ logger = logging.getLogger(__name__)
 
 def _registration_key(
     handler: ProviderHandler,
-) -> tuple[tuple[str, str], frozenset[str] | None]:
-    """``provides_for`` plus the allowlist as a set. Order and repeated names do not make a new identity."""
+) -> tuple[tuple[str, str], tuple[str, ...] | None]:
+    """
+    ``provides_for``, plus the allowlist as a set on a ``"*"`` handler. Order and
+    repeated names do not make a new identity. Routing ignores the list on an
+    exact handler, so it is not part of that handler's identity.
+    """
     provides_for = handler.provides_for
     if provides_for is None:
         raise ValueError("handler is missing provides_for")
     providers = handler.providers
-    scope = None if providers is None else frozenset(providers)
-    return (provides_for, scope)
+    if provides_for[0] != "*" or providers is None:
+        return (provides_for, None)
+    return (provides_for, tuple(sorted(set(providers))))
 
 
 class Registry:

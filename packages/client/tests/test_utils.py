@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from launchdarkly_ai_server import (
+    ProviderHandler,
     create_handler,
     make_track_data,
     model_stamps_from_meta,
@@ -248,6 +249,50 @@ class TestCreateHandler:
 
         with pytest.raises(ValueError, match="providers"):
             create_handler(("*", "messages"), fn, providers=["Bedrock", ""])
+
+    @pytest.mark.parametrize("name", [" Bedrock", "Bedrock ", "\tBedrock"])
+    def test_rejects_a_provider_name_with_surrounding_whitespace(
+        self, name: str
+    ) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers=[name])
+
+    def test_rejects_a_bare_string(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers="Bedrock")
+
+    def test_drops_repeated_names_keeping_first_seen_order(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        h = create_handler(
+            ("*", "messages"), fn, providers=["Bedrock", "Anthropic", "Bedrock"]
+        )
+        assert h.providers == ("Bedrock", "Anthropic")
+
+    def test_provider_handler_validates_and_copies_providers(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            ProviderHandler(fn, ("*", "messages"), providers=[])
+        names = ["Bedrock"]
+        h = ProviderHandler(fn, ("*", "messages"), providers=names)
+        names.append("OpenAI")
+        assert h.providers == ("Bedrock",)
+
+    def test_provider_handler_takes_providers_by_keyword_only(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(TypeError):
+            ProviderHandler(fn, ("*", "messages"), None, None, ["Bedrock"])  # type: ignore[misc]
 
     def test_returns_callable(self) -> None:
         async def fn(
