@@ -240,6 +240,28 @@ class TestToAdkAgents:
         assert "$ld:ai:graph:total_tokens" in events
         span.end.assert_called()
 
+    async def test_tracks_graph_node_and_graph_level_totals(self) -> None:
+        tracker = MagicMock()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(native_mod, "get_client", lambda: tracker)
+            await to_adk_agents(_graph()).invoke(
+                "hi", context={"kind": "user", "key": "user-1"}
+            )
+        calls = [(call.args[0], call.args[2]) for call in tracker.track.call_args_list]
+        assert [name for name, _ in calls] == [
+            "$ld:ai:graph:node",
+            "$ld:ai:graph:duration:total",
+            "$ld:ai:graph:total_tokens",
+            "$ld:ai:graph:invocation_success",
+        ]
+        node = calls[0][1]
+        assert (node["nodeKey"], node["index"], node["configKey"]) == (
+            "root",
+            0,
+            "root",
+        )
+        assert {data["configKey"] for _, data in calls[1:]} == {"graph-flag"}
+
     async def test_runner_error_tracks_invocation_failure_and_ends_the_span(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -264,5 +286,6 @@ class TestToAdkAgents:
                     "hi", context={"kind": "user", "key": "user-1"}
                 )
         events = [call.args[0] for call in tracker.track.call_args_list]
-        assert events == ["$ld:ai:graph:invocation_failure"]
+        assert events == ["$ld:ai:graph:node", "$ld:ai:graph:invocation_failure"]
+        assert tracker.track.call_args_list[-1].args[2]["configKey"] == "graph-flag"
         span.end.assert_called()

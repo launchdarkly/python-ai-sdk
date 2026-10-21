@@ -86,7 +86,7 @@
       "bump-patch-for-minor-pre-major": true,
       "include-v-in-tag": false,
       "extra-files": [
-        "src/launchdarkly_ai_google_adk_agents/__init__.py"
+        "src/launchdarkly_ai_google_adk_agents/_version.py"
       ],
       "component": "launchdarkly-ai-google-adk-agents"
     },

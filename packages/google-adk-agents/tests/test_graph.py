@@ -9,13 +9,13 @@ from launchdarkly_ai_google_adk_agents.graph import google_adk_graph
 
 class TestGoogleAdkGraph:
     def test_forwards_the_flag_key(self) -> None:
-        with patch("launchdarkly_ai_google_adk_agents.graph.graph") as mock_graph:
+        with patch("launchdarkly_ai_google_adk_agents.graph._graph") as mock_graph:
             mock_graph.return_value = MagicMock()
             google_adk_graph("my-flag")
             assert mock_graph.call_args.args[0] == "my-flag"
 
     def test_prewires_one_wildcard_agent_handler(self) -> None:
-        with patch("launchdarkly_ai_google_adk_agents.graph.graph") as mock_graph:
+        with patch("launchdarkly_ai_google_adk_agents.graph._graph") as mock_graph:
             mock_graph.return_value = MagicMock()
             google_adk_graph("my-flag")
             handlers = mock_graph.call_args.kwargs["handlers"]
@@ -23,7 +23,7 @@ class TestGoogleAdkGraph:
             assert handlers[0].provides_for == ("*", "agent")
 
     def test_caller_cannot_replace_handlers(self) -> None:
-        with patch("launchdarkly_ai_google_adk_agents.graph.graph") as mock_graph:
+        with patch("launchdarkly_ai_google_adk_agents.graph._graph") as mock_graph:
             mock_graph.return_value = MagicMock()
             google_adk_graph(
                 "my-flag", handlers=["nope"], tool_handlers={"lookup": lambda: None}
@@ -36,9 +36,9 @@ class TestGoogleAdkGraph:
     def test_vertex_and_model_options_reach_the_handler(self) -> None:
         model = object()
         with (
-            patch("launchdarkly_ai_google_adk_agents.graph.graph") as mock_graph,
+            patch("launchdarkly_ai_google_adk_agents.graph._graph") as mock_graph,
             patch(
-                "launchdarkly_ai_google_adk_agents.graph.create_google_adk_agents_handler"
+                "launchdarkly_ai_google_adk_agents.graph._create_google_adk_agents_handler"
             ) as factory,
         ):
             factory.return_value = MagicMock(provides_for=("*", "agent"))

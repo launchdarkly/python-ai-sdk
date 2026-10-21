@@ -10,9 +10,12 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
+from ._version import PACKAGE_NAME, __version__
 from .handler import (
     _session_event,
     event_text,
@@ -69,22 +72,33 @@ class _AdkAgents:
         span = _graph_span(graph_def.key)
         start = time.monotonic()
         run_id = str(uuid.uuid4())
-        variables = variables or {}
-        tool_handlers = self._options.get("tool_handlers") or {}
-        handoff: dict[str, str | None] = {"target": None}
-        agents = _build_agents(graph_def, variables, tool_handlers, handoff)
-        root_agent = agents[graph_def.root.key]
-        Workflow(name="graph", edges=[(START, root_agent)])
-
         path: list[str] = []
         usage = {"input": 0, "output": 0, "total": 0}
         output = ""
         try:
+            variables = variables or {}
+            tool_handlers = self._options.get("tool_handlers") or {}
+            handoff: dict[str, str | None] = {"target": None}
+            agents = _build_agents(graph_def, variables, tool_handlers, handoff)
+            root_agent = agents[graph_def.root.key]
+            Workflow(name="graph", edges=[(START, root_agent)])
+
             current = graph_def.root
             seen: set[str] = set()
             seed = history
             while current is not None and current.key not in seen:
                 seen.add(current.key)
+                if ld_context is not None:
+                    get_client().track(
+                        "$ld:ai:graph:node",
+                        ld_context,
+                        {
+                            **make_track_data(current, graph_def.key, run_id),
+                            "nodeKey": current.key,
+                            "index": len(path),
+                        },
+                        1,
+                    )
                 path.append(current.key)
                 handoff["target"] = None
                 output, step = await _run_agent(
@@ -109,15 +123,7 @@ class _AdkAgents:
                 if SpanStatusCode is not None:
                     span.set_status(SpanStatusCode.OK)
             if ld_context is not None:
-                _track_success(
-                    graph_def.root,
-                    graph_def.key,
-                    run_id,
-                    ld_context,
-                    path,
-                    usage,
-                    start,
-                )
+                _track_success(graph_def.key, run_id, ld_context, usage, start)
             return {"response": output, "usage": usage}
         except Exception as exc:
             if span is not None:
@@ -128,7 +134,7 @@ class _AdkAgents:
                 get_client().track(
                     "$ld:ai:graph:invocation_failure",
                     ld_context,
-                    make_track_data(graph_def.root, graph_def.key, run_id),
+                    make_graph_track_data(graph_def.key, run_id),
                     1,
                 )
             raise
@@ -139,6 +145,7 @@ class _AdkAgents:
 
 def to_adk_agents(graph_def: Any, **options: Any) -> _AdkAgents:
     """Compiles a LaunchDarkly agent graph into an ADK workflow."""
+    report_usage("google-adk-agents.toAdkAgents", PACKAGE_NAME, __version__)
     return _AdkAgents(graph_def, options)
 
 
@@ -151,20 +158,17 @@ def _graph_span(key: str) -> Any:
 
 
 def _track_success(
-    root: Any,
     graph_key: str,
     run_id: str,
     ld_context: Any,
-    path: list[str],
     usage: dict[str, int],
     start: float,
 ) -> None:
     client = get_client()
-    data = make_track_data(root, graph_key, run_id)
+    data = make_graph_track_data(graph_key, run_id)
     duration = int((time.monotonic() - start) * 1000)
     client.track("$ld:ai:graph:duration:total", ld_context, data, duration)
     client.track("$ld:ai:graph:total_tokens", ld_context, data, usage["total"])
-    client.track("$ld:ai:graph:path", ld_context, data, len(path))
     client.track("$ld:ai:graph:invocation_success", ld_context, data, 1)
 
 

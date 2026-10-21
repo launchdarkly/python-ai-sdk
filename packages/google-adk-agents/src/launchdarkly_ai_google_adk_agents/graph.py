@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from launchdarkly_ai_server import graph
+from launchdarkly_ai_server import _graph, report_usage
 
-from .handler import create_google_adk_agents_handler
+from ._version import PACKAGE_NAME, __version__
+from .handler import _create_google_adk_agents_handler
 
 
 def google_adk_graph(
@@ -16,7 +17,7 @@ def google_adk_graph(
     project: str | None = None,
     location: str | None = None,
     model: Any = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
     **options: Any,
 ) -> Any:
     """Runs an agent graph with one wildcard ADK handler pre-bound.
@@ -24,11 +25,12 @@ def google_adk_graph(
     ``handlers`` passed by the caller is ignored. Auth and model options go to the
     handler factory, not to ``graph()``.
     """
+    report_usage("google-adk-agents.googleAdkGraph", PACKAGE_NAME, __version__)
     options.pop("handlers", None)
-    return graph(
+    return _graph(
         key,
         handlers=[
-            create_google_adk_agents_handler(
+            _create_google_adk_agents_handler(
                 use_vertexai=use_vertexai,
                 project=project,
                 location=location,

@@ -20,17 +20,20 @@ from launchdarkly_ai_server import (
     NATIVE_TOOL_KEY,
     AiConfigRep,
     NativeTool,
-    config,
-    create_handler,
+    _config,
+    _create_handler,
     end_unfinished_spans,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from . import spans as spanlib
+from ._version import PACKAGE_NAME, __version__
 
 try:
     from google.adk.agents.llm_agent import LlmAgent
@@ -174,9 +177,32 @@ def create_google_adk_agents_handler(
     project: str | None = None,
     location: str | None = None,
     model: Any = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> Any:
     """Builds a wildcard agent handler. Vertex project and location are required up front."""
+    report_usage(
+        "google-adk-agents.createGoogleAdkAgentsHandler", PACKAGE_NAME, __version__
+    )
+    return _create_google_adk_agents_handler(
+        api_key=api_key,
+        use_vertexai=use_vertexai,
+        project=project,
+        location=location,
+        model=model,
+        capture_content=capture_content,
+    )
+
+
+def _create_google_adk_agents_handler(
+    *,
+    api_key: str | None = None,
+    use_vertexai: bool = False,
+    project: str | None = None,
+    location: str | None = None,
+    model: Any = None,
+    capture_content: bool | None = None,
+) -> Any:
+    """Non-reporting :func:`create_google_adk_agents_handler`, used by this package's wrappers."""
     if use_vertexai:
         project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
         location = location or os.environ.get("GOOGLE_CLOUD_LOCATION")
@@ -197,7 +223,9 @@ def create_google_adk_agents_handler(
         ended: set[int] = set()
         root = spanlib.start_root_span(cfg, variables)
         plugin = LaunchDarklyTelemetryPlugin(
-            cfg, spanlib.parent_context_of(root), capture_content
+            cfg,
+            spanlib.parent_context_of(root),
+            effective_capture_content(capture_content),
         )
         try:
             output, usage = await _execute(
@@ -240,7 +268,9 @@ def create_google_adk_agents_handler(
         ended: set[int] = set()
         root = spanlib.start_root_span(cfg, variables)
         plugin = LaunchDarklyTelemetryPlugin(
-            cfg, spanlib.parent_context_of(root), capture_content
+            cfg,
+            spanlib.parent_context_of(root),
+            effective_capture_content(capture_content),
         )
         try:
             runner, session, user_id = await _open_run(
@@ -287,7 +317,9 @@ def create_google_adk_agents_handler(
             plugin.abandon_open_spans(ended)
             end_unfinished_spans(root)
 
-    return create_handler(("*", "agent"), _run, _stream, capture_content)
+    return _create_handler(
+        ("*", "agent"), _run, _stream, capture_content=capture_content
+    )
 
 
 def google_adk_agents(
@@ -297,16 +329,17 @@ def google_adk_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: one wildcard ADK handler and ``config().invoke()``."""
+    report_usage("google-adk-agents.googleAdkAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     api_key = kwargs.pop("api_key", None)
     use_vertexai = kwargs.pop("use_vertexai", False)
     project = kwargs.pop("project", None)
     location = kwargs.pop("location", None)
     model = kwargs.pop("model", None)
-    return config(
+    return _config(
         key=config_key,
-        handler=create_google_adk_agents_handler(
+        handler=_create_google_adk_agents_handler(
             api_key=api_key,
             use_vertexai=use_vertexai,
             project=project,
