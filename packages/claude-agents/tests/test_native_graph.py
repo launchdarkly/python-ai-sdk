@@ -550,6 +550,42 @@ class TestToClaudeAgentsAnthropicSpecific:
         assert "child" in created_tools[0]
 
     @pytest.mark.asyncio
+    async def test_cyclic_edge_is_dropped_with_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_sdk = _make_sdk_mock("done")
+
+        # root -> a -> b -> a: post-order builds b while a is still unbuilt.
+        def _node(key: str, target: str) -> dict[str, Any]:
+            return {
+                "key": key,
+                "config": {"model": {"name": "claude-3"}, "instructions": key},
+                "meta": {},
+                "edges": [{"source_key": key, "target_key": target}],
+                "is_terminal": False,
+            }
+
+        edges = [("root", "a"), ("a", "b"), ("b", "a")]
+        graph_def = _make_graph_def(
+            nodes={
+                "root": _node("root", "a"),
+                "a": _node("a", "b"),
+                "b": _node("b", "a"),
+            },
+            edges=[{"source_key": s, "target_key": t} for s, t in edges],
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        assert 'Dropping cyclic edge "b" -> "a"' in caplog.text
+
+    @pytest.mark.asyncio
     async def test_emits_handoff_success_when_sub_agent_tool_invoked(self) -> None:
         track_calls: list[tuple[str, Any]] = []
 

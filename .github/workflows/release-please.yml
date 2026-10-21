@@ -29,7 +29,9 @@ on:
           - packages/claude-agents
           - packages/claude-messages
           - packages/openai-agents
+          - packages/litellm-agents
           - packages/openai-messages
+          - packages/litellm-messages
           - packages/langchain-agents
           - packages/langchain-messages
           - packages/opencode-agents
@@ -59,8 +61,12 @@ jobs:
       package-claude-messages-tag-name: ${{ steps.release.outputs['packages/claude-messages--tag_name'] }}
       package-openai-agents-released: ${{ steps.release.outputs['packages/openai-agents--release_created'] }}
       package-openai-agents-tag-name: ${{ steps.release.outputs['packages/openai-agents--tag_name'] }}
+      package-litellm-agents-released: ${{ steps.release.outputs['packages/litellm-agents--release_created'] }}
+      package-litellm-agents-tag-name: ${{ steps.release.outputs['packages/litellm-agents--tag_name'] }}
       package-openai-messages-released: ${{ steps.release.outputs['packages/openai-messages--release_created'] }}
       package-openai-messages-tag-name: ${{ steps.release.outputs['packages/openai-messages--tag_name'] }}
+      package-litellm-messages-released: ${{ steps.release.outputs['packages/litellm-messages--release_created'] }}
+      package-litellm-messages-tag-name: ${{ steps.release.outputs['packages/litellm-messages--tag_name'] }}
       package-langchain-agents-released: ${{ steps.release.outputs['packages/langchain-agents--release_created'] }}
       package-langchain-agents-tag-name: ${{ steps.release.outputs['packages/langchain-agents--tag_name'] }}
       package-langchain-messages-released: ${{ steps.release.outputs['packages/langchain-messages--release_created'] }}
@@ -232,6 +238,37 @@ jobs:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/openai-agents/dist/
 
+  release-litellm-agents:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-litellm-agents-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/litellm-agents
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/litellm-agents
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/litellm-agents/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/litellm-agents/dist/
+
   release-openai-messages:
     runs-on: ubuntu-latest
     needs: ['release-please']
@@ -262,6 +299,37 @@ jobs:
         with:
           password: ${{ env.PYPI_AUTH_TOKEN }}
           packages-dir: packages/openai-messages/dist/
+
+  release-litellm-messages:
+    runs-on: ubuntu-latest
+    needs: ['release-please']
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    if: ${{ needs.release-please.outputs.package-litellm-messages-released == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci
+        with:
+          workspace_path: packages/litellm-messages
+      - uses: ./.github/actions/build
+        with:
+          workspace_path: packages/litellm-messages
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: 'packages/litellm-messages/dist/*'
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+        name: 'Get PyPI token'
+        with:
+          aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
+          ssm_parameter_pairs: '/production/common/releasing/pypi/token = PYPI_AUTH_TOKEN'
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          password: ${{ env.PYPI_AUTH_TOKEN }}
+          packages-dir: packages/litellm-messages/dist/
 
   release-langchain-agents:
     runs-on: ubuntu-latest

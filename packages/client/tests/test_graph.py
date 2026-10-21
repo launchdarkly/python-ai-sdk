@@ -517,6 +517,38 @@ class TestGraphInvoke:
         await gd.reverse_traverse(visitor)
         assert visited.index("leaf-node") < visited.index("root-node")
 
+    @pytest.mark.parametrize(
+        ("edges", "expected"),
+        [
+            # Uneven depths: P has a terminal child and a deeper one.
+            (
+                {"root": ["P"], "P": ["T1", "Q"], "Q": ["T2"]},
+                ["T1", "T2", "Q", "P", "root"],
+            ),
+            # Cycle: each node is visited exactly once.
+            ({"root": ["A"], "A": ["B"], "B": ["A", "T"]}, ["T", "B", "A", "root"]),
+        ],
+    )
+    async def test_reverse_traverse_visits_every_child_before_its_parent(
+        self, edges: dict[str, list[str]], expected: list[str]
+    ) -> None:
+        topology = {
+            "root": "root",
+            "edges": {k: [{"key": t} for t in ts] for k, ts in edges.items()},
+        }
+        lifecycle_module._set_client_for_testing(_make_client(topology))
+        try:
+            gd = await resolve_graph("graph-key", context=CONTEXT)
+            visited: list[str] = []
+
+            async def visitor(node: Any, ctx: Any) -> None:
+                visited.append(node.key)
+
+            await gd.reverse_traverse(visitor)
+            assert visited == expected
+        finally:
+            lifecycle_module._reset_for_testing()
+
     async def test_reverse_traverse_key_is_snake_case(
         self, mock_ld_client: MagicMock
     ) -> None:

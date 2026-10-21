@@ -49,6 +49,7 @@ from launchdarkly_ai_server import (
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    tool_result_string,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -102,7 +103,7 @@ async def build_tool_mcp(
             if not handler:
                 raise ValueError(f'No handler registered for tool "{_name}"')
             result = await handler(args) if _is_coroutine(handler) else handler(args)
-            return {"content": [{"type": "text", "text": str(result)}]}
+            return {"content": [{"type": "text", "text": tool_result_string(result)}]}
 
         mcp_tool = tool_fn(
             tool_name,

@@ -580,7 +580,7 @@ class TestToolConversion:
             {"my-tool": {"description": "d"}}, {"my-tool": _sync}
         )
         out = await tools[0].on_invoke_tool(MagicMock(), '{"order_id": "A19"}')
-        assert out == str({"order_id": "A19", "status": "shipped"})
+        assert out == json.dumps({"order_id": "A19", "status": "shipped"})
 
     async def test_async_tool_handler_result_is_returned(self) -> None:
         async def _async(args: Any) -> str:
