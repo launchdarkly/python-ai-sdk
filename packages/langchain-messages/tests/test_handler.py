@@ -2713,7 +2713,10 @@ class TestModelSource:
             "provider": {"name": "Anthropic"},
             "model": {
                 "name": "claude-sonnet-4-5",
-                "parameters": {"temperature": 0.1, "thinking": {"type": "enabled"}},
+                "parameters": {
+                    "temperature": 0.1,
+                    "thinking": {"type": "enabled", "budget_tokens": 1024},
+                },
             },
         }
         with (
@@ -2725,7 +2728,7 @@ class TestModelSource:
             await create_langchain_messages_handler()(cfg, "q", {}, {})
         assert ctor.call_args.kwargs == {
             "temperature": 0.1,
-            "thinking": {"type": "enabled"},
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
             "model": "claude-sonnet-4-5",
         }
 

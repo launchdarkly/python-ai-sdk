@@ -210,6 +210,40 @@ _CHAT_ANTHROPIC_MAPPING_KEYS = frozenset({"output_config", "thinking"})
 #: of the one field, so passing both would leave which one wins to pydantic.
 _CHAT_ANTHROPIC_RENAMES = {"max_tokens_to_sample": "max_tokens"}
 
+#: The ``thinking`` variants the Anthropic Messages API takes, each mapped to its required and
+#: optional sub-keys. ``ChatAnthropic`` sends ``thinking`` as written, so one with no ``type``, an
+#: unknown ``type``, or an ``enabled`` type without ``budget_tokens`` is dropped rather than sent
+#: for the API to reject, and other sub-keys are removed. The same shapes as the Claude Messages
+#: handler's.
+_ANTHROPIC_THINKING_SHAPES: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
+    "enabled": (frozenset({"budget_tokens"}), frozenset({"display"})),
+    "adaptive": (frozenset(), frozenset({"display"})),
+    "disabled": (frozenset(), frozenset()),
+}
+
+
+def _rebuild_anthropic_thinking(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilds a forwarded ``thinking`` from :data:`_ANTHROPIC_THINKING_SHAPES`, or drops it."""
+    if "thinking" not in kwargs:
+        return kwargs
+    thinking = kwargs.pop("thinking")
+    kind = thinking.get("type")
+    if not isinstance(kind, str) or kind not in _ANTHROPIC_THINKING_SHAPES:
+        return kwargs
+    required, optional = _ANTHROPIC_THINKING_SHAPES[kind]
+    if any(thinking.get(key) is None for key in required):
+        return kwargs
+    kwargs["thinking"] = {
+        "type": kind,
+        **{
+            k: thinking[k]
+            for k in sorted(required | optional)
+            if thinking.get(k) is not None
+        },
+    }
+    return kwargs
+
+
 #: Accepted by ``ChatAnthropic`` but never forwarded, and why:
 #: * ``anthropic_api_key``, ``api_key``: credentials (field plus alias).
 #: * ``anthropic_api_url``, ``base_url``, ``anthropic_proxy``: where requests go.
@@ -565,12 +599,14 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            **_model_constructor_kwargs(
-                config,
-                "claude-3-5-sonnet-20241022",
-                _CHAT_ANTHROPIC_FORWARDED_KEYS,
-                mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
-                renames=_CHAT_ANTHROPIC_RENAMES,
+            **_rebuild_anthropic_thinking(
+                _model_constructor_kwargs(
+                    config,
+                    "claude-3-5-sonnet-20241022",
+                    _CHAT_ANTHROPIC_FORWARDED_KEYS,
+                    mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
+                    renames=_CHAT_ANTHROPIC_RENAMES,
+                )
             )
         )
     if provider == "bedrock":

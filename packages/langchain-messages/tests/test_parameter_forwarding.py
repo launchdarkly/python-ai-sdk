@@ -359,6 +359,50 @@ class TestMalformedObjectValuesAreDropped:
         assert kwargs == {"model": "configured-model", "temperature": 0.2}
 
 
+class TestChatAnthropicThinkingIsRebuilt:
+    """``ChatAnthropic`` sends ``thinking`` as written, so it is rebuilt from the variants the
+    Messages API takes, as the Claude Messages handler does."""
+
+    @pytest.mark.parametrize(
+        "thinking",
+        [
+            {"budget_tokens": 1024},
+            {"type": "enabled"},
+            {"type": "on", "budget_tokens": 1024},
+            {"type": 1},
+        ],
+    )
+    def test_a_missing_or_unknown_type_or_budget_is_dropped(
+        self, thinking: dict[str, Any]
+    ) -> None:
+        assert _build("anthropic", {"thinking": thinking, "temperature": 0.2}) == {
+            "model": "configured-model",
+            "temperature": 0.2,
+        }
+
+    @pytest.mark.parametrize(
+        ("thinking", "expected"),
+        [
+            (
+                {"type": "enabled", "budget_tokens": 1024, "x": 1},
+                {"type": "enabled", "budget_tokens": 1024},
+            ),
+            (
+                {"type": "adaptive", "display": "omitted"},
+                {"type": "adaptive", "display": "omitted"},
+            ),
+            ({"type": "disabled", "budget_tokens": 1}, {"type": "disabled"}),
+        ],
+    )
+    def test_a_known_type_keeps_only_its_sub_keys(
+        self, thinking: dict[str, Any], expected: dict[str, Any]
+    ) -> None:
+        assert _build("anthropic", {"thinking": thinking}) == {
+            "model": "configured-model",
+            "thinking": expected,
+        }
+
+
 class _Built(Exception):
     """Stops a run once the chat model has been built."""
 
