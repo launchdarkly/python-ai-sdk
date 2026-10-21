@@ -57,6 +57,28 @@
       ],
       "component": "launchdarkly-ai-openai-agents"
     },
+    "packages/vercel-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_vercel_agents/_version.py"
+      ],
+      "component": "launchdarkly-ai-vercel-agents"
+    },
+    "packages/litellm-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_litellm_agents/_version.py"
+      ],
+      "component": "launchdarkly-ai-litellm-agents"
+    },
     "packages/openai-messages": {
       "release-type": "python",
       "versioning": "default",
@@ -67,6 +89,28 @@
         "src/launchdarkly_ai_openai_messages/_version.py"
       ],
       "component": "launchdarkly-ai-openai-messages"
+    },
+    "packages/vercel-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_vercel_messages/_version.py"
+      ],
+      "component": "launchdarkly-ai-vercel-messages"
+    },
+    "packages/litellm-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_litellm_messages/_version.py"
+      ],
+      "component": "launchdarkly-ai-litellm-messages"
     },
     "packages/langchain-agents": {
       "release-type": "python",

@@ -8,6 +8,10 @@
   "packages/langchain-agents": "0.2.5",
   "packages/langchain-messages": "0.2.4",
   "packages/opencode-agents": "0.1.0",
+  "packages/vercel-messages": "0.1.0",
+  "packages/vercel-agents": "0.1.0",
+  "packages/litellm-messages": "0.1.0",
+  "packages/litellm-agents": "0.1.0",
   "packages/bedrock-agents": "0.0.1",
   "packages/bedrock-messages": "0.0.1"
 }

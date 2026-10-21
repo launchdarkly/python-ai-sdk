@@ -25,7 +25,7 @@ That call is the whole integration. Everything it does is configured in LaunchDa
 - Run agents and multi-step graphs, where each step can use a different provider
 - Score output quality with judges, including scoring that stays off the request path
 - See cost, latency, token usage, errors, and full conversations with no instrumentation code
-- Keep the providers and frameworks you already run: OpenAI, Anthropic, Amazon Bedrock, LangChain, or your own handler
+- Keep the providers and frameworks you already run: OpenAI, Anthropic, Amazon Bedrock, LangChain, LiteLLM, or your own handler
 
 - [What you get](#what-you-get)
 - [How It Works](#how-it-works)
@@ -85,6 +85,10 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-claude-agents`](packages/claude-agents/README.md) | Anthropic | `agent` | Claude Agent SDK — agentic loop with MCP tool support |
 | [`launchdarkly-ai-langchain-messages`](packages/langchain-messages/README.md) | `*` (any) | `messages` | Any `BaseChatModel` via LangChain `bind_tools` loop |
 | [`launchdarkly-ai-langchain-agents`](packages/langchain-agents/README.md) | `*` (any) | `agent` | LangGraph `StateGraph` — managed ReAct loop |
+| [`launchdarkly-ai-litellm-messages`](packages/litellm-messages/README.md) | `*` (any) | `messages` | In-process LiteLLM `acompletion` tool loop |
+| [`launchdarkly-ai-litellm-agents`](packages/litellm-agents/README.md) | `*` (any) | `agent` | OpenAI Agents SDK with LiteLLM models |
+| [`launchdarkly-ai-vercel-messages`](packages/vercel-messages/README.md) | `*` (any) | `messages` | Vercel AI SDK with AI Gateway routing |
+| [`launchdarkly-ai-vercel-agents`](packages/vercel-agents/README.md) | `*` (any) | `agent` | Native Vercel `ai.Agent` loop and graph adapter |
 | [`launchdarkly-ai-bedrock-messages`](packages/bedrock-messages/README.md) | Bedrock | `messages` | Bedrock Runtime Converse with manual tool-call loop |
 | [`launchdarkly-ai-bedrock-agents`](packages/bedrock-agents/README.md) | Bedrock | `agent` | Strands Agent backed by BedrockModel |
 
@@ -112,6 +116,9 @@ No code changes are needed — `init_client()` detects whether the OTel packages
 cp .env.example .env
 # Fill in LD_SDK_KEY and the API key for your provider
 ```
+
+LiteLLM runs in-process in Python, so no proxy endpoint is required. Set the
+provider credentials required by the model names in your AI Config.
 
 ### 3. Call a model
 
@@ -151,6 +158,10 @@ asyncio.run(main())
 | `claude_agents` | `launchdarkly-ai-claude-agents` | `claude-agent-sdk` | Claude Agent SDK (MCP) |
 | `langchain_messages` | `launchdarkly-ai-langchain-messages` | `langchain-core` | LangChain `bind_tools` loop |
 | `langchain_agents` | `launchdarkly-ai-langchain-agents` | `langgraph` | LangGraph `StateGraph` |
+| `litellm_messages` | `launchdarkly-ai-litellm-messages` | `litellm` | LiteLLM `acompletion` |
+| `litellm_agents` | `launchdarkly-ai-litellm-agents` | `openai-agents[litellm]` | OpenAI Agents via LiteLLM |
+| `vercel_messages` | `launchdarkly-ai-vercel-messages` | `ai` | Vercel AI SDK stream runtime |
+| `vercel_agents` | `launchdarkly-ai-vercel-agents` | `ai` | Native Vercel `ai.Agent` |
 | `bedrock_messages` | `launchdarkly-ai-bedrock-messages` | `aioboto3` | Bedrock Runtime Converse |
 | `bedrock_agents` | `launchdarkly-ai-bedrock-agents` | `strands-agents` | Strands Agent + BedrockModel |
 
@@ -254,7 +265,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Provider packages also export single-provider conveniences (`claude_graph`, `openai_graph`, `langchain_graph`, `bedrock_graph`) that pre-bind their handler.
+Provider packages also export conveniences (`claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`, `bedrock_graph`) that pre-bind their handler.
 
 ---
 
@@ -310,6 +321,22 @@ from launchdarkly_ai_openai_agents import to_openai_agents
 
 ctx = {"kind": "user", "key": "user-123"}
 result = await to_openai_agents(
+    resolve_graph("support-graph", context=ctx),
+    {"tool_handlers": registry.tools, "context": ctx},
+).invoke("I was double charged")
+```
+
+##### `to_litellm_agents` — OpenAI Agents SDK over LiteLLM
+
+Builds the same native Agents SDK handoff tree while creating each evaluated
+node model through LiteLLM in-process.
+
+```python
+from launchdarkly_ai_server import resolve_graph
+from launchdarkly_ai_litellm_agents import to_litellm_agents
+
+ctx = {"kind": "user", "key": "user-123"}
+result = await to_litellm_agents(
     resolve_graph("support-graph", context=ctx),
     {"tool_handlers": registry.tools, "context": ctx},
 ).invoke("I was double charged")
@@ -601,6 +628,13 @@ uv run python main.py [example] [flag-key] [user-input]
 | `graph-history` | `uv run python main.py graph-history` | `graph().invoke()` with multimodal `history` forwarded to the root node |
 | `openai-only` | `uv run python main.py openai-only` | `config()` with a custom `Registry` restricted to OpenAI handlers |
 | `streaming` | `uv run python main.py streaming` | `config().stream()` — token-by-token output |
+| `litellm` | `uv run python main.py litellm` | `config()` routing both messages and agents through LiteLLM |
+| `litellm-agents` | `uv run python main.py litellm-agents` | `litellm_agents()` with in-process LiteLLM routing |
+| `litellm-messages` | `uv run python main.py litellm-messages` | `litellm_messages()` with in-process LiteLLM routing |
+| `vercel-agents` | `uv run python main.py vercel-agents` | Native Vercel `ai.Agent` handler via AI Gateway |
+| `vercel-messages` | `uv run python main.py vercel-messages` | Vercel AI SDK messages handler via AI Gateway |
+| `vercel-direct` | `uv run python main.py vercel-direct` | Vercel messages handler with a constructed OpenAI model (no Gateway) |
+| `native-graph-vercel` | `uv run python main.py native-graph-vercel` | Framework-native Vercel `ai.Agent` graph runner |
 
 **Examples:**
 
@@ -641,6 +675,8 @@ python-ai-sdk/
 │   ├── openai-messages/ # launchdarkly-ai-openai-messages
 │   ├── langchain-agents/   # launchdarkly-ai-langchain-agents
 │   ├── langchain-messages/ # launchdarkly-ai-langchain-messages
+│   ├── litellm-agents/     # launchdarkly-ai-litellm-agents
+│   ├── litellm-messages/   # launchdarkly-ai-litellm-messages
 │   ├── bedrock-agents/     # launchdarkly-ai-bedrock-agents
 │   └── bedrock-messages/   # launchdarkly-ai-bedrock-messages
 ├── .env.example         # Template — copy to .env and fill in your values

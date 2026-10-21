@@ -749,7 +749,7 @@ async def _build_graph(
             raise
 
     # ── traverse / reverse_traverse ───────────────────────────────────────────
-    # Async BFS visitors that mirror the TS GraphDefinition.traverse /
+    # Async visitors that mirror the TS GraphDefinition.traverse /
     # reverseTraverse. The visitor fn receives (node, ctx) and its return value
     # is stored in ctx[node_key]. Both handle sync and async visitors.
 
@@ -789,33 +789,23 @@ async def _build_graph(
         return ctx.get(root_node.key)
 
     async def reverse_traverse(fn: Any, ctx: dict[str, Any] | None = None) -> Any:
-        """Visit nodes leaf-first (terminal nodes first, root last)."""
+        """Visit every child before its parents (post-order DFS, each node once, root last)."""
         if root_node is None:
             return None
         ctx = ctx if ctx is not None else {}
-        terminals = terminal_nodes()
-        if not terminals:
-            return None
         visited: set[str] = set()
-        frontier: list[str] = [n.key for n in terminals]
-        iterations = 0
-        while frontier and iterations < MAX_TRAVERSAL_DEPTH:
-            iterations += 1
-            next_frontier: list[str] = []
-            for node_key in frontier:
-                if node_key in visited:
-                    continue
-                visited.add(node_key)
-                if node_key == root_node.key:
-                    continue
-                node = nodes.get(node_key)
-                if node:
-                    ctx[node_key] = await _call_visitor(fn, node, ctx)
-                for parent in get_parent_nodes(node_key):
-                    if parent.key not in visited:
-                        next_frontier.append(parent.key)
-            frontier = next_frontier
-        ctx[root_node.key] = await _call_visitor(fn, root_node, ctx)
+
+        async def visit(node_key: str) -> None:
+            if node_key in visited:
+                return
+            visited.add(node_key)
+            for child in get_child_nodes(node_key):
+                await visit(child.key)
+            node = nodes.get(node_key)
+            if node:
+                ctx[node_key] = await _call_visitor(fn, node, ctx)
+
+        await visit(root_node.key)
         return ctx.get(root_node.key)
 
     graph_def = GraphDefinition(

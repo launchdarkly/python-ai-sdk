@@ -6,6 +6,7 @@ tree and runs it via Runner.run, mirroring the TypeScript toOpenAIAgents.
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 import time
 import types
@@ -23,6 +24,7 @@ from launchdarkly_ai_server import (
     report_usage,
     set_ld_span_attributes,
     to_ld_context,
+    tool_result_string,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data
 
@@ -36,6 +38,8 @@ try:
     _HAS_OTEL = True
 except ImportError:
     _HAS_OTEL = False
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_name(key: str) -> str:
@@ -77,7 +81,7 @@ def _build_node_tools(
             result = handler(args)
             if inspect.isawaitable(result):
                 result = await result
-            return str(result)
+            return tool_result_string(result)
 
         t = tool_fn(
             name=name,
@@ -182,9 +186,13 @@ def to_openai_agents(
                 for edge in edges_from(node_key):
                     child_agent = agent_ctx.get(edge.target_key)
                     if child_agent is None:
-                        raise ValueError(
-                            f'Child agent "{edge.target_key}" not built before parent "{node_key}"'
+                        # Unbuilt only when the edge closes a cycle; drop it so the graph still builds.
+                        logger.warning(
+                            'Dropping cyclic edge "%s" -> "%s"',
+                            node_key,
+                            edge.target_key,
                         )
+                        continue
                     child_handoffs.append(handoff_fn(child_agent))
 
                 instructions = _build_instructions(node, vs)

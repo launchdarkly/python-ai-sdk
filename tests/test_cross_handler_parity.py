@@ -42,6 +42,8 @@ HANDLERS: dict[str, str] = {
     "langchain-messages": "launchdarkly_ai_langchain_messages.spans",
     "langchain-agents": "launchdarkly_ai_langchain_agents.spans",
     "opencode-agents": "launchdarkly_ai_opencode_agents.spans",
+    "vercel-messages": "launchdarkly_ai_vercel_messages.spans",
+    "vercel-agents": "launchdarkly_ai_vercel_agents.spans",
     "bedrock-messages": "launchdarkly_ai_bedrock_messages.spans",
     "bedrock-agents": "launchdarkly_ai_bedrock_agents.spans",
 }

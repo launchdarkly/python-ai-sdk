@@ -30,6 +30,7 @@ from launchdarkly_ai_server import (
     report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
+    tool_result_string,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -71,7 +72,7 @@ def _build_agent_tools(
             result = fn(kwargs)
             if inspect.isawaitable(result):
                 result = await result
-            return str(result)
+            return tool_result_string(result)
 
         t = tool_fn(
             name,
