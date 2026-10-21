@@ -5,6 +5,7 @@ query() calls, mirroring the TypeScript toClaudeAgents implementation.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 import types
@@ -47,6 +48,8 @@ TOOL_MCP_NAME = "tool-mcp"
 SUBAGENT_MCP_NAME = "subagents"
 MCP_TOOL_PREFIX = f"mcp__{TOOL_MCP_NAME}__"
 SUBAGENT_TOOL_PREFIX = f"mcp__{SUBAGENT_MCP_NAME}__"
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_name(key: str) -> str:
@@ -276,11 +279,15 @@ def to_claude_agents(
                     return
 
                 node_key = _sanitize_name(node.key)
-                child_tools = [
-                    subagent_tool_ctx[e.target_key]
-                    for e in node.edges
-                    if e.target_key in subagent_tool_ctx
-                ]
+                child_tools = []
+                for e in node.edges:
+                    if e.target_key not in subagent_tool_ctx:
+                        # The root is never a tool, so only an edge back to the root or into a cycle lands here.
+                        logger.warning(
+                            'Dropping cyclic edge "%s" -> "%s"', node.key, e.target_key
+                        )
+                        continue
+                    child_tools.append(subagent_tool_ctx[e.target_key])
 
                 async def _subagent_execute(
                     args: Any, _node: GraphNode = node
