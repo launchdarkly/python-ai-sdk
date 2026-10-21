@@ -392,6 +392,17 @@ class TestTelemetryAndCleanup:
         ] == [("root", 0, 1), ("leaf", 1, 1)]
         assert node_events[0].args[2]["runId"] == node_events[1].args[2]["runId"]
         assert node_events[0].args[2]["graphKey"] == "vercel-graph"
+        graph_level = [
+            call.args[2]["configKey"]
+            for call in client.track.call_args_list
+            if call.args[0]
+            in (
+                "$ld:ai:graph:invocation_success",
+                "$ld:ai:graph:duration:total",
+                "$ld:ai:graph:total_tokens",
+            )
+        ]
+        assert graph_level == ["vercel-graph"] * 3
 
     @pytest.mark.asyncio
     async def test_no_context_emits_no_launchdarkly_tracking(
@@ -410,6 +421,31 @@ class TestTelemetryAndCleanup:
         with patch.object(native_graph_mod.trace, "get_tracer", return_value=tracer):
             await to_vercel_agents(_definition(_graph())).invoke("hello")
         tracer.start_span.assert_called_once_with("launchdarkly.graph")
+        span.set_attribute.assert_any_call("launchdarkly.config.key", "vercel-graph")
+        attrs = [call.args[0] for call in span.set_attribute.call_args_list]
+        assert "launchdarkly.run.id" in attrs
+        span.end.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_setup_error_is_recorded_and_tracked(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        client = MagicMock()
+        span = MagicMock()
+        tracer = MagicMock()
+        tracer.start_span.return_value = span
+        ai_runtime.Agent.side_effect = RuntimeError("agent build failed")
+        with (
+            patch.object(native_graph_mod, "get_client", return_value=client),
+            patch.object(native_graph_mod.trace, "get_tracer", return_value=tracer),
+            pytest.raises(RuntimeError, match="agent build failed"),
+        ):
+            await to_vercel_agents(
+                _definition(_graph()), {"context": {"kind": "user", "key": "u"}}
+            ).invoke("hello")
+        tracked = [call.args[0] for call in client.track.call_args_list]
+        assert tracked == ["$ld:ai:graph:invocation_failure"]
+        span.record_exception.assert_called_once()
         span.end.assert_called_once()
 
     @pytest.mark.asyncio

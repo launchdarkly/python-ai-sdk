@@ -16,8 +16,10 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     report_usage,
+    set_ld_span_attributes,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import (
@@ -60,13 +62,18 @@ def _handoff_tool(
 def _track(
     name: str,
     context: Any,
-    node: GraphNode,
+    node: GraphNode | None,
     definition: GraphDefinition,
     run_id: str,
     value: int | float,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    data = make_track_data(node, definition.key, run_id)
+    """Tracks a node event, or a graph-level event when ``node`` is ``None``."""
+    data = (
+        make_track_data(node, definition.key, run_id)
+        if node is not None
+        else make_graph_track_data(definition.key, run_id)
+    )
     if extra:
         data.update(extra)
     client = get_client()
@@ -126,8 +133,6 @@ def to_vercel_agents(
                 if child is not None:
                     await build(child)
 
-        await build(definition.root)
-
         span = trace.get_tracer("@launchdarkly/ai-vercel-agents").start_span(
             "launchdarkly.graph"
         )
@@ -142,6 +147,14 @@ def to_vercel_agents(
         current_input = input_text
         final_text = ""
         try:
+            set_ld_span_attributes(
+                span,
+                {
+                    "__ld": make_graph_track_data(definition.key, run_id),
+                    "ldContext": context,
+                },
+            )
+            await build(definition.root)
             while current is not None and current.key not in path:
                 index = len(path)
                 path.append(current.key)
@@ -212,7 +225,7 @@ def to_vercel_agents(
                 _track(
                     "$ld:ai:graph:invocation_success",
                     context,
-                    definition.root,
+                    None,
                     definition,
                     run_id,
                     1,
@@ -220,7 +233,7 @@ def to_vercel_agents(
                 _track(
                     "$ld:ai:graph:duration:total",
                     context,
-                    definition.root,
+                    None,
                     definition,
                     run_id,
                     (time.monotonic() - start) * 1000,
@@ -228,7 +241,7 @@ def to_vercel_agents(
                 _track(
                     "$ld:ai:graph:total_tokens",
                     context,
-                    definition.root,
+                    None,
                     definition,
                     run_id,
                     total,
@@ -249,7 +262,7 @@ def to_vercel_agents(
                     _track(
                         "$ld:ai:graph:invocation_failure",
                         context,
-                        definition.root,
+                        None,
                         definition,
                         run_id,
                         1,
