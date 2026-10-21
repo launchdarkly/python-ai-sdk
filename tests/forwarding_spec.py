@@ -74,6 +74,22 @@ OPENAI_AGENTS = frozenset(
     }
 )
 
+LITELLM_MESSAGES = frozenset(
+    {
+        "frequency_penalty",
+        "max_completion_tokens",
+        "max_tokens",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning_effort",
+        "seed",
+        "stop",
+        "temperature",
+        "tool_choice",
+        "top_p",
+    }
+)
+
 LANGCHAIN_CHAT_OPENAI = frozenset(
     {
         "frequency_penalty",
