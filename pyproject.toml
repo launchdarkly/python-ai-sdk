@@ -17,13 +17,14 @@ dev = [
   "python-dotenv>=1.2.2",
   "claude-agent-sdk>=0.2.110",
   "opentelemetry-exporter-otlp-proto-http>=1.43.0",
-  "launchdarkly-server-sdk>=9.0",
+  "launchdarkly-server-sdk>=9.18.3",
   "langchain-openai>=0.3",
   "langchain-anthropic>=1.4.8",
   "ruff>=0.15.20",
   "pre-commit>=4.6.0",
   "brotlicffi>=1.0",
   "langchain-aws>=1",
+  "ai[openai]>=0.7",
 ]
 
 [tool.pytest.ini_options]
@@ -64,6 +65,11 @@ known-first-party = [
   "launchdarkly_ai_claude_messages",
   "launchdarkly_ai_langchain_agents",
   "launchdarkly_ai_langchain_messages",
+  "launchdarkly_ai_litellm_agents",
+  "launchdarkly_ai_litellm_messages",
   "launchdarkly_ai_openai_agents",
   "launchdarkly_ai_openai_messages",
+  "launchdarkly_ai_opencode_agents",
+  "launchdarkly_ai_vercel_agents",
+  "launchdarkly_ai_vercel_messages",
 ]

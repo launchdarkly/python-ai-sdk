@@ -23,6 +23,7 @@ from launchdarkly_ai_server.content import (
     set_tool_definition_attributes,
     text_message,
     to_semconv_finish_reason,
+    tool_result_string,
 )
 
 
@@ -613,3 +614,23 @@ class TestToolCallContentAttributes:
         span = FakeSpan()
         set_tool_definition_attributes(span, True, [])
         assert span.attributes == {}
+
+
+def test_tool_result_string_passes_strings_maps_none_to_empty_and_json_encodes_the_rest() -> (
+    None
+):
+    assert tool_result_string("plain") == "plain"
+    assert tool_result_string(None) == ""
+    assert (
+        tool_result_string({"temp": 72, "city": "Zürich"})
+        == '{"temp": 72, "city": "Zürich"}'
+    )
+    assert tool_result_string([1, "two"]) == '[1, "two"]'
+    assert tool_result_string(3) == "3"
+
+
+def test_tool_result_string_falls_back_to_str_for_a_value_json_cannot_encode() -> None:
+    cyclic: dict[str, Any] = {}
+    cyclic["self"] = cyclic
+    assert tool_result_string(cyclic) == str(cyclic)
+    assert tool_result_string({1, 2}) == str({1, 2})

@@ -11,6 +11,7 @@ from .judge_scoring import (
     numeric_score,
     parse_judge_response,
 )
+from .sdk_usage import report_usage
 from .types import (
     AiConfigRep,
     JudgeResult,
@@ -26,7 +27,6 @@ from .utils import (
 )
 from .utils import (
     normalize_mode,
-    omit_model_stamps,
     to_ld_context,
     to_usage_dict,
 )
@@ -232,6 +232,31 @@ async def build_judge_tasks(
     ``samplingRate`` causes them to be skipped are excluded from the list.
     Returns an empty list when no active judges are configured.
     """
+    report_usage("client.buildJudgeTasks")
+    return await _build_judge_tasks(
+        config=config,
+        user_context=user_context,
+        handler=handler,
+        handlers=handlers,
+        llm_response=llm_response,
+        base_track_data=base_track_data,
+        user_input=user_input,
+        trajectory=trajectory,
+    )
+
+
+async def _build_judge_tasks(
+    *,
+    config: AiConfigRep,
+    user_context: LDContext,
+    handler: ProviderHandler,
+    handlers: list[ProviderHandler] | None = None,
+    llm_response: str,
+    base_track_data: TrackData,
+    user_input: str | None = None,
+    trajectory: str = "",
+) -> list[JudgeTask]:
+    """Non-reporting :func:`build_judge_tasks`, used by ``config().invoke``."""
     from .lifecycle import extract_variation
 
     judge_config_block = (
@@ -351,6 +376,7 @@ async def run_judge(
     Returns ``None`` when no compatible handler is found or the response cannot
     be parsed as ``{"score": ..., "reasoning": ...}``.
     """
+    report_usage("client.runJudge")
     from .tracking import execute_and_track
 
     def _matches(h: ProviderHandler) -> bool:
@@ -431,12 +457,10 @@ async def run_judge(
 
         usage = to_usage_dict(raw_usage)
 
-        # A judge without a pinned model config must not inherit the parent's
-        # modelKey / modelVersion; every other parent-only key (graphKey, ...)
-        # is still carried over.
+        # The score belongs to the evaluated (parent) config, exactly as in
+        # the inline run_judges path.
         merged_track_data: TrackData = {
-            **omit_model_stamps(task.parent_track_data),
-            **result["track_data"],
+            **task.parent_track_data,
             "judgeConfigKey": task.config_key,
         }
 

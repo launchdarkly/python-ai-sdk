@@ -394,11 +394,15 @@ error for an abandoned stream, so two dashboards would describe the same run dif
 
 ## 7. Content capture
 
-Every handler factory takes `capture_content: bool = False`.
+Every handler factory takes `capture_content: bool | None = None`.
 
-The default is off. Conversation content is personal data. A run emits only metadata, meaning
-models, token counts, timings and tool names, until a caller asks for more. Turning it on sends the
-text of every request and response to whatever collector the SDK points at.
+`None` reads the process-wide default at invocation (`configure(options=SDKOptions(...))`), which
+is off. `True` or `False` overrides that default for the handler, and an explicit `False` wins
+over a configured `True`. A convenience wrapper's `capture_content` is the per-call override: when
+the caller passes it, that value is what the handler is built with; when they omit it, the wrapper
+passes `None` and the process default applies. Conversation content is personal data. A run emits
+only metadata, meaning models, token counts, timings and tool names, until capture is turned on.
+Turning it on sends the text of every request and response to whatever collector the SDK points at.
 
 Guard twice, on purpose. The helper returns without writing when capture is off, which makes a
 forgotten call site harmless. The call site also checks before building the argument, which avoids
@@ -649,25 +653,30 @@ them so the graph span and the `invoke_agent` root share one name for the graph 
 everything LaunchDarkly owns on a span sits under `launchdarkly.`. `ld.ai.` stays reserved for
 metric and event keys.
 
+Every `launchdarkly.graph` span, from `graph()` and from each `native_graph` adapter, goes through
+`set_ld_span_attributes`, so it carries the identity in section 2 and the `feature_flag` event.
+Its config key is the graph key. The graph-level events (`$ld:ai:graph:invocation_success`,
+`invocation_failure`, `duration:total` and `total_tokens`) use the same track data, so their
+`configKey` is the graph key too, whichever runner produced them. Node-level events keep the node's
+own config key.
+
+A native adapter has no graph variation metadata, so its graph span and graph events report an
+empty `variationKey` and version 1. `graph()` reports the real values.
+
 Nothing else in `graph.py` or `native_graph.py` needs work.
 
 ---
 
 ## 11. Superseded, do not carry forward
 
-`set_openllmetry_prompt` and `set_openllmetry_completion` in `utils.py` are the shape this SDK
-emitted before the span work. In TypeScript they still exist and nothing calls them. The content
-layer replaced them, and it handles any number of messages rather than only index 0.
+`set_openllmetry_prompt` and `set_openllmetry_completion` were the shape this SDK emitted before
+the span work: one flat span per call, with the prompt and only completion index 0 written as
+OpenLLMetry attributes. The content layer replaced them, and it handles any number of messages.
+Every handler now writes content through `content.py`, and both functions have been removed, from
+this SDK and from TypeScript.
 
-Every Python handler calls them today, verified in all six. That is the clearest single statement
-of the gap: Python is built on the layer TypeScript retired.
-
-Move every call site onto the content helpers. Keep the two functions exported for one release,
-then remove them.
-
-Neither function has a test of its own in the client package today, and neither does
-`set_ld_span_attributes`. The only coverage they have is indirect, through the handler tests. Give
-their replacements direct tests.
+Do not bring them back. Content goes through the content helpers, and the token aliases go through
+`set_usage_span_attributes`, so each attribute has one writer.
 
 ---
 

@@ -117,6 +117,10 @@ class FakeStreamedResult:
             await self.hooks.on_llm_start(
                 MagicMock(), self.agent, self.agent.instructions, self.prompt
             )
+            yield SimpleNamespace(
+                type="raw_response_event",
+                data=SimpleNamespace(type="response.created"),
+            )
             for delta in turn.get("deltas", []):
                 yield SimpleNamespace(
                     type="raw_response_event",
@@ -134,6 +138,13 @@ class FakeStreamedResult:
                 await self.hooks.on_tool_start(ctx, self.agent, tool_obj)
                 await self.hooks.on_tool_end(
                     ctx, self.agent, tool_obj, call.get("result", "ok")
+                )
+            for delta in turn.get("late_deltas", []):
+                yield SimpleNamespace(
+                    type="raw_response_event",
+                    data=SimpleNamespace(
+                        type="response.output_text.delta", delta=delta
+                    ),
                 )
             if turn.get("error") is not None:
                 raise turn["error"]
@@ -569,7 +580,7 @@ class TestToolConversion:
             {"my-tool": {"description": "d"}}, {"my-tool": _sync}
         )
         out = await tools[0].on_invoke_tool(MagicMock(), '{"order_id": "A19"}')
-        assert out == str({"order_id": "A19", "status": "shipped"})
+        assert out == json.dumps({"order_id": "A19", "status": "shipped"})
 
     async def test_async_tool_handler_result_is_returned(self) -> None:
         async def _async(args: Any) -> str:
@@ -998,6 +1009,68 @@ class TestContentCapture:
         prompt_written = json.dumps(rec.root.attributes)
         assert "my question" in prompt_written
 
+    async def test_process_default_is_read_when_the_handler_runs(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            # Built before configure, with no capture flag. Vega's startup call
+            # has to reach this handler when it later runs.
+            handler = create_openai_agent_handler()
+            configure(options=SDKOptions(capture_content=True))
+            ctx, rec = _recording()
+            agents_mod = _fake_agents_module(
+                run=_make_run([{"output": _text_output("answer")}])
+            )
+            with ctx, _patched_agents(agents_mod):
+                await handler(CONFIG, "my question", {}, {})
+            assert "my question" in json.dumps(rec.root.attributes)
+        finally:
+            _reset_for_testing()
+
+    async def test_explicit_false_overrides_a_process_default_of_on(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            ctx, rec = _recording()
+            agents_mod = _fake_agents_module(
+                run=_make_run([{"output": _text_output("answer")}])
+            )
+            with ctx, _patched_agents(agents_mod):
+                await create_openai_agent_handler(capture_content=False)(
+                    CONFIG, "my question", {}, {}
+                )
+            for span in rec.spans:
+                assert "gen_ai.input.messages" not in span.attributes
+                assert "my question" not in json.dumps(span.attributes)
+        finally:
+            _reset_for_testing()
+
+    async def test_process_default_is_read_on_the_streaming_path(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
+            ctx, rec = _recording()
+            agents_mod = _fake_agents_module(
+                run_streamed=_make_run_streamed(turns, "hi")
+            )
+            with ctx, _patched_agents(agents_mod):
+                async for _ in await create_openai_agent_handler().stream(
+                    CONFIG, "stream question", {}, {}
+                ):
+                    pass
+            assert "stream question" in json.dumps(rec.root.attributes)
+        finally:
+            _reset_for_testing()
+
     async def test_tool_call_arguments_and_result_gated(self) -> None:
         turns = [
             {
@@ -1225,7 +1298,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             ctx = {"kind": "user", "key": "u1"}
             openai_agents("my-flag", "hello", ctx)
 
@@ -1242,7 +1315,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             ctx = {"kind": "user", "key": "u1"}
             openai_agents("my-flag", "hello", ctx)
 
@@ -1325,11 +1398,180 @@ class TestStreaming:
                     CONFIG, "q", {}, {}
                 )
             ]
-        chunks = [e["text"] for e in events if e["type"] == "chunk"]
-        assert chunks == ["Hello", " world"]
+        deltas = [e["delta"] for e in events if e["type"] == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["Hello", " world"]
+        assert events[0]["type"] == "TEXT_MESSAGE_START"
+        assert any(e["type"] == "TEXT_MESSAGE_END" for e in events)
         done = [e for e in events if e["type"] == "done"]
         assert len(done) == 1
         assert done[0]["output"] == "Hello world"
+
+    async def test_tool_lifecycle_hides_payloads_until_capture_is_on(self) -> None:
+        turns = [
+            {
+                "deltas": ["Looking"],
+                "tool_calls": [
+                    {
+                        "name": "search",
+                        "id": "c1",
+                        "args": {"q": "x"},
+                        "result": "secret",
+                    }
+                ],
+                "output": [],
+            }
+        ]
+
+        async def _events(capture: bool) -> list[dict[str, Any]]:
+            agents_mod = _fake_agents_module(
+                run_streamed=_make_run_streamed(turns, "done")
+            )
+            with _patched_agents(agents_mod):
+                return [
+                    event
+                    async for event in await create_openai_agent_handler(
+                        capture_content=capture
+                    ).stream(CONFIG, "q", {}, {})
+                ]
+
+        hidden = await _events(False)
+        start = next(event for event in hidden if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "search"
+        assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+        result = next(event for event in hidden if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == ""
+
+        shown = await _events(True)
+        args = next(event for event in shown if event["type"] == "TOOL_CALL_ARGS")
+        assert args["delta"] == json.dumps({"q": "x"})
+        shown_result = next(
+            event for event in shown if event["type"] == "TOOL_CALL_RESULT"
+        )
+        assert shown_result["content"] == "secret"
+        types = [event["type"] for event in shown]
+        assert types.index("TEXT_MESSAGE_CONTENT") < types.index("TEXT_MESSAGE_END")
+        assert types.index("TEXT_MESSAGE_END") < types.index("TOOL_CALL_RESULT")
+
+    async def test_unread_text_stays_on_the_message_the_tool_result_closes(
+        self,
+    ) -> None:
+        turns = [
+            {
+                "deltas": ["Hel"],
+                "tool_calls": [
+                    {"name": "search", "id": "c1", "args": {}, "result": "found"}
+                ],
+                "late_deltas": ["lo"],
+                "output": [],
+            }
+        ]
+        agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "done"))
+        with _patched_agents(agents_mod):
+            events = [
+                event
+                async for event in await create_openai_agent_handler(
+                    capture_content=True
+                ).stream(CONFIG, "q", {}, {})
+            ]
+        contents = [
+            event for event in events if event["type"] == "TEXT_MESSAGE_CONTENT"
+        ]
+        assert [event["delta"] for event in contents] == ["Hel", "lo"]
+        assert contents[0]["messageId"] == contents[1]["messageId"]
+        types = [event["type"] for event in events]
+        assert types.index("TEXT_MESSAGE_END") < types.index("TOOL_CALL_RESULT")
+        assert types.index("TOOL_CALL_START") < types.index("TEXT_MESSAGE_END")
+
+    async def test_a_streaming_prefix_is_not_closed_by_the_tool_hook(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import _SpanningHooks
+        from launchdarkly_ai_server import create_run_usage
+
+        hooks = _SpanningHooks(CONFIG, None, True, create_run_usage())
+        hooks.emitter.tool_start("c1", "search")
+        hooks.emitter.tool_args("c1", '{"q":')
+        ctx = SimpleNamespace(
+            tool_name="search",
+            tool_call_id="c1",
+            tool_arguments='{"q":"x"}',
+        )
+        await hooks.on_tool_start(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search")
+        )
+        assert not any(event["type"] == "TOOL_CALL_END" for event in hooks.pending)
+        rest = hooks.emitter.tool_args("c1", '"}')
+        assert rest[0]["delta"] == '"}'
+        assert any(
+            event["type"] == "TOOL_CALL_END" for event in hooks.emitter.tool_end("c1")
+        )
+
+    async def test_tool_end_publishes_arguments_the_consumer_has_not_read(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import _SpanningHooks
+        from launchdarkly_ai_server import create_run_usage
+
+        hooks = _SpanningHooks(CONFIG, None, True, create_run_usage())
+        hooks.emitter.tool_start("c1", "search")
+        hooks.emitter.tool_args("c1", '{"q":')
+        ctx = SimpleNamespace(
+            tool_name="search",
+            tool_call_id="c1",
+            tool_arguments='{"q":"x"}',
+        )
+        await hooks.on_tool_end(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search"), "found"
+        )
+        deltas = [
+            event["delta"]
+            for event in hooks.pending
+            if event["type"] == "TOOL_CALL_ARGS"
+        ]
+        assert "".join(['{"q":', *deltas]) == '{"q":"x"}'
+        assert any(event["type"] == "TOOL_CALL_RESULT" for event in hooks.pending)
+        assert hooks.emitter.tool_args("c1", "more") == []
+
+    async def test_a_tool_hook_leaves_text_open_until_the_deltas_are_read(self) -> None:
+        from launchdarkly_ai_openai_agents.handler import (
+            _SpanningHooks,
+            _take_finished_tools,
+        )
+        from launchdarkly_ai_server import create_run_usage
+
+        hooks = _SpanningHooks(CONFIG, None, True, create_run_usage())
+        opened = hooks.emitter.text("Hel")
+        ctx = SimpleNamespace(
+            tool_name="search",
+            tool_call_id="c1",
+            tool_arguments="{}",
+        )
+        await hooks.on_tool_start(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search")
+        )
+        await hooks.on_tool_end(
+            ctx, SimpleNamespace(), SimpleNamespace(name="search"), "found"
+        )
+        assert not any(event["type"] == "TEXT_MESSAGE_END" for event in hooks.pending)
+        more = hooks.emitter.text("lo")
+        assert more[0]["type"] == "TEXT_MESSAGE_CONTENT"
+        assert more[0]["messageId"] == opened[0]["messageId"]
+        released = _take_finished_tools(hooks)
+        types = [event["type"] for event in released]
+        assert types.index("TOOL_CALL_START") < types.index("TEXT_MESSAGE_END")
+        assert types.index("TEXT_MESSAGE_END") < types.index("TOOL_CALL_RESULT")
+
+    def test_a_new_response_closes_text_in_read_order(self) -> None:
+        from launchdarkly_ai_server.agui import TurnEmitter
+        from launchdarkly_ai_server.responses import map_responses_event
+
+        emitter = TurnEmitter(capture_content=True)
+        opened = emitter.text("Let me ")
+        closed = map_responses_event(
+            SimpleNamespace(type="response.created"), emitter, {}
+        )
+        assert closed[0]["type"] == "TEXT_MESSAGE_END"
+        assert closed[0]["messageId"] == opened[0]["messageId"]
+        nxt = emitter.text("Answer")
+        assert nxt[0]["type"] == "TEXT_MESSAGE_START"
+        assert nxt[0]["messageId"] != opened[0]["messageId"]
 
     async def test_opens_the_same_root_span_name_as_the_blocking_path(self) -> None:
         ctx, rec = _recording()
@@ -1402,6 +1644,25 @@ class TestStreaming:
                 pass
         assert StatusCode.ERROR in rec.root.statuses
         assert rec.root.ended == 1
+
+    async def test_a_failed_turn_closes_the_open_text_message(self) -> None:
+        err = RuntimeError("next turn failed")
+        turns = [{"deltas": ["Let me "], "error": err}]
+        agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, ""))
+        seen: list[dict[str, Any]] = []
+        with (
+            _patched_agents(agents_mod),
+            pytest.raises(RuntimeError, match="next turn failed"),
+        ):
+            async for event in await create_openai_agent_handler().stream(
+                CONFIG, "q", {}, {}
+            ):
+                seen.append(event)
+        starts = [event for event in seen if event["type"] == "TEXT_MESSAGE_START"]
+        ends = [event for event in seen if event["type"] == "TEXT_MESSAGE_END"]
+        assert len(starts) == 1
+        assert len(ends) == 1
+        assert ends[0]["messageId"] == starts[0]["messageId"]
 
     async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
@@ -1691,8 +1952,8 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "create_openai_agent_handler", _factory),
-            patch.object(handler_mod, "config", fake_config),
+            patch.object(handler_mod, "_create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.openai_agents("k", "q", {}, capture_content=True)
 
@@ -1700,7 +1961,7 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in fake_config.call_args.kwargs
 
-    async def test_defaults_to_off(self) -> None:
+    async def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
         import launchdarkly_ai_openai_agents.handler as handler_mod
 
         seen: dict[str, Any] = {}
@@ -1712,10 +1973,29 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "create_openai_agent_handler", _factory),
-            patch.object(handler_mod, "config", fake_config),
+            patch.object(handler_mod, "_create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.openai_agents("k", "q", {})
+
+        assert seen["capture_content"] is None
+
+    async def test_explicit_false_reaches_the_factory(self) -> None:
+        import launchdarkly_ai_openai_agents.handler as handler_mod
+
+        seen: dict[str, Any] = {}
+
+        def _factory(*, capture_content: bool | None = None) -> Any:
+            seen["capture_content"] = capture_content
+            return MagicMock()
+
+        fake_config = MagicMock()
+        fake_config.return_value.invoke = MagicMock(return_value="ok")
+        with (
+            patch.object(handler_mod, "_create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
+        ):
+            handler_mod.openai_agents("k", "q", {}, capture_content=False)
 
         assert seen["capture_content"] is False
 
