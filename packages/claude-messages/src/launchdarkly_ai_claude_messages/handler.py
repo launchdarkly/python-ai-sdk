@@ -24,6 +24,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
+    tool_result_string,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -332,7 +333,7 @@ async def _run_tool_loop(
                     {
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": str(result),
+                        "content": tool_result_string(result),
                     }
                 )
             conversation.append({"role": "user", "content": tool_results})
@@ -714,7 +715,7 @@ async def _stream_gen(
                     {
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": str(result),
+                        "content": tool_result_string(result),
                     }
                 )
             for rich in emitter.fail_open():

@@ -508,12 +508,10 @@ async def run_judge(
                 metric_score,
                 reasoning if judge_handler.capture_content else None,
             )
-        # A judge without a pinned model config must not inherit the parent's
-        # modelKey / modelVersion; every other parent-only key (graphKey, ...)
-        # is still carried over.
+        # The score belongs to the evaluated (parent) config, exactly as in
+        # the inline run_judges path.
         merged_track_data: TrackData = {
-            **omit_model_stamps(task.parent_track_data),
-            **result["track_data"],
+            **task.parent_track_data,
             "judgeConfigKey": task.config_key,
         }
 

@@ -533,7 +533,7 @@ class TestRunJudgeScoreReporting:
 
 
 class TestRunJudgeTrackData:
-    """§3.13 run_judge result track_data must not inherit the parent's model stamps."""
+    """§3.13 run_judge result track_data carries the evaluated (parent) config identity."""
 
     PARENT: ClassVar[dict[str, Any]] = {
         "runId": "parent-run",
@@ -600,45 +600,54 @@ class TestRunJudgeTrackData:
         )
         return await run_judge(task, [handler])
 
-    async def test_does_not_inherit_parent_model_stamps(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_matches_inline_track_data(
+        self, monkeypatch: pytest.MonkeyPatch, mock_ld_client: MagicMock
     ) -> None:
-        result = await self._run(
-            monkeypatch,
-            {
-                "runId": "judge-run",
-                "configKey": "judge-key",
-                "variationKey": "j1",
-                "version": 1,
-                "modelName": "claude",
-                "providerName": "TestProvider",
-            },
-        )
-        assert result is not None
-        assert "modelKey" not in result.track_data
-        assert "modelVersion" not in result.track_data
-        assert result.track_data["judgeConfigKey"] == "judge-key"
-        assert result.track_data["graphKey"] == "g1"
+        # The judge's own track_data differs on every identity key; none of it
+        # may leak into the result, which must equal what run_judges tracks.
+        import random
 
-    async def test_keeps_judge_own_model_stamps(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        result = await self._run(
-            monkeypatch,
-            {
-                "runId": "judge-run",
-                "configKey": "judge-key",
-                "variationKey": "j1",
-                "version": 1,
-                "modelName": "claude",
-                "providerName": "TestProvider",
-                "modelKey": "judge-model",
-                "modelVersion": 2,
-            },
-        )
+        judge_track_data = {
+            "runId": "judge-run",
+            "configKey": "judge-key",
+            "variationKey": "j1",
+            "version": 3,
+            "modelName": "claude",
+            "providerName": "TestProvider",
+            "modelKey": "judge-model",
+            "modelVersion": 2,
+        }
+        result = await self._run(monkeypatch, judge_track_data)
         assert result is not None
-        assert result.track_data["modelKey"] == "judge-model"
-        assert result.track_data["modelVersion"] == 2
+        assert result.track_data == {**self.PARENT, "judgeConfigKey": "judge-key"}
+
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "claude"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+                "evaluationMetricKey": "judge-metric",
+                "_ldMeta": {"enabled": True, "variationKey": "j1", "version": 3},
+            }
+        )
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config={
+                    "model": {"name": "gpt-4o"},
+                    "provider": {"name": "TestProvider"},
+                    "instructions": "hi",
+                    "judgeConfiguration": {
+                        "judges": [{"key": "judge-key", "samplingRate": 1.0}]
+                    },
+                },
+                user_context=CONTEXT,
+                handler=_make_handler(),
+                user_input="q",
+                llm_response="response",
+                base_track_data=dict(self.PARENT),
+            )
+        inline_track_data = mock_ld_client.track.call_args.args[2]
+        assert result.track_data == inline_track_data
 
 
 class TestTypesafeJudgeResults:
