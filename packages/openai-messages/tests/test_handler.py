@@ -2959,6 +2959,29 @@ class TestForwardsExactlyTheCrossSdkList:
         assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_MESSAGES
 
 
+class TestReasoningKeepsEffortAndSummary:
+    @staticmethod
+    def _forwarded(parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_openai_messages.handler import _forwarded_parameters
+
+        return _forwarded_parameters({"model": {"parameters": parameters}})
+
+    def test_other_sub_keys_are_dropped(self) -> None:
+        assert self._forwarded(
+            {"reasoning": {"effort": "low", "generate_summary": "auto", "x": 1}}
+        ) == {"reasoning": {"effort": "low"}}
+
+    def test_effort_and_summary_are_kept(self) -> None:
+        assert self._forwarded(
+            {"reasoning": {"effort": "high", "summary": "auto"}}
+        ) == {"reasoning": {"effort": "high", "summary": "auto"}}
+
+    def test_a_reasoning_with_neither_is_dropped(self) -> None:
+        assert self._forwarded(
+            {"reasoning": {"generate_summary": "auto"}, "top_p": 0.4}
+        ) == {"top_p": 0.4}
+
+
 class TestMalformedObjectValuesAreDropped:
     """``reasoning`` set to anything but an object is dropped on both paths."""
 

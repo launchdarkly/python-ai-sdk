@@ -66,7 +66,8 @@ from .spans import (
 #: ``max_output_tokens`` (see :func:`_apply_max_output_tokens_rename`); the rest are dropped.
 #:
 #: The UI writes reasoning effort as ``reasoning: {"effort": ...}``, the Responses API's own shape,
-#: so ``reasoning`` is forwarded as-is and no top-level ``reasoning_effort`` is read.
+#: so ``reasoning`` is forwarded with its ``effort`` and ``summary`` (see :func:`_rebuild_reasoning`)
+#: and no top-level ``reasoning_effort`` is read.
 #:
 #: This is the cross-SDK list for OpenAI Messages (TESTING.md section 1.12). The same list serves
 #: ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves the
@@ -165,16 +166,37 @@ def _apply_max_output_tokens_rename(params: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+#: The ``reasoning`` sub-keys forwarded, the same two the JS SDK keeps. The deprecated
+#: ``generate_summary`` spelling and anything else are dropped.
+_REASONING_KEYS = ("effort", "summary")
+
+
+def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
+    """Keeps only ``effort`` and ``summary`` of a forwarded ``reasoning`` object, and drops a
+    ``reasoning`` with neither."""
+    if "reasoning" in params:
+        reasoning = params.pop("reasoning")
+        kept = {
+            k: reasoning[k] for k in _REASONING_KEYS if reasoning.get(k) is not None
+        }
+        if kept:
+            params["reasoning"] = kept
+    return params
+
+
 def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that reach ``responses.create``/``.stream``:
     ``max_tokens``/``max_completion_tokens`` renamed to ``max_output_tokens``, then only
-    :data:`_RESPONSES_FORWARDED_KEYS`, with malformed object values dropped. ``invoke`` and
-    ``stream`` both call this, so they forward the same keys.
+    :data:`_RESPONSES_FORWARDED_KEYS`, with malformed object values dropped and ``reasoning``
+    narrowed to ``effort`` and ``summary``. ``invoke`` and ``stream`` both call this, so they
+    forward the same keys.
     """
-    return select_forwarded_parameters(
-        _apply_max_output_tokens_rename(model_parameters(config)),
-        _RESPONSES_FORWARDED_KEYS,
-        mapping_keys=_RESPONSES_MAPPING_KEYS,
+    return _rebuild_reasoning(
+        select_forwarded_parameters(
+            _apply_max_output_tokens_rename(model_parameters(config)),
+            _RESPONSES_FORWARDED_KEYS,
+            mapping_keys=_RESPONSES_MAPPING_KEYS,
+        )
     )
 
 
