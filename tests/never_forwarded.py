@@ -28,6 +28,8 @@ NEVER_FORWARDED_KEYS = frozenset(
         "aws_secret_access_key",
         "aws_session_token",
         "aws_region",
+        "aws_region_name",
+        "vertex_credentials",
         # Endpoints and connection.
         "base_url",
         "openai_api_base",
@@ -52,6 +54,14 @@ NEVER_FORWARDED_KEYS = frozenset(
         "proxies",
         "openai_proxy",
         "anthropic_proxy",
+        "api_base",
+        "api_version",
+        "deployment_id",
+        "custom_llm_provider",
+        "model_list",
+        "fallbacks",
+        "num_retries",
+        "shared_session",
         # Request injection.
         "headers",
         "extra_headers",
@@ -61,6 +71,7 @@ NEVER_FORWARDED_KEYS = frozenset(
         "model_kwargs",
         "provider_data",
         "additional_model_request_fields",
+        "mock_response",
         # Remote tools.
         "mcp_servers",
         # Data retention.
