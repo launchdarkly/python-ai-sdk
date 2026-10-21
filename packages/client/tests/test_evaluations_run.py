@@ -254,7 +254,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         project_key="proj",
         api_key="token",
         sdk_key="sdk-key",
-        base_uri="https://api.example.com",
+        api_base_uri="https://api.example.com",
         ui_base_uri="https://ui.example.com/",
         transport=transport,
     )
@@ -986,6 +986,39 @@ def hosted_dataset_responses() -> list[HttpResponse]:
             },
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_api_host_env_alone_leaves_result_url_on_default_ui_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The UI host is not derived from the API host: environments do not always
+    # serve both from the same place.
+    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+    monkeypatch.delenv("LD_UI_BASE_URI", raising=False)
+    transport = SequencedTransport(hosted_dataset_responses())
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=handler,
+        generation={"provider": "OpenAI", "model": "gpt-4o"},
+    )
+
+    assert all(
+        request["url"].startswith("https://api.staging.example.com/api/v2/")
+        for request in transport.requests
+    )
+    assert result.url == (
+        "https://app.launchdarkly.com/projects/proj/ai/evaluations/"
+        "evaluation-id/runs/run-id"
+    )
 
 
 @pytest.mark.asyncio
