@@ -129,6 +129,10 @@ VERCEL = frozenset(
     }
 )
 
+#: OpenCode's message route takes no model setting, so the Python-only OpenCode handler forwards
+#: nothing.
+OPENCODE_AGENTS: frozenset[str] = frozenset()
+
 LANGCHAIN_CHAT_OPENAI = frozenset(
     {
         "frequency_penalty",
