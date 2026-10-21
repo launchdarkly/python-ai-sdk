@@ -1028,3 +1028,35 @@ class TestInspectConfig:
         assert result["enabled"] is False
         assert result["config"] is None
         assert result["meta"] is None
+
+
+# ---------------------------------------------------------------------------
+# extract_variation — missing enabled flag
+# ---------------------------------------------------------------------------
+
+
+class TestExtractVariationMissingEnabled:
+    # Spec §3.10: only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
+    @pytest.mark.parametrize("ld_meta", [None, {}], ids=["no_ldMeta", "empty_ldMeta"])
+    async def test_raises_when_enabled_is_missing(
+        self, ld_meta: dict[str, Any] | None
+    ) -> None:
+        raw: dict[str, Any] = {
+            "model": {"name": "claude-3-5"},
+            "provider": {"name": "Anthropic"},
+            "instructions": "You are helpful.",
+        }
+        if ld_meta is not None:
+            raw["_ldMeta"] = ld_meta
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(return_value=raw)
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            with pytest.raises(RuntimeError, match="'my-flag' is disabled"):
+                await lifecycle_module.extract_variation("my-flag", ctx)
+            assert (await inspect_config("my-flag", ctx))["enabled"] is False
