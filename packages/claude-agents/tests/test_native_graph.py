@@ -1255,6 +1255,26 @@ class TestNativeGraphModelParameters:
             assert not find_leaks(opts)
 
 
+def _build_cli_command(options_kwargs: dict[str, Any]) -> list[str]:
+    """The CLI command the real ``claude_agent_sdk`` would launch for one node's options, built by
+    the SDK's own transport with a stand-in binary. The mocked hooks and MCP servers are left out,
+    since only the forwarded settings are being checked."""
+    from claude_agent_sdk import ClaudeAgentOptions
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    options = ClaudeAgentOptions(
+        **{
+            k: v
+            for k, v in options_kwargs.items()
+            if k not in {"hooks", "mcp_servers", "can_use_tool"}
+        },
+        cli_path="/bin/echo",
+    )
+    return SubprocessCLITransport(prompt="q", options=options)._build_command()
+
+
 class TestNativeGraphForwardsExactlyTheCrossSdkList:
     """The native graph builds each node's options with the handler's own forwarding, so a probe
     of one node finds exactly the cross-SDK Claude Agents list."""
@@ -1292,6 +1312,10 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
                 await to_claude_agents(
                     _make_def_promise(_make_graph_def(nodes=nodes))
                 ).invoke("hi")
+            # The real SDK builds its CLI command from each node's options, so a value it
+            # cannot read fails the probe here.
+            for kw in captured:
+                _build_cli_command(kw)
             return [
                 {k: v for k, v in kw.items() if k not in {"hooks", "mcp_servers"}}
                 for kw in captured

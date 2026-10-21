@@ -2562,6 +2562,7 @@ class TestForwardsExactlyTheCrossSdkList:
 
         async def _query(**kwargs: Any) -> AsyncIterator[Any]:
             captured["options"] = kwargs["options"]
+            build_cli_command(kwargs["options"])
             yield assistant_message()
             yield result_message()
 
@@ -2587,6 +2588,87 @@ class TestForwardsExactlyTheCrossSdkList:
             return _comparable(captured["options"])
 
         assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_AGENTS
+
+
+def build_cli_command(options: Any) -> list[str]:
+    """The CLI command ``claude_agent_sdk`` would launch for *options*, built by the SDK's own
+    transport (with a stand-in binary), so an option value the SDK cannot read raises here the
+    way it would at run time."""
+    import dataclasses
+
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    transport = SubprocessCLITransport(
+        prompt="q", options=dataclasses.replace(options, cli_path="/bin/echo")
+    )
+    return transport._build_command()
+
+
+class TestThinkingIsRebuilt:
+    @staticmethod
+    def _thinking(value: Any) -> Any:
+        from launchdarkly_ai_claude_agents.handler import _options_parameters
+
+        return _options_parameters({"model": {"parameters": {"thinking": value}}}).get(
+            "thinking"
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ({"type": "adaptive"}, {"type": "adaptive"}),
+            (
+                {"type": "adaptive", "display": "summarized"},
+                {"type": "adaptive", "display": "summarized"},
+            ),
+            (
+                {"type": "enabled", "budget_tokens": 1024, "extra": 1},
+                {"type": "enabled", "budget_tokens": 1024},
+            ),
+            (
+                {"type": "enabled", "budgetTokens": 2048, "display": "omitted"},
+                {"type": "enabled", "budget_tokens": 2048, "display": "omitted"},
+            ),
+            (
+                {"type": "disabled", "budget_tokens": 1, "display": "omitted"},
+                {"type": "disabled"},
+            ),
+            (
+                {"type": "adaptive", "display": "verbose"},
+                {"type": "adaptive"},
+            ),
+        ],
+    )
+    def test_a_known_type_keeps_only_the_sub_keys_the_sdk_reads(
+        self, value: Any, expected: Any
+    ) -> None:
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        assert self._thinking(value) == expected
+        build_cli_command(ClaudeAgentOptions(thinking=expected))
+
+    @pytest.mark.parametrize("value", [{"budget_tokens": 1024}, {"type": "enabled"}])
+    def test_the_shapes_the_sdk_cannot_read_are_dropped(self, value: Any) -> None:
+        """Both raise ``KeyError`` in the SDK's command builder when passed through."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        with pytest.raises(KeyError):
+            build_cli_command(ClaudeAgentOptions(thinking=value))
+        assert self._thinking(value) is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"type": "enabled", "budget_tokens": "1024"},
+            {"type": "enabled", "budget_tokens": True},
+            {"type": "on", "budget_tokens": 1024},
+            {"type": None},
+        ],
+    )
+    def test_an_unknown_type_or_a_malformed_budget_is_dropped(self, value: Any) -> None:
+        assert self._thinking(value) is None
 
 
 class TestMalformedObjectValuesAreDropped:

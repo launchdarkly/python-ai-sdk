@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from typing import Any
 
 from claude_agent_sdk import (
@@ -594,16 +594,53 @@ def _raise_if_run_failed(message: Any) -> None:
     )
 
 
+#: The ``thinking`` types ``claude_agent_sdk`` knows (``ThinkingConfig``). It reads
+#: ``thinking["type"]`` when it builds the CLI command, so a ``thinking`` without one raises.
+_THINKING_TYPES = frozenset({"adaptive", "enabled", "disabled"})
+
+#: The ``thinking.display`` values the SDK passes to the CLI (``ThinkingDisplay``).
+_THINKING_DISPLAYS = frozenset({"summarized", "omitted"})
+
+
+def _rebuild_thinking(value: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``thinking`` in the shape ``claude_agent_sdk`` reads, or ``None`` when it is malformed.
+
+    Keeps ``type``, ``budget_tokens`` and ``display`` only, the same sub-keys the JS SDK keeps.
+    The type must be one the SDK knows, and an ``enabled`` thinking must carry an integer
+    ``budget_tokens``: the SDK reads ``thinking["budget_tokens"]`` for it straight away, so one
+    without a budget would raise. ``budgetTokens`` is read as well, as in the JS SDK. ``display``
+    is kept only for a type that takes it and only with a value the SDK knows.
+    """
+    kind = value.get("type")
+    if kind not in _THINKING_TYPES:
+        return None
+    thinking: dict[str, Any] = {"type": kind}
+    if kind == "enabled":
+        budget = value.get("budget_tokens", value.get("budgetTokens"))
+        if not isinstance(budget, int) or isinstance(budget, bool):
+            return None
+        thinking["budget_tokens"] = budget
+    if kind != "disabled" and value.get("display") in _THINKING_DISPLAYS:
+        thinking["display"] = value["display"]
+    return thinking
+
+
 def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that become ``ClaudeAgentOptions`` fields: only
-    :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped. The handler
-    and the native graph both call this, so they forward the same keys.
+    :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
+    ``thinking`` rebuilt by :func:`_rebuild_thinking`. The handler and the native graph both call
+    this, so they forward the same keys.
     """
-    return select_forwarded_parameters(
+    params = select_forwarded_parameters(
         model_parameters(config),
         _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
         mapping_keys=_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS,
     )
+    if "thinking" in params:
+        thinking = _rebuild_thinking(params.pop("thinking"))
+        if thinking is not None:
+            params["thinking"] = thinking
+    return params
 
 
 def _build_query_options(
