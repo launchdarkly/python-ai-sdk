@@ -11,7 +11,7 @@ from __future__ import annotations
 
 #: Credentials, endpoints and connection settings, raw request injection, remote tools, the Claude
 #: Agents host-process settings, and the categories no cross-SDK allowlist (TESTING.md section 1.12)
-#: may hold: data retention, server-side state, identity and attribution, runtime wiring and
+#: may hold: data location and retention, server-side state, identity and attribution, runtime wiring and
 #: API-shape switches, prompt content beyond the instructions, and safety configuration.
 NEVER_FORWARDED_KEYS = frozenset(
     {
@@ -38,7 +38,6 @@ NEVER_FORWARDED_KEYS = frozenset(
         "endpoint_url",
         "region",
         "region_name",
-        "inference_geo",
         "client_options",
         "client",
         "async_client",
@@ -74,10 +73,14 @@ NEVER_FORWARDED_KEYS = frozenset(
         "mock_response",
         # Remote tools.
         "mcp_servers",
-        # Data retention.
+        # Data location and retention.
+        "inference_geo",
         "store",
         "prompt_cache_retention",
         # Server-side state.
+        "container",
+        "reuse_last_container",
+        "previous_response_id",
         "context_management",
         "truncation",
         # Identity and attribution.
