@@ -348,6 +348,28 @@ async def main():
 asyncio.run(main())
 ```
 
+#### Deferred judges
+
+With `skip_judges=True`, `invoke()` returns `judge_tasks` instead of running them. Run each with `run_judge(task, handlers)` on your own thread or process, then track the result. A judge that scores several labels in one call (a TypeSafe judge, for example) returns `metrics`: track each entry under its own `eventKey`, and do not also track `evaluation_metric_key`.
+
+```python
+from ldclient import Context
+from launchdarkly_ai_server import get_client, run_judge
+
+result = await run_judge(task, handlers)
+context = Context.from_dict(task.user_context)
+if result and result.metrics:
+    for metric in result.metrics:
+        get_client().track(
+            metric["eventKey"],
+            context,
+            {**result.track_data, "judgeConfigKey": metric["judgeConfigKey"]},
+            metric["score"],
+        )
+elif result and task.evaluation_metric_key:
+    get_client().track(task.evaluation_metric_key, context, result.track_data, result.score)
+```
+
 ### `graph(key, **options)`
 
 Runs a multi-agent workflow defined in a LaunchDarkly agent graph flag. The SDK uses a **model-driven router**: it starts at the root node, presents outgoing edges as handoff choices to the model, and follows whichever edge the model selects. The loop terminates when the model produces a final answer, a leaf is reached, a cycle is detected, or the step cap is hit.

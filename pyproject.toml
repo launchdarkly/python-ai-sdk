@@ -72,4 +72,5 @@ known-first-party = [
   "launchdarkly_ai_opencode_agents",
   "launchdarkly_ai_vercel_agents",
   "launchdarkly_ai_vercel_messages",
+  "launchdarkly_ai_typesafe",
 ]

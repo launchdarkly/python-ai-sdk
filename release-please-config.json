@@ -144,6 +144,17 @@
         "src/launchdarkly_ai_opencode_agents/_version.py"
       ],
       "component": "launchdarkly-ai-opencode-agents"
+    },
+    "packages/typesafe": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_typesafe/_version.py"
+      ],
+      "component": "launchdarkly-ai-typesafe"
     }
   },
   "changelog-sections": [
