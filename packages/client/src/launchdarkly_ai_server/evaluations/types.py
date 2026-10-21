@@ -40,10 +40,15 @@ class GenerationConfig(TypedDict, total=False):
 
 @dataclass
 class DatasetRef:
-    """Identifiers returned when resolving a dataset by key."""
+    """Identifiers returned when resolving a dataset by key.
 
-    id: str
-    key: str
+    Both are ``None`` for an inline dataset, whose rows are uploaded to the run
+    rather than stored as a dataset. Its events must carry no dataset id: the
+    server drops any that name one as a mismatch.
+    """
+
+    id: str | None
+    key: str | None
 
 
 @dataclass
@@ -55,6 +60,16 @@ class DatasetRow:
     expected_output: str | None = None
     variables: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] | None = None
+
+
+InlineDatasetRow = Mapping[str, Any]
+"""One caller-supplied row of an inline dataset.
+
+A mapping uses the dataset-rows wire shape: ``input``, ``expectedOutput``,
+``variables``, ``metadata`` and an optional ``rowIdx``. A row's index is its
+position in the list; a ``rowIdx`` that disagrees with that position is
+rejected.
+"""
 
 
 @dataclass
@@ -123,8 +138,12 @@ class AIConfigVariation:
             base_parameters = model_config.get("params")
             if isinstance(base_parameters, Mapping):
                 parameters = {**base_parameters, **parameters}
-            if not model_name:
-                model_name = model_config.get("id")
+            # A linked variation's modelName is the model-config key
+            # ("OpenAI.gpt-4o"), not a model ID the provider accepts; the
+            # model config's id is, so it wins whenever one is linked.
+            config_model_id = model_config.get("id")
+            if isinstance(config_model_id, str) and config_model_id:
+                model_name = config_model_id
 
         generation = GenerationConfig()
         if isinstance(provider, str) and provider:

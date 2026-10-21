@@ -1,0 +1,750 @@
+"""Reduce OpenCode session events into handler stream events.
+
+Each call opens its own session on a running ``opencode serve``. This module
+does not start that process. The handler yields the AG-UI text and tool subset,
+then one ``done``. ``config().stream()`` still yields ``chunk`` then ``done``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator, AsyncIterable, Mapping
+from contextlib import aclosing
+from typing import Any
+
+from launchdarkly_ai_server import (
+    AiConfigRep,
+    ProviderHandler,
+    SpanMessage,
+    SpanUsage,
+    _config,
+    _create_handler,
+    add_cached_tokens_to_input,
+    compose_history,
+    content_to_text,
+    end_span_once,
+    parse_template,
+    set_input_content_attributes,
+    set_output_content_attributes,
+    text_message,
+)
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.sdk_usage import report_usage
+from launchdarkly_ai_server.utils import number_or_zero
+
+from ._version import PACKAGE_NAME, __version__
+from .server import ModelResolver, default_model, session_events
+from .spans import fail_span, finish_root_span, mark_ok, start_root_span
+
+
+class OpenCodeSessionError(Exception):
+    """The OpenCode session failed.
+
+    The provider error body is not included. The error ``name`` is, when the
+    event has one. A failed session does not finish the run.
+    """
+
+
+class _Reducer:
+    """One pass over a session.
+
+    Text is emitted only for messages ``message.updated`` has marked assistant.
+    A part snapshot is that part's full text so far: a later delta still appends,
+    and a snapshot that repeats text already emitted adds nothing. A text delta
+    without ``partID`` is dropped. The first ``running`` tool state with complete
+    ``state.input`` opens the call. OpenCode runs the tool. ``state.raw`` is not
+    diffed into argument text.
+
+    Events whose ``sessionID`` is not *session_id* are ignored. A missing
+    ``sessionID`` is kept. The reducer does not adopt the first session it
+    sees. A ``session.idle`` for this session ends the iterable.
+    """
+
+    def __init__(self, *, capture_content: bool, session_id: str) -> None:
+        self._emitter = TurnEmitter(capture_content=capture_content)
+        self._session_id = session_id
+        self._started: set[str] = set()
+        self._text_message_id: str | None = None
+        self._text_open = False
+        self._held_tools: dict[str, list[Mapping[str, Any]]] = {}
+        self._deltas: list[str] = []
+        self._roles: dict[str, str] = {}
+        self._held: dict[str, list[tuple[str, str, str]]] = {}
+        self._parked: list[
+            tuple[str, list[tuple[str, str, str]], list[Mapping[str, Any]]]
+        ] = []
+        self._part_text: dict[str, str] = {}
+        self._usage_ids: set[str] = set()
+        self._input = 0
+        self._output = 0
+        self._cache_read = 0
+        self._cache_write = 0
+        self._saw_usage = False
+        self._saw_cache = False
+
+    @property
+    def deltas(self) -> list[str]:
+        return self._deltas
+
+    def usage_payload(self) -> dict[str, int] | None:
+        """Raw usage for ``parse_usage``, or ``None`` when no assistant message completed."""
+        if not self._saw_usage:
+            return None
+        payload: dict[str, int] = {
+            "input_tokens": self._input,
+            "output_tokens": self._output,
+        }
+        if self._saw_cache:
+            payload["cache_read_input_tokens"] = self._cache_read
+            payload["cache_creation_input_tokens"] = self._cache_write
+        return payload
+
+    async def reduce(
+        self, events: AsyncIterable[Mapping[str, Any]]
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        async for raw in events:
+            if not isinstance(raw, Mapping):
+                continue
+            kind = raw.get("type")
+            properties = raw.get("properties")
+            session_id = _session_id(raw)
+            if session_id is not None and session_id != self._session_id:
+                continue
+            if kind == "session.idle":
+                if session_id == self._session_id:
+                    return
+                continue
+            if kind == "session.error":
+                raise OpenCodeSessionError(_session_error_message(properties))
+            for event in self._event(raw):
+                yield event
+
+    def _accept_text(
+        self, message_id: str, part_id: str, kind: str, text: str
+    ) -> list[dict[str, Any]]:
+        role = self._roles.get(message_id)
+        if role is None:
+            self._held.setdefault(message_id, []).append((kind, part_id, text))
+            return []
+        if role != "assistant":
+            return []
+        if self._text_open and message_id != self._text_message_id:
+            self._held.setdefault(message_id, []).append((kind, part_id, text))
+            return []
+        events = self._begin_message(message_id)
+        events.extend(self._flush_held(message_id))
+        events.extend(self._apply_text(part_id, kind, text))
+        if self._text_open and self._text_message_id == message_id:
+            events.extend(self._release_tools(message_id))
+        return events
+
+    def _flush_held(self, message_id: str) -> list[dict[str, Any]]:
+        held = self._held.pop(message_id, [])
+        events: list[dict[str, Any]] = []
+        for kind, part_id, text in held:
+            events.extend(self._apply_text(part_id, kind, text))
+        return events
+
+    def _apply_text(self, part_id: str, kind: str, text: str) -> list[dict[str, Any]]:
+        if kind == "delta":
+            if part_id:
+                self._part_text[part_id] = self._part_text.get(part_id, "") + text
+            return self._chunk(text)
+        already = self._part_text.get(part_id, "")
+        if text.startswith(already):
+            suffix = text[len(already) :]
+            if part_id:
+                self._part_text[part_id] = text
+        elif not already:
+            suffix = text
+            if part_id:
+                self._part_text[part_id] = text
+        else:
+            return []
+        if not suffix:
+            return []
+        return self._chunk(suffix)
+
+    def _begin_message(self, message_id: str) -> list[dict[str, Any]]:
+        if self._text_message_id == message_id:
+            return []
+        events = self._end_open_text()
+        self._text_message_id = message_id
+        return events
+
+    def _end_open_text(self) -> list[dict[str, Any]]:
+        events = self._emitter.end_text()
+        self._text_message_id = None
+        self._text_open = False
+        events.extend(self._flush_parked())
+        return events
+
+    def _flush_parked(self) -> list[dict[str, Any]]:
+        """Emit messages completed while other text was open, after that text ends."""
+        parked = self._parked
+        self._parked = []
+        events: list[dict[str, Any]] = []
+        for message_id, held, tools in parked:
+            events.extend(self._emit_parked(message_id, held, tools))
+        return events
+
+    def _emit_parked(
+        self,
+        message_id: str,
+        held: list[tuple[str, str, str]],
+        tools: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        if held:
+            events.extend(self._begin_message(message_id))
+            for kind, part_id, text in held:
+                events.extend(self._apply_text(part_id, kind, text))
+        if self._text_open and self._text_message_id == message_id:
+            for part in tools:
+                events.extend(self._emit_tool(part))
+            events.extend(self._emitter.end_text())
+            self._text_message_id = None
+            self._text_open = False
+            return events
+        for part in tools:
+            events.extend(self._emit_tool(part))
+        if self._text_message_id == message_id:
+            self._text_message_id = None
+        return events
+
+    def _release_tools(self, message_id: str) -> list[dict[str, Any]]:
+        parts = self._held_tools.pop(message_id, [])
+        events: list[dict[str, Any]] = []
+        for part in parts:
+            events.extend(self._emit_tool(part))
+        return events
+
+    def close(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        # End the open assistant message before leftover tools. tool_start
+        # copies that message into parentMessageId. Then apply every held
+        # assistant call, including one that completed after the text closed,
+        # before fail_open marks a started call as a failure.
+        events.extend(self._end_open_text())
+        for message_id, held in list(self._held.items()):
+            if self._roles.get(message_id) != "assistant" or not held:
+                continue
+            tools = self._held_tools.pop(message_id, [])
+            events.extend(self._emit_parked(message_id, held, tools))
+            self._held.pop(message_id, None)
+        for message_id, parts in list(self._held_tools.items()):
+            role = self._roles.get(message_id)
+            if role is None or role == "assistant":
+                for part in parts:
+                    events.extend(self._emit_tool(part))
+        self._held_tools.clear()
+        events.extend(self._emitter.fail_open())
+        return events
+
+    def _event(self, raw: Mapping[str, Any]) -> list[dict[str, Any]]:
+        kind = raw.get("type")
+        properties = raw.get("properties")
+        if not isinstance(properties, Mapping):
+            return []
+        if kind == "message.part.delta":
+            return self._delta(properties)
+        if kind == "message.part.updated":
+            part = properties.get("part")
+            if not isinstance(part, Mapping):
+                return []
+            if part.get("type") == "tool":
+                return self._tool(part)
+            if part.get("type") != "text":
+                return []
+            return self._text_snapshot(part)
+        if kind == "message.updated":
+            info = properties.get("info")
+            if isinstance(info, Mapping):
+                return self._message(info)
+        return []
+
+    def _delta(self, properties: Mapping[str, Any]) -> list[dict[str, Any]]:
+        if properties.get("field") != "text":
+            return []
+        delta = properties.get("delta")
+        message_id = properties.get("messageID")
+        part_id = properties.get("partID")
+        if (
+            not isinstance(delta, str)
+            or not delta
+            or not isinstance(message_id, str)
+            or not isinstance(part_id, str)
+            or not part_id
+        ):
+            return []
+        return self._accept_text(message_id, part_id, "delta", delta)
+
+    def _text_snapshot(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
+        message_id = part.get("messageID")
+        text = part.get("text")
+        part_id = part.get("id")
+        if (
+            not isinstance(message_id, str)
+            or not isinstance(text, str)
+            or not text
+            or not isinstance(part_id, str)
+        ):
+            return []
+        return self._accept_text(message_id, part_id, "snapshot", text)
+
+    def _chunk(self, text: str) -> list[dict[str, Any]]:
+        self._deltas.append(text)
+        events = self._emitter.text(text)
+        if events:
+            self._text_open = True
+        return events
+
+    def _tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
+        message_id = part.get("messageID")
+        if not isinstance(message_id, str):
+            self._held_tools.setdefault("", []).append(part)
+            return []
+        role = self._roles.get(message_id)
+        if role is None:
+            self._held_tools.setdefault(message_id, []).append(part)
+            return []
+        if role != "assistant":
+            return []
+        raw_id = part.get("callID") or part.get("id") or ""
+        call_id = raw_id if isinstance(raw_id, str) else ""
+        if call_id and call_id in self._started:
+            return self._emit_tool(part)
+        if self._text_open and self._text_message_id == message_id:
+            return self._emit_tool(part)
+        # Another message is streaming, or this message's text has not opened
+        # yet. Emitting now would parent the call to the wrong message.
+        if self._text_open or self._text_message_id == message_id:
+            self._held_tools.setdefault(message_id, []).append(part)
+            return []
+        return self._emit_tool(part)
+
+    def _emit_tool(self, part: Mapping[str, Any]) -> list[dict[str, Any]]:
+        state = part.get("state")
+        if not isinstance(state, Mapping):
+            return []
+        status = state.get("status")
+        raw_id = part.get("callID") or part.get("id") or ""
+        call_id = raw_id if isinstance(raw_id, str) else ""
+        name = part.get("tool") if isinstance(part.get("tool"), str) else ""
+        if not call_id or status == "pending":
+            return []
+        if status == "running":
+            if "input" not in state or not name:
+                return []
+            events = self._emitter.tool_start(call_id, name)
+            if any(event.get("type") == "TOOL_CALL_START" for event in events):
+                self._started.add(call_id)
+            events.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
+            return events
+        if status not in ("completed", "error"):
+            return []
+        opened: list[dict[str, Any]] = []
+        if name:
+            started = self._emitter.tool_start(call_id, name)
+            if any(event.get("type") == "TOOL_CALL_START" for event in started):
+                self._started.add(call_id)
+            opened.extend(started)
+            opened.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
+        if status == "error":
+            opened.extend(self._emitter.tool_result(call_id, failed=True))
+        else:
+            opened.extend(self._emitter.tool_result(call_id, state.get("output")))
+        return opened
+
+    def _message(self, info: Mapping[str, Any]) -> list[dict[str, Any]]:
+        message_id = info.get("id")
+        role = info.get("role")
+        events: list[dict[str, Any]] = []
+        completed_time = info.get("time")
+        finished = isinstance(completed_time, Mapping) and "completed" in completed_time
+        if isinstance(message_id, str) and isinstance(role, str):
+            self._roles[message_id] = role
+            if role == "assistant":
+                # A reserved id is not an open AG-UI message. Only text that
+                # TurnEmitter has already yielded can take a parent or be split.
+                late_completion = (
+                    finished and self._text_open and message_id != self._text_message_id
+                )
+                if late_completion:
+                    # Keep the open message intact. The held text and tools
+                    # still happened; emit them once that text ends.
+                    held = self._held.pop(message_id, [])
+                    tools = self._held_tools.pop(message_id, [])
+                    if held or tools:
+                        self._parked.append((message_id, held, tools))
+                else:
+                    events.extend(self._begin_message(message_id))
+                    events.extend(self._flush_held(message_id))
+                    if self._text_open and self._text_message_id == message_id:
+                        events.extend(self._release_tools(message_id))
+                    elif finished:
+                        events.extend(self._release_tools(message_id))
+            else:
+                self._held.pop(message_id, None)
+                self._held_tools.pop(message_id, None)
+        if role != "assistant" or not isinstance(message_id, str) or not finished:
+            return events
+        if self._text_message_id == message_id and self._text_open:
+            events.extend(self._end_open_text())
+        elif self._text_message_id == message_id:
+            self._text_message_id = None
+        if message_id not in self._usage_ids:
+            tokens = info.get("tokens")
+            if isinstance(tokens, Mapping):
+                self._add_usage(tokens)
+                self._usage_ids.add(message_id)
+        return events
+
+    def _add_usage(self, tokens: Mapping[str, Any]) -> None:
+        self._saw_usage = True
+        self._input += number_or_zero(tokens.get("input"))
+        self._output += number_or_zero(tokens.get("output"))
+        cache = tokens.get("cache")
+        if isinstance(cache, Mapping):
+            self._saw_cache = True
+            self._cache_read += number_or_zero(cache.get("read"))
+            self._cache_write += number_or_zero(cache.get("write"))
+
+
+def _string_id(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _session_id(raw: object) -> str | None:
+    """Session id from a bus event.
+
+    Deltas carry it on ``properties``. ``message.updated`` carries it on
+    ``properties.info``, and ``message.part.updated`` on ``properties.part``.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    properties = raw.get("properties")
+    if not isinstance(properties, Mapping):
+        return _string_id(raw.get("sessionID"))
+    found = _string_id(properties.get("sessionID"))
+    if found is not None:
+        return found
+    info = properties.get("info")
+    if isinstance(info, Mapping):
+        found = _string_id(info.get("sessionID"))
+        if found is not None:
+            return found
+    part = properties.get("part")
+    if isinstance(part, Mapping):
+        return _string_id(part.get("sessionID"))
+    return None
+
+
+def _session_error_message(properties: object) -> str:
+    name = None
+    if isinstance(properties, Mapping):
+        error = properties.get("error")
+        if isinstance(error, Mapping):
+            raw_name = error.get("name")
+            if isinstance(raw_name, str) and raw_name:
+                name = raw_name
+    if name is None:
+        return "The OpenCode session failed."
+    return f"The OpenCode session failed ({name})."
+
+
+def _input_messages(
+    user_input: str | None,
+    history: list[dict[str, Any]] | None,
+) -> list[SpanMessage]:
+    """History and *user_input* as span messages.
+
+    Block-array history is flattened the same way as the other handlers.
+    System turns stay off this list: they belong on the system instructions.
+    An empty *user_input* adds nothing, so a history turn that already holds
+    the user message is not followed by a blank one.
+    """
+    items = [item for item in (history or []) if isinstance(item, dict)]
+    messages: list[SpanMessage] = []
+    for item in compose_history(history=items, user_input=user_input):
+        role = item.get("role")
+        content = item.get("content")
+        if not isinstance(role, str) or not role:
+            continue
+        if isinstance(content, str):
+            messages.append(text_message(role, content))
+            continue
+        if isinstance(content, list):
+            text = content_to_text(
+                [block for block in content if isinstance(block, dict)]
+            )
+            if text:
+                messages.append(text_message(role, text))
+    return messages
+
+
+def create_opencode_handler(
+    *,
+    base_url: str,
+    capture_content: bool | None = None,
+    model: ModelResolver | None = None,
+    agent: str | None = None,
+) -> ProviderHandler:
+    """Return a handler that opens one OpenCode session per call.
+
+    ``provides_for`` is ``('*', 'agent')``. *base_url* is a running
+    ``opencode serve``. The handler opens its own HTTP client. A caller does
+    not pass a client or a transport. A judge routed here gets its own session
+    and runs as a full OpenCode agent: the server's tools, in the server's
+    working directory, apply to the judge prompt too. This package does not
+    offer a tool-less judge agent. A Vega-local handler was rejected: the
+    session boundary belongs to this package. *model* overrides provider and
+    model selection.
+    """
+    if not isinstance(base_url, str) or not base_url:
+        raise TypeError("The OpenCode handler requires a base_url.")
+    report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
+    return _create_opencode_handler(
+        base_url=base_url,
+        capture_content=capture_content,
+        model=model or default_model,
+        agent=agent,
+    )
+
+
+def opencode_agents(
+    config_key: str,
+    user_input: str,
+    context: dict[str, Any],
+    **kwargs: Any,
+) -> Any:
+    """Convenience wrapper: creates a handler and calls ``config(...).invoke()``."""
+    report_usage("opencode-agents.opencodeAgents", PACKAGE_NAME, __version__)
+    variables = kwargs.pop("variables", None)
+    history = kwargs.pop("history", None)
+    capture_content = kwargs.pop("capture_content", None)
+    base_url = kwargs.pop("base_url", None)
+    if not isinstance(base_url, str) or not base_url:
+        raise TypeError("The OpenCode handler requires a base_url.")
+    model = kwargs.pop("model", None)
+    agent = kwargs.pop("agent", None)
+    return _config(
+        key=config_key,
+        handler=_create_opencode_handler(
+            base_url=base_url,
+            capture_content=capture_content,
+            model=model or default_model,
+            agent=agent,
+        ),
+        **kwargs,
+    ).invoke(user_input, context, variables, history)
+
+
+def _create_opencode_handler(
+    *,
+    base_url: str,
+    capture_content: bool | None,
+    model: ModelResolver,
+    agent: str | None,
+) -> ProviderHandler:
+    content_override = capture_content
+    bound_url = base_url
+    resolve_model = model
+    bound_agent = agent
+
+    async def _stream_impl(
+        config: AiConfigRep,
+        user_input: str | None,
+        tool_handlers: dict[str, Any] | None,
+        variables: dict[str, Any] | None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        del tool_handlers
+        capture = effective_capture_content(content_override)
+        span = start_root_span(config, variables or {})
+        ended: set[int] = set()
+        provider_id, model_id = resolve_model(
+            config if isinstance(config, dict) else {}
+        )
+        system = _system_text(config, variables)
+        prompt = _user_prompt(config, user_input, history, variables)
+        try:
+            set_input_content_attributes(
+                span,
+                capture,
+                system_instructions=system,
+                messages=_input_messages(user_input, history),
+            )
+            created = _Created()
+            async with aclosing(
+                _reduce_session(
+                    created,
+                    base_url=bound_url,
+                    prompt=prompt,
+                    system=system,
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    agent=bound_agent,
+                    capture=capture,
+                )
+            ) as reduced:
+                async for event in reduced:
+                    yield event
+            output = "".join(created.deltas)
+            if output:
+                set_output_content_attributes(
+                    span, capture, [text_message("assistant", output)]
+                )
+            usage = created.usage
+            finish_root_span(
+                span,
+                config,
+                add_cached_tokens_to_input(usage) if usage is not None else SpanUsage(),
+            )
+            mark_ok(span)
+            done: dict[str, Any] = {"type": "done", "output": output}
+            if usage is not None:
+                done["usage"] = usage
+            yield done
+        except Exception as exc:
+            fail_span(span, exc, ended)
+            raise
+        finally:
+            end_span_once(span, ended)
+
+    async def _call_impl(
+        config: AiConfigRep,
+        user_input: str | None,
+        tool_handlers: dict[str, Any] | None,
+        variables: dict[str, Any] | None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        output = ""
+        usage: dict[str, Any] = {}
+        async with aclosing(
+            _stream_impl(config, user_input, tool_handlers, variables, history)
+        ) as stream:
+            async for event in stream:
+                if event.get("type") != "done":
+                    continue
+                raw_output = event.get("output")
+                output = raw_output if isinstance(raw_output, str) else ""
+                raw_usage = event.get("usage")
+                usage = raw_usage if isinstance(raw_usage, dict) else {}
+        return {"output": output, "usage": usage}
+
+    return _create_handler(
+        ("*", "agent"),
+        _call_impl,
+        _stream_impl,
+        capture_content=content_override,
+    )
+
+
+class _Created:
+    deltas: list[str]
+    usage: dict[str, int] | None
+
+    def __init__(self) -> None:
+        self.deltas = []
+        self.usage = None
+
+
+async def _reduce_session(
+    created: _Created,
+    *,
+    base_url: str,
+    prompt: str,
+    system: str | None,
+    provider_id: str,
+    model_id: str,
+    agent: str | None,
+    capture: bool,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Reduce the session ``POST /session`` created. The reducer is unchanged."""
+    session_ids: list[str] = []
+    reducer: _Reducer | None = None
+    async with aclosing(
+        session_events(
+            base_url=base_url,
+            prompt=prompt,
+            system=system,
+            provider_id=provider_id,
+            model_id=model_id,
+            agent=agent,
+            session_ids=session_ids,
+        )
+    ) as raw_events:
+        async for raw in raw_events:
+            if reducer is None:
+                reducer = _Reducer(capture_content=capture, session_id=session_ids[0])
+            async with aclosing(reducer.reduce(_once(raw))) as reduced:
+                async for event in reduced:
+                    yield event
+    if reducer is None:
+        return
+    for event in reducer.close():
+        yield event
+    created.deltas = list(reducer.deltas)
+    created.usage = reducer.usage_payload()
+
+
+async def _once(raw: dict[str, Any]) -> AsyncGenerator[dict[str, Any], None]:
+    yield raw
+
+
+def _system_text(config: AiConfigRep, variables: dict[str, Any] | None) -> str | None:
+    """Agent instructions, with ``{{variables}}`` rendered.
+
+    History and the user turn are not rendered. A judge prompt is rendered
+    the same way, because a judge uses this handler.
+    """
+    if not isinstance(config, dict):
+        return None
+    instructions = config.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        return parse_template(instructions, variables or {})
+    return None
+
+
+def _user_prompt(
+    config: AiConfigRep,
+    user_input: str | None,
+    history: list[dict[str, Any]] | None,
+    variables: dict[str, Any] | None = None,
+) -> str:
+    values = variables or {}
+    messages: list[dict[str, Any]] = []
+    if isinstance(config, dict):
+        raw_messages = config.get("messages")
+        if isinstance(raw_messages, list):
+            for message in raw_messages:
+                if not isinstance(message, dict) or message.get("role") == "system":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    message = {**message, "content": parse_template(content, values)}
+                messages.append(message)
+    turns = compose_history(
+        history=[item for item in (history or []) if isinstance(item, dict)],
+        user_input=user_input,
+        config_messages=messages,
+    )
+    lines: list[str] = []
+    for turn in turns:
+        role = turn.get("role")
+        text = content_to_text(turn.get("content") or "")
+        if not text:
+            continue
+        label = "Assistant" if role == "assistant" else "User"
+        lines.append(f"{label}: {text}")
+    if (
+        len(lines) == 1
+        and lines[0].startswith("User: ")
+        and not messages
+        and not history
+    ):
+        return lines[0].removeprefix("User: ")
+    return "\n\n".join(lines)

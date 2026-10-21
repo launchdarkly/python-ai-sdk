@@ -523,7 +523,7 @@ than inside it. A turn that reads 19,971 tokens from cache and writes 3,580 more
 Prompts, model output, tool arguments and tool results are personal data, so a span carries only
 metadata unless you ask for more: models, token counts, timings, tool names.
 
-Pass `capture_content=True` to a handler factory to include the conversation:
+Pass `capture_content=True` to a handler factory to include the conversation, or turn it on for every handler from process startup. See [Process-wide defaults](packages/client/README.md#process-wide-defaults).
 
 ```python
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
