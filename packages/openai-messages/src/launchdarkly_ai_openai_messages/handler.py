@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -184,18 +184,32 @@ def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _drop_malformed_tool_choice(params: dict[str, Any]) -> dict[str, Any]:
+    """Drops a ``tool_choice`` that is neither a mode string (``auto``, ``none``, ``required``)
+    nor an object with a string ``type``, the two shapes the Responses API takes. The JS SDK's
+    ``isToolChoice`` applies the same check."""
+    if "tool_choice" in params:
+        value = params["tool_choice"]
+        typed = isinstance(value, Mapping) and isinstance(value.get("type"), str)
+        if not (isinstance(value, str) or typed):
+            del params["tool_choice"]
+    return params
+
+
 def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that reach ``responses.create``/``.stream``:
     ``max_tokens``/``max_completion_tokens`` renamed to ``max_output_tokens``, then only
     :data:`_RESPONSES_FORWARDED_KEYS`, with malformed object values dropped and ``reasoning``
-    narrowed to ``effort`` and ``summary``. ``invoke`` and ``stream`` both call this, so they
-    forward the same keys.
+    narrowed to ``effort`` and ``summary``, and a malformed ``tool_choice`` dropped. ``invoke`` and
+    ``stream`` both call this, so they forward the same keys.
     """
-    return _rebuild_reasoning(
-        select_forwarded_parameters(
-            _apply_max_output_tokens_rename(model_parameters(config)),
-            _RESPONSES_FORWARDED_KEYS,
-            mapping_keys=_RESPONSES_MAPPING_KEYS,
+    return _drop_malformed_tool_choice(
+        _rebuild_reasoning(
+            select_forwarded_parameters(
+                _apply_max_output_tokens_rename(model_parameters(config)),
+                _RESPONSES_FORWARDED_KEYS,
+                mapping_keys=_RESPONSES_MAPPING_KEYS,
+            )
         )
     )
 

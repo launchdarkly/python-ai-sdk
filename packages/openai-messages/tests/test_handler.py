@@ -2959,6 +2959,24 @@ class TestForwardsExactlyTheCrossSdkList:
         assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_MESSAGES
 
 
+class TestToolChoiceShape:
+    @staticmethod
+    def _forwarded(parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_openai_messages.handler import _forwarded_parameters
+
+        return _forwarded_parameters({"model": {"parameters": parameters}})
+
+    @pytest.mark.parametrize(
+        "value", ["auto", "required", {"type": "function", "name": "lookup"}]
+    )
+    def test_a_string_or_typed_object_is_forwarded(self, value: Any) -> None:
+        assert self._forwarded({"tool_choice": value}) == {"tool_choice": value}
+
+    @pytest.mark.parametrize("value", [{}, {"name": "lookup"}, ["auto"], 1, True])
+    def test_any_other_value_is_dropped(self, value: Any) -> None:
+        assert self._forwarded({"tool_choice": value, "top_p": 0.4}) == {"top_p": 0.4}
+
+
 class TestReasoningKeepsEffortAndSummary:
     @staticmethod
     def _forwarded(parameters: dict[str, Any]) -> dict[str, Any]:
