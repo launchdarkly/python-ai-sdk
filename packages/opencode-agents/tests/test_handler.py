@@ -1527,6 +1527,8 @@ class TestProcess:
         argv = records[0]["argv"]
         assert argv[argv.index("serve") + 1] == "--port"
         assert argv[argv.index("--hostname") + 1] == "127.0.0.1"
+        assert "--print-logs" not in argv
+        assert "--log-level" not in argv
         assert records[0]["cwd"] == str(script.cwd)
         assert records[0]["config"] == str(script.config.resolve())
         paths = [item["path"] for item in script.requests]

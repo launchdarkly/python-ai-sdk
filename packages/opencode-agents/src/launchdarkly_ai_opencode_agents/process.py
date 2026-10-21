@@ -63,9 +63,6 @@ class OpenCodeServe:
             str(port),
             "--hostname",
             "127.0.0.1",
-            "--print-logs",
-            "--log-level",
-            "INFO",
         ]
         try:
             self._proc = await asyncio.create_subprocess_exec(
