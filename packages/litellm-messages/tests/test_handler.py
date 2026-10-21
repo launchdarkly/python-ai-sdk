@@ -626,7 +626,7 @@ class TestTelemetryAndConvenience:
         instance = MagicMock()
         instance.invoke.return_value = "result"
         config = MagicMock(return_value=instance)
-        with patch.object(handler_mod, "config", config):
+        with patch.object(handler_mod, "_config", config):
             result = litellm_messages(
                 "config-key",
                 "hello",

@@ -8,6 +8,7 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openai.types.shared import Reasoning
 
 import launchdarkly_ai_litellm_agents.handler as handler_mod
 from launchdarkly_ai_litellm_agents import (
@@ -291,6 +292,45 @@ class TestAgentToolsAndRun:
             "usage": {"input_tokens": 11, "output_tokens": 4},
         }
 
+    async def test_runs_with_agents_sdk_tracing_disabled(self) -> None:
+        streamed = FakeStreamedResult([])
+        agents = _agents_module(run_streamed=MagicMock(return_value=streamed))
+        with _patch_agents(agents):
+            handler = create_litellm_agents_handler(model_factory=lambda *_: object())
+            await handler(CONFIG, "q")
+            [event async for event in await handler.stream(CONFIG, "q")]
+        assert agents.Runner.run.call_args.kwargs["run_config"].tracing_disabled is True
+        assert (
+            agents.Runner.run_streamed.call_args.kwargs["run_config"].tracing_disabled
+            is True
+        )
+
+    def test_model_settings_keep_the_shared_allowlist_and_type_reasoning(
+        self,
+    ) -> None:
+        settings = handler_mod._model_settings(
+            {
+                "temperature": 0.1,
+                "verbosity": "low",
+                "reasoning": {"effort": "high", "summary": "auto", "smuggled": 1},
+                "metadata": {"team": "a"},
+                "include_usage": True,
+                "top_logprobs": 2,
+            }
+        )
+        assert isinstance(settings.reasoning, Reasoning)
+        assert settings.reasoning.effort == "high"
+        assert settings.reasoning.summary == "auto"
+        assert settings.verbosity == "low"
+        assert settings.temperature == 0.1
+        assert settings.metadata is None
+        assert settings.include_usage is None
+        assert settings.top_logprobs is None
+
+    @pytest.mark.parametrize("reasoning", ["high", {"smuggled": 1}, None])
+    def test_unusable_reasoning_is_dropped(self, reasoning: Any) -> None:
+        assert handler_mod._model_settings({"reasoning": reasoning}).reasoning is None
+
     async def test_history_uses_agents_sdk_structured_input(self) -> None:
         run = AsyncMock(
             return_value=SimpleNamespace(
@@ -522,7 +562,7 @@ class TestConvenienceWrapper:
         instance = MagicMock()
         instance.invoke.return_value = "result"
         config = MagicMock(return_value=instance)
-        with patch.object(handler_mod, "config", config):
+        with patch.object(handler_mod, "_config", config):
             result = litellm_agents(
                 "agent-key",
                 "hello",

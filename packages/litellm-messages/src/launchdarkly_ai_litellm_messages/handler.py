@@ -14,12 +14,13 @@ from launchdarkly_ai_server import (
     LDContext,
     ProviderHandler,
     SpanUsage,
-    config,
+    _config,
+    _create_handler,
     content_to_text,
-    create_handler,
     end_span_once,
     image_block_to_url,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_ld_span_attributes,
     set_model_identity_attributes,
@@ -29,6 +30,9 @@ from launchdarkly_ai_server import (
     text_message,
     to_semconv_finish_reason,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+
+from ._version import PACKAGE_NAME, __version__
 
 Completion = Callable[..., Awaitable[Any]]
 
@@ -361,8 +365,23 @@ def _output_value(content: Any, output_format: Any) -> Any:
 def create_litellm_messages_handler(
     *,
     completion: Completion | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
+    report_usage(
+        "litellm-messages.createLiteLLMMessagesHandler", PACKAGE_NAME, __version__
+    )
+    return _create_litellm_messages_handler(
+        completion=completion, capture_content=capture_content
+    )
+
+
+def _create_litellm_messages_handler(
+    *,
+    completion: Completion | None = None,
+    capture_content: bool | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_litellm_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
     if completion is None:
         from litellm import acompletion
 
@@ -375,6 +394,7 @@ def create_litellm_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        capture_content = effective_capture_content(content_override)
         handlers = tool_handlers or {}
         values = variables or {}
         messages = _build_messages(config_value, user_input, values, history)
@@ -486,14 +506,14 @@ def create_litellm_messages_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("*", "messages"),
         call,
         stream,
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -658,9 +678,10 @@ def litellm_messages(
     **kwargs: Any,
 ) -> Any:
     variables = kwargs.pop("variables", None)
-    capture_content = bool(kwargs.pop("capture_content", False))
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    report_usage("litellm-messages.litellmMessages", PACKAGE_NAME, __version__)
+    return _config(
         key=config_key,
-        handler=create_litellm_messages_handler(capture_content=capture_content),
+        handler=_create_litellm_messages_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables)

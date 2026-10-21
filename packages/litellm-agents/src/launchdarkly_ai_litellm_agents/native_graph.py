@@ -19,9 +19,12 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     parse_template,
+    report_usage,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
+from ._version import PACKAGE_NAME, __version__
 from .handler import (
     ModelFactory,
     _litellm_model,
@@ -64,6 +67,7 @@ def to_litellm_agents(
     definition: Any,
     opts: dict[str, Any] | None = None,
 ) -> Any:
+    report_usage("litellm-agents.toLiteLLMAgents", PACKAGE_NAME, __version__)
     options = opts or {}
 
     async def invoke(
@@ -137,75 +141,58 @@ def to_litellm_agents(
                 built[node.key] = types.SimpleNamespace(**kwargs)
             agent_name_to_key[_name(node.key)] = node.key
 
-        await build(graph.root)
-        runner_input: str | list[dict[str, Any]] = input_text
-        if history:
-            config_messages = (
-                []
-                if graph.root.config.get("instructions")
-                else [
+        # One try covers setup and the run, so a setup error (a model factory or
+        # tool conversion that raises) is recorded and tracked as an invocation
+        # failure, like a run error.
+        if _HAS_OTEL:
+            span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
+                "launchdarkly.graph"
+            )
+            span.set_attribute("launchdarkly.graph.key", graph.key)
+        else:
+            span = None
+
+        try:
+            await build(graph.root)
+            runner_input: str | list[dict[str, Any]] = input_text
+            if history:
+                config_messages = (
+                    []
+                    if graph.root.config.get("instructions")
+                    else [
+                        {
+                            "role": message.get("role", "user"),
+                            "content": parse_template(
+                                str(message.get("content", "")), values
+                            ),
+                        }
+                        for message in (graph.root.config.get("messages") or [])
+                        if message.get("role") != "system"
+                    ]
+                )
+                turns = compose_history(
+                    history=history,
+                    user_input=input_text,
+                    config_messages=config_messages,
+                )
+                runner_input = [
                     {
-                        "role": message.get("role", "user"),
-                        "content": parse_template(
-                            str(message.get("content", "")), values
+                        "role": turn["role"],
+                        "content": _map_agent_content(
+                            str(turn["role"]), turn.get("content", "")
                         ),
                     }
-                    for message in (graph.root.config.get("messages") or [])
-                    if message.get("role") != "system"
+                    for turn in turns
                 ]
-            )
-            turns = compose_history(
-                history=history,
-                user_input=input_text,
-                config_messages=config_messages,
-            )
-            runner_input = [
-                {
-                    "role": turn["role"],
-                    "content": _map_agent_content(
-                        str(turn["role"]), turn.get("content", "")
-                    ),
-                }
-                for turn in turns
-            ]
 
-        class _LDHooks(RunHooks):  # type: ignore[misc, valid-type]
-            async def on_agent_end(self, context: Any, agent: Any, output: Any) -> None:
-                node_key = agent_name_to_key.get(agent.name)
-                if node_key and ld_context:
-                    node = graph.get_node(node_key)
-                    if node:
-                        get_client().track(
-                            "$ld:ai:generation:success",
-                            ld_context,
-                            make_track_data(node, graph.key, run_id),
-                            1,
-                        )
-
-            async def on_handoff(
-                self, context: Any, from_agent: Any, to_agent: Any
-            ) -> None:
-                from_key = agent_name_to_key.get(from_agent.name)
-                if from_key and ld_context:
-                    from_node = graph.get_node(from_key)
-                    if from_node:
-                        get_client().track(
-                            "$ld:ai:graph:handoff_success",
-                            ld_context,
-                            make_track_data(from_node, graph.key, run_id),
-                            1,
-                        )
-
-            async def on_agent_start(self, context: Any, agent: Any) -> None:
-                node_key = agent_name_to_key.get(agent.name)
+            def _enter(agent_name: str) -> None:
+                node_key = agent_name_to_key.get(agent_name)
                 if not node_key or node_key in path:
                     return
                 index = len(path)
                 path.append(node_key)
-                if not ld_context:
-                    return
-                node = graph.get_node(node_key)
-                if node:
+                node = graph.get_node(node_key) if ld_context else None
+                if ld_context and node:
                     get_client().track(
                         "$ld:ai:graph:node",
                         ld_context,
@@ -217,15 +204,39 @@ def to_litellm_agents(
                         1,
                     )
 
-        if _HAS_OTEL:
-            span = trace.get_tracer("@launchdarkly/ai-litellm-agents").start_span(
-                "launchdarkly.graph"
-            )
-            span.set_attribute("launchdarkly.graph.key", graph.key)
-        else:
-            span = None
+            class _LDHooks(RunHooks):  # type: ignore[misc, valid-type]
+                async def on_agent_end(
+                    self, context: Any, agent: Any, output: Any
+                ) -> None:
+                    node_key = agent_name_to_key.get(agent.name)
+                    if node_key and ld_context:
+                        node = graph.get_node(node_key)
+                        if node:
+                            get_client().track(
+                                "$ld:ai:generation:success",
+                                ld_context,
+                                make_track_data(node, graph.key, run_id),
+                                1,
+                            )
 
-        try:
+                async def on_handoff(
+                    self, context: Any, from_agent: Any, to_agent: Any
+                ) -> None:
+                    _enter(to_agent.name)
+                    from_key = agent_name_to_key.get(from_agent.name)
+                    if from_key and ld_context:
+                        from_node = graph.get_node(from_key)
+                        if from_node:
+                            get_client().track(
+                                "$ld:ai:graph:handoff_success",
+                                ld_context,
+                                make_track_data(from_node, graph.key, run_id),
+                                1,
+                            )
+
+                async def on_agent_start(self, context: Any, agent: Any) -> None:
+                    _enter(agent.name)
+
             result = await agents.Runner.run(
                 built[graph.root.key],
                 runner_input,
@@ -250,7 +261,7 @@ def to_litellm_agents(
                 span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
                 span.set_attribute("gen_ai.usage.total_tokens", total_tokens)
             if ld_context:
-                root_td = make_track_data(graph.root, graph.key, run_id)
+                root_td = make_graph_track_data(graph.key, run_id)
                 client = get_client()
                 client.track(
                     "$ld:ai:graph:duration:total", ld_context, root_td, duration
@@ -279,7 +290,7 @@ def to_litellm_agents(
                 get_client().track(
                     "$ld:ai:graph:invocation_failure",
                     ld_context,
-                    make_track_data(graph.root, graph.key, run_id),
+                    make_graph_track_data(graph.key, run_id),
                     1,
                 )
             raise

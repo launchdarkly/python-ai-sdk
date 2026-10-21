@@ -94,7 +94,7 @@ async def _definition_awaitable_from(
 class TestGraphConvenience:
     def test_binds_wildcard_litellm_agent_handler(self) -> None:
         graph = MagicMock(return_value=object())
-        with patch.object(graph_mod, "graph", graph):
+        with patch.object(graph_mod, "_graph", graph):
             result = litellm_graph(
                 "graph-key",
                 context={"kind": "user", "key": "u"},
@@ -107,6 +107,18 @@ class TestGraphConvenience:
         assert len(handlers) == 1
         assert handlers[0].provides_for == ("*", "agent")
         assert "model_factory" not in graph.call_args.kwargs
+
+    def test_forwards_proxy_connection_options_to_the_handler(self) -> None:
+        create = MagicMock(return_value=MagicMock(provides_for=("*", "agent")))
+        with (
+            patch.object(graph_mod, "_graph", MagicMock()) as graph,
+            patch.object(graph_mod, "_create_litellm_agents_handler", create),
+        ):
+            litellm_graph("graph-key", base_url="http://proxy:4000", api_key="sk-proxy")
+        assert create.call_args.kwargs["base_url"] == "http://proxy:4000"
+        assert create.call_args.kwargs["api_key"] == "sk-proxy"
+        assert "base_url" not in graph.call_args.kwargs
+        assert "api_key" not in graph.call_args.kwargs
 
 
 class TestNativeGraphAdapter:
@@ -506,3 +518,95 @@ class TestNativeGraphAdapter:
                 opts={"model_factory": model_factory},
             ).invoke("hello")
         model_factory.assert_not_called()
+
+
+class TestNativeGraphTelemetry:
+    def _agents(self, run: Any) -> Any:
+        return SimpleNamespace(
+            Agent=MagicMock(
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    name=kwargs["name"], **kwargs
+                )
+            ),
+            Runner=SimpleNamespace(run=run),
+            handoff=MagicMock(side_effect=lambda target: target),
+            FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
+        )
+
+    async def _invoke(self, agents: Any, **opts: Any) -> Any:
+        real_import = __import__
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=lambda name: (
+                    agents if name == "agents" else real_import(name)
+                ),
+            ),
+            patch.object(native_graph_mod, "get_client") as get_client,
+            patch.object(native_graph_mod, "to_ld_context", lambda _c, ctx: ctx),
+        ):
+            try:
+                await to_litellm_agents(
+                    _definition_awaitable(),
+                    opts={
+                        "model_factory": lambda *_: object(),
+                        "context": {"key": "u"},
+                        **opts,
+                    },
+                ).invoke("hello")
+            except Exception as exc:
+                get_client.return_value.raised = exc
+            return get_client.return_value
+
+    @staticmethod
+    def _events(client: Any) -> list[tuple[str, str]]:
+        return [
+            (c.args[0], c.args[2]["configKey"]) for c in client.track.call_args_list
+        ]
+
+    async def test_handoff_target_enters_the_path_and_totals_use_the_graph_key(
+        self,
+    ) -> None:
+        async def run(agent: Any, _input: Any, *, hooks: Any, run_config: Any) -> Any:
+            child = SimpleNamespace(name="child")
+            await hooks.on_agent_start(None, agent)
+            await hooks.on_handoff(None, agent, child)
+            await hooks.on_agent_start(None, child)
+            await hooks.on_agent_end(None, child, "done")
+            return SimpleNamespace(
+                final_output="done",
+                context_wrapper=SimpleNamespace(
+                    usage=SimpleNamespace(
+                        input_tokens=2, output_tokens=1, total_tokens=3
+                    )
+                ),
+            )
+
+        client = await self._invoke(self._agents(run))
+        assert self._events(client) == [
+            ("$ld:ai:graph:node", "root"),
+            ("$ld:ai:graph:node", "child"),
+            ("$ld:ai:graph:handoff_success", "root"),
+            ("$ld:ai:generation:success", "child"),
+            ("$ld:ai:graph:duration:total", "litellm-graph"),
+            ("$ld:ai:graph:total_tokens", "litellm-graph"),
+            ("$ld:ai:graph:invocation_success", "litellm-graph"),
+        ]
+        nodes = [
+            c for c in client.track.call_args_list if c.args[0] == "$ld:ai:graph:node"
+        ]
+        assert [c.args[2]["index"] for c in nodes] == [0, 1]
+
+    async def test_setup_error_is_tracked_as_an_invocation_failure(self) -> None:
+        run = AsyncMock()
+
+        def broken_factory(*_: Any) -> Any:
+            raise RuntimeError("no proxy")
+
+        client = await self._invoke(self._agents(run), model_factory=broken_factory)
+        assert str(client.raised) == "no proxy"
+        assert self._events(client) == [
+            ("$ld:ai:graph:invocation_failure", "litellm-graph")
+        ]
+        run.assert_not_awaited()

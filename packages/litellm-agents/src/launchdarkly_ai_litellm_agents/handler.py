@@ -10,6 +10,7 @@ from agents import ModelSettings, RunConfig
 from agents.agent_output import AgentOutputSchemaBase
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.lifecycle import RunHooksBase
+from openai.types.shared import Reasoning
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
@@ -18,12 +19,13 @@ from launchdarkly_ai_server import (
     LDContext,
     ProviderHandler,
     SpanUsage,
-    config,
+    _config,
+    _create_handler,
     content_to_text,
-    create_handler,
     end_span_once,
     image_block_to_url,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_ld_span_attributes,
     set_model_identity_attributes,
@@ -32,6 +34,9 @@ from launchdarkly_ai_server import (
     set_usage_span_attributes,
     text_message,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+
+from ._version import PACKAGE_NAME, __version__
 
 ModelFactory = Callable[[str, dict[str, Any]], Any]
 _MODEL_SETTING_FIELDS = {
@@ -44,10 +49,7 @@ _MODEL_SETTING_FIELDS = {
     "max_tokens",
     "reasoning",
     "verbosity",
-    "metadata",
     "store",
-    "include_usage",
-    "top_logprobs",
 }
 _RUN_CONFIG = RunConfig(tracing_disabled=True)
 
@@ -120,13 +122,21 @@ def _litellm_model(
 
 
 def _model_settings(parameters: dict[str, Any]) -> ModelSettings:
-    return ModelSettings(
-        **{
-            key: value
-            for key, value in parameters.items()
-            if key in _MODEL_SETTING_FIELDS
+    settings = {
+        key: value for key, value in parameters.items() if key in _MODEL_SETTING_FIELDS
+    }
+    # Only ``effort`` and ``summary`` reach the model, as in the TypeScript SDK; any other
+    # key, or a non-object value, is dropped rather than failing ModelSettings validation.
+    reasoning = settings.pop("reasoning", None)
+    if isinstance(reasoning, dict):
+        picked = {
+            k: reasoning[k]
+            for k in ("effort", "summary")
+            if reasoning.get(k) is not None
         }
-    )
+        if picked:
+            settings["reasoning"] = Reasoning(**picked)
+    return ModelSettings(**settings)
 
 
 def _instructions(config_value: AiConfigRep, variables: dict[str, Any]) -> str | None:
@@ -481,10 +491,28 @@ def _agent_and_prompt(
 def create_litellm_agents_handler(
     *,
     model_factory: ModelFactory | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
 ) -> ProviderHandler:
+    report_usage("litellm-agents.createLiteLLMAgentsHandler", PACKAGE_NAME, __version__)
+    return _create_litellm_agents_handler(
+        model_factory=model_factory,
+        capture_content=capture_content,
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+
+def _create_litellm_agents_handler(
+    *,
+    model_factory: ModelFactory | None = None,
+    capture_content: bool | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_litellm_agents_handler`, used by this package's wrappers."""
+    content_override = capture_content
     if model_factory is None:
 
         def model_factory(name: str, _parameters: dict[str, Any]) -> Any:
@@ -499,6 +527,7 @@ def create_litellm_agents_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         values = variables or {}
@@ -571,14 +600,14 @@ def create_litellm_agents_handler(
             variables or {},
             history,
             factory,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("*", "agent"),
         call,
         stream,
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -675,13 +704,14 @@ def litellm_agents(
     **kwargs: Any,
 ) -> Any:
     variables = kwargs.pop("variables", None)
-    capture_content = bool(kwargs.pop("capture_content", False))
+    capture_content = kwargs.pop("capture_content", None)
     model_factory = kwargs.pop("model_factory", None)
     base_url = kwargs.pop("base_url", None)
     api_key = kwargs.pop("api_key", None)
-    return config(
+    report_usage("litellm-agents.litellmAgents", PACKAGE_NAME, __version__)
+    return _config(
         key=config_key,
-        handler=create_litellm_agents_handler(
+        handler=_create_litellm_agents_handler(
             model_factory=model_factory,
             capture_content=capture_content,
             base_url=base_url,
