@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .sdk_usage import report_usage
 from .types import (
     AiConfigRep,
     GraphNode,
@@ -21,12 +23,27 @@ def create_handler(
     provides_for: tuple[str, Literal["agent", "messages"]],
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
     ``provides_for`` metadata and optional streaming implementation.
+
+    ``capture_content`` is this handler's override. ``None`` reads the process
+    default from :func:`configure` when the value is used. ``True`` or ``False``
+    overrides that default.
     """
+    report_usage("client.createHandler")
+    return _create_handler(provides_for, fn, stream_fn, capture_content)
+
+
+def _create_handler(
+    provides_for: tuple[str, Literal["agent", "messages"]],
+    fn: _HandlerFn,
+    stream_fn: _StreamFn | None = None,
+    capture_content: bool | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_handler`, used by the package factories."""
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,
@@ -538,22 +555,112 @@ def select_handler(
     raise ValueError(f"Handler for provider {provider} not found")
 
 
+def model_stamps_from_meta(meta: Any) -> dict[str, Any]:
+    """
+    Copies the pinned model-config identity (``modelKey``, ``modelVersion``)
+    from a variation's ``_ldMeta`` into a dict that can be merged into
+    ``TrackData``. Keys are omitted (never set to ``None``) when absent; an
+    empty ``modelKey`` is treated as absent and ``modelVersion`` is coerced to
+    ``int``. Gonfalon's cost attribution reads these two fields from every
+    ``$ld:ai:*`` event payload.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    stamps: dict[str, Any] = {}
+    model_key = meta.get("modelKey")
+    if isinstance(model_key, str) and model_key:
+        stamps["modelKey"] = model_key
+    model_version = _coerce_model_version(meta.get("modelVersion"))
+    if model_version is not None:
+        stamps["modelVersion"] = model_version
+    return stamps
+
+
+def _coerce_model_version(value: Any) -> int | None:
+    """
+    Coerces an ``_ldMeta.modelVersion`` value to ``int``. Accepts ``int``
+    (but not ``bool``), integral ``float`` and integer-looking ``str``;
+    returns ``None`` for anything else. ``_ldMeta`` is an untyped flag payload,
+    so a malformed value must be dropped rather than abort the invocation.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def omit_model_stamps(track_data: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Returns a copy of ``track_data`` without ``modelKey`` / ``modelVersion``.
+    Used when overlaying a judge's ``track_data`` on its parent's so a judge
+    without a pinned model config does not inherit the parent's identity.
+    """
+    return {
+        k: v for k, v in track_data.items() if k not in ("modelKey", "modelVersion")
+    }
+
+
 def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, Any]:
     """
     Builds the standard tracking payload for a graph node event.
     Shared by all native graph adapters (openai-agents, claude-agents, langchain-agents).
     """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
     meta = node.meta if isinstance(node.meta, dict) else {}
     config = node.config if isinstance(node.config, dict) else {}
-    return {
+    track_data: dict[str, Any] = {
         "runId": run_id,
         "configKey": node.key,
         "variationKey": meta.get("variationKey", ""),
         "version": meta.get("version", 1),
         "modelName": config.get("model", {}).get("name", ""),
         "providerName": config.get("provider", {}).get("name", ""),
+        **model_stamps_from_meta(meta),
         "graphKey": graph_key,
     }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
+
+
+def make_graph_track_data(graph_key: str, run_id: str) -> dict[str, Any]:
+    """
+    Builds the tracking payload for a native graph run as a whole.
+
+    The graph flag is itself the AI Config the trace belongs to, so its key is
+    both the config key and the graph key -- the same choice ``graph.py`` makes
+    for the SDK's own graph runner. There is no model or variation to report: a
+    graph flag carries a topology, and ``GraphDefinition`` does not expose its
+    ``_ldMeta``.
+
+    Native graph adapters pass this to ``set_ld_span_attributes`` so the
+    ``launchdarkly.graph`` span can be found by an AI Config Monitoring query.
+    """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
+    track_data: dict[str, Any] = {
+        "runId": run_id,
+        "configKey": graph_key,
+        "variationKey": "",
+        "version": 1,
+        "modelName": "",
+        "providerName": "",
+        "graphKey": graph_key,
+    }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
 
 
 def _usable_context_key(value: Any) -> str | None:
@@ -680,33 +787,6 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
             span.set_attribute(f"context.contextKeys.{kind}", key)
 
     span.add_event("feature_flag", feature_flag_attrs)
-
-
-def set_openllmetry_prompt(span: Any, messages: list[dict[str, str]]) -> None:
-    """Set OpenLLMetry-style indexed prompt attributes on a span.
-
-    Gonfalon's LLM Summary tab reads ``gen_ai.prompt.N.role`` / ``.content``
-    (attribute-based, takes precedence over span events).
-    """
-    for i, msg in enumerate(messages):
-        span.set_attribute(f"gen_ai.prompt.{i}.role", msg["role"])
-        span.set_attribute(f"gen_ai.prompt.{i}.content", msg["content"])
-
-
-def set_openllmetry_completion(
-    span: Any,
-    completion: str,
-    usage: dict[str, int],
-) -> None:
-    """Set OpenLLMetry-style indexed completion attributes and token usage aliases.
-
-    Gonfalon reads ``gen_ai.completion.0.role`` / ``.content`` and prefers
-    ``gen_ai.usage.prompt_tokens`` / ``completion_tokens``.
-    """
-    span.set_attribute("gen_ai.completion.0.role", "assistant")
-    span.set_attribute("gen_ai.completion.0.content", completion)
-    span.set_attribute("gen_ai.usage.prompt_tokens", usage.get("input_tokens", 0))
-    span.set_attribute("gen_ai.usage.completion_tokens", usage.get("output_tokens", 0))
 
 
 def parse_json_with_possible_fences(raw_text: str) -> Any | None:

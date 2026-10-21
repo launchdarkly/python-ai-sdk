@@ -144,6 +144,47 @@ def result_message(
     )
 
 
+# Measured against Agent SDK 0.3.220 with a rejected key, and the same for a key without credits: an
+# API failure does not fail the run. The CLI emits a synthetic assistant message whose ``model`` is
+# the literal ``<synthetic>`` and whose content is the error text, then a result that says
+# ``success`` but sets ``is_error``. The CLI emits the same kind of synthetic message after a
+# response stops at ``max_output_tokens``, and that run can still succeed.
+ZERO_USAGE: dict[str, Any] = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+}
+
+
+def synthetic_message(
+    text: str = "Credit balance is too low", message_id: str = "msg_synthetic"
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="<synthetic>",
+        error="billing_error",
+        usage=dict(ZERO_USAGE),
+        message_id=message_id,
+        stop_reason="stop_sequence",
+        session_id="sess-1",
+    )
+
+
+def api_error_result_message(text: str = "Credit balance is too low") -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=0,
+        is_error=True,
+        num_turns=1,
+        session_id="sess-1",
+        usage=dict(ZERO_USAGE),
+        result=text,
+        api_error_status=400,
+    )
+
+
 def init_message(
     session_id: str = "sess-1", tools: list[str] | None = None
 ) -> SystemMessage:
@@ -318,10 +359,10 @@ class TestPromptConstruction:
         assert "context line" in prompt
         assert prompt.endswith("final question")
 
-    def test_history_appended_to_system_prompt(self) -> None:
+    def test_history_not_appended_to_system_prompt(self) -> None:
         history = [{"role": "user", "content": "earlier"}]
         _, system = build_prompt(BASE_CONFIG, "hi", {}, history=history)
-        assert "earlier" in (system or "")
+        assert system == "You are helpful."
         assert "You are helpful." in (system or "")
 
     def test_no_user_input_defaults_to_empty_string(self) -> None:
@@ -903,6 +944,31 @@ class TestContentCapture:
         assert "gen_ai.output.messages" in chat.attributes
         assert "gen_ai.system_instructions" in root().attributes
 
+    async def test_process_default_is_read_on_the_streaming_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            monkeypatch.setattr(
+                handler_mod,
+                "query",
+                _fake_query(
+                    [stream_event("Hi"), assistant_message(), result_message("Hi")]
+                ),
+            )
+            await _collect(
+                await create_claude_agents_handler().stream(BASE_CONFIG, "q", {}, {})
+            )
+            assert any(
+                "gen_ai.input.messages" in (span.attributes or {}) for span in spans()
+            )
+        finally:
+            _reset_for_testing()
+
 
 # ---------------------------------------------------------------------------
 # Errors, and the failure path — section 6
@@ -934,6 +1000,95 @@ class TestErrorHandling:
         assert root().status.status_code == StatusCode.ERROR
         assert attrs["gen_ai.usage.input_tokens"] == 40000
         assert attrs["gen_ai.usage.output_tokens"] == 500
+
+    async def test_api_error_under_success_subtype_fails_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query(
+                [init_message(), synthetic_message(), api_error_result_message()]
+            ),
+        )
+        with pytest.raises(RuntimeError, match=r"400.*Credit balance is too low"):
+            await create_claude_agents_handler(capture_content=True)(BASE_CONFIG, "q")
+        # The synthetic message is not a model response, so it gets no chat span.
+        assert [s.name for s in spans()] == ["invoke_agent"]
+        assert root().status.status_code == StatusCode.ERROR
+        [exception] = [e for e in root().events if e.name == "exception"]
+        assert "Credit balance is too low" in exception.attributes["exception.message"]
+        # The error text is not model output.
+        assert "gen_ai.output.messages" not in root().attributes
+
+    async def test_streamed_api_error_fails_the_run_without_a_done_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query(
+                [init_message(), synthetic_message(), api_error_result_message()]
+            ),
+        )
+        events: list[Any] = []
+        with pytest.raises(RuntimeError, match=r"400.*Credit balance is too low"):
+            gen = await create_claude_agents_handler(capture_content=True).stream(
+                BASE_CONFIG, "q", {}, {}
+            )
+            async for event in gen:
+                events.append(event)
+        assert events == []
+        assert [s.name for s in spans()] == ["invoke_agent"]
+        assert root().status.status_code == StatusCode.ERROR
+        assert "gen_ai.output.messages" not in root().attributes
+
+    async def test_success_result_with_is_error_false_is_a_successful_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query([assistant_message(), result_message("fine")]),
+        )
+        result = await create_claude_agents_handler()(BASE_CONFIG, "q")
+        assert result["output"] == "fine"
+        assert root().status.status_code == StatusCode.OK
+
+    async def test_synthetic_message_is_left_out_of_every_chat_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A synthetic message can share the real response's id, so grouping on it would append the
+        # error text to that response's output.
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query(
+                [
+                    assistant_message(10, 2, "msg_1", [TextBlock(text="first half")]),
+                    synthetic_message("API Error: output token maximum", "msg_1"),
+                    tool_result_user_message(),
+                    assistant_message(12, 3, "msg_2", [TextBlock(text="second half")]),
+                    result_message("second half"),
+                ]
+            ),
+        )
+        result = await create_claude_agents_handler(capture_content=True)(
+            BASE_CONFIG, "q"
+        )
+        assert result["output"] == "second half"
+        chats = named("chat ")
+        assert [c.name for c in chats] == [
+            "chat claude-opus-4-5",
+            "chat claude-opus-4-5",
+        ]
+        for chat in chats:
+            assert "output token maximum" not in str(
+                chat.attributes.get("gen_ai.output.messages")
+            )
+            assert "output token maximum" not in str(
+                chat.attributes.get("gen_ai.input.messages")
+            )
 
     async def test_reports_responses_that_arrived_when_the_sdk_throws(
         self, monkeypatch: pytest.MonkeyPatch
@@ -999,8 +1154,13 @@ class TestStreaming:
         )
         h = create_claude_agents_handler()
         events = await _collect(await h.stream(BASE_CONFIG, "q", {}, {}))
-        assert [e["type"] for e in events] == ["chunk", "done"]
-        assert events[0]["text"] == "Hi"
+        assert [e["type"] for e in events] == [
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "done",
+        ]
+        assert events[1]["delta"] == "Hi"
         assert events[-1]["output"] == "Hi"
 
     async def test_emits_same_span_tree_as_blocking_path(
@@ -1050,7 +1210,7 @@ class TestStreaming:
         gen = await h.stream(BASE_CONFIG, "q", {}, {})
         # Consume only the first chunk, then abandon the generator without exhausting it.
         first = await gen.__anext__()
-        assert first["type"] == "chunk"
+        assert first["type"] == "TEXT_MESSAGE_START"
         await gen.aclose()
 
         assert root().status.status_code == StatusCode.UNSET
@@ -1095,9 +1255,8 @@ class TestStreaming:
         h = create_claude_agents_handler()
         events = [e async for e in await h.stream(BASE_CONFIG, "hi")]
 
-        chunks = [e for e in events if e.get("type") == "chunk"]
-        assert len(chunks) == 2
-        assert chunks[0]["text"] == "hello "
+        deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["hello ", "world"]
 
     async def test_all_chunks_before_done(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1111,8 +1270,13 @@ class TestStreaming:
         events = [e async for e in await h.stream(BASE_CONFIG, "hi")]
 
         done_idx = next(i for i, e in enumerate(events) if e.get("type") == "done")
-        chunk_indices = [i for i, e in enumerate(events) if e.get("type") == "chunk"]
-        assert all(ci < done_idx for ci in chunk_indices)
+        text_indices = [
+            i
+            for i, e in enumerate(events)
+            if e.get("type")
+            in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}
+        ]
+        assert all(ci < done_idx for ci in text_indices)
 
     async def test_yields_exactly_one_done_event(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1204,7 +1368,7 @@ class TestQueryGeneratorLifecycle:
         h = create_claude_agents_handler()
         gen = await h.stream(BASE_CONFIG, "q", {}, {})
         first = await gen.__anext__()
-        assert first["type"] == "chunk"
+        assert first["type"] == "TEXT_MESSAGE_START"
         await gen.aclose()
 
         assert closed["value"] is True
@@ -1399,20 +1563,24 @@ class TestToolSpanFailure:
 
 
 class TestHistoryAndVariables:
-    async def test_history_reaches_the_query_as_part_of_the_system_prompt(
+    async def test_history_reaches_query_as_structured_input(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         captured: dict[str, Any] = {}
 
         async def _query(**kwargs: Any) -> AsyncIterator[Any]:
             captured["options"] = kwargs["options"]
+            captured["prompt"] = kwargs["prompt"]
             yield assistant_message()
             yield result_message()
 
         monkeypatch.setattr(handler_mod, "query", _query)
         history = [{"role": "user", "content": "earlier turn"}]
         await create_claude_agents_handler()(BASE_CONFIG, "q", history=history)
-        assert "earlier turn" in captured["options"].system_prompt
+        assert captured["options"].system_prompt == "You are helpful."
+        turns = [turn async for turn in captured["prompt"]]
+        assert turns[0]["message"]["content"] == "earlier turn"
+        assert turns[-1]["message"]["content"] == "q"
 
     async def test_ld_span_attributes_land_on_root_only(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1600,7 +1768,7 @@ class TestConvenienceExport:
             return instance
 
         monkeypatch.setattr(
-            "launchdarkly_ai_claude_agents.handler.config", _fake_config
+            "launchdarkly_ai_claude_agents.handler._config", _fake_config
         )
         result = await claude_agents("cfg-key", "hi", {"key": "u1"})
         assert result == {"output": "ok"}
@@ -1629,7 +1797,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(_handler_mod, "config", mock_config_fn):
+        with patch.object(_handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_claude_agents.handler import claude_agents
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1652,7 +1820,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(_handler_mod, "config", mock_config_fn):
+        with patch.object(_handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_claude_agents.handler import claude_agents
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1713,12 +1881,12 @@ class TestHistory:
         {"role": "assistant", "content": "Feature flagging is a technique..."},
     ]
 
-    def test_history_format_is_correct(self) -> None:
-        config = _make_config(instructions="Be helpful.")
+    def test_history_not_stuffed_into_system_prompt(self) -> None:
+        config = _make_config(instructions="Be concise.")
         _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
         assert system is not None
-        assert "user: What is feature flagging?" in system
-        assert "assistant: Feature flagging is a technique..." in system
+        assert "Be concise." in system
+        assert "Conversation History:" not in system
 
     def test_empty_history_treated_like_no_history(self) -> None:
         config = _make_config(instructions="Be concise.")
@@ -1727,12 +1895,135 @@ class TestHistory:
         assert system_with_empty == system_without
         assert "Conversation History:" not in (system_with_empty or "")
 
-    def test_history_without_prior_system_prompt(self) -> None:
+    def test_history_without_instructions_keeps_system_none(self) -> None:
         config = _make_config()
         _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
-        assert system is not None
-        assert "Conversation History:" in system
-        assert "user: What is feature flagging?" in system
+        assert system is None or "Conversation History:" not in system
+
+
+IMAGE_BLOCK: dict[str, Any] = {
+    "type": "image",
+    "source": {"type": "base64", "media_type": "image/png", "data": "IMGDATA123"},
+}
+
+
+async def _capture_streamed_turns(
+    monkeypatch: pytest.MonkeyPatch,
+    user_input: str,
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Runs the handler and returns the turns actually written to the SDK."""
+    captured: dict[str, Any] = {}
+
+    async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+        prompt = kwargs["prompt"]
+        captured["turns"] = (
+            prompt if isinstance(prompt, str) else [turn async for turn in prompt]
+        )
+        yield result_message()
+
+    monkeypatch.setattr(handler_mod, "query", _query)
+    await create_claude_agents_handler()(BASE_CONFIG, user_input, history=history)
+    return captured["turns"]
+
+
+class TestMultimodalHistoryReachesTheProvider:
+    """The image has to arrive as a block, and the envelope has to be one the CLI accepts.
+
+    Asserting only that the run succeeded, or that the base64 payload appears somewhere in
+    the prompt, passes just as happily when the block has been flattened to a string on the
+    way out. These check the structure.
+    """
+
+    async def test_image_block_is_sent_as_a_block_not_stringified(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "What colour is the square?",
+            [{"role": "user", "content": [IMAGE_BLOCK]}],
+        )
+
+        assert not isinstance(turns, str), "history collapsed to a single prompt string"
+        content = turns[0]["message"]["content"]
+        assert isinstance(content, list), f"content was stringified: {content!r}"
+        assert content == [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "IMGDATA123",
+                },
+            }
+        ]
+
+    async def test_every_envelope_satisfies_the_cli_role_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The CLI reading this stream accepts an "assistant" envelope as a replayed turn and
+        # rejects every other envelope whose role is not "user", with
+        # "Expected message role 'user', got 'assistant'".
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "",
+            [
+                {"role": "user", "content": "I am going to share an image."},
+                {"role": "assistant", "content": "Sure — go ahead."},
+                {
+                    "role": "user",
+                    "content": [IMAGE_BLOCK, {"type": "text", "text": "What colour?"}],
+                },
+            ],
+        )
+
+        assert not isinstance(turns, str)
+        for turn in turns:
+            role = turn["message"]["role"]
+            assert turn["type"] == "assistant" or role == "user", (
+                f"envelope type {turn['type']!r} with role {role!r} is rejected by the CLI"
+            )
+            assert turn["type"] == role
+
+    async def test_assistant_turn_is_replayed_as_an_assistant_envelope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        )
+
+        assert turns[1] == {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}],
+            },
+            "parent_tool_use_id": None,
+        }
+
+    async def test_empty_user_input_appends_no_trailing_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # History that already ends with the user turn is sent as-is; an empty user_input
+        # must not be appended as a second, blank user turn.
+        turns = await _capture_streamed_turns(
+            monkeypatch,
+            "",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [IMAGE_BLOCK]},
+            ],
+        )
+
+        assert len(turns) == 3
+        assert turns[-1]["message"]["role"] == "user"
+        assert turns[-1]["message"]["content"] == [IMAGE_BLOCK]
 
 
 class TestBuiltinsSurviveAnEmptyToolList:
@@ -1801,7 +2092,7 @@ class TestAbandonedToolSpansAreNotErrors:
         monkeypatch.setattr(handler_mod, "query", _query_that_opens_a_tool)
         h = create_claude_agents_handler()
         gen = await h.stream(config, "q", {"webSearch": stub}, {})
-        assert (await gen.__anext__())["type"] == "chunk"
+        assert (await gen.__anext__())["type"] == "TOOL_CALL_START"
         await gen.aclose()
 
         tools = [s for s in spans() if s.name.startswith("execute_tool ")]
@@ -2102,3 +2393,93 @@ class TestToolSpanSurvivesAContentFailure:
 
         tool = named("execute_tool ")[0]
         assert tool.end_time is not None
+
+
+async def test_a_builtin_tool_result_is_not_marked_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = StreamEvent(
+        uuid="u1",
+        session_id="sess-1",
+        event={
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu-1", "name": "Read"},
+        },
+    )
+    args = StreamEvent(
+        uuid="u2",
+        session_id="sess-1",
+        event={
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"file":"a"}'},
+        },
+    )
+    stopped = StreamEvent(
+        uuid="u3",
+        session_id="sess-1",
+        event={"type": "content_block_stop", "index": 0},
+    )
+    monkeypatch.setattr(
+        handler_mod,
+        "query",
+        _fake_query(
+            [
+                started,
+                args,
+                stopped,
+                tool_result_user_message("tu-1", "file body"),
+                result_message("done"),
+            ]
+        ),
+    )
+
+    async def _events(capture: bool) -> list[dict[str, Any]]:
+        handler = create_claude_agents_handler(capture_content=capture)
+        return [event async for event in await handler.stream(BASE_CONFIG, "q", {}, {})]
+
+    shown = await _events(True)
+    types = [event["type"] for event in shown if str(event["type"]).startswith("TOOL_")]
+    assert types == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+    ]
+    assert shown[0]["toolCallName"] == "Read" or any(
+        event.get("toolCallName") == "Read" for event in shown
+    )
+    result = next(event for event in shown if event["type"] == "TOOL_CALL_RESULT")
+    assert result["content"] == "file body"
+    assert "metadata" not in result
+
+    hidden = await _events(False)
+    assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+    hidden_result = next(
+        event for event in hidden if event["type"] == "TOOL_CALL_RESULT"
+    )
+    assert hidden_result["content"] == ""
+
+
+def test_a_streamed_mcp_tool_uses_the_config_name() -> None:
+    from launchdarkly_ai_claude_agents.handler import _map_claude_stream_event
+    from launchdarkly_ai_server.agui import TurnEmitter
+
+    emitter = TurnEmitter(capture_content=True)
+    events = _map_claude_stream_event(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "tu-1",
+                "name": "mcp__tool-mcp__search",
+            },
+        },
+        emitter,
+        {},
+        set(),
+    )
+    assert events[0]["toolCallName"] == "search"
+    assert events[0]["toolCallId"] == "tu-1"

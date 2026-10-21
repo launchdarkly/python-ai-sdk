@@ -3,13 +3,15 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.2"  # x-release-please-version
+__version__ = "0.3.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
+from .client import _config as _config
 from .content import (
     SpanMessage,
     SpanMessagePart,
     ToolDefinitionInput,
+    lang_chain_content_text,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
     set_input_content_attributes,
@@ -24,17 +26,19 @@ from .conversation import (
     conversation_id,
     set_conversation_id_if_absent,
 )
-from .evaluations import (
-    EvalRunResult,
-    EvaluationsError,
-    EvaluationsModule,
-    GenerationConfig,
-    RunSummary,
-    init_evaluations,
-)
 from .graph import GraphInstance, graph, resolve_graph
+from .graph import _graph as _graph
+from .history import (
+    any_multimodal,
+    compose_history,
+    content_to_text,
+    has_multimodal_content,
+    image_block_to_url,
+    is_content_blocks,
+)
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
+    configure,
     extract_variation,
     get_client,
     init_client,
@@ -49,6 +53,7 @@ from .registry import (
     resolve_tools,
 )
 from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
+from .sdk_usage import report_usage
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -60,6 +65,7 @@ from .types import (
     GraphEdge,
     GraphNode,
     GraphOptions,
+    GraphStreamEvent,
     GraphTopology,
     HandlerResult,
     HandlerStreamEvent,
@@ -78,6 +84,7 @@ from .types import (
     ProviderGraphResponse,
     ProviderHandler,
     ProviderResponse,
+    SDKOptions,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -96,19 +103,20 @@ from .utils import (
     end_unfinished_spans,
     lang_chain_span_usage,
     make_track_data,
+    model_stamps_from_meta,
     normalize_mode,
     number_or_zero,
+    omit_model_stamps,
     parse_json_with_possible_fences,
     parse_template,
     parse_usage,
     set_ld_span_attributes,
     set_model_identity_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
     set_usage_span_attributes,
     to_ld_context,
     to_usage_dict,
 )
+from .utils import _create_handler as _create_handler
 
 __all__ = [  # noqa: RUF022
     # types
@@ -121,10 +129,12 @@ __all__ = [  # noqa: RUF022
     "GraphEdge",
     "GraphNode",
     "GraphOptions",
+    "GraphStreamEvent",
     "GraphTopology",
     "HandlerResult",
     "HandlerStreamEvent",
     "InitClientOptions",
+    "SDKOptions",
     "JudgeResult",
     "JudgeRunResult",
     "JudgeTask",
@@ -153,6 +163,7 @@ __all__ = [  # noqa: RUF022
     "create_run_usage",
     "end_span_once",
     "end_unfinished_spans",
+    "lang_chain_content_text",
     "lang_chain_finish_reasons",
     "lang_chain_span_messages",
     "lang_chain_span_usage",
@@ -167,24 +178,24 @@ __all__ = [  # noqa: RUF022
     "text_message",
     "to_semconv_finish_reason",
     "VariationMeta",
-    # evaluations
-    "EvalRunResult",
-    "EvaluationsError",
-    "EvaluationsModule",
-    "GenerationConfig",
-    "RunSummary",
-    "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",
+    "model_stamps_from_meta",
+    "omit_model_stamps",
     "normalize_mode",
     "parse_json_with_possible_fences",
     "parse_template",
     "parse_usage",
     "set_ld_span_attributes",
-    "set_openllmetry_completion",
-    "set_openllmetry_prompt",
     "to_ld_context",
+    # history
+    "compose_history",
+    "content_to_text",
+    "image_block_to_url",
+    "is_content_blocks",
+    "has_multimodal_content",
+    "any_multimodal",
     # validation
     "parse_ai_config",
     # registry
@@ -198,6 +209,7 @@ __all__ = [  # noqa: RUF022
     "execute_and_track",
     "execute_and_stream",
     # lifecycle
+    "configure",
     "init_client",
     "get_client",
     "shutdown",
@@ -206,6 +218,7 @@ __all__ = [  # noqa: RUF022
     "SDK_INFO_CONTEXT",
     "SDK_INFO_EVENT",
     "register_ai_sdk_package",
+    "report_usage",
     # judges
     "build_judge_tasks",
     "run_judge",

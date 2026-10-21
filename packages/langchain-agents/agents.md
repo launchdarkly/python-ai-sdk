@@ -2,7 +2,7 @@
 
 > **Span shape.** This package emits `invoke_agent` → `chat {model}` → `execute_tool {name}`, with
 > tool spans as siblings of `chat`. Span construction lives in `spans.py` beside the handler.
-> Conversation content is off unless the caller passes `capture_content=True`.
+> Conversation content is off unless the caller passes `capture_content=True`, or the process sets it. See [Process-wide defaults](../client/README.md#process-wide-defaults).
 > `TELEMETRY-CONTRACT.md` at the repo root is the authority; read it before changing span code.
 
 
@@ -34,6 +34,7 @@ The handler is model-agnostic — it accepts any `BaseChatModel`. The default is
 | `src/launchdarkly_ai_langchain_agents/graph.py` | `langchain_graph()` convenience wrapper around `graph()` |
 | `src/launchdarkly_ai_langchain_agents/native_graph.py` | `to_lang_graph()` native graph adapter |
 | `src/launchdarkly_ai_langchain_agents/__init__.py` | Package exports |
+| `src/launchdarkly_ai_langchain_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
 ---
 
@@ -145,11 +146,11 @@ Key implementation detail: `WorkflowState` is a `TypedDict` with an `Annotated[l
 
 ## OTel Setup
 
-This package emits one span per invocation using `opentelemetry-api`. **No OTel configuration is needed in this package** — the tracer provider is registered by `init_client()` in `launchdarkly-ai-server` (or `launchdarkly-ai`).
+This package emits one span per invocation using `opentelemetry-api`. **No OTel configuration is needed in this package** — the tracer provider is registered by `init_client()` in `launchdarkly-ai-server` (or `launchdarkly-ai-python`).
 
 To receive spans, install the OTel SDK in your application:
 ```sh
-pip install "launchdarkly-ai[otel]"
+pip install "launchdarkly-ai-python[otel]"
 # or:
 pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 ```

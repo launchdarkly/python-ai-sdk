@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.2.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.2.4...launchdarkly-ai-langchain-agents-0.2.5) (2026-10-09)
+
+
+### Features
+
+* **AIC-3495:** record which public helpers an application calls ([#145](https://github.com/launchdarkly/python-ai-sdk/issues/145)) ([19d2c2b](https://github.com/launchdarkly/python-ai-sdk/commit/19d2c2baf35440af57ed57f12f0413e524de27fa))
+
+
+### Bug Fixes
+
+* **agents:** accept sync tool handlers on invoke and native graphs ([#134](https://github.com/launchdarkly/python-ai-sdk/issues/134)) ([4ab5020](https://github.com/launchdarkly/python-ai-sdk/commit/4ab5020a0d8da04e18b0e230f86e2e13271bb9f9))
+* **AIC-3506:** strip tools from LangChain model constructor kwargs ([#133](https://github.com/launchdarkly/python-ai-sdk/issues/133)) ([77c4979](https://github.com/launchdarkly/python-ai-sdk/commit/77c497966e58235ce18257a56fd6e6b139d2cf85))
+
+## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.2.3...launchdarkly-ai-langchain-agents-0.2.4) (2026-09-30)
+
+
+### Features
+
+* **AIC-3211:** record each graph node as its own tracking event ([#114](https://github.com/launchdarkly/python-ai-sdk/issues/114)) ([c3c439e](https://github.com/launchdarkly/python-ai-sdk/commit/c3c439ede989ea98c43d238b80467351c5920c56))
+
+## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.2.2...launchdarkly-ai-langchain-agents-0.2.3) (2026-09-21)
+
+
+### Features
+
+* **AIC-3106:** add multimodal history support to graph().invoke() ([#26](https://github.com/launchdarkly/python-ai-sdk/issues/26)) ([c91132d](https://github.com/launchdarkly/python-ai-sdk/commit/c91132de81f846326457c6d397be609b7a510e35))
+
+
+### Bug Fixes
+
+* **AIC-3382:** support Bedrock configs in LangChain handlers ([#101](https://github.com/launchdarkly/python-ai-sdk/issues/101)) ([04a67c7](https://github.com/launchdarkly/python-ai-sdk/commit/04a67c71bf8d21c7ef49a1283044ac1c5d77d219))
+* apply Claude thinking parameters from the evaluated LangChain config ([#99](https://github.com/launchdarkly/python-ai-sdk/issues/99)) ([8be2318](https://github.com/launchdarkly/python-ai-sdk/commit/8be231801575e1071c50aab8e2d7b6a1c20fc16c))
+* extract LangChain content-block text and apply model parameters after eval ([#80](https://github.com/launchdarkly/python-ai-sdk/issues/80)) ([a4e1aad](https://github.com/launchdarkly/python-ai-sdk/commit/a4e1aade8adea9f9dcf18c38b374d2de089a7cc1))
+
+
+### Documentation
+
+* replace stale launchdarkly-ai package name with launchdarkly-ai-python ([#40](https://github.com/launchdarkly/python-ai-sdk/issues/40)) ([3256db7](https://github.com/launchdarkly/python-ai-sdk/commit/3256db77a8f3e54c08635ea3a8157e60e5aa0f8b))
+
 ## [0.2.2](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.2.1...launchdarkly-ai-langchain-agents-0.2.2) (2026-09-08)
 
 

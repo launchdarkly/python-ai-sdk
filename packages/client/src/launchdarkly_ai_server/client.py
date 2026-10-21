@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncGenerator, Callable
+from contextlib import aclosing
 from typing import Any
 
+from .agui import StableProjector, judge_completed_stream
 from .conversation import bind_conversation_id
-from .judges import build_judge_tasks, run_judges
+from .judges import _build_judge_tasks, run_judges
 from .lifecycle import extract_variation
 from .registry import resolve_handlers, resolve_tools
+from .sdk_usage import report_usage
 from .tracking import execute_and_stream, execute_and_track
 from .types import (
     AiConfigRep,
@@ -73,6 +76,16 @@ class ConfigInstance:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> ProviderResponse[Any]:
+        report_usage("client.config.invoke")
+        return await self._invoke(user_input, context, variables, history)
+
+    async def _invoke(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ProviderResponse[Any]:
         resolved_handler_list = resolve_handlers(
             self._registry, self._normalize_handlers()
         )
@@ -116,13 +129,15 @@ class ConfigInstance:
         usage_obj = to_usage_dict(usage)
 
         if self._skip_judges:
-            judge_tasks = await build_judge_tasks(
+            judge_tasks = await _build_judge_tasks(
                 config=config,
                 user_context=context,
                 handler=handler,
                 handlers=resolved_handler_list,
                 llm_response=llm_str,
                 base_track_data=track_data,
+                user_input=user_input,
+                trajectory=result.get("trajectory", ""),
             )
             return ProviderResponse(
                 response=parsed_response,
@@ -137,6 +152,7 @@ class ConfigInstance:
             handler=handler,
             handlers=resolved_handler_list,
             user_input=user_input,
+            trajectory=result.get("trajectory", ""),
             llm_response=llm_str,
             base_track_data=track_data,
             tool_handlers=resolved_tools,
@@ -160,19 +176,38 @@ class ConfigInstance:
         Deliberately not an ``async def`` with ``yield``: a generator body does not run until the
         first ``__anext__``, by which point a :func:`conversation_id` block wrapped around this
         call has already exited. Binding here — at call time — is what lets a caller hand the
-        generator off and iterate it later.
+        generator off and iterate it later. The usage report runs here for the same reason: it
+        fires on the call, before any iteration.
         """
-        return bind_conversation_id(
-            self._stream_events(user_input, context, variables, history)
-        )
+        report_usage("client.config.stream")
+        return self._stream(user_input, context, variables, history)
 
-    async def _stream_events(
+    def _stream(
         self,
         user_input: str | None,
         context: LDContext,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
+        """Non-reporting :meth:`stream`: binds the conversation id at call time."""
+        return bind_conversation_id(
+            self._stream_events(user_input, context, variables, history)
+        )
+
+    async def _execute_stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None,
+        history: list[dict[str, Any]] | None,
+        sink: dict[str, Any],
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield handler events and the internal ``done``.
+
+        Fills *sink* with the resolved config and handler before the first event,
+        so both ``config().stream()`` and the AG-UI reader run judges from one
+        pass.
+        """
         resolved_handler_list = resolve_handlers(
             self._registry, self._normalize_handlers()
         )
@@ -185,40 +220,54 @@ class ConfigInstance:
         if not resolved_handler_list:
             raise ValueError("No handlers provided to config()")
         handler = select_handler(config, meta, resolved_handler_list)
+        provider = ""
+        model = ""
+        if isinstance(config, dict):
+            provider = str((config.get("provider") or {}).get("name") or "")
+            model = str((config.get("model") or {}).get("name") or "")
+        sink["config"] = config
+        sink["handler"] = handler
+        sink["handlers"] = resolved_handler_list
+        sink["tools"] = resolved_tools
+        sink["provider"] = provider
+        sink["model"] = model
 
-        done_event: dict[str, Any] | None = None
-
-        async for event in execute_and_stream(
-            config_key=self._key,
-            config=config,
-            meta=meta,
-            user_context=context,
-            handler=handler,
-            user_input=user_input,
-            tool_handlers=resolved_tools,
-            variables=variables,
-            history=history,
-        ):
-            if event.get("type") == "chunk":
+        async with aclosing(
+            execute_and_stream(
+                config_key=self._key,
+                config=config,
+                meta=meta,
+                user_context=context,
+                handler=handler,
+                user_input=user_input,
+                tool_handlers=resolved_tools,
+                variables=variables,
+                history=history,
+            )
+        ) as source:
+            async for event in source:
                 yield event
-            else:
-                done_event = event
+
+    async def _stream_events(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        sink: dict[str, Any] = {}
+        projector = StableProjector()
+        async with aclosing(
+            self._execute_stream(user_input, context, variables, history, sink)
+        ) as source:
+            async for event in source:
+                for stable in projector.feed(event):
+                    yield stable
+        done_event = projector.done
 
         if done_event:
-            track_data = done_event.get("track_data", {})
-            judge_results = (
-                {}
-                if self._skip_judges
-                else await run_judges(
-                    config=config,
-                    user_context=context,
-                    handler=handler,
-                    handlers=resolved_handler_list,
-                    user_input=user_input,
-                    llm_response=done_event.get("response", ""),
-                    base_track_data=track_data,
-                    tool_handlers=resolved_tools,
-                )
+            judge_results = await judge_completed_stream(
+                self, sink, done_event, user_input, context
             )
             yield {
                 "type": "done",
@@ -226,6 +275,32 @@ class ConfigInstance:
                 "usage": done_event.get("usage"),
                 "judge_results": judge_results if judge_results else None,
             }
+
+
+class _InternalConfigInstance(ConfigInstance):
+    """A ``ConfigInstance`` whose ``invoke`` and ``stream`` do not report usage.
+
+    Returned by :func:`_config` for SDK wrappers: the wrapper reports itself, and the
+    config call it makes is not a call from the application.
+    """
+
+    async def invoke(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> ProviderResponse[Any]:
+        return await self._invoke(user_input, context, variables, history)
+
+    def stream(
+        self,
+        user_input: str | None,
+        context: LDContext,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        return self._stream(user_input, context, variables, history)
 
 
 def config(
@@ -249,6 +324,24 @@ def config(
     thread calling ``run_judge(task, handlers)``.
     """
     return ConfigInstance(
+        key=key,
+        handler=handler,
+        tool_handlers=tool_handlers,
+        registry=registry,
+        skip_judges=skip_judges,
+    )
+
+
+def _config(
+    *,
+    key: str,
+    handler: ProviderHandler | list[ProviderHandler] | None = None,
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    registry: Any = None,
+    skip_judges: bool = False,
+) -> ConfigInstance:
+    """Non-reporting :func:`config` for SDK wrappers."""
+    return _InternalConfigInstance(
         key=key,
         handler=handler,
         tool_handlers=tool_handlers,

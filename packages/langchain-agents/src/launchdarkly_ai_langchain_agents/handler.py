@@ -6,6 +6,7 @@ Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -16,18 +17,25 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
-    config,
-    create_handler,
+    _config,
+    _create_handler,
+    compose_history,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    lang_chain_content_text,
     lang_chain_span_messages,
     lang_chain_span_usage,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
+from ._version import PACKAGE_NAME, __version__
+from .messages import to_lang_chain_messages
 from .spans import (
     build_span_callbacks,
     fail_span,
@@ -57,8 +65,13 @@ def _build_agent_tools(
             fn = tool_handlers.get(_name)
             if not fn:
                 raise ValueError(f'No handler registered for tool "{_name}"')
-            res = await fn(kwargs)
-            return str(res)
+            # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
+            # routing records the selected edge on the call itself; awaiting a plain
+            # return value raises. Same rule as ``tracking.wrap_tool_handlers``.
+            result = fn(kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return str(result)
 
         t = tool_fn(
             name,
@@ -70,21 +83,9 @@ def _build_agent_tools(
     return result
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
-
-
 def _extract_system_prompt(
     config: AiConfigRep,
     variables: dict[str, Any],
-    history: list[dict[str, Any]] | None = None,
 ) -> str | None:
     system_prompt: str | None = None
     if config.get("instructions"):
@@ -96,20 +97,43 @@ def _extract_system_prompt(
                 "\n".join(m["content"] for m in sys_msgs), variables
             )
 
-    history_text = _format_history(history)
-    if history_text:
-        system_prompt = (
-            f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
-        )
-
     return system_prompt
+
+
+def _config_conversation_turns(
+    config: AiConfigRep, variables: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": message.get("role"),
+            "content": parse_template(message.get("content", ""), variables)
+            if isinstance(message.get("content", ""), str)
+            else message.get("content", ""),
+        }
+        for message in (config.get("messages") or [])
+        if message.get("role") != "system"
+    ]
 
 
 def _build_initial_messages(
     config: AiConfigRep,
     user_input: str,
     variables: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
 ) -> list[Any]:
+    if history:
+        return to_lang_chain_messages(
+            compose_history(
+                history=history,
+                user_input=user_input,
+                config_messages=(
+                    []
+                    if config.get("instructions")
+                    else _config_conversation_turns(config, variables)
+                ),
+            )
+        )
+
     import importlib
 
     msgs_mod = importlib.import_module("langchain_core.messages")
@@ -133,23 +157,82 @@ def _build_initial_messages(
     return messages
 
 
+def _resolved_model_name(config: AiConfigRep, fallback_name: str = "") -> str:
+    """Bedrock ``model.region`` is an inference-profile prefix, prepended once."""
+    model = config.get("model") or {}
+    name = str(model.get("name") or fallback_name)
+    provider = str((config.get("provider") or {}).get("name") or "").lower()
+    if provider != "bedrock":
+        return name
+    prefix = str(model.get("region") or "")
+    if not prefix or name.startswith(f"{prefix}."):
+        return name
+    return f"{prefix}.{name}"
+
+
+def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
+    """Shallow copy with a resolved Bedrock model name. Does not mutate *config*."""
+    resolved = _resolved_model_name(config)
+    model = dict(config.get("model") or {})
+    if model.get("name") == resolved:
+        return config
+    return {**config, "model": {**model, "name": resolved}}
+
+
+def _model_constructor_kwargs(
+    config: AiConfigRep, fallback_name: str
+) -> dict[str, Any]:
+    raw = (config.get("model") or {}).get("parameters")
+    parameters = dict(raw) if isinstance(raw, dict) else {}
+    # Tools are bound from config["tools"]. A tools key here is forwarded raw and rejected.
+    parameters.pop("tools", None)
+    parameters["model"] = _resolved_model_name(config, fallback_name)
+    return parameters
+
+
+def _is_model_factory(llm: Any) -> bool:
+    """LangChain models are callable, so ``callable`` is not enough to spot a factory."""
+    return callable(llm) and not hasattr(llm, "invoke") and not hasattr(llm, "ainvoke")
+
+
 def _make_default_chat_model(config: AiConfigRep) -> Any:
     """
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
+    ``model.parameters`` are passed through, except ``tools``, which is bound separately.
     """
     import importlib
 
     provider = ((config.get("provider") or {}).get("name") or "openai").lower()
-    model_name = (config.get("model") or {}).get("name", "")
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            model=model_name or "claude-3-5-sonnet-20241022"
+            **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
         )
+    if provider == "bedrock":
+        try:
+            lc_aws = importlib.import_module("langchain_aws")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Bedrock models requires langchain-aws. "
+                "Install it with: pip install langchain-aws"
+            ) from exc
+        return lc_aws.ChatBedrockConverse(**_model_constructor_kwargs(config, ""))
     lc_openai = importlib.import_module("langchain_openai")
-    return lc_openai.ChatOpenAI(model=model_name or "gpt-4o")
+    return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
+
+
+async def _resolve_base_model(config: AiConfigRep, llm: Any) -> Any:
+    invocation = _config_for_model_call(config)
+    if llm is None:
+        return _make_default_chat_model(invocation)
+    if _is_model_factory(llm):
+        model = llm(invocation)
+        if asyncio.iscoroutine(model):
+            return await model
+        return model
+    return llm
 
 
 def _run_usage_from_messages(messages: list[Any]) -> Any:
@@ -174,14 +257,30 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 
 
 def create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
 
+    Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
+    called after flag evaluation so ``model.parameters`` can be applied unchanged.
+
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
+    report_usage(
+        "langchain-agents.createLangChainAgentsHandler", PACKAGE_NAME, __version__
+    )
+    return _create_langchain_agents_handler(llm, capture_content=capture_content)
+
+
+def _create_langchain_agents_handler(
+    llm: Any = None, *, capture_content: bool | None = None
+) -> ProviderHandler:
+    """Non-reporting :func:`create_langchain_agents_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -190,6 +289,8 @@ def create_langchain_agents_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         th = tool_handlers or {}
@@ -202,14 +303,14 @@ def create_langchain_agents_handler(
         # truthily, and the test suite is built on mock spans.
         open_root_span: Any = span
 
-        system_prompt = _extract_system_prompt(config, vs, history)
+        system_prompt = _extract_system_prompt(config, vs)
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
             system_prompt = (
                 f"{system_prompt}\n\n{schema_instr}" if system_prompt else schema_instr
             )
 
-        initial_messages = _build_initial_messages(config, user_input, vs)
+        initial_messages = _build_initial_messages(config, user_input, vs, history)
 
         span_callbacks = build_span_callbacks(
             config,
@@ -229,9 +330,7 @@ def create_langchain_agents_handler(
                     system_instructions=system_prompt,
                     messages=lang_chain_span_messages(initial_messages)[1],
                 )
-            base_model = llm
-            if base_model is None:
-                base_model = _make_default_chat_model(config)
+            base_model = await _resolve_base_model(config, llm)
 
             langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
             create_react_agent = langgraph_prebuilt.create_react_agent
@@ -261,20 +360,11 @@ def create_langchain_agents_handler(
                 run_usage = span_callbacks.run_usage
 
             last_msg = msgs[-1] if msgs else None
-            output = (
-                (last_msg.content if isinstance(last_msg.content, str) else "")
-                if last_msg
-                else ""
-            )
+            output = lang_chain_content_text(last_msg.content) if last_msg else ""
 
             # Built through the same conversion the chat span uses, not from `output`. A chat model
-            # may return content as a list of blocks, and `output` is deliberately blank for that
-            # case because it is also what this function returns to the caller. Reading it here made
-            # the root record an empty completion while its own chat child held the real text, so the
-            # two spans described the same reply differently.
-            #
-            # The blank return value is a separate question. It predates this work and is not
-            # telemetry, so it stays as it is.
+            # may return content as a list of blocks. Keeping that conversion here preserves
+            # non-text parts in telemetry while the caller-facing output contains visible text.
             set_output_content_attributes(
                 span,
                 capture_content,
@@ -337,14 +427,14 @@ def create_langchain_agents_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("*", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -373,8 +463,8 @@ async def _stream_gen(
     span = start_root_span(config, variables)
     parent = parent_context_of(span)
 
-    system_prompt = _extract_system_prompt(config, variables, history)
-    initial_messages = _build_initial_messages(config, user_input, variables)
+    system_prompt = _extract_system_prompt(config, variables)
+    initial_messages = _build_initial_messages(config, user_input, variables, history)
 
     span_callbacks = build_span_callbacks(
         config, parent, capture_content, to_tool_definitions(config.get("tools") or {})
@@ -385,6 +475,7 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -396,9 +487,7 @@ async def _stream_gen(
                 system_instructions=system_prompt,
                 messages=lang_chain_span_messages(initial_messages)[1],
             )
-        base_model = llm
-        if base_model is None:
-            base_model = _make_default_chat_model(config)
+        base_model = await _resolve_base_model(config, llm)
 
         langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
         create_react_agent = langgraph_prebuilt.create_react_agent
@@ -430,10 +519,38 @@ async def _stream_gen(
                     if usage:
                         run_usage.add(lang_chain_span_usage(usage))
                     if getattr(msg, "type", None) == "ai":
-                        text = msg.content if isinstance(msg.content, str) else ""
+                        text = lang_chain_content_text(msg.content)
                         if text:
-                            yield {"type": "chunk", "text": text}
+                            for rich in emitter.text(text):
+                                yield rich
                             full_output = text
+                        for tc in getattr(msg, "tool_calls", None) or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            call_id = str(tc.get("id") or tc.get("name") or "")
+                            name = str(tc.get("name") or "")
+                            for rich in emitter.tool_start(call_id, name):
+                                yield rich
+                            for rich in emitter.tool_end(
+                                call_id, arguments=tc.get("args")
+                            ):
+                                yield rich
+                    elif getattr(msg, "type", None) == "tool":
+                        call_id = str(getattr(msg, "tool_call_id", "") or "")
+                        if call_id:
+                            for rich in emitter.tool_result(
+                                call_id,
+                                getattr(msg, "content", None),
+                                failed=getattr(msg, "status", None) == "error",
+                            ):
+                                yield rich
+            for rich in emitter.end_text():
+                yield rich
+
+        # A step can start a call the graph never answers with a tool message.
+        # Close it before the run finishes, or the client keeps it open.
+        for rich in emitter.fail_open():
+            yield rich
 
         # The same reconciliation the blocking path does, for the same reason. This walk reads
         # usage_metadata off the astream payloads, and sees nothing at all unless the graph is
@@ -475,6 +592,8 @@ async def _stream_gen(
         if span_callbacks.run_usage.reported:
             finish_root_span(span, config, span_callbacks.run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -500,10 +619,11 @@ def langchain_agents(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("langchain-agents.langchainAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    return _config(
         key=config_key,
-        handler=create_langchain_agents_handler(capture_content=capture_content),
+        handler=_create_langchain_agents_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

@@ -200,6 +200,34 @@ def bind_conversation_id(
     return _stream_with_bound_id(generator, conversation)
 
 
+async def bind_span_context(
+    generator: AsyncGenerator[Any, None],
+    ctx: otel_context.Context,
+) -> AsyncGenerator[Any, None]:
+    """Re-enter ``ctx`` around every step of ``generator``.
+
+    Sibling of :func:`bind_conversation_id`, which deliberately carries only the conversation id
+    and leaves span parenting alone. A generator body suspends at each ``yield``, so the context
+    has to be re-applied on every ``__anext__`` — wrapping the body once is not enough.
+    """
+    try:
+        while True:
+            token = otel_context.attach(ctx)
+            try:
+                item = await generator.__anext__()
+            except StopAsyncIteration:
+                return
+            finally:
+                otel_context.detach(token)
+            yield item
+    finally:
+        token = otel_context.attach(ctx)
+        try:
+            await generator.aclose()
+        finally:
+            otel_context.detach(token)
+
+
 @asynccontextmanager
 async def with_judge_evaluation(name: str) -> AsyncIterator[RecordEvaluation]:
     """Hold the judge ``invoke_agent`` span open until ``record`` runs.

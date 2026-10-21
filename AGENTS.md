@@ -74,6 +74,18 @@ them mypy-clean under `strict` is a separate piece of work.
 The `UP046` rule (PEP 695 `type` statement syntax for generic classes) is **ignored** in `pyproject.toml`. Do not convert `class Foo(Generic[T]):` to PEP 695 syntax — it is a deliberate migration decision.
 
 
+## PR Titles and the Changelog
+
+PRs are squash-merged with the PR title as the commit message, and release-please builds each package's changelog from those messages.
+
+- **A change to an experimental feature uses that feature's scope:** `skills` (Agent Skills) and `evaluations` (Evaluations from Code). `feat`, `fix` and `perf` commits with one of these scopes are listed under **Experimental** (`changelog-sections` in `release-please-config.json`), for example `feat(skills): watch skills for revocations`. Any other scope, such as `client`, lists the change as a core feature or fix.
+- **Use exactly one scope.** `feat(skills,client):` matches no Experimental row, so it lands under Features.
+- **A PR that changes both core and experimental behaviour** should be split. If it can't be, add a `BEGIN_COMMIT_OVERRIDE` block to its description with one conventional-commit line per change. An override also corrects a merged PR's title, as long as the release PR hasn't merged yet.
+- **A breaking experimental change** uses `!` while the package is 0.x: `feat(skills)!:` bumps the minor version, which is what an experimental break is allowed. After 1.0, `!` would force a major release. Use `feat(skills):` without `!` instead, and say the change is breaking in the title.
+- **When a feature is promoted to core,** remove its rows from `changelog-sections`.
+
+The rule is specified in `TESTING.md` §0.3 in `launchdarkly/ai-sdks-monorepo`.
+
 ## Package Hierarchy
 
 The monorepo is organized into three tiers plus a convenience barrel. Dependencies only flow **downward** — never sideways between packages in the same tier, and never upward.
@@ -87,21 +99,24 @@ graph TD
   claude["launchdarkly-ai-claude-agents"]
   openai["launchdarkly-ai-openai-agents"]
   langchain["launchdarkly-ai-langchain-agents"]
+  opencode["launchdarkly-ai-opencode-agents"]
   newHandler["launchdarkly-ai-new-provider\n(future)"]
  end
  subgraph tier0 ["Tier 0 — Core"]
-  ai["launchdarkly-ai\n(convenience barrel)"]
+  ai["launchdarkly-ai-python\n(convenience barrel)"]
   client["launchdarkly-ai-server"]
  end
 
  app --> claude
  app --> openai
  app --> langchain
+ app --> opencode
  app --> newHandler
  app --> ai
  claude --> client
  openai --> client
  langchain --> client
+ opencode --> client
  newHandler --> client
  ai --> client
 ```
@@ -109,9 +124,9 @@ graph TD
 ### Tiers
 
 - **Tier 0 — Core** (`launchdarkly-ai-server`): The foundation. Owns all LaunchDarkly integration, telemetry orchestration, shared data types, and the primary entry points (`config()`, `graph()`, `resolve_graph()`). Has no dependency on any other `launchdarkly-ai-*` package.
-- **Tier 0 — Convenience barrel** (`launchdarkly-ai`): A pure re-export package that makes all of `launchdarkly-ai-server` available under a shorter install name. No new logic — intended as the default install for most Python applications.
-- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, `launchdarkly-ai-bedrock-agents`, `launchdarkly-ai-bedrock-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages.
-- **Tier 2 — Consumer applications** (e.g. `main.py`, downstream projects): Imports from one or more handler packages and either `launchdarkly-ai` or `launchdarkly-ai-server`. Owns tool implementations and orchestration logic. No `launchdarkly-ai-*` package should ever depend on Tier 2 code.
+- **Tier 0 — Convenience barrel** (`launchdarkly-ai-python`): A pure re-export package that makes all of `launchdarkly-ai-server` available under a shorter install name. No new logic — intended as the default install for most Python applications.
+- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, `launchdarkly-ai-opencode-agents`, `launchdarkly-ai-bedrock-agents`, `launchdarkly-ai-bedrock-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages. The OpenCode handler reduces caller-supplied session events and does not depend on an OpenCode SDK.
+- **Tier 2 — Consumer applications** (e.g. `main.py`, downstream projects): Imports from one or more handler packages and either `launchdarkly-ai-python` or `launchdarkly-ai-server`. Owns tool implementations and orchestration logic. No `launchdarkly-ai-*` package should ever depend on Tier 2 code.
 
 ### Rules
 
@@ -128,10 +143,11 @@ The client manages a singleton connection to LaunchDarkly and the associated tel
 
 | Export | Description |
 |---|---|
-| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. |
+| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. Does not take behavior defaults. |
 | `init_client(client=...)` | **BYOC overload** — accepts a pre-initialized `LDClientInterface`. Stores it directly without calling the SDK. Flushes pending `$ld:ai:sdk:info` events. |
+| `configure(*, options)` | Sets process-wide behavior defaults on the lifecycle singleton. `options` is a frozen `SDKOptions` (`capture_content: bool = False`). Keyword-only. Handlers read it at invocation. An explicit factory or wrapper `capture_content` overrides it. Replaceable until the first AI invocation; an identical value is allowed after. Not read from request data. |
 | `get_client()` | Returns the initialized `LDClientInterface`. Throws if initialization has not completed. |
-| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. |
+| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. Restores the built-in SDK defaults. |
 | `register_ai_sdk_package(name, version)` | Records a LaunchDarkly AI package identity. Handler and convenience packages call this at import time. |
 
 ### Core Data Types
@@ -193,6 +209,8 @@ LaunchDarkly metadata attached to a flag variation.
 | `variationKey` | `str?` | Identifier for the specific variation. |
 | `version` | `int?` | Variation version number. |
 | `mode` | `"agent" \| "completion" \| "judge"` | Execution mode, used alongside `provider.name` to select a handler. |
+| `modelKey` | `str?` | Stable key of the pinned model config, from `_ldMeta.modelKey`. Absent when the variation has no linked model config. Copied onto `TrackData`. |
+| `modelVersion` | `int?` | Pinned model config version, from `_ldMeta.modelVersion`. Copied onto `TrackData`. |
 
 #### `ProviderResponse`
 
@@ -240,6 +258,8 @@ Payload attached to every LaunchDarkly tracking event.
 | `version` | `int` | Variation version number. |
 | `modelName` | `str` | Model name from the config. |
 | `providerName` | `str` | Provider name from the config. |
+| `modelKey` | `str?` | Stable key of the pinned model config, read from `_ldMeta.modelKey`. Omitted when the variation has no pinned model config. |
+| `modelVersion` | `int?` | Pinned model config version, read from `_ldMeta.modelVersion`. Omitted when absent. |
 | `graphKey` | `str?` | Present when the event was produced inside an agent graph. |
 | `toolKey` | `str?` | Present when the event is for a tool call. |
 | `judgeConfigKey` | `str?` | Present when the event is from a judge execution. |
@@ -538,9 +558,12 @@ providers out of three. `SpanUsage` is the type that means the folding is alread
 
 #### Content is off by default
 
-Every factory takes `capture_content: bool = False`. Guard at the
-call site as well as inside the helper: the helper's guard makes a forgotten call site harmless, and
-the call site's guard avoids serialising JSON that would then be discarded, once per turn, in a loop.
+Every factory takes `capture_content: bool | None = None`. `None` reads `configure()` at
+invocation, which is off until a process sets `SDKOptions(capture_content=True)`. An explicit
+`True` or `False` overrides that default. Guard at the call site as well as inside the helper: the
+helper's guard makes a forgotten call site harmless, and the call site's guard avoids serialising
+JSON that would then be discarded, once per turn, in a loop. Resolve the bool when the handler
+runs, not when it is constructed.
 
 #### Finish reasons have three mechanisms, not one
 

@@ -41,6 +41,7 @@ HANDLERS: dict[str, str] = {
     "openai-agents": "launchdarkly_ai_openai_agents.spans",
     "langchain-messages": "launchdarkly_ai_langchain_messages.spans",
     "langchain-agents": "launchdarkly_ai_langchain_agents.spans",
+    "opencode-agents": "launchdarkly_ai_opencode_agents.spans",
     "bedrock-messages": "launchdarkly_ai_bedrock_messages.spans",
     "bedrock-agents": "launchdarkly_ai_bedrock_agents.spans",
 }
@@ -290,19 +291,17 @@ class TestModelIdentity:
         assert attrs["gen_ai.system"] == "langchain"
         assert attrs["gen_ai.provider.name"] == "anthropic"
 
-    def test_the_langchain_provider_name_is_binary_not_a_passthrough(
+    def test_the_langchain_provider_name_is_the_configured_name(
         self, handler_spans: Any
     ) -> None:
-        # Anything that is not Anthropic is served by the OpenAI client, so the attribute follows the
-        # client actually instantiated rather than whatever the config happens to name.
         package, module, _ = handler_spans
         if not package.startswith("langchain-"):
-            pytest.skip("only the LangChain handlers make this choice")
+            pytest.skip("only the LangChain handlers pass through provider.name")
         for configured, expected in (
             ("Anthropic", "anthropic"),
             ("OpenAI", "openai"),
-            ("Bedrock", "openai"),
-            ("Azure", "openai"),
+            ("Bedrock", "bedrock"),
+            ("Azure", "azure"),
             ("", "openai"),
         ):
             config = {**CONFIG, "provider": {"name": configured}}
@@ -384,42 +383,15 @@ EXPECTED_VOCABULARY = {
     "feature_flag.context.id",
     "feature_flag.contextKeys",
     "context.contextKeys",
-    # Graph spans, unchanged from before the span work
-    "ld.ai.graph",
-    "ld.ai.graph.key",
-    "ld.ai.graph.path",
+    # Graph spans. The graph key is listed with the root attributes above.
+    "launchdarkly.graph",
+    "launchdarkly.graph.path",
 }
-
-#: Functions kept exported for one release that nothing calls any more.
-#:
-#: Their bodies are cut out before the scan below, rather than their keys being listed as expected.
-#: Listing the keys does not work: `gen_ai.prompt` is written by the live content writer *and* by
-#: dead `set_openllmetry_prompt`, so naming it as expected lets the dead copy satisfy the lock after
-#: the live one is removed. Cutting the dead code out means only live writes can satisfy anything.
-#:
-#: Delete these names when the functions go. The lock will tell you if you miss one.
-SUPERSEDED_FUNCTIONS = (
-    "set_openllmetry_prompt",
-    "set_openllmetry_completion",
-)
-
-
-def _without_superseded(source: str) -> str:
-    """Drops the body of every superseded function, so a dead write cannot satisfy the lock."""
-    for name in SUPERSEDED_FUNCTIONS:
-        start = source.find(f"def {name}(")
-        if start == -1:
-            continue
-        nxt = source.find("\ndef ", start + 1)
-        end = len(source) if nxt == -1 else nxt
-        source = source[:start] + source[end:]
-    return source
-
 
 _KEY_PATTERN = re.compile(
     r'set_attribute\(\s*f?"([^"{]+)"'
     r'|add_event\(\s*"([^"]+)"'
-    r'|start_span\(\s*"(ld\.ai\.graph)"'
+    r'|start_span\(\s*"(launchdarkly\.graph)"'
     r'|"(gen_ai\.[a-z_.0-9]+)"'
     r'|f"(gen_ai\.[a-z_.]+)\.\{'
     # The feature_flag event's own attributes are built as a plain dict before being handed to
@@ -435,7 +407,7 @@ def _emitted_vocabulary() -> set[str]:
     """Every attribute key, event name and template found in the package sources."""
     found: set[str] = set()
     for path in (REPO_ROOT / "packages").glob("*/src/*/*.py"):
-        for match in _KEY_PATTERN.finditer(_without_superseded(path.read_text())):
+        for match in _KEY_PATTERN.finditer(path.read_text()):
             key = next((g for g in match.groups() if g), None)
             if key and key.split(".")[0] in (
                 "gen_ai",

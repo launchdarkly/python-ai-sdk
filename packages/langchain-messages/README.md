@@ -42,6 +42,20 @@ from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 handler = create_langchain_messages_handler(ChatAnthropic(model="claude-opus-4-5"))
 ```
 
+A constructed instance cannot see flag parameters. Pass a function instead if the model should
+be built after evaluation:
+
+```python
+handler = create_langchain_messages_handler(
+    lambda config: ChatAnthropic(
+        **{
+            **(config["model"].get("parameters") or {}),
+            "model": config["model"]["name"],
+        }
+    )
+)
+```
+
 ### Convenience wrapper
 
 ```python

@@ -19,6 +19,7 @@ interface intercepts it.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -29,18 +30,26 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     RunUsage,
     SpanUsage,
-    config,
-    create_handler,
+    _config,
+    _create_handler,
+    compose_history,
+    content_to_text,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    image_block_to_url,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.responses import map_responses_event
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     derive_finish_reason,
     fail_span,
@@ -93,7 +102,10 @@ def _build_agent_tools(
                 args = json.loads(args_str) if args_str else {}
             except (json.JSONDecodeError, ValueError):
                 args = {}
-            res = await handler(args)
+            # Accept a sync or an async tool handler.
+            res = handler(args)
+            if inspect.isawaitable(res):
+                res = await res
             return str(res)
 
         t = FunctionTool(
@@ -107,15 +119,40 @@ def _build_agent_tools(
     return result
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
+def _parse_message_content(content: Any, variables: dict[str, Any]) -> Any:
+    """Apply templates to text content while preserving structured blocks."""
+    return parse_template(content, variables) if isinstance(content, str) else content
+
+
+def _to_openai_agent_items(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map LaunchDarkly canonical turns to OpenAI Agents input items."""
+    items: list[dict[str, Any]] = []
+    for turn in turns:
+        role = turn["role"]
+        content = turn["content"]
+        if role == "assistant":
+            items.append({"role": "assistant", "content": content_to_text(content)})
+            continue
+
+        blocks = (
+            content
+            if isinstance(content, list)
+            else [{"type": "text", "text": content}]
+        )
+        parts: list[dict[str, Any]] = []
+        for block in blocks:
+            if block.get("type") == "image":
+                parts.append(
+                    {"type": "input_image", "image_url": image_block_to_url(block)}
+                )
+            elif block.get("type") == "text":
+                parts.append({"type": "input_text", "text": block.get("text", "")})
+        items.append({"role": "user", "content": parts})
+    return items
+
+
+def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
+    return prompt if isinstance(prompt, str) else json.dumps(prompt)
 
 
 def _build_agent_and_prompt(
@@ -124,7 +161,7 @@ def _build_agent_and_prompt(
     tool_handlers: dict[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
-) -> tuple[Any, str, str | None]:
+) -> tuple[Any, str | list[dict[str, Any]], str | None]:
     import importlib
 
     agents_mod = importlib.import_module("agents")
@@ -132,27 +169,46 @@ def _build_agent_and_prompt(
 
     safe_input = user_input or ""
     instructions: str | None = None
-    prompt = safe_input
+    prompt: str | list[dict[str, Any]] = safe_input
+
+    config_messages = config.get("messages") or []
+    parsed_messages = [
+        {
+            **message,
+            "content": _parse_message_content(message.get("content", ""), variables),
+        }
+        for message in config_messages
+    ]
 
     if config.get("instructions"):
         instructions = parse_template(config["instructions"], variables)
-    elif config.get("messages"):
-        system_msgs = [m for m in config["messages"] if m.get("role") == "system"]
-        conv_msgs = [m for m in config["messages"] if m.get("role") != "system"]
+    elif parsed_messages:
+        system_msgs = [m for m in parsed_messages if m.get("role") == "system"]
+        conv_msgs = [m for m in parsed_messages if m.get("role") != "system"]
         if system_msgs:
-            instructions = parse_template(
-                "\n".join(m["content"] for m in system_msgs), variables
-            )
-        conv_history = "\n".join(
-            parse_template(m["content"], variables) for m in conv_msgs
-        )
+            instructions = "\n".join(content_to_text(m["content"]) for m in system_msgs)
+        conv_history = "\n".join(content_to_text(m["content"]) for m in conv_msgs)
         prompt = f"{conv_history}\n\n{safe_input}" if conv_history else safe_input
 
-    history_text = _format_history(history)
-    if history_text:
-        instructions = (
-            f"{instructions}\n\n{history_text}" if instructions else history_text
+    if history:
+        # When config.instructions is set, config.messages conversation turns are
+        # ignored (see the no-history branches above), so history composition must
+        # not resurrect them — mirror that priority here.
+        config_history_messages = (
+            []
+            if config.get("instructions")
+            else [
+                message
+                for message in parsed_messages
+                if message.get("role") != "system"
+            ]
         )
+        turns = compose_history(
+            history=history,
+            user_input=user_input,
+            config_messages=config_history_messages,
+        )
+        prompt = _to_openai_agent_items(turns)
 
     tools = _build_agent_tools(config.get("tools") or {}, tool_handlers)
 
@@ -196,10 +252,16 @@ class _SpanningHooks(_RunHooksBase):
         self.run_usage = run_usage
         self.open_model_span: Any = None
         self.open_tool_spans: dict[str, Any] = {}
+        self.emitter = TurnEmitter(capture_content=capture_content)
+        self.pending: list[dict[str, Any]] = []
+        self.item_to_call: dict[str, str] = {}
 
     async def on_llm_start(
         self, context: Any, agent: Any, system_prompt: str | None, input_items: Any
     ) -> None:
+        # Text is closed from response.created, in the order the consumer
+        # reads raw events. Closing here runs ahead of unread deltas and
+        # splits one turn across two messages.
         span = start_model_span(self.config, self.parent)
         self.open_model_span = span
         if self.capture_content:
@@ -266,6 +328,16 @@ class _SpanningHooks(_RunHooksBase):
         # abandon_open_spans both walk this dict, so a span missing from it never ends and never
         # exports.
         self.open_tool_spans[str(call_id)] = span
+        self.pending.extend(self.emitter.tool_start(str(call_id), str(name)))
+        # The Runner can invoke this hook from its background task while
+        # argument deltas are still unread. Closing now would drop the rest
+        # and skip the full argument string, because a prefix is already
+        # recorded. arguments.done closes a call that is still streaming.
+        if not self.emitter.has_argument_deltas(str(call_id)):
+            tool_args = getattr(context, "tool_arguments", None)
+            self.pending.extend(
+                self.emitter.tool_end(str(call_id), arguments=tool_args)
+            )
         if self.capture_content:
             # `tool_arguments` is the raw JSON args string the model produced. Parsed here rather
             # than passed through, per TELEMETRY-CONTRACT.md section 12: arguments hold the object
@@ -282,7 +354,19 @@ class _SpanningHooks(_RunHooksBase):
     async def on_tool_end(
         self, context: Any, agent: Any, tool: Any, result: Any
     ) -> None:
-        span = self.open_tool_spans.pop(self._tool_span_key(context, tool), None)
+        call_id = self._tool_span_key(context, tool)
+        # The hook can run before unread argument deltas. Close with the full
+        # argument string first, so tool_result does not seal a prefix.
+        # Text stays open: this runs before unread text deltas, and closing
+        # here would start a second message for the rest of the turn.
+        self.pending.extend(
+            self.emitter.tool_end(
+                str(call_id),
+                arguments=getattr(context, "tool_arguments", None),
+            )
+        )
+        self.pending.extend(self.emitter.tool_result(str(call_id), str(result)))
+        span = self.open_tool_spans.pop(call_id, None)
         if span is None:
             return
         # Once popped, ending it is this method's job alone: nothing else knows the span exists. A
@@ -327,6 +411,26 @@ class _SpanningHooks(_RunHooksBase):
                 self.open_model_span, ended, abandoned=True, cancelled=cancelled
             )
             self.open_model_span = None
+
+
+def _take_finished_tools(hooks: _SpanningHooks) -> list[dict[str, Any]]:
+    """Return tool events recorded by the hook, text closed before each result.
+
+    The hook runs before unread deltas from the same model call. The caller
+    applies those deltas first. Tool results then follow ``TEXT_MESSAGE_END``
+    so the client does not attach them to the next message.
+    """
+    if not hooks.pending:
+        return []
+    earlier: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    for event in hooks.pending:
+        if event.get("type") == "TOOL_CALL_RESULT":
+            results.append(event)
+        else:
+            earlier.append(event)
+    hooks.pending.clear()
+    return [*earlier, *hooks.emitter.end_text(), *results]
 
 
 def _write_failed_run_usage(
@@ -406,13 +510,26 @@ def _usage_from_error(error: BaseException) -> SpanUsage | None:
     return to_span_usage(usage)
 
 
-def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_openai_agent_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
+    report_usage("openai-agents.createOpenAIAgentHandler", PACKAGE_NAME, __version__)
+    return _create_openai_agent_handler(capture_content=capture_content)
+
+
+def _create_openai_agent_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
+    """Non-reporting :func:`create_openai_agent_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -421,6 +538,8 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         agents_mod = importlib.import_module("agents")
@@ -449,7 +568,7 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
                 span,
                 capture_content,
                 system_instructions=instructions,
-                messages=[text_message("user", prompt)],
+                messages=to_request_span_messages(prompt),
             )
             result = await Runner.run(agent, prompt, hooks=hooks)
             final_output = result.final_output
@@ -506,14 +625,14 @@ def create_openai_agent_handler(*, capture_content: bool = False) -> ProviderHan
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("OpenAI", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -579,22 +698,34 @@ async def _stream_gen(
             span,
             capture_content,
             system_instructions=instructions,
-            messages=[text_message("user", prompt)],
+            messages=to_request_span_messages(prompt),
         )
         streamed = Runner.run_streamed(agent, prompt, hooks=hooks)
         full_output = ""
 
         async for event in streamed.stream_events():
-            if event.type == "raw_response_event":
-                raw = getattr(event, "data", None)
-                if (
-                    raw is not None
-                    and getattr(raw, "type", None) == "response.output_text.delta"
-                ):
-                    delta = getattr(raw, "delta", "")
-                    if isinstance(delta, str) and delta:
-                        yield {"type": "chunk", "text": delta}
-                        full_output += delta
+            raw = (
+                getattr(event, "data", None)
+                if event.type == "raw_response_event"
+                else None
+            )
+            # The next model call is queued only after this turn's tools have
+            # run. Unread deltas from this turn are still ahead of that event,
+            # so the tool result waits until they have been applied.
+            if getattr(raw, "type", None) == "response.created":
+                for rich in _take_finished_tools(hooks):
+                    yield rich
+            if raw is not None:
+                for rich in map_responses_event(raw, hooks.emitter, hooks.item_to_call):
+                    if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                        full_output += rich.get("delta") or ""
+                    yield rich
+        for rich in _take_finished_tools(hooks):
+            yield rich
+        for rich in hooks.emitter.end_text():
+            yield rich
+        for rich in hooks.emitter.fail_open():
+            yield rich
 
         stream_completed = True
         final_output = streamed.final_output
@@ -628,6 +759,12 @@ async def _stream_gen(
         hooks.close_open_spans(exc)
         _write_failed_run_usage(span, config, exc, run_usage)
         fail_span(span, exc, ended)
+        for rich in _take_finished_tools(hooks):
+            yield rich
+        for rich in hooks.emitter.end_text():
+            yield rich
+        for rich in hooks.emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths: both already ended their spans through
@@ -661,10 +798,11 @@ def openai_agents(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("openai-agents.openaiAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    return _config(
         key=config_key,
-        handler=create_openai_agent_handler(capture_content=capture_content),
+        handler=_create_openai_agent_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

@@ -1,12 +1,13 @@
 {
-  "packages/client": "0.2.2",
-  "packages/ai": "0.1.6",
-  "packages/claude-agents": "0.2.2",
-  "packages/claude-messages": "0.2.2",
-  "packages/openai-agents": "0.2.2",
-  "packages/openai-messages": "0.2.2",
-  "packages/langchain-agents": "0.2.2",
-  "packages/langchain-messages": "0.2.2",
+  "packages/client": "0.3.0",
+  "packages/ai": "0.2.0",
+  "packages/claude-agents": "0.2.5",
+  "packages/claude-messages": "0.2.4",
+  "packages/openai-agents": "0.2.5",
+  "packages/openai-messages": "0.2.4",
+  "packages/langchain-agents": "0.2.5",
+  "packages/langchain-messages": "0.2.4",
+  "packages/opencode-agents": "0.1.0",
   "packages/bedrock-agents": "0.0.1",
   "packages/bedrock-messages": "0.0.1"
 }

@@ -1167,7 +1167,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_openai_messages.handler import openai_messages
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1190,7 +1190,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_openai_messages.handler import openai_messages
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1281,10 +1281,279 @@ class TestStreaming:
         with patch.object(spans_mod, "_HAS_OTEL", False):
             h = create_openai_messages_handler()
             events = [e async for e in await h.stream(CONFIG, "q")]
-        chunks = [e for e in events if e.get("type") == "chunk"]
-        assert len(chunks) == 2
-        assert chunks[0]["text"] == "hello "
-        assert chunks[1]["text"] == "world"
+        deltas = [e["delta"] for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert deltas == ["hello ", "world"]
+        assert events[0]["type"] == "TEXT_MESSAGE_START"
+        assert events[-2]["type"] == "TEXT_MESSAGE_END"
+        assert events[-1]["type"] == "done"
+
+    async def test_tool_lifecycle_hides_payloads_until_capture_is_on(
+        self, mock_openai: MagicMock
+    ) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        tool_call = _function_call_item("search", "c1", {"q": "x"})
+
+        async def search(args: dict[str, Any]) -> str:
+            return "secret"
+
+        async def _events(capture: bool) -> list[dict[str, Any]]:
+            mock_openai.responses.stream = MagicMock(
+                side_effect=[
+                    _make_openai_stream_context(["Looking"], output=[tool_call]),
+                    _make_openai_stream_context(["Done"]),
+                ]
+            )
+            with patch.object(spans_mod, "_HAS_OTEL", False):
+                handler = create_openai_messages_handler(capture_content=capture)
+                return [
+                    event
+                    async for event in await handler.stream(
+                        CONFIG, "q", {"search": search}
+                    )
+                ]
+
+        hidden = await _events(False)
+        start = next(event for event in hidden if event["type"] == "TOOL_CALL_START")
+        assert start["toolCallId"] == "c1"
+        assert start["toolCallName"] == "search"
+        assert start["parentMessageId"]
+        assert not any(event["type"] == "TOOL_CALL_ARGS" for event in hidden)
+        result = next(event for event in hidden if event["type"] == "TOOL_CALL_RESULT")
+        assert result["content"] == ""
+
+        shown = await _events(True)
+        args = next(event for event in shown if event["type"] == "TOOL_CALL_ARGS")
+        assert args["delta"] == json.dumps({"q": "x"})
+        shown_result = next(
+            event for event in shown if event["type"] == "TOOL_CALL_RESULT"
+        )
+        assert shown_result["content"] == "secret"
+
+    async def test_a_failed_call_closes_its_siblings(
+        self, mock_openai: MagicMock
+    ) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        calls = [
+            _function_call_item("boom", "c1", {}),
+            _function_call_item("later", "c2", {}),
+        ]
+        mock_openai.responses.stream = MagicMock(
+            return_value=_make_openai_stream_context(["x"], output=calls)
+        )
+
+        def boom(_args: dict[str, Any]) -> str:
+            raise RuntimeError("nope")
+
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            handler = create_openai_messages_handler()
+            seen: list[dict[str, Any]] = []
+            with pytest.raises(RuntimeError, match="nope"):
+                async for event in await handler.stream(
+                    CONFIG, "q", {"boom": boom, "later": lambda _args: "ok"}
+                ):
+                    seen.append(event)
+        results = {
+            event["toolCallId"] for event in seen if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results == {"c1", "c2"}
+
+    def test_parallel_argument_deltas_stay_on_their_call(self) -> None:
+        from types import SimpleNamespace
+
+        from launchdarkly_ai_server.agui import TurnEmitter
+        from launchdarkly_ai_server.responses import map_responses_event
+
+        emitter = TurnEmitter(capture_content=True)
+        ids: dict[str, str] = {}
+        events: list[dict[str, Any]] = []
+
+        def feed(event: Any) -> None:
+            events.extend(map_responses_event(event, emitter, ids))
+
+        feed(
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call", id="fc_1", call_id="call_1", name="search"
+                ),
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call", id="fc_2", call_id="call_2", name="other"
+                ),
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_1",
+                delta='{"q":',
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_2",
+                delta='{"n":',
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_1",
+                delta='"x"}',
+            )
+        )
+        feed(
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="fc_2",
+                delta="1}",
+            )
+        )
+        by_id: dict[str, str] = {}
+        for event in events:
+            if event["type"] != "TOOL_CALL_ARGS":
+                continue
+            by_id[event["toolCallId"]] = (
+                by_id.get(event["toolCallId"], "") + event["delta"]
+            )
+        assert by_id == {"call_1": '{"q":"x"}', "call_2": '{"n":1}'}
+
+    async def test_an_opened_call_without_a_function_result_is_closed(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from types import SimpleNamespace
+
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        added = SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call", call_id="c1", id="item-1", name="search"
+            ),
+        )
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield added
+
+            async def get_final_response(self) -> Any:
+                final = MagicMock()
+                final.output = []
+                final.status = "completed"
+                final.incomplete_details = None
+                final.usage = MagicMock(input_tokens=1, output_tokens=1)
+                final.usage.input_tokens_details = MagicMock(cached_tokens=0)
+                final.id = "resp-stream"
+                final.model = "gpt-4o"
+                return final
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_mgr())
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            handler = create_openai_messages_handler()
+            events = [event async for event in await handler.stream(CONFIG, "q")]
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in events
+        )
+
+    async def test_a_provider_error_closes_an_opened_call(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from types import SimpleNamespace
+
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        added = SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call", call_id="c1", id="item-1", name="search"
+            ),
+        )
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield added
+                raise RuntimeError("stream broke")
+
+            async def get_final_response(self) -> Any:
+                raise AssertionError("final response is not read")
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_mgr())
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="stream broke"),
+        ):
+            handler = create_openai_messages_handler()
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        assert any(
+            event["type"] == "TOOL_CALL_RESULT" and event["toolCallId"] == "c1"
+            for event in seen
+        )
+
+    async def test_a_provider_error_closes_the_open_text(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from types import SimpleNamespace
+
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        delta = SimpleNamespace(type="response.output_text.delta", delta="Hello")
+
+        class _Stream:
+            def __aiter__(self) -> AsyncIterator[Any]:
+                return self._iter()
+
+            async def _iter(self) -> AsyncIterator[Any]:
+                yield delta
+                raise RuntimeError("stream broke")
+
+            async def get_final_response(self) -> Any:
+                raise AssertionError("final response is not read")
+
+        @asynccontextmanager
+        async def _mgr() -> AsyncGenerator[Any, None]:
+            yield _Stream()
+
+        mock_openai.responses.stream = MagicMock(return_value=_mgr())
+        seen: list[dict[str, Any]] = []
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="stream broke"),
+        ):
+            handler = create_openai_messages_handler()
+            async for event in await handler.stream(CONFIG, "q"):
+                seen.append(event)
+        start = next(event for event in seen if event["type"] == "TEXT_MESSAGE_START")
+        end = next(event for event in seen if event["type"] == "TEXT_MESSAGE_END")
+        assert end["messageId"] == start["messageId"]
 
     async def test_yields_exactly_one_done_event(self, mock_openai: MagicMock) -> None:
         import launchdarkly_ai_openai_messages.spans as spans_mod
@@ -1699,6 +1968,28 @@ class TestStreamingTelemetry:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
+    async def test_process_default_is_read_on_the_streaming_path(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            self._patch_stream(mock_openai, ["hi"])
+            ctx, rec = _recording()
+            from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+            with ctx:
+                async for _ in await create_openai_messages_handler().stream(
+                    CONFIG, "q"
+                ):
+                    pass
+            assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+        finally:
+            _reset_for_testing()
+
 
 # ---------------------------------------------------------------------------
 # History parameter
@@ -1745,6 +2036,61 @@ class TestHistory:
         assert non_system[1]["content"] == "Feature flagging is a technique..."
         assert non_system[-1]["content"] == "my question"
 
+    async def test_user_image_block_becomes_an_input_image_part(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        image_block = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "IMGDATA123",
+            },
+        }
+        h = create_openai_messages_handler()
+        await h(
+            CONFIG, "what colour?", {}, {}, [{"role": "user", "content": [image_block]}]
+        )
+        msgs = mock_openai.responses.create.call_args.kwargs["input"]
+        user_msg = next(m for m in msgs if m.get("role") == "user")
+
+        assert isinstance(user_msg["content"], list), (
+            f"content was stringified: {user_msg['content']!r}"
+        )
+        assert user_msg["content"] == [
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,IMGDATA123",
+            }
+        ]
+
+    async def test_assistant_block_content_flattens_to_text(
+        self, mock_openai: MagicMock
+    ) -> None:
+        # ``input_text`` is an input-side part type; the Responses API only accepts it on a
+        # user turn, so a replayed assistant turn has to arrive as a plain string.
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+        await h(
+            CONFIG,
+            "q",
+            {},
+            {},
+            [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "prior answer"}],
+                },
+            ],
+        )
+        msgs = mock_openai.responses.create.call_args.kwargs["input"]
+        assistant_msg = next(m for m in msgs if m.get("role") == "assistant")
+        assert assistant_msg["content"] == "prior answer"
+
     async def test_empty_history_treated_like_no_history(
         self, mock_openai: MagicMock
     ) -> None:
@@ -1781,6 +2127,16 @@ class TestHistory:
         ]
         assert "system" not in history_roles
 
+    async def test_empty_user_input_no_history_still_sends_user_turn(
+        self, mock_openai: MagicMock
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        h = create_openai_messages_handler()
+        await h(CONFIG, "", {}, {})
+        msgs = mock_openai.responses.create.call_args.kwargs["input"]
+        assert any(m.get("role") == "user" for m in msgs)
+
 
 class TestConvenienceWrapperForwardsCaptureContent:
     """`capture_content` must reach the handler, not fall through into `config()`.
@@ -1801,8 +2157,8 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "create_openai_messages_handler", _factory),
-            patch.object(handler_mod, "config", fake_config),
+            patch.object(handler_mod, "_create_openai_messages_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.openai_messages("k", "q", {}, **kwargs)
         seen["config_kwargs"] = fake_config.call_args.kwargs
@@ -1814,8 +2170,11 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in seen["config_kwargs"]
 
-    def test_defaults_to_off(self) -> None:
-        assert self._run()["capture_content"] is False
+    def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
+        assert self._run()["capture_content"] is None
+
+    def test_explicit_false_reaches_the_factory(self) -> None:
+        assert self._run(capture_content=False)["capture_content"] is False
 
 
 class TestChatSpanNeverLeaks:

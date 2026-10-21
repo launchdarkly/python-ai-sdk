@@ -19,6 +19,8 @@ from launchdarkly_ai_bedrock_agents import create_bedrock_agents_handler
 from launchdarkly_ai_bedrock_messages import create_bedrock_messages_handler
 from launchdarkly_ai_claude_agents import ClaudeWebSearch, create_claude_agents_handler
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
+from launchdarkly_ai_langchain_agents import create_langchain_agents_handler
+from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 from launchdarkly_ai_openai_agents import create_openai_agent_handler
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
 from launchdarkly_ai_server import global_registry
@@ -29,6 +31,8 @@ global_registry.register(
         create_openai_agent_handler(),
         create_claude_agents_handler(),
         create_claude_messages_handler(),
+        create_langchain_messages_handler(),
+        create_langchain_agents_handler(),
         create_bedrock_agents_handler(),
         create_bedrock_messages_handler(),
     ],

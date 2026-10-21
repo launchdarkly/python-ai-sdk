@@ -24,6 +24,8 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     StreamEvent,
+    ToolResultBlock,
+    UserMessage,
     query,
 )
 
@@ -35,17 +37,23 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
-    config,
-    create_handler,
+    _config,
+    _create_handler,
+    compose_history,
+    content_to_text,
     end_span_once,
     end_unfinished_spans,
     parse_template,
+    report_usage,
     set_conversation_id_if_absent,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     MCP_TOOL_PREFIX,
     TOOL_MCP_NAME,
@@ -193,6 +201,9 @@ def build_tool_hooks(
     native_tool_map: dict[str, Any],
     parent_context: Any,
     capture_content: bool,
+    *,
+    emitter: TurnEmitter | None = None,
+    pending: list[dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, list[HookMatcher]], ToolTelemetry, AbandonTelemetry, CancelTelemetry
 ]:
@@ -212,6 +223,11 @@ def build_tool_hooks(
     ) -> None:
         if tool_use_id is None:
             return
+        if emitter is not None and pending is not None:
+            if error is None:
+                pending.extend(emitter.tool_result(tool_use_id, result))
+            else:
+                pending.extend(emitter.tool_result(tool_use_id, failed=True))
         span = tool_spans.pop(tool_use_id, None)
         if span is None:
             return
@@ -253,6 +269,11 @@ def build_tool_hooks(
         # out of an unfiled span leaves it open with nothing tracking it: close_open_spans and the
         # teardown both walk this dict, so a span missing from it is a span that never exports.
         tool_spans[use_id] = span
+        if emitter is not None and pending is not None and use_id:
+            pending.extend(emitter.tool_start(use_id, display_name))
+            pending.extend(
+                emitter.tool_end(use_id, arguments=input_data.get("tool_input"))
+            )
         set_tool_call_content_attributes(
             span, capture_content, arguments=input_data.get("tool_input")
         )
@@ -320,17 +341,6 @@ def build_tool_hooks(
 # ---------------------------------------------------------------------------
 
 
-def _format_history(history: list[dict[str, Any]] | None) -> str | None:
-    if not history:
-        return None
-    lines = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "Conversation History:\n\n" + "\n".join(lines)
-
-
 def build_prompt(
     config: AiConfigRep,
     user_input: str | None,
@@ -362,13 +372,98 @@ def build_prompt(
             f"{config_history}\n\n{safe_input}" if config_history else safe_input
         )
 
-    history_text = _format_history(history)
-    if history_text:
-        system_prompt = (
-            f"{system_prompt}\n\n{history_text}" if system_prompt else history_text
-        )
-
     return safe_input, system_prompt
+
+
+def _parse_message_content(content: Any, variables: dict[str, Any]) -> Any:
+    return parse_template(content, variables) if isinstance(content, str) else content
+
+
+def _config_conversation_turns(
+    config: AiConfigRep, variables: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": message.get("role"),
+            "content": _parse_message_content(message.get("content", ""), variables),
+        }
+        for message in (config.get("messages") or [])
+        if message.get("role") != "system"
+    ]
+
+
+def _to_anthropic_user_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            source = block.get("source", {})
+            if source.get("type") == "url":
+                mapped_source = {"type": "url", "url": source.get("url", "")}
+            else:
+                mapped_source = {
+                    "type": "base64",
+                    "media_type": source.get("media_type", ""),
+                    "data": source.get("data", ""),
+                }
+            blocks.append({"type": "image", "source": mapped_source})
+    return blocks
+
+
+async def _to_streamed_prompt(
+    turns: list[dict[str, Any]],
+) -> AsyncGenerator[dict[str, Any], None]:
+    # The envelope ``type`` has to agree with the message role. The CLI reading this stream
+    # accepts an "assistant" envelope as a replayed turn, but every other envelope type is
+    # required to carry role "user" — an assistant turn sent as ``type: "user"`` is rejected
+    # outright with "Expected message role 'user', got 'assistant'".
+    for turn in turns:
+        role = turn.get("role")
+        content = turn.get("content", "")
+        if role == "assistant":
+            yield {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": content_to_text(content)}],
+                },
+                "parent_tool_use_id": None,
+            }
+        else:
+            yield {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": _to_anthropic_user_content(content),
+                },
+                "parent_tool_use_id": None,
+            }
+
+
+def build_query_prompt(
+    config: AiConfigRep,
+    user_input: str | None,
+    variables: dict[str, Any],
+    history: list[dict[str, Any]] | None,
+    fallback_prompt: str,
+) -> str | AsyncGenerator[dict[str, Any], None]:
+    if not history:
+        return fallback_prompt
+
+    turns = compose_history(
+        history=history,
+        user_input=user_input,
+        config_messages=(
+            []
+            if config.get("instructions")
+            else _config_conversation_turns(config, variables)
+        ),
+    )
+    return _to_streamed_prompt(turns)
 
 
 def _opening_of(prompt: str, system_prompt: str | None) -> Opening:
@@ -382,15 +477,30 @@ def _opening_of(prompt: str, system_prompt: str | None) -> Opening:
     )
 
 
-def _result_error(subtype: str, errors: list[str] | None) -> str:
-    """Builds the error for a non-success result message.
+def _raise_if_run_failed(message: Any) -> None:
+    """Raises when a result message reports a failed run.
 
-    ``SDKResultError`` carries no ``result`` field, so a run that hit ``error_max_turns`` or
-    ``error_max_budget_usd`` genuinely failed and has to surface as a failure rather than being
-    reported OK with zeroed usage.
+    Two shapes fail. A non-``success`` subtype carries no ``result`` field, so a run that hit
+    ``error_max_turns`` or ``error_max_budget_usd`` genuinely failed and has to surface as a failure
+    rather than being reported OK with zeroed usage.
+
+    The other is a ``success`` subtype with ``is_error`` set, which is how the CLI reports a failed
+    Anthropic API call. Measured against Agent SDK 0.3.220 with a key that had no credits: the run
+    ends ``success``, ``is_error`` true, ``api_error_status`` set, and the error text in ``result`` —
+    so a caller was handed "Credit balance is too low" as the model's answer.
     """
-    detail = f": {'; '.join(errors)}" if errors else ""
-    return f"Claude agent run ended with {subtype}{detail}"
+    if message.subtype != "success":
+        detail = f": {'; '.join(message.errors)}" if message.errors else ""
+        raise RuntimeError(f"Claude agent run ended with {message.subtype}{detail}")
+    if message.is_error is not True:
+        return
+    # ``getattr``: the field arrived with CLI v2.1.110, and older SDKs' dataclass lacks it.
+    status = getattr(message, "api_error_status", None)
+    status_text = f" (HTTP {status})" if isinstance(status, int) else ""
+    detail = f": {message.result}" if message.result else ""
+    raise RuntimeError(
+        f"Claude agent run ended with an error result{status_text}{detail}"
+    )
 
 
 def _build_query_options(
@@ -426,12 +536,25 @@ def _build_query_options(
 # ---------------------------------------------------------------------------
 
 
-def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_claude_agents_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic's Claude via the claude-agent-sdk.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. See TELEMETRY-CONTRACT.md section 7.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. See TELEMETRY-CONTRACT.md section 7.
     """
+    report_usage("claude-agents.createClaudeAgentsHandler", PACKAGE_NAME, __version__)
+    return _create_claude_agents_handler(capture_content=capture_content)
+
+
+def _create_claude_agents_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
+    """Non-reporting :func:`create_claude_agents_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -440,6 +563,8 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         th = tool_handlers or {}
         vs = variables or {}
 
@@ -451,6 +576,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
         open_root_span: Any = span
 
         prompt, system_prompt = build_prompt(config, user_input, vs, history)
+        query_prompt = build_query_prompt(config, user_input, vs, history, prompt)
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
             system_prompt = (
@@ -510,7 +636,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             # Held in a variable so the finally below can aclose() it. A bare `return` inside
             # `async for` abandons the generator, and asyncio's finalizer then raises RuntimeError
             # when the generator is suspended inside a real await in the SDK.
-            gen = query(prompt=prompt, options=options)
+            gen = query(prompt=query_prompt, options=options)
             try:
                 async for message in gen:
                     record_conversation_id(span, message)
@@ -525,10 +651,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
                         # The CLI's own run-level total is authoritative, so the except clause below
                         # must not overwrite it with the summed-per-response figure.
                         root_usage_written = True
-                        if message.subtype != "success":
-                            raise RuntimeError(
-                                _result_error(message.subtype, message.errors)
-                            )
+                        _raise_if_run_failed(message)
                         result_text = (
                             message.result
                             if isinstance(message.result, str)
@@ -614,15 +737,60 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("Anthropic", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
+
+
+def _map_claude_stream_event(
+    event: dict[str, Any],
+    emitter: TurnEmitter,
+    block_ids: dict[int, str],
+    saw_args: set[str],
+) -> list[dict[str, Any]]:
+    """Map one Claude Agent SDK stream event onto the AG-UI subset."""
+    kind = event.get("type")
+    if kind == "content_block_start":
+        block = event.get("content_block") or {}
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            return []
+        index = event.get("index")
+        call_id = str(block.get("id") or "")
+        if isinstance(index, int):
+            block_ids[index] = call_id
+        return emitter.tool_start(
+            call_id, tool_display_name(str(block.get("name") or ""))
+        )
+    if kind == "content_block_delta":
+        delta = event.get("delta") or {}
+        if not isinstance(delta, dict):
+            return []
+        if delta.get("type") == "text_delta":
+            text = delta.get("text") or ""
+            if not isinstance(text, str) or not text:
+                return []
+            return emitter.text(text)
+        if delta.get("type") == "input_json_delta":
+            index = event.get("index")
+            call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+            partial = delta.get("partial_json") or ""
+            if isinstance(partial, str) and partial and call_id:
+                saw_args.add(call_id)
+            return emitter.tool_args(
+                call_id, partial if isinstance(partial, str) else ""
+            )
+    if kind == "content_block_stop":
+        index = event.get("index")
+        call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+        if call_id and call_id in saw_args:
+            return emitter.tool_end(call_id)
+    return []
 
 
 async def _stream_gen(
@@ -647,6 +815,7 @@ async def _stream_gen(
     parent = parent_context_of(span)
 
     prompt, system_prompt = build_prompt(config, user_input, variables, history)
+    query_prompt = build_query_prompt(config, user_input, variables, history, prompt)
     opening = _opening_of(prompt, system_prompt)
 
     native_tool_map, user_config_tools, native_tool_names = partition_tools(
@@ -665,6 +834,10 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
+    pending: list[dict[str, Any]] = []
+    block_ids: dict[int, str] = {}
+    saw_args: set[str] = set()
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -685,7 +858,11 @@ async def _stream_gen(
         hooks = None
         if native_tool_names or mcp_allowed_tools:
             hooks, tool_telemetry, abandon_tool_spans, _ = build_tool_hooks(
-                native_tool_map, parent, capture_content
+                native_tool_map,
+                parent,
+                capture_content,
+                emitter=emitter,
+                pending=pending,
             )
 
         options = _build_query_options(
@@ -699,30 +876,46 @@ async def _stream_gen(
         )
 
         full_output = ""
-        gen = query(prompt=prompt, options=options)
+        gen = query(prompt=query_prompt, options=options)
         async for message in gen:
+            while pending:
+                yield pending.pop(0)
             record_conversation_id(span, message)
             record_native_tools(span, message, capture_content, catalog)
             inference.record(message)
 
             if isinstance(message, StreamEvent):
                 event = message.event
-                if (
-                    event.get("type") == "content_block_delta"
-                    and event.get("delta", {}).get("type") == "text_delta"
+                if event.get("type") == "message_start":
+                    for rich in emitter.end_text():
+                        yield rich
+                for rich in _map_claude_stream_event(
+                    event, emitter, block_ids, saw_args
                 ):
-                    text = event["delta"].get("text", "")
-                    if text:
-                        yield {"type": "chunk", "text": text}
-                        full_output += text
+                    if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                        full_output += rich.get("delta") or ""
+                    yield rich
+            elif isinstance(message, UserMessage):
+                blocks = message.content if isinstance(message.content, list) else []
+                for block in blocks:
+                    if not isinstance(block, ToolResultBlock):
+                        continue
+                    # Built-in tools have no hook when the config lists none.
+                    # The SDK still yields the result, and that is what closes
+                    # the call instead of fail_open marking it failed.
+                    for rich in emitter.tool_result(
+                        str(block.tool_use_id),
+                        block.content,
+                        failed=bool(getattr(block, "is_error", False)),
+                    ):
+                        yield rich
             elif isinstance(message, ResultMessage):
                 # Before the root, so the children it parents are already closed.
                 inference.finish()
                 raw_usage: dict[str, Any] = dict(message.usage or {})
                 finish_root_span(span, config, raw_usage)
                 root_usage_written = True
-                if message.subtype != "success":
-                    raise RuntimeError(_result_error(message.subtype, message.errors))
+                _raise_if_run_failed(message)
                 final_output = (
                     message.result if message.result is not None else full_output
                 )
@@ -743,6 +936,12 @@ async def _stream_gen(
                 )
                 mark_ok(span)
                 end_span_once(span, ended)
+                while pending:
+                    yield pending.pop(0)
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 yield {"type": "done", "output": final_output, "usage": raw_usage}
                 return
 
@@ -766,6 +965,12 @@ async def _stream_gen(
         )
         mark_ok(span)
         end_span_once(span, ended)
+        while pending:
+            yield pending.pop(0)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         yield {"type": "done", "output": full_output, "usage": streamed_usage["total"]}
 
     except asyncio.CancelledError:
@@ -778,6 +983,10 @@ async def _stream_gen(
             finish_root_span(span, config, inference.run_usage["total"])
             root_usage_written = True
         fail_span(span, exc, ended)
+        while pending:
+            yield pending.pop(0)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success path, where the result message already closed the last response.
@@ -808,10 +1017,11 @@ def claude_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
+    report_usage("claude-agents.claudeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    return _config(
         key=config_key,
-        handler=create_claude_agents_handler(capture_content=capture_content),
+        handler=_create_claude_agents_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

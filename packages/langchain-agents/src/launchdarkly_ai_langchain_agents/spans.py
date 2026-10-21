@@ -63,17 +63,13 @@ def model_name(config: AiConfigRep) -> str:
 
 
 def serving_provider(config: AiConfigRep) -> str:
-    """The provider that actually serves the model.
+    """The configured provider, lower-cased, for ``gen_ai.provider.name``.
 
     ``gen_ai.provider.name`` names who served the request, and its semconv enum has no
-    ``langchain`` member: LangChain is the framework, not the provider. This mirrors the choice
-    ``_make_default_chat_model`` makes, so the attribute agrees with the client that is really
-    used. It is a binary choice, not a passthrough of the configured name: the configured name
-    lower-cased if it equals ``anthropic``, otherwise ``openai``, no matter what else the config
-    names (Bedrock, Azure, Cohere, a typo, or nothing at all).
+    ``langchain`` member: LangChain is the framework, not the provider. Empty or missing
+    names fall back to ``openai``. ``gen_ai.system`` stays the literal ``langchain``.
     """
-    provider = ((config.get("provider") or {}).get("name") or "").lower()
-    return "anthropic" if provider == "anthropic" else "openai"
+    return str((config.get("provider") or {}).get("name") or "openai").lower()
 
 
 # ─── Span starts ─────────────────────────────────────────────────────────────

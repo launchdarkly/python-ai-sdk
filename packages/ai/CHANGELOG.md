@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.2.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.8...launchdarkly-ai-python-0.2.0) (2026-10-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **evaluations:** take tools as a list of EvalTool, with inline definitions ([#105](https://github.com/launchdarkly/python-ai-sdk/issues/105))
+* **evaluations:** rename Tool to EvalTool, freeze it, and make tools.get async
+* **evaluations:** take tools as a list of Tool
+
+### Experimental
+
+* **evaluations:** rename Tool to EvalTool, freeze it, and make tools.get async ([4b8a819](https://github.com/launchdarkly/python-ai-sdk/commit/4b8a81936b9345048be7c05cd9842e07a32a421d))
+* **evaluations:** take tools as a list of EvalTool, with inline definitions ([#105](https://github.com/launchdarkly/python-ai-sdk/issues/105)) ([cad1547](https://github.com/launchdarkly/python-ai-sdk/commit/cad1547154270695c0e9a8673a4daa12a8161a35))
+* **evaluations:** take tools as a list of Tool ([0a92b13](https://github.com/launchdarkly/python-ai-sdk/commit/0a92b13a75869361c28a6efb5cf6b94bfdb5907c))
+* **skills:** add experimental Agent Skills under `launchdarkly_ai_server.experimental.skills` ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Features
+
+* **client:** warn about unrecognized `init_client` options instead of ignoring them silently ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Bug Fixes
+
+* **client:** `init_client` adopts a client only after telemetry setup succeeds, and closes a client it built when setup fails ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+* **client:** `shutdown()` releases the global OpenTelemetry tracer provider the SDK registered, so a later `init_client` exports spans again ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+## [0.1.8](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.7...launchdarkly-ai-python-0.1.8) (2026-09-30)
+
+
+### Features
+
+* **evaluations:** preserve the tool trajectory for judges ([#89](https://github.com/launchdarkly/python-ai-sdk/issues/89)) ([bcaa8c8](https://github.com/launchdarkly/python-ai-sdk/commit/bcaa8c80ae3859e332ddf391e867d9beed42a0f6))
+
+## [0.1.7](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.6...launchdarkly-ai-python-0.1.7) (2026-09-21)
+
+
+### Features
+
+* **evaluations:** add LD judge event support ([#63](https://github.com/launchdarkly/python-ai-sdk/issues/63)) ([ce61644](https://github.com/launchdarkly/python-ai-sdk/commit/ce616444ba39ba3c1fc4954410357ccf744d4bf9))
+
+
+### Documentation
+
+* **evaluations:** document criteria, judge handlers, and scoring policy ([5f5a626](https://github.com/launchdarkly/python-ai-sdk/commit/5f5a626a2406774010485a070546ab27cc5d86fb))
+* **evaluations:** use a customer-style judge key in examples ([ceca049](https://github.com/launchdarkly/python-ai-sdk/commit/ceca049617b1cac362789aafbe7465759aed0762))
+* remove the internal staging host from a public repo ([00b8dba](https://github.com/launchdarkly/python-ai-sdk/commit/00b8dba7d7fe2d5997a7f61f23eb240f77823042))
+* remove the internal staging host from a public repo ([#96](https://github.com/launchdarkly/python-ai-sdk/issues/96)) ([1ad638d](https://github.com/launchdarkly/python-ai-sdk/commit/1ad638d208d7185a83900cfd3de1ae6c817eb451))
+* replace stale launchdarkly-ai package name with launchdarkly-ai-python ([#40](https://github.com/launchdarkly/python-ai-sdk/issues/40)) ([3256db7](https://github.com/launchdarkly/python-ai-sdk/commit/3256db77a8f3e54c08635ea3a8157e60e5aa0f8b))
+
 ## [0.1.6](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.5...launchdarkly-ai-python-0.1.6) (2026-09-08)
 
 

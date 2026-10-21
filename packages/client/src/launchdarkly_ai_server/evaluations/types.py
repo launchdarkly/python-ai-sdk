@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 
 @dataclass
@@ -40,10 +40,15 @@ class GenerationConfig(TypedDict, total=False):
 
 @dataclass
 class DatasetRef:
-    """Identifiers returned when resolving a dataset by key."""
+    """Identifiers returned when resolving a dataset by key.
 
-    id: str
-    key: str
+    Both are ``None`` for an inline dataset, whose rows are uploaded to the run
+    rather than stored as a dataset. Its events must carry no dataset id: the
+    server drops any that name one as a mismatch.
+    """
+
+    id: str | None
+    key: str | None
 
 
 @dataclass
@@ -57,6 +62,16 @@ class DatasetRow:
     metadata: dict[str, Any] | None = None
 
 
+InlineDatasetRow = Mapping[str, Any]
+"""One caller-supplied row of an inline dataset.
+
+A mapping uses the dataset-rows wire shape: ``input``, ``expectedOutput``,
+``variables``, ``metadata`` and an optional ``rowIdx``. A row's index is its
+position in the list; a ``rowIdx`` that disagrees with that position is
+rejected.
+"""
+
+
 @dataclass
 class ResolvedTool:
     """The schema and pinned version returned by the LaunchDarkly tool API."""
@@ -65,6 +80,133 @@ class ResolvedTool:
     version: int
     description: str = ""
     schema: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AIConfig:
+    """Identifies an existing AI Config variation to seed an evaluation run.
+
+    ``key`` is the AI Config key and ``variation`` is the variation key. The two
+    are only meaningful together, since a variation key is scoped to its config.
+    ``run()`` reads the variation's latest version from the management API.
+    This is a reference, not the config itself; see ``AiConfigRep`` for the
+    evaluated payload.
+    """
+
+    key: str
+    variation: str
+
+
+@dataclass
+class AIConfigVariation:
+    """An AI Config variation read from the management API as run() defaults.
+
+    ``generation`` holds only the fields the variation defines, so a caller's
+    explicit arguments can be layered over it. ``tool_versions`` maps each
+    attached tool key to the version the variation pins; ``judge_keys`` lists
+    the judges attached to the variation.
+    """
+
+    generation: GenerationConfig
+    tool_versions: dict[str, int] = field(default_factory=dict)
+    judge_keys: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_api(
+        cls,
+        data: Mapping[str, Any],
+        model_config: Mapping[str, Any] | None = None,
+    ) -> AIConfigVariation:
+        """Build from one variation version and the model config it links.
+
+        ``model_config`` is the linked model-config response, or ``None`` when
+        the variation links none. Fetching it is the caller's job, so this stays
+        a pure translation of API shapes. Provider and base parameters come from
+        the model config; the variation's own parameters are layered over them,
+        as the served flag payload layers them.
+        """
+        model = data.get("model")
+        model = model if isinstance(model, Mapping) else {}
+        model_name = model.get("modelName")
+        variation_parameters = model.get("parameters")
+        parameters: dict[str, Any] = dict(
+            variation_parameters if isinstance(variation_parameters, Mapping) else {}
+        )
+        provider: Any = None
+        if model_config is not None:
+            provider = model_config.get("provider")
+            base_parameters = model_config.get("params")
+            if isinstance(base_parameters, Mapping):
+                parameters = {**base_parameters, **parameters}
+            # A linked variation's modelName is the model-config key
+            # ("OpenAI.gpt-4o"), not a model ID the provider accepts; the
+            # model config's id is, so it wins whenever one is linked.
+            config_model_id = model_config.get("id")
+            if isinstance(config_model_id, str) and config_model_id:
+                model_name = config_model_id
+
+        generation = GenerationConfig()
+        if isinstance(provider, str) and provider:
+            generation["provider"] = provider
+        if isinstance(model_name, str) and model_name:
+            generation["model"] = model_name
+        if parameters:
+            generation["parameters"] = parameters
+        instructions = data.get("instructions")
+        messages = data.get("messages")
+        if isinstance(instructions, str) and instructions:
+            generation["instructions"] = instructions
+        elif isinstance(messages, list) and messages:
+            generation["messages"] = [
+                dict(message) for message in messages if isinstance(message, Mapping)
+            ]
+        output_format = data.get("outputFormat")
+        if isinstance(output_format, Mapping):
+            generation["output_format"] = dict(output_format)
+
+        tools = data.get("tools")
+        tool_versions = {
+            tool["key"]: tool["version"]
+            for tool in (tools if isinstance(tools, list) else [])
+            if isinstance(tool, Mapping)
+            and isinstance(tool.get("key"), str)
+            and isinstance(tool.get("version"), int)
+        }
+        judge_configuration = data.get("judgeConfiguration")
+        judges = (
+            judge_configuration.get("judges")
+            if isinstance(judge_configuration, Mapping)
+            else None
+        )
+        judge_keys = [
+            judge["judgeConfigKey"]
+            for judge in (judges if isinstance(judges, list) else [])
+            if isinstance(judge, Mapping)
+            and isinstance(judge.get("judgeConfigKey"), str)
+        ]
+        return cls(
+            generation=generation,
+            tool_versions=tool_versions,
+            judge_keys=judge_keys,
+        )
+
+
+@dataclass
+class ResolvedJudge:
+    """A LaunchDarkly AI Judge config variation resolved for an evaluation run.
+
+    ``provider`` and ``mode`` come from the judge's own variation, not the
+    evaluation's generation config: a judge is an independent AI Config and may
+    be served by a different provider in a different mode. They are kept here
+    because they are what selects the handler that can actually run this config.
+    """
+
+    key: str
+    config: dict[str, Any]
+    variation_key: str = ""
+    version: int | None = None
+    provider: str | None = None
+    mode: Literal["agent", "messages"] = "messages"
 
 
 @dataclass

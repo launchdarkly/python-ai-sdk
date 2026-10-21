@@ -523,7 +523,7 @@ than inside it. A turn that reads 19,971 tokens from cache and writes 3,580 more
 Prompts, model output, tool arguments and tool results are personal data, so a span carries only
 metadata unless you ask for more: models, token counts, timings, tool names.
 
-Pass `capture_content=True` to a handler factory to include the conversation:
+Pass `capture_content=True` to a handler factory to include the conversation, or turn it on for every handler from process startup. See [Process-wide defaults](packages/client/README.md#process-wide-defaults).
 
 ```python
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
@@ -598,6 +598,7 @@ uv run python main.py [example] [flag-key] [user-input]
 | --- | --- | --- |
 | `agent` *(default)* | `uv run python main.py agent` | `config()` via the global registry — switches providers without code changes |
 | `graph` | `uv run python main.py graph` | `graph()` multi-agent workflow driven by a LaunchDarkly agent graph flag |
+| `graph-history` | `uv run python main.py graph-history` | `graph().invoke()` with multimodal `history` forwarded to the root node |
 | `openai-only` | `uv run python main.py openai-only` | `config()` with a custom `Registry` restricted to OpenAI handlers |
 | `streaming` | `uv run python main.py streaming` | `config().stream()` — token-by-token output |
 

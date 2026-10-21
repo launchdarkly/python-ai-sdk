@@ -1,6 +1,6 @@
-# Agent Guide — `launchdarkly-ai` (Convenience Wrapper)
+# Agent Guide — `launchdarkly-ai-python` (Convenience Wrapper)
 
-This document describes the role, structure, and constraints of the `launchdarkly-ai` package for AI agents and contributors.
+This document describes the role, structure, and constraints of the `launchdarkly-ai-python` package for AI agents and contributors.
 
 ---
 
@@ -18,7 +18,7 @@ Its purpose: Python application developers install this single package and get b
 
 | File | Responsibility |
 |---|---|
-| `src/launchdarkly_ai/__init__.py` | Single `from launchdarkly_ai_server import *` — the entire public barrel |
+| `src/launchdarkly_ai_python/__init__.py` | Single `from launchdarkly_ai_server import *` — the entire public barrel |
 
 ---
 
@@ -30,7 +30,7 @@ This package re-exports everything from `launchdarkly-ai-server` and nothing els
 from launchdarkly_ai_server import *
 ```
 
-Every symbol available from `launchdarkly-ai-server` is available from `launchdarkly-ai` under the same name. No additional symbols are added. When `launchdarkly-ai-server` gains a new export, this package automatically picks it up.
+Every symbol available from `launchdarkly-ai-server` is available from `launchdarkly-ai-python` under the same name. No additional symbols are added. When `launchdarkly-ai-server` gains a new export, this package automatically picks it up.
 
 ---
 
@@ -49,7 +49,7 @@ This package itself emits no spans. OTel is initialized and configured by `launc
 
 Install the OTel packages alongside this package:
 ```sh
-pip install "launchdarkly-ai[otel]"
+pip install "launchdarkly-ai-python[otel]"
 # or:
 pip install launchdarkly-ai-python opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 ```
@@ -84,4 +84,4 @@ This package must remain a pure re-export barrel. Any new utility, type, or help
 
 ### 2. Do not import from both packages in the same application
 
-Importing from both `launchdarkly-ai` and `launchdarkly-ai-server` in the same app can produce subtle issues if the dependency graph deduplication fails. Pick one: use `launchdarkly-ai` for standard Python apps, `launchdarkly-ai-server` for custom runtimes where you manage the SDK client yourself. The `get_client()` singleton is process-wide and shared regardless of which package path you import through.
+Importing from both `launchdarkly-ai-python` and `launchdarkly-ai-server` in the same app can produce subtle issues if the dependency graph deduplication fails. Pick one: use `launchdarkly-ai-python` for standard Python apps, `launchdarkly-ai-server` for custom runtimes where you manage the SDK client yourself. The `get_client()` singleton is process-wide and shared regardless of which package path you import through.
