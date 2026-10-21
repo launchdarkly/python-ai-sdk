@@ -98,7 +98,7 @@
       "aiSdkNames": ["launchdarkly-ai-typesafe"],
       "releases": { "tag-prefix": "launchdarkly-ai-typesafe-" },
       "features": {
-        "aiCompletionConfig": { "introduced": "0.1" }
+        "aiJudgeConfig": { "introduced": "0.1" }
       }
     },
     "python-ai-langchain-agents": {

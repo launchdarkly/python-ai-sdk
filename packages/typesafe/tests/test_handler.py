@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from launchdarkly_ai_server import SDKOptions, configure
 from launchdarkly_ai_server.judge_scoring import FORMATTING_INSTRUCTIONS
+from launchdarkly_ai_server.lifecycle import _reset_for_testing
 from launchdarkly_ai_typesafe import create_typesafe_handler
 
 CLASSIFIERS = [
@@ -123,3 +125,38 @@ async def test_propagates_client_failure() -> None:
             },
             "output",
         )
+
+
+@pytest.mark.asyncio
+async def test_configured_capture_default_applies_without_an_override() -> None:
+    response = SimpleNamespace(
+        answers={
+            "tone": SimpleNamespace(noul=0.25),
+            "accuracy": SimpleNamespace(score=1),
+        }
+    )
+    _reset_for_testing()
+    configure(options=SDKOptions(capture_content=True))
+    try:
+        handler = create_typesafe_handler()
+        with (
+            patch(
+                "launchdarkly_ai_typesafe.handler.AsyncTypeSafeClient",
+                _client(response),
+            ),
+            patch(
+                "launchdarkly_ai_typesafe.handler.set_input_content_attributes"
+            ) as capture_input,
+        ):
+            await handler(
+                {
+                    "model": {"name": "jev-latest"},
+                    "provider": {"name": "TypeSafe"},
+                    "messages": [],
+                    "classifiers": CLASSIFIERS,
+                },
+                "assistant output",
+            )
+        capture_input.assert_called_once()
+    finally:
+        _reset_for_testing()

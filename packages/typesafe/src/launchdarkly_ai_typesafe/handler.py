@@ -22,6 +22,7 @@ from launchdarkly_ai_server import (
     set_usage_span_attributes,
     text_message,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.utils import SpanUsage
 
 from ._version import PACKAGE_NAME, __version__
@@ -79,7 +80,7 @@ def _answer_for(response: Any, key: str) -> Any:
     return None
 
 
-def create_typesafe_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_typesafe_handler(*, capture_content: bool | None = None) -> ProviderHandler:
     """Build a handler with ``provides_for = ('TypeSafe', 'messages')``.
 
     Judge mode normalizes to messages, so a judge variation whose provider is
@@ -96,6 +97,7 @@ def create_typesafe_handler(*, capture_content: bool = False) -> ProviderHandler
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         del tool_handlers
+        capture = effective_capture_content(capture_content)
         questions = extract_typesafe_questions(config)
         state = build_typesafe_state(
             user_input=user_input, variables=variables, history=history
@@ -110,7 +112,7 @@ def create_typesafe_handler(*, capture_content: bool = False) -> ProviderHandler
         set_ld_span_attributes(root, dict(variables) if variables else None)
         set_model_identity_attributes(root, "typesafe", span_model)
         set_model_identity_attributes(chat, "typesafe", span_model)
-        if capture_content:
+        if capture:
             set_input_content_attributes(
                 chat,
                 True,
@@ -144,7 +146,7 @@ def create_typesafe_handler(*, capture_content: bool = False) -> ProviderHandler
             )
             set_usage_span_attributes(chat, span_usage)
             set_usage_span_attributes(root, span_usage)
-            if capture_content:
+            if capture:
                 set_output_content_attributes(
                     chat, True, [text_message("assistant", output)]
                 )
