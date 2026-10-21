@@ -99,6 +99,9 @@ graph TD
   claude["launchdarkly-ai-claude-agents"]
   openai["launchdarkly-ai-openai-agents"]
   langchain["launchdarkly-ai-langchain-agents"]
+  opencode["launchdarkly-ai-opencode-agents"]
+  vercel["launchdarkly-ai-vercel-agents"]
+  litellm["launchdarkly-ai-litellm-agents"]
   newHandler["launchdarkly-ai-new-provider\n(future)"]
  end
  subgraph tier0 ["Tier 0 — Core"]
@@ -109,11 +112,14 @@ graph TD
  app --> claude
  app --> openai
  app --> langchain
+ app --> opencode
  app --> newHandler
  app --> ai
  claude --> client
  openai --> client
  langchain --> client
+ opencode --> client
+ vercel --> client
  newHandler --> client
  ai --> client
 ```
@@ -122,7 +128,7 @@ graph TD
 
 - **Tier 0 — Core** (`launchdarkly-ai-server`): The foundation. Owns all LaunchDarkly integration, telemetry orchestration, shared data types, and the primary entry points (`config()`, `graph()`, `resolve_graph()`). Has no dependency on any other `launchdarkly-ai-*` package.
 - **Tier 0 — Convenience barrel** (`launchdarkly-ai-python`): A pure re-export package that makes all of `launchdarkly-ai-server` available under a shorter install name. No new logic — intended as the default install for most Python applications.
-- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages.
+- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, `launchdarkly-ai-litellm-agents`, `launchdarkly-ai-litellm-messages`, `launchdarkly-ai-opencode-agents`, `launchdarkly-ai-vercel-agents`, `launchdarkly-ai-vercel-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages. The OpenCode handler reduces caller-supplied session events and does not depend on an OpenCode SDK.
 - **Tier 2 — Consumer applications** (e.g. `main.py`, downstream projects): Imports from one or more handler packages and either `launchdarkly-ai-python` or `launchdarkly-ai-server`. Owns tool implementations and orchestration logic. No `launchdarkly-ai-*` package should ever depend on Tier 2 code.
 
 ### Rules
@@ -140,10 +146,11 @@ The client manages a singleton connection to LaunchDarkly and the associated tel
 
 | Export | Description |
 |---|---|
-| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. |
+| `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. Does not take behavior defaults. |
 | `init_client(client=...)` | **BYOC overload** — accepts a pre-initialized `LDClientInterface`. Stores it directly without calling the SDK. Flushes pending `$ld:ai:sdk:info` events. |
+| `configure(*, options)` | Sets process-wide behavior defaults on the lifecycle singleton. `options` is a frozen `SDKOptions` (`capture_content: bool = False`). Keyword-only. Handlers read it at invocation. An explicit factory or wrapper `capture_content` overrides it. Replaceable until the first AI invocation; an identical value is allowed after. Not read from request data. |
 | `get_client()` | Returns the initialized `LDClientInterface`. Throws if initialization has not completed. |
-| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. |
+| `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. Restores the built-in SDK defaults. |
 | `register_ai_sdk_package(name, version)` | Records a LaunchDarkly AI package identity. Handler and convenience packages call this at import time. |
 
 ### Core Data Types
@@ -332,7 +339,7 @@ A resolved agent graph returned by `resolve_graph()`. A class with attribute acc
 | `run_node(node, input?, opts?)` | Executes a single node through the tracked `config().invoke()` path. |
 | `route(node, input?, opts?)` | Executes a node, presenting outgoing edges as handoff choices; returns the response plus the chosen `next` node. |
 | `traverse(fn, ctx?)` | Awaits each visitor in BFS order (root → leaves). Visitor may be sync or async. |
-| `reverse_traverse(fn, ctx?)` | Awaits each visitor in reverse BFS order (leaves → root). Visitor may be sync or async. |
+| `reverse_traverse(fn, ctx?)` | Awaits each visitor, every child before its parents (post-order from the root, each node once, root last). Visitor may be sync or async. |
 
 #### `GraphOptions`
 
@@ -387,7 +394,7 @@ Requires `handlers` (either in `options` or via `options.registry`) to be set.
 
 Resolves an agent graph's topology and node configs without executing it. The returned `GraphDefinition` carries `enabled`; callers should branch on it before traversing.
 
-This is the entry point that framework-native runners (`to_claude_agents`, `to_openai_agents`, `to_lang_graph`) use to build their own execution structure.
+This is the entry point that framework-native runners (`to_claude_agents`, `to_openai_agents`, `to_lang_graph`, `to_litellm_agents`) use to build their own execution structure.
 
 ### `Registry` / `global_registry` / `compose`
 
@@ -554,9 +561,12 @@ providers out of three. `SpanUsage` is the type that means the folding is alread
 
 #### Content is off by default
 
-Every factory takes `capture_content: bool = False`. Guard at the
-call site as well as inside the helper: the helper's guard makes a forgotten call site harmless, and
-the call site's guard avoids serialising JSON that would then be discarded, once per turn, in a loop.
+Every factory takes `capture_content: bool | None = None`. `None` reads `configure()` at
+invocation, which is off until a process sets `SDKOptions(capture_content=True)`. An explicit
+`True` or `False` overrides that default. Guard at the call site as well as inside the helper: the
+helper's guard makes a forgotten call site harmless, and the call site's guard avoids serialising
+JSON that would then be discarded, once per turn, in a loop. Resolve the bool when the handler
+runs, not when it is constructed.
 
 #### Finish reasons have three mechanisms, not one
 
@@ -669,7 +679,7 @@ def my_provider(
 
 For example, `claude_agents(config_key, user_input, context)` is equivalent to `config(key=config_key, handler=create_claude_agents_handler()).invoke(user_input, context)`.
 
-The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`.
+The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`, `litellm_agents`, `litellm_messages`, `vercel_agents`, `vercel_messages`.
 
 ### Graph Export (optional)
 
@@ -680,7 +690,7 @@ def claude_graph(key: str, **options) -> GraphInstance:
     return graph(key, handlers=[create_claude_agents_handler()], **options)
 ```
 
-Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`.
+Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`, `vercel_graph`.
 
 ### Native Graph Adapter (optional)
 
@@ -690,6 +700,8 @@ Current adapters:
 - `to_claude_agents(def_coro, opts)` — exported from `launchdarkly_ai_claude_agents`
 - `to_openai_agents(def_coro, opts)` — exported from `launchdarkly_ai_openai_agents`
 - `to_lang_graph(def_coro, opts)` — exported from `launchdarkly_ai_langchain_agents`
+- `to_litellm_agents(def_coro, opts)` — exported from `launchdarkly_ai_litellm_agents`
+- `to_vercel_agents(def_coro, opts)` — exported from `launchdarkly_ai_vercel_agents`
 
 ---
 

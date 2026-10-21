@@ -16,12 +16,12 @@ from launchdarkly_ai_server import (
     create_handler,
     graph,
     init_client,
-    init_evaluations,
     inspect_config,
     resolve_graph,
     run_judge,
     shutdown,
 )
+from launchdarkly_ai_server.experimental.evaluations import init_evaluations
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 HELPER = "client.buildJudgeTasks"
@@ -92,7 +92,7 @@ def _expect_usage(client: MagicMock, helper: str) -> None:
         "helperPackageName": "launchdarkly-ai-server",
         "helperPackageVersion": __version__,
     }
-    # A client.* helper belongs to the core package.
+    # A client.* or experimental.* helper belongs to the core package.
     payload = calls[0].args[2]
     assert payload["helperPackageName"] == payload["aiSdkName"]
     assert payload["helperPackageVersion"] == payload["aiSdkVersion"]
@@ -152,6 +152,7 @@ def _call(helper: str) -> Any:
 
         create_handler(("OpenAI", "messages"), _fn)
         return None
+    assert helper == "experimental.initEvaluations", helper
     try:
         init_evaluations()
     except Exception:
@@ -178,7 +179,7 @@ async def client() -> Any:
         "client.runJudge",
         "client.buildJudgeTasks",
         "client.createHandler",
-        "client.init_evaluations",
+        "experimental.initEvaluations",
     ],
 )
 async def test_helper_sends_one_usage_event(client: MagicMock, helper: str) -> None:

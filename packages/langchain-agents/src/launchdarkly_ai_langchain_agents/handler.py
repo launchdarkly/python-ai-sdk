@@ -30,9 +30,12 @@ from launchdarkly_ai_server import (
     report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
+    tool_result_string,
 )
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from ._version import PACKAGE_NAME, __version__
 from .messages import to_lang_chain_messages
@@ -343,7 +346,7 @@ def _build_agent_tools(
             result = fn(kwargs)
             if inspect.isawaitable(result):
                 result = await result
-            return str(result)
+            return tool_result_string(result)
 
         t = tool_fn(
             name,
@@ -559,7 +562,7 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 
 
 def create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
 
@@ -567,8 +570,10 @@ def create_langchain_agents_handler(
     called after flag evaluation so ``model.parameters`` can be applied unchanged.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
     report_usage(
         "langchain-agents.createLangChainAgentsHandler", PACKAGE_NAME, __version__
@@ -577,9 +582,10 @@ def create_langchain_agents_handler(
 
 
 def _create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_langchain_agents_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -588,6 +594,8 @@ def _create_langchain_agents_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         th = tool_handlers or {}
@@ -724,14 +732,14 @@ def _create_langchain_agents_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
     return _create_handler(
         ("*", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -772,6 +780,7 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -817,8 +826,36 @@ async def _stream_gen(
                     if getattr(msg, "type", None) == "ai":
                         text = lang_chain_content_text(msg.content)
                         if text:
-                            yield {"type": "chunk", "text": text}
+                            for rich in emitter.text(text):
+                                yield rich
                             full_output = text
+                        for tc in getattr(msg, "tool_calls", None) or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            call_id = str(tc.get("id") or tc.get("name") or "")
+                            name = str(tc.get("name") or "")
+                            for rich in emitter.tool_start(call_id, name):
+                                yield rich
+                            for rich in emitter.tool_end(
+                                call_id, arguments=tc.get("args")
+                            ):
+                                yield rich
+                    elif getattr(msg, "type", None) == "tool":
+                        call_id = str(getattr(msg, "tool_call_id", "") or "")
+                        if call_id:
+                            for rich in emitter.tool_result(
+                                call_id,
+                                getattr(msg, "content", None),
+                                failed=getattr(msg, "status", None) == "error",
+                            ):
+                                yield rich
+            for rich in emitter.end_text():
+                yield rich
+
+        # A step can start a call the graph never answers with a tool message.
+        # Close it before the run finishes, or the client keeps it open.
+        for rich in emitter.fail_open():
+            yield rich
 
         # The same reconciliation the blocking path does, for the same reason. This walk reads
         # usage_metadata off the astream payloads, and sees nothing at all unless the graph is
@@ -860,6 +897,8 @@ async def _stream_gen(
         if span_callbacks.run_usage.reported:
             finish_root_span(span, config, span_callbacks.run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -887,7 +926,7 @@ def langchain_agents(
     # asking for content on spans got a TypeError instead of content.
     report_usage("langchain-agents.langchainAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
         handler=_create_langchain_agents_handler(capture_content=capture_content),

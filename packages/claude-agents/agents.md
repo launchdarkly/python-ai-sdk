@@ -2,7 +2,7 @@
 
 > **Span shape.** This package emits `invoke_agent` → `chat {model}` → `execute_tool {name}`, with
 > tool spans as siblings of `chat`. Span construction lives in `spans.py` beside the handler.
-> Conversation content is off unless the caller passes `capture_content=True`.
+> Conversation content is off unless the caller passes `capture_content=True`, or the process sets it. See [Process-wide defaults](../client/README.md#process-wide-defaults).
 > `TELEMETRY-CONTRACT.md` at the repo root is the authority; read it before changing span code.
 
 
@@ -108,11 +108,23 @@ gen = query_fn(prompt=prompt, options=options)
 try:
     async for message in gen:
         if isinstance(message, ResultMessage):
+            _raise_if_run_failed(message)  # raises on a failed run
             # done — extract output and usage
             break
 finally:
     await gen.aclose()
 ```
+
+A `success` subtype is not enough to call the run a success. An error subtype (`error_max_turns`,
+`error_during_execution`, ...) fails, and so does a `success` result with `is_error` set. The second
+is how the CLI reports a failed Anthropic API call (bad key, no credits, rate limit after retries):
+`api_error_status` is set and `result` holds the error text. `_raise_if_run_failed` raises on either
+shape, so the caller tracks `$ld:ai:generation:error` instead of being handed the error text as the
+model's answer. The native graph adapter applies the same check to every node's run.
+
+The CLI also writes its own `AssistantMessage`, with `model` set to the literal `<synthetic>`, when
+an API call fails and after a response stops at `max_output_tokens`. It is not a model response:
+it gets no `chat` span and never joins the conversation a later span reports.
 
 **Important:** a bare `return` inside `async for` abandons the generator. Python's asyncio finalizer will try to `aclose()` it later and may raise `RuntimeError: aclose(): asynchronous generator is already running` if the generator is still suspended inside a real SDK `await`. Always use `break` + explicit `aclose()`. See **Appendix A.4** in `TESTING.md`.
 

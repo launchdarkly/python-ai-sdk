@@ -31,9 +31,12 @@ from launchdarkly_ai_server import (
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    tool_result_string,
 )
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -424,6 +427,21 @@ def _build_messages(
     return messages
 
 
+def _merge_stream_chunk(gathered: Any, chunk: Any) -> Any:
+    """Fold one streamed chunk into the turn the way LangChain does.
+
+    ``AIMessageChunk.tool_calls`` is parsed from that chunk alone. Keeping only
+    the last chunk drops every earlier parallel call and every argument slice
+    that chunk did not repeat. Addition merges chunks by index.
+    """
+    if gathered is None:
+        return chunk
+    try:
+        return gathered + chunk
+    except TypeError:
+        return chunk
+
+
 def _assistant_output_messages(
     content: Any, tool_calls: list[Any] | None
 ) -> list[SpanMessage]:
@@ -674,7 +692,7 @@ async def _run_structured_turn(
 
 
 def create_langchain_messages_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
@@ -685,17 +703,20 @@ def create_langchain_messages_handler(
     config's model name and parameters.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
     report_usage("langchain-messages.createLangChainHandler", PACKAGE_NAME, __version__)
     return _create_langchain_messages_handler(llm, capture_content=capture_content)
 
 
 def _create_langchain_messages_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_langchain_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -704,6 +725,8 @@ def _create_langchain_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         th = tool_handlers or {}
@@ -932,7 +955,7 @@ def _create_langchain_messages_handler(
                         tool_results.append(
                             ToolMessage(
                                 tool_call_id=tc.get("id") or tc["name"],
-                                content=str(result_val),
+                                content=tool_result_string(result_val),
                             )
                         )
                     conversation_messages.extend(tool_results)
@@ -1003,14 +1026,14 @@ def _create_langchain_messages_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
     return _create_handler(
         ("*", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -1058,6 +1081,7 @@ async def _stream_gen(
     conversation_messages = list(initial_messages)
     full_output: Any = ""
     steps = 0
+    emitter = TurnEmitter(capture_content=capture_content)
 
     ended: set[int] = set()
     open_model_span: Any = None
@@ -1094,7 +1118,9 @@ async def _stream_gen(
             open_model_span = model_span
 
             accumulated_content = ""
-            accumulated_tool_calls: list[Any] = []
+            gathered: Any = None
+            tool_chunk_ids: dict[int, str] = {}
+            seen_call_ids: list[str] = []
             # The cache breakdown has to be accumulated alongside the scalars. LangChain reports it
             # per chunk in `usage_metadata.input_token_details`, and synthesizing a usage bag
             # without it would make the streaming span emit `cache_read = 0` where the blocking path
@@ -1127,8 +1153,60 @@ async def _stream_gen(
                 async for chunk in chunk_stream:
                     text = lang_chain_content_text(chunk.content)
                     if text:
-                        yield {"type": "chunk", "text": text}
+                        for rich in emitter.text(text):
+                            yield rich
                         accumulated_content += text
+                    for piece in getattr(chunk, "tool_call_chunks", None) or []:
+                        piece_name = (
+                            piece.get("name")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "name", None)
+                        )
+                        piece_id = (
+                            piece.get("id")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "id", None)
+                        )
+                        piece_index = (
+                            piece.get("index")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "index", None)
+                        )
+                        piece_args = (
+                            piece.get("args")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "args", None)
+                        )
+                        # Later chunks often omit id. They carry an index, or,
+                        # when only one call is open, just the args slice.
+                        if isinstance(piece_id, str) and piece_id:
+                            if piece_id not in seen_call_ids:
+                                seen_call_ids.append(piece_id)
+                            if isinstance(piece_index, int):
+                                tool_chunk_ids[piece_index] = piece_id
+                        elif (
+                            isinstance(piece_index, int)
+                            and piece_index in tool_chunk_ids
+                        ):
+                            piece_id = tool_chunk_ids[piece_index]
+                        elif len(seen_call_ids) == 1:
+                            piece_id = seen_call_ids[0]
+                        if (
+                            isinstance(piece_name, str)
+                            and piece_name
+                            and isinstance(piece_id, str)
+                            and piece_id
+                        ):
+                            for rich in emitter.tool_start(piece_id, piece_name):
+                                yield rich
+                        if (
+                            isinstance(piece_id, str)
+                            and piece_id
+                            and isinstance(piece_args, str)
+                            and piece_args
+                        ):
+                            for rich in emitter.tool_args(piece_id, piece_args):
+                                yield rich
                     usage = getattr(chunk, "usage_metadata", None)
                     if usage:
                         usage_reported = True
@@ -1141,9 +1219,7 @@ async def _stream_gen(
                         turn_usage.cache_creation += number_or_zero(
                             details.get("cache_creation")
                         )
-                    chunk_tools = getattr(chunk, "tool_calls", None) or []
-                    if chunk_tools:
-                        accumulated_tool_calls = chunk_tools
+                    gathered = _merge_stream_chunk(gathered, chunk)
                     finish_reasons = lang_chain_finish_reasons(chunk) or finish_reasons
                 open_chunk_stream = None
             except Exception as exc:
@@ -1168,6 +1244,11 @@ async def _stream_gen(
             # billed these tokens: a content failure is our problem and must not report the run as
             # having spent less than it did.
             run_usage.add(turn_usage if usage_reported else None)
+            accumulated_tool_calls = [
+                tc
+                for tc in (getattr(gathered, "tool_calls", None) or [])
+                if isinstance(tc, dict) and tc.get("name")
+            ]
 
             # Inside a guard for the same reason as the blocking path: a raise while serialising
             # completion content would otherwise leave this span for `finally` to end as abandoned,
@@ -1191,6 +1272,13 @@ async def _stream_gen(
                 raise
 
             if not accumulated_tool_calls:
+                for rich in emitter.end_text():
+                    yield rich
+                # A chunk can open a call that never becomes a complete tool
+                # call. Close it before the turn ends, or the client keeps it
+                # open across RUN_FINISHED.
+                for rich in emitter.fail_open():
+                    yield rich
                 full_output = (full_output or "") + accumulated_content
                 break
 
@@ -1201,6 +1289,14 @@ async def _stream_gen(
             steps += 1
 
             full_output = (full_output or "") + accumulated_content
+            for tc in accumulated_tool_calls:
+                call_id = str(tc.get("id") or tc["name"])
+                for rich in emitter.tool_start(call_id, str(tc["name"])):
+                    yield rich
+                for rich in emitter.tool_end(call_id, arguments=tc.get("args")):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             assistant_msg = AIMessage(
                 content=accumulated_content, tool_calls=accumulated_tool_calls
             )
@@ -1241,11 +1337,20 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                for rich in emitter.tool_result(
+                    str(tc.get("id") or tc["name"]), result_val
+                ):
+                    yield rich
                 tool_results.append(
                     ToolMessage(
-                        tool_call_id=tc.get("id") or tc["name"], content=str(result_val)
+                        tool_call_id=tc.get("id") or tc["name"],
+                        content=tool_result_string(result_val),
                     )
                 )
+            # Chunks can start a call the gathered message then omits. The
+            # calls we ran are already closed; this finishes the rest.
+            for rich in emitter.fail_open():
+                yield rich
             conversation_messages.extend(tool_results)
 
         full_output_str = (
@@ -1286,6 +1391,10 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -1327,7 +1436,7 @@ def langchain_messages(
     # asking for content on spans got a TypeError instead of content.
     report_usage("langchain-messages.langchainMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
+    capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
         handler=_create_langchain_messages_handler(

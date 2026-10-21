@@ -5,6 +5,7 @@ Reference: TESTING.md §2.2, §2.x (Anthropic)
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,10 +28,21 @@ from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 
 def _make_result_msg(
-    text: str = "result", input_tokens: int = 5, output_tokens: int = 3
+    text: str | None = "result",
+    input_tokens: int = 5,
+    output_tokens: int = 3,
+    subtype: str = "success",
+    is_error: bool = False,
+    errors: list[str] | None = None,
+    api_error_status: int | None = None,
 ) -> Any:
     m = MagicMock()
     m.__class__.__name__ = "ResultMessage"
+    # Set explicitly: an unset MagicMock attribute is truthy, so `is_error` would read as an error.
+    m.subtype = subtype
+    m.is_error = is_error
+    m.errors = errors
+    m.api_error_status = api_error_status
     m.result = text
     m.usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
     return m
@@ -137,6 +149,72 @@ def _make_sdk_mock(result_text: str = "done") -> Any:
 # ---------------------------------------------------------------------------
 # §2.2 Generic topology
 # ---------------------------------------------------------------------------
+
+
+def _recording_trace() -> tuple[Any, Any, list[Any]]:
+    """A real tracer behind the module's ``trace`` lookup, with every span's ``end`` spied.
+
+    Returns the stand-in ``trace`` module, the exporter holding finished spans, and the
+    ``end`` spies, so a test can check both what was exported and how often each span ended.
+    """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    end_spies: list[Any] = []
+
+    def _start_span(name: str, *args: Any, **kwargs: Any) -> Any:
+        span = tracer.start_span(name, *args, **kwargs)
+        span.end = MagicMock(wraps=span.end)  # type: ignore[method-assign]
+        end_spies.append(span.end)
+        return span
+
+    fake_trace = MagicMock()
+    fake_trace.get_tracer.return_value.start_span.side_effect = _start_span
+    return fake_trace, exporter, end_spies
+
+
+def _assert_one_failed_graph_span(
+    exporter: Any, end_spies: list[Any], message: str, track_calls: list[Any]
+) -> None:
+    from opentelemetry.trace import StatusCode
+
+    assert [spy.call_count for spy in end_spies] == [1]
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description == message
+    assert [e.name for e in span.events].count("exception") == 1
+    assert (span.attributes or {}).get("launchdarkly.graph.key") == "test-graph"
+
+    failures = [d for e, d in track_calls if e == "$ld:ai:graph:invocation_failure"]
+    assert len(failures) == 1
+    assert failures[0]["configKey"] == "test-graph"
+    assert failures[0]["graphKey"] == "test-graph"
+
+
+def _assert_two_runs_two_run_ids(
+    exporter: Any, track_calls_per_run: list[list[tuple[str, Any]]]
+) -> None:
+    """Each run's graph span carries the ``runId`` of that run's graph-level events,
+    and the two runs carry different ids."""
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 2
+    span_run_ids = [(s.attributes or {}).get("launchdarkly.run.id") for s in spans]
+    for span_run_id, run_calls in zip(span_run_ids, track_calls_per_run, strict=True):
+        assert span_run_id
+        graph_events = [d for e, d in run_calls if e.startswith("$ld:ai:graph:")]
+        assert graph_events
+        for data in graph_events:
+            assert data["runId"] == span_run_id
+    assert span_run_ids[0] != span_run_ids[1]
 
 
 class TestToClaudeAgentsTopology:
@@ -478,6 +556,42 @@ class TestToClaudeAgentsAnthropicSpecific:
         assert "child" in created_tools[0]
 
     @pytest.mark.asyncio
+    async def test_cyclic_edge_is_dropped_with_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_sdk = _make_sdk_mock("done")
+
+        # root -> a -> b -> a: post-order builds b while a is still unbuilt.
+        def _node(key: str, target: str) -> dict[str, Any]:
+            return {
+                "key": key,
+                "config": {"model": {"name": "claude-3"}, "instructions": key},
+                "meta": {},
+                "edges": [{"source_key": key, "target_key": target}],
+                "is_terminal": False,
+            }
+
+        edges = [("root", "a"), ("a", "b"), ("b", "a")]
+        graph_def = _make_graph_def(
+            nodes={
+                "root": _node("root", "a"),
+                "a": _node("a", "b"),
+                "b": _node("b", "a"),
+            },
+            edges=[{"source_key": s, "target_key": t} for s, t in edges],
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        assert 'Dropping cyclic edge "b" -> "a"' in caplog.text
+
+    @pytest.mark.asyncio
     async def test_emits_handoff_success_when_sub_agent_tool_invoked(self) -> None:
         track_calls: list[tuple[str, Any]] = []
 
@@ -594,6 +708,161 @@ class TestToClaudeAgentsAnthropicSpecific:
         assert all(evt != "$ld:ai:graph:path" for evt, _ in track_calls)
 
     @pytest.mark.asyncio
+    async def test_graph_span_carries_config_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The graph span must identify the config so Monitoring can link the trace."""
+        import launchdarkly_ai_claude_agents.native_graph as ng_mod
+
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        mock_span = MagicMock()
+        mock_trace = MagicMock()
+        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(ng_mod, "get_client", return_value=MagicMock()):
+                with patch.object(ng_mod, "trace", mock_trace):
+                    with patch.object(ng_mod, "_HAS_OTEL", True):
+                        await to_claude_agents(
+                            _make_def_promise(graph_def),
+                            opts={"context": ctx},
+                        ).invoke("hi")
+
+        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "test-graph"
+        assert attrs["launchdarkly.graph.key"] == "test-graph"
+        assert attrs["launchdarkly.run.id"]
+        assert "launchdarkly.variation.key" in attrs
+        assert attrs["context.contextKeys.user"] == "u1"
+
+        events = {c[0][0]: c[0][1] for c in mock_span.add_event.call_args_list}
+        assert events["feature_flag"] == {
+            "feature_flag.key": "test-graph",
+            "feature_flag.provider.name": "LaunchDarkly",
+            "feature_flag.set.id": "env-123",
+            "feature_flag.context.id": "u1",
+            "feature_flag.contextKeys": '{"user":"u1"}',
+        }
+
+    @pytest.mark.asyncio
+    async def test_tracking_events_carry_the_environment_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        payloads: list[Any] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: payloads.append(data)
+        )
+
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "get_client", return_value=mock_ld_client):
+                await to_claude_agents(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+
+        assert payloads
+        for data in payloads:
+            assert data["environmentId"] == "env-123"
+
+    @pytest.mark.asyncio
+    async def test_graph_events_are_keyed_to_the_graph(self) -> None:
+        """Graph-level events carry the graph key, like the graph span and graph()."""
+        calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: calls.append((evt, data))
+        )
+
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "get_client", return_value=mock_ld_client):
+                await to_claude_agents(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+
+        graph_events = [
+            (e, d)
+            for e, d in calls
+            if e
+            in (
+                "$ld:ai:graph:invocation_success",
+                "$ld:ai:graph:duration:total",
+                "$ld:ai:graph:total_tokens",
+            )
+        ]
+        assert len(graph_events) == 3
+        for _, data in graph_events:
+            assert data["configKey"] == "test-graph"
+            assert data["graphKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_each_runner_call_gets_its_own_run_id(self) -> None:
+        """Two calls on one runner: each span shares its run's id, and the ids differ."""
+        fake_trace, exporter, _ = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "trace", fake_trace):
+                with patch.object(_claude_ng, "_HAS_OTEL", True):
+                    with patch.object(
+                        _claude_ng, "get_client", return_value=mock_ld_client
+                    ):
+                        # A task, unlike a bare coroutine, can be awaited on each call.
+                        runner = to_claude_agents(
+                            asyncio.ensure_future(_make_def_promise(graph_def)),
+                            opts={"context": {"kind": "user", "key": "u1"}},
+                        )
+                        await runner.invoke("first")
+                        first_run_calls = len(track_calls)
+                        await runner.invoke("second")
+
+        _assert_two_runs_two_run_ids(
+            exporter,
+            [track_calls[:first_run_calls], track_calls[first_run_calls:]],
+        )
+
+    @pytest.mark.asyncio
     async def test_emits_invocation_failure_on_error(self) -> None:
         track_calls: list[str] = []
         mock_ld_client = MagicMock()
@@ -630,6 +899,126 @@ class TestToClaudeAgentsAnthropicSpecific:
                     ).invoke("hi")
 
         assert "$ld:ai:graph:invocation_failure" in track_calls
+
+    # Measured against Agent SDK 0.3.220: an Anthropic API failure arrives as a `success` result
+    # with `is_error` set and the error text in `result`. The adapter used to return that text as
+    # the answer, and it ignored error subtypes entirely.
+    @pytest.mark.asyncio
+    async def test_root_api_error_result_fails_the_graph(self) -> None:
+        track_calls: list[str] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append(evt)
+        )
+        mock_sdk = _make_sdk_mock()
+        error_msg = _make_result_msg(
+            "Credit balance is too low", 0, 0, is_error=True, api_error_status=400
+        )
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield error_msg
+
+        mock_sdk.query = _query
+        mock_sdk.ResultMessage = type(error_msg)
+        ctx = {"kind": "user", "key": "test"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "get_client", return_value=mock_ld_client):
+                with pytest.raises(RuntimeError, match="Credit balance is too low"):
+                    await to_claude_agents(
+                        _make_def_promise(_make_graph_def()),
+                        opts={"context": ctx},
+                    ).invoke("hi")
+
+        assert "$ld:ai:graph:invocation_failure" in track_calls
+        assert "$ld:ai:graph:invocation_success" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_root_error_subtype_fails_the_graph(self) -> None:
+        mock_sdk = _make_sdk_mock()
+        error_msg = _make_result_msg(
+            None,
+            subtype="error_max_turns",
+            is_error=True,
+            errors=["turn limit reached"],
+        )
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield error_msg
+
+        mock_sdk.query = _query
+        mock_sdk.ResultMessage = type(error_msg)
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError, match=r"error_max_turns.*turn limit reached"
+            ):
+                await to_claude_agents(_make_def_promise(_make_graph_def())).invoke(
+                    "hi"
+                )
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_api_error_fails_its_tool_call(self) -> None:
+        child_node = {
+            "key": "child",
+            "config": {"model": {"name": "claude-3"}, "instructions": "child"},
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [],
+            "is_terminal": True,
+        }
+        root_node = {
+            "key": "root",
+            "config": {"model": {"name": "claude-3"}, "instructions": "root"},
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [{"source_key": "root", "target_key": "child"}],
+            "is_terminal": False,
+        }
+        graph_def = _make_graph_def(
+            nodes={"root": root_node, "child": child_node},
+            edges=[{"source_key": "root", "target_key": "child"}],
+        )
+        child_tool_fn: list[Any] = []
+
+        def _tool_factory(name: str, desc: str, schema: Any) -> Any:
+            def _dec(fn: Any) -> Any:
+                if "child" in name:
+                    child_tool_fn.append(fn)
+                return fn
+
+            return _dec
+
+        mock_sdk = _make_sdk_mock("root-done")
+        mock_sdk.tool = MagicMock(side_effect=_tool_factory)
+        error_msg = _make_result_msg(
+            "Credit balance is too low", 0, 0, is_error=True, api_error_status=400
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+            async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+                yield error_msg
+
+            mock_sdk.query = _query
+            mock_sdk.ResultMessage = type(error_msg)
+            assert child_tool_fn
+            with pytest.raises(RuntimeError, match="Credit balance is too low"):
+                await child_tool_fn[0]({"input": "sub-query"})
 
     @pytest.mark.asyncio
     async def test_returns_root_query_result(self) -> None:
@@ -704,7 +1093,44 @@ class TestToClaudeAgentsAnthropicSpecific:
                             "hi"
                         )
 
-        mock_span.end.assert_called()
+        mock_span.end.assert_called_once()
+        mock_span.record_exception.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_subagent_setup_error_fails_the_graph_span(self) -> None:
+        """A sub-agent build error before the run ends one ERROR span and tracks the failure."""
+        fake_trace, exporter, end_spies = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+        mock_sdk = _make_sdk_mock("done")
+        graph_def = _make_graph_def()
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "trace", fake_trace):
+                with patch.object(_claude_ng, "_HAS_OTEL", True):
+                    with patch.object(
+                        _claude_ng, "get_client", return_value=mock_ld_client
+                    ):
+                        with patch.object(
+                            _claude_ng,
+                            "_reverse_traverse",
+                            AsyncMock(side_effect=ValueError("bad sub-agent")),
+                        ):
+                            with pytest.raises(ValueError, match="bad sub-agent"):
+                                await to_claude_agents(
+                                    _make_def_promise(graph_def),
+                                    opts={"context": {"kind": "user", "key": "u1"}},
+                                ).invoke("hi")
+
+        _assert_one_failed_graph_span(exporter, end_spies, "bad sub-agent", track_calls)
 
     @pytest.mark.asyncio
     async def test_build_tool_mcp_throws_when_tool_not_in_handlers(self) -> None:
