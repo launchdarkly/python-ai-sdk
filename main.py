@@ -71,6 +71,8 @@ EXAMPLES: dict[str, str] = {
     "vercel-agents": "examples.vercel_agents_example",
     "vercel-direct": "examples.vercel_direct",
     "vercel-messages": "examples.vercel_messages_example",
+    "bedrock-agents": "examples.bedrock_agents_example",
+    "bedrock-messages": "examples.bedrock_messages_example",
     "native-graph": "examples.native_graph",
     "native-graph-langchain": "examples.native_graph_langchain",
     "native-graph-vercel": "examples.native_graph_vercel",

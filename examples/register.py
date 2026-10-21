@@ -15,6 +15,8 @@ from examples.tools import (
     search_ld_documentation,
     web_search,
 )
+from launchdarkly_ai_bedrock_agents import create_bedrock_agents_handler
+from launchdarkly_ai_bedrock_messages import create_bedrock_messages_handler
 from launchdarkly_ai_claude_agents import ClaudeWebSearch, create_claude_agents_handler
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
 from launchdarkly_ai_langchain_agents import create_langchain_agents_handler
@@ -31,6 +33,8 @@ global_registry.register(
         create_claude_messages_handler(),
         create_langchain_messages_handler(),
         create_langchain_agents_handler(),
+        create_bedrock_agents_handler(),
+        create_bedrock_messages_handler(),
     ],
     tools={
         # LD documentation agent tools

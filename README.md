@@ -25,7 +25,7 @@ That call is the whole integration. Everything it does is configured in LaunchDa
 - Run agents and multi-step graphs, where each step can use a different provider
 - Score output quality with judges, including scoring that stays off the request path
 - See cost, latency, token usage, errors, and full conversations with no instrumentation code
-- Keep the providers and frameworks you already run: OpenAI, Anthropic, LangChain, LiteLLM, or your own handler
+- Keep the providers and frameworks you already run: OpenAI, Anthropic, Amazon Bedrock, LangChain, LiteLLM, or your own handler
 
 - [What you get](#what-you-get)
 - [How It Works](#how-it-works)
@@ -89,6 +89,8 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-litellm-agents`](packages/litellm-agents/README.md) | `*` (any) | `agent` | OpenAI Agents SDK with LiteLLM models |
 | [`launchdarkly-ai-vercel-messages`](packages/vercel-messages/README.md) | `*` (any) | `messages` | Vercel AI SDK with AI Gateway routing |
 | [`launchdarkly-ai-vercel-agents`](packages/vercel-agents/README.md) | `*` (any) | `agent` | Native Vercel `ai.Agent` loop and graph adapter |
+| [`launchdarkly-ai-bedrock-messages`](packages/bedrock-messages/README.md) | Bedrock | `messages` | Bedrock Runtime Converse with manual tool-call loop |
+| [`launchdarkly-ai-bedrock-agents`](packages/bedrock-agents/README.md) | Bedrock | `agent` | Strands Agent backed by BedrockModel |
 
 ## Quick Start
 
@@ -160,6 +162,8 @@ asyncio.run(main())
 | `litellm_agents` | `launchdarkly-ai-litellm-agents` | `openai-agents[litellm]` | OpenAI Agents via LiteLLM |
 | `vercel_messages` | `launchdarkly-ai-vercel-messages` | `ai` | Vercel AI SDK stream runtime |
 | `vercel_agents` | `launchdarkly-ai-vercel-agents` | `ai` | Native Vercel `ai.Agent` |
+| `bedrock_messages` | `launchdarkly-ai-bedrock-messages` | `aioboto3` | Bedrock Runtime Converse |
+| `bedrock_agents` | `launchdarkly-ai-bedrock-agents` | `strands-agents` | Strands Agent + BedrockModel |
 
 ---
 
@@ -261,7 +265,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Provider packages also export conveniences (`claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`) that pre-bind their handler.
+Provider packages also export conveniences (`claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`, `bedrock_graph`) that pre-bind their handler.
 
 ---
 
@@ -672,7 +676,9 @@ python-ai-sdk/
 │   ├── langchain-agents/   # launchdarkly-ai-langchain-agents
 │   ├── langchain-messages/ # launchdarkly-ai-langchain-messages
 │   ├── litellm-agents/     # launchdarkly-ai-litellm-agents
-│   └── litellm-messages/   # launchdarkly-ai-litellm-messages
+│   ├── litellm-messages/   # launchdarkly-ai-litellm-messages
+│   ├── bedrock-agents/     # launchdarkly-ai-bedrock-agents
+│   └── bedrock-messages/   # launchdarkly-ai-bedrock-messages
 ├── .env.example         # Template — copy to .env and fill in your values
 └── agents.md            # Architecture reference for AI agents and contributors
 ```

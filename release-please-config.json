@@ -144,6 +144,28 @@
         "src/launchdarkly_ai_opencode_agents/_version.py"
       ],
       "component": "launchdarkly-ai-opencode-agents"
+    },
+    "packages/bedrock-agents": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_bedrock_agents/_version.py"
+      ],
+      "component": "launchdarkly-ai-bedrock-agents"
+    },
+    "packages/bedrock-messages": {
+      "release-type": "python",
+      "versioning": "default",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-v-in-tag": false,
+      "extra-files": [
+        "src/launchdarkly_ai_bedrock_messages/_version.py"
+      ],
+      "component": "launchdarkly-ai-bedrock-messages"
     }
   },
   "changelog-sections": [
