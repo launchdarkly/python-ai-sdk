@@ -124,6 +124,7 @@ class Script:
         mode: str = "script",
         message_status: int = 200,
         delay_tail: float = 0,
+        delay_ready: float = 0,
     ) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="oc-fake-"))
         self.cwd = self.root / "work"
@@ -140,6 +141,7 @@ class Script:
                     "events": events,
                     "message_status": message_status,
                     "delay_tail": delay_tail,
+                    "delay_ready": delay_ready,
                 }
             ),
             encoding="utf-8",
@@ -1559,6 +1561,57 @@ class TestProcess:
         assert script.aborts
         assert script.pids
         assert all(not _alive(pid) for pid in script.pids)
+
+    async def test_the_process_is_dead_when_the_context_returns(self) -> None:
+        script = Script([], mode="open")
+        handler = create_opencode_handler(**script.handler_args())
+        with pytest.raises(TimeoutError):
+            async with handler:
+                async with asyncio.timeout(0.25):
+                    async with aclosing(
+                        await handler.stream(
+                            {
+                                "instructions": "Be brief.",
+                                "model": {"name": "m"},
+                                "provider": {"name": "Acme"},
+                            },
+                            "hi",
+                            None,
+                            None,
+                        )
+                    ) as gen:
+                        async for event in gen:
+                            if event["type"] == "TEXT_MESSAGE_CONTENT":
+                                await asyncio.sleep(2)
+        assert script.pids
+        assert all(not _alive(pid) for pid in script.pids)
+
+    async def test_boot_is_outside_the_caller_timeout(self) -> None:
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ],
+            delay_ready=0.6,
+        )
+        handler = create_opencode_handler(**script.handler_args())
+        async with handler:
+            async with asyncio.timeout(0.2):
+                seen = [
+                    event
+                    async for event in await handler.stream(
+                        {
+                            "instructions": "Be brief.",
+                            "model": {"name": "m"},
+                            "provider": {"name": "Acme"},
+                        },
+                        "hi",
+                        None,
+                        None,
+                    )
+                ]
+        assert seen[-1]["output"] == "Hi"
 
 
 async def _drain(stream: Any) -> None:

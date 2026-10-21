@@ -1,9 +1,10 @@
 """Reduce OpenCode session events into handler stream events.
 
-Each call starts ``opencode serve``, opens one session, and stops the process
-when the stream finishes or the caller closes it. The handler yields the AG-UI
-text and tool subset, then one ``done``. ``config().stream()`` still yields
-``chunk`` then ``done``.
+``async with handler`` starts ``opencode serve`` and waits until it is healthy.
+The process stops when that context exits, after ``config().stream()`` returns,
+including when the caller times out or closes the stream. The handler yields
+the AG-UI text and tool subset, then one ``done``. ``config().stream()`` still
+yields ``chunk`` then ``done``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from launchdarkly_ai_server import (
     SpanMessage,
     SpanUsage,
     _config,
-    _create_handler,
     add_cached_tokens_to_input,
     compose_history,
     content_to_text,
@@ -506,15 +506,18 @@ def create_opencode_handler(
     executable, ``opencode`` when omitted. A test passes a fake executable
     here. There is no URL, client, or transport argument.
 
-    The process starts when the call starts and stops when the stream finishes
-    or the caller closes it. A judge routed here gets its own process and
-    session and runs as a full OpenCode agent: the server's tools, in *cwd*,
-    apply to the judge prompt too. This package does not offer a tool-less
-    judge agent. *model* overrides provider and model selection.
+    Entering the handler as an async context starts the process and returns
+    only once it is healthy. Exiting waits until the process has stopped, so a
+    caller can remove *cwd* after the context returns. A wall-clock budget
+    belongs around ``config().stream()``, not around enter or exit. Without
+    the context, one call starts and stops its own process. A judge routed
+    here runs as a full OpenCode agent: the server's tools, in *cwd*, apply to
+    the judge prompt too. This package does not offer a tool-less judge agent.
+    *model* overrides provider and model selection.
     """
     bound = serve_from(cwd=cwd, config=config, env=env, command=command)
     report_usage("opencode-agents.createOpenCodeHandler", PACKAGE_NAME, __version__)
-    return _create_opencode_handler(
+    return OpenCodeHandler(
         serve=bound,
         capture_content=capture_content,
         model=model or default_model,
@@ -545,7 +548,7 @@ def opencode_agents(
     agent = kwargs.pop("agent", None)
     return _config(
         key=config_key,
-        handler=_create_opencode_handler(
+        handler=OpenCodeHandler(
             serve=serve_from(cwd=cwd, config=config_path, env=env, command=command),
             capture_content=capture_content,
             model=model or default_model,
@@ -555,19 +558,57 @@ def opencode_agents(
     ).invoke(user_input, context, variables, history)
 
 
-def _create_opencode_handler(
-    *,
-    serve: OpenCodeServe,
-    capture_content: bool | None,
-    model: ModelResolver,
-    agent: str | None,
-) -> ProviderHandler:
-    content_override = capture_content
-    bound_serve = serve
-    resolve_model = model
-    bound_agent = agent
+class OpenCodeHandler(ProviderHandler):
+    """Handler whose async context owns one ``opencode serve`` process."""
+
+    def __init__(
+        self,
+        *,
+        serve: OpenCodeServe,
+        capture_content: bool | None,
+        model: ModelResolver,
+        agent: str | None,
+    ) -> None:
+        self._serve = serve
+        self._model = model
+        self._agent = agent
+        self._active: OpenCodeServe | None = None
+        self._base_url: str | None = None
+        self._depth = 0
+        super().__init__(
+            fn=self._call_impl,
+            provides_for=("*", "agent"),
+            stream_fn=self._stream_impl,
+            capture_content=capture_content,
+        )
+
+    async def __aenter__(self) -> OpenCodeHandler:
+        """Start ``opencode serve`` and return once it answers on loopback."""
+        if self._active is None:
+            active = self._serve.spawn()
+            self._base_url = await active.start()
+            self._active = active
+        self._depth += 1
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        """Stop the process and wait until it has exited."""
+        self._depth -= 1
+        if self._depth > 0:
+            return
+        active = self._active
+        self._active = None
+        self._base_url = None
+        if active is not None:
+            await active.stop()
 
     async def _stream_impl(
+        self,
         config: AiConfigRep,
         user_input: str | None,
         tool_handlers: dict[str, Any] | None,
@@ -575,15 +616,20 @@ def _create_opencode_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         del tool_handlers
-        capture = effective_capture_content(content_override)
+        capture = effective_capture_content(self._capture_content_override)
         span = start_root_span(config, variables or {})
         ended: set[int] = set()
-        provider_id, model_id = resolve_model(
-            config if isinstance(config, dict) else {}
-        )
+        provider_id, model_id = self._model(config if isinstance(config, dict) else {})
         system = _system_text(config, variables)
         prompt = _user_prompt(config, user_input, history, variables)
-        owned = bound_serve.spawn()
+        # A context-owned process outlives this stream, so a caller timeout
+        # that cancels the stream cannot cancel its shutdown.
+        owned: OpenCodeServe | None = None
+        if self._active is not None and self._base_url is not None:
+            base_url = self._base_url
+        else:
+            owned = self._serve.spawn()
+            base_url = ""
         try:
             set_input_content_attributes(
                 span,
@@ -591,7 +637,8 @@ def _create_opencode_handler(
                 system_instructions=system,
                 messages=_input_messages(user_input, history),
             )
-            base_url = await owned.start()
+            if owned is not None:
+                base_url = await owned.start()
             created = _Created()
             async with aclosing(
                 _reduce_session(
@@ -601,7 +648,7 @@ def _create_opencode_handler(
                     system=system,
                     provider_id=provider_id,
                     model_id=model_id,
-                    agent=bound_agent,
+                    agent=self._agent,
                     capture=capture,
                 )
             ) as reduced:
@@ -627,10 +674,12 @@ def _create_opencode_handler(
             fail_span(span, exc, ended)
             raise
         finally:
-            await owned.stop()
+            if owned is not None:
+                await owned.stop()
             end_span_once(span, ended)
 
     async def _call_impl(
+        self,
         config: AiConfigRep,
         user_input: str | None,
         tool_handlers: dict[str, Any] | None,
@@ -640,7 +689,7 @@ def _create_opencode_handler(
         output = ""
         usage: dict[str, Any] = {}
         async with aclosing(
-            _stream_impl(config, user_input, tool_handlers, variables, history)
+            self._stream_impl(config, user_input, tool_handlers, variables, history)
         ) as stream:
             async for event in stream:
                 if event.get("type") != "done":
@@ -650,13 +699,6 @@ def _create_opencode_handler(
                 raw_usage = event.get("usage")
                 usage = raw_usage if isinstance(raw_usage, dict) else {}
         return {"output": output, "usage": usage}
-
-    return _create_handler(
-        ("*", "agent"),
-        _call_impl,
-        _stream_impl,
-        capture_content=content_override,
-    )
 
 
 class _Created:

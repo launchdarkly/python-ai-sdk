@@ -253,6 +253,9 @@ def main() -> None:
         raise SystemExit(2)
     server = _Server(spec, os.environ.get("LD_OPENCODE_FAKE_DIR", ""))
     server.write()
+    delay_ready = spec.get("delay_ready")
+    if isinstance(delay_ready, int | float) and delay_ready > 0:
+        time.sleep(delay_ready)
     httpd = _Loopback(("127.0.0.1", _port(sys.argv)), _Request)
     httpd.script = server  # type: ignore[attr-defined]
     httpd.serve_forever()
