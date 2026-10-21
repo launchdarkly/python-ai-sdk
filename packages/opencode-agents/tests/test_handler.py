@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import select
-import socket
-import threading
-import time
+import os
+import shutil
+import sys
+import tempfile
 from collections.abc import Iterator
 from contextlib import aclosing
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,6 +24,8 @@ from launchdarkly_ai_opencode_agents import (
 )
 from launchdarkly_ai_opencode_agents.server import default_model
 from launchdarkly_ai_server import SDKOptions, config, configure
+
+_FAKE = Path(__file__).with_name("fake_opencode.py")
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 
@@ -112,112 +114,96 @@ def assistant_completed(
     return bus("message.updated", info=info)
 
 
-class _Loopback(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+class Script:
+    """A fake ``opencode`` executable. The handler starts and stops it."""
+
+    def __init__(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        mode: str = "script",
+        message_status: int = 200,
+        delay_tail: float = 0,
+    ) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="oc-fake-"))
+        self.cwd = self.root / "work"
+        self.cwd.mkdir()
+        self.config = self.root / "opencode.json"
+        self.config.write_text("{}", encoding="utf-8")
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.spec_path = self.root / "spec.json"
+        self.spec_path.write_text(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "events": events,
+                    "message_status": message_status,
+                    "delay_tail": delay_tail,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _scripts.append(self)
+
+    def handler_args(self) -> dict[str, Any]:
+        return {
+            "cwd": self.cwd,
+            "config": self.config,
+            "env": {
+                "LD_OPENCODE_FAKE_DIR": str(self.state),
+                "LD_OPENCODE_FAKE_SPEC": str(self.spec_path),
+            },
+            "command": [sys.executable, str(_FAKE)],
+        }
+
+    def _records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for path in sorted(
+            self.state.glob("*.json"), key=lambda item: item.stat().st_mtime
+        ):
+            records.append(json.loads(path.read_text(encoding="utf-8")))
+        return records
+
+    @property
+    def sessions(self) -> list[str]:
+        found: list[str] = []
+        for record in self._records():
+            found.extend(record.get("sessions") or [])
+        return found
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for record in self._records():
+            found.extend(record.get("messages") or [])
+        return found
+
+    @property
+    def aborts(self) -> list[str]:
+        found: list[str] = []
+        for record in self._records():
+            found.extend(record.get("aborts") or [])
+        return found
+
+    @property
+    def pids(self) -> list[int]:
+        return [int(record["pid"]) for record in self._records() if "pid" in record]
+
+    @property
+    def requests(self) -> list[dict[str, str]]:
+        found: list[dict[str, str]] = []
+        for record in self._records():
+            found.extend(record.get("requests") or [])
+        return found
 
 
-class _Request(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        return
-
-    def do_GET(self) -> None:
-        script: _Serve = self.server.script  # type: ignore[attr-defined]
-        if self.path.split("?", 1)[0] != "/event":
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-        try:
-            script.serve_events(self)
-            self._chunk(b"")
-        except (BrokenPipeError, ConnectionResetError):
-            return
-
-    def do_POST(self) -> None:
-        script: _Serve = self.server.script  # type: ignore[attr-defined]
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length) if length else b""
-        status, payload = script.serve_post(self.path.split("?", 1)[0], body)
-        raw = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def _chunk(self, data: bytes) -> None:
-        self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
-        self.wfile.flush()
-
-
-class _Serve:
-    """A loopback ``opencode serve``. The handler uses its own HTTP client."""
-
-    def __init__(self) -> None:
-        self.sessions: list[str] = []
-        self.messages: list[dict[str, Any]] = []
-        self.aborts: list[str] = []
-        self.base_url = ""
-        self._httpd: _Loopback | None = None
-
-    def start(self) -> str:
-        httpd = _Loopback(("127.0.0.1", 0), _Request)
-        httpd.script = self  # type: ignore[attr-defined]
-        self._httpd = httpd
-        threading.Thread(
-            target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
-        ).start()
-        host, port = httpd.server_address
-        self.base_url = f"http://{host}:{port}"
-        _servers.append(self)
-        return self.base_url
-
-    def stop(self) -> None:
-        if self._httpd is not None:
-            self._httpd.shutdown()
-            self._httpd.server_close()
-            self._httpd = None
-
-    def serve_events(self, request: _Request) -> None:
-        return
-
-    def serve_post(self, path: str, body: bytes) -> tuple[int, dict[str, Any]]:
-        if path == "/session":
-            session_id = "ses" if not self.sessions else f"ses-{len(self.sessions) + 1}"
-            self.sessions.append(session_id)
-            return 200, {"id": session_id}
-        if path.endswith("/message"):
-            self.messages.append(json.loads(body.decode()) if body else {})
-            return 200, {}
-        if path.endswith("/abort"):
-            self.aborts.append(path)
-            return 200, {}
-        return 404, {}
-
-
-_servers: list[_Serve] = []
-
-
-class Script(_Serve):
-    """One finite bus. The connection closes after the scripted events."""
-
-    def __init__(self, events: list[dict[str, Any]]) -> None:
-        super().__init__()
-        self.events = events
-
-    def serve_events(self, request: _Request) -> None:
-        for event in self.events:
-            request._chunk(f"data: {json.dumps(event)}\n\n".encode())
+_scripts: list[Script] = []
 
 
 def playing(events: list[dict[str, Any]], **kwargs: Any) -> tuple[Any, Script]:
     script = Script(events)
-    handler = create_opencode_handler(base_url=script.start(), **kwargs)
+    handler = create_opencode_handler(**script.handler_args(), **kwargs)
     return handler, script
 
 
@@ -245,12 +231,14 @@ def _reset_sdk() -> Iterator[None]:
     lifecycle_module._reset_for_testing()
     yield
     lifecycle_module._reset_for_testing()
-    for server in _servers:
-        release = getattr(server, "release", None)
-        if release is not None:
-            release.set()
-        server.stop()
-    _servers.clear()
+    for script in _scripts:
+        for pid in script.pids:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        shutil.rmtree(script.root, ignore_errors=True)
+    _scripts.clear()
 
 
 @pytest.fixture
@@ -831,17 +819,35 @@ class TestStableStream:
 
 
 class TestInvocation:
-    def test_base_url_is_required(self) -> None:
+    def test_directory_config_and_env_are_required(self) -> None:
         with pytest.raises(TypeError):
             create_opencode_handler()  # type: ignore[call-arg]
-        with pytest.raises(TypeError, match="base_url"):
-            create_opencode_handler(base_url="")
-        with pytest.raises(TypeError, match="base_url"):
+        with pytest.raises(TypeError, match="working directory"):
+            create_opencode_handler(cwd="", config="/tmp/opencode.json", env={})
+        with pytest.raises(TypeError, match="config file"):
+            create_opencode_handler(cwd="/tmp", config="", env={})
+        with pytest.raises(TypeError, match="working directory"):
             opencode_agents("flag", "hi", CONTEXT)
+        with pytest.raises(TypeError, match="base_url"):
+            create_opencode_handler(
+                cwd="/tmp",
+                config="/tmp/opencode.json",
+                env={},
+                base_url="http://127.0.0.1:9",  # type: ignore[call-arg]
+            )
         with pytest.raises(TypeError):
             create_opencode_handler(
-                base_url="http://127.0.0.1:9",
+                cwd="/tmp",
+                config="/tmp/opencode.json",
+                env={},
                 client=object(),  # type: ignore[call-arg]
+            )
+        with pytest.raises(TypeError, match="URL"):
+            create_opencode_handler(
+                cwd="/tmp",
+                config="/tmp/opencode.json",
+                env={},
+                command="http://127.0.0.1:9",
             )
 
     async def test_the_first_session_on_the_stream_is_not_adopted(self) -> None:
@@ -1159,7 +1165,7 @@ class TestInvocation:
         mock_ld_client.variation = variation
         await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
         assert len(script.sessions) == 2
-        assert script.sessions[0] != script.sessions[1]
+        assert len(set(script.pids)) == 2
         prompts = [message["parts"][0]["text"] for message in script.messages]
         systems = [message.get("system", "") for message in script.messages]
         assert prompts[0] == "q"
@@ -1181,8 +1187,8 @@ class TestInvocation:
             "flag",
             "Hello",
             CONTEXT,
-            base_url=script.start(),
             history=[{"role": "user", "content": "earlier"}],
+            **script.handler_args(),
         )
         assert result.response == "Hi"
         assert script.messages[0]["system"] == "Be brief."
@@ -1349,8 +1355,8 @@ class TestInvocation:
         assert "gen_ai.prompt.3.role" not in tracer.spans[0].attributes
 
     async def test_a_failed_message_post_does_not_wait_for_the_bus(self) -> None:
-        script = _OpenBus(message_status=400)
-        handler = create_opencode_handler(base_url=script.start())
+        script = Script([], mode="open", message_status=400)
+        handler = create_opencode_handler(**script.handler_args())
 
         async def _run() -> None:
             async for _event in await handler.stream(
@@ -1382,8 +1388,8 @@ class TestInvocation:
         from launchdarkly_ai_opencode_agents import server as server_mod
         from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
 
-        bus = _CloseAfterRead()
-        handler = create_opencode_handler(base_url=bus.start())
+        bus = Script([], mode="close_after_read")
+        handler = create_opencode_handler(**bus.handler_args())
         order: list[str] = []
         real_next_line = server_mod._next_line
 
@@ -1428,8 +1434,8 @@ class TestInvocation:
         )
 
     async def test_breaking_aborts_without_waiting_for_gc(self) -> None:
-        script = _OpenBus()
-        handler = create_opencode_handler(base_url=script.start())
+        script = Script([], mode="open")
+        handler = create_opencode_handler(**script.handler_args())
 
         async def _run() -> None:
             async with aclosing(
@@ -1452,8 +1458,8 @@ class TestInvocation:
         assert script.aborts
 
     async def test_a_late_completion_survives_the_post_returning(self) -> None:
-        script = _OpenBus(delay_tail=0.2)
-        handler = create_opencode_handler(base_url=script.start(), capture_content=True)
+        script = Script([], mode="open", delay_tail=0.2)
+        handler = create_opencode_handler(**script.handler_args(), capture_content=True)
         seen = [
             event
             async for event in await handler.stream(
@@ -1483,84 +1489,76 @@ class TestInvocation:
         assert events[-1]["output"] == "Hi!"
 
 
-class _CloseAfterRead(_Serve):
-    """``/event`` stays open. The message POST fails while the next read is blocked."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.second_read = threading.Event()
-
-    def serve_events(self, request: _Request) -> None:
-        request._chunk(b":\n\n")
-        self.second_read.set()
-        sock = request.connection
-        while True:
-            readable, _, _ = select.select([sock], [], [], 0.05)
-            if not readable:
-                continue
-            try:
-                peeked = sock.recv(1, socket.MSG_PEEK)
-            except OSError:
-                return
-            if not peeked:
-                return
-
-    def serve_post(self, path: str, body: bytes) -> tuple[int, dict[str, Any]]:
-        if path.endswith("/message"):
-            self.second_read.wait(timeout=2)
-            self.messages.append(json.loads(body.decode()) if body else {})
-            return 400, {}
-        return super().serve_post(path, body)
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
-class _OpenBus(_Serve):
-    """An `/event` stream that stays open, unlike a finite ``Script`` body."""
-
-    def __init__(self, *, message_status: int = 200, delay_tail: float = 0) -> None:
-        super().__init__()
-        self.message_status = message_status
-        self.delay_tail = delay_tail
-        self.release = threading.Event()
-
-    def serve_events(self, request: _Request) -> None:
-        # A rejected message sends nothing. Events here would let the loop
-        # notice the 400 without racing the POST.
-        head = (
-            []
-            if self.message_status >= 400
-            else [
+class TestProcess:
+    async def test_a_fake_opencode_is_started_spoken_to_and_stopped(self) -> None:
+        handler, script = playing(
+            [
                 assistant_open("m1"),
                 text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
             ]
         )
-        for event in head:
-            request._chunk(f"data: {json.dumps(event)}\n\n".encode())
-        if self.delay_tail:
-            time.sleep(self.delay_tail)
-            tail = [
-                text_delta("m1", "p1", "!", session_id="ses"),
-                assistant_completed("m1", tokens={"input": 1, "output": 4}),
-                bus("session.idle", sessionID="ses"),
-            ]
-            for event in tail:
-                request._chunk(f"data: {json.dumps(event)}\n\n".encode())
-            return
-        self.release.wait()
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi"
+        records = script._records()
+        assert len(records) == 1
+        argv = records[0]["argv"]
+        assert argv[argv.index("serve") + 1] == "--port"
+        assert argv[argv.index("--hostname") + 1] == "127.0.0.1"
+        assert records[0]["cwd"] == str(script.cwd)
+        assert records[0]["config"] == str(script.config.resolve())
+        paths = [item["path"] for item in script.requests]
+        assert "/event" in paths
+        assert "/session" in paths
+        assert any(path.endswith("/message") for path in paths)
+        assert script.pids
+        assert all(not _alive(pid) for pid in script.pids)
 
-    def serve_post(self, path: str, body: bytes) -> tuple[int, dict[str, Any]]:
-        if path.endswith("/message"):
-            self.messages.append(json.loads(body.decode()) if body else {})
-            if self.message_status >= 400:
-                return self.message_status, {}
-            if self.delay_tail:
-                return 200, {}
-            self.release.wait()
-            return 200, {}
-        if path.endswith("/abort"):
-            self.aborts.append(path)
-            self.release.set()
-            return 200, {}
-        return super().serve_post(path, body)
+    async def test_closing_the_stream_stops_the_process(self) -> None:
+        script = Script([], mode="open")
+        handler = create_opencode_handler(**script.handler_args())
+
+        async def _run() -> None:
+            async with aclosing(
+                await handler.stream(
+                    {
+                        "instructions": "Be brief.",
+                        "model": {"name": "m"},
+                        "provider": {"name": "Acme"},
+                    },
+                    "hi",
+                    None,
+                    None,
+                )
+            ) as gen:
+                async for event in gen:
+                    if event["type"] == "TEXT_MESSAGE_CONTENT":
+                        break
+
+        await asyncio.wait_for(_run(), timeout=5)
+        assert script.aborts
+        assert script.pids
+        assert all(not _alive(pid) for pid in script.pids)
 
 
 async def _drain(stream: Any) -> None:

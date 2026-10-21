@@ -2,7 +2,8 @@
 
 ``GET /event`` is opened before ``POST /session/{id}/message``. The message
 route is the stable API. ``/api/session/{id}/prompt`` is not used: that preview
-route rejects the amazon-bedrock provider.
+route rejects the amazon-bedrock provider. The base URL is the loopback server
+this process just started. It is not a caller argument.
 """
 
 from __future__ import annotations
@@ -63,8 +64,8 @@ async def session_events(
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Open one session and yield its bus events.
 
-    The handler owns the HTTP client. Callers pass ``base_url`` for a server
-    that is already running and do not supply a client or a transport. The
+    The handler owns the HTTP client. ``base_url`` is the ``opencode serve``
+    this call started. Callers do not supply a client or a transport. The
     event stream is opened before the message post. The post runs
     concurrently with the read. This session's ``session.idle`` ends the
     turn. A failed message POST raises without waiting for another bus

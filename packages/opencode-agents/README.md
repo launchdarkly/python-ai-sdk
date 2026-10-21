@@ -1,6 +1,6 @@
 # `launchdarkly-ai-opencode-agents`
 
-OpenCode handler for `launchdarkly-ai-server`. It reduces caller-supplied OpenCode session events into assistant text. It does not start OpenCode and it does not depend on an OpenCode SDK.
+OpenCode handler for `launchdarkly-ai-server`. Each call starts `opencode serve`, speaks the OpenCode HTTP API, and stops the process when the stream finishes or the caller closes it. It does not depend on an OpenCode SDK.
 
 **`provides_for`:** `['*', 'agent']` — matches an agent-mode variation for any provider.
 
@@ -10,6 +10,7 @@ pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-openc
 
 ```python
 import asyncio
+import os
 
 from launchdarkly_ai_opencode_agents import create_opencode_handler
 from launchdarkly_ai_server import config, init_client, shutdown
@@ -17,7 +18,11 @@ from launchdarkly_ai_server import config, init_client, shutdown
 
 async def main() -> None:
     await init_client()
-    handler = create_opencode_handler(base_url="http://127.0.0.1:4096")
+    handler = create_opencode_handler(
+        cwd="/work",
+        config="/home/app/.vega/opencode.json",
+        env=os.environ.copy(),
+    )
     async for event in config(key="my-agent", handler=handler).stream(
         "Hello", {"kind": "user", "key": "user-1"}
     ):
@@ -28,4 +33,6 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`base_url` is a running `opencode serve`. The handler owns every HTTP call to that server. A caller does not pass an HTTP client or transport. Each call opens its own session, including a judge routed to this handler. A judge runs as a full OpenCode agent: the server's tools, in the server's working directory, apply to the judge prompt. There is no tool-less judge mode. The handler yields AG-UI text and tool events. `config().stream()` yields `chunk` then `done`.
+`cwd` is the working directory, `config` is the OpenCode config file, and `env` is the child environment. The handler sets `OPENCODE_CONFIG` from `config` and binds `opencode serve` to loopback. A caller does not pass a URL, an HTTP client, or a transport. `command` overrides the `opencode` executable; a test passes a fake executable there.
+
+Each call, including a judge routed to this handler, starts its own process and session. A judge runs as a full OpenCode agent: the server's tools, in `cwd`, apply to the judge prompt. There is no tool-less judge mode. The handler yields AG-UI text and tool events. `config().stream()` yields `chunk` then `done`.
