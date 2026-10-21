@@ -12,7 +12,7 @@ class TestBedrockGraph:
         tools = {"lookup": MagicMock()}
         registry = MagicMock()
 
-        with patch("launchdarkly_ai_bedrock_agents.graph.graph") as graph_mock:
+        with patch("launchdarkly_ai_bedrock_agents.graph._graph") as graph_mock:
             expected = MagicMock()
             graph_mock.return_value = expected
             actual = bedrock_graph(
@@ -26,7 +26,7 @@ class TestBedrockGraph:
         assert graph_mock.call_args.kwargs["registry"] is registry
 
     def test_prebinds_exactly_one_bedrock_agent_handler(self) -> None:
-        with patch("launchdarkly_ai_bedrock_agents.graph.graph") as graph_mock:
+        with patch("launchdarkly_ai_bedrock_agents.graph._graph") as graph_mock:
             bedrock_graph("bedrock-graph")
 
         handlers = graph_mock.call_args.kwargs["handlers"]
@@ -36,7 +36,7 @@ class TestBedrockGraph:
     def test_caller_cannot_override_prebound_handler(self) -> None:
         wrong_handler = MagicMock()
 
-        with patch("launchdarkly_ai_bedrock_agents.graph.graph") as graph_mock:
+        with patch("launchdarkly_ai_bedrock_agents.graph._graph") as graph_mock:
             bedrock_graph("bedrock-graph", handlers=[wrong_handler])
 
         handlers = graph_mock.call_args.kwargs["handlers"]

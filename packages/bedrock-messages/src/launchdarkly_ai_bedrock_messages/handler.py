@@ -17,16 +17,19 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
-    config,
-    create_handler,
+    _config,
+    _create_handler,
     end_span_once,
     end_unfinished_spans,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     fail_span,
     finish_model_span,
@@ -629,13 +632,34 @@ def create_bedrock_messages_handler(
     api_key: str | None = None,
     region: str | None = None,
     converse_options: ConverseOptions | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Create a Bedrock Converse handler.
 
     ``model.region`` is an inference-profile prefix. ``region`` configures only the AWS endpoint.
     Injected clients are used verbatim and are never closed.
     """
+    report_usage(
+        "bedrock-messages.createBedrockMessagesHandler", PACKAGE_NAME, __version__
+    )
+    return _create_bedrock_messages_handler(
+        client=client,
+        api_key=api_key,
+        region=region,
+        converse_options=converse_options,
+        capture_content=capture_content,
+    )
+
+
+def _create_bedrock_messages_handler(
+    *,
+    client: Any = None,
+    api_key: str | None = None,
+    region: str | None = None,
+    converse_options: ConverseOptions | None = None,
+    capture_content: bool | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_bedrock_messages_handler`, used by this package's wrappers."""
 
     async def invoke(
         cfg: AiConfigRep,
@@ -644,6 +668,7 @@ def create_bedrock_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        capture = effective_capture_content(capture_content)
         async with _client_scope(client, api_key, region) as runtime:
             return await _call(
                 runtime,
@@ -653,7 +678,7 @@ def create_bedrock_messages_handler(
                 variables or {},
                 history,
                 converse_options,
-                capture_content,
+                capture,
             )
 
     async def stream(
@@ -663,6 +688,7 @@ def create_bedrock_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
+        capture = effective_capture_content(capture_content)
         async with _client_scope(client, api_key, region) as runtime:
             provider_stream = _stream(
                 runtime,
@@ -672,7 +698,7 @@ def create_bedrock_messages_handler(
                 variables or {},
                 history,
                 converse_options,
-                capture_content,
+                capture,
             )
             try:
                 async for event in provider_stream:
@@ -680,7 +706,7 @@ def create_bedrock_messages_handler(
             finally:
                 await provider_stream.aclose()
 
-    return create_handler(
+    return _create_handler(
         ("Bedrock", "messages"),
         invoke,
         stream,
@@ -695,6 +721,7 @@ def bedrock_messages(
     **kwargs: Any,
 ) -> Any:
     """Invoke a LaunchDarkly AI config using Bedrock Converse."""
+    report_usage("bedrock-messages.bedrockMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     factory_keys = (
         "client",
@@ -704,8 +731,8 @@ def bedrock_messages(
         "capture_content",
     )
     factory = {key: kwargs.pop(key) for key in factory_keys if key in kwargs}
-    return config(
+    return _config(
         key=config_key,
-        handler=create_bedrock_messages_handler(**factory),
+        handler=_create_bedrock_messages_handler(**factory),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

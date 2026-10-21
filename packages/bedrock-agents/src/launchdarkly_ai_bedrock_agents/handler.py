@@ -18,17 +18,20 @@ from launchdarkly_ai_server import (
     SpanMessage,
     SpanMessagePart,
     SpanUsage,
-    config,
-    create_handler,
+    _config,
+    _create_handler,
     end_span_once,
     end_unfinished_spans,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     text_message,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     fail_span,
     finish_model_span,
@@ -423,9 +426,30 @@ def create_bedrock_agents_handler(
     api_key: str | None = None,
     region: str | None = None,
     model_options: ModelOptions | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Create a Strands Agent backed by BedrockModel."""
+    report_usage("bedrock-agents.createBedrockAgentsHandler", PACKAGE_NAME, __version__)
+    return _create_bedrock_agents_handler(
+        client=client,
+        boto_session=boto_session,
+        api_key=api_key,
+        region=region,
+        model_options=model_options,
+        capture_content=capture_content,
+    )
+
+
+def _create_bedrock_agents_handler(
+    *,
+    client: Any = None,
+    boto_session: Any = None,
+    api_key: str | None = None,
+    region: str | None = None,
+    model_options: ModelOptions | None = None,
+    capture_content: bool | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_bedrock_agents_handler`, used by this package's wrappers."""
 
     async def invoke(
         cfg: AiConfigRep,
@@ -434,6 +458,7 @@ def create_bedrock_agents_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        capture = effective_capture_content(capture_content)
         values = variables or {}
         prompt = _prompt(cfg, user_input, values, history)
         bearer = _bearer_scope(api_key if client is None else None)
@@ -452,11 +477,11 @@ def create_bedrock_agents_handler(
                 region=region,
                 model_options=model_options,
                 parent=parent,
-                capture_content=capture_content,
+                capture_content=capture,
             )
             set_input_content_attributes(
                 root,
-                capture_content,
+                capture,
                 system_instructions=system,
                 messages=[text_message("user", prompt)]
                 if isinstance(prompt, str)
@@ -469,7 +494,7 @@ def create_bedrock_agents_handler(
             if not result_usage and run_spans.reported:
                 span_usage = run_spans.span_usage
             set_output_content_attributes(
-                root, capture_content, [text_message("assistant", output)]
+                root, capture, [text_message("assistant", output)]
             )
             finish_root_span(root, cfg, span_usage)
             succeed_span(root)
@@ -496,6 +521,7 @@ def create_bedrock_agents_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
+        capture = effective_capture_content(capture_content)
         values = variables or {}
         prompt = _prompt(cfg, user_input, values, history)
         bearer = _bearer_scope(api_key if client is None else None)
@@ -515,11 +541,11 @@ def create_bedrock_agents_handler(
                 region=region,
                 model_options=model_options,
                 parent=parent,
-                capture_content=capture_content,
+                capture_content=capture,
             )
             set_input_content_attributes(
                 root,
-                capture_content,
+                capture,
                 system_instructions=system,
                 messages=[text_message("user", prompt)]
                 if isinstance(prompt, str)
@@ -546,7 +572,7 @@ def create_bedrock_agents_handler(
             ):
                 span_usage = run_spans.span_usage
             set_output_content_attributes(
-                root, capture_content, [text_message("assistant", output)]
+                root, capture, [text_message("assistant", output)]
             )
             finish_root_span(root, cfg, span_usage)
             mark_ok(root)
@@ -575,7 +601,7 @@ def create_bedrock_agents_handler(
             )
             await bearer.__aexit__(None, None, None)
 
-    return create_handler(
+    return _create_handler(
         ("Bedrock", "agent"),
         invoke,
         stream,
@@ -590,6 +616,7 @@ def bedrock_agents(
     **kwargs: Any,
 ) -> Any:
     """Invoke a LaunchDarkly AI config using a Strands Bedrock agent."""
+    report_usage("bedrock-agents.bedrockAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     factory_keys = (
         "client",
@@ -600,8 +627,8 @@ def bedrock_agents(
         "capture_content",
     )
     factory = {key: kwargs.pop(key) for key in factory_keys if key in kwargs}
-    return config(
+    return _config(
         key=config_key,
-        handler=create_bedrock_agents_handler(**factory),
+        handler=_create_bedrock_agents_handler(**factory),
         **kwargs,
     ).invoke(user_input, context, variables=variables)
