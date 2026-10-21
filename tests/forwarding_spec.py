@@ -90,6 +90,20 @@ LITELLM_MESSAGES = frozenset(
     }
 )
 
+LITELLM_AGENTS = frozenset(
+    {
+        "frequency_penalty",
+        "max_tokens",
+        "max_turns",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning",
+        "temperature",
+        "tool_choice",
+        "top_p",
+    }
+)
+
 LANGCHAIN_CHAT_OPENAI = frozenset(
     {
         "frequency_penalty",
