@@ -270,6 +270,17 @@ SAMPLE_VALUES: Mapping[str, Any] = {
 }
 
 
+class ProbeError(AssertionError):
+    """Setting one or more keys alone made the probed call raise."""
+
+    def __init__(self, failures: Mapping[str, BaseException]) -> None:
+        self.failures = dict(failures)
+        lines = "\n".join(
+            f"  {key}: {error!r}" for key, error in sorted(self.failures.items())
+        )
+        super().__init__(f"setting these keys alone made the call raise:\n{lines}")
+
+
 def candidate_keys(*accepted: Iterable[str]) -> frozenset[str]:
     """Every key worth probing: the provider's own accept-set(s), every canonical key, every
     never-forwarded key, and the off-list keys."""
@@ -297,7 +308,8 @@ async def probe_forwarded_keys(
 
     *call* runs the handler with the given ``model.parameters`` and returns whatever it handed the
     provider. A key counts as forwarded when that result differs from the result with no
-    parameters, or when setting it makes the call raise.
+    parameters. A key whose call raises is a failure, not a forwarded key: a config that sets it
+    would crash the handler, so the probe raises :class:`ProbeError` naming every such key.
 
     *overrides* replaces a :data:`SAMPLE_VALUES` entry for a handler whose library takes a
     different valid shape for that key, such as a string ``tool_choice`` where another handler
@@ -305,12 +317,15 @@ async def probe_forwarded_keys(
     """
     baseline = await call({})
     forwarded: set[str] = set()
+    failures: dict[str, BaseException] = {}
     for key in sorted(set(candidates)):
         try:
             result = await call({key: sample(key, overrides)})
-        except Exception:
-            forwarded.add(key)
+        except Exception as error:
+            failures[key] = error
             continue
         if result != baseline:
             forwarded.add(key)
+    if failures:
+        raise ProbeError(failures)
     return frozenset(forwarded)
