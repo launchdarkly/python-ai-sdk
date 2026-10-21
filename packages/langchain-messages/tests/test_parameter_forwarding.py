@@ -413,6 +413,43 @@ class TestMaxTokensToSampleRename:
         ) == {"model": "configured-model", "max_tokens": 200}
 
 
+class TestBedrockStopRename:
+    """``ChatBedrockConverse`` takes ``stop`` as the alias of ``stop_sequences`` and rejects a call
+    that passes both. ``stop`` is renamed before forwarding, and ``stop_sequences`` wins when both
+    are set."""
+
+    def test_alias_becomes_stop_sequences(self) -> None:
+        assert _build("bedrock", {"stop": ["A"]}) == {
+            "model": "configured-model",
+            "stop_sequences": ["A"],
+        }
+
+    def test_stop_sequences_wins_when_both_are_set(self) -> None:
+        assert _build("bedrock", {"stop": ["A"], "stop_sequences": ["B"]}) == {
+            "model": "configured-model",
+            "stop_sequences": ["B"],
+        }
+
+    def test_the_real_class_accepts_the_forwarded_kwargs(self) -> None:
+        lc_aws = pytest.importorskip("langchain_aws")
+        kwargs = _build(
+            "bedrock",
+            {"stop": ["A"], "stop_sequences": ["B"], "reasoning_effort": "low"},
+        )
+        kwargs["model"] = "anthropic.claude-opus-5"
+        model = lc_aws.ChatBedrockConverse(
+            region_name="us-east-1",
+            aws_access_key_id="test-not-a-real-key",
+            aws_secret_access_key="test-not-a-real-secret",
+            **kwargs,
+        )
+        assert model.stop_sequences == ["B"]
+        assert model.additional_model_request_fields == {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"},
+        }
+
+
 def test_prompt_cache_key_is_dropped_for_chat_openai() -> None:
     """Cut from the cross-SDK ChatOpenAI list: a config value never reaches the constructor."""
     assert _build("openai", {"prompt_cache_key": "cache-1", "temperature": 0.2}) == {

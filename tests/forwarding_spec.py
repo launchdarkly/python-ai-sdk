@@ -172,7 +172,16 @@ LANGCHAIN_CHAT_ANTHROPIC = frozenset(
 )
 
 LANGCHAIN_CHAT_BEDROCK_CONVERSE = frozenset(
-    {"max_tokens", "performance_config", "service_tier", "temperature", "top_p"}
+    {
+        "max_tokens",
+        "performance_config",
+        "reasoning_effort",
+        "service_tier",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "top_p",
+    }
 )
 
 #: Keys the UI or another provider uses that are on none of the lists above for some handler, so

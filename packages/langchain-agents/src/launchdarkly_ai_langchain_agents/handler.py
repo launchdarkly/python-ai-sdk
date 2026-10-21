@@ -248,11 +248,19 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: is not installed rather than asserting nothing.
 #:
 #: This is the cross-SDK list for LangChain ChatBedrockConverse (TESTING.md section 1.12).
+#: ``reasoning_effort``, ``stop`` and ``stop_sequences`` are marked not supported in TypeScript
+#: there: the JS ``ChatBedrockConverse`` takes stop sequences only as a per-call option and has no
+#: reasoning effort field, while this class has constructor fields for both. ``stop`` is renamed to
+#: ``stop_sequences`` before this list applies, and a ``stop_sequences`` the config also set wins
+#: (see :data:`_CHAT_BEDROCK_CONVERSE_RENAMES`).
 _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS = frozenset(
     {
         "max_tokens",
         "performance_config",
+        "reasoning_effort",
         "service_tier",
+        "stop",
+        "stop_sequences",
         "temperature",
         "top_p",
     }
@@ -261,6 +269,10 @@ _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS = frozenset(
 #: Forwarded keys whose value must be an object. A config value of any other type is malformed
 #: and dropped rather than passed to ``ChatBedrockConverse``.
 _CHAT_BEDROCK_CONVERSE_MAPPING_KEYS = frozenset({"performance_config"})
+
+#: Alias to the name it is renamed to before forwarding. ``stop`` is the pydantic alias of
+#: ``stop_sequences``, and ``ChatBedrockConverse`` rejects a call that passes both spellings.
+_CHAT_BEDROCK_CONVERSE_RENAMES = {"stop": "stop_sequences"}
 
 #: Accepted by ``ChatBedrockConverse`` but never forwarded, and why:
 #: * ``bedrock_api_key``, ``api_key``, ``aws_access_key_id``, ``aws_secret_access_key``,
@@ -280,12 +292,10 @@ _CHAT_BEDROCK_CONVERSE_MAPPING_KEYS = frozenset({"performance_config"})
 #:   invocation logs.
 #: * ``system``: prompt content beyond instructions. It adds system prompt blocks on top of the
 #:   config's own instructions.
-#: * ``output_config``: API-shape switch. It is how ``ChatBedrockConverse`` asks for structured
-#:   output, which changes the response the handler reads.
-#: * ``reasoning_effort``: runtime wiring. ``ChatBedrockConverse`` turns it into model-specific
-#:   ``additionalModelRequestFields``, the raw request fields the handler never sets otherwise.
-#: * ``stop``, ``stop_sequences``: runtime wiring. ``ChatBedrockConverse`` merges them with the
-#:   stop sequences its own structured-output prompt relies on.
+#: * ``output_config``: API-shape switch. Its only use is Bedrock's JSON schema output format, the
+#:   structured output the handler owns through the config's ``outputFormat``. Set on the
+#:   constructor, it is sent on every request, including the forced tool call the handler's
+#:   ``with_structured_output`` makes, so the two would constrain the reply at once.
 #: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
 #:
 #: Named for the drift test and for review, not read at runtime.
@@ -318,9 +328,6 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "request_metadata",
     "system",
     "output_config",
-    "reasoning_effort",
-    "stop",
-    "stop_sequences",
 }
 
 
@@ -516,6 +523,7 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
                 "",
                 _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
                 mapping_keys=_CHAT_BEDROCK_CONVERSE_MAPPING_KEYS,
+                renames=_CHAT_BEDROCK_CONVERSE_RENAMES,
             )
         )
     lc_openai = importlib.import_module("langchain_openai")
