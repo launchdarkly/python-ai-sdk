@@ -259,6 +259,21 @@ class TestGraphInvoke:
         events = [c[0][0] for c in mock_ld_client.track.call_args_list]
         assert "$ld:ai:graph:invocation_success" in events
 
+    async def test_graph_events_carry_the_environment_id(
+        self, mock_ld_client: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-abc")
+        g = graph("graph-key", handlers=[_make_handler()])
+        await g.invoke("hi", CONTEXT)
+        graph_calls = [
+            c
+            for c in mock_ld_client.track.call_args_list
+            if str(c[0][0]).startswith("$ld:ai:graph:")
+        ]
+        assert graph_calls
+        for c in graph_calls:
+            assert c[0][2]["environmentId"] == "env-abc"
+
     async def test_graph_invocation_failure_tracked_on_error(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -309,14 +324,80 @@ class TestGraphInvoke:
         assert node_events[0][2]["graphKey"] == "graph-key"
         assert "path" not in node_events[0][2]
 
-    async def test_node_variations_resolved_only_once(
+    async def test_node_variations_resolved_on_every_call(
         self, mock_ld_client: MagicMock
     ) -> None:
+        """Each invoke() re-resolves the graph and node flags. See TESTING.md §3.11."""
         g = graph("graph-key", handlers=[_make_handler()])
         await g.invoke("hi", CONTEXT)
+        after_first = mock_ld_client.variation.call_count
         await g.invoke("hi again", CONTEXT)
-        # Second call should use the cache — variation calls should not double
-        assert mock_ld_client.variation.call_count <= 4  # graph + 2 nodes × 1 cache hit
+        assert mock_ld_client.variation.call_count == after_first * 2
+
+    async def test_flag_change_reaches_reused_graph(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """A node flag change between calls is seen on the next call. See TESTING.md §3.11."""
+        state = {"instructions": "v1", "graph_enabled": True}
+
+        async def variation(key: str, ctx: dict, default: Any) -> Any:
+            if key == "graph-key":
+                return (
+                    {"root": "only-node", "edges": {}} if state["graph_enabled"] else {}
+                )
+            return {
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": state["instructions"],
+                "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+            }
+
+        mock_ld_client.variation = AsyncMock(side_effect=variation)
+        seen: list[str] = []
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[no-untyped-def]
+            seen.append(config["instructions"])
+            return {"output": "ok", "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        g = graph(
+            "graph-key",
+            handlers=[
+                ProviderHandler(fn=fn, provides_for=("TestProvider", "messages"))
+            ],  # type: ignore[arg-type]
+        )
+        await g.invoke("first", CONTEXT)
+        state["instructions"] = "v2"
+        await g.invoke("second", CONTEXT)
+        assert seen == ["v1", "v2"]
+
+        state["graph_enabled"] = False
+        with pytest.raises(ValueError, match="disabled"):
+            await g.invoke("third", CONTEXT)
+        with pytest.raises(ValueError, match="disabled"):
+            async for _ in g.stream("fourth", CONTEXT):
+                pass
+
+    async def test_failed_resolution_is_not_reused(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """A transient variation failure on one call does not stick to the next."""
+        original = mock_ld_client.variation.side_effect
+        failures = {"left": 1}
+
+        async def flaky(key: str, ctx: dict, default: Any) -> Any:
+            if key != "graph-key" and failures["left"]:
+                failures["left"] -= 1
+                raise RuntimeError("transient")
+            return await original(key, ctx, default)
+
+        mock_ld_client.variation = AsyncMock(side_effect=flaky)
+        g = graph("graph-key", handlers=[_make_handler()])
+        with pytest.raises(ValueError, match="disabled"):
+            await g.invoke("first", CONTEXT)
+        result = await g.invoke("second", CONTEXT)
+        assert result.response == "ok"
 
     async def test_handoff_success_tracked_on_each_handoff(
         self, mock_ld_client: MagicMock
@@ -448,35 +529,6 @@ class TestGraphInvoke:
         gd = await resolve_graph("graph-key", context=CONTEXT)
         assert hasattr(gd, "reverse_traverse")
         assert not hasattr(gd, "reverseTraverse")
-
-    async def test_cache_is_bounded(self, mock_ld_client: MagicMock) -> None:
-        """GraphInstance._cache must not grow beyond MAX_GRAPH_CACHE_SIZE.
-        See TESTING.md §3.11."""
-        from launchdarkly_ai_server.graph import MAX_GRAPH_CACHE_SIZE
-
-        g = graph("graph-key", handlers=[_make_handler()])
-        # Invoke with more distinct contexts than the max
-        limit = MAX_GRAPH_CACHE_SIZE + 10
-        for i in range(limit):
-            await g.invoke("hi", {"kind": "user", "key": f"u{i}"})
-        assert len(g._cache) <= MAX_GRAPH_CACHE_SIZE
-
-    async def test_equal_content_contexts_share_cache_entry(
-        self, mock_ld_client: MagicMock
-    ) -> None:
-        """Two distinct dict objects with identical JSON content must share one
-        cache entry. The cache key must be json.dumps(context, sort_keys=True),
-        not id(context). See TESTING.md §3.11."""
-        g = graph("graph-key", handlers=[_make_handler()])
-        ctx_a = {"kind": "user", "key": "u1"}
-        ctx_b = {"kind": "user", "key": "u1"}  # distinct object, same content
-        assert ctx_a is not ctx_b, "test requires two different dict objects"
-        await g.invoke("first call", ctx_a)
-        await g.invoke("second call", ctx_b)
-        assert len(g._cache) == 1, (
-            "Equal-content contexts must share a single cache entry — "
-            "the cache key must be json.dumps(context), not id(context)."
-        )
 
     async def test_error_logging_when_node_variation_fails(
         self, mock_ld_client: MagicMock
