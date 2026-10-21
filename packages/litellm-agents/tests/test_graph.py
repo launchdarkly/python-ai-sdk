@@ -14,6 +14,12 @@ import launchdarkly_ai_litellm_agents.handler as handler_mod
 import launchdarkly_ai_litellm_agents.native_graph as native_graph_mod
 from launchdarkly_ai_litellm_agents import litellm_graph, to_litellm_agents
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.forwarding_spec import (
+    LITELLM_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 
 class _FakeRunHooks:
@@ -27,7 +33,9 @@ class _FakeRunHooks:
         return None
 
 
-def _definition(*, enabled: bool = True) -> GraphDefinition:
+def _definition(
+    *, enabled: bool = True, root_parameters: dict[str, Any] | None = None
+) -> GraphDefinition:
     edge = GraphEdge(
         key="root-child",
         source_key="root",
@@ -49,7 +57,14 @@ def _definition(*, enabled: bool = True) -> GraphDefinition:
         key="root",
         config={
             "provider": {"name": "Anthropic"},
-            "model": {"name": "anthropic/claude-sonnet-4"},
+            "model": {
+                "name": "anthropic/claude-sonnet-4",
+                **(
+                    {"parameters": root_parameters}
+                    if root_parameters is not None
+                    else {}
+                ),
+            },
             "instructions": "root",
         },
         meta={},
@@ -613,3 +628,82 @@ class TestNativeGraphTelemetry:
             ("$ld:ai:graph:invocation_failure", "litellm-graph")
         ]
         run.assert_not_awaited()
+
+
+class TestNativeGraphForwarding:
+    """The native graph builds each node's ``ModelSettings`` with the handler's own list, and
+    reads the root's ``max_turns`` for the run, so a probe of the root node finds exactly the
+    LiteLLM Agents list."""
+
+    @staticmethod
+    async def _run(parameters: dict[str, Any]) -> tuple[Any, Any, Any]:
+        factory_parameters: dict[str, dict[str, Any]] = {}
+        created: dict[str, dict[str, Any]] = {}
+
+        def model_factory(name: str, params: dict[str, Any]) -> object:
+            factory_parameters[name] = params
+            return object()
+
+        def agent(**kwargs: Any) -> Any:
+            created[kwargs["name"]] = kwargs
+            return SimpleNamespace(**kwargs)
+
+        runner = SimpleNamespace(
+            run=AsyncMock(
+                return_value=SimpleNamespace(
+                    final_output="done",
+                    context_wrapper=SimpleNamespace(
+                        usage=SimpleNamespace(input_tokens=1, output_tokens=1)
+                    ),
+                )
+            )
+        )
+        agents = SimpleNamespace(
+            Agent=agent,
+            Runner=runner,
+            handoff=MagicMock(side_effect=lambda target: target),
+            FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
+        )
+        real_import = __import__
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda name: agents if name == "agents" else real_import(name),
+        ):
+            await to_litellm_agents(
+                _definition_awaitable_from(_definition(root_parameters=parameters)),
+                opts={"model_factory": model_factory},
+            ).invoke("hello")
+        run_kwargs = dict(runner.run.call_args.kwargs)
+        run_kwargs.pop("hooks", None)
+        run_kwargs.pop("run_config", None)
+        return (
+            factory_parameters["anthropic/claude-sonnet-4"],
+            created["root"]["model_settings"],
+            run_kwargs,
+        )
+
+    async def test_forwards_exactly_the_litellm_agents_list(self) -> None:
+        import dataclasses
+
+        from agents import ModelSettings
+
+        candidates = candidate_keys(
+            (f.name for f in dataclasses.fields(ModelSettings)), LITELLM_AGENTS
+        )
+        forwarded = await probe_forwarded_keys(
+            candidates, self._run, overrides={"tool_choice": "required"}
+        )
+        assert forwarded == LITELLM_AGENTS
+
+    async def test_root_max_turns_applies_to_the_run(self) -> None:
+        _, _, run_kwargs = await self._run({"max_turns": 6})
+        assert run_kwargs["max_turns"] == 6
+
+    async def test_forwards_no_never_forwarded_key(self) -> None:
+        factory_parameters, settings, run_kwargs = await self._run(
+            {**NEVER_FORWARDED_BAG, "temperature": 0.1}
+        )
+        assert factory_parameters == {"temperature": 0.1}
+        assert settings.temperature == 0.1
+        assert not find_leaks((settings, run_kwargs))
