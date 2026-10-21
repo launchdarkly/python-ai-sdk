@@ -60,17 +60,17 @@ async def session_events(
     model_id: str,
     agent: str | None,
     session_ids: list[str],
-    client: httpx.AsyncClient | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Open one session and yield its bus events.
 
-    The event stream is opened before the message post. The post runs
+    The handler owns the HTTP client. Callers pass ``base_url`` for a server
+    that is already running and do not supply a client or a transport. The
+    event stream is opened before the message post. The post runs
     concurrently with the read. This session's ``session.idle`` ends the
     turn. A failed message POST raises without waiting for another bus
     frame. Leaving early cancels the post and aborts the session.
     """
-    owns_client = client is None
-    http = client or httpx.AsyncClient(
+    http = httpx.AsyncClient(
         timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=MESSAGE_TIMEOUT_SECONDS)
     )
     base = base_url.rstrip("/")
@@ -127,8 +127,7 @@ async def session_events(
                 )
             except Exception:
                 pass
-        if owns_client:
-            await http.aclose()
+        await http.aclose()
 
 
 async def _read_until_done(

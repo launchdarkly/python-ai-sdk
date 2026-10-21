@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import select
+import socket
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import aclosing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
@@ -108,48 +112,112 @@ def assistant_completed(
     return bus("message.updated", info=info)
 
 
-class Script:
-    """One fake `opencode serve` over ``httpx.MockTransport``."""
+class _Loopback(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
-    def __init__(self, events: list[dict[str, Any]]) -> None:
-        self.events = events
+
+class _Request(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:
+        script: _Serve = self.server.script  # type: ignore[attr-defined]
+        if self.path.split("?", 1)[0] != "/event":
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            script.serve_events(self)
+            self._chunk(b"")
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def do_POST(self) -> None:
+        script: _Serve = self.server.script  # type: ignore[attr-defined]
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length else b""
+        status, payload = script.serve_post(self.path.split("?", 1)[0], body)
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _chunk(self, data: bytes) -> None:
+        self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+        self.wfile.flush()
+
+
+class _Serve:
+    """A loopback ``opencode serve``. The handler uses its own HTTP client."""
+
+    def __init__(self) -> None:
         self.sessions: list[str] = []
         self.messages: list[dict[str, Any]] = []
         self.aborts: list[str] = []
+        self.base_url = ""
+        self._httpd: _Loopback | None = None
 
-    def transport(self) -> httpx.MockTransport:
-        script = self
+    def start(self) -> str:
+        httpd = _Loopback(("127.0.0.1", 0), _Request)
+        httpd.script = self  # type: ignore[attr-defined]
+        self._httpd = httpd
+        threading.Thread(
+            target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        ).start()
+        host, port = httpd.server_address
+        self.base_url = f"http://{host}:{port}"
+        _servers.append(self)
+        return self.base_url
 
-        async def handle(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path == "/event" and request.method == "GET":
-                body = "".join(
-                    f"data: {json.dumps(event)}\n\n" for event in script.events
-                )
-                return httpx.Response(200, text=body)
-            if path == "/session" and request.method == "POST":
-                session_id = (
-                    "ses" if not script.sessions else f"ses-{len(script.sessions) + 1}"
-                )
-                script.sessions.append(session_id)
-                return httpx.Response(200, json={"id": session_id})
-            if path.endswith("/message") and request.method == "POST":
-                script.messages.append(json.loads(request.content.decode()))
-                return httpx.Response(200, json={})
-            if path.endswith("/abort") and request.method == "POST":
-                script.aborts.append(path)
-                return httpx.Response(200, json={})
-            return httpx.Response(404)
+    def stop(self) -> None:
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
 
-        return httpx.MockTransport(handle)
+    def serve_events(self, request: _Request) -> None:
+        return
+
+    def serve_post(self, path: str, body: bytes) -> tuple[int, dict[str, Any]]:
+        if path == "/session":
+            session_id = "ses" if not self.sessions else f"ses-{len(self.sessions) + 1}"
+            self.sessions.append(session_id)
+            return 200, {"id": session_id}
+        if path.endswith("/message"):
+            self.messages.append(json.loads(body.decode()) if body else {})
+            return 200, {}
+        if path.endswith("/abort"):
+            self.aborts.append(path)
+            return 200, {}
+        return 404, {}
+
+
+_servers: list[_Serve] = []
+
+
+class Script(_Serve):
+    """One finite bus. The connection closes after the scripted events."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.events = events
+
+    def serve_events(self, request: _Request) -> None:
+        for event in self.events:
+            request._chunk(f"data: {json.dumps(event)}\n\n".encode())
 
 
 def playing(events: list[dict[str, Any]], **kwargs: Any) -> tuple[Any, Script]:
     script = Script(events)
-    client = httpx.AsyncClient(transport=script.transport(), base_url="http://opencode")
-    handler = create_opencode_handler(
-        base_url="http://opencode", client=client, **kwargs
-    )
+    handler = create_opencode_handler(base_url=script.start(), **kwargs)
     return handler, script
 
 
@@ -177,6 +245,12 @@ def _reset_sdk() -> Iterator[None]:
     lifecycle_module._reset_for_testing()
     yield
     lifecycle_module._reset_for_testing()
+    for server in _servers:
+        release = getattr(server, "release", None)
+        if release is not None:
+            release.set()
+        server.stop()
+    _servers.clear()
 
 
 @pytest.fixture
@@ -764,6 +838,11 @@ class TestInvocation:
             create_opencode_handler(base_url="")
         with pytest.raises(TypeError, match="base_url"):
             opencode_agents("flag", "hi", CONTEXT)
+        with pytest.raises(TypeError):
+            create_opencode_handler(
+                base_url="http://127.0.0.1:9",
+                client=object(),  # type: ignore[call-arg]
+            )
 
     async def test_the_first_session_on_the_stream_is_not_adopted(self) -> None:
         events = await collect(
@@ -1098,15 +1177,11 @@ class TestInvocation:
                 assistant_completed("m1"),
             ]
         )
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
         result = await opencode_agents(
             "flag",
             "Hello",
             CONTEXT,
-            base_url="http://opencode",
-            client=client,
+            base_url=script.start(),
             history=[{"role": "user", "content": "earlier"}],
         )
         assert result.response == "Hi"
@@ -1275,10 +1350,7 @@ class TestInvocation:
 
     async def test_a_failed_message_post_does_not_wait_for_the_bus(self) -> None:
         script = _OpenBus(message_status=400)
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(base_url="http://opencode", client=client)
+        handler = create_opencode_handler(base_url=script.start())
 
         async def _run() -> None:
             async for _event in await handler.stream(
@@ -1300,13 +1372,37 @@ class TestInvocation:
         assert script.aborts
 
     async def test_a_cancelled_sse_read_is_awaited_before_the_stream_closes(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The loopback socket cannot tell a cancelled read from the close that
+        # unblocks it. Record the client: ``_next_line`` must finish before
+        # GET /event is closed.
+        import httpx
+
+        from launchdarkly_ai_opencode_agents import server as server_mod
+        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
+
         bus = _CloseAfterRead()
-        client = httpx.AsyncClient(
-            transport=bus.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(base_url="http://opencode", client=client)
+        handler = create_opencode_handler(base_url=bus.start())
+        order: list[str] = []
+        real_next_line = server_mod._next_line
+
+        async def _recording_next_line(lines: Any) -> str | None:
+            try:
+                return await real_next_line(lines)
+            finally:
+                order.append("read_finished")
+
+        monkeypatch.setattr(server_mod, "_next_line", _recording_next_line)
+        real_aclose = httpx.Response.aclose
+
+        async def _recording_aclose(response: httpx.Response) -> None:
+            request = response.request
+            if request.method == "GET" and request.url.path == "/event":
+                order.append("response_closed")
+            await real_aclose(response)
+
+        monkeypatch.setattr(httpx.Response, "aclose", _recording_aclose)
 
         async def _run() -> None:
             async for _event in await handler.stream(
@@ -1321,20 +1417,19 @@ class TestInvocation:
             ):
                 return
 
-        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
-
         with pytest.raises(OpenCodeHTTPError, match="400"):
             await asyncio.wait_for(_run(), timeout=2)
-        assert bus.read_finished.is_set()
-        assert bus.closed
-        assert not bus.closed_before_read_finished
+        close_at = order.index("response_closed")
+        assert any(name == "read_finished" for name in order)
+        assert all(
+            index < close_at
+            for index, name in enumerate(order)
+            if name == "read_finished"
+        )
 
     async def test_breaking_aborts_without_waiting_for_gc(self) -> None:
         script = _OpenBus()
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(base_url="http://opencode", client=client)
+        handler = create_opencode_handler(base_url=script.start())
 
         async def _run() -> None:
             async with aclosing(
@@ -1358,12 +1453,7 @@ class TestInvocation:
 
     async def test_a_late_completion_survives_the_post_returning(self) -> None:
         script = _OpenBus(delay_tail=0.2)
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(
-            base_url="http://opencode", client=client, capture_content=True
-        )
+        handler = create_opencode_handler(base_url=script.start(), capture_content=True)
         seen = [
             event
             async for event in await handler.stream(
@@ -1393,122 +1483,84 @@ class TestInvocation:
         assert events[-1]["output"] == "Hi!"
 
 
-class _CloseAfterRead(httpx.AsyncByteStream):
+class _CloseAfterRead(_Serve):
     """``/event`` stays open. The message POST fails while the next read is blocked."""
 
     def __init__(self) -> None:
-        self.second_read = asyncio.Event()
-        self.read_finished = asyncio.Event()
-        self.closed = False
-        self.closed_before_read_finished = False
+        super().__init__()
+        self.second_read = threading.Event()
 
-    def transport(self) -> httpx.MockTransport:
-        stream = self
-
-        async def handle(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path == "/event" and request.method == "GET":
-                return httpx.Response(200, stream=stream)
-            if path == "/session" and request.method == "POST":
-                return httpx.Response(200, json={"id": "ses"})
-            if path.endswith("/message") and request.method == "POST":
-                await stream.second_read.wait()
-                return httpx.Response(400, json={})
-            if path.endswith("/abort") and request.method == "POST":
-                return httpx.Response(200, json={})
-            return httpx.Response(404)
-
-        return httpx.MockTransport(handle)
-
-    async def __aiter__(self) -> Any:
-        yield b":\n\n"
+    def serve_events(self, request: _Request) -> None:
+        request._chunk(b":\n\n")
         self.second_read.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            self.read_finished.set()
-            raise
+        sock = request.connection
+        while True:
+            readable, _, _ = select.select([sock], [], [], 0.05)
+            if not readable:
+                continue
+            try:
+                peeked = sock.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return
+            if not peeked:
+                return
 
-    async def aclose(self) -> None:
-        if not self.read_finished.is_set():
-            self.closed_before_read_finished = True
-        self.closed = True
-
-
-class _ByteStream(httpx.AsyncByteStream):
-    def __init__(self, chunks: Any) -> None:
-        self._chunks = chunks
-
-    async def __aiter__(self) -> Any:
-        async for chunk in self._chunks:
-            yield chunk
-
-    async def aclose(self) -> None:
-        return None
+    def serve_post(self, path: str, body: bytes) -> tuple[int, dict[str, Any]]:
+        if path.endswith("/message"):
+            self.second_read.wait(timeout=2)
+            self.messages.append(json.loads(body.decode()) if body else {})
+            return 400, {}
+        return super().serve_post(path, body)
 
 
-class _OpenBus:
+class _OpenBus(_Serve):
     """An `/event` stream that stays open, unlike a finite ``Script`` body."""
 
     def __init__(self, *, message_status: int = 200, delay_tail: float = 0) -> None:
+        super().__init__()
         self.message_status = message_status
         self.delay_tail = delay_tail
-        self.sessions: list[str] = []
-        self.messages: list[dict[str, Any]] = []
-        self.aborts: list[str] = []
-        self.release = asyncio.Event()
+        self.release = threading.Event()
 
-    def transport(self) -> httpx.MockTransport:
-        script = self
+    def serve_events(self, request: _Request) -> None:
+        # A rejected message sends nothing. Events here would let the loop
+        # notice the 400 without racing the POST.
+        head = (
+            []
+            if self.message_status >= 400
+            else [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+            ]
+        )
+        for event in head:
+            request._chunk(f"data: {json.dumps(event)}\n\n".encode())
+        if self.delay_tail:
+            time.sleep(self.delay_tail)
+            tail = [
+                text_delta("m1", "p1", "!", session_id="ses"),
+                assistant_completed("m1", tokens={"input": 1, "output": 4}),
+                bus("session.idle", sessionID="ses"),
+            ]
+            for event in tail:
+                request._chunk(f"data: {json.dumps(event)}\n\n".encode())
+            return
+        self.release.wait()
 
-        async def handle(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path == "/event" and request.method == "GET":
-
-                async def chunks() -> Any:
-                    # A rejected message sends nothing. Events here would let
-                    # the loop notice the 400 without racing the POST.
-                    head = (
-                        []
-                        if script.message_status >= 400
-                        else [
-                            assistant_open("m1"),
-                            text_delta("m1", "p1", "Hi"),
-                        ]
-                    )
-                    for event in head:
-                        yield f"data: {json.dumps(event)}\n\n".encode()
-                    if script.delay_tail:
-                        await asyncio.sleep(script.delay_tail)
-                        tail = [
-                            text_delta("m1", "p1", "!", session_id="ses"),
-                            assistant_completed("m1", tokens={"input": 1, "output": 4}),
-                            bus("session.idle", sessionID="ses"),
-                        ]
-                        for event in tail:
-                            yield f"data: {json.dumps(event)}\n\n".encode()
-                        return
-                    await script.release.wait()
-
-                return httpx.Response(200, stream=_ByteStream(chunks()))
-            if path == "/session" and request.method == "POST":
-                script.sessions.append("ses")
-                return httpx.Response(200, json={"id": "ses"})
-            if path.endswith("/message") and request.method == "POST":
-                script.messages.append(json.loads(request.content.decode()))
-                if script.message_status >= 400:
-                    return httpx.Response(script.message_status, json={})
-                if script.delay_tail:
-                    return httpx.Response(200, json={})
-                await script.release.wait()
-                return httpx.Response(200, json={})
-            if path.endswith("/abort") and request.method == "POST":
-                script.aborts.append(path)
-                script.release.set()
-                return httpx.Response(200, json={})
-            return httpx.Response(404)
-
-        return httpx.MockTransport(handle)
+    def serve_post(self, path: str, body: bytes) -> tuple[int, dict[str, Any]]:
+        if path.endswith("/message"):
+            self.messages.append(json.loads(body.decode()) if body else {})
+            if self.message_status >= 400:
+                return self.message_status, {}
+            if self.delay_tail:
+                return 200, {}
+            self.release.wait()
+            return 200, {}
+        if path.endswith("/abort"):
+            self.aborts.append(path)
+            self.release.set()
+            return 200, {}
+        return super().serve_post(path, body)
 
 
 async def _drain(stream: Any) -> None:

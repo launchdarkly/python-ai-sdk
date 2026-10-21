@@ -30,7 +30,7 @@ A run opens one `invoke_agent` span and sets `launchdarkly.operation.type`. The 
 
 ## Call shape
 
-`create_opencode_handler(*, base_url, capture_content=None, model=None, agent=None, client=None)` returns a `ProviderHandler`. `base_url` is a running `opencode serve`. Each call opens its own session.
+`create_opencode_handler(*, base_url, capture_content=None, model=None, agent=None)` returns a `ProviderHandler`. `base_url` is a running `opencode serve`. The handler owns the HTTP client. Each call opens its own session.
 
 Assistant text is emitted only after `message.updated` marks that message `role == "assistant"`. A part snapshot is the full text of that part so far; a later delta appends. A text delta without `partID` is dropped.
 
