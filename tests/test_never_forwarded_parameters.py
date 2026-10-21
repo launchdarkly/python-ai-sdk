@@ -34,6 +34,7 @@ FORWARDED_LISTS: dict[str, set[str]] = {
     "launchdarkly_ai_openai_messages.handler": {"_RESPONSES_FORWARDED_KEYS"},
     "launchdarkly_ai_litellm_agents.handler": {"_MODEL_SETTINGS_FORWARDED_KEYS"},
     "launchdarkly_ai_litellm_messages.handler": {"_COMPLETION_FORWARDED_KEYS"},
+    "launchdarkly_ai_vercel_agents.handler": {"_INFERENCE_PARAMS_FORWARDED_KEYS"},
     "launchdarkly_ai_vercel_messages.handler": {"_INFERENCE_PARAMS_FORWARDED_KEYS"},
     "launchdarkly_ai_langchain_agents.handler": {
         "_CHAT_OPENAI_FORWARDED_KEYS",
