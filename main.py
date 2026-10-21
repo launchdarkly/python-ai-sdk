@@ -14,6 +14,7 @@ Examples:
     python main.py graph-streaming          travel-agent-flow "I was double charged for my flight"
     python main.py openai-only              my-openai-flag "Tell me about feature flags"
     python main.py langchain                my-langchain-flag "Tell me about feature flags"
+    python main.py litellm                  my-litellm-flag "Tell me about feature flags"
     python main.py claude-agents            launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py openai-agents            launch-darkly-documentation-summarizer-open-ai-only "What is the LaunchDarkly AI SDK?"
     python main.py langchain-agents         launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
@@ -64,6 +65,9 @@ EXAMPLES: dict[str, str] = {
     "langchain-agents": "examples.langchain_agents_example",
     "langchain-messages": "examples.langchain_messages_example",
     "langchain-thinking": "examples.langchain_thinking",
+    "litellm": "examples.litellm_example",
+    "litellm-agents": "examples.litellm_agents_example",
+    "litellm-messages": "examples.litellm_messages_example",
     "vercel-agents": "examples.vercel_agents_example",
     "vercel-direct": "examples.vercel_direct",
     "vercel-messages": "examples.vercel_messages_example",

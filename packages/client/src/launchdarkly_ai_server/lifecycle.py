@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import logging
@@ -301,7 +302,30 @@ async def init_client(
 
     ld_config = config_cls(sdk_key, **config_kwargs)
     # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
-    ld_client = client_cls(ld_config, start_wait=10)
+    # Built in a thread so that wait does not stall the caller's event loop.
+    build = asyncio.ensure_future(
+        asyncio.to_thread(client_cls, ld_config, start_wait=10)
+    )
+    try:
+        ld_client = await asyncio.shield(build)
+    except asyncio.CancelledError:
+        # The thread can't be stopped: close the client it finishes building, or its
+        # streaming connection outlives this cancelled call.
+        build.add_done_callback(_close_abandoned_client)
+        raise
+
+    # A concurrent first call may have won while this one was connecting: keep
+    # its client and close ours, so only one streaming connection survives.
+    if _client is not None:
+        try:
+            close_result = ld_client.close()
+            if inspect.isawaitable(close_result):
+                await close_result
+        except Exception:
+            pass
+        flush_ai_sdk_info(_client)
+        flush_sdk_usage(_client)
+        return _client
 
     # As on the BYOC path: only a fully set-up client becomes the singleton. We
     # built this one, so close it on failure — it holds a streaming connection
@@ -320,6 +344,24 @@ async def init_client(
     flush_ai_sdk_info(_client)
     flush_sdk_usage(_client)
     return _client
+
+
+def _close_abandoned_client(build: asyncio.Future[Any]) -> None:
+    """Closes a client whose ``init_client`` call was cancelled while it was being built."""
+    if build.cancelled() or build.exception() is not None:
+        return
+    try:
+        close_result = build.result().close()
+        if inspect.isawaitable(close_result):
+            # The loop keeps only a weak reference to the task; hold it until it is done.
+            task = asyncio.ensure_future(close_result)
+            _closing_tasks.add(task)
+            task.add_done_callback(_closing_tasks.discard)
+    except Exception:
+        pass
+
+
+_closing_tasks: set[asyncio.Future[Any]] = set()
 
 
 def _release_otel_globals() -> None:
@@ -532,13 +574,13 @@ async def extract_variation(
             f"Variation '{config_key}' returned None (flag may be disabled)."
         )
 
-    if isinstance(raw, dict) and raw.get("_ldMeta", {}).get("enabled") is False:
+    # Only an explicit ``_ldMeta.enabled`` counts as enabled (spec §3.10, as in JS and Go).
+    ld_meta = (raw.get("_ldMeta") or {}) if isinstance(raw, dict) else {}
+    if not isinstance(ld_meta, dict) or not ld_meta.get("enabled"):
         raise RuntimeError(f"Variation '{config_key}' is disabled.")
 
-    # Extract meta from _ldMeta if present
-    ld_meta = raw.get("_ldMeta", {}) if isinstance(raw, dict) else {}
     meta = {
-        "enabled": ld_meta.get("enabled", True),
+        "enabled": True,
         "variationKey": ld_meta.get("variationKey", ""),
         "version": ld_meta.get("version", 1),
         "mode": ld_meta.get("mode"),
