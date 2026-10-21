@@ -2882,6 +2882,108 @@ class TestForwardsExactlyTheCrossSdkList:
         assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_MESSAGES
 
 
+class TestTypedObjectsAreRebuilt:
+    """``thinking``, ``tool_choice`` and ``cache_control`` reach the API only with a ``type`` it
+    knows and that type's required sub-keys, and with no other sub-key."""
+
+    @staticmethod
+    def _forwarded(parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_claude_messages.handler import _forwarded_parameters
+
+        return _forwarded_parameters({"model": {"parameters": parameters}})
+
+    @pytest.mark.parametrize(
+        "parameters",
+        [
+            {"thinking": {"budget_tokens": 1}},
+            {"thinking": {"type": "enabled"}},
+            {"thinking": {"type": "on", "budget_tokens": 1}},
+            {"tool_choice": {}},
+            {"tool_choice": {"type": "tool"}},
+            {"tool_choice": {"type": "required"}},
+            {"cache_control": {}},
+            {"cache_control": {"type": "persistent"}},
+        ],
+    )
+    def test_a_missing_or_unknown_type_or_required_sub_key_is_dropped(
+        self, parameters: dict[str, Any]
+    ) -> None:
+        assert self._forwarded({**parameters, "top_p": 0.4}) == {"top_p": 0.4}
+
+    @pytest.mark.parametrize(
+        ("key", "value", "expected"),
+        [
+            (
+                "thinking",
+                {"type": "enabled", "budget_tokens": 1024, "x": 1},
+                {"type": "enabled", "budget_tokens": 1024},
+            ),
+            (
+                "thinking",
+                {"type": "adaptive", "display": "omitted", "budget_tokens": 1},
+                {"type": "adaptive", "display": "omitted"},
+            ),
+            (
+                "thinking",
+                {"type": "disabled", "budget_tokens": 1},
+                {"type": "disabled"},
+            ),
+            (
+                "tool_choice",
+                {"type": "tool", "name": "lookup", "disable_parallel_tool_use": True},
+                {"type": "tool", "name": "lookup", "disable_parallel_tool_use": True},
+            ),
+            ("tool_choice", {"type": "auto", "name": "x"}, {"type": "auto"}),
+            (
+                "cache_control",
+                {"type": "ephemeral", "ttl": "1h", "scope": "x"},
+                {"type": "ephemeral", "ttl": "1h"},
+            ),
+        ],
+    )
+    def test_a_known_type_keeps_only_its_sub_keys(
+        self, key: str, value: dict[str, Any], expected: dict[str, Any]
+    ) -> None:
+        assert self._forwarded({key: value}) == {key: expected}
+
+    def test_the_shapes_match_the_sdk_types(self) -> None:
+        """Every variant of each typed object the ``anthropic`` SDK declares, with its required
+        and optional keys, is the shape the handler rebuilds."""
+        import typing
+        from typing import Required
+
+        from anthropic.types import (
+            CacheControlEphemeralParam,
+            ThinkingConfigParam,
+            ToolChoiceParam,
+        )
+
+        from launchdarkly_ai_claude_messages.handler import _TYPED_OBJECT_SHAPES
+
+        def shapes(*variants: Any) -> dict[str, tuple[frozenset[str], frozenset[str]]]:
+            # The SDK's TypedDicts are total=False with ``Required[...]`` under postponed
+            # annotations, so ``__required_keys__`` is empty; read ``Required`` from the hints.
+            out = {}
+            for variant in variants:
+                hints = typing.get_type_hints(variant, include_extras=True)
+                required = {
+                    k for k, v in hints.items() if typing.get_origin(v) is Required
+                }
+                (literal,) = typing.get_args(hints["type"])
+                (kind,) = typing.get_args(literal)
+                out[kind] = (
+                    frozenset(required - {"type"}),
+                    frozenset(set(hints) - required - {"type"}),
+                )
+            return out
+
+        assert _TYPED_OBJECT_SHAPES == {
+            "thinking": shapes(*typing.get_args(ThinkingConfigParam)),
+            "tool_choice": shapes(*typing.get_args(ToolChoiceParam)),
+            "cache_control": shapes(CacheControlEphemeralParam),
+        }
+
+
 class TestMalformedObjectValuesAreDropped:
     """A key the API expects as an object, set to anything else, is dropped on both paths."""
 

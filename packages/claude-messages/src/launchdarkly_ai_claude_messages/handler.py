@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -81,6 +81,63 @@ _MESSAGES_MAPPING_KEYS = frozenset(
     {"cache_control", "output_config", "thinking", "tool_choice"}
 )
 
+#: The typed objects among the forwarded keys, as the ``anthropic`` SDK declares them: for each
+#: key, each ``type`` the API knows, mapped to that variant's required and optional sub-keys
+#: (``ThinkingConfigParam``, ``ToolChoiceParam``, ``CacheControlEphemeralParam``). A value whose
+#: ``type`` is missing or unknown, or that lacks a required sub-key, is dropped; any other sub-key
+#: is removed. The API rejects all of these, so passing them through would only fail the request.
+_TYPED_OBJECT_SHAPES: Mapping[
+    str, Mapping[str, tuple[frozenset[str], frozenset[str]]]
+] = {
+    "thinking": {
+        "enabled": (frozenset({"budget_tokens"}), frozenset({"display"})),
+        "adaptive": (frozenset(), frozenset({"display"})),
+        "disabled": (frozenset(), frozenset()),
+    },
+    "tool_choice": {
+        "auto": (frozenset(), frozenset({"disable_parallel_tool_use"})),
+        "any": (frozenset(), frozenset({"disable_parallel_tool_use"})),
+        "tool": (frozenset({"name"}), frozenset({"disable_parallel_tool_use"})),
+        "none": (frozenset(), frozenset()),
+    },
+    "cache_control": {
+        "ephemeral": (frozenset(), frozenset({"ttl"})),
+    },
+}
+
+
+def _rebuild_typed_object(
+    value: Mapping[str, Any],
+    shapes: Mapping[str, tuple[frozenset[str], frozenset[str]]],
+) -> dict[str, Any] | None:
+    """*value* with only the sub-keys its ``type`` takes, or ``None`` when the type is not in
+    *shapes* or a required sub-key is missing."""
+    kind = value.get("type")
+    if not isinstance(kind, str) or kind not in shapes:
+        return None
+    required, optional = shapes[kind]
+    if any(value.get(key) is None for key in required):
+        return None
+    return {
+        "type": kind,
+        **{
+            k: value[k] for k in sorted(required | optional) if value.get(k) is not None
+        },
+    }
+
+
+def _rebuild_typed_objects(params: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilds each forwarded typed object with :func:`_rebuild_typed_object`, dropping the ones
+    that are malformed. Runs after :func:`select_forwarded_parameters`, so every value here is
+    already a mapping."""
+    for key, shapes in _TYPED_OBJECT_SHAPES.items():
+        if key in params:
+            rebuilt = _rebuild_typed_object(params.pop(key), shapes)
+            if rebuilt is not None:
+                params[key] = rebuilt
+    return params
+
+
 #: Accepted by the API but never forwarded, and why:
 #: * ``stream``: runtime wiring. The handler chooses blocking vs. streaming itself, not via a kwarg.
 #: * ``output_format``: API-shape switch. Only ``.stream`` accepts it, so forwarding it would make
@@ -139,12 +196,14 @@ def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
 def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that reach ``messages.create``/``.stream``: ``effort``
     moved into ``output_config``, then only :data:`_MESSAGES_FORWARDED_KEYS`, with malformed
-    object values dropped. ``invoke`` and ``stream`` both call this, so they forward the same keys.
+    object values dropped and typed objects rebuilt (see :data:`_TYPED_OBJECT_SHAPES`). ``invoke`` and ``stream`` both call this, so they forward the same keys.
     """
-    return select_forwarded_parameters(
-        _rename_effort_to_output_config(model_parameters(config)),
-        _MESSAGES_FORWARDED_KEYS,
-        mapping_keys=_MESSAGES_MAPPING_KEYS,
+    return _rebuild_typed_objects(
+        select_forwarded_parameters(
+            _rename_effort_to_output_config(model_parameters(config)),
+            _MESSAGES_FORWARDED_KEYS,
+            mapping_keys=_MESSAGES_MAPPING_KEYS,
+        )
     )
 
 
