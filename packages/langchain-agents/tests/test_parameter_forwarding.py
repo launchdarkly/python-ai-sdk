@@ -450,7 +450,8 @@ class TestBedrockStopRename:
 
 
 def test_prompt_cache_key_is_dropped_for_chat_openai() -> None:
-    """Cut from the cross-SDK ChatOpenAI list: a config value never reaches the constructor."""
+    """Not supported in Python: ``ChatOpenAI`` has no such field, so a config value never reaches
+    the constructor."""
     assert _build("openai", {"prompt_cache_key": "cache-1", "temperature": 0.2}) == {
         "model": "configured-model",
         "temperature": 0.2,

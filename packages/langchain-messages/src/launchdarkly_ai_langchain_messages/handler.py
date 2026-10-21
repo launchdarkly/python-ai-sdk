@@ -133,9 +133,10 @@ _CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 #:   handler gets back. ``truncation``, ``context_management`` and ``use_previous_response_id``
 #:   also lean on server-side conversation state.
 #: * ``store``: data retention. It decides whether the request is kept on the server.
-#: * ``prompt_cache_key``: cut from the cross-SDK list, because ``ChatOpenAI`` has no such field
-#:   and the spec cuts a key rather than work around it. It is not in the set below because
-#:   ``ChatOpenAI`` does not accept it at all, which the drift test requires of every listed key.
+#: * ``prompt_cache_key``: on the spec list, marked not supported in Python, because
+#:   ``ChatOpenAI`` has no such constructor field (it takes it only per call). It is not in the set
+#:   below because ``ChatOpenAI`` does not accept it at all, which the drift test requires of every
+#:   listed key.
 #: * ``stream_usage``, ``include_response_headers``, ``disabled_params``, ``tiktoken_model_name``:
 #:   runtime wiring. They change what the handler gets back and how usage is reported to it.
 #: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
