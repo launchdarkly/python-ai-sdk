@@ -143,6 +143,7 @@ LANGCHAIN_CHAT_OPENAI = frozenset(
         "max_tokens",
         "n",
         "presence_penalty",
+        "reasoning_effort",
         "seed",
         "service_tier",
         "stop",

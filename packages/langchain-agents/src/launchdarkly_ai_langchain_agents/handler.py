@@ -85,9 +85,11 @@ _LANGCHAIN_RUNTIME_KEYS = frozenset(
 #: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
 #: stays exhaustive as the SDK's own pydantic model changes.
 #:
-#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12). ``seed`` is
-#: marked not supported in TypeScript there: the JS ``ChatOpenAI`` takes it only as a per-call
-#: option, while this handler sets it on the constructor, which has a ``seed`` field.
+#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12).
+#: ``reasoning_effort`` and ``seed`` are marked not supported in TypeScript there: the JS
+#: ``ChatOpenAI`` takes them only as per-call options, while this handler sets them on the
+#: constructor, which has a field for each. ``reasoning_effort`` is the Chat Completions field and
+#: does not switch ``ChatOpenAI`` to the Responses API the way ``reasoning`` does.
 _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -97,6 +99,7 @@ _CHAT_OPENAI_FORWARDED_KEYS = frozenset(
         "max_tokens",
         "n",
         "presence_penalty",
+        "reasoning_effort",
         "seed",
         "service_tier",
         "stop",
@@ -127,8 +130,6 @@ _CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 #:   the Responses API instead of Chat Completions, which changes the API and response shape the
 #:   handler gets back. ``truncation``, ``context_management`` and ``use_previous_response_id``
 #:   also lean on server-side conversation state.
-#: * ``reasoning_effort``: the Chat Completions spelling of ``reasoning``, left out with it so a
-#:   config cannot set reasoning by one spelling and not the other.
 #: * ``store``: data retention. It decides whether the request is kept on the server.
 #: * ``prompt_cache_key``: cut from the cross-SDK list, because ``ChatOpenAI`` has no such field
 #:   and the spec cuts a key rather than work around it. It is not in the set below because
@@ -172,7 +173,6 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
     "reasoning",
     "truncation",
     "context_management",
-    "reasoning_effort",
     "store",
 }
 

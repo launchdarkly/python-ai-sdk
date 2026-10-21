@@ -418,3 +418,24 @@ def test_prompt_cache_key_is_dropped_for_chat_openai() -> None:
         "model": "configured-model",
         "temperature": 0.2,
     }
+
+
+def test_reasoning_effort_keeps_chat_openai_on_chat_completions() -> None:
+    """``reasoning_effort`` is the Chat Completions field. Unlike ``reasoning`` it does not switch
+    ``ChatOpenAI`` to the Responses API, so the handler still reads a Chat Completions reply."""
+    from langchain_core.messages import HumanMessage
+
+    kwargs = _model_constructor_kwargs(
+        {
+            "model": {"name": "gpt-4o", "parameters": {"reasoning_effort": "low"}},
+            "provider": {"name": "openai"},
+        },
+        "fallback",
+        _CHAT_OPENAI_FORWARDED_KEYS,
+    )
+    model = langchain_openai.ChatOpenAI(api_key="sk-test-not-a-real-key", **kwargs)
+    payload: dict[str, Any] = model._get_request_payload([HumanMessage("hi")])
+    assert payload["reasoning_effort"] == "low"
+    assert "messages" in payload
+    assert "input" not in payload
+    assert "reasoning" not in payload
