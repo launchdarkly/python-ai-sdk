@@ -338,17 +338,13 @@ class TestInitClientOtelMissing:
 
         stub = _make_stub_client()
 
-        def _broken_setup(key: str, opts: Any = None) -> None:
-            _logging.getLogger("launchdarkly_ai_server.lifecycle").warning(
-                "OpenTelemetry packages not installed. Run `pip install opentelemetry-sdk`"
-            )
-
+        # A None entry makes the real import inside _setup_telemetry raise ImportError.
         with caplog.at_level(_logging.WARNING):
-            with patch.object(
-                lifecycle_module, "_setup_telemetry", side_effect=_broken_setup
-            ):
+            with patch.dict(sys.modules, {"opentelemetry.sdk.trace": None}):
                 await init_client(client=stub)
-        assert any("OpenTelemetry" in m for m in caplog.messages)
+        hints = [m for m in caplog.messages if "OpenTelemetry" in m]
+        assert len(hints) == 1
+        assert 'pip install "launchdarkly-ai-server[otel]"' in hints[0]
 
     async def test_still_resolves_successfully(self) -> None:
         stub = _make_stub_client()

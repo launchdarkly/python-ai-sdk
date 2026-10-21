@@ -199,8 +199,8 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
 
     except ImportError:
         logger.warning(
-            "OpenTelemetry packages not installed. Run `pip install opentelemetry-sdk` "
-            "to enable telemetry."
+            "OpenTelemetry packages not installed. Run "
+            '`pip install "launchdarkly-ai-server[otel]"` to enable telemetry.'
         )
         return None
 
