@@ -482,6 +482,50 @@ class TestToClaudeAgentsTopology:
         assert "response" in result
 
 
+class TestToClaudeAgentsHostIsolation:
+    """Every ``query()`` the adapter makes switches the built-ins off unless a node attaches one,
+    and loads none of the host's Claude Code settings. The adapter takes no host options, so
+    ``setting_sources`` is always ``[]``: the Agent SDK's own ``None`` loads every source.
+    """
+
+    @staticmethod
+    async def _root_options(
+        tool_handlers: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        mock_sdk = _make_sdk_mock("done")
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(
+                _make_def_promise(_make_graph_def()),
+                opts={"tool_handlers": tool_handlers or {}},
+            ).invoke("hi")
+        assert len(captured) == 1
+        return captured[0]
+
+    @pytest.mark.asyncio
+    async def test_sends_an_empty_tool_list_with_no_native_tools(self) -> None:
+        opts = await self._root_options()
+        assert opts["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_sends_the_native_tool_names(self) -> None:
+        opts = await self._root_options({"run-bash": NativeTool("Bash")})
+        assert opts["tools"] == ["Bash"]
+
+    @pytest.mark.asyncio
+    async def test_loads_no_host_settings(self) -> None:
+        opts = await self._root_options()
+        assert opts["setting_sources"] == []
+
+
 # ---------------------------------------------------------------------------
 # Anthropic-specific specs
 # ---------------------------------------------------------------------------

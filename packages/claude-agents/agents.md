@@ -39,7 +39,12 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 
 ```python
 # Factory — returns a ProviderHandler with provides_for attached
-def create_claude_agents_handler() -> ProviderHandler: ...
+def create_claude_agents_handler(
+    *,
+    capture_content: bool | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    setting_sources: list[SettingSource] | None = None,
+) -> ProviderHandler: ...
 
 # Convenience wrapper — equivalent to config(key=config_key, handler=create_claude_agents_handler()).invoke(user_input, context)
 def claude_agents(config_key: str, user_input: str, context: dict, **kwargs) -> ProviderResponse: ...
@@ -98,6 +103,12 @@ Tools are delivered via an in-process MCP server, not as raw JSON schema defs. T
 5. Allowed tools are prefixed: `mcp__tool-mcp__<tool_name>`.
 
 If `config.tools` is absent, the MCP server is not created and `allowed_tools` is an empty list.
+
+**`tools` is always sent, and it is `[]` when the config attaches no `NativeTool`.** The explicit empty list switches every Claude Code built-in off. Omitting the key would leave the Agent SDK default, the full built-in set, on every run, and the read-only tools in it need no permission. A config turns a built-in on by attaching its sentinel (`ClaudeRead`, `ClaudeBash`, …). User-defined tools go through the MCP server and are not governed by `tools`. `to_claude_agents` follows the same rule.
+
+### 2a. Host options (`cwd`, `setting_sources`)
+
+`create_claude_agents_handler(cwd=..., setting_sources=...)` takes two trusted, app-supplied options and passes them to every `query()` call, blocking and streaming. The handler forwards none of `model.parameters` to `ClaudeAgentOptions`, so a config can neither set nor override them. **`setting_sources` is always sent, `[]` unless the application gives sources**: the Agent SDK reads `None` as "load every source", which put the host's plugins, skills, hooks, permission rules and `CLAUDE.md` into every run (AIC-3584). `[]` still lets the SDK read the managed-settings policy tier. `cwd` is sent only when given. The convenience wrappers and the native graph adapter don't take these options; they send `setting_sources=[]`.
 
 ### 3. Agentic Loop
 

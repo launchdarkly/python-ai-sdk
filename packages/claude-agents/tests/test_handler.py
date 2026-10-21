@@ -2026,25 +2026,148 @@ class TestMultimodalHistoryReachesTheProvider:
         assert turns[-1]["message"]["content"] == [IMAGE_BLOCK]
 
 
-class TestBuiltinsSurviveAnEmptyToolList:
-    """`tools=[]` is not the same as omitting `tools`.
+_PATHS = ["invoke", "stream"]
 
-    An explicit empty list switches off the Claude Code built-ins. Omitting the key leaves the SDK
-    default, which is what a run with only MCP tools, or none at all, has always had. Passing the
-    empty list silently cost such a run Read, Bash and the rest.
+
+async def _query_options(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Any,
+    path: str,
+    config: dict[str, Any] | None = None,
+    tool_handlers: dict[str, Any] | None = None,
+) -> Any:
+    """Runs one invoke or stream through *handler* and returns the options ``query()`` received."""
+    captured: list[Any] = []
+
+    async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+        captured.append(kwargs["options"])
+        yield result_message()
+
+    monkeypatch.setattr(handler_mod, "query", _query)
+    cfg = config if config is not None else BASE_CONFIG
+    if path == "invoke":
+        await handler(cfg, "q", tool_handlers or {})
+    else:
+        await _collect(await handler.stream(cfg, "q", tool_handlers or {}))
+    assert len(captured) == 1
+    return captured[0]
+
+
+@pytest.mark.parametrize("path", _PATHS)
+class TestHostOptionsAndBuiltinToolSet:
+    """TESTING.md §2.x Claude Agents Handler — host options and built-in tool set.
+
+    ``cwd`` and ``setting_sources`` configure the CLI process, so only the application sets them.
+    ``setting_sources`` not given sends ``[]``: the Agent SDK's own ``None`` loads every settings
+    source on the host. ``tools=[]`` is sent, not omitted, when a config attaches no native tool,
+    because omitting it gives every run the full built-in set.
     """
 
-    def test_no_native_tools_omits_the_key_entirely(self) -> None:
-        from launchdarkly_ai_claude_agents.handler import _build_query_options
+    async def test_forwards_cwd_and_setting_sources(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        h = create_claude_agents_handler(cwd="/srv/app", setting_sources=["project"])
+        opts = await _query_options(monkeypatch, h, path)
+        assert opts.cwd == "/srv/app"
+        assert opts.setting_sources == ["project"]
 
-        opts = _build_query_options(BASE_CONFIG, None, [], [], None, None)
-        assert not hasattr(opts, "tools") or getattr(opts, "tools", None) is None
+    async def test_sends_no_setting_sources_and_no_cwd_by_default(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        opts = await _query_options(monkeypatch, create_claude_agents_handler(), path)
+        # `None` is the dataclass default, so "not sent" is `None` here, never "".
+        assert opts.cwd is None
+        assert opts.setting_sources == []
 
-    def test_native_tools_are_still_passed(self) -> None:
-        from launchdarkly_ai_claude_agents.handler import _build_query_options
+    async def test_loads_host_settings_only_when_the_application_opts_in(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        all_sources: list[Any] = ["user", "project", "local"]
+        h = create_claude_agents_handler(setting_sources=all_sources)
+        opts = await _query_options(monkeypatch, h, path)
+        assert opts.setting_sources == ["user", "project", "local"]
 
-        opts = _build_query_options(BASE_CONFIG, None, ["Read"], [], None, None)
-        assert opts.tools == ["Read"]
+    async def test_forwards_an_explicit_empty_setting_sources(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        h = create_claude_agents_handler(setting_sources=[])
+        opts = await _query_options(monkeypatch, h, path)
+        assert opts.setting_sources == []
+
+    async def test_a_path_like_cwd_is_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch, path: str, tmp_path: Any
+    ) -> None:
+        opts = await _query_options(
+            monkeypatch, create_claude_agents_handler(cwd=tmp_path), path
+        )
+        assert opts.cwd == tmp_path
+
+    async def test_no_config_sets_or_overrides_a_host_option(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "claude-opus-4-5",
+                "parameters": {
+                    "cwd": "/from-config",
+                    "setting_sources": ["user"],
+                    "settingSources": ["user"],
+                    "plugins": [{"type": "local", "path": "/from-config"}],
+                    "skills": "all",
+                },
+            },
+        }
+        from_config = await _query_options(
+            monkeypatch, create_claude_agents_handler(), path, config
+        )
+        assert from_config.cwd is None
+        assert from_config.plugins == []
+        assert from_config.skills is None
+        # The handler's own default, not the config's `["user"]`.
+        assert from_config.setting_sources == []
+        overridden = await _query_options(
+            monkeypatch, create_claude_agents_handler(cwd="/srv/app"), path, config
+        )
+        assert overridden.cwd == "/srv/app"
+
+    async def test_sends_an_empty_tool_list_when_the_config_has_no_tools(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        opts = await _query_options(monkeypatch, create_claude_agents_handler(), path)
+        assert opts.tools == []
+
+    async def test_only_user_defined_tools_send_an_empty_tool_list_and_stay_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        opts = await _query_options(
+            monkeypatch,
+            create_claude_agents_handler(),
+            path,
+            TOOL_CONFIG,
+            {"search": MagicMock(return_value="ok")},
+        )
+        assert opts.tools == []
+        assert "mcp__tool-mcp__search" in opts.allowed_tools
+
+    async def test_sends_exactly_the_native_tool_provider_names(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        from launchdarkly_ai_claude_agents import ClaudeBash, ClaudeRead
+        from launchdarkly_ai_server import NATIVE_TOOL_KEY
+
+        # The client hands the handler a tracking stub with the sentinel stashed on it.
+        read, bash = MagicMock(), MagicMock()
+        setattr(read, NATIVE_TOOL_KEY, ClaudeRead)
+        setattr(bash, NATIVE_TOOL_KEY, ClaudeBash)
+        opts = await _query_options(
+            monkeypatch,
+            create_claude_agents_handler(),
+            path,
+            BASE_CONFIG,
+            {"read": read, "bash": bash},
+        )
+        assert sorted(opts.tools) == ["Bash", "Read"]
 
 
 class TestAbandonedToolSpansAreNotErrors:

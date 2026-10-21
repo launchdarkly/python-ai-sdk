@@ -174,6 +174,10 @@ async def _run_query(
         else [],
         mcp_servers=mcp_servers,
         hooks=hooks or {},
+        # No host settings: the Agent SDK reads `None` as "load every source", which would put
+        # the host's plugins, skills, hooks and CLAUDE.md into every node's run. The adapter takes
+        # no host options; an application that needs them builds the handler itself.
+        setting_sources=[],
         **({"system_prompt": system_prompt} if system_prompt else {}),
     )
 
