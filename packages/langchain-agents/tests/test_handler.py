@@ -1326,7 +1326,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_langchain_agents.handler import langchain_agents
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1348,7 +1348,7 @@ class TestConvenienceExport:
         mock_config_fn = MagicMock(return_value=mock_config_instance)
         mock_config_instance.invoke = MagicMock(return_value="result")
 
-        with patch.object(handler_mod, "config", mock_config_fn):
+        with patch.object(handler_mod, "_config", mock_config_fn):
             from launchdarkly_ai_langchain_agents.handler import langchain_agents
 
             ctx = {"kind": "user", "key": "u1"}
@@ -1427,7 +1427,11 @@ class TestStreaming:
                     llm=MagicMock()
                 ).stream(_make_config(), "q")
             ]
-        assert {"type": "chunk", "text": "visible answer"} in events
+        assert any(
+            event.get("type") == "TEXT_MESSAGE_CONTENT"
+            and event.get("delta") == "visible answer"
+            for event in events
+        )
         assert events[-1]["output"] == "visible answer"
 
     @pytest.mark.asyncio
@@ -1446,6 +1450,111 @@ class TestStreaming:
                 with pytest.raises(RuntimeError, match="stream fail"):
                     async for _ in await h.stream(_make_config(), "hi"):
                         pass
+
+    @pytest.mark.asyncio
+    async def test_a_failed_run_closes_started_tool_calls(self) -> None:
+        mocks = _make_langchain_mock()
+        msg = _make_ai_msg("looking")
+        msg.tool_calls = [
+            {"name": "search", "id": "c1", "args": {"q": "x"}},
+            {"name": "other", "id": "d1", "args": {"n": 1}},
+        ]
+
+        async def _astream(*_a: Any, **_kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [msg]}}
+            raise RuntimeError("tool failed")
+
+        mocks["_agent"].astream = _astream
+        seen: list[dict[str, Any]] = []
+        with (
+            _patch_lc(mocks),
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            pytest.raises(RuntimeError, match="tool failed"),
+        ):
+            handler = create_langchain_agents_handler(llm=MagicMock())
+            async for event in await handler.stream(_make_config(), "q"):
+                seen.append(event)
+        results = {
+            event["toolCallId"] for event in seen if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert results == {"c1", "d1"}
+
+    @pytest.mark.asyncio
+    async def test_tool_messages_close_parallel_calls(self) -> None:
+        mocks = _make_langchain_mock()
+        ai = _make_ai_msg("looking")
+        ai.tool_calls = [
+            {"name": "search", "id": "c1", "args": {"q": "x"}},
+            {"name": "other", "id": "d1", "args": {"n": 1}},
+        ]
+
+        def tool(call_id: str, content: str) -> Any:
+            message = MagicMock()
+            message.type = "tool"
+            message.tool_call_id = call_id
+            message.content = content
+            message.status = "success"
+            message.usage_metadata = None
+            return message
+
+        async def _astream(*_a: Any, **_kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [ai]}}
+            yield {"tools": {"messages": [tool("c1", "found"), tool("d1", "also")]}}
+
+        mocks["_agent"].astream = _astream
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            events = [
+                event
+                async for event in await create_langchain_agents_handler(
+                    llm=MagicMock(), capture_content=True
+                ).stream(_make_config(), "q")
+            ]
+        by_id: dict[str, list[str]] = {}
+        for event in events:
+            if not str(event.get("type", "")).startswith("TOOL_CALL"):
+                continue
+            by_id.setdefault(event["toolCallId"], []).append(event["type"])
+        assert by_id["c1"] == [
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+        ]
+        assert by_id["d1"] == [
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+        ]
+        contents = {
+            event["toolCallId"]: event["content"]
+            for event in events
+            if event["type"] == "TOOL_CALL_RESULT"
+        }
+        assert contents == {"c1": "found", "d1": "also"}
+
+    @pytest.mark.asyncio
+    async def test_a_successful_run_closes_a_call_with_no_tool_message(self) -> None:
+        mocks = _make_langchain_mock()
+        ai = _make_ai_msg("looking")
+        ai.tool_calls = [{"name": "search", "id": "c1", "args": {"q": "x"}}]
+
+        async def _astream(*_a: Any, **_kw: Any) -> AsyncIterator[Any]:
+            yield {"agent": {"messages": [ai]}}
+
+        mocks["_agent"].astream = _astream
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            events = [
+                event
+                async for event in await create_langchain_agents_handler(
+                    llm=MagicMock()
+                ).stream(_make_config(), "q")
+            ]
+        result = next(event for event in events if event["type"] == "TOOL_CALL_RESULT")
+        assert result["toolCallId"] == "c1"
+        assert result["metadata"]["launchdarkly"]["toolFailed"] is True
+        assert events[-1]["type"] == "done"
+        assert events.index(result) < len(events) - 1
 
 
 # ---------------------------------------------------------------------------
@@ -1572,6 +1681,25 @@ class TestStreamingTelemetry:
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
+
+    @pytest.mark.asyncio
+    async def test_process_default_is_read_on_the_streaming_path(self) -> None:
+        from launchdarkly_ai_server import SDKOptions, configure
+        from launchdarkly_ai_server.lifecycle import _reset_for_testing
+
+        _reset_for_testing()
+        try:
+            configure(options=SDKOptions(capture_content=True))
+            ctx, rec = _recording()
+            llm = _FakeToolModel(replies=[_ai_message("hi")])
+            with ctx:
+                async for _ in await create_langchain_agents_handler(llm).stream(
+                    BASE_CONFIG, "q", {}, {}
+                ):
+                    pass
+            assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+        finally:
+            _reset_for_testing()
 
 
 # ---------------------------------------------------------------------------
@@ -1836,8 +1964,8 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "create_langchain_agents_handler", _factory),
-            patch.object(handler_mod, "config", fake_config),
+            patch.object(handler_mod, "_create_langchain_agents_handler", _factory),
+            patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.langchain_agents("k", "q", {}, **kwargs)
         seen["config_kwargs"] = fake_config.call_args.kwargs
@@ -1849,8 +1977,11 @@ class TestConvenienceWrapperForwardsCaptureContent:
         # And it must not have been forwarded to config(), which does not accept it.
         assert "capture_content" not in seen["config_kwargs"]
 
-    def test_defaults_to_off(self) -> None:
-        assert self._run()["capture_content"] is False
+    def test_omitted_capture_content_defers_to_the_process_default(self) -> None:
+        assert self._run()["capture_content"] is None
+
+    def test_explicit_false_reaches_the_factory(self) -> None:
+        assert self._run(capture_content=False)["capture_content"] is False
 
 
 class TestCallbackSpansNeverLeak:
@@ -2376,7 +2507,6 @@ class TestModelSource:
         assert ctor.call_args.kwargs == {
             "temperature": 0.2,
             "max_tokens": 512,
-            "tools": [{"name": "openai-tool"}],
             "model": "gpt-4o",
         }
 
@@ -2565,5 +2695,6 @@ class TestModelSource:
             ]
         assert seen[0]["model"]["parameters"] == {"temperature": 0.2}
         assert any(
-            e.get("type") == "chunk" and e.get("text") == "streamed" for e in events
+            e.get("type") == "TEXT_MESSAGE_CONTENT" and e.get("delta") == "streamed"
+            for e in events
         )
