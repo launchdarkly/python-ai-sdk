@@ -20,6 +20,7 @@ from launchdarkly_ai_server import (
     make_track_data,
     parse_template,
     report_usage,
+    set_ld_span_attributes,
     to_ld_context,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data
@@ -153,6 +154,14 @@ def to_litellm_agents(
             span = None
 
         try:
+            if span:
+                set_ld_span_attributes(
+                    span,
+                    {
+                        "__ld": make_graph_track_data(graph.key, run_id),
+                        "ldContext": raw_ld_context,
+                    },
+                )
             await build(graph.root)
             runner_input: str | list[dict[str, Any]] = input_text
             if history:

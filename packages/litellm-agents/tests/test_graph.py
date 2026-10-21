@@ -509,6 +509,9 @@ class TestNativeGraphAdapter:
                 ).invoke("hello")
         span.end.assert_called_once_with()
         span.set_attribute.assert_any_call("launchdarkly.run.cancelled", True)
+        span.set_attribute.assert_any_call("launchdarkly.config.key", "litellm-graph")
+        attrs = [c.args[0] for c in span.set_attribute.call_args_list]
+        assert "launchdarkly.run.id" in attrs
 
     async def test_disabled_graph_fails_before_runner_or_model_creation(self) -> None:
         model_factory = MagicMock()
