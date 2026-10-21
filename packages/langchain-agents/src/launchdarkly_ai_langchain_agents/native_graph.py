@@ -26,8 +26,7 @@ from launchdarkly_ai_server import (
     tool_result_string,
 )
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
-from launchdarkly_ai_server.utils import make_graph_track_data
+from launchdarkly_ai_server.utils import make_graph_track_data, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import _CHAT_OPENAI_FORWARDED_KEYS, _CHAT_OPENAI_MAPPING_KEYS

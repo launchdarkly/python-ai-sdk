@@ -18,8 +18,7 @@ from launchdarkly_ai_server import (
     parse_template,
     parse_usage,
 )
-from launchdarkly_ai_server.utils import model_parameters
-from launchdarkly_ai_server.utils import make_graph_track_data
+from launchdarkly_ai_server.utils import make_graph_track_data, model_parameters
 
 # ---------------------------------------------------------------------------
 # ?3.1 parse_template
