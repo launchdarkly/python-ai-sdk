@@ -234,6 +234,9 @@ class TestToAdkAgents:
                 "hi", context={"kind": "user", "key": "user-1"}
             )
         assert tracer.start_span.call_args.args[0] == "launchdarkly.graph"
+        span.set_attribute.assert_any_call("launchdarkly.config.key", "graph-flag")
+        attrs = [call.args[0] for call in span.set_attribute.call_args_list]
+        assert "launchdarkly.run.id" in attrs
         events = [call.args[0] for call in tracker.track.call_args_list]
         assert "$ld:ai:graph:invocation_success" in events
         assert "$ld:ai:graph:duration:total" in events

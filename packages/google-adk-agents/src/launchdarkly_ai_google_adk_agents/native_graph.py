@@ -11,6 +11,7 @@ from launchdarkly_ai_server import (
     make_track_data,
     parse_template,
     report_usage,
+    set_ld_span_attributes,
     to_ld_context,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data
@@ -76,6 +77,14 @@ class _AdkAgents:
         usage = {"input": 0, "output": 0, "total": 0}
         output = ""
         try:
+            if span is not None:
+                set_ld_span_attributes(
+                    span,
+                    {
+                        "__ld": make_graph_track_data(graph_def.key, run_id),
+                        "ldContext": context,
+                    },
+                )
             variables = variables or {}
             tool_handlers = self._options.get("tool_handlers") or {}
             handoff: dict[str, str | None] = {"target": None}
