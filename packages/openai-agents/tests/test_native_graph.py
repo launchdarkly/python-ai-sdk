@@ -1238,7 +1238,10 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
 
         async def call(parameters: dict[str, Any]) -> object:
             agents_mock = _make_agents_mock(_make_run_result("out"))
-            agents_mock.ModelSettings = MagicMock(side_effect=lambda **kw: dict(kw))
+            # Validated by the real ModelSettings, so a value the SDK rejects fails the probe.
+            agents_mock.ModelSettings = MagicMock(
+                side_effect=lambda **kw: (ModelSettings(**kw), dict(kw))[1]
+            )
             nodes = {
                 "root": {
                     "key": "root",
@@ -1268,4 +1271,9 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
         candidates = candidate_keys(
             (f.name for f in dataclasses.fields(ModelSettings)), OPENAI_AGENTS
         )
-        assert await probe_forwarded_keys(candidates, call) == OPENAI_AGENTS
+        assert (
+            await probe_forwarded_keys(
+                candidates, call, overrides={"tool_choice": "required"}
+            )
+            == OPENAI_AGENTS
+        )

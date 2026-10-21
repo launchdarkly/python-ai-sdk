@@ -171,16 +171,29 @@ def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _drop_non_string_tool_choice(params: dict[str, Any]) -> dict[str, Any]:
+    """Drops a ``tool_choice`` that is not a string. ``ModelSettings`` takes a mode (``auto``,
+    ``required``, ``none``) or a tool name; its only other shape is an ``MCPToolChoice`` object,
+    which a config cannot express, so an object such as ``{"type": "auto"}`` would fail
+    ``ModelSettings`` validation. The JS SDK drops a non-string ``toolChoice`` the same way.
+    """
+    if "tool_choice" in params and not isinstance(params["tool_choice"], str):
+        del params["tool_choice"]
+    return params
+
+
 def _model_settings_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that become ``ModelSettings`` fields. The handler and the
     native graph both call this, so they forward the same keys. ``max_turns`` is not among them:
     it is a ``Runner.run`` option, read separately for the run.
     """
-    return _rebuild_reasoning(
-        select_forwarded_parameters(
-            _apply_text_verbosity(model_parameters(config)),
-            _MODEL_SETTINGS_FORWARDED_KEYS,
-            mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
+    return _drop_non_string_tool_choice(
+        _rebuild_reasoning(
+            select_forwarded_parameters(
+                _apply_text_verbosity(model_parameters(config)),
+                _MODEL_SETTINGS_FORWARDED_KEYS,
+                mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
+            )
         )
     )
 

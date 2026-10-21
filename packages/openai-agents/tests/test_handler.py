@@ -2598,9 +2598,19 @@ class TestNeverForwardedParameters:
 
 def _settings_and_run(captured: dict[str, Any]) -> object:
     """What one handler call handed the SDK from the config: the ``ModelSettings`` kwargs (or
-    none) and the ``Runner`` kwargs."""
+    none) and the ``Runner`` kwargs. The kwargs are also passed to the real ``ModelSettings``, so
+    a value the SDK would reject fails the probe instead of counting as forwarded."""
+    from agents import ModelSettings
+
     settings = captured["agent"].kwargs.get("model_settings")
+    if settings is not None:
+        ModelSettings(**settings.kwargs)
     return (settings.kwargs if settings is not None else None, captured["run_kwargs"])
+
+
+#: ``ModelSettings`` takes ``tool_choice`` only as a string, so the probe sets one instead of the
+#: shared object sample, which the handler drops.
+_SAMPLE_OVERRIDES = {"tool_choice": "required"}
 
 
 class TestForwardsExactlyTheCrossSdkList:
@@ -2640,7 +2650,12 @@ class TestForwardsExactlyTheCrossSdkList:
                 )
             return _settings_and_run(captured)
 
-        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_AGENTS
+        assert (
+            await probe_forwarded_keys(
+                self._candidates(), call, overrides=_SAMPLE_OVERRIDES
+            )
+            == OPENAI_AGENTS
+        )
 
     async def test_stream(self) -> None:
         captured: dict[str, Any] = {}
@@ -2661,7 +2676,12 @@ class TestForwardsExactlyTheCrossSdkList:
                     pass
             return _settings_and_run(captured)
 
-        assert await probe_forwarded_keys(self._candidates(), call) == OPENAI_AGENTS
+        assert (
+            await probe_forwarded_keys(
+                self._candidates(), call, overrides=_SAMPLE_OVERRIDES
+            )
+            == OPENAI_AGENTS
+        )
 
 
 class TestTextVerbosity:
@@ -2694,6 +2714,31 @@ class TestTextVerbosity:
         assert self._settings({"reasoning": "high", "temperature": 0.1}) == {
             "temperature": 0.1
         }
+
+
+class TestToolChoiceIsAString:
+    def _settings(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        from launchdarkly_ai_openai_agents.handler import _model_settings_parameters
+
+        return _model_settings_parameters({"model": {"parameters": parameters}})
+
+    @pytest.mark.parametrize("value", ["auto", "required", "none", "lookup_weather"])
+    def test_a_string_is_forwarded(self, value: str) -> None:
+        from agents import ModelSettings
+
+        settings = self._settings({"tool_choice": value})
+        assert settings == {"tool_choice": value}
+        assert ModelSettings(**settings).tool_choice == value
+
+    @pytest.mark.parametrize(
+        "value", [{"type": "auto"}, {"type": "function", "name": "f"}, ["auto"], 1]
+    )
+    def test_any_other_value_is_dropped(self, value: Any) -> None:
+        from agents import ModelSettings
+
+        settings = self._settings({"tool_choice": value, "temperature": 0.1})
+        assert settings == {"temperature": 0.1}
+        ModelSettings(**settings)
 
 
 class TestReasoningIsRebuilt:
