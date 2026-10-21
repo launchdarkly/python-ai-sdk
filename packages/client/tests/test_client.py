@@ -22,6 +22,15 @@ from launchdarkly_ai_server import (
 # ---------------------------------------------------------------------------
 
 CONTEXT = {"kind": "user", "key": "u1"}
+_SDK_BOOKKEEPING = {"$ld:ai:sdk:usage", "$ld:ai:sdk:info"}
+
+
+def _generation_calls(client: MagicMock) -> list[Any]:
+    return [
+        call
+        for call in client.track.call_args_list
+        if call[0][0] not in _SDK_BOOKKEEPING
+    ]
 
 
 def _make_client(response: Any = "Hello", usage: dict | None = None) -> MagicMock:
@@ -127,8 +136,8 @@ class TestConfigSingleHandler:
         assert result.track_data["modelKey"] == "my-model"
         assert result.track_data["modelVersion"] == 3
         assert isinstance(result.track_data["modelVersion"], int)
-        assert mock_ld_client.track.call_args_list
-        for call in mock_ld_client.track.call_args_list:
+        assert _generation_calls(mock_ld_client)
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
             assert payload["modelVersion"] == 3
@@ -141,7 +150,7 @@ class TestConfigSingleHandler:
         assert result.track_data is not None
         assert "modelKey" not in result.track_data
         assert "modelVersion" not in result.track_data
-        for call in mock_ld_client.track.call_args_list:
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert "modelKey" not in payload
             assert "modelVersion" not in payload
@@ -174,8 +183,8 @@ class TestConfigSingleHandler:
         m = config(key="flag", handler=_make_handler(stream_chunks=["a", "b"]))
         async for _ in m.stream("q", CONTEXT):
             pass
-        assert mock_ld_client.track.call_args_list
-        for call in mock_ld_client.track.call_args_list:
+        assert _generation_calls(mock_ld_client)
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
             assert payload["modelVersion"] == 3
@@ -875,6 +884,65 @@ class TestConfigStream:
                 pass
         events_tracked = [c[0][0] for c in mock_ld_client.track.call_args_list]
         assert "$ld:ai:generation:error" in events_tracked
+
+    async def test_a_plain_async_iterator_exits_cleanly(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        class _Iterator:
+            def __init__(self) -> None:
+                self._events = [
+                    {"type": "chunk", "text": "hi"},
+                    {
+                        "type": "done",
+                        "output": "hi",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                ]
+
+            def __aiter__(self) -> Any:
+                return self
+
+            async def __anext__(self) -> dict[str, Any]:
+                if not self._events:
+                    raise StopAsyncIteration
+                event = self._events.pop(0)
+                return event
+
+        def _stream_fn(
+            cfg: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> _Iterator:
+            iterator = _Iterator()
+            assert not hasattr(iterator, "aclose")
+            return iterator
+
+        async def _noop_fn(
+            cfg: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict[str, Any]:
+            return {"output": "", "usage": {}}
+
+        handler = ProviderHandler(
+            fn=_noop_fn,
+            stream_fn=_stream_fn,
+            provides_for=("TestProvider", "messages"),
+        )
+        events = [
+            event
+            async for event in config(key="flag", handler=handler).stream("q", CONTEXT)
+        ]
+        chunks = [event for event in events if event["type"] == "chunk"]
+        assert chunks == [{"type": "chunk", "text": "hi"}]
+        assert events[-1]["type"] == "done"
+        assert events[-1]["response"] == "hi"
+        tracked = [call[0][0] for call in mock_ld_client.track.call_args_list]
+        assert "$ld:ai:generation:success" in tracked
 
     async def test_ld_context_injected_into_stream_variables(
         self, mock_ld_client: MagicMock

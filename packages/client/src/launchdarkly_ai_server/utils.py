@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .sdk_usage import report_usage
 from .types import (
     AiConfigRep,
     GraphNode,
@@ -23,26 +24,31 @@ def normalize_providers(providers: Sequence[str] | None) -> tuple[str, ...] | No
     Validates an optional wildcard allowlist.
 
     ``None`` means the handler is unscoped. A list must contain at least one
-    non-blank name and is stored in the caller's order. Names are compared to
-    ``config.provider.name`` exactly, so surrounding whitespace is rejected
-    rather than trimmed.
+    name and is stored as a tuple in first-seen order, with repeats dropped.
+    Names are compared to ``config.provider.name`` exactly, so a name with
+    surrounding whitespace is rejected rather than trimmed.
     """
     if providers is None:
         return None
     if (
         isinstance(providers, (str, bytes))
         or len(providers) == 0
-        or any(not isinstance(name, str) or name.strip() == "" for name in providers)
+        or any(
+            not isinstance(name, str) or name == "" or name != name.strip()
+            for name in providers
+        )
     ):
-        raise ValueError("providers must be a non-empty list of provider names")
-    return tuple(providers)
+        raise ValueError(
+            "providers must be a non-empty list of provider names without surrounding whitespace"
+        )
+    return tuple(dict.fromkeys(providers))
 
 
 def create_handler(
     provides_for: tuple[str, Literal["agent", "messages"]],
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
-    capture_content: bool = False,
+    capture_content: bool | None = None,
     *,
     providers: Sequence[str] | None = None,
 ) -> ProviderHandler:
@@ -50,15 +56,34 @@ def create_handler(
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
     ``provides_for`` metadata and optional streaming implementation.
 
+    ``capture_content`` is this handler's override. ``None`` reads the process
+    default from :func:`configure` when the value is used. ``True`` or ``False``
+    overrides that default.
+
     ``providers`` is consulted only when ``provides_for`` starts with ``"*"``.
     It limits which ``config.provider.name`` values that wildcard accepts.
     """
+    report_usage("client.createHandler")
+    return _create_handler(
+        provides_for, fn, stream_fn, capture_content, providers=providers
+    )
+
+
+def _create_handler(
+    provides_for: tuple[str, Literal["agent", "messages"]],
+    fn: _HandlerFn,
+    stream_fn: _StreamFn | None = None,
+    capture_content: bool | None = None,
+    *,
+    providers: Sequence[str] | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_handler`, used by the package factories."""
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,
         stream_fn=stream_fn,
         capture_content=capture_content,
-        providers=normalize_providers(providers),
+        providers=providers,
     )
 
 
@@ -684,9 +709,11 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
     Builds the standard tracking payload for a graph node event.
     Shared by all native graph adapters (openai-agents, claude-agents, langchain-agents).
     """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
     meta = node.meta if isinstance(node.meta, dict) else {}
     config = node.config if isinstance(node.config, dict) else {}
-    return {
+    track_data: dict[str, Any] = {
         "runId": run_id,
         "configKey": node.key,
         "variationKey": meta.get("variationKey", ""),
@@ -696,6 +723,40 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
         **model_stamps_from_meta(meta),
         "graphKey": graph_key,
     }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
+
+
+def make_graph_track_data(graph_key: str, run_id: str) -> dict[str, Any]:
+    """
+    Builds the tracking payload for a native graph run as a whole.
+
+    The graph flag is itself the AI Config the trace belongs to, so its key is
+    both the config key and the graph key -- the same choice ``graph.py`` makes
+    for the SDK's own graph runner. There is no model or variation to report: a
+    graph flag carries a topology, and ``GraphDefinition`` does not expose its
+    ``_ldMeta``.
+
+    Native graph adapters pass this to ``set_ld_span_attributes`` so the
+    ``launchdarkly.graph`` span can be found by an AI Config Monitoring query.
+    """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
+    track_data: dict[str, Any] = {
+        "runId": run_id,
+        "configKey": graph_key,
+        "variationKey": "",
+        "version": 1,
+        "modelName": "",
+        "providerName": "",
+        "graphKey": graph_key,
+    }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
 
 
 def _usable_context_key(value: Any) -> str | None:
@@ -822,33 +883,6 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
             span.set_attribute(f"context.contextKeys.{kind}", key)
 
     span.add_event("feature_flag", feature_flag_attrs)
-
-
-def set_openllmetry_prompt(span: Any, messages: list[dict[str, str]]) -> None:
-    """Set OpenLLMetry-style indexed prompt attributes on a span.
-
-    Gonfalon's LLM Summary tab reads ``gen_ai.prompt.N.role`` / ``.content``
-    (attribute-based, takes precedence over span events).
-    """
-    for i, msg in enumerate(messages):
-        span.set_attribute(f"gen_ai.prompt.{i}.role", msg["role"])
-        span.set_attribute(f"gen_ai.prompt.{i}.content", msg["content"])
-
-
-def set_openllmetry_completion(
-    span: Any,
-    completion: str,
-    usage: dict[str, int],
-) -> None:
-    """Set OpenLLMetry-style indexed completion attributes and token usage aliases.
-
-    Gonfalon reads ``gen_ai.completion.0.role`` / ``.content`` and prefers
-    ``gen_ai.usage.prompt_tokens`` / ``completion_tokens``.
-    """
-    span.set_attribute("gen_ai.completion.0.role", "assistant")
-    span.set_attribute("gen_ai.completion.0.content", completion)
-    span.set_attribute("gen_ai.usage.prompt_tokens", usage.get("input_tokens", 0))
-    span.set_attribute("gen_ai.usage.completion_tokens", usage.get("output_tokens", 0))
 
 
 def parse_json_with_possible_fences(raw_text: str) -> Any | None:

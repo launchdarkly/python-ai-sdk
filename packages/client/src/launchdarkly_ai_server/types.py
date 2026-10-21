@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, TypeVar
 
@@ -92,7 +92,10 @@ class Message:
 AiConfigRep = dict[str, Any]
 """
 Raw AI config dict as returned by ``parse_ai_config``. Fields include
-``model``, ``provider``, and at least one of ``instructions`` / ``messages``.
+``model``, ``provider``, at least one of ``instructions`` / ``messages``, and an
+optional ``skills`` array of ``{key, version}`` references. Parsing does not
+validate ``skills``; read it with
+``launchdarkly_ai_server.experimental.skills.skill_refs``, which does.
 """
 
 VariationMeta = dict[str, Any]
@@ -111,7 +114,12 @@ HandlerResult = dict[str, Any]
 
 
 class HandlerStreamEvent:
-    """Union of chunk / done events yielded by a handler's stream method."""
+    """Events a handler stream yields.
+
+    ``chunk`` and ``done`` remain valid. A handler may instead yield the AG-UI
+    text and tool subset (``TEXT_MESSAGE_*``, ``TOOL_CALL_*``) and one ``done``.
+    ``config().stream()`` still yields ``chunk`` then ``done``.
+    """
 
     pass
 
@@ -149,30 +157,49 @@ class ProviderHandler:
     - ``stream``   — optional async-generator streaming (may be ``None``)
     - ``provides_for`` — ``(provider_name, mode)`` tuple or ``None``
     - ``providers`` — optional allowlist consulted only when ``provides_for`` names ``"*"``
-    - ``capture_content`` — whether this handler was built with content capture on
+    - ``capture_content`` — the effective content-capture decision for this handler
 
     ``capture_content`` is declared here so the client core can apply the handler's own content
     decision to content it writes on the handler's behalf — notably the judge's reasoning —
-    without reaching into the factory's closure.
+    without reaching into the factory's closure. ``None`` at construction reads the process
+    default from ``configure`` when the value is used. An explicit ``True`` or ``False`` is an
+    override. The property returns that effective bool, so judge and span paths share one gate.
     """
 
     provides_for: tuple[str, Literal["agent", "messages"]] | None
     providers: tuple[str, ...] | None
-    capture_content: bool
 
     def __init__(
         self,
         fn: _HandlerFn,
         provides_for: tuple[str, Literal["agent", "messages"]] | None = None,
         stream_fn: _StreamFn | None = None,
-        capture_content: bool = False,
-        providers: tuple[str, ...] | None = None,
+        capture_content: bool | None = None,
+        *,
+        providers: Sequence[str] | None = None,
     ) -> None:
         self._fn = fn
         self.provides_for = provides_for
         self._stream_fn = stream_fn
-        self.capture_content = capture_content
-        self.providers = providers
+        from .utils import normalize_providers
+
+        self._capture_content_override = capture_content
+        self.providers = normalize_providers(providers)
+
+    @property
+    def capture_content(self) -> bool:
+        """Effective content capture: an explicit override, else the process default.
+
+        Assigning ``True`` or ``False`` sets this handler's override, the same as
+        passing it to the factory. It does not change the process default.
+        """
+        from .lifecycle import effective_capture_content
+
+        return effective_capture_content(self._capture_content_override)
+
+    @capture_content.setter
+    def capture_content(self, value: bool) -> None:
+        self._capture_content_override = value
 
     async def __call__(
         self,
@@ -182,6 +209,9 @@ class ProviderHandler:
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> HandlerResult:
+        from .lifecycle import note_ai_invocation
+
+        note_ai_invocation()
         return await self._fn(config, user_input, tool_handlers, variables, history)
 
     async def stream(
@@ -194,6 +224,9 @@ class ProviderHandler:
     ) -> AsyncGenerator[dict[str, Any], None]:
         if self._stream_fn is None:
             raise NotImplementedError("This handler does not support streaming")
+        from .lifecycle import note_ai_invocation
+
+        note_ai_invocation()
         return self._stream_fn(config, user_input, tool_handlers, variables, history)
 
     @property
@@ -448,6 +481,129 @@ class ProviderGraphResponse:
 
 
 # ---------------------------------------------------------------------------
+# Agent Skills
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SkillReference:
+    """A version-pinned pointer to a skill, as attached to an AI Config variation."""
+
+    key: str
+    """Immutable skill key — ``^[a-z0-9][a-z0-9-]*$``, at most 256 characters."""
+    version: int
+    """Immutable skill version — an integer >= 1."""
+
+
+@dataclass(frozen=True)
+class Skill:
+    """
+    A single verified ``SKILL.md`` document. Immutable.
+
+    The accessors return a ``Skill`` only after integrity verification, so
+    ``content`` is exactly the bytes LaunchDarkly delivered and ``content_hash``
+    is their sha256.
+    """
+
+    key: str
+    version: int
+    content: bytes
+    """The verbatim bytes. The SDK never decodes or parses them."""
+    content_hash: str
+    """sha256, lowercase hex, over the verbatim bytes of ``content``."""
+    name: str | None = None
+    """Display name from LaunchDarkly metadata; never parsed from the content."""
+    description: str | None = None
+    """Description from LaunchDarkly metadata; never parsed from the content."""
+
+
+SkillOutcomeReason = Literal[
+    "absent", "integrity_failure", "ok", "store_unavailable", "wrong_version"
+]
+"""
+The outcomes ``get_skill_result`` reports.
+
+- ``ok`` — a verified skill was returned.
+- ``absent`` — the store does not hold the key.
+- ``integrity_failure`` — content failed verification and was withheld. Fail
+  closed on this one: it can indicate tampering.
+- ``store_unavailable`` — the store raised. An outage, not a deletion.
+- ``wrong_version`` — the store holds a different version than the one
+  requested, so nothing was returned.
+"""
+
+
+@dataclass(frozen=True)
+class SkillOutcome:
+    """
+    The result of ``get_skill_result``: the skill, plus why it was or wasn't
+    returned. Immutable.
+    """
+
+    skill: Skill | None
+    """The verified skill; set only when ``reason == "ok"``."""
+    reason: SkillOutcomeReason
+    """Which outcome happened; see ``SkillOutcomeReason``."""
+    detail: str | None
+    """
+    Human-readable message, set for every reason except ``ok``.
+
+    Safe to log: never contains skill content or filesystem paths. Branch on
+    ``reason``, not on this.
+    """
+
+
+ReconcileActionKind = Literal[
+    "written", "updated", "skipped_current", "removed", "error"
+]
+"""
+The per-skill outcomes ``write_skills`` reports.
+
+- ``written`` — the file did not exist and now holds the resolved content.
+- ``updated`` — a managed file held different bytes and was overwritten.
+- ``skipped_current`` — the bytes on disk already are the resolved content.
+- ``removed`` — the skill is no longer managed and is not on disk (whether this
+  run deleted it or it was already gone).
+- ``error`` — the outcome was refused or failed; see ``ReconcileAction.error``.
+"""
+
+
+@dataclass(frozen=True)
+class ReconcileAction:
+    """What ``write_skills`` did — or refused to do — for one skill."""
+
+    key: str
+    """
+    The skill key, or ``""`` for a run-level failure not tied to one skill (for
+    example a corrupt or unwritable manifest, or a failed retrieval). Expect
+    ``""`` when grouping a report by key.
+    """
+    action: ReconcileActionKind
+    version: int | None = None
+    path: str | None = None
+    """Canonical resolved path, when one was determined."""
+    error: str | None = None
+    """Failure detail, set only when ``action == "error"``."""
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """The result of a ``write_skills`` run: one action per outcome."""
+
+    actions: list[ReconcileAction] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """``True`` iff no action is an ``error``."""
+        return not self.errors
+
+    @property
+    def errors(self) -> list[ReconcileAction]:
+        """The ``error`` actions, in ``actions`` order."""
+        return [a for a in self.actions if a.action == "error"]
+
+
+# ---------------------------------------------------------------------------
 # Model / graph options
 # ---------------------------------------------------------------------------
 
@@ -455,6 +611,26 @@ ModelArgs = dict[str, Any]
 RoutedModelArgs = dict[str, Any]
 GraphOptions = dict[str, Any]
 GraphArgs = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SDKOptions:
+    """Process-wide behavior defaults, applied by :func:`configure`.
+
+    ``capture_content`` is the default for writing prompts, model output, tool
+    arguments, tool results, and judge explanations. It is a default, not a
+    ceiling: an explicit ``True`` or ``False`` on a handler factory or a
+    convenience wrapper overrides it. Further process-wide defaults are added
+    as fields on this object.
+    """
+
+    capture_content: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capture_content, bool):
+            raise TypeError("SDKOptions.capture_content must be a bool")
+
+
 InitClientOptions = dict[str, Any]
 
 # ---------------------------------------------------------------------------

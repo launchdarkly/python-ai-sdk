@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from launchdarkly_ai_langchain_agents.handler import create_langchain_agents_handler
-from launchdarkly_ai_server import graph
+from launchdarkly_ai_langchain_agents.handler import _create_langchain_agents_handler
+from launchdarkly_ai_server import _graph, report_usage
+
+from ._version import PACKAGE_NAME, __version__
 
 
 def langchain_graph(key: str, llm: Any = None, **options: Any) -> Any:
@@ -18,9 +20,10 @@ def langchain_graph(key: str, llm: Any = None, **options: Any) -> Any:
     ``providers`` is forwarded to the handler, not to ``graph()``. It limits which
     ``config.provider.name`` values the wildcard accepts.
     """
+    report_usage("langchain-agents.langchainGraph", PACKAGE_NAME, __version__)
     providers = options.pop("providers", None)
-    return graph(
+    return _graph(
         key,
-        handlers=[create_langchain_agents_handler(llm, providers=providers)],
+        handlers=[_create_langchain_agents_handler(llm, providers=providers)],
         **options,
     )

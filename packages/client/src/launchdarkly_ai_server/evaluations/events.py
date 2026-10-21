@@ -37,14 +37,14 @@ class CriterionEventPayload:
     evaluation_id: str
     evaluation_run_id: str
     run_id: str
-    dataset_id: str
+    dataset_id: str | None
     row_index: int
     criterion_type: str
     kind: CriterionEventKind
     event_id: str
     emitted_at: str
     evaluation_key: str
-    dataset_key: str
+    dataset_key: str | None
     status: CriterionStatus
     started_at: str
     evaluated_at: str
