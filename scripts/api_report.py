@@ -41,7 +41,7 @@ def public_modules(root: Path) -> dict[str, Path]:
     return found
 
 
-def resolve(loader: griffe.GriffeLoader, module: Any, name: str) -> Any:
+def resolve(collection: griffe.ModulesCollection, module: Any, name: str) -> Any:
     """Return what ``from module import name`` gives an application.
 
     An imported name wins over a submodule of the same name, as it does at run
@@ -51,7 +51,7 @@ def resolve(loader: griffe.GriffeLoader, module: Any, name: str) -> Any:
     path = module.imports.get(name)
     if path:
         try:
-            obj = loader.modules_collection.get_member(path)
+            obj = collection.get_member(path)
         except KeyError:  # imported from another distribution; keep the alias
             pass
     if obj is None:
@@ -137,7 +137,9 @@ def report(loader: griffe.GriffeLoader, module_path: str) -> str:
         raise SystemExit(f"{module_path}: no __all__")
     lines = [HEADER.format(module=module_path).rstrip("\n")]
     for name in sorted(module.exports, key=lambda n: (n.lower(), n)):
-        lines += describe(resolve(loader, module, str(name)), str(name))
+        lines += describe(
+            resolve(loader.modules_collection, module, str(name)), str(name)
+        )
     return "\n".join(lines) + "\n"
 
 
