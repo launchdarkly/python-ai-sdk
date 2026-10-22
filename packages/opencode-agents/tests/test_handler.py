@@ -1533,7 +1533,7 @@ class TestProcess:
         assert argv[argv.index("--hostname") + 1] == "127.0.0.1"
         assert "--print-logs" not in argv
         assert "--log-level" not in argv
-        assert records[0]["cwd"] == str(script.cwd)
+        assert records[0]["cwd"] == str(script.cwd.resolve())
         assert records[0]["config"] == str(script.config.resolve())
         paths = [item["path"] for item in script.requests]
         assert "/event" in paths
