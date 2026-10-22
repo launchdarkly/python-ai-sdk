@@ -159,11 +159,14 @@ def reports(root: Path = ROOT) -> dict[Path, str]:
 
 
 def main(argv: list[str]) -> int:
-    expected = reports()
+    expected = reports(ROOT)
     if argv != ["--check"]:
         for path, text in expected.items():
             path.parent.mkdir(exist_ok=True)
             path.write_text(text)
+        # A removed or renamed module's old report would otherwise stay and fail --check.
+        for path in set(ROOT.glob("packages/*/api-report/*.txt")) - set(expected):
+            path.unlink()
         print(f"wrote {len(expected)} API reports")
         return 0
     stale = []
