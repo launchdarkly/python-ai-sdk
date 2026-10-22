@@ -11,5 +11,6 @@
   "packages/vercel-messages": "0.1.0",
   "packages/vercel-agents": "0.1.0",
   "packages/litellm-messages": "0.1.0",
-  "packages/litellm-agents": "0.1.0"
+  "packages/litellm-agents": "0.1.0",
+  "packages/typesafe": "0.1.0"
 }

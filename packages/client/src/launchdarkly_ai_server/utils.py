@@ -95,6 +95,27 @@ def normalize_mode(mode: str | None) -> Literal["agent", "messages"]:
     return "agent" if mode == "agent" else "messages"
 
 
+def handler_key(
+    handler: Any,
+) -> tuple[str, Literal["agent", "messages"]] | None:
+    """Return the normalized ``(provider, mode)`` identity for *handler*.
+
+    ``completion`` and ``messages`` are the same mode. A list tag is accepted
+    the same as a tuple. Online and offline share this helper:
+    :func:`select_handler` matches on it, :meth:`Registry.register` replaces on
+    it, online judges (``run_judges`` / ``run_judge``) match on it, and the
+    evaluations harness rejects duplicates on it.
+    """
+    provides_for = getattr(handler, "provides_for", None)
+    if (
+        isinstance(provides_for, tuple | list)
+        and len(provides_for) == 2
+        and isinstance(provides_for[0], str)
+    ):
+        return (provides_for[0], normalize_mode(provides_for[1]))
+    return None
+
+
 def number_or_zero(value: Any) -> int:
     """Coerces a provider-reported token count to a finite number, defaulting to 0.
 
@@ -537,25 +558,18 @@ def select_handler(
 
     mode = normalize_mode(meta.get("mode") if isinstance(meta, dict) else None)
 
-    exact = next((h for h in handlers if h.provides_for == (provider, mode)), None)
+    exact = next((h for h in handlers if handler_key(h) == (provider, mode)), None)
     if exact:
         return exact
 
-    wildcard = next(
-        (
-            h
-            for h in handlers
-            if h.provides_for and h.provides_for[0] == "*" and h.provides_for[1] == mode
-        ),
-        None,
-    )
+    wildcard = next((h for h in handlers if handler_key(h) == ("*", mode)), None)
     if wildcard:
         return wildcard
 
     if strict:
         has_coverage = any(
-            h.provides_for
-            and (h.provides_for[0] == provider or h.provides_for[0] == "*")
+            (key := handler_key(h)) is not None
+            and (key[0] == provider or key[0] == "*")
             for h in handlers
         )
         if not has_coverage:
@@ -563,7 +577,11 @@ def select_handler(
         raise ValueError(f"Handler for provider {provider} with mode {mode} not found")
 
     by_provider = next(
-        (h for h in handlers if h.provides_for and h.provides_for[0] == provider),
+        (
+            h
+            for h in handlers
+            if (key := handler_key(h)) is not None and key[0] == provider
+        ),
         None,
     )
     if by_provider:

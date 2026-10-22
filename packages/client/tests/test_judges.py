@@ -194,6 +194,58 @@ class TestRunJudges:
         assert effective.get("instructions") is not None
         assert effective.get("messages") == []
 
+    async def test_exact_provider_beats_an_earlier_wildcard(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        seen: list[str] = []
+
+        def handler_for(name: str, provider: str) -> ProviderHandler:
+            async def fn(
+                config, user_input, tool_handlers, variables, history=None
+            ) -> dict:  # type: ignore[override]
+                seen.append(name)
+                return {
+                    "output": '{"score": 0.5, "reasoning": "ok"}',
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+
+            return ProviderHandler(fn=fn, provides_for=(provider, "messages"))  # type: ignore[arg-type]
+
+        wildcard = handler_for("wildcard", "*")
+        typesafe = handler_for("typesafe", "TypeSafe")
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "jev"},
+                "provider": {"name": "TypeSafe"},
+                "instructions": "judge",
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "OpenAI"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "jev", "samplingRate": 1.0}]},
+        }
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=wildcard,
+                handlers=[wildcard, typesafe],
+                user_input="question",
+                llm_response="answer",
+                base_track_data={},
+            )
+        assert seen == ["typesafe"]
+
     async def test_exact_agent_handler_fallback_collapses_messages(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -319,6 +371,77 @@ class TestRunJudges:
 
         assert called_handlers == ["messages"]
 
+    async def test_completion_handler_matches_messages_judge_over_agent(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """completion ≡ messages: registry replace must not lose judge routing.
+
+        After registering a completion handler over a messages one, online
+        judges still need an exact mode match. Comparing raw provides_for
+        would miss completion and fall through to agent (with collapse).
+        """
+        called_handlers: list[str] = []
+
+        async def completion_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            called_handlers.append("completion")
+            return {
+                "output": '{"score": 0.9, "reasoning": "ok"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        async def agent_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            called_handlers.append("agent")
+            return {
+                "output": '{"score": 0.1, "reasoning": "fallback"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        completion_handler = ProviderHandler(
+            fn=completion_fn, provides_for=("TestProvider", "completion")
+        )  # type: ignore[arg-type]
+        agent_handler = ProviderHandler(
+            fn=agent_fn, provides_for=("TestProvider", "agent")
+        )  # type: ignore[arg-type]
+
+        judge_variation = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "messages": [{"role": "system", "content": "Judge."}],
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "j1",
+                "version": 1,
+                "mode": "messages",
+            },
+        }
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=agent_handler,
+                handlers=[completion_handler, agent_handler],
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+
+        assert called_handlers == ["completion"]
+
     async def test_returns_judge_result_objects_with_score_and_reasoning(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -406,6 +529,103 @@ class TestScoreGuard:
         assert numeric_score(0) == 0.0
         assert numeric_score(inf) is None
         assert numeric_score(nan) is None
+
+
+class TestRunJudgeModeAliases:
+    """run_judge must treat completion and messages as one mode."""
+
+    @pytest.mark.asyncio
+    async def test_completion_handler_matches_messages_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from contextlib import asynccontextmanager
+
+        import launchdarkly_ai_server.judges as judges_module
+        import launchdarkly_ai_server.tracking as tracking_module
+        from launchdarkly_ai_server import JudgeTask, run_judge
+
+        @asynccontextmanager
+        async def fake_with_judge_evaluation(name: str) -> Any:
+            yield lambda score, explanation=None: None
+
+        monkeypatch.setattr(
+            judges_module, "with_judge_evaluation", fake_with_judge_evaluation
+        )
+
+        async def fake_execute_and_track(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "response": '{"score": 0.8, "reasoning": "aliased"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "track_data": {"runId": "run-1"},
+            }
+
+        monkeypatch.setattr(
+            tracking_module, "execute_and_track", fake_execute_and_track
+        )
+
+        async def completion_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            raise AssertionError("execute_and_track is stubbed")
+
+        handler = ProviderHandler(
+            fn=completion_fn, provides_for=("TestProvider", "completion")
+        )  # type: ignore[arg-type]
+
+        task = JudgeTask(
+            config_key="judge-key",
+            judge_config={
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+            },
+            judge_meta={"enabled": True, "variationKey": "j1", "version": 1},
+            actual_output="response",
+            user_context=CONTEXT,
+            judge_provider="TestProvider",
+            judge_mode="messages",
+            collapse_messages=False,
+            parent_track_data={"runId": "run-1"},
+        )
+
+        result = await run_judge(task, [handler])
+
+        assert result is not None
+        assert result.score == 0.8
+        assert result.response == "aliased"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_only_unrelated_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from launchdarkly_ai_server import JudgeTask, run_judge
+
+        async def agent_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            raise AssertionError("should not run — messages task with no match")
+
+        # Agent-only list still falls back for messages tasks; use a different
+        # provider so there is truly no compatible handler.
+        handler = ProviderHandler(fn=agent_fn, provides_for=("OtherProvider", "agent"))  # type: ignore[arg-type]
+
+        task = JudgeTask(
+            config_key="judge-key",
+            judge_config={
+                "model": {"name": "gpt-4"},
+                "provider": {"name": "TestProvider"},
+                "instructions": "judge",
+            },
+            judge_meta={"enabled": True, "variationKey": "j1", "version": 1},
+            actual_output="response",
+            user_context=CONTEXT,
+            judge_provider="TestProvider",
+            judge_mode="messages",
+            collapse_messages=False,
+            parent_track_data={"runId": "run-1"},
+        )
+
+        assert await run_judge(task, [handler]) is None
 
 
 class TestRunJudgeScoreReporting:
@@ -596,3 +816,179 @@ class TestRunJudgeTrackData:
             )
         inline_track_data = mock_ld_client.track.call_args.args[2]
         assert result.track_data == inline_track_data
+
+
+class TestTypesafeJudgeResults:
+    async def test_expands_labels_and_tracks_each_event_key(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        import json
+        import random
+
+        payload = json.dumps(
+            {
+                "kind": "typesafe",
+                "results": [
+                    {
+                        "key": "migration_intent",
+                        "eventKey": "$ld:ai:judge:jev:migration_intent",
+                        "score": 0.25,
+                        "reason": "Unclear",
+                    },
+                    {
+                        "key": "migration",
+                        "eventKey": "$ld:ai:judge:jev:migration",
+                        "score": 0.9,
+                        "reason": "Yes",
+                    },
+                ],
+            }
+        )
+
+        seen_variables: list[dict[str, Any]] = []
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            seen_variables.append(variables)
+            return {
+                "output": payload,
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            }
+
+        handler = ProviderHandler(fn=fn, provides_for=("TypeSafe", "messages"))  # type: ignore[arg-type]
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "jev"},
+                "provider": {"name": "TypeSafe"},
+                "instructions": "judge",
+                "evaluationMetricKey": "judge-metric",
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        with patch.object(random, "random", return_value=0.0):
+            result = await run_judges(
+                config={
+                    "model": {"name": "gpt-4"},
+                    "provider": {"name": "OpenAI"},
+                    "instructions": "hi",
+                    "judgeConfiguration": {
+                        "judges": [{"key": "jev-judge", "samplingRate": 1.0}]
+                    },
+                },
+                user_context=CONTEXT,
+                handler=handler,
+                user_input="question",
+                llm_response="answer",
+                base_track_data={"runId": "x"},
+            )
+
+        assert seen_variables[0]["input"] == "question"
+        assert seen_variables[0]["response_to_evaluate"] == "answer"
+        assert set(result) == {
+            "jev-judge.migration_intent",
+            "jev-judge.migration",
+        }
+        assert result["jev-judge.migration_intent"].score == 0.25
+        assert result["jev-judge.migration"].score == 0.9
+        assert result["jev-judge.migration_intent"].response == "Unclear"
+        assert result["jev-judge.migration"].response == "Yes"
+        assert result["jev-judge.migration_intent"].usage.input == 100
+        assert result["jev-judge.migration"].usage.input == 100
+        assert result["jev-judge.migration_intent"].usage.output == 20
+        metric_calls = [
+            call
+            for call in mock_ld_client.track.call_args_list
+            if str(call.args[0]).startswith("$ld:ai:judge:jev:")
+        ]
+        token_calls = [
+            call
+            for call in mock_ld_client.track.call_args_list
+            if call.args[0] == "$ld:ai:tokens:total"
+        ]
+        assert [call.args[0] for call in metric_calls] == [
+            "$ld:ai:judge:jev:migration_intent",
+            "$ld:ai:judge:jev:migration",
+        ]
+        assert metric_calls[0].args[2]["judgeConfigKey"] == "jev-judge.migration_intent"
+        assert metric_calls[0].args[3] == 0.25
+        assert metric_calls[1].args[3] == 0.9
+        assert len(token_calls) == 1
+
+    async def test_run_judge_keeps_the_first_label_event_key(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        import json
+
+        from launchdarkly_ai_server import JudgeTask, run_judge
+
+        payload = json.dumps(
+            {
+                "kind": "typesafe",
+                "results": [
+                    {
+                        "key": "migration_intent",
+                        "eventKey": "$ld:ai:judge:jev:migration_intent",
+                        "score": 0.25,
+                        "reason": "Unclear",
+                    },
+                    {
+                        "key": "migration",
+                        "eventKey": "$ld:ai:judge:jev:migration",
+                        "score": 0.9,
+                        "reason": "Yes",
+                    },
+                ],
+            }
+        )
+
+        seen_variables: list[dict[str, Any]] = []
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            seen_variables.append(variables)
+            return {
+                "output": payload,
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            }
+
+        handler = ProviderHandler(fn=fn, provides_for=("TypeSafe", "messages"))  # type: ignore[arg-type]
+        result = await run_judge(
+            JudgeTask(
+                config_key="jev-judge",
+                judge_config={
+                    "model": {"name": "jev"},
+                    "provider": {"name": "TypeSafe"},
+                    "instructions": "judge",
+                },
+                judge_meta={
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+                actual_output="answer",
+                user_input="question",
+                user_context=CONTEXT,
+                judge_provider="TypeSafe",
+                judge_mode="messages",
+                collapse_messages=False,
+                parent_track_data={"runId": "x"},
+            ),
+            [handler],
+        )
+        assert result is not None
+        assert seen_variables[0]["input"] == "question"
+        assert result.event_key == "$ld:ai:judge:jev:migration_intent"
+        assert result.score == 0.25
+        assert result.response == "Unclear"
+        assert result.track_data == {
+            "runId": "x",
+            "judgeConfigKey": "jev-judge.migration_intent",
+        }
