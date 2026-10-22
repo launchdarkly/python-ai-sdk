@@ -139,3 +139,36 @@ def test_an_undefined_name_in_all_fails(workspace: Path) -> None:
     )
     with pytest.raises(SystemExit, match="missing is in __all__ but not defined"):
         api_report.reports(workspace)
+
+
+def test_dunders_and_class_keywords_are_reported(workspace: Path) -> None:
+    write(
+        workspace / "packages/demo/src/demo_sdk/experimental/beta.py",
+        """
+        from typing import TypedDict
+
+        class Config(TypedDict, total=False):
+            model: str
+
+        class Runner:
+            def __init__(self) -> None: ...
+            def __call__(self, key: str) -> int: ...
+            def _private(self) -> None: ...
+
+        __all__ = ["Config", "Runner"]
+        """,
+    )
+    text = api_report.reports(workspace)[
+        workspace / "packages/demo/api-report/demo_sdk.experimental.beta.txt"
+    ]
+    assert text.endswith(
+        textwrap.dedent(
+            """\
+            Config(TypedDict, total=False)  [class]
+              model: str
+            Runner  [class]
+              __init__()
+              __call__(key: str) -> int
+            """
+        )
+    )

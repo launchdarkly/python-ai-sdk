@@ -110,13 +110,20 @@ def describe(obj: Any, name: str, indent: str = "") -> list[str]:
             return [f"{indent}{name}{annotation}{tags(obj, 'property')}"]
         value = f" = {obj.value}" if obj.value is not None else ""
         return [f"{indent}{name}{annotation}{value}{tags(obj)}"]
-    # A class: its bases, then its constructor and public members.
-    bases = f"({', '.join(str(b) for b in obj.bases)})" if obj.bases else ""
+    # A class: its bases and keywords (e.g. ``total=False``), then its constructor and
+    # public members, dunders included.
+    args = [*map(str, obj.bases), *(f"{k}={v}" for k, v in obj.keywords.items())]
+    bases = f"({', '.join(args)})" if args else ""
     lines = [f"{indent}{name}{bases}{tags(obj, 'class')}"]
     if "__init__" in obj.members:
         lines.append(f"{indent}  {call(obj, '__init__')}")
     members = sorted(
-        (m for m in obj.members.values() if not m.name.startswith("_")),
+        (
+            m
+            for m in obj.members.values()
+            if m.name != "__init__"
+            and (not m.name.startswith("_") or m.name.endswith("__"))
+        ),
         key=lambda m: m.name.lower(),
     )
     for member in members:

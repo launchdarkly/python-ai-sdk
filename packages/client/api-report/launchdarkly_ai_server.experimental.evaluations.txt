@@ -36,7 +36,7 @@ EvaluationsModule  [class]
   sdk_key: str | None  [property]
   tools: ToolsClient  [property]
   ui_base_uri: str  [property]
-GenerationConfig(TypedDict)  [class]
+GenerationConfig(TypedDict, total=False)  [class]
   instructions: str
   messages: list[dict[str, Any]]
   model: str
@@ -47,6 +47,7 @@ GenerationConfig(TypedDict)  [class]
 init_evaluations(project_key: str | None = None, api_key: str | None = None, sdk_key: str | None = None, base_uri: str | None = None, ui_base_uri: str | None = None, transport: Transport = urllib_transport) -> EvaluationsModule
 Judge  [class, @dataclass(frozen=True)]
   __init__(key: str, threshold: float | None = DEFAULT_JUDGE_THRESHOLD, pass_rate_threshold: float | None = None, ground_truth_context: str | None = None)
+  __post_init__() -> None
   criterion_type: str  [property]
   ground_truth_context: str | None = None
   key: str
@@ -63,6 +64,7 @@ RunSummary  [class, @dataclass]
   total_rows: int = 0
 Scorer  [class, @dataclass(frozen=True)]
   __init__(name: str, fn: ScorerFn, threshold: float | None = 1.0, pass_rate_threshold: float | None = None, success_direction: SuccessDirection = 'higher_is_better')
+  __post_init__() -> None
   criterion_type: str  [property]
   fn: ScorerFn
   name: str
