@@ -27,6 +27,7 @@ from .utils import (
     collapse_messages_to_instructions as _collapse_messages_to_instructions,
 )
 from .utils import (
+    handler_key,
     normalize_mode,
     to_ld_context,
     to_usage_dict,
@@ -35,10 +36,18 @@ from .utils import (
 
 def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
     """Returns True when the handler covers the given provider or is a wildcard."""
-    return bool(
-        handler.provides_for
-        and (handler.provides_for[0] == provider or handler.provides_for[0] == "*")
-    )
+    key = handler_key(handler)
+    return key is not None and (key[0] == provider or key[0] == "*")
+
+
+def _mode_matches(handler: ProviderHandler, mode: str) -> bool:
+    """True when the handler's normalized mode equals *mode*.
+
+    Shares :func:`handler_key` with registry / ``select_handler`` so a
+    ``completion`` tag matches a ``messages`` judge (and vice versa).
+    """
+    key = handler_key(handler)
+    return key is not None and key[1] == mode
 
 
 def _handler_for(
@@ -46,11 +55,16 @@ def _handler_for(
 ) -> ProviderHandler | None:
     """Exact ``(provider, mode)`` match, then a same-mode wildcard.
 
-    A wildcard such as LangChain's ``('*', 'messages')`` must not hide a
-    handler registered for the judge's own provider.
+    Modes are compared after normalization, so a ``completion`` tag matches
+    a ``messages`` judge. A wildcard such as LangChain's ``('*', 'messages')``
+    does not hide a handler registered for the judge's own provider.
     """
     exact = next(
-        (handler for handler in handlers if handler.provides_for == (provider, mode)),
+        (
+            handler
+            for handler in handlers
+            if (key := handler_key(handler)) is not None and key == (provider, mode)
+        ),
         None,
     )
     if exact is not None:
@@ -59,9 +73,7 @@ def _handler_for(
         (
             handler
             for handler in handlers
-            if handler.provides_for
-            and handler.provides_for[0] == "*"
-            and handler.provides_for[1] == mode
+            if (key := handler_key(handler)) is not None and key == ("*", mode)
         ),
         None,
     )
@@ -150,10 +162,8 @@ async def run_judges(
                     collapse_messages = True
                 elif _provider_matches(handler, judge_provider):
                     judge_handler = handler
-                    collapse_messages = (
-                        judge_mode == "messages"
-                        and handler.provides_for is not None
-                        and handler.provides_for[1] == "agent"
+                    collapse_messages = judge_mode == "messages" and _mode_matches(
+                        handler, "agent"
                     )
                 else:
                     logger.warning(
@@ -347,10 +357,8 @@ async def _build_judge_tasks(
                 elif agent_fallback:
                     collapse_messages = True
                 elif _provider_matches(handler, judge_provider):
-                    collapse_messages = (
-                        judge_mode == "messages"
-                        and handler.provides_for is not None
-                        and handler.provides_for[1] == "agent"
+                    collapse_messages = judge_mode == "messages" and _mode_matches(
+                        handler, "agent"
                     )
                 else:
                     # No compatible handler — skip, same as run_judges.

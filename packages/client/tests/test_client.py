@@ -451,6 +451,27 @@ class TestConfigMultiHandler:
         result = await rm.invoke("hi", CONTEXT)
         assert result.response == "normalized"
 
+    @pytest.mark.parametrize(
+        "provides_for", [("TestProvider", "completion"), ["TestProvider", "messages"]]
+    )
+    async def test_handler_tag_is_matched_after_normalizing_its_mode(
+        self, mock_ld_client: MagicMock, provides_for: Any
+    ) -> None:
+        h = _handler_for("TestProvider", "messages", "normalized")
+        h.provides_for = provides_for
+        rm = config(key="flag", handler=[h])
+        result = await rm.invoke("hi", CONTEXT)
+        assert result.response == "normalized"
+
+    async def test_wildcard_tag_is_matched_after_normalizing_its_mode(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        h = _handler_for("*", "messages", "wildcard")
+        h.provides_for = ("*", "completion")
+        rm = config(key="flag", handler=[h])
+        result = await rm.invoke("hi", CONTEXT)
+        assert result.response == "wildcard"
+
     async def test_throws_when_no_provider(self, mock_ld_client: MagicMock) -> None:
         raw = {
             "model": {"name": "gpt-4"},
@@ -1160,6 +1181,33 @@ class TestInvokeJudgeTasks:
         assert result.judge_tasks is not None
         assert len(result.judge_tasks) == 1
         assert result.judge_tasks[0].collapse_messages is True
+
+    async def test_completion_handler_is_exact_match_for_messages_judge(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        # Registry may keep only a completion-tagged handler after replace.
+        # That must still be an exact messages-mode match (no agent collapse).
+        mock_ld_client.variation = self._make_multi_variation(
+            self._main_variation_with_judge(),
+            self._judge_variation(),
+        )
+
+        async def completion_fn(
+            cfg, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok", "usage": {}}
+
+        h = ProviderHandler(
+            fn=completion_fn, provides_for=("TestProvider", "completion")
+        )  # type: ignore[arg-type]
+        result = await config(key="flag", handler=h, skip_judges=True).invoke(
+            "q", CONTEXT
+        )
+
+        assert result.judge_tasks is not None
+        assert len(result.judge_tasks) == 1
+        assert result.judge_tasks[0].collapse_messages is False
+        assert result.judge_tasks[0].judge_mode == "messages"
 
     async def test_excludes_task_when_no_handler_matches_judge_provider(
         self, mock_ld_client: MagicMock
