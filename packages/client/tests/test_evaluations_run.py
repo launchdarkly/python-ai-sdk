@@ -1007,8 +1007,8 @@ async def test_api_host_env_alone_leaves_result_url_on_default_ui_host(
     result = await evals.run(
         key="eval-key",
         dataset="golden",
-        handler=handler,
-        generation={"provider": "OpenAI", "model": "gpt-4o"},
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
     assert all(
