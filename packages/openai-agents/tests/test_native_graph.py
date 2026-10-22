@@ -340,6 +340,42 @@ class TestToOpenAIAgentsTopology:
         agents_mock.handoff.assert_called()
 
     @pytest.mark.asyncio
+    async def test_cyclic_edge_is_dropped_with_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        agents_mock = _make_agents_mock(_make_run_result("out"))
+
+        # root -> a -> b -> a: post-order builds b while a is still unbuilt.
+        def _node(key: str, target: str) -> dict[str, Any]:
+            return {
+                "key": key,
+                "config": {"model": {"name": "gpt-4o"}, "instructions": key},
+                "meta": {},
+                "edges": [{"source_key": key, "target_key": target}],
+                "is_terminal": False,
+            }
+
+        edges = [("root", "a"), ("a", "b"), ("b", "a")]
+        graph_def = _make_graph_def(
+            nodes={
+                "root": _node("root", "a"),
+                "a": _node("a", "b"),
+                "b": _node("b", "a"),
+            },
+            edges=[{"source_key": s, "target_key": t} for s, t in edges],
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            await to_openai_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        assert [a.name for a in agents_mock._created_agents] == ["b", "a", "root"]
+        assert "handoffs" not in agents_mock._created_agents[0]._kw
+        assert 'Dropping cyclic edge "b" -> "a"' in caplog.text
+
+    @pytest.mark.asyncio
     async def test_runner_starts_at_root_and_returns_output(self) -> None:
         run_result = _make_run_result("final-output")
         agents_mock = _make_agents_mock(run_result)

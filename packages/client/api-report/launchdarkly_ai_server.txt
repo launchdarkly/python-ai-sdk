@@ -80,13 +80,17 @@ InputTokenDetails  [class, @dataclass]
 inspect_config(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
 is_content_blocks(content: MessageContent) -> bool
 JudgeResult  [class, @dataclass]
-  __init__(usage: UsageDict, response: str, score: float)
+  __init__(usage: UsageDict, response: str, score: float, event_key: str | None = None)
+  event_key: str | None = None
   response: str
   score: float
   usage: UsageDict
 JudgeRunResult  [class, @dataclass]
-  __init__(score: float, response: str, usage: UsageDict, track_data: TrackData)
+  __init__(score: float, response: str, usage: UsageDict, track_data: TrackData, results: dict[str, JudgeResult] | None = None, metrics: list[dict[str, Any]] | None = None, event_key: str | None = None)
+  event_key: str | None = None
+  metrics: list[dict[str, Any]] | None = None
   response: str
+  results: dict[str, JudgeResult] | None = None
   score: float
   track_data: TrackData
   usage: UsageDict
@@ -222,6 +226,7 @@ text_message(role: str, content: str) -> SpanMessage
 to_ld_context(client: Any, context: dict[str, Any]) -> Any
 to_semconv_finish_reason(raw: str | None) -> str | None
 to_usage_dict(usage: dict[str, Any]) -> UsageDict
+tool_result_string(value: Any) -> str
 ToolDefinitionInput  [class, @dataclass]
   __init__(name: str, description: str | None = None, parameters: Any = None)
   description: str | None = None

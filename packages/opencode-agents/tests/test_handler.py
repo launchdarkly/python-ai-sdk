@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import sys
+import tempfile
 from collections.abc import Iterator
 from contextlib import aclosing
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,8 +23,11 @@ from launchdarkly_ai_opencode_agents import (
     create_opencode_handler,
     opencode_agents,
 )
+from launchdarkly_ai_opencode_agents.process import _is_healthy
 from launchdarkly_ai_opencode_agents.server import default_model
 from launchdarkly_ai_server import SDKOptions, config, configure
+
+_FAKE = Path(__file__).with_name("fake_opencode.py")
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 
@@ -109,47 +117,99 @@ def assistant_completed(
 
 
 class Script:
-    """One fake `opencode serve` over ``httpx.MockTransport``."""
+    """A fake ``opencode`` executable. The handler starts and stops it."""
 
-    def __init__(self, events: list[dict[str, Any]]) -> None:
-        self.events = events
-        self.sessions: list[str] = []
-        self.messages: list[dict[str, Any]] = []
-        self.aborts: list[str] = []
+    def __init__(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        mode: str = "script",
+        message_status: int = 200,
+        delay_tail: float = 0,
+        delay_ready: float = 0,
+        exit_stderr: str | None = None,
+    ) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="oc-fake-"))
+        self.cwd = self.root / "work"
+        self.cwd.mkdir()
+        self.config = self.root / "opencode.json"
+        self.config.write_text("{}", encoding="utf-8")
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.spec_path = self.root / "spec.json"
+        self.spec_path.write_text(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "events": events,
+                    "message_status": message_status,
+                    "delay_tail": delay_tail,
+                    "delay_ready": delay_ready,
+                    "exit_stderr": exit_stderr,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _scripts.append(self)
 
-    def transport(self) -> httpx.MockTransport:
-        script = self
+    def handler_args(self) -> dict[str, Any]:
+        return {
+            "cwd": self.cwd,
+            "config": self.config,
+            "env": {
+                "LD_OPENCODE_FAKE_DIR": str(self.state),
+                "LD_OPENCODE_FAKE_SPEC": str(self.spec_path),
+            },
+            "command": [sys.executable, str(_FAKE)],
+        }
 
-        async def handle(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path == "/event" and request.method == "GET":
-                body = "".join(
-                    f"data: {json.dumps(event)}\n\n" for event in script.events
-                )
-                return httpx.Response(200, text=body)
-            if path == "/session" and request.method == "POST":
-                session_id = (
-                    "ses" if not script.sessions else f"ses-{len(script.sessions) + 1}"
-                )
-                script.sessions.append(session_id)
-                return httpx.Response(200, json={"id": session_id})
-            if path.endswith("/message") and request.method == "POST":
-                script.messages.append(json.loads(request.content.decode()))
-                return httpx.Response(200, json={})
-            if path.endswith("/abort") and request.method == "POST":
-                script.aborts.append(path)
-                return httpx.Response(200, json={})
-            return httpx.Response(404)
+    def _records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for path in sorted(
+            self.state.glob("*.json"), key=lambda item: item.stat().st_mtime
+        ):
+            records.append(json.loads(path.read_text(encoding="utf-8")))
+        return records
 
-        return httpx.MockTransport(handle)
+    @property
+    def sessions(self) -> list[str]:
+        found: list[str] = []
+        for record in self._records():
+            found.extend(record.get("sessions") or [])
+        return found
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for record in self._records():
+            found.extend(record.get("messages") or [])
+        return found
+
+    @property
+    def aborts(self) -> list[str]:
+        found: list[str] = []
+        for record in self._records():
+            found.extend(record.get("aborts") or [])
+        return found
+
+    @property
+    def pids(self) -> list[int]:
+        return [int(record["pid"]) for record in self._records() if "pid" in record]
+
+    @property
+    def requests(self) -> list[dict[str, str]]:
+        found: list[dict[str, str]] = []
+        for record in self._records():
+            found.extend(record.get("requests") or [])
+        return found
+
+
+_scripts: list[Script] = []
 
 
 def playing(events: list[dict[str, Any]], **kwargs: Any) -> tuple[Any, Script]:
     script = Script(events)
-    client = httpx.AsyncClient(transport=script.transport(), base_url="http://opencode")
-    handler = create_opencode_handler(
-        base_url="http://opencode", client=client, **kwargs
-    )
+    handler = create_opencode_handler(**script.handler_args(), **kwargs)
     return handler, script
 
 
@@ -177,6 +237,14 @@ def _reset_sdk() -> Iterator[None]:
     lifecycle_module._reset_for_testing()
     yield
     lifecycle_module._reset_for_testing()
+    for script in _scripts:
+        for pid in script.pids:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        shutil.rmtree(script.root, ignore_errors=True)
+    _scripts.clear()
 
 
 @pytest.fixture
@@ -757,13 +825,36 @@ class TestStableStream:
 
 
 class TestInvocation:
-    def test_base_url_is_required(self) -> None:
+    def test_directory_config_and_env_are_required(self) -> None:
         with pytest.raises(TypeError):
             create_opencode_handler()  # type: ignore[call-arg]
-        with pytest.raises(TypeError, match="base_url"):
-            create_opencode_handler(base_url="")
-        with pytest.raises(TypeError, match="base_url"):
+        with pytest.raises(TypeError, match="working directory"):
+            create_opencode_handler(cwd="", config="/tmp/opencode.json", env={})
+        with pytest.raises(TypeError, match="config file"):
+            create_opencode_handler(cwd="/tmp", config="", env={})
+        with pytest.raises(TypeError, match="working directory"):
             opencode_agents("flag", "hi", CONTEXT)
+        with pytest.raises(TypeError, match="base_url"):
+            create_opencode_handler(
+                cwd="/tmp",
+                config="/tmp/opencode.json",
+                env={},
+                base_url="http://127.0.0.1:9",  # type: ignore[call-arg]
+            )
+        with pytest.raises(TypeError):
+            create_opencode_handler(
+                cwd="/tmp",
+                config="/tmp/opencode.json",
+                env={},
+                client=object(),  # type: ignore[call-arg]
+            )
+        with pytest.raises(TypeError, match="URL"):
+            create_opencode_handler(
+                cwd="/tmp",
+                config="/tmp/opencode.json",
+                env={},
+                command="http://127.0.0.1:9",
+            )
 
     async def test_the_first_session_on_the_stream_is_not_adopted(self) -> None:
         events = await collect(
@@ -1080,7 +1171,7 @@ class TestInvocation:
         mock_ld_client.variation = variation
         await _drain(config(key="flag", handler=handler).stream("q", CONTEXT))
         assert len(script.sessions) == 2
-        assert script.sessions[0] != script.sessions[1]
+        assert len(set(script.pids)) == 2
         prompts = [message["parts"][0]["text"] for message in script.messages]
         systems = [message.get("system", "") for message in script.messages]
         assert prompts[0] == "q"
@@ -1098,16 +1189,12 @@ class TestInvocation:
                 assistant_completed("m1"),
             ]
         )
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
         result = await opencode_agents(
             "flag",
             "Hello",
             CONTEXT,
-            base_url="http://opencode",
-            client=client,
             history=[{"role": "user", "content": "earlier"}],
+            **script.handler_args(),
         )
         assert result.response == "Hi"
         assert script.messages[0]["system"] == "Be brief."
@@ -1274,11 +1361,8 @@ class TestInvocation:
         assert "gen_ai.prompt.3.role" not in tracer.spans[0].attributes
 
     async def test_a_failed_message_post_does_not_wait_for_the_bus(self) -> None:
-        script = _OpenBus(message_status=400)
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(base_url="http://opencode", client=client)
+        script = Script([], mode="open", message_status=400)
+        handler = create_opencode_handler(**script.handler_args())
 
         async def _run() -> None:
             async for _event in await handler.stream(
@@ -1300,13 +1384,37 @@ class TestInvocation:
         assert script.aborts
 
     async def test_a_cancelled_sse_read_is_awaited_before_the_stream_closes(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        bus = _CloseAfterRead()
-        client = httpx.AsyncClient(
-            transport=bus.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(base_url="http://opencode", client=client)
+        # The loopback socket cannot tell a cancelled read from the close that
+        # unblocks it. Record the client: ``_next_line`` must finish before
+        # GET /event is closed.
+        import httpx
+
+        from launchdarkly_ai_opencode_agents import server as server_mod
+        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
+
+        bus = Script([], mode="close_after_read")
+        handler = create_opencode_handler(**bus.handler_args())
+        order: list[str] = []
+        real_next_line = server_mod._next_line
+
+        async def _recording_next_line(lines: Any) -> str | None:
+            try:
+                return await real_next_line(lines)
+            finally:
+                order.append("read_finished")
+
+        monkeypatch.setattr(server_mod, "_next_line", _recording_next_line)
+        real_aclose = httpx.Response.aclose
+
+        async def _recording_aclose(response: httpx.Response) -> None:
+            request = response.request
+            if request.method == "GET" and request.url.path == "/event":
+                order.append("response_closed")
+            await real_aclose(response)
+
+        monkeypatch.setattr(httpx.Response, "aclose", _recording_aclose)
 
         async def _run() -> None:
             async for _event in await handler.stream(
@@ -1321,20 +1429,19 @@ class TestInvocation:
             ):
                 return
 
-        from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
-
         with pytest.raises(OpenCodeHTTPError, match="400"):
             await asyncio.wait_for(_run(), timeout=2)
-        assert bus.read_finished.is_set()
-        assert bus.closed
-        assert not bus.closed_before_read_finished
+        close_at = order.index("response_closed")
+        assert any(name == "read_finished" for name in order)
+        assert all(
+            index < close_at
+            for index, name in enumerate(order)
+            if name == "read_finished"
+        )
 
     async def test_breaking_aborts_without_waiting_for_gc(self) -> None:
-        script = _OpenBus()
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(base_url="http://opencode", client=client)
+        script = Script([], mode="open")
+        handler = create_opencode_handler(**script.handler_args())
 
         async def _run() -> None:
             async with aclosing(
@@ -1357,13 +1464,8 @@ class TestInvocation:
         assert script.aborts
 
     async def test_a_late_completion_survives_the_post_returning(self) -> None:
-        script = _OpenBus(delay_tail=0.2)
-        client = httpx.AsyncClient(
-            transport=script.transport(), base_url="http://opencode"
-        )
-        handler = create_opencode_handler(
-            base_url="http://opencode", client=client, capture_content=True
-        )
+        script = Script([], mode="open", delay_tail=0.2)
+        handler = create_opencode_handler(**script.handler_args(), capture_content=True)
         seen = [
             event
             async for event in await handler.stream(
@@ -1393,122 +1495,224 @@ class TestInvocation:
         assert events[-1]["output"] == "Hi!"
 
 
-class _CloseAfterRead(httpx.AsyncByteStream):
-    """``/event`` stays open. The message POST fails while the next read is blocked."""
-
-    def __init__(self) -> None:
-        self.second_read = asyncio.Event()
-        self.read_finished = asyncio.Event()
-        self.closed = False
-        self.closed_before_read_finished = False
-
-    def transport(self) -> httpx.MockTransport:
-        stream = self
-
-        async def handle(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path == "/event" and request.method == "GET":
-                return httpx.Response(200, stream=stream)
-            if path == "/session" and request.method == "POST":
-                return httpx.Response(200, json={"id": "ses"})
-            if path.endswith("/message") and request.method == "POST":
-                await stream.second_read.wait()
-                return httpx.Response(400, json={})
-            if path.endswith("/abort") and request.method == "POST":
-                return httpx.Response(200, json={})
-            return httpx.Response(404)
-
-        return httpx.MockTransport(handle)
-
-    async def __aiter__(self) -> Any:
-        yield b":\n\n"
-        self.second_read.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            self.read_finished.set()
-            raise
-
-    async def aclose(self) -> None:
-        if not self.read_finished.is_set():
-            self.closed_before_read_finished = True
-        self.closed = True
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
-class _ByteStream(httpx.AsyncByteStream):
-    def __init__(self, chunks: Any) -> None:
-        self._chunks = chunks
+class TestProcess:
+    async def test_a_fake_opencode_is_started_spoken_to_and_stopped(self) -> None:
+        handler, script = playing(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi"
+        records = script._records()
+        assert len(records) == 1
+        argv = records[0]["argv"]
+        assert argv[argv.index("serve") + 1] == "--port"
+        assert argv[argv.index("--hostname") + 1] == "127.0.0.1"
+        assert "--print-logs" not in argv
+        assert "--log-level" not in argv
+        assert records[0]["cwd"] == str(script.cwd.resolve())
+        assert records[0]["config"] == str(script.config.resolve())
+        paths = [item["path"] for item in script.requests]
+        assert "/event" in paths
+        assert "/session" in paths
+        assert any(path.endswith("/message") for path in paths)
+        assert script.pids
+        assert all(not _alive(pid) for pid in script.pids)
 
-    async def __aiter__(self) -> Any:
-        async for chunk in self._chunks:
-            yield chunk
+    async def test_closing_the_stream_stops_the_process(self) -> None:
+        script = Script([], mode="open")
+        handler = create_opencode_handler(**script.handler_args())
 
-    async def aclose(self) -> None:
-        return None
+        async def _run() -> None:
+            async with aclosing(
+                await handler.stream(
+                    {
+                        "instructions": "Be brief.",
+                        "model": {"name": "m"},
+                        "provider": {"name": "Acme"},
+                    },
+                    "hi",
+                    None,
+                    None,
+                )
+            ) as gen:
+                async for event in gen:
+                    if event["type"] == "TEXT_MESSAGE_CONTENT":
+                        break
 
+        await asyncio.wait_for(_run(), timeout=5)
+        assert script.aborts
+        assert script.pids
+        assert all(not _alive(pid) for pid in script.pids)
 
-class _OpenBus:
-    """An `/event` stream that stays open, unlike a finite ``Script`` body."""
+    async def test_the_process_is_dead_when_the_context_returns(self) -> None:
+        script = Script([], mode="open")
+        handler = create_opencode_handler(**script.handler_args())
+        with pytest.raises(TimeoutError):
+            async with handler:
+                async with asyncio.timeout(0.25):
+                    async with aclosing(
+                        await handler.stream(
+                            {
+                                "instructions": "Be brief.",
+                                "model": {"name": "m"},
+                                "provider": {"name": "Acme"},
+                            },
+                            "hi",
+                            None,
+                            None,
+                        )
+                    ) as gen:
+                        async for event in gen:
+                            if event["type"] == "TEXT_MESSAGE_CONTENT":
+                                await asyncio.sleep(2)
+        assert script.pids
+        assert all(not _alive(pid) for pid in script.pids)
 
-    def __init__(self, *, message_status: int = 200, delay_tail: float = 0) -> None:
-        self.message_status = message_status
-        self.delay_tail = delay_tail
-        self.sessions: list[str] = []
-        self.messages: list[dict[str, Any]] = []
-        self.aborts: list[str] = []
-        self.release = asyncio.Event()
-
-    def transport(self) -> httpx.MockTransport:
-        script = self
-
-        async def handle(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path == "/event" and request.method == "GET":
-
-                async def chunks() -> Any:
-                    # A rejected message sends nothing. Events here would let
-                    # the loop notice the 400 without racing the POST.
-                    head = (
-                        []
-                        if script.message_status >= 400
-                        else [
-                            assistant_open("m1"),
-                            text_delta("m1", "p1", "Hi"),
-                        ]
+    async def test_boot_is_outside_the_caller_timeout(self) -> None:
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ],
+            delay_ready=0.6,
+        )
+        handler = create_opencode_handler(**script.handler_args())
+        async with handler:
+            async with asyncio.timeout(0.2):
+                seen = [
+                    event
+                    async for event in await handler.stream(
+                        {
+                            "instructions": "Be brief.",
+                            "model": {"name": "m"},
+                            "provider": {"name": "Acme"},
+                        },
+                        "hi",
+                        None,
+                        None,
                     )
-                    for event in head:
-                        yield f"data: {json.dumps(event)}\n\n".encode()
-                    if script.delay_tail:
-                        await asyncio.sleep(script.delay_tail)
-                        tail = [
-                            text_delta("m1", "p1", "!", session_id="ses"),
-                            assistant_completed("m1", tokens={"input": 1, "output": 4}),
-                            bus("session.idle", sessionID="ses"),
-                        ]
-                        for event in tail:
-                            yield f"data: {json.dumps(event)}\n\n".encode()
-                        return
-                    await script.release.wait()
+                ]
+        assert seen[-1]["output"] == "Hi"
 
-                return httpx.Response(200, stream=_ByteStream(chunks()))
-            if path == "/session" and request.method == "POST":
-                script.sessions.append("ses")
-                return httpx.Response(200, json={"id": "ses"})
-            if path.endswith("/message") and request.method == "POST":
-                script.messages.append(json.loads(request.content.decode()))
-                if script.message_status >= 400:
-                    return httpx.Response(script.message_status, json={})
-                if script.delay_tail:
-                    return httpx.Response(200, json={})
-                await script.release.wait()
-                return httpx.Response(200, json={})
-            if path.endswith("/abort") and request.method == "POST":
-                script.aborts.append(path)
-                script.release.set()
-                return httpx.Response(200, json={})
-            return httpx.Response(404)
+    async def test_two_concurrent_contexts_leave_no_process(self) -> None:
+        script = Script([])
+        handler = create_opencode_handler(**script.handler_args())
 
-        return httpx.MockTransport(handle)
+        async def user() -> None:
+            async with handler:
+                await asyncio.sleep(0.1)
+
+        await asyncio.gather(user(), user())
+        assert script.pids
+        assert len(script.pids) == 1
+        assert all(not _alive(pid) for pid in script.pids)
+
+    async def test_a_generated_password_replaces_one_from_the_environment(
+        self,
+    ) -> None:
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        args = script.handler_args()
+        args["env"] = {**args["env"], "OPENCODE_SERVER_PASSWORD": "inherited-secret"}
+        handler = create_opencode_handler(**args)
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi"
+        records = script._records()
+        assert len(records) == 1
+        password = records[0]["password"]
+        assert isinstance(password, str) and password
+        assert password != "inherited-secret"
+
+    async def test_an_inherited_username_is_replaced(self) -> None:
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        args = script.handler_args()
+        args["env"] = {**args["env"], "OPENCODE_SERVER_USERNAME": "someone-else"}
+        handler = create_opencode_handler(**args)
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi"
+        records = script._records()
+        assert len(records) == 1
+        assert records[0]["username"] == "opencode"
+
+    async def test_a_startup_failure_includes_the_stderr_tail(self) -> None:
+        prefix = "HEAD-MARKER"
+        tail = "TAIL-MARKER"
+        script = Script([], exit_stderr=prefix + ("x" * 4000) + tail)
+        handler = create_opencode_handler(**script.handler_args())
+        with pytest.raises(RuntimeError) as caught:
+            async with handler:
+                pass
+        message = str(caught.value)
+        assert "exited during startup" in message
+        assert tail in message
+        assert prefix not in message
+
+    def test_health_requires_a_healthy_body(self) -> None:
+        assert _is_healthy(httpx.Response(200, json={"healthy": True, "version": "1"}))
+        assert not _is_healthy(httpx.Response(404, json={"healthy": True}))
+        assert not _is_healthy(httpx.Response(200, json={}))
+        assert not _is_healthy(httpx.Response(200, json={"healthy": False}))
+        assert not _is_healthy(httpx.Response(200, content=b"ok"))
 
 
 async def _drain(stream: Any) -> None:

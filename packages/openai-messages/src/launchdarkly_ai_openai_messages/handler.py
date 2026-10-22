@@ -26,6 +26,7 @@ from launchdarkly_ai_server import (
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    tool_result_string,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -353,7 +354,7 @@ def _create_openai_messages_handler(
                         {
                             "type": "function_call_output",
                             "call_id": tc.call_id,
-                            "output": str(result),
+                            "output": tool_result_string(result),
                         }
                     )
 
@@ -612,14 +613,16 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
-                # The model is sent str(result). The stream reports that same text.
-                for rich in emitter.tool_result(str(tc.call_id), str(result)):
+                # The model is sent tool_result_string(result). The stream reports that same text.
+                for rich in emitter.tool_result(
+                    str(tc.call_id), tool_result_string(result)
+                ):
                     yield rich
                 tool_outputs.append(
                     {
                         "type": "function_call_output",
                         "call_id": tc.call_id,
-                        "output": str(result),
+                        "output": tool_result_string(result),
                     }
                 )
             current_input = tool_outputs

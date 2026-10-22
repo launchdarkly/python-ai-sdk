@@ -52,7 +52,7 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
-Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts only. A run passes only when the completed summary has no failed, error, or pending rows. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
+Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts only. A run passes only when the completed summary has no failed, error, or pending rows. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
 ```python
 import asyncio
@@ -71,7 +71,8 @@ async def main() -> int:
         generation={
             "provider": "OpenAI",
             "model": "gpt-4o",
-            "instructions": "You are a support agent.",
+            "mode": "completion",
+            "messages": [{"role": "system", "content": "You are a support agent."}],
         },
     )
     print(result.url, result.summary)
@@ -81,7 +82,15 @@ async def main() -> int:
 sys.exit(asyncio.run(main()))
 ```
 
-`project_key` is supplied during initialization, either as an argument to `init_evaluations()` or through `LD_PROJECT_KEY`. `generation.instructions` is shorthand for one system message; use `generation.messages` instead for a full message list, but do not supply both. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
+`project_key` is supplied during initialization, either as an argument to `init_evaluations()` or through `LD_PROJECT_KEY`. `generation` requires `provider`, `model`, and `mode`. `generation` is a `TypedDict`, so you pass a plain `dict` and import no type.
+
+**Choose the mode.** Use `"completion"` when the prompt is a list of `messages` and the handler sends one request to a chat or messages API, for example `create_openai_messages_handler()`. Use `"agent"` when the prompt is one `instructions` string and an agent framework runs the model, for example OpenAI Agents, Claude Agents, or LangChain agents. If you are not sure, use the mode of the AI Config in LaunchDarkly. The mode has no default.
+
+**The prompt must match the handler.** A messages handler needs `messages`, and an agent handler needs `instructions`. The harness does not convert one into the other: a mismatch raises before any network I/O, and the error names the field the handler needs.
+
+**Pass one handler as `handler` or a list as `handlers`, not both.** Each handler must declare `provides_for`; the provider packages' `create_*_handler()` factories and `create_handler()` set it. The generation config and every judge select a handler from the list by provider and mode, with the same rule as `config()`: a handler that names the provider wins over a `"*"` handler, and the mode must match exactly. To evaluate your own application code, wrap it with `create_handler((provider, mode), fn)`.
+
+**Start from an AI Config.** Pass `ai_config=AIConfig(key=..., variation=...)` instead of a full `generation`. The harness reads the AI Config's mode first, then the variation, then the model config it links, and runs each check as soon as the read that supplies its input returns. The mode selects the prompt field: `instructions` in agent mode, `messages` in completion and judge mode. `generation` can then override single fields, except `mode`. The harness never retries a handler invocation because doing so could repeat tool side effects. Its retries apply only to LaunchDarkly management API requests.
 
 Generation and criterion events are the only path by which row results reach LaunchDarkly, so `init_evaluations()` raises rather than creating a run that can never complete unless it can resolve an event transport: either an SDK key (`sdk_key` or `LD_SDK_KEY`) or a client already initialized through `init_client(client=...)`. Bringing your own client lets a process emit evaluation events without an SDK key in scope. Every generated row is emitted and flushed unconditionally; no feature flag gates event publishing. The harness then polls the summary endpoint until row accounting shows processing is complete.
 
@@ -98,7 +107,7 @@ result = await evals.run(
         {"input": "Where is order {{order_id}}?", "variables": {"order_id": "A-17"}},
     ],
     handler=create_openai_messages_handler(),
-    generation={"provider": "OpenAI", "model": "gpt-4o"},
+    generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
 )
 ```
 
@@ -123,15 +132,14 @@ def mentions_policy(row: DatasetRow, output: str | None) -> bool:
 result = await init_evaluations(project_key="my-project").run(
     key="support-qa-2026-08-20",
     dataset="support-golden",
-    handler=create_openai_messages_handler(),
-    generation={"provider": "OpenAI", "model": "gpt-4o"},
+    # The generation config uses OpenAI and the judge uses Anthropic, so the
+    # list holds a handler for each.
+    handlers=[create_openai_messages_handler(), create_claude_messages_handler()],
+    generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     criteria=[
         Judge(key="accuracy-judge", threshold=0.8),
         Scorer(name="mentions-policy", fn=mentions_policy),
     ],
-    # Needed only because this judge is served by a different provider than
-    # the generation config above.
-    judge_handlers=[create_claude_messages_handler()],
 )
 ```
 
@@ -184,9 +192,9 @@ Two limits keep a trajectory from spending the judge's context window: at most 5
 
 A tool result is now judge-prompt input. It stays literal for the same reason the generated output does: the judge config is handed to the handler unrendered and the handler makes exactly one template pass, so a `{{...}}` sequence coming back from a tool is never expanded into the judge prompt.
 
-**Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`, and a handler built for one provider cannot execute another's config. `handler` runs a judge when it provides for that judge's provider; pass handlers for any other providers in `judge_handlers`. Selection prefers a handler naming the judge's provider outright over a wildcard multi-provider adapter, and an agent-mode handler can serve a messages-mode judge with its messages collapsed into one instructions block. A plain callable that declares no `provides_for` routes itself, exactly as it already does for the generation config.
+**Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`. Each judge selects its handler from `handler` or `handlers` by its provider and mode, with the same rule as generation. There is no mode fallback: a messages-mode judge never runs on an agent handler. A judge's prompt must also match its handler's mode. Judges get no tools: the harness passes an empty tool map and removes `tools` from the judge config.
 
-Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge or one no handler covers fails the run up front rather than after the generation spend. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
+Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge, a judge that no handler covers, or a judge whose prompt does not match its handler fails the run up front rather than after the generation spend. One error lists every judge with a problem. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
 
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 
@@ -287,7 +295,7 @@ result = await evals.run(
     key="support-qa-2026-08-20",
     dataset="support-golden",
     handler=create_openai_messages_handler(),
-    generation={"provider": "OpenAI", "model": "gpt-4o"},
+    generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     tools=[search_docs_tool, lookup_order_tool],
 )
 ```
@@ -346,6 +354,28 @@ async def main():
     await shutdown()
 
 asyncio.run(main())
+```
+
+#### Deferred judges
+
+With `skip_judges=True`, `invoke()` returns `judge_tasks` instead of running them. Run each with `run_judge(task, handlers)` on your own thread or process, then track the result. A judge that scores several labels in one call (a TypeSafe judge, for example) returns `metrics`: track each entry under its own `eventKey`, and do not also track `evaluation_metric_key`.
+
+```python
+from ldclient import Context
+from launchdarkly_ai_server import get_client, run_judge
+
+result = await run_judge(task, handlers)
+context = Context.from_dict(task.user_context)
+if result and result.metrics:
+    for metric in result.metrics:
+        get_client().track(
+            metric["eventKey"],
+            context,
+            {**result.track_data, "judgeConfigKey": metric["judgeConfigKey"]},
+            metric["score"],
+        )
+elif result and task.evaluation_metric_key:
+    get_client().track(task.evaluation_metric_key, context, result.track_data, result.score)
 ```
 
 ### `graph(key, **options)`
