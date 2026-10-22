@@ -112,7 +112,6 @@ class TestHostProcessSettingsAreNeverForwarded:
                     "effort": "high",
                     "max_budget_usd": 1.5,
                     "fallback_model": "claude-sonnet-4-5",
-                    "output_format": {"type": "json_schema", "schema": {}},
                     "betas": ["context-1m-2025-08-07"],
                 }
             ),
@@ -128,6 +127,22 @@ class TestHostProcessSettingsAreNeverForwarded:
         assert options.effort == "high"
         assert options.max_budget_usd == 1.5
         assert options.fallback_model == "claude-sonnet-4-5"
-        assert options.output_format == {"type": "json_schema", "schema": {}}
         assert options.betas == ["context-1m-2025-08-07"]
         assert not find_leaks(options)
+
+    def test_output_format_is_dropped_the_handler_owns_structured_output(self) -> None:
+        """The handler puts the config's ``outputFormat`` schema in the system prompt, so a
+        ``model.parameters.output_format`` with a different schema must not reach the SDK,
+        which would enforce it instead."""
+        options = _build_query_options(
+            _config(
+                {"output_format": {"type": "json_schema", "schema": {}}, "max_turns": 4}
+            ),
+            None,
+            [],
+            [],
+            None,
+            None,
+        )
+        assert options.output_format is None
+        assert options.max_turns == 4

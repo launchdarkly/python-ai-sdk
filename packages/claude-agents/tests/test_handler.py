@@ -2672,7 +2672,9 @@ class TestThinkingIsRebuilt:
 
 
 class TestMalformedObjectValuesAreDropped:
-    def test_thinking_and_output_format_that_are_not_objects_are_dropped(self) -> None:
+    def test_a_thinking_that_is_not_an_object_and_output_format_are_dropped(
+        self,
+    ) -> None:
         from launchdarkly_ai_claude_agents.handler import _options_parameters
 
         params = _options_parameters(

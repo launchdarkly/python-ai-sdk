@@ -55,7 +55,6 @@ CLAUDE_AGENTS = frozenset(
         "max_budget_usd",
         "max_thinking_tokens",
         "max_turns",
-        "output_format",
         "thinking",
     }
 )

@@ -100,14 +100,13 @@ _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
         "max_budget_usd",
         "max_thinking_tokens",
         "max_turns",
-        "output_format",
         "thinking",
     }
 )
 
 #: Forwarded keys whose value must be an object. A config value of any other type is malformed
 #: and dropped rather than passed to ``ClaudeAgentOptions``.
-_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS = frozenset({"output_format", "thinking"})
+_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS = frozenset({"thinking"})
 
 #: Accepted by ``ClaudeAgentOptions`` but never forwarded, and why:
 #: * ``cli_path``, ``env``, ``cwd``, ``add_dirs``, ``settings``, ``setting_sources``, ``plugins``,
@@ -122,6 +121,9 @@ _CLAUDE_AGENT_OPTIONS_MAPPING_KEYS = frozenset({"output_format", "thinking"})
 #: * ``stderr``, ``debug_stderr``, ``include_partial_messages``, ``include_hook_events``,
 #:   ``max_buffer_size``, ``load_timeout_ms``: process I/O and transport plumbing, including the
 #:   streamed message shape the handler reads.
+#: * ``output_format``: structured output, which the handler owns through the config's
+#:   ``outputFormat`` by adding its schema to the system prompt. Forwarding a second schema here
+#:   would have the reply follow one schema while the prompt asks for another.
 #: * ``task_budget``: not one of the agreed run settings yet; ``max_turns`` and ``max_budget_usd``
 #:   cover run limits.
 #:
@@ -145,6 +147,7 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
         "include_partial_messages",
         "load_timeout_ms",
         "max_buffer_size",
+        "output_format",
         "permission_mode",
         "permission_prompt_tool_name",
         "plugins",
