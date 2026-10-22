@@ -113,6 +113,46 @@ async def main():
 asyncio.run(main())
 ```
 
+## Agent Skills (experimental)
+
+> **Experimental.** Imported from `launchdarkly_ai_claude_agents.experimental.skills`. The name and behavior may change in a minor release, and each change is listed under **Experimental** in the changelog.
+
+`create_claude_agents_handler()` doesn't give the model a variation's skills. `create_claude_agents_skills_handler()` does. It takes the same options, plus `skills_temp_dir`.
+
+```python
+import os
+from launchdarkly_ai_server import config
+from launchdarkly_ai_server.experimental.skills import FDv2SkillStore, set_skill_store
+from launchdarkly_ai_claude_agents.experimental.skills import (
+    create_claude_agents_skills_handler,
+)
+
+store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
+store.wait_for_skills(timeout=10)
+set_skill_store(store)
+
+triage = config(
+    key="triage-agent",
+    handler=create_claude_agents_skills_handler(setting_sources=[]),
+)
+```
+
+On every invoke and stream it:
+
+1. Writes the variation's `skills` into a new directory under `skills_temp_dir` (default: `tempfile.gettempdir()`), through the store you configured with `set_skill_store`. Pinned versions are honored.
+2. Hands that directory to the Claude Agent SDK as a local plugin named `launchdarkly`, enables only those skills (`launchdarkly:<key>`), and turns on the `Skill` tool.
+3. Removes the directory when the run ends, whether it succeeded, failed, or a stream was abandoned.
+
+Each run has its own directory, so concurrent runs and different variations never share files, and nothing needs to watch for changes. Detaching a skill from a variation takes effect on the next run.
+
+`setting_sources` behaves as on the core factory and is always sent, `[]` unless you give sources. Without it, `claude-agent-sdk` would load the `user` and `project` settings sources whenever skills are enabled.
+
+**A run whose skills can't be written doesn't start.** The handler raises before the model is called if no store is configured, the store hasn't received its first payload, a skill fails integrity verification, or a pinned version isn't in the store. The error names each skill. A variation with no skills runs exactly as it would with `create_claude_agents_handler()`, and needs no store.
+
+A `Skill` call shows up in traces as an `execute_tool Skill` span.
+
+**Not covered yet:** `claude_agents()`, `claude_graph()` and `to_claude_agents()` use the core handler, so a variation run through them doesn't get its skills.
+
 ## How It Works
 
 - Uses the system prompt and conversation history defined in your LaunchDarkly flag config.
