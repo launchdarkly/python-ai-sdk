@@ -24,6 +24,7 @@ dev = [
   "pre-commit>=4.6.0",
   "brotlicffi>=1.0",
   "langchain-aws>=1",
+  "griffelib>=2.1.0",
   "ai[openai]>=0.7",
 ]
 
