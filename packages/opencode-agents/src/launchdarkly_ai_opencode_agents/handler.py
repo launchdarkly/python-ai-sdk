@@ -9,6 +9,7 @@ yields ``chunk`` then ``done``.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncGenerator, AsyncIterable, Mapping
 from contextlib import aclosing
@@ -502,9 +503,11 @@ def create_opencode_handler(
 
     ``provides_for`` is ``('*', 'agent')``. *cwd* is the working directory,
     *config* is the OpenCode config file, and *env* is the child environment.
-    The handler sets ``OPENCODE_CONFIG`` from *config*. *command* is the
-    executable, ``opencode`` when omitted. A test passes a fake executable
-    here. There is no URL, client, or transport argument.
+    The handler sets ``OPENCODE_CONFIG`` from *config* and
+    ``OPENCODE_SERVER_PASSWORD`` to a generated secret, replacing any password
+    in *env*. *command* is the executable, ``opencode`` when omitted. A test
+    passes a fake executable here. There is no URL, client, or transport
+    argument.
 
     Entering the handler as an async context starts the process and returns
     only once it is healthy. Exiting waits until the process has stopped, so a
@@ -574,7 +577,9 @@ class OpenCodeHandler(ProviderHandler):
         self._agent = agent
         self._active: OpenCodeServe | None = None
         self._base_url: str | None = None
+        self._password: str | None = None
         self._depth = 0
+        self._lock = asyncio.Lock()
         super().__init__(
             fn=self._call_impl,
             provides_for=("*", "agent"),
@@ -583,13 +588,20 @@ class OpenCodeHandler(ProviderHandler):
         )
 
     async def __aenter__(self) -> OpenCodeHandler:
-        """Start ``opencode serve`` and return once it answers on loopback."""
-        if self._active is None:
-            active = self._serve.spawn()
-            self._base_url = await active.start()
-            self._active = active
-        self._depth += 1
-        return self
+        """Start ``opencode serve`` and return once it answers on loopback.
+
+        Concurrent entries share that process. The lock covers startup so a
+        second entry cannot replace ``_active`` and leave the first process
+        running.
+        """
+        async with self._lock:
+            if self._active is None:
+                active = self._serve.spawn()
+                self._base_url = await active.start()
+                self._password = active.password
+                self._active = active
+            self._depth += 1
+            return self
 
     async def __aexit__(
         self,
@@ -598,14 +610,16 @@ class OpenCodeHandler(ProviderHandler):
         traceback: Any,
     ) -> None:
         """Stop the process and wait until it has exited."""
-        self._depth -= 1
-        if self._depth > 0:
-            return
-        active = self._active
-        self._active = None
-        self._base_url = None
-        if active is not None:
-            await active.stop()
+        async with self._lock:
+            self._depth -= 1
+            if self._depth > 0:
+                return
+            active = self._active
+            self._active = None
+            self._base_url = None
+            self._password = None
+            if active is not None:
+                await active.stop()
 
     async def _stream_impl(
         self,
@@ -625,11 +639,17 @@ class OpenCodeHandler(ProviderHandler):
         # A context-owned process outlives this stream, so a caller timeout
         # that cancels the stream cannot cancel its shutdown.
         owned: OpenCodeServe | None = None
-        if self._active is not None and self._base_url is not None:
+        if (
+            self._active is not None
+            and self._base_url is not None
+            and self._password is not None
+        ):
             base_url = self._base_url
+            password = self._password
         else:
             owned = self._serve.spawn()
             base_url = ""
+            password = ""
         try:
             set_input_content_attributes(
                 span,
@@ -639,11 +659,13 @@ class OpenCodeHandler(ProviderHandler):
             )
             if owned is not None:
                 base_url = await owned.start()
+                password = owned.password
             created = _Created()
             async with aclosing(
                 _reduce_session(
                     created,
                     base_url=base_url,
+                    password=password,
                     prompt=prompt,
                     system=system,
                     provider_id=provider_id,
@@ -714,6 +736,7 @@ async def _reduce_session(
     created: _Created,
     *,
     base_url: str,
+    password: str,
     prompt: str,
     system: str | None,
     provider_id: str,
@@ -727,6 +750,7 @@ async def _reduce_session(
     async with aclosing(
         session_events(
             base_url=base_url,
+            password=password,
             prompt=prompt,
             system=system,
             provider_id=provider_id,

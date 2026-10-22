@@ -32,9 +32,9 @@ A run opens one `invoke_agent` span and sets `launchdarkly.operation.type`. The 
 
 ## Call shape
 
-`create_opencode_handler(*, cwd, config, env, capture_content=None, model=None, agent=None, command=None)` returns a `ProviderHandler`. `cwd` is the working directory. `config` is the path of the OpenCode config file. `env` replaces the child environment, and the handler sets `OPENCODE_CONFIG` from `config`. `command` defaults to `opencode`. A test passes a fake executable instead of a URL. There is no `base_url`, client, or transport argument.
+`create_opencode_handler(*, cwd, config, env, capture_content=None, model=None, agent=None, command=None)` returns a `ProviderHandler`. `cwd` is the working directory. `config` is the path of the OpenCode config file. `env` replaces the child environment, and the handler sets `OPENCODE_CONFIG` from `config`. Each start also sets `OPENCODE_SERVER_PASSWORD` to a generated secret, replacing one inherited from `env`, and sends it as basic auth. `command` defaults to `opencode`. A test passes a fake executable instead of a URL. There is no `base_url`, client, or transport argument.
 
-`async with handler` starts the process and returns once it is healthy. The process stops when that context exits, after `config().stream()` returns, including when the caller times out or closes the stream. A wall-clock budget goes around `config().stream()`, not around the context. Closing the stream still aborts the session. Without the context, one call starts and stops its own process.
+`async with handler` starts the process and returns once `/global/health` returns 200 and `healthy: true`. Concurrent entries share that process. The process stops when the last context exits, after `config().stream()` returns, including when the caller times out or closes the stream. A wall-clock budget goes around `config().stream()`, not around the context. Closing the stream still aborts the session. Without the context, one call starts and stops its own process.
 
 Assistant text is emitted only after `message.updated` marks that message `role == "assistant"`. A part snapshot is the full text of that part so far; a later delta appends. A text delta without `partID` is dropped.
 

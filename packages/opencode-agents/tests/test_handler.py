@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
@@ -22,6 +23,7 @@ from launchdarkly_ai_opencode_agents import (
     create_opencode_handler,
     opencode_agents,
 )
+from launchdarkly_ai_opencode_agents.process import _is_healthy
 from launchdarkly_ai_opencode_agents.server import default_model
 from launchdarkly_ai_server import SDKOptions, config, configure
 
@@ -125,6 +127,7 @@ class Script:
         message_status: int = 200,
         delay_tail: float = 0,
         delay_ready: float = 0,
+        exit_stderr: str | None = None,
     ) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="oc-fake-"))
         self.cwd = self.root / "work"
@@ -142,6 +145,7 @@ class Script:
                     "message_status": message_status,
                     "delay_tail": delay_tail,
                     "delay_ready": delay_ready,
+                    "exit_stderr": exit_stderr,
                 }
             ),
             encoding="utf-8",
@@ -1614,6 +1618,72 @@ class TestProcess:
                     )
                 ]
         assert seen[-1]["output"] == "Hi"
+
+    async def test_two_concurrent_contexts_leave_no_process(self) -> None:
+        script = Script([])
+        handler = create_opencode_handler(**script.handler_args())
+
+        async def user() -> None:
+            async with handler:
+                await asyncio.sleep(0.1)
+
+        await asyncio.gather(user(), user())
+        assert script.pids
+        assert len(script.pids) == 1
+        assert all(not _alive(pid) for pid in script.pids)
+
+    async def test_a_generated_password_replaces_one_from_the_environment(
+        self,
+    ) -> None:
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        args = script.handler_args()
+        args["env"] = {**args["env"], "OPENCODE_SERVER_PASSWORD": "inherited-secret"}
+        handler = create_opencode_handler(**args)
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi"
+        records = script._records()
+        assert len(records) == 1
+        password = records[0]["password"]
+        assert isinstance(password, str) and password
+        assert password != "inherited-secret"
+
+    async def test_a_startup_failure_includes_the_stderr_tail(self) -> None:
+        prefix = "HEAD-MARKER"
+        tail = "TAIL-MARKER"
+        script = Script([], exit_stderr=prefix + ("x" * 4000) + tail)
+        handler = create_opencode_handler(**script.handler_args())
+        with pytest.raises(RuntimeError) as caught:
+            async with handler:
+                pass
+        message = str(caught.value)
+        assert "exited during startup" in message
+        assert tail in message
+        assert prefix not in message
+
+    def test_health_requires_a_healthy_body(self) -> None:
+        assert _is_healthy(httpx.Response(200, json={"healthy": True, "version": "1"}))
+        assert not _is_healthy(httpx.Response(404, json={"healthy": True}))
+        assert not _is_healthy(httpx.Response(200, json={}))
+        assert not _is_healthy(httpx.Response(200, json={"healthy": False}))
+        assert not _is_healthy(httpx.Response(200, content=b"ok"))
 
 
 async def _drain(stream: Any) -> None:

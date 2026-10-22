@@ -6,6 +6,7 @@ speaks the stable HTTP routes, and exits when the handler stops the process.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import select
@@ -30,10 +31,13 @@ class _Request(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         script: _Server = self.server.script  # type: ignore[attr-defined]
+        if not script.authorized(self.headers):
+            self.send_error(401)
+            return
         path = self.path.split("?", 1)[0]
         script.note("GET", path)
         if path == "/global/health":
-            body = b"{}"
+            body = b'{"healthy":true,"version":"fake"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -55,6 +59,9 @@ class _Request(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         script: _Server = self.server.script  # type: ignore[attr-defined]
+        if not script.authorized(self.headers):
+            self.send_error(401)
+            return
         path = self.path.split("?", 1)[0]
         script.note("POST", path)
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -84,6 +91,19 @@ class _Server:
         self.release = threading.Event()
         self._lock = threading.Lock()
 
+    def authorized(self, headers: Any) -> bool:
+        expected = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
+        if not expected:
+            return False
+        header = headers.get("Authorization")
+        if not isinstance(header, str) or not header.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(header[6:].strip(), validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return decoded == f"opencode:{expected}"
+
     def note(self, method: str, path: str) -> None:
         with self._lock:
             self.requests.append({"method": method, "path": path})
@@ -97,6 +117,7 @@ class _Server:
             "argv": sys.argv,
             "cwd": os.getcwd(),
             "config": os.environ.get("OPENCODE_CONFIG", ""),
+            "password": os.environ.get("OPENCODE_SERVER_PASSWORD", ""),
             "sessions": self.sessions,
             "messages": self.messages,
             "aborts": self.aborts,
@@ -253,6 +274,11 @@ def main() -> None:
         raise SystemExit(2)
     server = _Server(spec, os.environ.get("LD_OPENCODE_FAKE_DIR", ""))
     server.write()
+    exit_stderr = spec.get("exit_stderr")
+    if isinstance(exit_stderr, str) and exit_stderr:
+        sys.stderr.write(exit_stderr)
+        sys.stderr.flush()
+        raise SystemExit(1)
     delay_ready = spec.get("delay_ready")
     if isinstance(delay_ready, int | float) and delay_ready > 0:
         time.sleep(delay_ready)

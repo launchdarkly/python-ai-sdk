@@ -1,22 +1,28 @@
 """Start and stop one ``opencode serve`` for a single handler call.
 
-The process is loopback-only. Callers pass a working directory, a config file,
-and an environment. They do not pass a URL, an HTTP client, or a transport.
+The process is loopback-only. Each start sets a generated basic-auth password
+on the child, and the health probe sends it. Callers pass a working directory,
+a config file, and an environment. They do not pass a URL, an HTTP client, or
+a transport.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import socket
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from typing import BinaryIO, cast
 
 import httpx
 
 _STARTUP_TIMEOUT_SECONDS = 45.0
 _SHUTDOWN_GRACE_SECONDS = 5.0
 _PROBE_INTERVAL_SECONDS = 0.05
+_STDERR_TAIL_BYTES = 2048
 
 _CommandPart = str | os.PathLike[str]
 Command = _CommandPart | Sequence[_CommandPart] | None
@@ -38,6 +44,15 @@ class OpenCodeServe:
         self._config = config
         self._env = env
         self._proc: asyncio.subprocess.Process | None = None
+        self._password: str | None = None
+        self._stderr: BinaryIO | None = None
+
+    @property
+    def password(self) -> str:
+        """The basic-auth secret ``start`` gave this child."""
+        if self._password is None:
+            raise RuntimeError("opencode serve failed to start.")
+        return self._password
 
     def spawn(self) -> OpenCodeServe:
         """A new child. Calls do not share a process."""
@@ -55,6 +70,8 @@ class OpenCodeServe:
             raise FileNotFoundError("OpenCode working directory does not exist.")
         if not os.path.isfile(config):
             raise FileNotFoundError("OpenCode config file does not exist.")
+        password = secrets.token_urlsafe(32)
+        self._password = password
         port = _free_port()
         argv = [
             *self._command,
@@ -64,19 +81,23 @@ class OpenCodeServe:
             "--hostname",
             "127.0.0.1",
         ]
+        # A pipe fills and blocks when the server writes and nothing reads it.
+        stderr = tempfile.TemporaryFile()
+        self._stderr = stderr
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=cwd,
-                env=_child_env(self._env, config),
+                env=_child_env(self._env, config, password),
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=stderr,
             )
         except OSError as exc:
+            self._close_stderr()
             raise RuntimeError("opencode serve failed to start.") from exc
         base = f"http://127.0.0.1:{port}"
         try:
-            await self._wait_until_listening(base)
+            await self._wait_until_listening(base, password)
         except BaseException:
             await self.stop()
             raise
@@ -84,10 +105,10 @@ class OpenCodeServe:
 
     async def stop(self) -> None:
         proc = self._proc
-        if proc is None:
-            return
         self._proc = None
         try:
+            if proc is None:
+                return
             if proc.returncode is None:
                 proc.terminate()
                 try:
@@ -99,16 +120,18 @@ class OpenCodeServe:
                 await proc.wait()
         except (ProcessLookupError, OSError):
             return
+        finally:
+            self._close_stderr()
 
-    async def _wait_until_listening(self, base: str) -> None:
+    async def _wait_until_listening(self, base: str, password: str) -> None:
         proc = self._proc
         if proc is None:
             raise RuntimeError("opencode serve failed to start.")
         deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
-        async with httpx.AsyncClient() as http:
+        async with httpx.AsyncClient(auth=("opencode", password)) as http:
             while time.monotonic() < deadline:
                 if proc.returncode is not None:
-                    raise RuntimeError(
+                    raise self._startup_error(
                         "opencode serve exited during startup "
                         f"(code {proc.returncode})."
                     )
@@ -116,10 +139,39 @@ class OpenCodeServe:
                     response = await http.get(f"{base}/global/health", timeout=2.0)
                 except httpx.HTTPError:
                     response = None
-                if response is not None and response.status_code < 500:
+                if response is not None and _is_healthy(response):
                     return
                 await asyncio.sleep(_PROBE_INTERVAL_SECONDS)
-        raise RuntimeError("opencode serve did not become healthy in time.")
+        raise self._startup_error("opencode serve did not become healthy in time.")
+
+    def _startup_error(self, message: str) -> RuntimeError:
+        tail = self._stderr_tail()
+        if not tail:
+            return RuntimeError(message)
+        return RuntimeError(f"{message}\n{tail}")
+
+    def _stderr_tail(self) -> str:
+        handle = self._stderr
+        if handle is None:
+            return ""
+        try:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _STDERR_TAIL_BYTES), os.SEEK_SET)
+            raw = handle.read()
+        except OSError:
+            return ""
+        return raw.decode("utf-8", errors="replace").strip()
+
+    def _close_stderr(self) -> None:
+        handle = self._stderr
+        self._stderr = None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except OSError:
+            return
 
 
 def serve_from(
@@ -176,16 +228,25 @@ def _one_command(part: str) -> str:
     return part
 
 
-def _child_env(env: Mapping[str, str], config: str) -> dict[str, str]:
+def _child_env(env: Mapping[str, str], config: str, password: str) -> dict[str, str]:
     child = dict(env)
     child["OPENCODE_CONFIG"] = config
+    child["OPENCODE_SERVER_PASSWORD"] = password
     return child
+
+
+def _is_healthy(response: httpx.Response) -> bool:
+    """``/global/health`` is ready only with 200 and ``healthy: true``."""
+    if response.status_code != 200:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(body, dict) and body.get("healthy") is True
 
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
-        allocated = sock.getsockname()[1]
-    if not isinstance(allocated, int):
-        raise RuntimeError("opencode serve failed to start.")
-    return allocated
+        return cast(int, sock.getsockname()[1])

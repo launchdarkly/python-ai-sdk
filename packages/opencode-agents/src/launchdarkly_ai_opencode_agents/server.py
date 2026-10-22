@@ -55,6 +55,7 @@ def default_model(config: dict[str, Any]) -> tuple[str, str]:
 async def session_events(
     *,
     base_url: str,
+    password: str,
     prompt: str,
     system: str | None,
     provider_id: str,
@@ -65,14 +66,16 @@ async def session_events(
     """Open one session and yield its bus events.
 
     The handler owns the HTTP client. ``base_url`` is the ``opencode serve``
-    this call started. Callers do not supply a client or a transport. The
-    event stream is opened before the message post. The post runs
-    concurrently with the read. This session's ``session.idle`` ends the
+    this call started. ``password`` is the secret that start set on the child,
+    sent as basic auth with username ``opencode``. Callers do not supply a
+    client or a transport. The event stream is opened before the message post.
+    The post runs concurrently with the read. This session's ``session.idle`` ends the
     turn. A failed message POST raises without waiting for another bus
     frame. Leaving early cancels the post and aborts the session.
     """
     http = httpx.AsyncClient(
-        timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=MESSAGE_TIMEOUT_SECONDS)
+        auth=("opencode", password),
+        timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=MESSAGE_TIMEOUT_SECONDS),
     )
     base = base_url.rstrip("/")
     post: asyncio.Task[httpx.Response] | None = None

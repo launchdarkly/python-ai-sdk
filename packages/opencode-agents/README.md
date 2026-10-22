@@ -34,6 +34,6 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`cwd` is the working directory, `config` is the OpenCode config file, and `env` is the child environment. The handler sets `OPENCODE_CONFIG` from `config` and binds `opencode serve` to loopback. A caller does not pass a URL, an HTTP client, or a transport. `command` overrides the `opencode` executable; a test passes a fake executable there.
+`cwd` is the working directory, `config` is the OpenCode config file, and `env` is the child environment. The handler sets `OPENCODE_CONFIG` from `config`, replaces any `OPENCODE_SERVER_PASSWORD` in `env` with a generated secret, and binds `opencode serve` to loopback. Requests to that server use that secret as basic auth. A caller does not pass a URL, an HTTP client, or a transport. `command` overrides the `opencode` executable; a test passes a fake executable there.
 
 Entering the handler starts `opencode serve` and returns once it is healthy. The process stops when the context exits, after `config().stream()` returns. Put a wall-clock limit around `config().stream()`, not around the context. A judge routed here runs as a full OpenCode agent: the server's tools, in `cwd`, apply to the judge prompt. There is no tool-less judge mode. The handler yields AG-UI text and tool events. `config().stream()` yields `chunk` then `done`.
