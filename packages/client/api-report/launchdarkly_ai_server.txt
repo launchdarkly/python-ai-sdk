@@ -148,6 +148,7 @@ ProviderGraphResponse  [class, @dataclass]
   usage: UsageDict
 ProviderHandler  [class]
   __init__(fn: _HandlerFn, provides_for: tuple[str, Literal['agent', 'messages']] | None = None, stream_fn: _StreamFn | None = None, capture_content: bool | None = None)
+  __call__(config: AiConfigRep, user_input: str | None = None, tool_handlers: dict[str, Any] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> HandlerResult  [async]
   capture_content: bool  [property]
   has_stream: bool  [property]
   provides_for: tuple[str, Literal['agent', 'messages']] | None = provides_for
@@ -180,6 +181,7 @@ SDK_INFO_CONTEXT: LDContext = {'kind': 'ld_ai', 'key': 'ld-internal-tracking', '
 SDK_INFO_EVENT = '$ld:ai:sdk:info'
 SDKOptions  [class, @dataclass(frozen=True)]
   __init__(capture_content: bool = False)
+  __post_init__() -> None
   capture_content: bool = False
 set_conversation_id_if_absent(span: Any, conversation: str) -> None
 set_input_content_attributes(span: Any, capture: bool, *, system_instructions: str | None = None, messages: list[SpanMessage] | None = None, tool_definitions: list[ToolDefinitionInput] | None = None) -> None

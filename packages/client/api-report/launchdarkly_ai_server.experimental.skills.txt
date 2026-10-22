@@ -2,6 +2,8 @@
 all_skills() -> list[Skill]  [async]
 FDv2SkillStore  [class]
   __init__(sdk_key: str, *, base_uri: str | None = None, stream_uri: str | None = None, mode: Mode = 'stream', poll_interval: float = 30.0, read_timeout: float | None = None, initial_backoff: float = 1.0, max_backoff: float = 30.0, _requester: Any = None)
+  __enter__() -> FDv2SkillStore
+  __exit__(*_exc: Any) -> None
   add_listener(kind: str, fn: Callable[[dict[str, Any]], Any]) -> None
   all_objects(kind: str) -> dict[str, dict[str, Any]]
   close(timeout: float = 5.0) -> None
@@ -64,6 +66,8 @@ SkillStore(Protocol)  [class]
   get_object(kind: str, key: str, version: int | None = None) -> dict[str, Any] | None
 SkillWatcher  [class]
   __init__(request: Sequence[Skill | SkillReference | str] | str, root: str | os.PathLike[str], store: Any, *, prune: bool, timeout: float, on_unavailable: OnUnavailable, debounce: float, on_reconcile: Callable[[ReconcileReport], Any] | None)
+  __enter__() -> SkillWatcher
+  __exit__(*_exc: Any) -> None
   close(timeout: float = 15.0) -> None
   notify(_raw: Any = None) -> None
   reconciles: int  [property]
