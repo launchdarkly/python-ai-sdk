@@ -2676,6 +2676,51 @@ async def test_every_judge_problem_is_reported_in_one_error(
 
 
 @pytest.mark.asyncio
+async def test_an_agent_mode_judge_with_messages_fails_before_any_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_extract_variation(
+        key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "config": {
+                "provider": {"name": "OpenAI"},
+                "model": {"name": "judge-model"},
+                "messages": [{"role": "system", "content": "Judge"}],
+            },
+            "meta": {"variationKey": "default", "version": 1, "mode": "agent"},
+        }
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    transport = judge_run_transport()
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    generation_handler = AsyncMock(return_value={"output": "generated"})
+    judge_handler = AsyncMock(return_value={"output": "{}"})
+
+    with pytest.raises(EvaluationsError) as error:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handlers=[
+                tagged(generation_handler),
+                tagged(judge_handler, ("OpenAI", "agent")),
+            ],
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+            criteria=[Judge(key="agent-judge")],
+        )
+
+    assert "judge 'agent-judge': prompt needs 'instructions'" in str(error.value)
+    assert transport.requests == []
+    generation_handler.assert_not_awaited()
+    judge_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_mixed_modes_route_generation_and_judge_to_their_own_handlers(
     monkeypatch: pytest.MonkeyPatch,
     stub_sdk_client: MagicMock,
@@ -4367,25 +4412,43 @@ async def test_generation_mode_and_prompt_are_checked_before_network_io(
 
 
 @pytest.mark.asyncio
-async def test_an_agent_handler_rejects_a_messages_prompt() -> None:
-    transport = SequencedTransport([])
-    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
-
-    with pytest.raises(
-        EvaluationsError,
-        match="generation prompt needs 'instructions' because the handler is an agent",
-    ):
-        await evals.run(
-            key="eval-key",
-            dataset="golden",
-            handler=tagged(_echo, ("OpenAI", "agent")),
-            generation={
+@pytest.mark.parametrize(
+    ("provides_for", "generation", "message"),
+    [
+        (
+            ("OpenAI", "agent"),
+            {
                 **COMPLETION,
                 "mode": "agent",
                 "messages": [{"role": "user", "content": "hi"}],
             },
+            "The generation prompt needs 'instructions' because the handler is an "
+            "agent handler, but it has 'messages'. Handler: ('OpenAI', 'agent').",
+        ),
+        (
+            ("OpenAI", "messages"),
+            {**COMPLETION, "instructions": "Help."},
+            "The generation prompt needs 'messages' because the handler is a "
+            "messages handler, but it has 'instructions'. "
+            "Handler: ('OpenAI', 'messages').",
+        ),
+    ],
+)
+async def test_a_prompt_for_the_other_mode_names_the_handler(
+    provides_for: tuple[str, str], generation: dict[str, Any], message: str
+) -> None:
+    transport = SequencedTransport([])
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(EvaluationsError) as error:
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=tagged(_echo, provides_for),
+            generation=generation,
         )
 
+    assert str(error.value) == message
     assert transport.requests == []
 
 
