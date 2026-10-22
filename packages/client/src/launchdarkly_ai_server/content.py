@@ -545,6 +545,22 @@ def set_tool_call_content_attributes(
         span.set_attribute("gen_ai.tool.call.result", _stringify_tool_value(result))
 
 
+def tool_result_string(value: Any) -> str:
+    """Render a tool handler's return value as the text sent back to the provider.
+
+    A string passes through unchanged, ``None`` becomes ``""``, and anything else becomes
+    JSON (non-ASCII kept as is). A value JSON cannot encode falls back to ``str(value)``.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _stringify_tool_value(value: Any) -> str:
     """A string passes through unchanged; anything else becomes JSON."""
     return value if isinstance(value, str) else json.dumps(value)

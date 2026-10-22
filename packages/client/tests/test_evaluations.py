@@ -167,41 +167,148 @@ def test_missing_sdk_key_raises_when_the_byoc_client_cannot_emit_events(
         init_evaluations(transport=failing_transport)
 
 
-def test_base_uri_override_isolated_from_sdk_delivery_uri(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.fixture
+def host_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
-    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com/")
-    monkeypatch.setenv("LD_BASE_URI", "https://relay.example.com/")
+    for name in ("LD_API_BASE_URI", "LD_UI_BASE_URI", "LD_BASE_URI"):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
 
-    from_env = init_evaluations(transport=RecordingTransport())
-    explicit = init_evaluations(
-        base_uri="https://other.example.com", transport=RecordingTransport()
+
+def request_url(**options: Any) -> str:
+    """Init the harness, send one management API request, return its URL."""
+    transport = RecordingTransport()
+    evals = init_evaluations(transport=transport, **options)
+    evals.api.get("projects/proj/evaluations")
+    return str(transport.requests[0]["url"])
+
+
+def test_api_host_option_wins_over_env(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+
+    url = request_url(api_base_uri="https://other.example.com")
+
+    assert url == "https://other.example.com/api/v2/projects/proj/evaluations"
+
+
+def test_api_host_env_wins_over_default(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+
+    url = request_url()
+
+    assert url == "https://api.staging.example.com/api/v2/projects/proj/evaluations"
+
+
+def test_api_host_defaults_to_production(host_env: pytest.MonkeyPatch) -> None:
+    assert (
+        request_url() == "https://app.launchdarkly.com/api/v2/projects/proj/evaluations"
     )
 
-    assert from_env.api.base_uri == "https://api.staging.example.com"
-    assert explicit.api.base_uri == "https://other.example.com"
 
-
-def test_ui_base_uri_precedence_and_api_base_isolation(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_api_host_option_falls_through_to_env(
+    host_env: pytest.MonkeyPatch, blank: str
 ) -> None:
-    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
-    monkeypatch.setenv("LD_API_TOKEN", "api-token")
-    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
-    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
-    monkeypatch.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com/")
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
 
-    from_env = init_evaluations(transport=RecordingTransport())
-    explicit = init_evaluations(
+    url = request_url(api_base_uri=blank)
+
+    assert url == "https://api.staging.example.com/api/v2/projects/proj/evaluations"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_api_host_at_both_levels_falls_through_to_default(
+    host_env: pytest.MonkeyPatch, blank: str
+) -> None:
+    host_env.setenv("LD_API_BASE_URI", blank)
+
+    url = request_url(api_base_uri=blank)
+
+    assert url == "https://app.launchdarkly.com/api/v2/projects/proj/evaluations"
+
+
+@pytest.mark.parametrize(
+    "options, env",
+    [
+        ({"api_base_uri": "https://host/"}, None),
+        ({}, "https://host/"),
+    ],
+)
+def test_api_host_trailing_slash_is_stripped(
+    host_env: pytest.MonkeyPatch, options: dict[str, str], env: str | None
+) -> None:
+    if env is not None:
+        host_env.setenv("LD_API_BASE_URI", env)
+
+    assert request_url(**options) == "https://host/api/v2/projects/proj/evaluations"
+
+
+def test_sdk_delivery_host_alone_does_not_move_api_requests(
+    host_env: pytest.MonkeyPatch,
+) -> None:
+    host_env.setenv("LD_BASE_URI", "https://relay.example.com")
+
+    url = request_url()
+
+    assert url == "https://app.launchdarkly.com/api/v2/projects/proj/evaluations"
+
+
+def test_init_evaluations_has_no_base_uri_option(host_env: pytest.MonkeyPatch) -> None:
+    with pytest.raises(TypeError):
+        init_evaluations(base_uri="https://relay.example.com")  # type: ignore[call-arg]
+
+
+def test_ui_host_option_wins_over_env(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com")
+
+    evals = init_evaluations(
         ui_base_uri="https://ui.example.com/", transport=RecordingTransport()
     )
 
-    assert from_env.api.base_uri == "https://api.staging.example.com"
-    assert from_env.ui_base_uri == "https://ui.staging.example.com"
-    assert explicit.ui_base_uri == "https://ui.example.com"
+    assert evals.ui_base_uri == "https://ui.example.com"
+
+
+def test_ui_host_env_wins_over_default(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com/")
+
+    evals = init_evaluations(transport=RecordingTransport())
+
+    assert evals.ui_base_uri == "https://ui.staging.example.com"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_ui_host_option_falls_through_to_env(
+    host_env: pytest.MonkeyPatch, blank: str
+) -> None:
+    host_env.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com")
+
+    evals = init_evaluations(ui_base_uri=blank, transport=RecordingTransport())
+
+    assert evals.ui_base_uri == "https://ui.staging.example.com"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_ui_host_at_both_levels_falls_through_to_default(
+    host_env: pytest.MonkeyPatch, blank: str
+) -> None:
+    host_env.setenv("LD_UI_BASE_URI", blank)
+
+    evals = init_evaluations(ui_base_uri=blank, transport=RecordingTransport())
+
+    assert evals.ui_base_uri == "https://app.launchdarkly.com"
+
+
+def test_api_host_env_alone_leaves_ui_host_on_default(
+    host_env: pytest.MonkeyPatch,
+) -> None:
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+
+    evals = init_evaluations(transport=RecordingTransport())
+
+    assert evals.api.base_uri == "https://api.staging.example.com"
+    assert evals.ui_base_uri == "https://app.launchdarkly.com"
 
 
 def test_requests_carry_token_auth_and_json_body() -> None:
@@ -495,6 +602,8 @@ EXPERIMENTAL_EVALUATIONS_SURFACE = frozenset(
         "EvaluationsModule",
         "AIConfig",
         "GenerationConfig",
+        "GenerationMode",
+        "GenerationOverrides",
         "DatasetRow",
         "EvalTool",
         "Criterion",

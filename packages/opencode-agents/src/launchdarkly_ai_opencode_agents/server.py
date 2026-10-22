@@ -2,7 +2,8 @@
 
 ``GET /event`` is opened before ``POST /session/{id}/message``. The message
 route is the stable API. ``/api/session/{id}/prompt`` is not used: that preview
-route rejects the amazon-bedrock provider.
+route rejects the amazon-bedrock provider. The base URL is the loopback server
+this process just started. It is not a caller argument.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 import httpx
+
+from .process import SERVER_USERNAME
 
 # After the message POST returns, keep reading until this session's
 # ``session.idle``. A quiet bus ends the turn only after this fallback, so a
@@ -54,24 +57,27 @@ def default_model(config: dict[str, Any]) -> tuple[str, str]:
 async def session_events(
     *,
     base_url: str,
+    password: str,
     prompt: str,
     system: str | None,
     provider_id: str,
     model_id: str,
     agent: str | None,
     session_ids: list[str],
-    client: httpx.AsyncClient | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Open one session and yield its bus events.
 
-    The event stream is opened before the message post. The post runs
-    concurrently with the read. This session's ``session.idle`` ends the
+    The handler owns the HTTP client. ``base_url`` is the ``opencode serve``
+    this call started. ``password`` is the secret that start set on the child,
+    sent as basic auth with username ``opencode``. Callers do not supply a
+    client or a transport. The event stream is opened before the message post.
+    The post runs concurrently with the read. This session's ``session.idle`` ends the
     turn. A failed message POST raises without waiting for another bus
     frame. Leaving early cancels the post and aborts the session.
     """
-    owns_client = client is None
-    http = client or httpx.AsyncClient(
-        timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=MESSAGE_TIMEOUT_SECONDS)
+    http = httpx.AsyncClient(
+        auth=(SERVER_USERNAME, password),
+        timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=MESSAGE_TIMEOUT_SECONDS),
     )
     base = base_url.rstrip("/")
     post: asyncio.Task[httpx.Response] | None = None
@@ -127,8 +133,7 @@ async def session_events(
                 )
             except Exception:
                 pass
-        if owns_client:
-            await http.aclose()
+        await http.aclose()
 
 
 async def _read_until_done(

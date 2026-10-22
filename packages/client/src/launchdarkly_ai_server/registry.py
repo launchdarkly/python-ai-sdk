@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .types import NativeTool, ProviderHandler
+from .utils import handler_key
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,15 @@ class Registry:
     ) -> None:
         if handlers:
             for handler in handlers:
-                if handler.provides_for is not None:
-                    # Check for duplicate by providesFor key
-                    key = handler.provides_for
+                key = handler_key(handler)
+                if key is not None:
+                    # Same identity as select_handler / evaluations: provider plus
+                    # normalized mode (completion and messages collide).
                     existing_idx = next(
                         (
                             i
                             for i, h in enumerate(self._handlers)
-                            if h.provides_for == key
+                            if handler_key(h) == key
                         ),
                         None,
                     )

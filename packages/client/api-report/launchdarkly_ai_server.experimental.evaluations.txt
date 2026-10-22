@@ -32,11 +32,21 @@ EvaluationsModule  [class]
   __init__(api_client: LDApiClient, project_key: str, sdk_key: str | None, ui_base_uri: str = DEFAULT_UI_BASE_URI)
   api: LDApiClient  [property]
   project_key: str  [property]
-  run(*, key: str, dataset: str | Sequence[InlineDatasetRow], handler: EvalHandler, generation: GenerationConfig | None = None, ai_config: AIConfig | None = None, tools: Sequence[EvalTool] | None = None, criteria: list[Criterion] | None = None, judge_handlers: list[EvalHandler] | None = None, concurrency: int = 10, poll_interval_seconds: float | None = None, poll_timeout_seconds: float | None = None) -> EvalRunResult  [async]
+  run(*, key: str, dataset: str | Sequence[InlineDatasetRow], handler: EvalHandler | None = None, handlers: Sequence[EvalHandler] | None = None, generation: GenerationConfig | GenerationOverrides | None = None, ai_config: AIConfig | None = None, tools: Sequence[EvalTool] | None = None, criteria: list[Criterion] | None = None, concurrency: int = 10, poll_interval_seconds: float | None = None, poll_timeout_seconds: float | None = None) -> EvalRunResult  [async]
   sdk_key: str | None  [property]
   tools: ToolsClient  [property]
   ui_base_uri: str  [property]
 GenerationConfig(TypedDict, total=False)  [class]
+  instructions: str
+  messages: list[dict[str, Any]]
+  mode: Required[GenerationMode]
+  model: Required[str]
+  output_format: dict[str, Any]
+  parameters: dict[str, Any]
+  prompt_snippets: dict[str, str]
+  provider: Required[str]
+GenerationMode = Literal['completion', 'agent']
+GenerationOverrides(TypedDict, total=False)  [class]
   instructions: str
   messages: list[dict[str, Any]]
   model: str
@@ -44,7 +54,7 @@ GenerationConfig(TypedDict, total=False)  [class]
   parameters: dict[str, Any]
   prompt_snippets: dict[str, str]
   provider: str
-init_evaluations(project_key: str | None = None, api_key: str | None = None, sdk_key: str | None = None, base_uri: str | None = None, ui_base_uri: str | None = None, transport: Transport = urllib_transport) -> EvaluationsModule
+init_evaluations(project_key: str | None = None, api_key: str | None = None, sdk_key: str | None = None, api_base_uri: str | None = None, ui_base_uri: str | None = None, transport: Transport = urllib_transport) -> EvaluationsModule
 Judge  [class, @dataclass(frozen=True)]
   __init__(key: str, threshold: float | None = DEFAULT_JUDGE_THRESHOLD, pass_rate_threshold: float | None = None, ground_truth_context: str | None = None)
   __post_init__() -> None
