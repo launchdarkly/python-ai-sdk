@@ -186,6 +186,7 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
 #: ``max_tokens_to_sample`` is renamed to ``max_tokens`` before this list applies, and a
 #: ``max_tokens`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
+#: ``output_config`` keeps only its ``effort`` (see :func:`_rebuild_anthropic_output_config`).
 _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
     {
         "betas",
@@ -241,6 +242,23 @@ def _rebuild_anthropic_thinking(kwargs: dict[str, Any]) -> dict[str, Any]:
             if thinking.get(k) is not None
         },
     }
+    return kwargs
+
+
+def _rebuild_anthropic_output_config(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keeps only ``effort`` of a forwarded ``output_config``, and drops an ``output_config``
+    whose ``effort`` is missing or not a string.
+
+    ``output_config.format`` is Anthropic's structured-output schema. The handler owns structured
+    output through the config's ``outputFormat`` (``with_structured_output``), and ``ChatAnthropic``
+    sends a constructor ``output_config`` on every request, so a ``format`` here would make the
+    reply follow a second, possibly different, schema. It is always removed, as is any other
+    sub-key. The same rule as the Claude Messages handler's.
+    """
+    if "output_config" in kwargs:
+        effort = kwargs.pop("output_config").get("effort")
+        if isinstance(effort, str):
+            kwargs["output_config"] = {"effort": effort}
     return kwargs
 
 
@@ -599,13 +617,15 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            **_rebuild_anthropic_thinking(
-                _model_constructor_kwargs(
-                    config,
-                    "claude-3-5-sonnet-20241022",
-                    _CHAT_ANTHROPIC_FORWARDED_KEYS,
-                    mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
-                    renames=_CHAT_ANTHROPIC_RENAMES,
+            **_rebuild_anthropic_output_config(
+                _rebuild_anthropic_thinking(
+                    _model_constructor_kwargs(
+                        config,
+                        "claude-3-5-sonnet-20241022",
+                        _CHAT_ANTHROPIC_FORWARDED_KEYS,
+                        mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
+                        renames=_CHAT_ANTHROPIC_RENAMES,
+                    )
                 )
             )
         )

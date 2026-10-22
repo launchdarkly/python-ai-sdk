@@ -57,7 +57,8 @@ from .spans import (
 #:
 #: This is the cross-SDK list for Claude Messages (TESTING.md section 1.12). A top-level
 #: ``effort`` is also accepted and moved into ``output_config.effort`` before this list applies
-#: (see :func:`_rename_effort_to_output_config`), and ``max_tokens`` defaults to 1024. The same list
+#: (see :func:`_rename_effort_to_output_config`), ``output_config`` keeps only its ``effort`` (see
+#: :func:`_rebuild_output_config`), and ``max_tokens`` defaults to 1024. The same list
 #: serves ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves
 #: the same whichever is called.
 _MESSAGES_FORWARDED_KEYS = frozenset(
@@ -141,8 +142,9 @@ def _rebuild_typed_objects(params: dict[str, Any]) -> dict[str, Any]:
 #: Accepted by the API but never forwarded, and why:
 #: * ``stream``: runtime wiring. The handler chooses blocking vs. streaming itself, not via a kwarg.
 #: * ``output_format``: API-shape switch. Only ``.stream`` accepts it, so forwarding it would make
-#:   ``invoke`` and ``stream`` behave differently. ``output_config`` (forwarded) carries the same
-#:   output format on both.
+#:   ``invoke`` and ``stream`` behave differently. Structured output is handler-owned through the
+#:   config's ``outputFormat``, which is also why only ``effort`` of ``output_config`` is
+#:   forwarded.
 #: * ``inference_geo``: data location. The region inference runs in decides where data is
 #:   processed.
 #: * ``container``: server-side state. It selects container state carried over from another
@@ -170,21 +172,37 @@ _MESSAGES_EXCLUDED_KEYS = frozenset(
 )
 
 
+def _rebuild_output_config(params: dict[str, Any]) -> dict[str, Any]:
+    """Keeps only ``effort`` of a forwarded ``output_config``, and drops an ``output_config``
+    whose ``effort`` is missing or not a string.
+
+    ``output_config.format`` is Anthropic's structured-output schema. The handler owns structured
+    output through the config's ``outputFormat`` (see ``_build_messages``), so a ``format`` here
+    would make the reply follow a second, possibly different, schema. It is always removed, as is
+    any other sub-key.
+    """
+    if "output_config" in params:
+        effort = params.pop("output_config").get("effort")
+        if isinstance(effort, str):
+            params["output_config"] = {"effort": effort}
+    return params
+
+
 def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
     """Moves a top-level ``effort`` into ``output_config.effort``, the shape the Anthropic Messages
     API actually accepts (there is no top-level ``effort`` parameter).
 
-    An ``output_config`` the config itself already set wins: if it carries its own ``effort``, the
-    top-level one is dropped rather than overwriting it. This handler does not itself set
-    ``output_config`` (structured output goes through a system-prompt instruction instead, see
-    ``_build_messages``), so there is nothing here to merge with yet; a future call site that starts
-    setting ``output_config`` must merge so its own keys win and a config's ``effort`` survives.
+    An ``output_config`` the config itself already set wins: if it carries its own string
+    ``effort``, the top-level one is dropped rather than overwriting it. Only ``effort`` of the
+    merged ``output_config`` is forwarded in the end (see :func:`_rebuild_output_config`). This
+    handler does not itself set ``output_config`` (structured output goes through a system-prompt
+    instruction instead, see ``_build_messages``).
     """
     effort = params.pop("effort", None)
     if effort is None:
         return params
     existing = params.get("output_config")
-    if isinstance(existing, dict) and "effort" in existing:
+    if isinstance(existing, dict) and isinstance(existing.get("effort"), str):
         return params
     params["output_config"] = {
         **(existing if isinstance(existing, dict) else {}),
@@ -196,13 +214,17 @@ def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
 def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that reach ``messages.create``/``.stream``: ``effort``
     moved into ``output_config``, then only :data:`_MESSAGES_FORWARDED_KEYS`, with malformed
-    object values dropped and typed objects rebuilt (see :data:`_TYPED_OBJECT_SHAPES`). ``invoke`` and ``stream`` both call this, so they forward the same keys.
+    object values dropped, typed objects rebuilt (see :data:`_TYPED_OBJECT_SHAPES`), and
+    ``output_config`` narrowed to ``effort`` (see :func:`_rebuild_output_config`). ``invoke`` and
+    ``stream`` both call this, so they forward the same keys.
     """
-    return _rebuild_typed_objects(
-        select_forwarded_parameters(
-            _rename_effort_to_output_config(model_parameters(config)),
-            _MESSAGES_FORWARDED_KEYS,
-            mapping_keys=_MESSAGES_MAPPING_KEYS,
+    return _rebuild_output_config(
+        _rebuild_typed_objects(
+            select_forwarded_parameters(
+                _rename_effort_to_output_config(model_parameters(config)),
+                _MESSAGES_FORWARDED_KEYS,
+                mapping_keys=_MESSAGES_MAPPING_KEYS,
+            )
         )
     )
 

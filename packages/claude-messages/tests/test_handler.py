@@ -608,8 +608,8 @@ class TestEffortRename:
     async def test_top_level_effort_merges_into_an_output_config_without_effort(
         self, mock_anthropic: MagicMock
     ) -> None:
-        """An ``output_config`` present without its own ``effort`` keeps its other keys and gains
-        the top-level ``effort``."""
+        """An ``output_config`` present without its own ``effort`` gains the top-level
+        ``effort``, and its other keys are dropped."""
         from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
         config = {
@@ -625,10 +625,24 @@ class TestEffortRename:
         h = create_claude_messages_handler()
         await h(config, "q", {}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
-        assert call_kwargs["output_config"] == {
-            "some_other_key": "kept",
-            "effort": "low",
+        assert call_kwargs["output_config"] == {"effort": "low"}
+
+    async def test_top_level_effort_replaces_a_non_string_output_config_effort(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {"effort": "low", "output_config": {"effort": 5}},
+            },
         }
+        h = create_claude_messages_handler()
+        await h(config, "q", {}, {})
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["output_config"] == {"effort": "low"}
 
 
 class TestToolExecutionLoop:
@@ -2796,12 +2810,16 @@ class TestNeverForwardedParameters:
 
 class TestInvokeAndStreamForwardTheSameKeys:
     """``output_format`` is accepted by ``messages.stream`` only. Forwarding it there and not on
-    ``create`` made one config behave differently by call, so it is dropped on both, and
-    ``output_config`` (accepted by both) carries the output format instead."""
+    ``create`` made one config behave differently by call, so it is dropped on both. Structured
+    output is handler-owned through ``outputFormat``, so ``output_config.format`` is dropped on
+    both too, and only ``output_config.effort`` is forwarded."""
 
     _PARAMS: ClassVar[dict[str, Any]] = {
         "output_format": {"type": "json_schema", "schema": {}},
-        "output_config": {"format": {"type": "json_schema", "schema": {}}},
+        "output_config": {
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": {}},
+        },
         "top_p": 0.4,
     }
 
@@ -2812,7 +2830,7 @@ class TestInvokeAndStreamForwardTheSameKeys:
         await create_claude_messages_handler()(config, "q", {}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         assert "output_format" not in call_kwargs
-        assert call_kwargs["output_config"] == self._PARAMS["output_config"]
+        assert call_kwargs["output_config"] == {"effort": "low"}
         assert call_kwargs["top_p"] == 0.4
 
     async def test_stream(self, mock_anthropic: MagicMock) -> None:
@@ -2828,8 +2846,80 @@ class TestInvokeAndStreamForwardTheSameKeys:
             pass
         call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
         assert "output_format" not in call_kwargs
-        assert call_kwargs["output_config"] == self._PARAMS["output_config"]
+        assert call_kwargs["output_config"] == {"effort": "low"}
         assert call_kwargs["top_p"] == 0.4
+
+
+class TestOutputConfigKeepsOnlyEffort:
+    """``output_config.format`` is Anthropic's structured-output schema, which would fight the
+    handler's own ``outputFormat``. Only ``effort`` is forwarded, and an ``output_config`` without
+    a string ``effort`` is dropped, on ``invoke`` and ``stream`` alike."""
+
+    _FORMAT: ClassVar[dict[str, Any]] = {"type": "json_schema", "schema": {}}
+
+    @staticmethod
+    async def _invoke_kwargs(
+        mock_anthropic: MagicMock, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": params}}
+        await create_claude_messages_handler()(config, "q", {}, {})
+        return mock_anthropic.messages.create.call_args.kwargs
+
+    @staticmethod
+    async def _stream_kwargs(
+        mock_anthropic: MagicMock, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        import launchdarkly_ai_claude_messages.spans as spans_mod
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        ctx, _ = _make_stream_context(["hi"])
+        mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+        config = {**CONFIG, "model": {**CONFIG["model"], "parameters": params}}
+        with patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_claude_messages_handler()
+        async for _event in await h.stream(config, "q", {}, {}):
+            pass
+        return mock_anthropic.messages.stream.call_args.kwargs
+
+    async def test_invoke_forwards_only_effort(self, mock_anthropic: MagicMock) -> None:
+        kwargs = await self._invoke_kwargs(
+            mock_anthropic,
+            {"output_config": {"effort": "low", "format": self._FORMAT}},
+        )
+        assert kwargs["output_config"] == {"effort": "low"}
+
+    async def test_stream_forwards_only_effort(self, mock_anthropic: MagicMock) -> None:
+        kwargs = await self._stream_kwargs(
+            mock_anthropic,
+            {"output_config": {"effort": "low", "format": self._FORMAT}},
+        )
+        assert kwargs["output_config"] == {"effort": "low"}
+
+    async def test_invoke_drops_format_only_output_config(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        kwargs = await self._invoke_kwargs(
+            mock_anthropic, {"output_config": {"format": self._FORMAT}}
+        )
+        assert "output_config" not in kwargs
+
+    async def test_stream_drops_format_only_output_config(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        kwargs = await self._stream_kwargs(
+            mock_anthropic, {"output_config": {"format": self._FORMAT}}
+        )
+        assert "output_config" not in kwargs
+
+    async def test_invoke_drops_output_config_with_non_string_effort(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        kwargs = await self._invoke_kwargs(
+            mock_anthropic, {"output_config": {"effort": 5}}
+        )
+        assert "output_config" not in kwargs
 
 
 class TestForwardsExactlyTheCrossSdkList:

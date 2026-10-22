@@ -403,6 +403,42 @@ class TestChatAnthropicThinkingIsRebuilt:
         }
 
 
+class TestChatAnthropicOutputConfigKeepsOnlyEffort:
+    """``output_config.format`` is Anthropic's structured-output schema, which would fight the
+    handler's own ``outputFormat``. Only ``effort`` is forwarded, as the Claude Messages handler
+    does, and an ``output_config`` without a string ``effort`` is dropped."""
+
+    _FORMAT: ClassVar[dict[str, Any]] = {"type": "json_schema", "schema": {}}
+
+    def test_format_is_removed_and_effort_kept(self) -> None:
+        assert _build(
+            "anthropic", {"output_config": {"effort": "low", "format": self._FORMAT}}
+        ) == {"model": "configured-model", "output_config": {"effort": "low"}}
+
+    @pytest.mark.parametrize(
+        "output_config",
+        [{"format": {"type": "json_schema", "schema": {}}}, {"effort": 5}, {}],
+    )
+    def test_no_string_effort_drops_output_config(
+        self, output_config: dict[str, Any]
+    ) -> None:
+        assert _build(
+            "anthropic", {"output_config": output_config, "temperature": 0.2}
+        ) == {"model": "configured-model", "temperature": 0.2}
+
+    def test_the_request_payload_carries_only_effort(self) -> None:
+        from langchain_core.messages import HumanMessage
+
+        kwargs = _build(
+            "anthropic", {"output_config": {"effort": "low", "format": self._FORMAT}}
+        )
+        model = langchain_anthropic.ChatAnthropic(
+            api_key="sk-test-not-a-real-key", **kwargs
+        )
+        payload: dict[str, Any] = model._get_request_payload([HumanMessage("hi")])
+        assert payload["output_config"] == {"effort": "low"}
+
+
 class _Built(Exception):
     """Stops a run once the chat model has been built."""
 
