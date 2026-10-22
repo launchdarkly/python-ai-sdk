@@ -232,10 +232,6 @@ class EvaluationsModule:
         self._tools = ToolsClient(api_client, project_key)
 
     @property
-    def api(self) -> LDApiClient:
-        return self._api
-
-    @property
     def project_key(self) -> str:
         """Project that holds this module's evaluations, tools, and datasets."""
         return self._project_key
