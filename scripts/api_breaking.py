@@ -30,7 +30,7 @@ from typing import Any
 
 import griffe
 
-from scripts.api_report import ROOT, public_modules, resolve
+from scripts.api_report import ROOT, SKIP, public_modules, resolve
 
 BREAKING_TITLE = re.compile(r"^[a-z]+(\([^)]*\))?!:")
 COMPATIBLE_LABEL = "api-compatible"
@@ -45,17 +45,22 @@ def load(root: Path, ref: str | None, tops: set[str]) -> griffe.ModulesCollectio
     loader = griffe.GriffeLoader(
         search_paths=sorted(str(p) for p in root.glob("packages/*/src"))
     )
-    relative = sorted(str(p.relative_to(root)) for p in root.glob("packages/*/src"))
+    relative = {str(p.relative_to(root)) for p in root.glob("packages/*/src")}
+    if ref is not None:  # and the ref's own, for a package removed since
+        relative |= {src for src, _ in package_roots(root, ref)}
     for top in sorted(tops):
         if ref is None:
-            loader.load(top)
+            try:
+                loader.load(top)
+            except ImportError:  # the package was removed; compare reports it
+                pass
             continue
         try:
             griffe.load_git(
                 top,
                 ref=ref,
                 repo=root,
-                search_paths=relative,
+                search_paths=sorted(relative),
                 modules_collection=loader.modules_collection,
             )
         except (ImportError, griffe.GitError):  # the package did not exist yet
@@ -123,7 +128,7 @@ def returns_changed(path: str, old: Any, new: Any) -> list[str]:
         pairs += [
             (f"{path}.{name}", member, new.members[name])
             for name, member in old.members.items()
-            if not name.startswith("_") and name in new.members
+            if (not name.startswith("_") or name.endswith("__")) and name in new.members
         ]
     return [
         f"{where}: return type changed from {o.returns} to {n.returns}"
@@ -140,8 +145,16 @@ def tops_of(modules: list[str]) -> set[str]:
     return {m.split(".")[0] for m in modules}
 
 
+def package_roots(root: Path, ref: str) -> list[tuple[str, str]]:
+    """(source directory, top-level package) of each package at ``ref``."""
+    files = git(root, "ls-tree", "-r", "--name-only", ref, "--", "packages").stdout
+    return re.findall(r"^(packages/[^/]+/src)/([^/]+)/__init__\.py$", files, re.M)
+
+
 def check_pr(root: Path, base: str, title: str, labels: list[str]) -> int:
-    modules = sorted(stable_modules(root))
+    # The base's package roots too, so a package removed or renamed since is compared.
+    at_base = {top for _, top in package_roots(root, base)} - SKIP
+    modules = sorted(set(stable_modules(root)) | at_base)
     found = compare(
         load(root, base, tops_of(modules)), load(root, None, tops_of(modules)), modules
     )

@@ -216,3 +216,33 @@ def test_an_owner_can_judge_a_release_compatible(repo: Path) -> None:
 
 def test_another_label_does_not_pass_a_breaking_release(repo: Path) -> None:
     assert release(repo, "1.2.0", "1.2.1", True, ["docs"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("title", "labels", "code"),
+    [("feat: drop demo", [], 1), ("feat: drop demo", ["api-compatible"], 0)],
+)
+def test_a_removed_package_is_breaking(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+    title: str,
+    labels: list[str],
+    code: int,
+) -> None:
+    git(repo, "rm", "-rq", "packages/demo/src")
+    git(repo, "commit", "-q", "-m", "drop demo")
+    assert api_breaking.check_pr(repo, "demo-sdk-1.2.0", title, labels) == code
+    assert "demo_sdk: the module was removed" in capsys.readouterr().out
+
+
+def test_a_dunder_return_type_change_is_breaking(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = "class Runner:\n    def __call__(self) -> str: ...\n"
+    exported = V1.replace('"make", "run"', '"Runner", "make", "run"')
+    change(repo, "__init__.py", exported + runner)
+    change(repo, "__init__.py", exported + runner.replace("-> str", "-> int"))
+    assert api_breaking.check_pr(repo, "HEAD~1", "feat: change Runner", []) == 1
+    assert "Runner.__call__: return type changed from str to int" in (
+        capsys.readouterr().out
+    )
