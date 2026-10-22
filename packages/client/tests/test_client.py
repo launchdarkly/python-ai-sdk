@@ -1182,6 +1182,33 @@ class TestInvokeJudgeTasks:
         assert len(result.judge_tasks) == 1
         assert result.judge_tasks[0].collapse_messages is True
 
+    async def test_completion_handler_is_exact_match_for_messages_judge(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        # Registry may keep only a completion-tagged handler after replace.
+        # That must still be an exact messages-mode match (no agent collapse).
+        mock_ld_client.variation = self._make_multi_variation(
+            self._main_variation_with_judge(),
+            self._judge_variation(),
+        )
+
+        async def completion_fn(
+            cfg, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok", "usage": {}}
+
+        h = ProviderHandler(
+            fn=completion_fn, provides_for=("TestProvider", "completion")
+        )  # type: ignore[arg-type]
+        result = await config(key="flag", handler=h, skip_judges=True).invoke(
+            "q", CONTEXT
+        )
+
+        assert result.judge_tasks is not None
+        assert len(result.judge_tasks) == 1
+        assert result.judge_tasks[0].collapse_messages is False
+        assert result.judge_tasks[0].judge_mode == "messages"
+
     async def test_excludes_task_when_no_handler_matches_judge_provider(
         self, mock_ld_client: MagicMock
     ) -> None:
