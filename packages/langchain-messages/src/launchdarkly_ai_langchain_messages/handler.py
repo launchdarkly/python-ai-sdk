@@ -185,7 +185,8 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #:
 #: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
 #: ``max_tokens_to_sample`` is renamed to ``max_tokens`` before this list applies, and a
-#: ``max_tokens`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
+#: ``max_tokens`` the config also set wins. ``stop`` is renamed to ``stop_sequences`` the same way, and
+#: a ``stop_sequences`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
 #: ``output_config`` keeps only its ``effort`` (see :func:`_rebuild_anthropic_output_config`).
 _CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
     {
@@ -209,7 +210,10 @@ _CHAT_ANTHROPIC_MAPPING_KEYS = frozenset({"output_config", "thinking"})
 
 #: Alias to the name it is renamed to before forwarding. ``ChatAnthropic`` takes both spellings
 #: of the one field, so passing both would leave which one wins to pydantic.
-_CHAT_ANTHROPIC_RENAMES = {"max_tokens_to_sample": "max_tokens"}
+_CHAT_ANTHROPIC_RENAMES = {
+    "max_tokens_to_sample": "max_tokens",
+    "stop": "stop_sequences",
+}
 
 #: The ``thinking`` variants the Anthropic Messages API takes, each mapped to its required and
 #: optional sub-keys. ``ChatAnthropic`` sends ``thinking`` as written, so one with no ``type``, an

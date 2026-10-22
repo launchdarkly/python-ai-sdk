@@ -493,6 +493,24 @@ class TestMaxTokensToSampleRename:
         ) == {"model": "configured-model", "max_tokens": 200}
 
 
+class TestAnthropicStopRename:
+    """``ChatAnthropic`` takes ``stop`` as the alias of ``stop_sequences``. ``stop`` is renamed
+    before forwarding, and ``stop_sequences`` wins when both are set, so the model is never given
+    both spellings of the one field."""
+
+    def test_alias_becomes_stop_sequences(self) -> None:
+        assert _build("anthropic", {"stop": ["A"]}) == {
+            "model": "configured-model",
+            "stop_sequences": ["A"],
+        }
+
+    def test_stop_sequences_wins_when_both_are_set(self) -> None:
+        assert _build("anthropic", {"stop": ["A"], "stop_sequences": ["B"]}) == {
+            "model": "configured-model",
+            "stop_sequences": ["B"],
+        }
+
+
 class TestBedrockStopRename:
     """``ChatBedrockConverse`` takes ``stop`` as the alias of ``stop_sequences`` and rejects a call
     that passes both. ``stop`` is renamed before forwarding, and ``stop_sequences`` wins when both
