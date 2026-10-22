@@ -2764,6 +2764,16 @@ class TestReasoningIsRebuilt:
             "temperature": 0.1
         }
 
+    @pytest.mark.parametrize(
+        "reasoning", [{"effort": "bogus"}, {"effort": 3}, {"summary": ["auto"]}]
+    )
+    def test_reasoning_the_sdk_rejects_is_dropped(self, reasoning: Any) -> None:
+        """A mistyped ``effort`` or ``summary`` is malformed and dropped rather than raising while
+        the Agent is built."""
+        assert self._settings({"reasoning": reasoning, "temperature": 0.1}) == {
+            "temperature": 0.1
+        }
+
     async def test_chat_completions_model_reads_it_without_raising(self) -> None:
         """The Chat Completions model reads ``reasoning.effort`` as an attribute and sends it as
         ``reasoning_effort``. Runs the real model against a mocked OpenAI client."""

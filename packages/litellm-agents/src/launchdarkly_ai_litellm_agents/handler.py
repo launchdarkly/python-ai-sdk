@@ -13,6 +13,7 @@ from agents.lifecycle import RunHooksBase
 from openai.types.shared import Reasoning
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
+from pydantic import ValidationError
 
 from launchdarkly_ai_server import (
     AiConfigRep,
@@ -172,13 +173,16 @@ def _model_settings(parameters: dict[str, Any]) -> ModelSettings:
 
     ``reasoning`` keeps only ``effort``, rebuilt as the SDK's ``Reasoning`` type: ``LitellmModel``
     sends it as ``reasoning_effort`` and logs a warning on every call that also sets ``summary``.
-    A ``reasoning`` with no ``effort`` is dropped. ``tool_choice`` is forwarded only as a string;
+    A ``reasoning`` with no ``effort``, or one the ``Reasoning`` type rejects, is dropped. ``tool_choice`` is forwarded only as a string;
     ``ModelSettings`` rejects an object value while the Agent is built, so one is dropped.
     """
     settings = select_forwarded_parameters(parameters, _MODEL_SETTINGS_FORWARDED_KEYS)
     reasoning = settings.pop("reasoning", None)
     if isinstance(reasoning, Mapping) and reasoning.get("effort") is not None:
-        settings["reasoning"] = Reasoning(effort=reasoning["effort"])
+        try:
+            settings["reasoning"] = Reasoning(effort=reasoning["effort"])
+        except ValidationError:
+            pass
     if not isinstance(settings.get("tool_choice", ""), str):
         del settings["tool_choice"]
     return ModelSettings(**settings)

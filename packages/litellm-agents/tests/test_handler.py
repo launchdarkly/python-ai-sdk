@@ -332,7 +332,15 @@ class TestAgentToolsAndRun:
         assert settings.top_logprobs is None
 
     @pytest.mark.parametrize(
-        "reasoning", ["high", {"smuggled": 1}, {"summary": "auto"}, None]
+        "reasoning",
+        [
+            "high",
+            {"smuggled": 1},
+            {"summary": "auto"},
+            None,
+            {"effort": "bogus"},
+            {"effort": 3},
+        ],
     )
     def test_unusable_reasoning_is_dropped(self, reasoning: Any) -> None:
         _, parameters = handler_mod._model_config(

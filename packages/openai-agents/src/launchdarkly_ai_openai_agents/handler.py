@@ -158,7 +158,9 @@ _REASONING_KEYS = ("effort", "summary")
 def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
     """Rebuilds a forwarded ``reasoning`` object as the SDK's own ``Reasoning`` type, the type
     ``ModelSettings`` declares, keeping only ``effort`` and ``summary`` as the JS SDK does. Any
-    other sub-key is dropped, and so is a ``reasoning`` with neither.
+    other sub-key is dropped, and so is a ``reasoning`` with neither. A ``reasoning`` whose
+    ``effort`` or ``summary`` the ``Reasoning`` type rejects is malformed and dropped too, rather
+    than failing the run while the Agent is built.
     """
     reasoning = params.pop("reasoning", None)
     if not isinstance(reasoning, Mapping):
@@ -166,8 +168,12 @@ def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
     kept = {k: reasoning[k] for k in _REASONING_KEYS if k in reasoning}
     if kept:
         from openai.types.shared import Reasoning
+        from pydantic import ValidationError
 
-        params["reasoning"] = Reasoning(**kept)
+        try:
+            params["reasoning"] = Reasoning(**kept)
+        except ValidationError:
+            pass
     return params
 
 
