@@ -23,6 +23,7 @@ _STARTUP_TIMEOUT_SECONDS = 45.0
 _SHUTDOWN_GRACE_SECONDS = 5.0
 _PROBE_INTERVAL_SECONDS = 0.05
 _STDERR_TAIL_BYTES = 2048
+SERVER_USERNAME = "opencode"
 
 _CommandPart = str | os.PathLike[str]
 Command = _CommandPart | Sequence[_CommandPart] | None
@@ -128,7 +129,7 @@ class OpenCodeServe:
         if proc is None:
             raise RuntimeError("opencode serve failed to start.")
         deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
-        async with httpx.AsyncClient(auth=("opencode", password)) as http:
+        async with httpx.AsyncClient(auth=(SERVER_USERNAME, password)) as http:
             while time.monotonic() < deadline:
                 if proc.returncode is not None:
                     raise self._startup_error(
@@ -231,6 +232,7 @@ def _one_command(part: str) -> str:
 def _child_env(env: Mapping[str, str], config: str, password: str) -> dict[str, str]:
     child = dict(env)
     child["OPENCODE_CONFIG"] = config
+    child["OPENCODE_SERVER_USERNAME"] = SERVER_USERNAME
     child["OPENCODE_SERVER_PASSWORD"] = password
     return child
 

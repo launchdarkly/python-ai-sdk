@@ -503,8 +503,9 @@ def create_opencode_handler(
 
     ``provides_for`` is ``('*', 'agent')``. *cwd* is the working directory,
     *config* is the OpenCode config file, and *env* is the child environment.
-    The handler sets ``OPENCODE_CONFIG`` from *config* and
-    ``OPENCODE_SERVER_PASSWORD`` to a generated secret, replacing any password
+    The handler sets ``OPENCODE_CONFIG`` from *config*,
+    ``OPENCODE_SERVER_USERNAME`` to ``opencode``, and
+    ``OPENCODE_SERVER_PASSWORD`` to a generated secret, replacing either value
     in *env*. *command* is the executable, ``opencode`` when omitted. A test
     passes a fake executable here. There is no URL, client, or transport
     argument.

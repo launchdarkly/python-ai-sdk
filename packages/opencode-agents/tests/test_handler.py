@@ -1665,6 +1665,35 @@ class TestProcess:
         assert isinstance(password, str) and password
         assert password != "inherited-secret"
 
+    async def test_an_inherited_username_is_replaced(self) -> None:
+        script = Script(
+            [
+                assistant_open("m1"),
+                text_delta("m1", "p1", "Hi"),
+                assistant_completed("m1"),
+            ]
+        )
+        args = script.handler_args()
+        args["env"] = {**args["env"], "OPENCODE_SERVER_USERNAME": "someone-else"}
+        handler = create_opencode_handler(**args)
+        seen = [
+            event
+            async for event in await handler.stream(
+                {
+                    "instructions": "Be brief.",
+                    "model": {"name": "m"},
+                    "provider": {"name": "Acme"},
+                },
+                "hi",
+                None,
+                None,
+            )
+        ]
+        assert seen[-1]["output"] == "Hi"
+        records = script._records()
+        assert len(records) == 1
+        assert records[0]["username"] == "opencode"
+
     async def test_a_startup_failure_includes_the_stderr_tail(self) -> None:
         prefix = "HEAD-MARKER"
         tail = "TAIL-MARKER"

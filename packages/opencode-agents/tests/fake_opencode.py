@@ -117,6 +117,7 @@ class _Server:
             "argv": sys.argv,
             "cwd": os.getcwd(),
             "config": os.environ.get("OPENCODE_CONFIG", ""),
+            "username": os.environ.get("OPENCODE_SERVER_USERNAME", ""),
             "password": os.environ.get("OPENCODE_SERVER_PASSWORD", ""),
             "sessions": self.sessions,
             "messages": self.messages,

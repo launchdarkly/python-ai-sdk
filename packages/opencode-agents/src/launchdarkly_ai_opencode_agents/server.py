@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from .process import SERVER_USERNAME
+
 # After the message POST returns, keep reading until this session's
 # ``session.idle``. A quiet bus ends the turn only after this fallback, so a
 # late ``message.updated`` is not dropped the way a 50 ms drain dropped it.
@@ -74,7 +76,7 @@ async def session_events(
     frame. Leaving early cancels the post and aborts the session.
     """
     http = httpx.AsyncClient(
-        auth=("opencode", password),
+        auth=(SERVER_USERNAME, password),
         timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=MESSAGE_TIMEOUT_SECONDS),
     )
     base = base_url.rstrip("/")
