@@ -123,6 +123,18 @@ def test_an_imported_name_wins_over_a_submodule(workspace: Path) -> None:
     assert "run  [module]" not in text
 
 
+def test_writing_removes_a_stale_report(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(api_report, "ROOT", workspace)
+    stale = workspace / "packages/demo/api-report/demo_sdk.gone.txt"
+    stale.parent.mkdir()
+    stale.write_text("old\n")
+    assert api_report.main([]) == 0
+    assert not stale.exists()
+    assert api_report.main(["--check"]) == 0
+
+
 def test_a_module_without_all_fails(workspace: Path) -> None:
     write(
         workspace / "packages/demo/src/demo_sdk/experimental/beta.py",
