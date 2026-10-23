@@ -3,8 +3,9 @@ Agent Skills (experimental).
 
 Configure a store with ``set_skill_store``, then read verified skill content with
 ``get_skill``, ``get_skills`` or ``all_skills``, or write it to disk with
-``write_skills``. These names may change in a minor release, so review the
-changelog when you upgrade.
+``write_skills``. To keep the skills an AI Config pins on disk as the config
+changes, use ``watch_skills(config_skills(key, context), root)``. These names
+may change in a minor release, so review the changelog when you upgrade.
 """
 
 from ..skills import (
@@ -25,6 +26,7 @@ from ..skills_fs import (
     OnUnavailable,
     write_skills,
 )
+from ..skills_source import config_skills
 from ..skills_watch import SkillWatcher, watch_skills
 from ..types import (
     ReconcileAction,
@@ -34,6 +36,7 @@ from ..types import (
     SkillOutcome,
     SkillOutcomeReason,
     SkillReference,
+    SkillSource,
 )
 
 __all__ = [  # noqa: RUF022
@@ -46,6 +49,9 @@ __all__ = [  # noqa: RUF022
     "StoreDiagnostics",
     "watch_skills",
     "SkillWatcher",
+    # a requested set read on every reconcile, following AI Config changes
+    "SkillSource",
+    "config_skills",
     # accessors
     "skill_refs",
     "get_skill",

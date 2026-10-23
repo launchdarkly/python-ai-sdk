@@ -22,6 +22,7 @@ from launchdarkly_ai_server import (
     shutdown,
 )
 from launchdarkly_ai_server.experimental.evaluations import init_evaluations
+from launchdarkly_ai_server.experimental.skills import config_skills
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 HELPER = "client.buildJudgeTasks"
@@ -152,6 +153,10 @@ def _call(helper: str) -> Any:
 
         create_handler(("OpenAI", "messages"), _fn)
         return None
+    if helper == "experimental.configSkills":
+        # Builds the source without reading it: the report is on the call.
+        config_skills("k", CONTEXT)
+        return None
     assert helper == "experimental.initEvaluations", helper
     try:
         init_evaluations()
@@ -179,6 +184,7 @@ async def client() -> Any:
         "client.runJudge",
         "client.buildJudgeTasks",
         "client.createHandler",
+        "experimental.configSkills",
         "experimental.initEvaluations",
     ],
 )

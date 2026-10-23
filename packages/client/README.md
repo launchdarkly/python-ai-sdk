@@ -533,6 +533,10 @@ async def main():
 asyncio.run(main())
 ```
 
+This reads the config once, which is right at boot. To keep a config's skills on disk as the
+config changes, pass `config_skills(key, context)` to `watch_skills` instead; see
+[Following an AI Config's changes](#following-an-ai-configs-changes).
+
 **Know what `"*"` asks for.** Passing `"*"` instead of a reference list writes the **whole
 project library**, which puts every skill's `description` into the agent's context, including
 skills no AI Config references and skills belonging to other teams. `write_skills(skill_refs(...), root)`,
@@ -806,11 +810,71 @@ an outage the store keeps serving its last content and retries for as long as it
 `write_skills`' default `on_unavailable="keep"` leaves managed files alone, so an outage does
 not read as "everything was revoked".
 
-**With an explicit skill list, revocation does not reach the disk.** Given a list such as
-`skill_refs(config)`, a skill deleted in LaunchDarkly is reported as an `error` action under
-its key, and its `SKILL.md` is kept rather than pruned. The watcher also listens only to the
-skill store, not to flag changes, so unpinning a skill from a variation is not seen either. Use
-`"*"` when revocation must reach the disk.
+**What reaches the disk depends on what you pass as `skills`.** A fixed list, such as
+`skill_refs(config)`, is never re-read, so the watcher cannot see a config change:
+
+| Change in LaunchDarkly | `"*"` | Fixed list | `config_skills(key, context)` |
+|---|---|---|---|
+| A skill is deleted (possible only once no variation pins it) | Pruned | Stays on disk, reported `error` on every run | Already pruned, when the config stopped referencing it |
+| A config moves `pdf-extraction` from v2 to v3 | Unaffected: `"*"` already follows the newest version | v2 stays on disk, reported `error`; v3 is never written | v3 replaces v2 |
+| A config stops referencing a skill | Unaffected: `"*"` asks for the whole library | Stays on disk | Pruned |
+
+So a revoked skill leaves the disk under `"*"` and `config_skills`, never under a fixed list.
+Keep a fixed list for a set that genuinely does not change for the life of the process.
+
+#### Following an AI Config's changes
+
+`config_skills(key, context)` returns a `SkillSource`: a requested set that is read on every
+reconcile instead of being fixed when you call `watch_skills`. The watcher also re-reconciles
+when that AI Config changes in the base LaunchDarkly client, so a version bump or an unpinned
+skill reaches the disk within `debounce`.
+
+```python
+from launchdarkly_ai_server import init_client
+from launchdarkly_ai_server.experimental.skills import config_skills, watch_skills
+
+await init_client()  # config_skills needs an initialized client; it never creates one
+report, watcher = await watch_skills(
+    config_skills("doc-agent", {"kind": "user", "key": "user-123"}),
+    ".claude/skills",
+)
+```
+
+- **A failed evaluation never reads as "no skills".** Each read evaluates the config with
+  `variation(key, context, None)`. Only a disabled variation, or a config with no `skills`
+  field, answers `[]`, and those are answers from LaunchDarkly, so their skills are pruned. No
+  initialized client, a `variation` that raises, the default (a missing flag or a client that
+  is not ready), or a malformed variation or `skills` field is a failed read: the reconcile
+  reports it as a run-level `error` (or raises, with `on_unavailable="raise"`) and changes
+  nothing on disk. There is no retry timer: the next store or config change is the retry,
+  and a client that finishes initializing reports a change for every flag.
+- **Each read is a real evaluation.** It records an evaluation event in the base SDK, as
+  `inspect_config` does: once per reconcile, which the debounce bounds. It sends no AI
+  telemetry.
+- **Following changes needs the base client's change signal.** The watcher registers one
+  `flag_tracker` listener and raises `RuntimeError` when no AI client is initialized, when the
+  client has no `flag_tracker` (a client brought to `init_client` that implements only
+  `variation`), or when the client is offline. The listener only wakes the watcher; the
+  config is read on the watcher's own thread, never on the base SDK's delivery thread.
+- **A dropped skill is pruned on the next reconcile whose retrieval is available.** A skill
+  the store answers `absent` for keeps its file under its own key, reported `error`, and does
+  not stop the dropped skill being pruned in the same run. A store that raises, has not
+  received its initial data, or runs out of `timeout` holds the prune until a later run.
+- **Daemon mode follows skill-store changes only.** With `use_ldd=True`, or
+  `ldclient.datasystem.daemon(...)`, the base client has no data source, so its `flag_tracker`
+  never fires and nothing reports it. Call `watcher.notify()` yourself if you learn of config
+  changes some other way.
+- **Several configs, or a custom resolution, take a hand-built source.**
+  `SkillSource(refs, config_keys=(...))` takes a zero-argument function, sync or async,
+  returning `SkillReference` values and key strings, plus the config keys whose changes should
+  re-read it. Raise from `refs` when you cannot tell; returning `[]` prunes every managed
+  skill. An answer that is not a sequence of references and keys, or holds one invalid entry,
+  is a failed read too. With `config_keys=()` the watcher subscribes to nothing; call
+  `watcher.notify()` from your own change listener. `config_keys` must be a sequence:
+  `config_keys="doc-agent"` raises `TypeError`.
+- **`timeout` covers the read, with one limit.** An async `refs` still pending at the deadline
+  is cancelled. A synchronous one cannot be interrupted, so a slow one uses up the time left
+  for the rest of the reconcile.
 
 **Without the watcher, the revocation bound is process lifetime.** If you call `write_skills`
 once at boot and never run `watch_skills`, a skill revoked after boot stays on disk, and in the
@@ -841,16 +905,18 @@ that skips verification.
 
 | Export | Description |
 |---|---|
+| `config_skills(key, context)` | A `SkillSource` that evaluates AI Config `key` for `context` on every read. Raises from the read, rather than answering `[]`, for anything but a disabled variation or a parsed config. Never initializes the client. See *Following an AI Config's changes* above. |
+| `SkillSource(refs, config_keys=())` | A requested set read when it is needed: `refs` is a zero-argument function, sync or async, returning `SkillReference` values and key strings; `config_keys` names the AI Configs whose changes make a watcher read it again. Frozen; `config_keys` is held as a tuple. A non-callable `refs`, a string `config_keys`, or an entry that is not a non-empty string raises `TypeError`. |
 | `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent. Raises `ValueError` when the config is not a dict (including the `None` a failed `inspect_config` returns) or the field is present but malformed (including `null`), so neither reaches a pruning reconcile as "no skills". |
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
 | `get_skill_result(key, *, version=None)` | The same retrieval, reporting **why**: a frozen `SkillOutcome` with `.skill`, `.reason` (`ok` / `absent` / `integrity_failure` / `store_unavailable` / `wrong_version`), and `.detail`. See *Failing closed on tampering* above. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
-| `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative or non-finite `timeout`, or an unrecognised `on_unavailable`. `timeout=0` is valid and makes every skill report an error. **Performs synchronous filesystem I/O — see the note below.** |
+| `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `skills` is a sequence of `Skill` / `SkillReference` / key strings, `"*"`, or a `SkillSource`, which is read once; a source that raises or answers anything malformed is an unavailable retrieval. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative or non-finite `timeout`, or an unrecognised `on_unavailable`. `timeout=0` is valid and makes every skill report an error. **Performs synchronous filesystem I/O — see the note below.** |
 | `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `is_initialized()`, `add_listener(kind, fn)` / `remove_listener(kind, fn)`. A store without `is_initialized()` is treated as initialized. Both shipped stores deliver only the skill kind, so `add_listener` on any other kind raises. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
 | `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `close()` is **final** — `start()` afterwards raises. `poll_interval`, `read_timeout`, `initial_backoff` and `max_backoff` must be positive and finite, and `initial_backoff` may not exceed `max_backoff`. **Server-side only.** See *Receiving skills from LaunchDarkly* above. |
-| `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, so revocation takes effect within `debounce` rather than at the next restart. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
+| `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, and, for a `SkillSource`, on every change to one of its `config_keys`, so revocation takes effect within `debounce` rather than at the next restart. `watcher.notify()` schedules a reconcile through the same debounce. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `set_skill_store(store)`. It applies on every call, before or after
@@ -874,7 +940,8 @@ and `MANIFEST_VERSION`. So are the closed-set types, for annotating your own hel
 `ok` / `store_unavailable` / `wrong_version`).
 
 **`write_skills` blocks.** It is `async` for parity with the other accessors, but awaits
-nothing: all file I/O runs inline and holds the event loop for the duration. Wrap it in
+nothing except an async `SkillSource`: all file I/O runs inline and holds the event loop for
+the duration. Wrap it in
 `asyncio.to_thread` if that matters; `timeout` is checked between steps, not mid-step. Do not
 run two reconciles against the same root concurrently — they race on the manifest.
 
