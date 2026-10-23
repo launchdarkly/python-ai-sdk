@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from launchdarkly_ai_server import NativeTool, create_handler
-from launchdarkly_ai_server.evaluations import HttpResponse
+from launchdarkly_ai_server.evaluations.api import HttpResponse
 from launchdarkly_ai_server.experimental.evaluations import (
     AIConfig,
     DatasetRow,
@@ -4209,7 +4209,7 @@ async def test_inline_upload_is_retried_after_a_server_error() -> None:
         ]
     )
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
-    evals.api._sleep = lambda _: None
+    evals._api._sleep = lambda _: None
 
     result = await evals.run(
         key="inline-eval",
