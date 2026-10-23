@@ -21,7 +21,8 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from time import time_ns
 from typing import Any
 
 from .types import NativeTool
@@ -57,6 +58,10 @@ class ToolInvocation:
     arguments: Any = None
     result: Any = None
     error: str | None = None
+    #: Epoch nanoseconds around the call, so a caller can time a span to it.
+    #: Excluded from equality: a judge sees the same step whenever it ran.
+    started_ns: int | None = field(default=None, compare=False)
+    ended_ns: int | None = field(default=None, compare=False)
 
 
 class TrajectoryRecorder:
@@ -177,7 +182,9 @@ class TrajectoryRecorder:
         # later sees, and an evaluation holding many rows' calls in memory
         # until scoring must hold their bounded text, not each raw value.
         self._invocations.append(
-            ToolInvocation(name=name, arguments=_render_value(arguments))
+            ToolInvocation(
+                name=name, arguments=_render_value(arguments), started_ns=time_ns()
+            )
         )
         return len(self._invocations) - 1
 
@@ -192,6 +199,7 @@ class TrajectoryRecorder:
             self._invocations[slot],
             result=None if error is not None else _render_value(result),
             error=None if error is None else _truncate(error),
+            ended_ns=time_ns(),
         )
 
 
