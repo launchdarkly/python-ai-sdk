@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
+from ..content import tool_result_string
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
     build_message_history,
@@ -822,7 +823,7 @@ class EvaluationsRunner:
         variables.update(
             {
                 "input": row_result.get("input") or "",
-                "response_to_evaluate": output if output is not None else "",
+                "response_to_evaluate": tool_result_string(output),
                 "message_history": build_message_history(
                     user_input=row_result.get("input"),
                     trajectory=trajectory,
@@ -949,7 +950,7 @@ class EvaluationsRunner:
         try:
             result = await execution.handler(
                 dict(resolved.config),
-                row.get("output"),
+                variables["response_to_evaluate"],
                 {},
                 {
                     **variables,

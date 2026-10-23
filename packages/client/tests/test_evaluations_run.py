@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from launchdarkly_ai_server import NativeTool, create_handler
-from launchdarkly_ai_server.evaluations import HttpResponse
+from launchdarkly_ai_server.evaluations.api import HttpResponse
 from launchdarkly_ai_server.experimental.evaluations import (
     AIConfig,
     DatasetRow,
@@ -2267,6 +2267,61 @@ async def test_missing_expected_output_renders_empty_judge_variables(
 
 
 @pytest.mark.asyncio
+async def test_structured_output_reaches_the_judge_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page([{"rowIndex": 0, "input": "Question"}], total=1),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    judged: dict[str, str] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in prompt_text(config):
+            assert user_input == variables["response_to_evaluate"]
+            judged["response"] = variables["response_to_evaluate"]
+            judged["history"] = variables["message_history"]
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": {"answer": "original", "tags": ["a"], "final": True}}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    rendered = '{"answer": "original", "tags": ["a"], "final": true}'
+    assert judged["response"] == rendered
+    assert rendered in judged["history"]
+
+
+@pytest.mark.asyncio
 async def test_duplicate_criteria_rejected_before_any_request() -> None:
     transport = SequencedTransport([])
     evals = init_evaluations(
@@ -4154,7 +4209,7 @@ async def test_inline_upload_is_retried_after_a_server_error() -> None:
         ]
     )
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
-    evals.api._sleep = lambda _: None
+    evals._api._sleep = lambda _: None
 
     result = await evals.run(
         key="inline-eval",

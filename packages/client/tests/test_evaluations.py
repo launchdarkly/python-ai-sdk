@@ -10,11 +10,10 @@ import pytest
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server.evaluations import (
     DEFAULT_BASE_URI,
-    HttpResponse,
-    LDApiClient,
     LDApiError,
     Usage,
 )
+from launchdarkly_ai_server.evaluations.api import HttpResponse, LDApiClient
 from launchdarkly_ai_server.experimental.evaluations import (
     EvalRunResult,
     EvaluationsError,
@@ -75,9 +74,9 @@ def test_init_resolves_credentials_from_env(monkeypatch: pytest.MonkeyPatch) -> 
 
     evals = init_evaluations(transport=RecordingTransport())
 
-    assert evals.api.api_key == "api-token-from-env"
+    assert evals._api.api_key == "api-token-from-env"
     assert evals.sdk_key == "sdk-key-from-env"
-    assert evals.api.base_uri == DEFAULT_BASE_URI
+    assert evals._api.base_uri == DEFAULT_BASE_URI
     assert evals.ui_base_uri == "https://app.launchdarkly.com"
 
 
@@ -92,7 +91,7 @@ def test_init_prefers_explicit_credentials(monkeypatch: pytest.MonkeyPatch) -> N
         transport=RecordingTransport(),
     )
 
-    assert evals.api.api_key == "explicit-token"
+    assert evals._api.api_key == "explicit-token"
     assert evals.sdk_key == "explicit-sdk-key"
 
 
@@ -181,7 +180,7 @@ def request_url(**options: Any) -> str:
     """Init the harness, send one management API request, return its URL."""
     transport = RecordingTransport()
     evals = init_evaluations(transport=transport, **options)
-    evals.api.get("projects/proj/evaluations")
+    evals._api.get("projects/proj/evaluations")
     return str(transport.requests[0]["url"])
 
 
@@ -307,7 +306,7 @@ def test_api_host_env_alone_leaves_ui_host_on_default(
 
     evals = init_evaluations(transport=RecordingTransport())
 
-    assert evals.api.base_uri == "https://api.staging.example.com"
+    assert evals._api.base_uri == "https://api.staging.example.com"
     assert evals.ui_base_uri == "https://app.launchdarkly.com"
 
 
