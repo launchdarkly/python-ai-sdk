@@ -6,7 +6,7 @@ dependencies = [
   "launchdarkly-ai-server>=0.4.1",
   "opentelemetry-api>=1.25",
   "anthropic>=0.40",
-  "claude-agent-sdk>=0.2",
+  "claude-agent-sdk>=0.2.121",
 ]
 description = "Anthropic Claude agent handler for LaunchDarkly AI SDK"
 readme = "README.md"
