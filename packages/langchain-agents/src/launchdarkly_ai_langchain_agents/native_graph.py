@@ -23,10 +23,13 @@ from launchdarkly_ai_server import (
     report_usage,
     set_ld_span_attributes,
     to_ld_context,
+    tool_result_string,
 )
-from launchdarkly_ai_server.utils import make_graph_track_data
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import make_graph_track_data, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
+from .handler import _CHAT_OPENAI_FORWARDED_KEYS, _CHAT_OPENAI_MAPPING_KEYS
 from .messages import to_lang_chain_messages
 
 try:
@@ -89,7 +92,7 @@ def _build_node_tools(
             result = fn(kwargs)
             if inspect.isawaitable(result):
                 result = await result
-            return str(result)
+            return tool_result_string(result)
 
         t = tool_fn(
             name,
@@ -222,10 +225,13 @@ def to_lang_graph(
                 else:
                     lc_openai = importlib.import_module("langchain_openai")
                     model_cfg = node.config.get("model") or {}
-                    raw = model_cfg.get("parameters")
-                    kwargs = dict(raw) if isinstance(raw, dict) else {}
-                    # Tools are bound from the node config. A tools key here is forwarded raw and rejected.
-                    kwargs.pop("tools", None)
+                    kwargs = model_parameters(node.config)
+                    if kwargs:
+                        kwargs = select_forwarded_parameters(
+                            kwargs,
+                            _CHAT_OPENAI_FORWARDED_KEYS,
+                            mapping_keys=_CHAT_OPENAI_MAPPING_KEYS,
+                        )
                     kwargs["model"] = model_cfg.get("name") or "gpt-4o"
                     chat_model = lc_openai.ChatOpenAI(**kwargs)
 

@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.3.0"  # x-release-please-version
+__version__ = "0.4.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .client import _config as _config
@@ -20,6 +20,7 @@ from .content import (
     set_tool_definition_attributes,
     text_message,
     to_semconv_finish_reason,
+    tool_result_string,
 )
 from .conversation import (
     ConversationIdSpanProcessor,
@@ -177,6 +178,7 @@ __all__ = [  # noqa: RUF022
     "to_usage_dict",
     "text_message",
     "to_semconv_finish_reason",
+    "tool_result_string",
     "VariationMeta",
     # utils
     "create_handler",

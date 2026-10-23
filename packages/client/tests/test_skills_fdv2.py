@@ -2136,8 +2136,8 @@ class TestFailureHandling:
             with poll_store(endpoint) as store:
                 assert wait_until(lambda: store.failed is not None)
         assert "403" in store.failed
-        assert "opt-in" in store.failed
-        assert any("opt-in" in r.getMessage() for r in caplog.records)
+        assert "proxy" in store.failed
+        assert any("proxy" in r.getMessage() for r in caplog.records)
 
     def test_the_give_up_line_points_at_start_not_a_process_restart(
         self, endpoint: Any, caplog: Any

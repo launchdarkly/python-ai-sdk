@@ -17,6 +17,12 @@ from launchdarkly_ai_openai_agents.native_graph import (
     to_openai_agents,
 )
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.forwarding_spec import (
+    OPENAI_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -338,6 +344,42 @@ class TestToOpenAIAgentsTopology:
 
         # handoff() should be called for the child agent
         agents_mock.handoff.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_cyclic_edge_is_dropped_with_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        agents_mock = _make_agents_mock(_make_run_result("out"))
+
+        # root -> a -> b -> a: post-order builds b while a is still unbuilt.
+        def _node(key: str, target: str) -> dict[str, Any]:
+            return {
+                "key": key,
+                "config": {"model": {"name": "gpt-4o"}, "instructions": key},
+                "meta": {},
+                "edges": [{"source_key": key, "target_key": target}],
+                "is_terminal": False,
+            }
+
+        edges = [("root", "a"), ("a", "b"), ("b", "a")]
+        graph_def = _make_graph_def(
+            nodes={
+                "root": _node("root", "a"),
+                "a": _node("a", "b"),
+                "b": _node("b", "a"),
+            },
+            edges=[{"source_key": s, "target_key": t} for s, t in edges],
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            await to_openai_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        assert [a.name for a in agents_mock._created_agents] == ["b", "a", "root"]
+        assert "handoffs" not in agents_mock._created_agents[0]._kw
+        assert 'Dropping cyclic edge "b" -> "a"' in caplog.text
 
     @pytest.mark.asyncio
     async def test_runner_starts_at_root_and_returns_output(self) -> None:
@@ -1042,6 +1084,46 @@ class TestToOpenAIAgentsOpenAISpecific:
         assert "$ld:ai:graph:handoff_success" in track_calls
 
 
+class TestNativeGraphModelParameters:
+    @pytest.mark.asyncio
+    async def test_no_never_forwarded_key_reaches_any_agent_or_the_run(self) -> None:
+        run_result = _make_run_result("out")
+        agents_mock = _make_agents_mock(run_result)
+        agents_mock.ModelSettings = MagicMock(side_effect=lambda **kw: dict(kw))
+        nodes = {
+            "root": {
+                "key": "root",
+                "config": {
+                    "model": {
+                        "name": "gpt-4o",
+                        "parameters": {
+                            **NEVER_FORWARDED_BAG,
+                            "temperature": 0.1,
+                            "max_turns": 6,
+                        },
+                    },
+                    "instructions": "help",
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [],
+                "is_terminal": True,
+            }
+        }
+        graph_def = _make_graph_def(nodes=nodes)
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+        ):
+            await to_openai_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        (root_agent,) = agents_mock._created_agents
+        assert root_agent._kw["model_settings"] == {"temperature": 0.1}
+        run_kwargs = agents_mock.Runner.run.call_args.kwargs
+        assert run_kwargs["max_turns"] == 6
+        assert not find_leaks({k: v for k, v in run_kwargs.items() if k != "hooks"})
+
+
 class TestBuildNodeToolsSyncHandlers:
     """``_build_node_tools`` must accept sync handlers (native path skips wrap_tool_handlers)."""
 
@@ -1141,3 +1223,57 @@ class TestBuildNodeToolsSyncHandlers:
             _build_node_tools(node, {"my-tool": sync_wrapper})
 
         assert await captured[0]({}) == "done"
+
+
+class TestNativeGraphForwardsExactlyTheCrossSdkList:
+    """The native graph builds each agent's ``ModelSettings`` with the handler's own forwarding
+    and reads the root's ``max_turns`` for the run, so a probe of one node finds exactly the
+    cross-SDK OpenAI Agents list."""
+
+    @pytest.mark.asyncio
+    async def test_root_agent_and_run(self) -> None:
+        import dataclasses
+
+        from agents import ModelSettings
+
+        async def call(parameters: dict[str, Any]) -> object:
+            agents_mock = _make_agents_mock(_make_run_result("out"))
+            # Validated by the real ModelSettings, so a value the SDK rejects fails the probe.
+            agents_mock.ModelSettings = MagicMock(
+                side_effect=lambda **kw: (ModelSettings(**kw), dict(kw))[1]
+            )
+            nodes = {
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": "gpt-4o", "parameters": parameters},
+                        "instructions": "help",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+            with patch(
+                "importlib.import_module",
+                side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
+            ):
+                await to_openai_agents(
+                    _make_def_promise(_make_graph_def(nodes=nodes))
+                ).invoke("hi")
+            (root_agent,) = agents_mock._created_agents
+            run_kwargs = agents_mock.Runner.run.call_args.kwargs
+            return (
+                root_agent._kw.get("model_settings"),
+                {k: v for k, v in run_kwargs.items() if k not in {"hooks", "context"}},
+            )
+
+        candidates = candidate_keys(
+            (f.name for f in dataclasses.fields(ModelSettings)), OPENAI_AGENTS
+        )
+        assert (
+            await probe_forwarded_keys(
+                candidates, call, overrides={"tool_choice": "required"}
+            )
+            == OPENAI_AGENTS
+        )
