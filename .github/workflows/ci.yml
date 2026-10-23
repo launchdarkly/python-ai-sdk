@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so an advisory published against an unchanged uv.lock still gets reported.
+  schedule:
+    - cron: "0 13 * * 1"
 
 permissions:
   contents: read
@@ -22,6 +25,20 @@ jobs:
       - run: uv sync --all-packages
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+
+  # ─── Dependency audit ───────────────────────────────────────────────────────
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    # A new advisory must not block unrelated PRs; push and the weekly schedule still fail on it.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      # Audits the committed uv.lock as-is (no `uv lock` first), so a vulnerable pin fails here.
+      - run: make audit
 
   # ─── Setup ──────────────────────────────────────────────────────────────────
   setup:
