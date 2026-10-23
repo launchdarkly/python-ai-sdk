@@ -3029,3 +3029,65 @@ class TestMalformedObjectValuesAreDropped:
         kwargs = mock_openai.responses.stream.call_args.kwargs
         assert "reasoning" not in kwargs
         assert kwargs["top_p"] == 0.4
+
+
+class TestMaxRetries:
+    """`max_retries` reaches the `AsyncOpenAI` client the factory builds, and only when set.
+
+    The client's own retries are the right layer for rate limits, so an omitted value must leave the
+    vendor default in place rather than replace it, and nothing may ever turn retries off.
+    """
+
+    def _build(
+        self, monkeypatch: pytest.MonkeyPatch, **kwargs: Any
+    ) -> tuple[Any, MagicMock]:
+        import openai
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        real_client = openai.AsyncOpenAI
+        built: list[Any] = []
+
+        def _construct(**options: Any) -> Any:
+            built.append(real_client(**options))
+            return built[-1]
+
+        with patch("openai.AsyncOpenAI", side_effect=_construct) as ctor:
+            create_openai_messages_handler(**kwargs)
+        return built[0], ctor
+
+    def test_value_reaches_the_constructed_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, _ctor = self._build(monkeypatch, max_retries=7)
+        assert client.max_retries == 7
+
+    def test_omitted_value_keeps_the_vendor_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import openai
+
+        client, ctor = self._build(monkeypatch)
+        assert "max_retries" not in ctor.call_args.kwargs
+        assert client.max_retries == openai.DEFAULT_MAX_RETRIES
+
+    def test_explicit_zero_is_the_callers_choice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, _ctor = self._build(monkeypatch, max_retries=0)
+        assert client.max_retries == 0
+
+    def test_convenience_wrapper_forwards_it_to_the_factory(self) -> None:
+        import launchdarkly_ai_openai_messages.handler as handler_mod
+
+        factory = MagicMock()
+        fake_config = MagicMock()
+        with (
+            patch.object(handler_mod, "_create_openai_messages_handler", factory),
+            patch.object(handler_mod, "_config", fake_config),
+        ):
+            handler_mod.openai_messages("k", "q", {}, max_retries=6)
+        assert factory.call_args.kwargs["max_retries"] == 6
+        # config() takes no such argument, so leaving it in kwargs would raise TypeError.
+        assert "max_retries" not in fake_config.call_args.kwargs

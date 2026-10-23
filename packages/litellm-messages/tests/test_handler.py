@@ -742,3 +742,57 @@ class TestForwardsExactlyTheCrossSdkList:
             return completion.call_args.kwargs
 
         assert await probe_forwarded_keys(self._candidates(), call) == LITELLM_MESSAGES
+
+
+class TestMaxRetries:
+    """`max_retries` reaches every `acompletion` call, and only when set.
+
+    LiteLLM hands it to the backing provider's client, which is the right layer for rate-limit
+    retries. An omitted value must leave LiteLLM's default in place rather than replace it.
+    """
+
+    async def test_value_reaches_acompletion(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        await create_litellm_messages_handler(completion=completion, max_retries=7)(
+            CONFIG, "question"
+        )
+        assert completion.call_args.kwargs["max_retries"] == 7
+        # The provider-client knob, not LiteLLM's own retry loop as well.
+        assert "num_retries" not in completion.call_args.kwargs
+
+    async def test_value_reaches_every_streamed_turn(self) -> None:
+        completion = AsyncMock(return_value=FakeStream([_chunk(text="hi")]))
+        await _events(
+            await create_litellm_messages_handler(
+                completion=completion, max_retries=7
+            ).stream(CONFIG, "q")
+        )
+        assert completion.call_args.kwargs["max_retries"] == 7
+
+    async def test_omitted_value_keeps_the_litellm_default(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        await create_litellm_messages_handler(completion=completion)(CONFIG, "question")
+        assert "max_retries" not in completion.call_args.kwargs
+
+    async def test_config_cannot_set_it(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_retries": 50}},
+        }
+        await create_litellm_messages_handler(completion=completion, max_retries=3)(
+            config, "question"
+        )
+        assert completion.call_args.kwargs["max_retries"] == 3
+
+    def test_convenience_wrapper_forwards_it_to_the_handler(self) -> None:
+        factory = MagicMock()
+        config = MagicMock()
+        with (
+            patch.object(handler_mod, "_create_litellm_messages_handler", factory),
+            patch.object(handler_mod, "_config", config),
+        ):
+            litellm_messages("k", "q", {}, max_retries=6)
+        assert factory.call_args.kwargs["max_retries"] == 6
+        # config() takes no such argument, so leaving it in kwargs would raise TypeError.
+        assert "max_retries" not in config.call_args.kwargs
