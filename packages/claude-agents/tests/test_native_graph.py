@@ -488,6 +488,119 @@ class TestToClaudeAgentsTopology:
         assert "response" in result
 
 
+class TestToClaudeAgentsHostIsolation:
+    """Every ``query()`` the adapter makes switches the built-ins off unless a node attaches one,
+    and loads none of the host's Claude Code settings unless ``opts`` names sources. The host
+    options in ``opts`` reach every node, root and sub-agents alike.
+    """
+
+    @staticmethod
+    async def _root_options(
+        tool_handlers: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        mock_sdk = _make_sdk_mock("done")
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(
+                _make_def_promise(_make_graph_def()),
+                opts={"tool_handlers": tool_handlers or {}},
+            ).invoke("hi")
+        assert len(captured) == 1
+        return captured[0]
+
+    @staticmethod
+    async def _root_and_leaf_options(
+        **host: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Runs a root with one leaf sub-agent, which the root calls, and returns the options
+        each node's ``query()`` received."""
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {"model": {"name": "claude-3"}, "instructions": "root"},
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [{"source_key": "root", "target_key": "leaf"}],
+                    "is_terminal": False,
+                },
+                "leaf": {
+                    "key": "leaf",
+                    "config": {"model": {"name": "claude-3"}, "instructions": "leaf"},
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                },
+            },
+            edges=[{"source_key": "root", "target_key": "leaf"}],
+        )
+        leaf_tool: list[Any] = []
+
+        def _tool_factory(name: str, desc: str, schema: Any) -> Any:
+            def _dec(fn: Any) -> Any:
+                if "leaf" in name:
+                    leaf_tool.append(fn)
+                return fn
+
+            return _dec
+
+        mock_sdk = _make_sdk_mock("done")
+        mock_sdk.tool = MagicMock(side_effect=_tool_factory)
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        result_msg = _make_result_msg("done")
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            if kwargs["options"].get("system_prompt") == "root":
+                await leaf_tool[0]({"input": "sub-query"})
+            yield result_msg
+
+        mock_sdk.query = _query
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def), opts=host).invoke("hi")
+        by_node = {kw["system_prompt"]: kw for kw in captured}
+        assert sorted(by_node) == ["leaf", "root"]
+        return by_node["root"], by_node["leaf"]
+
+    @pytest.mark.asyncio
+    async def test_sends_an_empty_tool_list_with_no_native_tools(self) -> None:
+        opts = await self._root_options()
+        assert opts["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_sends_the_native_tool_names(self) -> None:
+        opts = await self._root_options({"run-bash": NativeTool("Bash")})
+        assert opts["tools"] == ["Bash"]
+
+    @pytest.mark.asyncio
+    async def test_loads_no_host_settings_and_sends_no_cwd_by_default(self) -> None:
+        for opts in await self._root_and_leaf_options():
+            assert opts["setting_sources"] == []
+            assert "cwd" not in opts
+
+    @pytest.mark.asyncio
+    async def test_forwards_cwd_and_setting_sources_to_root_and_leaf(self) -> None:
+        for opts in await self._root_and_leaf_options(
+            cwd="/srv/app", setting_sources=["user"]
+        ):
+            assert opts["cwd"] == "/srv/app"
+            assert opts["setting_sources"] == ["user"]
+
+
 # ---------------------------------------------------------------------------
 # Anthropic-specific specs
 # ---------------------------------------------------------------------------
