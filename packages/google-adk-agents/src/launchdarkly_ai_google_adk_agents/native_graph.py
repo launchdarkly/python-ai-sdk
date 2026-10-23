@@ -9,7 +9,6 @@ from typing import Any
 from launchdarkly_ai_server import (
     get_client,
     make_track_data,
-    parse_template,
     report_usage,
     set_ld_span_attributes,
     to_ld_context,
@@ -18,6 +17,7 @@ from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import (
+    _instruction,
     _resolve_model,
     _session_event,
     _user_message,
@@ -238,7 +238,7 @@ def _visit(
             project=options.get("project"),
             location=options.get("location"),
         ),
-        instruction=parse_template(str(config.get("instructions") or ""), variables),
+        instruction=_instruction(config, variables),
         tools=tools,
     )
     for target_key in targets:

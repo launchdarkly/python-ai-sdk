@@ -738,3 +738,87 @@ class TestStreaming:
         await generator.aclose()
         assert abandoned == [True]
         spans_mod.fail_span.assert_not_called()
+
+
+class _AdkLikeFunctionTool:
+    """Real ADK's ``FunctionTool`` takes only the callable and builds its schema from it."""
+
+    def __init__(self, func: Any) -> None:
+        self.func = func
+        self.signature = inspect.signature(func)
+
+
+class TestToolSchemas:
+    _SCHEMA: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}, "units": {"type": "string"}},
+        "required": ["city"],
+    }
+
+    def test_schema_arguments_survive_adk_signature_filtering(self) -> None:
+        def weather(city: str, units: str = "c") -> str:
+            return f"{city}/{units}"
+
+        tool = handler_mod.make_function_tool(
+            _AdkLikeFunctionTool, weather, name="weather", parameters=self._SCHEMA
+        )
+        params = tool.signature.parameters
+        assert set(params) == {"city", "units"}
+        assert params["city"].default is inspect.Parameter.empty
+        assert tool.func(city="Paris") == "Paris/c"
+
+    def test_schema_becomes_the_declaration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        declaration = MagicMock()
+        declaration.model_copy.return_value = "copied"
+        genai = SimpleNamespace(FunctionDeclaration=MagicMock(return_value=declaration))
+        monkeypatch.setattr(handler_mod, "genai_types", genai)
+        tool = handler_mod.make_function_tool(
+            _AdkLikeFunctionTool,
+            lambda args: args,
+            name="weather",
+            description="forecast",
+            parameters=self._SCHEMA,
+        )
+        assert tool._get_declaration() == "copied"
+        genai.FunctionDeclaration.assert_called_once_with(
+            name="weather", description="forecast", parameters_json_schema=self._SCHEMA
+        )
+
+
+class TestSessionSeeding:
+    async def test_system_history_is_not_seeded(self) -> None:
+        await create_google_adk_agents_handler()(
+            BASE_CONFIG,
+            "hello",
+            history=[
+                {"role": "system", "content": "secret"},
+                {"role": "user", "content": "earlier"},
+            ],
+        )
+        appended = _FakeRunner.last.session_service.append_event.await_args_list
+        assert [_message_text(call.args[1].content) for call in appended] == ["earlier"]
+
+    async def test_config_turns_are_seeded_before_history(self) -> None:
+        config = {
+            "model": {"name": "gemini-2.5-flash"},
+            "provider": {"name": "Google"},
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Hi {{name}}"},
+                {"role": "assistant", "content": "Hello."},
+            ],
+        }
+        await create_google_adk_agents_handler()(
+            config,
+            "hello",
+            variables={"name": "Ada"},
+            history=[{"role": "user", "content": "earlier"}],
+        )
+        appended = _FakeRunner.last.session_service.append_event.await_args_list
+        assert [
+            (call.args[1].content.role, _message_text(call.args[1].content))
+            for call in appended
+        ] == [("user", "Hi Ada"), ("model", "Hello."), ("user", "earlier")]
+        assert handler_mod.LlmAgent.call_args.kwargs["instruction"] == "Be brief."

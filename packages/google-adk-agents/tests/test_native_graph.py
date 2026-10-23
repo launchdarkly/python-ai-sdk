@@ -299,6 +299,21 @@ class TestToAdkAgents:
         span.end.assert_called()
 
 
+class TestNodeInstructions:
+    async def test_system_messages_become_the_instruction(self) -> None:
+        graph = _graph()
+        graph.root.config.pop("instructions")
+        graph.root.config["messages"] = [
+            {"role": "system", "content": "Route for {{team}}."}
+        ]
+        await _adapter(graph).invoke("hi", variables={"team": "ops"})
+        instructions = {
+            call.kwargs["name"]: call.kwargs["instruction"]
+            for call in native_mod.LlmAgent.call_args_list
+        }
+        assert instructions["root"] == "Route for ops."
+
+
 class TestModelTransport:
     async def test_nodes_resolve_their_model_with_the_factory_options(self) -> None:
         await _adapter(

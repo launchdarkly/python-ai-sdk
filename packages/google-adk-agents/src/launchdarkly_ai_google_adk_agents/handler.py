@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import copy
 import inspect
+import keyword
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -200,9 +201,14 @@ class LaunchDarklyTelemetryPlugin(BasePlugin):  # type: ignore[misc]
 
 
 def history_contents(history: list[dict[str, Any]] | None) -> list[Any]:
-    """Prior turns as ADK contents. Image bytes are raw, not a data URL."""
+    """Prior turns as ADK contents. Image bytes are raw, not a data URL.
+
+    System turns are dropped: system text belongs on the agent instruction.
+    """
     contents: list[Any] = []
     for message in history or []:
+        if message.get("role") == "system":
+            continue
         role = "model" if message.get("role") == "assistant" else "user"
         contents.append(_content(role, _parts(message.get("content"))))
     return contents
@@ -466,9 +472,21 @@ async def _open_run(
     session = await runner.session_service.create_session(
         app_name=_APP_NAME, user_id=user_id
     )
-    for content in history_contents(history):
+    turns = _config_turns(cfg, variables) + list(history or [])
+    for content in history_contents(turns):
         await runner.session_service.append_event(session, _session_event(content))
     return runner, session, user_id
+
+
+def _config_turns(cfg: AiConfigRep, variables: dict[str, Any]) -> list[dict[str, Any]]:
+    """The variation's own user and assistant turns, templated, seeded ahead of history."""
+    turns: list[dict[str, Any]] = []
+    for message in cfg.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, str):
+            content = parse_template(content, variables)
+        turns.append({"role": message.get("role"), "content": content})
+    return turns
 
 
 def _resolve_model(
@@ -596,8 +614,12 @@ def _tools(cfg: AiConfigRep, handlers: dict[str, Any] | None) -> list[Any]:
     return built
 
 
-def adapt_handler(func: Any, name: str) -> Any:
-    """ADK calls tools with keywords. Mapping-style handlers still get one dict."""
+def adapt_handler(func: Any, name: str, parameters: Any = None) -> Any:
+    """ADK calls tools with keywords. Mapping-style handlers still get one dict.
+
+    ADK drops every argument not named in the callable's signature, so the adapter carries a
+    signature built from the tool's JSON schema when there is one.
+    """
     params = [
         param
         for param in inspect.signature(func).parameters.values()
@@ -616,7 +638,30 @@ def adapt_handler(func: Any, name: str) -> Any:
         adapted = _sync_adapter(_call)
     adapted.__name__ = name
     adapted.__doc__ = inspect.getdoc(func) or ""
+    signature = _schema_signature(parameters)
+    if signature is not None:
+        adapted.__signature__ = signature
     return adapted
+
+
+def _schema_signature(parameters: Any) -> inspect.Signature | None:
+    properties = parameters.get("properties") if isinstance(parameters, dict) else None
+    if not isinstance(properties, dict):
+        return None
+    required = set(parameters.get("required") or [])
+    # ponytail: a property name that is not a Python identifier cannot be a parameter, so ADK
+    # drops that argument. Upgrade to a BaseTool subclass if such schemas show up.
+    return inspect.Signature(
+        [
+            inspect.Parameter(
+                key,
+                inspect.Parameter.KEYWORD_ONLY,
+                **({} if key in required else {"default": None}),
+            )
+            for key in properties
+            if key.isidentifier() and not keyword.iskeyword(key)
+        ]
+    )
 
 
 def _sync_adapter(call: Any) -> Any:
@@ -641,7 +686,7 @@ def make_function_tool(
     description: str = "",
     parameters: Any = None,
 ) -> Any:
-    adapted = adapt_handler(func, name)
+    adapted = adapt_handler(func, name, parameters)
     try:
         return function_tool(
             adapted, name=name, description=description, parameters=parameters
@@ -657,7 +702,19 @@ def make_function_tool(
                 setattr(tool, attr, value)
             except Exception:
                 continue
+        declaration = _declaration(name, description, parameters)
+        if declaration is not None:
+            # ADK's FunctionTool takes no schema and would infer one from the adapter.
+            tool._get_declaration = lambda: declaration.model_copy(deep=True)
         return tool
+
+
+def _declaration(name: str, description: str, parameters: Any) -> Any:
+    if genai_types is None or not isinstance(parameters, dict):
+        return None
+    return genai_types.FunctionDeclaration(
+        name=name, description=description, parameters_json_schema=parameters
+    )
 
 
 def builtin_tool(name: str) -> Any:
