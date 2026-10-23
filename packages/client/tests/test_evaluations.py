@@ -608,6 +608,8 @@ EXPERIMENTAL_EVALUATIONS_SURFACE = frozenset(
         "Criterion",
         "Judge",
         "Scorer",
+        "ScorerContext",
+        "ToolInvocation",
         "EvalRunResult",
         "RunSummary",
         "EvaluationsError",

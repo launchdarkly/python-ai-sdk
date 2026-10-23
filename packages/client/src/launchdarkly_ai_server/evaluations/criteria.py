@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isnan
 from typing import Any, Literal
 
+from ..trajectory import ToolInvocation
 from .types import DatasetRow
 
-type ScorerFn = Callable[[DatasetRow, Any], float | bool | Awaitable[float | bool]]
+type ScorerResult = float | bool | Awaitable[float | bool]
+type ScorerFn = (
+    Callable[[DatasetRow, Any], ScorerResult]
+    | Callable[[DatasetRow, Any, ScorerContext], ScorerResult]
+)
 
 type SuccessDirection = Literal["higher_is_better", "lower_is_better"]
 
@@ -64,14 +70,35 @@ class Judge:
 
 
 @dataclass(frozen=True)
+class ScorerContext:
+    """Extra inputs for a scorer, beyond the row and the generated output.
+
+    A scorer receives this as an optional third argument. New inputs are added
+    as new fields, so the scorer signature does not change.
+
+    ``tool_calls`` lists the tools the handler called while it produced the
+    output, in the order the calls started. It is empty when the handler
+    called no tool. At most 50 calls are recorded. ``tool_calls_omitted``
+    counts the calls made past that limit. Each call records its arguments and
+    result as text, cut to 2000 characters.
+    """
+
+    tool_calls: tuple[ToolInvocation, ...] = ()
+    tool_calls_omitted: int = 0
+
+
+@dataclass(frozen=True)
 class Scorer:
     """Local deterministic scorer run for each generated evaluation row.
 
     ``fn`` may be sync or async and receives ``(row, output)``, where ``row``
     is the :class:`~launchdarkly_ai_server.evaluations.types.DatasetRow` the
-    output was generated from and ``output`` is the generated output. It must
-    return a boolean or a numeric score from 0 to 1. Boolean results are
-    converted to 1.0 or 0.0 before being emitted as evaluation events.
+    output was generated from and ``output`` is the generated output. To
+    receive more inputs, declare a required third positional parameter. It
+    receives a :class:`ScorerContext`. Any other function is called with two
+    arguments. ``fn`` must return a boolean or a numeric score
+    from 0 to 1. Boolean results are converted to 1.0 or 0.0 before being
+    emitted as evaluation events.
 
     ``threshold`` defaults to 1.0: a row passes only on a perfect score, which
     matches the common case of boolean scorers. Pass a lower threshold for
@@ -90,12 +117,14 @@ class Scorer:
     threshold: float | None = 1.0
     pass_rate_threshold: float | None = None
     success_direction: SuccessDirection = "higher_is_better"
+    _accepts_context: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("scorer name must not be blank")
         if not callable(self.fn):
             raise ValueError("scorer fn must be callable")
+        object.__setattr__(self, "_accepts_context", _takes_context(self.fn))
         _validate_thresholds(
             threshold=self.threshold,
             pass_rate_threshold=self.pass_rate_threshold,
@@ -118,6 +147,32 @@ class Scorer:
 
 
 type Criterion = Judge | Scorer
+
+
+def _takes_context(fn: Callable[..., Any]) -> bool:
+    """Whether ``fn`` requires a third positional parameter for the context.
+
+    Only required parameters count, so ``(row, output, extra=None)`` is called
+    with two arguments. Raises ``ValueError`` when ``fn`` requires more than
+    three positional arguments or any keyword-only argument, since every call
+    would fail. A function with no inspectable signature is called with two.
+    """
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    required = [p for p in parameters if p.default is p.empty]
+    if any(p.kind is inspect.Parameter.KEYWORD_ONLY for p in required):
+        raise ValueError("scorer fn must not require a keyword-only argument")
+    positional = [
+        p
+        for p in required
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional) > 3:
+        raise ValueError("scorer fn must accept at most (row, output, context)")
+    return len(positional) == 3
 
 
 def _validate_thresholds(

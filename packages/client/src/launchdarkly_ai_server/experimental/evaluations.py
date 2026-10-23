@@ -8,7 +8,7 @@ you upgrade.
 """
 
 from ..evaluations.api import EvaluationsError
-from ..evaluations.criteria import Criterion, Judge, Scorer
+from ..evaluations.criteria import Criterion, Judge, Scorer, ScorerContext
 from ..evaluations.module import EvaluationsModule, init_evaluations
 from ..evaluations.tools import EvalTool
 from ..evaluations.types import (
@@ -20,6 +20,7 @@ from ..evaluations.types import (
     GenerationOverrides,
     RunSummary,
 )
+from ..trajectory import ToolInvocation
 
 __all__ = [  # noqa: RUF022
     # entry point
@@ -36,6 +37,8 @@ __all__ = [  # noqa: RUF022
     "Criterion",
     "Judge",
     "Scorer",
+    "ScorerContext",
+    "ToolInvocation",
     # results and errors
     "EvalRunResult",
     "RunSummary",
