@@ -74,7 +74,19 @@ from launchdarkly_ai_server.skills_fdv2 import (
     _tombstone_from_delete,
 )
 
-pytestmark = pytest.mark.usefixtures("reset_skill_state")
+pytestmark = pytest.mark.usefixtures("reset_skill_state", "clear_endpoint_env")
+
+
+@pytest.fixture
+def clear_endpoint_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A store given no URI option reads ``LD_BASE_URI`` and ``LD_STREAM_URI``, so
+    a developer shell with either set would move every default this module
+    asserts. Both are cleared around each test, and restored after.
+    """
+    monkeypatch.delenv("LD_BASE_URI", raising=False)
+    monkeypatch.delenv("LD_STREAM_URI", raising=False)
+
 
 SDK_KEY = "sdk-00000000-0000-4000-8000-000000000000"
 SKILL_BODY = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
@@ -4050,6 +4062,110 @@ class TestStreamHostDefaults:
         assert endpoint.requests == []
 
 
+class TestEndpointsFromTheEnvironment:
+    """
+    ``init_client`` reads ``LD_BASE_URI`` and ``LD_STREAM_URI`` for the base
+    SDK. A store that ignored them resolved flags against the instance the
+    environment named and sent skill delivery to production, with that
+    instance's SDK key: a fatal 401 in ``failed``, not a configuration error.
+    With no URI option, the store reads them as if they were the options.
+    """
+
+    @staticmethod
+    def _origins(store: FDv2SkillStore) -> tuple[str, str]:
+        requester = store._requester
+        return requester._base_uri, requester._stream_uri
+
+    def test_ld_base_uri_alone_moves_both_endpoints(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The store's own rule for a lone base URI, not ``init_client``'s,
+        # which leaves flag streaming on its default host.
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        assert self._origins(FDv2SkillStore(SDK_KEY)) == (
+            "https://sdk.catfood.example.com",
+            "https://sdk.catfood.example.com",
+        )
+
+    def test_both_variables_set_each_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.catfood.example.com/")
+        assert self._origins(FDv2SkillStore(SDK_KEY)) == (
+            "https://sdk.catfood.example.com",
+            "https://stream.catfood.example.com",
+        )
+
+    def test_ld_stream_uri_alone_leaves_polling_on_its_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.catfood.example.com")
+        assert self._origins(FDv2SkillStore(SDK_KEY)) == (
+            DEFAULT_BASE_URI,
+            "https://stream.catfood.example.com",
+        )
+
+    def test_either_option_turns_both_variables_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Options win as a set: an explicit host is never mixed with one read
+        from the environment."""
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.catfood.example.com")
+        assert self._origins(
+            FDv2SkillStore(SDK_KEY, base_uri="https://relay.example.com")
+        ) == ("https://relay.example.com", "https://relay.example.com")
+        assert self._origins(
+            FDv2SkillStore(SDK_KEY, stream_uri="https://stream.example.com")
+        ) == (DEFAULT_BASE_URI, "https://stream.example.com")
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_a_blank_value_is_unset(
+        self, monkeypatch: pytest.MonkeyPatch, blank: str
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", blank)
+        monkeypatch.setenv("LD_STREAM_URI", blank)
+        assert self._origins(FDv2SkillStore(SDK_KEY)) == (
+            DEFAULT_BASE_URI,
+            DEFAULT_STREAM_URI,
+        )
+
+    @pytest.mark.parametrize("name", ["LD_BASE_URI", "LD_STREAM_URI"])
+    def test_a_plain_http_value_is_refused_by_the_variable_name(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """The message names the variable, not an option the caller never
+        passed."""
+        monkeypatch.setenv(name, "http://sdk.catfood.example.com")
+        with pytest.raises(ValueError, match="cleartext") as excinfo:
+            FDv2SkillStore(SDK_KEY)
+        message = str(excinfo.value)
+        assert name in message
+        assert "base_uri" not in message
+        assert "stream_uri" not in message
+
+    def test_the_variables_are_read_once_at_construction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        store = FDv2SkillStore(SDK_KEY)
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.elsewhere.example.com")
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.elsewhere.example.com")
+        assert self._origins(store) == (
+            "https://sdk.catfood.example.com",
+            "https://sdk.catfood.example.com",
+        )
+
+    def test_the_module_defaults_keep_the_production_hosts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        FDv2SkillStore(SDK_KEY)
+        assert DEFAULT_BASE_URI == "https://sdk.launchdarkly.com"
+        assert DEFAULT_STREAM_URI == "https://stream.launchdarkly.com"
+
+
 # ---------------------------------------------------------------------------
 # The eager re-reconcile, end to end over the transport
 # ---------------------------------------------------------------------------
@@ -4350,6 +4466,7 @@ class TestTransportLayering:
             "json",
             "logging",
             "math",
+            "os",
             "random",
             "re",
             "socket",

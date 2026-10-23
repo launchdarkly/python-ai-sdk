@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
 import re
 import socket
@@ -72,6 +73,17 @@ DEFAULT_STREAM_URI = "https://stream.launchdarkly.com"
 Where ``GET /sdk/stream`` is served. LaunchDarkly streams from a different host
 than it polls from; a *base_uri* given without a *stream_uri* is used for both.
 """
+
+
+def _endpoint_env(name: str) -> str | None:
+    """
+    Reads ``LD_BASE_URI`` or ``LD_STREAM_URI``, the variables ``init_client``
+    reads for the base SDK. Blank counts as unset: copied ``.env`` templates
+    ship these empty.
+    """
+    value = os.environ.get(name, "").strip()
+    return value or None
+
 
 POLL_PATH = "/sdk/poll"
 STREAM_PATH = "/sdk/stream"
@@ -1401,8 +1413,14 @@ class FDv2SkillStore:
           Given without *stream_uri*, it is used for streaming too (relays and
           private instances).
         - *stream_uri*: origin for ``GET /sdk/stream`` (default
-          ``DEFAULT_STREAM_URI``). Both must be ``https://``; ``http://`` is
-          accepted only for ``localhost``, ``127.0.0.1`` or ``::1``.
+          ``DEFAULT_STREAM_URI``, or the base URI when one is given or read from
+          ``LD_BASE_URI``). Both must be ``https://``; ``http://`` is accepted
+          only for ``localhost``, ``127.0.0.1`` or ``::1``.
+
+          When neither is given, ``LD_BASE_URI`` and ``LD_STREAM_URI`` are read
+          in their place, once, here, so a process pointed at a non-production
+          instance sends skill delivery there too. The defaults apply after
+          that.
         - *mode*: ``"stream"`` (default, recommended: revocations arrive in
           seconds) or ``"poll"`` (revocations arrive within one *poll_interval*).
         - *poll_interval*: seconds between polls; positive and finite.
@@ -1418,13 +1436,21 @@ class FDv2SkillStore:
         fatal status stops delivery and sets ``failed``.
         """
         _require_server_side_credential(sdk_key)
-        # A lone ``base_uri`` serves both endpoints.
+        # The environment stands in for the options only when neither is
+        # given, so an explicit host is never joined with one read from the
+        # environment.
+        base_option, stream_option = "base_uri", "stream_uri"
+        if base_uri is None and stream_uri is None:
+            base_uri = _endpoint_env("LD_BASE_URI")
+            stream_uri = _endpoint_env("LD_STREAM_URI")
+            base_option, stream_option = "LD_BASE_URI", "LD_STREAM_URI"
+        # A lone base URI serves both endpoints.
         if stream_uri is None:
             stream_uri = DEFAULT_STREAM_URI if base_uri is None else base_uri
         if base_uri is None:
             base_uri = DEFAULT_BASE_URI
-        _require_https_uri(base_uri)
-        _require_https_uri(stream_uri, "stream_uri")
+        _require_https_uri(base_uri, base_option)
+        _require_https_uri(stream_uri, stream_option)
         if mode not in ("stream", "poll"):
             raise ValueError(f'mode must be "stream" or "poll", got {mode!r}')
         # ``nan`` and ``inf`` pass a ``<= 0`` check, but would make the poll
