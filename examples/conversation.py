@@ -9,10 +9,10 @@ LaunchDarkly's Conversations view and confirm:
      the same id: root, ``chat``, ``execute_tool``, and the judge's own ``invoke_agent``.
   2. Each turn shows a score badge, sourced from the ``gen_ai.evaluation.result`` span event on
      the judge span.
-  3. No judge reasoning anywhere in the telemetry. The score and the judge's config key are
-     exported; the explanation is not, because it is model prose about the user's conversation
-     and content attributes require ``capture_content``. The reasoning IS printed below, straight
-     from ``judge_results`` — that is the caller's copy, and it is unaffected.
+  3. The judge explanation is on the span, because capture is on by default. The score and
+     the judge's config key are exported either way. An explicit ``False`` removes the
+     explanation from telemetry. The reasoning IS printed below, straight from
+     ``judge_results`` — that is the caller's copy, and it is unaffected.
 
 The flag key must point at an AI Config with a ``judge_configuration``, otherwise there are no
 judge turns to look at.
