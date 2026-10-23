@@ -39,15 +39,21 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 
 ```python
 # Factory — returns a ProviderHandler with provides_for attached
-def create_claude_agents_handler() -> ProviderHandler: ...
+def create_claude_agents_handler(
+    *,
+    capture_content: bool | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    setting_sources: list[SettingSource] | None = None,
+) -> ProviderHandler: ...
 
-# Convenience wrapper — equivalent to config(key=config_key, handler=create_claude_agents_handler()).invoke(user_input, context)
-def claude_agents(config_key: str, user_input: str, context: dict, **kwargs) -> ProviderResponse: ...
+# Convenience wrapper — equivalent to config(key=config_key, handler=create_claude_agents_handler(cwd=cwd, setting_sources=setting_sources)).invoke(user_input, context)
+def claude_agents(config_key: str, user_input: str, context: dict, *, cwd=None, setting_sources=None, **kwargs) -> ProviderResponse: ...
 
-# Graph convenience wrapper — equivalent to graph(key, options, handlers=[create_claude_agents_handler()])
-def claude_graph(key: str, options: dict | None = None): ...
+# Graph convenience wrapper — equivalent to graph(key, handlers=[create_claude_agents_handler(cwd=cwd, setting_sources=setting_sources)], **options)
+def claude_graph(key: str, *, cwd=None, setting_sources=None, **options): ...
 
-# Native graph adapter — builds a Claude code-agents graph from a resolved GraphDefinition
+# Native graph adapter — builds a Claude code-agents graph from a resolved GraphDefinition.
+# opts: context, tool_handlers, and the host options cwd and setting_sources
 def to_claude_agents(def_promise: Awaitable[dict], opts: dict | None = None): ...
 
 # NativeTool sentinels for Claude Code built-in capabilities
@@ -98,6 +104,14 @@ Tools are delivered via an in-process MCP server, not as raw JSON schema defs. T
 5. Allowed tools are prefixed: `mcp__tool-mcp__<tool_name>`.
 
 If `config.tools` is absent, the MCP server is not created and `allowed_tools` is an empty list.
+
+**`tools` is always sent, and it is `[]` when the config attaches no `NativeTool`.** The explicit empty list switches every Claude Code built-in off. Omitting the key would leave the Agent SDK default, the full built-in set, on every run, and the read-only tools in it need no permission. A config turns a built-in on by attaching its sentinel (`ClaudeRead`, `ClaudeBash`, …). User-defined tools go through the MCP server and are not governed by `tools`. `to_claude_agents` follows the same rule.
+
+### 2a. Host options (`cwd`, `setting_sources`)
+
+`create_claude_agents_handler(cwd=..., setting_sources=...)` takes two trusted, app-supplied options and passes them to every `query()` call, blocking and streaming. `_options_parameters` forwards only the allowlisted model and run settings from `model.parameters`, and both keys are in `_CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS`, so a config can neither set nor override them. **`setting_sources` is always sent, `[]` unless the application gives sources**: the Agent SDK reads `None` as "load every source", which put the host's plugins, skills, hooks, permission rules and `CLAUDE.md` into every run (AIC-3584). `[]` still lets the SDK read the managed-settings policy tier. `cwd` is sent only when given. Settings-file `env` (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX`, proxy variables), `apiKeyHelper` and `model` come from those sources too, so `[]` drops them; the README's migration note covers this.
+
+`claude_agents()` and `claude_graph()` take `cwd` and `setting_sources` keyword-only and build the handler with them, so neither reaches `config()` or `graph()`. `to_claude_agents()` reads them from `opts` and passes `_host_query_options(...)` to every node's `query()`, root and sub-agents. All four entry points share `_host_query_options`, so all four default to `[]`.
 
 ### 3. Agentic Loop
 

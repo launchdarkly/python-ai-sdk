@@ -10,6 +10,8 @@ from .judge_scoring import (
     build_message_history,
     numeric_score,
     parse_judge_response,
+    typesafe_judge_entries,
+    without_output_format,
 )
 from .sdk_usage import report_usage
 from .types import (
@@ -26,6 +28,7 @@ from .utils import (
     collapse_messages_to_instructions as _collapse_messages_to_instructions,
 )
 from .utils import (
+    handler_key,
     normalize_mode,
     select_mode_handler,
     to_ld_context,
@@ -36,11 +39,22 @@ from .utils import (
 
 def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
     """True when the handler names the provider or its wildcard allowlist contains it."""
-    if not handler.provides_for:
+    key = handler_key(handler)
+    if key is None:
         return False
-    if provider is not None and handler.provides_for[0] == provider:
+    if provider is not None and key[0] == provider:
         return True
     return wildcard_covers(handler, provider)
+
+
+def _mode_matches(handler: ProviderHandler, mode: str) -> bool:
+    """True when the handler's normalized mode equals *mode*.
+
+    Shares :func:`handler_key` with registry / ``select_handler`` so a
+    ``completion`` tag matches a ``messages`` judge (and vice versa).
+    """
+    key = handler_key(handler)
+    return key is not None and key[1] == mode
 
 
 logger = logging.getLogger(__name__)
@@ -104,9 +118,10 @@ async def run_judges(
             )
 
             # Select judge handler. Priority:
-            #   1. Exact provider + mode (or wildcard provider + same mode)
-            #   2. Agent-mode handler for same provider / wildcard (messages-mode fallback)
-            #   3. Parent handler when it covers the same provider or is a wildcard
+            #   1. Exact provider + mode
+            #   2. Wildcard provider + same mode
+            #   3. Exact provider agent handler, then a wildcard agent handler
+            #   4. Parent handler when it covers the same provider or is a wildcard
             # When falling back to an agent-mode handler for a messages-mode judge
             # config, collapse messages into a single instructions block.
             judge_handler: ProviderHandler = handler
@@ -125,10 +140,8 @@ async def run_judges(
                     collapse_messages = True
                 elif _provider_matches(handler, judge_provider):
                     judge_handler = handler
-                    collapse_messages = (
-                        judge_mode == "messages"
-                        and handler.provides_for is not None
-                        and handler.provides_for[1] == "agent"
+                    collapse_messages = judge_mode == "messages" and _mode_matches(
+                        handler, "agent"
                     )
                 else:
                     # No compatible handler — skip rather than calling a provider
@@ -140,10 +153,11 @@ async def run_judges(
                     )
                     continue
 
-            effective_judge_config = (
+            effective_judge_config = without_output_format(
                 _collapse_messages_to_instructions(judge_ai_config)
                 if collapse_messages
-                else judge_ai_config
+                else judge_ai_config,
+                judge_key,
             )
 
             message_history = build_message_history(
@@ -165,12 +179,39 @@ async def run_judges(
                     variables={
                         "message_history": message_history,
                         "response_to_evaluate": llm_response,
+                        **({"input": user_input} if user_input else {}),
                     },
                 )
 
+                usage = to_usage_dict(result["usage"])
+                entries = typesafe_judge_entries(result["response"])
+                if entries is not None:
+                    # One Jev call. Every label is returned with that call's
+                    # full usage, and each label is tracked under its eventKey.
+                    from .lifecycle import get_client
+
+                    client = get_client()
+                    for entry in entries:
+                        result_key = f"{judge_key}.{entry['key']}"
+                        score = entry["score"]
+                        judge_results[result_key] = JudgeResult(
+                            usage=usage,
+                            response=entry["reason"],
+                            score=score,
+                            event_key=entry["eventKey"],
+                        )
+                        record_evaluation(score, None, result_key)
+                        client.track(
+                            entry["eventKey"],
+                            to_ld_context(client, user_context),
+                            {**base_track_data, "judgeConfigKey": result_key},
+                            score,
+                        )
+                    continue
+
                 score, reasoning = parse_judge_response(result["response"])
                 judge_results[judge_key] = JudgeResult(
-                    usage=to_usage_dict(result["usage"]),
+                    usage=usage,
                     response=reasoning,
                     score=score,
                 )
@@ -297,10 +338,8 @@ async def _build_judge_tasks(
                 elif agent_fallback:
                     collapse_messages = True
                 elif _provider_matches(handler, judge_provider):
-                    collapse_messages = (
-                        judge_mode == "messages"
-                        and handler.provides_for is not None
-                        and handler.provides_for[1] == "agent"
+                    collapse_messages = judge_mode == "messages" and _mode_matches(
+                        handler, "agent"
                     )
                 else:
                     # No compatible handler — skip, same as run_judges.
@@ -320,7 +359,7 @@ async def _build_judge_tasks(
             tasks.append(
                 JudgeTask(
                     config_key=judge_key,
-                    judge_config=judge_ai_config,
+                    judge_config=without_output_format(judge_ai_config, judge_key),
                     judge_meta=judge_meta,
                     actual_output=llm_response,
                     user_input=user_input,
@@ -369,12 +408,20 @@ async def run_judge(
 
     judge_handler = exact or agent_fallback
     if judge_handler is None:
+        logger.warning(
+            "Judge %r skipped: no handler covers provider %r",
+            task.config_key,
+            task.judge_provider,
+        )
         return None
 
-    effective_config = (
+    # Defensive: a task serialized before outputFormat was stripped at build time
+    # may still carry it, so strip it here too rather than trust the producer.
+    effective_config = without_output_format(
         _collapse_messages_to_instructions(task.judge_config)
         if task.collapse_messages
-        else task.judge_config
+        else task.judge_config,
+        task.config_key,
     )
 
     # user_input and trajectory come off the task rather than being omitted:
@@ -399,8 +446,53 @@ async def run_judge(
                 **(task.variables or {}),
                 "message_history": message_history,
                 "response_to_evaluate": task.actual_output,
+                **({"input": task.user_input} if task.user_input else {}),
             },
         )
+
+        usage = to_usage_dict(result["usage"])
+        try:
+            entries = typesafe_judge_entries(result["response"])
+        except ValueError:
+            return None
+        if entries is not None:
+            first = entries[0]
+            result_key = f"{task.config_key}.{first['key']}"
+            expanded = {
+                f"{task.config_key}.{entry['key']}": JudgeResult(
+                    usage=usage,
+                    response=entry["reason"],
+                    score=entry["score"],
+                    event_key=entry["eventKey"],
+                )
+                for entry in entries
+            }
+            metrics = [
+                {
+                    "eventKey": entry["eventKey"],
+                    "score": entry["score"],
+                    "judgeConfigKey": f"{task.config_key}.{entry['key']}",
+                }
+                for entry in entries
+            ]
+            for entry in entries:
+                record_evaluation(
+                    entry["score"], None, f"{task.config_key}.{entry['key']}"
+                )
+            # The score belongs to the evaluated config. Each metric carries its own judgeConfigKey.
+            typesafe_track_data: TrackData = {
+                **task.parent_track_data,
+                "judgeConfigKey": result_key,
+            }
+            return JudgeRunResult(
+                score=first["score"],
+                response=first["reason"],
+                usage=usage,
+                track_data=typesafe_track_data,
+                results=expanded,
+                metrics=metrics,
+                event_key=first["eventKey"],
+            )
 
         try:
             score, reasoning = parse_judge_response(result["response"])
@@ -417,10 +509,6 @@ async def run_judge(
                 metric_score,
                 reasoning if judge_handler.capture_content else None,
             )
-        raw_usage = result["usage"]
-
-        usage = to_usage_dict(raw_usage)
-
         # The score belongs to the evaluated (parent) config, exactly as in
         # the inline run_judges path.
         merged_track_data: TrackData = {

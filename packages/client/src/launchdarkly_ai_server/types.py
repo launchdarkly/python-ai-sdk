@@ -92,10 +92,10 @@ class Message:
 AiConfigRep = dict[str, Any]
 """
 Raw AI config dict as returned by ``parse_ai_config``. Fields include
-``model``, ``provider``, at least one of ``instructions`` / ``messages``, and an
-optional ``skills`` array of ``{key, version}`` references. Parsing does not
-validate ``skills``; read it with
-``launchdarkly_ai_server.experimental.skills.skill_refs``, which does.
+``model``, ``provider``, at least one of ``instructions``, ``messages``, or a
+non-empty ``classifiers`` list, and an optional ``skills`` array of
+``{key, version}`` references. Parsing does not validate ``skills``; read it
+with ``launchdarkly_ai_server.experimental.skills.skill_refs``, which does.
 """
 
 VariationMeta = dict[str, Any]
@@ -148,6 +148,31 @@ _StreamFn = Callable[
 ]
 
 
+def normalize_providers(providers: Sequence[str] | None) -> tuple[str, ...] | None:
+    """
+    Validates an optional wildcard allowlist.
+
+    ``None`` means the handler is unscoped. A list must contain at least one
+    name and is stored as a tuple in first-seen order, with repeats dropped.
+    Names are compared to ``config.provider.name`` exactly, so a name with
+    surrounding whitespace is rejected rather than trimmed.
+    """
+    if providers is None:
+        return None
+    if (
+        isinstance(providers, (str, bytes))
+        or len(providers) == 0
+        or any(
+            not isinstance(name, str) or name == "" or name != name.strip()
+            for name in providers
+        )
+    ):
+        raise ValueError(
+            "providers must be a non-empty list of provider names without surrounding whitespace"
+        )
+    return tuple(dict.fromkeys(providers))
+
+
 class ProviderHandler:
     """
     Callable handler with provider metadata.
@@ -181,8 +206,6 @@ class ProviderHandler:
         self._fn = fn
         self.provides_for = provides_for
         self._stream_fn = stream_fn
-        from .utils import normalize_providers
-
         self._capture_content_override = capture_content
         self.providers = normalize_providers(providers)
 
@@ -266,6 +289,8 @@ class JudgeResult:
     usage: UsageDict
     response: str
     score: float
+    event_key: str | None = None
+    """Metric name for this score. Set when the judge produced one event per label."""
 
 
 @dataclass
@@ -370,6 +395,20 @@ class JudgeRunResult:
     ``get_client().track(task.evaluation_metric_key, ctx, track_data, score)``
     from the main thread after the worker finishes.
     """
+    results: dict[str, JudgeResult] | None = None
+    """
+    Present when one judge call produced several scores. Keys are
+    ``config_key.question_key``. ``score`` and ``response`` are the first
+    entry. Every entry carries the call's full usage and, for a classifier,
+    its ``event_key``.
+    """
+    metrics: list[dict[str, Any]] | None = None
+    """
+    One LaunchDarkly metric per classifier. When this is set, track each
+    entry's ``eventKey`` and do not also track ``evaluation_metric_key``.
+    """
+    event_key: str | None = None
+    """Metric name for ``score``. Set to the first label's event key when one call produced several."""
 
 
 # Stream events

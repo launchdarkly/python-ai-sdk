@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-messages-0.2.4...launchdarkly-ai-langchain-messages-0.2.5) (2026-10-23)
+
+
+### Features
+
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+* **langchain:** emit AG-UI text and tool events ([#163](https://github.com/launchdarkly/python-ai-sdk/issues/163)) ([ab5e9e1](https://github.com/launchdarkly/python-ai-sdk/commit/ab5e9e172fd33d26a15c26e84a75b01df31ea54c))
+
+
+### Bug Fixes
+
+* **AIC-3577:** send object tool results to the model as JSON ([#188](https://github.com/launchdarkly/python-ai-sdk/issues/188)) ([dead4bd](https://github.com/launchdarkly/python-ai-sdk/commit/dead4bdce43a1e68416a148073058da81030ab73))
+
 ## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-messages-0.2.3...launchdarkly-ai-langchain-messages-0.2.4) (2026-10-09)
 
 

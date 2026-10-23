@@ -37,6 +37,8 @@ except ImportError:
 
 from launchdarkly_ai_claude_agents.handler import (
     _build_hooks,
+    _host_query_options,
+    _options_parameters,
     _raise_if_run_failed,
     build_prompt,
     build_query_prompt,
@@ -114,6 +116,7 @@ async def _run_query(
     run_id: str,
     child_subagent_tools: list[Any],
     history: list[dict[str, Any]] | None = None,
+    host_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import importlib
 
@@ -158,7 +161,10 @@ async def _run_query(
 
     hooks = _build_hooks(native_tool_map)
 
+    params = _options_parameters(node.config)
+
     options = ClaudeAgentOptions(
+        **params,
         # Explicitly set the available built-in tools (empty list disables all).
         # When no native tools are needed, disable built-in tools so Claude
         # cannot call WebSearch/Bash/etc. and get stuck waiting for permission
@@ -174,6 +180,10 @@ async def _run_query(
         else [],
         mcp_servers=mcp_servers,
         hooks=hooks or {},
+        # `setting_sources` always, `[]` unless the application gave sources: the Agent SDK reads
+        # `None` as "load every source", which would put the host's plugins, skills, hooks and
+        # CLAUDE.md into every node's run. `cwd` only if given.
+        **(host_options or _host_query_options(None, None)),
         **({"system_prompt": system_prompt} if system_prompt else {}),
     )
 
@@ -217,10 +227,16 @@ def to_claude_agents(
     Converts a resolved ``GraphDefinition`` into a nested query() multi-agent
     execution where each child node becomes a sub-agent tool.
 
+    *opts* takes ``context``, ``tool_handlers``, and the host options ``cwd`` and
+    ``setting_sources``, which behave as on ``create_claude_agents_handler`` and are sent to
+    every node's ``query()``, root and sub-agents alike.
+
     Returns an object with a ``.invoke(input, variables)`` coroutine.
     """
     report_usage("claude-agents.toClaudeAgents", PACKAGE_NAME, __version__)
     _opts = opts or {}
+    # Resolved once, so a caller mutating its list afterwards does not change later runs.
+    host_options = _host_query_options(_opts.get("cwd"), _opts.get("setting_sources"))
 
     async def invoke(
         input_text: str = "",
@@ -322,6 +338,7 @@ def to_claude_agents(
                         def_obj.key,
                         run_id,
                         child_tools,
+                        host_options=host_options,
                     )
                     total_usage["input"] += result["usage"]["input"]
                     total_usage["output"] += result["usage"]["output"]
@@ -388,6 +405,7 @@ def to_claude_agents(
                 run_id,
                 root_child_tools,
                 history,
+                host_options=host_options,
             )
 
             final_output = result["output"]

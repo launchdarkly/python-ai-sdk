@@ -4,7 +4,7 @@ import asyncio
 import base64
 import inspect
 import json
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
 from typing import Any
 
@@ -24,6 +24,8 @@ from launchdarkly_ai_server import (
     parse_template,
     report_usage,
 )
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .model_id import gateway_model_id
@@ -39,71 +41,156 @@ from .spans import (
     start_tool_span,
 )
 
-OWNED_PARAMETERS = {
-    "model",
-    "messages",
-    "prompt",
-    "system",
-    "tools",
-    "stream",
-    "output",
-    "outputformat",
-    "stopwhen",
-    "maxsteps",
-    "apikey",
-    "baseurl",
-}
-
 ModelSource = Any | Callable[[AiConfigRep], Any]
 
 MAX_STEPS = 10
 
 
-def _owned(name: str) -> bool:
-    return name.replace("_", "").lower() in OWNED_PARAMETERS
+#: The ``model.parameters`` keys forwarded into ``ai.InferenceRequestParams``, after the renames in
+#: :func:`_renamed_parameters`. Every other key is dropped. The handler sets ``model``,
+#: ``messages``, ``tools`` and ``output_type`` itself, and runs the tool loop.
+#:
+#: This is the Vercel AI SDK list from TESTING.md section 1.12 as the Python ``ai`` library can
+#: send it. ``stop_sequences`` is on the JS list but the Python library has no field for it.
+#: ``parallel_tool_calls``, ``max_tool_calls``, ``service_tier`` and ``prompt_cache_key`` are
+#: Python-only: the library takes them as typed request params, while the JS AI SDK can reach them
+#: only through ``providerOptions``. ``TestInferenceRequestParamsAreClassified`` in this package's
+#: tests asserts every field of ``InferenceRequestParams`` and its parts is classified.
+_INFERENCE_PARAMS_FORWARDED_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "max_output_tokens",
+        "max_tool_calls",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "prompt_cache_key",
+        "reasoning",
+        "seed",
+        "service_tier",
+        "temperature",
+        "tool_choice",
+        "top_k",
+        "top_p",
+    }
+)
+
+#: Fields of ``ai.InferenceRequestParams`` and its parts that no config key reaches, and why:
+#: * ``metadata``, ``safety_identifier``, ``tags``: identity and attribution.
+#: * ``sampling`` ``min_p``, ``repetition_penalty``, ``consideration_window``: every built-in
+#:   provider raises on them, so a config that set one would fail every call.
+#: * ``output.include``: API-shape switch.
+#: * ``output.text_verbosity``: the AI Gateway raises on it.
+#: * ``output.reasoning_summary``: ``reasoning`` is read for its effort only.
+#: * ``cache.mode``, ``cache.retention``: the mode is provider-specific with no shared config
+#:   spelling, and retention is data retention.
+#: * ``routing``: endpoint and routing selection.
+#: * ``context_management``: server-side state.
+#: * ``provider_params``: carries credentials, data-retention and timeout settings.
+#: * ``extra_headers``, ``extra_query``, ``extra_body``: raw request injection.
+_INFERENCE_PARAMS_EXCLUDED_FIELDS = frozenset(
+    {
+        "metadata",
+        "safety_identifier",
+        "tags",
+        "min_p",
+        "repetition_penalty",
+        "consideration_window",
+        "include",
+        "text_verbosity",
+        "reasoning_summary",
+        "mode",
+        "retention",
+        "routing",
+        "context_management",
+        "provider_params",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+    }
+)
+
+#: Forwarded keys that become one sampler each: config key to the sampler class and its field.
+_SAMPLERS = {
+    "temperature": ("TemperatureSamplerParams", "temperature"),
+    "top_p": ("TopPSamplerParams", "top_p"),
+    "top_k": ("TopKSamplerParams", "top_k"),
+    "seed": ("SeedSamplerParams", "seed"),
+}
+
+#: The string ``tool_choice`` values the library's ``ToolChoiceMode`` takes.
+_TOOL_CHOICE_MODES = frozenset({"auto", "none", "required"})
+
+
+def _renamed_parameters(params: dict[str, Any]) -> dict[str, Any]:
+    """Applies the section 1.12 renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
+    which wins over ``max_tokens``, and an explicit ``reasoning`` wins over ``reasoning_effort``."""
+    for alias in ("max_completion_tokens", "max_tokens"):
+        value = params.pop(alias, None)
+        if value is not None:
+            params.setdefault("max_output_tokens", value)
+    effort = params.pop("reasoning_effort", None)
+    if effort is not None:
+        params.setdefault("reasoning", effort)
+    return params
+
+
+def _reasoning_effort(value: Any) -> tuple[bool, str | None]:
+    """The effort to send for a ``reasoning`` value, and whether to send one at all.
+
+    ``reasoning`` is a string, or an object whose ``effort`` is read. ``"provider-default"``
+    leaves it unset, and ``"none"`` becomes ``None``, the library's spelling of reasoning
+    disabled. Any other shape is malformed and dropped.
+    """
+    effort = value.get("effort") if isinstance(value, Mapping) else value
+    if not isinstance(effort, str) or effort == "provider-default":
+        return False, None
+    return True, None if effort == "none" else effort
 
 
 def _request_params(config: AiConfigRep) -> Any:
-    raw = {
-        key: value
-        for key, value in (config.get("model", {}).get("parameters") or {}).items()
-        if not _owned(key)
-    }
-    sampling: dict[type[Any], Any] = {}
-    mappings = {
-        "temperature": ("TemperatureSamplerParams", "temperature"),
-        "top_p": ("TopPSamplerParams", "top_p"),
-        "topP": ("TopPSamplerParams", "top_p"),
-        "top_k": ("TopKSamplerParams", "top_k"),
-        "topK": ("TopKSamplerParams", "top_k"),
-        "min_p": ("MinPSamplerParams", "min_p"),
-        "minP": ("MinPSamplerParams", "min_p"),
-        "repetition_penalty": (
-            "RepetitionPenaltyParams",
-            "repetition_penalty",
-        ),
-        "repetitionPenalty": (
-            "RepetitionPenaltyParams",
-            "repetition_penalty",
-        ),
-        "seed": ("SeedSamplerParams", "seed"),
-    }
-    for key, (class_name, argument) in mappings.items():
-        if key in raw:
-            cls = getattr(ai, class_name)
-            sampling[cls] = cls(**{argument: raw.pop(key)})
+    params = select_forwarded_parameters(
+        _renamed_parameters(model_parameters(config)), _INFERENCE_PARAMS_FORWARDED_KEYS
+    )
     kwargs: dict[str, Any] = {}
+    sampling: dict[type[Any], Any] = {}
+    for key, (class_name, argument) in _SAMPLERS.items():
+        if key in params:
+            cls = getattr(ai, class_name)
+            sampling[cls] = cls(**{argument: params[key]})
+    penalties = {
+        key: params[key]
+        for key in ("frequency_penalty", "presence_penalty")
+        if key in params
+    }
+    if penalties:
+        sampling[ai.RepetitionPenaltyParams] = ai.RepetitionPenaltyParams(**penalties)
     if sampling:
         kwargs["sampling"] = sampling
-    max_tokens = raw.pop("max_tokens", raw.pop("maxTokens", None))
-    if max_tokens is not None:
-        kwargs["output"] = ai.OutputParams(max_tokens=max_tokens)
-    reasoning_effort = raw.pop("reasoning_effort", raw.pop("reasoningEffort", None))
-    if reasoning_effort is not None:
-        kwargs["reasoning"] = ai.ReasoningParams(effort=reasoning_effort)
-    for direct in ("metadata", "safety_identifier"):
-        if direct in raw:
-            kwargs[direct] = raw.pop(direct)
+    if params.get("max_output_tokens") is not None:
+        kwargs["output"] = ai.OutputParams(max_tokens=params["max_output_tokens"])
+    send_effort, effort = _reasoning_effort(params.get("reasoning"))
+    if send_effort:
+        kwargs["reasoning"] = ai.ReasoningParams(effort=effort)
+    tool_calling: dict[str, Any] = {}
+    tool_choice = params.get("tool_choice")
+    if isinstance(tool_choice, str) and tool_choice in _TOOL_CHOICE_MODES:
+        tool_calling["tool_choice"] = ai.ToolChoiceMode(tool_choice)
+    if isinstance(params.get("parallel_tool_calls"), bool):
+        tool_calling["parallel_tool_calls"] = params["parallel_tool_calls"]
+    max_tool_calls = params.get("max_tool_calls")
+    if isinstance(max_tool_calls, int) and not isinstance(max_tool_calls, bool):
+        tool_calling["max_tool_calls"] = max_tool_calls
+    if tool_calling:
+        # ``ToolCallingParams`` requires a policy. ``auto`` is the library's own default when only
+        # the parallel or max-calls setting is given.
+        tool_calling.setdefault("tool_choice", ai.ToolChoiceMode.AUTO)
+        kwargs["tool_calling"] = ai.ToolCallingParams(**tool_calling)
+    if isinstance(params.get("service_tier"), str):
+        kwargs["provider_service"] = ai.ProviderServiceParams(
+            service_tier=params["service_tier"]
+        )
+    if isinstance(params.get("prompt_cache_key"), str):
+        kwargs["cache"] = ai.CacheParams(key=params["prompt_cache_key"])
     return ai.InferenceRequestParams(**kwargs)
 
 

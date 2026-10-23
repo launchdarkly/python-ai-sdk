@@ -19,31 +19,6 @@ from .types import (
 )
 
 
-def normalize_providers(providers: Sequence[str] | None) -> tuple[str, ...] | None:
-    """
-    Validates an optional wildcard allowlist.
-
-    ``None`` means the handler is unscoped. A list must contain at least one
-    name and is stored as a tuple in first-seen order, with repeats dropped.
-    Names are compared to ``config.provider.name`` exactly, so a name with
-    surrounding whitespace is rejected rather than trimmed.
-    """
-    if providers is None:
-        return None
-    if (
-        isinstance(providers, (str, bytes))
-        or len(providers) == 0
-        or any(
-            not isinstance(name, str) or name == "" or name != name.strip()
-            for name in providers
-        )
-    ):
-        raise ValueError(
-            "providers must be a non-empty list of provider names without surrounding whitespace"
-        )
-    return tuple(dict.fromkeys(providers))
-
-
 def create_handler(
     provides_for: tuple[str, Literal["agent", "messages"]],
     fn: _HandlerFn,
@@ -87,10 +62,30 @@ def _create_handler(
     )
 
 
+def model_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """
+    Returns ``config['model']['parameters']`` as a fresh dict, or ``{}`` when it
+    is absent or not a usable mapping.
+
+    This is the single place handler packages read provider tuning values from.
+    Values are forwarded to the provider as-is, keyed by whatever name the
+    LaunchDarkly UI wrote (already snake_case for every Python provider SDK
+    here), so no case conversion happens on the way through. Callers must
+    filter the result to their own forwarded-keys list (see
+    ``parameter_forwarding.select_forwarded_parameters``) before merging it
+    into a provider call; nothing else here is safe to forward as-is.
+
+    Never reads ``model.custom`` — that field is not forwarded to providers.
+    """
+    model = config.get("model") if isinstance(config, dict) else None
+    parameters = model.get("parameters") if isinstance(model, dict) else None
+    return dict(parameters) if isinstance(parameters, dict) else {}
+
+
 def wildcard_covers(handler: Any, provider: str | None) -> bool:
     """Whether a ``"*"`` handler accepts *provider*. An allowlist is a filter; an absent one accepts every name."""
-    provides_for = getattr(handler, "provides_for", None)
-    if not provides_for or provides_for[0] != "*":
+    key = handler_key(handler)
+    if key is None or key[0] != "*":
         return False
     allow = getattr(handler, "providers", None)
     if allow is None:
@@ -109,8 +104,8 @@ def best_wildcard(handlers: list[Any], provider: str | None, mode: str) -> Any |
     scoped: list[tuple[int, int, Any]] = []
     unscoped: Any | None = None
     for index, handler in enumerate(handlers):
-        provides_for = getattr(handler, "provides_for", None)
-        if not provides_for or provides_for[1] != mode:
+        key = handler_key(handler)
+        if key is None or key[1] != mode:
             continue
         if not wildcard_covers(handler, provider):
             continue
@@ -129,27 +124,31 @@ def best_wildcard(handlers: list[Any], provider: str | None, mode: str) -> Any |
 def select_mode_handler(
     handlers: list[Any], provider: str | None, mode: str
 ) -> Any | None:
-    """Exact ``(provider, mode)`` first, then the best wildcard of that mode."""
+    """Exact ``(provider, mode)`` first, then the best wildcard of that mode.
+
+    *mode* is compared after :func:`normalize_mode`, through :func:`handler_key`.
+    """
+    mode = normalize_mode(mode)
     if provider:
         exact = next(
             (
                 handler
                 for handler in handlers
-                if getattr(handler, "provides_for", None) == (provider, mode)
+                if handler_key(handler) == (provider, mode)
             ),
             None,
         )
-        if exact:
+        if exact is not None:
             return exact
     return best_wildcard(handlers, provider, mode)
 
 
 def covers_provider_name(handler: Any, provider: str | None) -> bool:
     """True when the handler names *provider* or its wildcard allowlist contains it, in any mode."""
-    provides_for = getattr(handler, "provides_for", None)
-    if not provides_for or provider is None:
+    key = handler_key(handler)
+    if key is None or provider is None:
         return False
-    if provides_for[0] == provider:
+    if key[0] == provider:
         return True
     return wildcard_covers(handler, provider)
 
@@ -175,6 +174,47 @@ def normalize_mode(mode: str | None) -> Literal["agent", "messages"]:
     ``'agent'`` → ``'agent'``; everything else → ``'messages'``.
     """
     return "agent" if mode == "agent" else "messages"
+
+
+def handler_key(
+    handler: Any,
+) -> tuple[str, Literal["agent", "messages"]] | None:
+    """Return the normalized ``(provider, mode)`` identity for *handler*.
+
+    ``completion`` and ``messages`` are the same mode. A list tag is accepted
+    the same as a tuple. Online and offline share this helper:
+    :func:`select_handler` matches on it, :meth:`Registry.register` replaces on
+    it, online judges (``run_judges`` / ``run_judge``) match on it, and the
+    evaluations harness rejects duplicates on it.
+    """
+    provides_for = getattr(handler, "provides_for", None)
+    if (
+        isinstance(provides_for, tuple | list)
+        and len(provides_for) == 2
+        and isinstance(provides_for[0], str)
+    ):
+        return (provides_for[0], normalize_mode(provides_for[1]))
+    return None
+
+
+def registration_key(
+    handler: Any,
+) -> tuple[tuple[str, str], tuple[str, ...] | None] | None:
+    """
+    Handler identity for :class:`Registry` and the evaluations duplicate check.
+
+    :func:`handler_key` (provider plus normalized mode, so ``completion`` and
+    ``messages`` collide), plus the allowlist as a set on a ``"*"`` handler.
+    Order and repeated names do not make a new identity. Routing ignores the
+    list on an exact handler, so it is not part of that handler's identity.
+    """
+    key = handler_key(handler)
+    if key is None:
+        return None
+    providers = getattr(handler, "providers", None)
+    if key[0] != "*" or providers is None:
+        return (key, None)
+    return (key, tuple(sorted(set(providers))))
 
 
 def number_or_zero(value: Any) -> int:
@@ -635,7 +675,11 @@ def select_handler(
         raise ValueError(f"Handler for provider {provider} with mode {mode} not found")
 
     by_provider = next(
-        (h for h in handlers if h.provides_for and h.provides_for[0] == provider),
+        (
+            h
+            for h in handlers
+            if (key := handler_key(h)) is not None and key[0] == provider
+        ),
         None,
     )
     if by_provider:

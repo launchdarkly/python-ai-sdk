@@ -143,6 +143,30 @@ class TestRegistry:
             )
         assert any("('Bedrock', 'Gemini')" in message for message in caplog.messages)
 
+    def test_register_replaces_across_mode_aliases(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """completion and messages are one identity (shared handler_key)."""
+        r = Registry()
+        old = _make_handler(("OpenAI", "messages"))
+        new = _make_handler(("OpenAI", "completion"))
+        with caplog.at_level(logging.WARNING):
+            r.register(handlers=[old])
+            r.register(handlers=[new])
+        assert len(r.handlers) == 1
+        assert r.handlers[0] is new
+        assert any("already registered" in m for m in caplog.messages)
+
+    def test_register_replaces_list_tagged_handler(self) -> None:
+        r = Registry()
+        old = _make_handler(("OpenAI", "messages"))
+        new = _make_handler(("OpenAI", "messages"))
+        new.provides_for = ["OpenAI", "completion"]  # type: ignore[assignment]
+        r.register(handlers=[old])
+        r.register(handlers=[new])
+        assert len(r.handlers) == 1
+        assert r.handlers[0] is new
+
     def test_handler_without_provides_for_always_appended(self) -> None:
         r = Registry()
         h1 = _make_handler(None)
@@ -208,6 +232,15 @@ class TestCompose:
         second = _make_handler(("*", "agent"), providers=["Anthropic", "Bedrock"])
         result = compose(Registry(handlers=[first]), Registry(handlers=[second]))
         assert result.handlers == [second]
+
+    def test_b_overrides_a_across_mode_aliases(self) -> None:
+        h_a = _make_handler(("OpenAI", "messages"))
+        h_b = _make_handler(("OpenAI", "completion"))
+        a = Registry(handlers=[h_a])
+        b = Registry(handlers=[h_b])
+        result = compose(a, b)
+        assert len(result.handlers) == 1
+        assert result.handlers[0] is h_b
 
     def test_b_overrides_a_on_tool_conflict(self) -> None:
         fn_a, fn_b = AsyncMock(), AsyncMock()
