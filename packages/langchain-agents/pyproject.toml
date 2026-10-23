@@ -6,8 +6,8 @@ dependencies = [
   "launchdarkly-ai-server>=0.4.1",
   "opentelemetry-api>=1.25",
   "langchain>=1.0",
-  "langchain-core>=0.3",
-  "langgraph>=0.2",
+  "langchain-core>=1.0",
+  "langgraph>=1.0",
 ]
 description = "LangChain/LangGraph agent handler for LaunchDarkly AI SDK"
 readme = "README.md"

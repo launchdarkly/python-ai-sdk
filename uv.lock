@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -1381,8 +1381,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "langchain", specifier = ">=1.0" },
-    { name = "langchain-core", specifier = ">=0.3" },
-    { name = "langgraph", specifier = ">=0.2" },
+    { name = "langchain-core", specifier = ">=1.0" },
+    { name = "langgraph", specifier = ">=1.0" },
     { name = "launchdarkly-ai-server", editable = "packages/client" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
 ]
