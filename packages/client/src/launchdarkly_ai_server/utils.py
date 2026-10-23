@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from .sdk_usage import report_usage
 from .types import (
@@ -24,6 +24,8 @@ def create_handler(
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
     capture_content: bool | None = None,
+    *,
+    providers: Sequence[str] | None = None,
 ) -> ProviderHandler:
     """
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
@@ -32,9 +34,14 @@ def create_handler(
     ``capture_content`` is this handler's override. ``None`` reads the process
     default from :func:`configure` when the value is used. ``True`` or ``False``
     overrides that default.
+
+    ``providers`` is consulted only when ``provides_for`` starts with ``"*"``.
+    It limits which ``config.provider.name`` values that wildcard accepts.
     """
     report_usage("client.createHandler")
-    return _create_handler(provides_for, fn, stream_fn, capture_content)
+    return _create_handler(
+        provides_for, fn, stream_fn, capture_content, providers=providers
+    )
 
 
 def _create_handler(
@@ -42,6 +49,8 @@ def _create_handler(
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
     capture_content: bool | None = None,
+    *,
+    providers: Sequence[str] | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_handler`, used by the package factories."""
     return ProviderHandler(
@@ -49,6 +58,7 @@ def _create_handler(
         provides_for=provides_for,
         stream_fn=stream_fn,
         capture_content=capture_content,
+        providers=providers,
     )
 
 
@@ -70,6 +80,77 @@ def model_parameters(config: AiConfigRep) -> dict[str, Any]:
     model = config.get("model") if isinstance(config, dict) else None
     parameters = model.get("parameters") if isinstance(model, dict) else None
     return dict(parameters) if isinstance(parameters, dict) else {}
+
+
+def wildcard_covers(handler: Any, provider: str | None) -> bool:
+    """Whether a ``"*"`` handler accepts *provider*. An allowlist is a filter; an absent one accepts every name."""
+    key = handler_key(handler)
+    if key is None or key[0] != "*":
+        return False
+    allow = getattr(handler, "providers", None)
+    if allow is None:
+        return True
+    return provider is not None and provider in tuple(allow)
+
+
+def best_wildcard(handlers: list[Any], provider: str | None, mode: str) -> Any | None:
+    """
+    The ``"*"`` handler of *mode* that accepts *provider*.
+
+    A scoped list beats an unscoped wildcard. Among scoped lists that contain
+    the name, the shorter list wins, and equal lengths keep the earlier
+    registration.
+    """
+    scoped: list[tuple[int, int, Any]] = []
+    unscoped: Any | None = None
+    for index, handler in enumerate(handlers):
+        key = handler_key(handler)
+        if key is None or key[1] != mode:
+            continue
+        if not wildcard_covers(handler, provider):
+            continue
+        allow = getattr(handler, "providers", None)
+        if allow is None:
+            if unscoped is None:
+                unscoped = handler
+            continue
+        scoped.append((len(tuple(allow)), index, handler))
+    if scoped:
+        scoped.sort(key=lambda item: (item[0], item[1]))
+        return scoped[0][2]
+    return unscoped
+
+
+def select_mode_handler(
+    handlers: list[Any], provider: str | None, mode: str
+) -> Any | None:
+    """Exact ``(provider, mode)`` first, then the best wildcard of that mode.
+
+    *mode* is compared after :func:`normalize_mode`, through :func:`handler_key`.
+    """
+    mode = normalize_mode(mode)
+    if provider:
+        exact = next(
+            (
+                handler
+                for handler in handlers
+                if handler_key(handler) == (provider, mode)
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact
+    return best_wildcard(handlers, provider, mode)
+
+
+def covers_provider_name(handler: Any, provider: str | None) -> bool:
+    """True when the handler names *provider* or its wildcard allowlist contains it, in any mode."""
+    key = handler_key(handler)
+    if key is None or provider is None:
+        return False
+    if key[0] == provider:
+        return True
+    return wildcard_covers(handler, provider)
 
 
 def collapse_messages_to_instructions(config: AiConfigRep) -> AiConfigRep:
@@ -114,6 +195,26 @@ def handler_key(
     ):
         return (provides_for[0], normalize_mode(provides_for[1]))
     return None
+
+
+def registration_key(
+    handler: Any,
+) -> tuple[tuple[str, str], tuple[str, ...] | None] | None:
+    """
+    Handler identity for :class:`Registry` and the evaluations duplicate check.
+
+    :func:`handler_key` (provider plus normalized mode, so ``completion`` and
+    ``messages`` collide), plus the allowlist as a set on a ``"*"`` handler.
+    Order and repeated names do not make a new identity. Routing ignores the
+    list on an exact handler, so it is not part of that handler's identity.
+    """
+    key = handler_key(handler)
+    if key is None:
+        return None
+    providers = getattr(handler, "providers", None)
+    if key[0] != "*" or providers is None:
+        return (key, None)
+    return (key, tuple(sorted(set(providers))))
 
 
 def number_or_zero(value: Any) -> int:
@@ -540,15 +641,18 @@ def select_handler(
     Selects a handler from *handlers* based on the provider and mode in *config*/*meta*.
 
     Resolution order:
-    1. Exact ``(provider, mode)`` match.
-    2. Wildcard ``("*", mode)`` match — for multi-provider adapters like LangChain.
-    3. (Non-strict only) Provider-only match, then single-handler fallback.
+    1. Exact ``(provider, mode)`` match. A ``providers`` list on an exact handler is ignored.
+    2. Wildcard ``("*", mode)`` whose ``providers`` list contains the name. The
+       shortest list wins; equal lengths keep the earlier registration.
+    3. Unscoped wildcard ``("*", mode)`` (``providers`` is ``None``).
+    4. (Non-strict only) Provider-only match, then single-handler fallback.
+       A sole handler whose allowlist omits the name is not used.
 
-    When *strict* is ``True`` (default, used by ``config()``), steps 1–2 are tried
-    and a descriptive error is raised if neither matches.
+    When *strict* is ``True`` (default, used by ``config()``), steps 1–3 are tried
+    and a descriptive error is raised if none match.
 
     When *strict* is ``False`` (used by ``graph()``), resolution falls back
-    progressively: exact match → wildcard match → provider-only match → single-handler fallback.
+    progressively through the provider-only match and the single-handler fallback.
     """
     provider = (
         (config.get("provider") or {}).get("name") if isinstance(config, dict) else None
@@ -558,19 +662,13 @@ def select_handler(
 
     mode = normalize_mode(meta.get("mode") if isinstance(meta, dict) else None)
 
-    exact = next((h for h in handlers if handler_key(h) == (provider, mode)), None)
-    if exact:
-        return exact
-
-    wildcard = next((h for h in handlers if handler_key(h) == ("*", mode)), None)
-    if wildcard:
-        return wildcard
+    chosen = select_mode_handler(handlers, provider, mode)
+    if chosen is not None:
+        return cast(ProviderHandler, chosen)
 
     if strict:
         has_coverage = any(
-            (key := handler_key(h)) is not None
-            and (key[0] == provider or key[0] == "*")
-            for h in handlers
+            covers_provider_name(handler, provider) for handler in handlers
         )
         if not has_coverage:
             raise ValueError(f"Handler for provider {provider} not found")
@@ -588,7 +686,11 @@ def select_handler(
         return by_provider
 
     if len(handlers) == 1:
-        return handlers[0]
+        only = handlers[0]
+        allow = getattr(only, "providers", None)
+        if allow is not None and provider not in tuple(allow):
+            raise ValueError(f"Handler for provider {provider} not found")
+        return only
 
     raise ValueError(f"Handler for provider {provider} not found")
 

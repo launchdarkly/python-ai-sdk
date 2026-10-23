@@ -4,6 +4,7 @@ Reference: TESTING.md §3.14
 """
 
 import json
+import logging
 from dataclasses import asdict
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -248,6 +249,113 @@ class TestRunJudges:
                 base_track_data={},
             )
         assert seen == ["typesafe"]
+
+    async def test_scoped_wildcard_skips_a_judge_outside_its_list(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        called = False
+
+        async def recording_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            nonlocal called
+            called = True
+            return {"output": '{"score": 0.8, "reasoning": "ok"}', "usage": {}}
+
+        scoped = ProviderHandler(
+            fn=recording_fn,
+            provides_for=("*", "agent"),  # type: ignore[arg-type]
+            providers=["Bedrock"],
+        )
+        parent = ProviderHandler(
+            fn=recording_fn,
+            provides_for=("OpenAI", "messages"),  # type: ignore[arg-type]
+        )
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "claude-3-5-sonnet"},
+                "provider": {"name": "Anthropic"},
+                "messages": [{"role": "user", "content": "Evaluate this."}],
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "OpenAI"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=parent,
+                handlers=[scoped],
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+        assert called is False
+
+    @pytest.mark.parametrize(
+        ("judge_provider", "runs"), [("Bedrock", True), ("Anthropic", False)]
+    )
+    async def test_scoped_parent_runs_only_a_listed_judge_provider(
+        self, mock_ld_client: MagicMock, judge_provider: str, runs: bool
+    ) -> None:
+        called = False
+
+        async def recording_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            nonlocal called
+            called = True
+            return {"output": '{"score": 0.8, "reasoning": "ok"}', "usage": {}}
+
+        parent = ProviderHandler(
+            fn=recording_fn,
+            provides_for=("*", "messages"),  # type: ignore[arg-type]
+            providers=["Bedrock"],
+        )
+        mock_ld_client.variation = AsyncMock(
+            return_value={
+                "model": {"name": "m"},
+                "provider": {"name": judge_provider},
+                "messages": [{"role": "user", "content": "Evaluate this."}],
+                "_ldMeta": {
+                    "enabled": True,
+                    "variationKey": "j1",
+                    "version": 1,
+                    "mode": "judge",
+                },
+            }
+        )
+        config = {
+            "model": {"name": "m"},
+            "provider": {"name": "Bedrock"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            await run_judges(
+                config=config,
+                user_context=CONTEXT,
+                handler=parent,
+                handlers=[],
+                user_input="q",
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+        assert called is runs
 
     async def test_exact_agent_handler_fallback_collapses_messages(
         self, mock_ld_client: MagicMock
@@ -599,7 +707,7 @@ class TestRunJudgeModeAliases:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_only_unrelated_mode(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         from launchdarkly_ai_server import JudgeTask, run_judge
 
@@ -628,7 +736,13 @@ class TestRunJudgeModeAliases:
             parent_track_data={"runId": "run-1"},
         )
 
-        assert await run_judge(task, [handler]) is None
+        with caplog.at_level(logging.WARNING, logger="launchdarkly_ai_server.judges"):
+            assert await run_judge(task, [handler]) is None
+        # The same warning run_judges logs when it skips a judge.
+        assert (
+            "Judge 'judge-key' skipped: no handler covers provider 'TestProvider'"
+            in caplog.messages
+        )
 
 
 class TestRunJudgeScoreReporting:

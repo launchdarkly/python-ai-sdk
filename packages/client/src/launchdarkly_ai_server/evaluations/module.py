@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast, overload
 
 from ..lifecycle import get_client, init_client
-from ..utils import normalize_mode
+from ..utils import normalize_mode, registration_key
 from .api import (
     DEFAULT_BASE_URI,
     EvaluationsError,
@@ -654,7 +654,7 @@ class EvaluationsModule:
             named = [
                 (f"handlers[{index}]", item) for index, item in enumerate(handlers)
             ]
-        seen: dict[tuple[str, str], str] = {}
+        seen: dict[Any, str] = {}
         for name, candidate in named:
             if not callable(candidate):
                 raise EvaluationsError(f"{name} must be callable")
@@ -665,12 +665,14 @@ class EvaluationsModule:
                     "create_handler() or a provider package's create_*_handler() "
                     "so that it can be matched to a config's provider and mode."
                 )
-            if provides_for in seen:
+            # Two scoped wildcards of one mode are distinct when their provider lists differ.
+            identity = registration_key(candidate)
+            if identity in seen:
                 raise EvaluationsError(
-                    f"{seen[provides_for]} and {name} both provide for "
+                    f"{seen[identity]} and {name} both provide for "
                     f"{provides_for!r}. Pass one handler for each provider and mode."
                 )
-            seen[provides_for] = name
+            seen[identity] = name
         return [candidate for _, candidate in named]
 
     @staticmethod

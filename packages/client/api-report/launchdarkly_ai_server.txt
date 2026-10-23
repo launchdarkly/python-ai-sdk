@@ -18,7 +18,7 @@ ConversationIdSpanProcessor(_SpanProcessorBase)  [class]
   on_end(span: Any) -> None
   on_start(span: Span, parent_context: otel_context.Context | None = None) -> None
   shutdown() -> None
-create_handler(provides_for: tuple[str, Literal['agent', 'messages']], fn: _HandlerFn, stream_fn: _StreamFn | None = None, capture_content: bool | None = None) -> ProviderHandler
+create_handler(provides_for: tuple[str, Literal['agent', 'messages']], fn: _HandlerFn, stream_fn: _StreamFn | None = None, capture_content: bool | None = None, *, providers: Sequence[str] | None = None) -> ProviderHandler
 create_run_usage() -> RunUsage
 end_span_once(span: Any, tracker: set[int], abandoned: bool = False, cancelled: bool = False) -> None
 end_unfinished_spans(*spans: Any) -> None
@@ -151,10 +151,11 @@ ProviderGraphResponse  [class, @dataclass]
   response: str
   usage: UsageDict
 ProviderHandler  [class]
-  __init__(fn: _HandlerFn, provides_for: tuple[str, Literal['agent', 'messages']] | None = None, stream_fn: _StreamFn | None = None, capture_content: bool | None = None)
+  __init__(fn: _HandlerFn, provides_for: tuple[str, Literal['agent', 'messages']] | None = None, stream_fn: _StreamFn | None = None, capture_content: bool | None = None, *, providers: Sequence[str] | None = None)
   __call__(config: AiConfigRep, user_input: str | None = None, tool_handlers: dict[str, Any] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> HandlerResult  [async]
   capture_content: bool  [property]
   has_stream: bool  [property]
+  providers: tuple[str, ...] | None = normalize_providers(providers)
   provides_for: tuple[str, Literal['agent', 'messages']] | None = provides_for
   stream(config: AiConfigRep, user_input: str | None = None, tool_handlers: dict[str, Any] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[dict[str, Any], None]  [async]
 ProviderResponse(Generic[T])  [class, @dataclass]

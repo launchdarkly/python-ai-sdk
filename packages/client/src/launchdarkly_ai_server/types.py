@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, TypeVar
 
@@ -148,6 +148,31 @@ _StreamFn = Callable[
 ]
 
 
+def normalize_providers(providers: Sequence[str] | None) -> tuple[str, ...] | None:
+    """
+    Validates an optional wildcard allowlist.
+
+    ``None`` means the handler is unscoped. A list must contain at least one
+    name and is stored as a tuple in first-seen order, with repeats dropped.
+    Names are compared to ``config.provider.name`` exactly, so a name with
+    surrounding whitespace is rejected rather than trimmed.
+    """
+    if providers is None:
+        return None
+    if (
+        isinstance(providers, (str, bytes))
+        or len(providers) == 0
+        or any(
+            not isinstance(name, str) or name == "" or name != name.strip()
+            for name in providers
+        )
+    ):
+        raise ValueError(
+            "providers must be a non-empty list of provider names without surrounding whitespace"
+        )
+    return tuple(dict.fromkeys(providers))
+
+
 class ProviderHandler:
     """
     Callable handler with provider metadata.
@@ -156,6 +181,7 @@ class ProviderHandler:
     - ``__call__`` — blocking invocation
     - ``stream``   — optional async-generator streaming (may be ``None``)
     - ``provides_for`` — ``(provider_name, mode)`` tuple or ``None``
+    - ``providers`` — optional allowlist consulted only when ``provides_for`` names ``"*"``
     - ``capture_content`` — the effective content-capture decision for this handler
 
     ``capture_content`` is declared here so the client core can apply the handler's own content
@@ -166,6 +192,7 @@ class ProviderHandler:
     """
 
     provides_for: tuple[str, Literal["agent", "messages"]] | None
+    providers: tuple[str, ...] | None
 
     def __init__(
         self,
@@ -173,11 +200,14 @@ class ProviderHandler:
         provides_for: tuple[str, Literal["agent", "messages"]] | None = None,
         stream_fn: _StreamFn | None = None,
         capture_content: bool | None = None,
+        *,
+        providers: Sequence[str] | None = None,
     ) -> None:
         self._fn = fn
         self.provides_for = provides_for
         self._stream_fn = stream_fn
         self._capture_content_override = capture_content
+        self.providers = normalize_providers(providers)
 
     @property
     def capture_content(self) -> bool:
