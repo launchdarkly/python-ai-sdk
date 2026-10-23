@@ -13,6 +13,7 @@ from .handler import _create_google_adk_agents_handler
 def google_adk_graph(
     key: str,
     *,
+    api_key: str | None = None,
     use_vertexai: bool = False,
     project: str | None = None,
     location: str | None = None,
@@ -31,6 +32,7 @@ def google_adk_graph(
         key,
         handlers=[
             _create_google_adk_agents_handler(
+                api_key=api_key,
                 use_vertexai=use_vertexai,
                 project=project,
                 location=location,

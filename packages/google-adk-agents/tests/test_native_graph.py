@@ -8,8 +8,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import launchdarkly_ai_google_adk_agents.handler as handler_mod
 import launchdarkly_ai_google_adk_agents.native_graph as native_mod
 from launchdarkly_ai_google_adk_agents.native_graph import to_adk_agents
+
+
+async def _resolved(graph: Any) -> Any:
+    return graph
+
+
+def _adapter(graph: Any, **opts: Any) -> Any:
+    """``to_adk_agents`` as callers use it: an awaitable definition and an options dict."""
+    return to_adk_agents(_resolved(graph), opts)
 
 
 class _FakeTool:
@@ -91,28 +101,25 @@ def _mocks(monkeypatch: pytest.MonkeyPatch) -> None:
         MagicMock(side_effect=lambda **kw: SimpleNamespace(**kw)),
     )
     monkeypatch.setattr(native_mod, "FunctionTool", _FakeTool)
-    monkeypatch.setattr(
-        native_mod,
-        "Workflow",
-        MagicMock(side_effect=lambda **kw: SimpleNamespace(**kw)),
-    )
     monkeypatch.setattr(native_mod, "InMemoryRunner", _FakeRunner)
-    monkeypatch.setattr(native_mod, "START", "START")
+    monkeypatch.setattr(
+        handler_mod, "Gemini", MagicMock(side_effect=lambda **kw: SimpleNamespace(**kw))
+    )
 
 
 class TestToAdkAgents:
     async def test_disabled_graph_throws(self) -> None:
         with pytest.raises(Exception, match="graph-flag"):
-            await to_adk_agents(_graph(enabled=False)).invoke("hi")
+            await _adapter(_graph(enabled=False)).invoke("hi")
 
     async def test_missing_root_throws(self) -> None:
         graph = _graph()
         graph.root = None
         with pytest.raises(Exception, match="root"):
-            await to_adk_agents(graph).invoke("hi")
+            await _adapter(graph).invoke("hi")
 
     async def test_two_node_graph_builds_two_agents_and_a_transfer_tool(self) -> None:
-        result = await to_adk_agents(_graph()).invoke("hi")
+        result = await _adapter(_graph()).invoke("hi")
         assert native_mod.LlmAgent.call_count == 2
         instructions = [
             call.kwargs["instruction"] for call in native_mod.LlmAgent.call_args_list
@@ -129,13 +136,11 @@ class TestToAdkAgents:
             name.startswith("transfer_to_") and name != "transfer_to_leaf"
             for name in names
         )
-        edges = native_mod.Workflow.call_args.kwargs["edges"]
-        assert edges[0][0] == "START"
         assert result["response"] == "leaf-answer"
         assert result["usage"]["total"] == 5
 
     async def test_transfer_tool_selects_the_target(self) -> None:
-        await to_adk_agents(_graph()).invoke("hi")
+        await _adapter(_graph()).invoke("hi")
         tool = next(
             item for item in _FakeTool.created if item.name == "transfer_to_leaf"
         )
@@ -146,11 +151,11 @@ class TestToAdkAgents:
         tracker = MagicMock()
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(native_mod, "get_client", lambda: tracker)
-            await to_adk_agents(_graph()).invoke("hi")
+            await _adapter(_graph()).invoke("hi")
         tracker.track.assert_not_called()
 
     async def test_history_is_seeded_on_the_root_session_only(self) -> None:
-        await to_adk_agents(_graph()).invoke(
+        await _adapter(_graph()).invoke(
             "hi", history=[{"role": "user", "content": "earlier"}]
         )
         assert _FakeRunner.created[0].session_service.append_event.await_count == 1
@@ -168,7 +173,7 @@ class TestToAdkAgents:
         def lookup(args: dict[str, Any]) -> str:
             return str(args["q"])
 
-        await to_adk_agents(graph, tool_handlers={"lookup": lookup}).invoke("hi")
+        await _adapter(graph, tool_handlers={"lookup": lookup}).invoke("hi")
         names = [tool.name for tool in _FakeTool.created]
         assert "lookup" in names
         assert names.count("transfer_to_leaf") == 1
@@ -214,7 +219,7 @@ class TestToAdkAgents:
 
         _HandoffRunner.hops = 0
         monkeypatch.setattr(native_mod, "InMemoryRunner", _HandoffRunner)
-        result = await to_adk_agents(_graph()).invoke("hi")
+        result = await _adapter(_graph()).invoke("hi")
         assert _HandoffRunner.hops == 1
         assert len(_FakeRunner.created) == 2
         assert result["response"] == "leaf-answer"
@@ -230,8 +235,8 @@ class TestToAdkAgents:
             patch.setattr(
                 native_mod, "trace", SimpleNamespace(get_tracer=lambda _name: tracer)
             )
-            await to_adk_agents(_graph()).invoke(
-                "hi", context={"kind": "user", "key": "user-1"}
+            await _adapter(_graph(), context={"kind": "user", "key": "user-1"}).invoke(
+                "hi"
             )
         assert tracer.start_span.call_args.args[0] == "launchdarkly.graph"
         span.set_attribute.assert_any_call("launchdarkly.config.key", "graph-flag")
@@ -247,8 +252,8 @@ class TestToAdkAgents:
         tracker = MagicMock()
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(native_mod, "get_client", lambda: tracker)
-            await to_adk_agents(_graph()).invoke(
-                "hi", context={"kind": "user", "key": "user-1"}
+            await _adapter(_graph(), context={"kind": "user", "key": "user-1"}).invoke(
+                "hi"
             )
         calls = [(call.args[0], call.args[2]) for call in tracker.track.call_args_list]
         assert [name for name, _ in calls] == [
@@ -285,10 +290,69 @@ class TestToAdkAgents:
                 native_mod, "trace", SimpleNamespace(get_tracer=lambda _name: tracer)
             )
             with pytest.raises(RuntimeError, match="runner broke"):
-                await to_adk_agents(_graph()).invoke(
-                    "hi", context={"kind": "user", "key": "user-1"}
-                )
+                await _adapter(
+                    _graph(), context={"kind": "user", "key": "user-1"}
+                ).invoke("hi")
         events = [call.args[0] for call in tracker.track.call_args_list]
         assert events == ["$ld:ai:graph:node", "$ld:ai:graph:invocation_failure"]
         assert tracker.track.call_args_list[-1].args[2]["configKey"] == "graph-flag"
         span.end.assert_called()
+
+
+class TestModelTransport:
+    async def test_nodes_resolve_their_model_with_the_factory_options(self) -> None:
+        await _adapter(
+            _graph(), use_vertexai=True, project="p", location="us-central1"
+        ).invoke("hi")
+        kwargs = handler_mod.Gemini.call_args.kwargs
+        assert kwargs["model"] == "gemini-2.5-flash"
+        assert kwargs["client_kwargs"] == {
+            "vertexai": True,
+            "project": "p",
+            "location": "us-central1",
+        }
+
+    def test_vertex_without_project_fails_up_front(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+        monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+        definition = _resolved(_graph())
+        with pytest.raises(ValueError, match="Vertex"):
+            to_adk_agents(definition, {"use_vertexai": True})
+        definition.close()
+
+    async def test_new_message_is_the_handler_user_message(self) -> None:
+        sent: list[Any] = []
+
+        class _Spy(_FakeRunner):
+            async def run_async(self, **kwargs: Any) -> Any:
+                sent.append(kwargs["new_message"])
+                async for event in super().run_async(**kwargs):
+                    yield event
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(native_mod, "InMemoryRunner", _Spy)
+            await _adapter(_graph()).invoke("hi")
+        assert sent[0] == handler_mod._user_message("hi")
+
+    async def test_usage_sums_every_non_partial_event(self) -> None:
+        class _TwoTurns(_FakeRunner):
+            async def run_async(self, **kwargs: Any) -> Any:
+                yield SimpleNamespace(
+                    content=None,
+                    partial=False,
+                    usage_metadata=SimpleNamespace(
+                        prompt_token_count=4,
+                        candidates_token_count=1,
+                        total_token_count=5,
+                    ),
+                    is_final_response=lambda: False,
+                )
+                async for event in super().run_async(**kwargs):
+                    yield event
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(native_mod, "InMemoryRunner", _TwoTurns)
+            result = await _adapter(_graph()).invoke("hi")
+        assert result["usage"] == {"input": 6, "output": 4, "total": 10}

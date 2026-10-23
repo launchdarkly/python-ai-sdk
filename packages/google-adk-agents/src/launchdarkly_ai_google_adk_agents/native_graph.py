@@ -1,4 +1,4 @@
-"""Native ADK workflow adapter for a LaunchDarkly agent graph."""
+"""Native ADK agent adapter for a LaunchDarkly agent graph."""
 
 from __future__ import annotations
 
@@ -18,11 +18,14 @@ from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import (
+    _resolve_model,
     _session_event,
+    _user_message,
     event_text,
     history_contents,
     make_function_tool,
     native_of,
+    vertex_target,
 )
 from .spans import usage_counts
 
@@ -30,13 +33,10 @@ try:
     from google.adk.agents.llm_agent import LlmAgent
     from google.adk.runners import InMemoryRunner
     from google.adk.tools.function_tool import FunctionTool
-    from google.adk.workflow import START, Workflow
 except ImportError:  # pragma: no cover - unit tests patch these names
     LlmAgent = None
     InMemoryRunner = None
     FunctionTool = None
-    Workflow = None
-    START = "START"
 
 try:
     from opentelemetry import trace
@@ -50,18 +50,18 @@ _APP = "launchdarkly"
 
 
 class _AdkAgents:
-    def __init__(self, graph_def: Any, options: dict[str, Any]) -> None:
-        self._graph = graph_def
+    def __init__(self, definition: Any, options: dict[str, Any]) -> None:
+        self._definition = definition
         self._options = options
 
     async def invoke(
         self,
         user_input: str | None = None,
-        context: Any = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        graph_def = self._graph
+        graph_def = await self._definition
+        context = self._options.get("context")
         if not getattr(graph_def, "enabled", True):
             raise RuntimeError(f"Graph {graph_def.key} is disabled")
         if getattr(graph_def, "root", None) is None:
@@ -88,9 +88,9 @@ class _AdkAgents:
             variables = variables or {}
             tool_handlers = self._options.get("tool_handlers") or {}
             handoff: dict[str, str | None] = {"target": None}
-            agents = _build_agents(graph_def, variables, tool_handlers, handoff)
-            root_agent = agents[graph_def.root.key]
-            Workflow(name="graph", edges=[(START, root_agent)])
+            agents = _build_agents(
+                graph_def, variables, tool_handlers, handoff, self._options
+            )
 
             current = graph_def.root
             seen: set[str] = set()
@@ -152,10 +152,20 @@ class _AdkAgents:
                 span.end()
 
 
-def to_adk_agents(graph_def: Any, **options: Any) -> _AdkAgents:
-    """Compiles a LaunchDarkly agent graph into an ADK workflow."""
+def to_adk_agents(definition: Any, opts: dict[str, Any] | None = None) -> Any:
+    """Builds one ADK agent per graph node from an awaitable ``resolve_graph()`` result.
+
+    ``opts`` takes ``tool_handlers``, ``context``, and the handler factory's model options:
+    ``api_key``, ``use_vertexai``, ``project``, ``location`` and ``model``.
+    """
     report_usage("google-adk-agents.toAdkAgents", PACKAGE_NAME, __version__)
-    return _AdkAgents(graph_def, options)
+    options = dict(opts or {})
+    options["project"], options["location"] = vertex_target(
+        bool(options.get("use_vertexai")),
+        options.get("project"),
+        options.get("location"),
+    )
+    return _AdkAgents(definition, options)
 
 
 def _graph_span(key: str) -> Any:
@@ -186,9 +196,12 @@ def _build_agents(
     variables: dict[str, Any],
     tool_handlers: dict[str, Any],
     handoff: dict[str, str | None],
+    options: dict[str, Any],
 ) -> dict[str, Any]:
     agents: dict[str, Any] = {}
-    _visit(graph_def, graph_def.root, agents, variables, tool_handlers, handoff)
+    _visit(
+        graph_def, graph_def.root, agents, variables, tool_handlers, handoff, options
+    )
     return agents
 
 
@@ -199,6 +212,7 @@ def _visit(
     variables: dict[str, Any],
     tool_handlers: dict[str, Any],
     handoff: dict[str, str | None],
+    options: dict[str, Any],
 ) -> None:
     if node is None or node.key in agents:
         return
@@ -216,7 +230,14 @@ def _visit(
     tools = _node_tools(config, tool_handlers) + tools
     agents[node.key] = LlmAgent(
         name=_agent_name(node.key),
-        model=str((config.get("model") or {}).get("name") or ""),
+        model=_resolve_model(
+            config,
+            options.get("model"),
+            api_key=options.get("api_key"),
+            use_vertexai=bool(options.get("use_vertexai")),
+            project=options.get("project"),
+            location=options.get("location"),
+        ),
         instruction=parse_template(str(config.get("instructions") or ""), variables),
         tools=tools,
     )
@@ -228,6 +249,7 @@ def _visit(
             variables,
             tool_handlers,
             handoff,
+            options,
         )
 
 
@@ -279,14 +301,13 @@ async def _run_agent(
     async for event in runner.run_async(
         user_id="user",
         session_id=session.id,
-        new_message=_message(user_input),
+        new_message=_user_message(user_input),
     ):
         if getattr(event, "partial", False):
             continue
         checker = getattr(event, "is_final_response", None)
-        if callable(checker) and not checker():
-            continue
-        output = event_text(event)
+        if not callable(checker) or checker():
+            output = event_text(event)
         prompt, candidates, total = usage_counts(getattr(event, "usage_metadata", None))
         usage = {
             "input": usage["input"] + prompt,
@@ -294,9 +315,3 @@ async def _run_agent(
             "total": usage["total"] + total,
         }
     return output, usage
-
-
-def _message(text: str) -> Any:
-    return type(
-        "Content", (), {"role": "user", "parts": [type("Part", (), {"text": text})()]}
-    )()

@@ -45,6 +45,7 @@ class TestGoogleAdkGraph:
             mock_graph.return_value = MagicMock()
             google_adk_graph(
                 "my-flag",
+                api_key="k",
                 use_vertexai=True,
                 project="p",
                 location="us-central1",
@@ -52,6 +53,7 @@ class TestGoogleAdkGraph:
                 capture_content=True,
             )
             factory.assert_called_once_with(
+                api_key="k",
                 use_vertexai=True,
                 project="p",
                 location="us-central1",

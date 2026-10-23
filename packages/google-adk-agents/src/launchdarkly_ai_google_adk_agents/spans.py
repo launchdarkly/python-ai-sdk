@@ -19,6 +19,7 @@ from launchdarkly_ai_server import (
     set_ld_span_attributes,
     set_model_identity_attributes,
     set_usage_span_attributes,
+    to_semconv_finish_reason,
 )
 
 try:
@@ -118,14 +119,29 @@ def finish_model_span(
     span: Any,
     config: AiConfigRep,
     usage: SpanUsage | None = None,
+    finish_reason: str | None = None,
 ) -> None:
+    """Ends one ``chat`` span successfully. *finish_reason* arrives already mapped."""
     if span is None:
         return
     span.set_attribute("gen_ai.response.model", model_name(config))
     set_usage_span_attributes(span, usage or SpanUsage())
+    if finish_reason:
+        span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
     if SpanStatusCode is not None:
         span.set_status(SpanStatusCode.OK)
     span.end()
+
+
+def finish_reason_of(llm_response: Any) -> str | None:
+    """An ADK ``LlmResponse.finish_reason`` mapped through the shared table.
+
+    Gemini reports a ``FinishReason`` enum (``STOP``, ``MAX_TOKENS``, ...), so its value is mapped,
+    not its ``repr``. A missing reason is ``None``, so the caller leaves the attribute off.
+    """
+    raw = getattr(llm_response, "finish_reason", None)
+    raw = getattr(raw, "value", raw)
+    return to_semconv_finish_reason(raw if isinstance(raw, str) else None)
 
 
 def succeed_span(span: Any) -> None:

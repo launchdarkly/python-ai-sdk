@@ -58,6 +58,12 @@ except Exception:  # pragma: no cover - extensions extra, or the package is abse
     LiteLlm = None
 
 try:
+    from google.adk.agents.run_config import RunConfig, StreamingMode
+except ImportError:  # pragma: no cover
+    RunConfig = None
+    StreamingMode = None
+
+try:
     from google.adk.events.event import Event
 except ImportError:  # pragma: no cover
     Event = None
@@ -84,6 +90,7 @@ class LaunchDarklyTelemetryPlugin(BasePlugin):  # type: ignore[misc]
         self.parent = parent
         self.capture_content = capture_content
         self._tool_spans: dict[str, Any] = {}
+        self._model_span: Any = None
         self._native_stubs: dict[str, Any] = {}
         self._instruction = ""
         self._user_text = ""
@@ -93,9 +100,13 @@ class LaunchDarklyTelemetryPlugin(BasePlugin):  # type: ignore[misc]
         self._user_text = user_text
         self._native_stubs = native_stubs(handlers)
 
-    async def after_model_callback(
-        self, *, callback_context: Any, llm_response: Any
+    async def before_model_callback(
+        self, *, callback_context: Any, llm_request: Any
     ) -> None:
+        # One model call is in flight per agent run; a stale span means the last call never
+        # reported back, so it is abandoned rather than overwritten.
+        if self._model_span is not None:
+            spanlib.abandon_open_spans([self._model_span])
         span = spanlib.start_model_span(self.config, self.parent)
         messages = [text_message("user", self._user_text)] if self._user_text else []
         set_input_content_attributes(
@@ -104,6 +115,17 @@ class LaunchDarklyTelemetryPlugin(BasePlugin):  # type: ignore[misc]
             system_instructions=self._instruction or None,
             messages=messages,
         )
+        self._model_span = span
+
+    async def after_model_callback(
+        self, *, callback_context: Any, llm_response: Any
+    ) -> None:
+        # In SSE mode ADK calls this once per partial chunk, then once with the whole response.
+        if getattr(llm_response, "partial", False):
+            return
+        span, self._model_span = self._model_span, None
+        if span is None:
+            return
         output = event_text(llm_response)
         if output:
             set_output_content_attributes(
@@ -113,8 +135,17 @@ class LaunchDarklyTelemetryPlugin(BasePlugin):  # type: ignore[misc]
             getattr(llm_response, "usage_metadata", None)
         )
         spanlib.finish_model_span(
-            span, self.config, spanlib.span_usage_from_counts(prompt, candidates)
+            span,
+            self.config,
+            spanlib.span_usage_from_counts(prompt, candidates),
+            spanlib.finish_reason_of(llm_response),
         )
+
+    async def on_model_error_callback(
+        self, *, callback_context: Any, llm_request: Any, error: Exception
+    ) -> None:
+        span, self._model_span = self._model_span, None
+        spanlib.fail_span(span, error)
 
     async def before_tool_callback(
         self, *, tool: Any, tool_args: Any, tool_context: Any
@@ -150,15 +181,22 @@ class LaunchDarklyTelemetryPlugin(BasePlugin):  # type: ignore[misc]
 
     def abandon_open_spans(self, ended: set[int] | None = None) -> None:
         tracker = ended if isinstance(ended, set) else set()
-        for span in list(self._tool_spans.values()):
-            spanlib.abandon_open_spans([span], tracker)
+        spanlib.abandon_open_spans(self._open_spans(), tracker)
         self._tool_spans.clear()
+        self._model_span = None
 
     def close_open_spans(self, err: Exception, ended: set[int] | None = None) -> None:
         tracker = ended if isinstance(ended, set) else set()
-        for span in list(self._tool_spans.values()):
+        for span in self._open_spans():
             spanlib.fail_span(span, err, tracker)
         self._tool_spans.clear()
+        self._model_span = None
+
+    def _open_spans(self) -> list[Any]:
+        spans = list(self._tool_spans.values())
+        if self._model_span is not None:
+            spans.append(self._model_span)
+        return spans
 
 
 def history_contents(history: list[dict[str, Any]] | None) -> list[Any]:
@@ -203,14 +241,7 @@ def _create_google_adk_agents_handler(
     capture_content: bool | None = None,
 ) -> Any:
     """Non-reporting :func:`create_google_adk_agents_handler`, used by this package's wrappers."""
-    if use_vertexai:
-        project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
-        location = location or os.environ.get("GOOGLE_CLOUD_LOCATION")
-        if not project or not location:
-            raise ValueError(
-                "Vertex mode requires a Google Cloud project and location "
-                "(arguments or GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION)"
-            )
+    project, location = vertex_target(use_vertexai, project, location)
 
     async def _run(
         cfg: AiConfigRep,
@@ -293,22 +324,24 @@ def _create_google_adk_agents_handler(
                 user_id=user_id,
                 session_id=session.id,
                 new_message=_user_message(user_input),
+                run_config=_sse_run_config(),
             ):
                 text = event_text(event)
                 if getattr(event, "partial", False):
                     if text:
                         yield {"type": "chunk", "text": text}
                     continue
+                usage = _add_usage(usage, event)
                 if _is_final(event):
                     output = text
-                    usage = _add_usage(usage, event)
-            yield {"type": "done", "output": output, "usage": usage}
+            # The root ends before `done`: a consumer may stop iterating at `done`.
             spanlib.finish_root_span(
                 root,
                 cfg,
                 spanlib.span_usage_from_counts(usage["input"], usage["output"]),
             )
             spanlib.succeed_span(root)
+            yield {"type": "done", "output": output, "usage": usage}
         except Exception as err:
             spanlib.fail_span(root, err, ended)
             plugin.close_open_spans(err, ended)
@@ -387,9 +420,11 @@ async def _execute(
         session_id=session.id,
         new_message=_user_message(user_input),
     ):
+        if getattr(event, "partial", False):
+            continue
+        usage = _add_usage(usage, event)
         if _is_final(event):
             output = event_text(event)
-            usage = _add_usage(usage, event)
     return output, usage
 
 
@@ -466,6 +501,29 @@ def _resolve_model(
     if client_kwargs:
         return Gemini(model=name, client_kwargs=client_kwargs)
     return Gemini(model=name)
+
+
+def _sse_run_config() -> Any:
+    """ADK defaults to ``StreamingMode.NONE``, which yields no partial events at all."""
+    if RunConfig is None or StreamingMode is None:
+        return None
+    return RunConfig(streaming_mode=StreamingMode.SSE)
+
+
+def vertex_target(
+    use_vertexai: bool, project: str | None, location: str | None
+) -> tuple[str | None, str | None]:
+    """Vertex project and location, from the arguments or the environment. Required for Vertex."""
+    if not use_vertexai:
+        return project, location
+    project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = location or os.environ.get("GOOGLE_CLOUD_LOCATION")
+    if not project or not location:
+        raise ValueError(
+            "Vertex mode requires a Google Cloud project and location "
+            "(arguments or GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION)"
+        )
+    return project, location
 
 
 def _instruction(cfg: AiConfigRep, variables: dict[str, Any]) -> str:

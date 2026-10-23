@@ -101,6 +101,9 @@ class _FakeRunner:
             raise _FakeRunner.explode
         plugin = self.plugins[0] if self.plugins else None
         if plugin is not None and hasattr(plugin, "after_model_callback"):
+            await plugin.before_model_callback(
+                callback_context=SimpleNamespace(), llm_request=SimpleNamespace()
+            )
             response = SimpleNamespace(
                 content=_FakeRunner.events[-1].content if _FakeRunner.events else None,
                 usage_metadata=_usage(),
@@ -593,7 +596,109 @@ class TestTelemetry:
         spans_mod.fail_span.assert_not_called()
 
 
+class TestModelSpanLifetime:
+    async def test_chat_span_opens_before_the_call_and_closes_after(self) -> None:
+        await create_google_adk_agents_handler()(BASE_CONFIG, "hello")
+        plugin = _FakeRunner.last.plugins[0]
+        spans_mod.start_model_span.reset_mock()
+        spans_mod.finish_model_span.reset_mock()
+        await plugin.before_model_callback(
+            callback_context=SimpleNamespace(), llm_request=SimpleNamespace()
+        )
+        spans_mod.start_model_span.assert_called_once()
+        spans_mod.finish_model_span.assert_not_called()
+        await plugin.after_model_callback(
+            callback_context=SimpleNamespace(),
+            llm_response=SimpleNamespace(
+                content=None, usage_metadata=None, partial=False
+            ),
+        )
+        spans_mod.finish_model_span.assert_called_once()
+
+    async def test_partial_responses_do_not_close_the_chat_span(self) -> None:
+        await create_google_adk_agents_handler()(BASE_CONFIG, "hello")
+        plugin = _FakeRunner.last.plugins[0]
+        spans_mod.finish_model_span.reset_mock()
+        await plugin.before_model_callback(
+            callback_context=SimpleNamespace(), llm_request=SimpleNamespace()
+        )
+        await plugin.after_model_callback(
+            callback_context=SimpleNamespace(),
+            llm_response=SimpleNamespace(content=None, partial=True),
+        )
+        spans_mod.finish_model_span.assert_not_called()
+
+    async def test_model_error_fails_the_chat_span(self) -> None:
+        await create_google_adk_agents_handler()(BASE_CONFIG, "hello")
+        plugin = _FakeRunner.last.plugins[0]
+        spans_mod.fail_span.reset_mock()
+        await plugin.before_model_callback(
+            callback_context=SimpleNamespace(), llm_request=SimpleNamespace()
+        )
+        model_span = spans_mod.start_model_span.return_value
+        error = RuntimeError("model broke")
+        await plugin.on_model_error_callback(
+            callback_context=SimpleNamespace(),
+            llm_request=SimpleNamespace(),
+            error=error,
+        )
+        spans_mod.fail_span.assert_called_once_with(model_span, error)
+
+    async def test_finish_reason_reaches_the_chat_span(self) -> None:
+        await create_google_adk_agents_handler()(BASE_CONFIG, "hello")
+        plugin = _FakeRunner.last.plugins[0]
+        spans_mod.finish_model_span.reset_mock()
+        await plugin.before_model_callback(
+            callback_context=SimpleNamespace(), llm_request=SimpleNamespace()
+        )
+        await plugin.after_model_callback(
+            callback_context=SimpleNamespace(),
+            llm_response=SimpleNamespace(
+                content=None,
+                usage_metadata=None,
+                partial=False,
+                finish_reason=SimpleNamespace(value="MAX_TOKENS"),
+            ),
+        )
+        assert spans_mod.finish_model_span.call_args.args[3] == "length"
+
+
+class TestUsageAcrossTurns:
+    async def test_usage_sums_every_non_partial_event(self) -> None:
+        _FakeRunner.events = [
+            _event("", usage=_usage(10, 2, 12), final=False),
+            _event("chunk", partial=True, usage=_usage(99, 99, 198), final=False),
+            _event("done", usage=_usage(15, 4, 19)),
+        ]
+        result = await create_google_adk_agents_handler()(BASE_CONFIG, "hello")
+        assert result["output"] == "done"
+        assert result["usage"] == {"input": 25, "output": 6, "total": 31}
+
+
 class TestStreaming:
+    async def test_stream_asks_adk_for_sse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_config = MagicMock(side_effect=lambda **kw: SimpleNamespace(**kw))
+        monkeypatch.setattr(handler_mod, "RunConfig", run_config)
+        monkeypatch.setattr(handler_mod, "StreamingMode", SimpleNamespace(SSE="sse"))
+        handler = create_google_adk_agents_handler()
+        async for _ in await handler.stream(BASE_CONFIG, "hello"):
+            pass
+        passed = _FakeRunner.last.run_calls[0]["run_config"]
+        assert passed.streaming_mode == "sse"
+
+    async def test_root_span_ends_before_done(self) -> None:
+        handler = create_google_adk_agents_handler()
+        root = spans_mod.start_root_span.return_value
+        seen_done = False
+        async for event in await handler.stream(BASE_CONFIG, "hello"):
+            if event["type"] == "done":
+                seen_done = True
+                spans_mod.finish_root_span.assert_called_once()
+                root.end.assert_called()
+        assert seen_done
+
     async def test_stream_yields_chunks_then_one_done(self) -> None:
         _FakeRunner.events = [
             _event("hel", partial=True, final=False),

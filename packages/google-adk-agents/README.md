@@ -14,4 +14,4 @@ Non-Gemini models use ADK's `LiteLlm` adapter (`pip install 'google-adk[extensio
 
 `google-adk` is not declared on this package. Release 2.9.2 caps `opentelemetry-sdk<=1.42.1`, which conflicts with this workspace's exporter. Install ADK in the application environment.
 
-`to_adk_agents(graph)` compiles a LaunchDarkly agent graph into an ADK `Workflow`. `google_adk_graph(key)` pre-wires this handler for `graph()`.
+`to_adk_agents(resolve_graph(key, context=ctx), {"context": ctx})` builds one ADK agent per graph node and follows `transfer_to_*` handoffs. Its options take `tool_handlers` and the factory's model options (`api_key`, `use_vertexai`, `project`, `location`, `model`). `google_adk_graph(key)` pre-wires this handler for `graph()`.

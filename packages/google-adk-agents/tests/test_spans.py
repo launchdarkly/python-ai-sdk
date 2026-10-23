@@ -96,3 +96,18 @@ def test_abandon_does_not_fail_the_tool_span(monkeypatch: Any) -> None:
     abandon_open_spans([span], ended=set())
     assert span.ended is True
     fail.assert_not_called()
+
+
+class TestFinishReason:
+    def test_gemini_enum_maps_through_the_shared_table(self) -> None:
+        reason = SimpleNamespace(value="STOP")
+        assert (
+            spans_mod.finish_reason_of(SimpleNamespace(finish_reason=reason)) == "stop"
+        )
+
+    def test_max_tokens_is_length(self) -> None:
+        response = SimpleNamespace(finish_reason="MAX_TOKENS")
+        assert spans_mod.finish_reason_of(response) == "length"
+
+    def test_missing_reason_writes_nothing(self) -> None:
+        assert spans_mod.finish_reason_of(SimpleNamespace()) is None
