@@ -377,6 +377,29 @@ class TestConfigSingleHandler:
         result = await m.invoke("q", CONTEXT)
         assert result.response == {"already": "parsed"}
 
+    async def test_online_judge_reads_a_structured_response_as_json_stringify_text(
+        self, mock_ld_client: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "Reply in JSON",
+            "_ldMeta": {
+                "enabled": True,
+                "variationKey": "v1",
+                "version": 1,
+                "mode": "messages",
+            },
+            "outputFormat": {"type": "object"},
+        }
+        mock_ld_client.variation = AsyncMock(return_value=raw)
+        judges = AsyncMock(return_value={})
+        monkeypatch.setattr("launchdarkly_ai_server.client.run_judges", judges)
+        handler = _make_handler(response='{"score": 1.0, "city": "Zürich"}')
+        await config(key="flag", handler=handler).invoke("q", CONTEXT)
+        # The same text an offline judge reads: no spaces, 1 not 1.0, no escapes.
+        assert judges.await_args.kwargs["llm_response"] == '{"score":1,"city":"Zürich"}'
+
     async def test_no_parsing_when_output_format_absent(
         self, mock_ld_client: MagicMock
     ) -> None:
