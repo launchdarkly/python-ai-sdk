@@ -647,9 +647,8 @@ class SkillSource:
         """
         Raises:
             TypeError: If *refs* is not callable, or *config_keys* is a string
-                or holds anything but strings. A bare string would be followed
-                as one-character keys, none of which ever changes.
-            ValueError: If a config key is empty.
+                or holds anything but non-empty strings. A bare string would be
+                followed as one-character keys, none of which ever changes.
         """
         if not callable(refs):
             raise TypeError(
@@ -673,7 +672,7 @@ class SkillSource:
                     f"{type(key).__name__}"
                 )
             if not key:
-                raise ValueError("SkillSource config_keys must not hold an empty key")
+                raise TypeError("SkillSource config_keys must not hold an empty key")
         object.__setattr__(self, "refs", refs)
         object.__setattr__(self, "config_keys", keys)
 

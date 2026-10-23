@@ -256,8 +256,8 @@ class TestSkillSource:
         with pytest.raises(TypeError, match="sequence"):
             SkillSource(list, config_keys=keys)
 
-    def test_an_empty_key_is_a_value_error(self) -> None:
-        with pytest.raises(ValueError, match="empty"):
+    def test_an_empty_key_is_a_type_error(self) -> None:
+        with pytest.raises(TypeError, match="empty"):
             SkillSource(list, config_keys=["a", ""])
 
 
@@ -425,7 +425,7 @@ class TestConfigSkillsTelemetry:
 
     async def test_usage_is_reported_before_the_arguments_are_checked(self) -> None:
         client = install(FakeLDClient())
-        with pytest.raises(ValueError, match="empty"):
+        with pytest.raises(TypeError, match="empty"):
             config_skills("", CONTEXT)
         assert client.usage_helpers() == ["experimental.configSkills"]
 
