@@ -110,6 +110,7 @@ graph TD
   opencode["launchdarkly-ai-opencode-agents"]
   vercel["launchdarkly-ai-vercel-agents"]
   litellm["launchdarkly-ai-litellm-agents"]
+  googleAdk["launchdarkly-ai-google-adk-agents"]
   newHandler["launchdarkly-ai-new-provider\n(future)"]
  end
  subgraph tier0 ["Tier 0 — Core"]
@@ -121,6 +122,7 @@ graph TD
  app --> openai
  app --> langchain
  app --> opencode
+ app --> googleAdk
  app --> newHandler
  app --> ai
  claude --> client
@@ -128,6 +130,7 @@ graph TD
  langchain --> client
  opencode --> client
  vercel --> client
+ googleAdk --> client
  newHandler --> client
  ai --> client
 ```
@@ -136,7 +139,7 @@ graph TD
 
 - **Tier 0 — Core** (`launchdarkly-ai-server`): The foundation. Owns all LaunchDarkly integration, telemetry orchestration, shared data types, and the primary entry points (`config()`, `graph()`, `resolve_graph()`). Has no dependency on any other `launchdarkly-ai-*` package.
 - **Tier 0 — Convenience barrel** (`launchdarkly-ai-python`): A pure re-export package that makes all of `launchdarkly-ai-server` available under a shorter install name. No new logic — intended as the default install for most Python applications.
-- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, `launchdarkly-ai-litellm-agents`, `launchdarkly-ai-litellm-messages`, `launchdarkly-ai-opencode-agents`, `launchdarkly-ai-vercel-agents`, `launchdarkly-ai-vercel-messages`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages. The OpenCode handler starts `opencode serve` per call and speaks the OpenCode HTTP API itself. It does not depend on an OpenCode SDK.
+- **Tier 1 — Handler packages** (`launchdarkly-ai-claude-agents`, `launchdarkly-ai-claude-messages`, `launchdarkly-ai-openai-agents`, `launchdarkly-ai-openai-messages`, `launchdarkly-ai-langchain-agents`, `launchdarkly-ai-langchain-messages`, `launchdarkly-ai-litellm-agents`, `launchdarkly-ai-litellm-messages`, `launchdarkly-ai-opencode-agents`, `launchdarkly-ai-vercel-agents`, `launchdarkly-ai-vercel-messages`, `launchdarkly-ai-google-adk-agents`, …): Each wraps a specific AI provider SDK. Depends on `launchdarkly-ai-server` for shared types and utilities. Must not depend on other Tier 1 packages. The OpenCode handler starts `opencode serve` per call and speaks the OpenCode HTTP API itself. It does not depend on an OpenCode SDK.
 - **Tier 2 — Consumer applications** (e.g. `main.py`, downstream projects): Imports from one or more handler packages and either `launchdarkly-ai-python` or `launchdarkly-ai-server`. Owns tool implementations and orchestration logic. No `launchdarkly-ai-*` package should ever depend on Tier 2 code.
 
 ### Rules
@@ -691,7 +694,7 @@ def my_provider(
 
 For example, `claude_agents(config_key, user_input, context)` is equivalent to `config(key=config_key, handler=create_claude_agents_handler()).invoke(user_input, context)`.
 
-The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`, `litellm_agents`, `litellm_messages`, `vercel_agents`, `vercel_messages`.
+The naming convention matches the package suffix: `claude_agents`, `claude_messages`, `openai_agents`, `openai_messages`, `langchain_agents`, `langchain_messages`, `litellm_agents`, `litellm_messages`, `vercel_agents`, `vercel_messages`, `google_adk_agents`.
 
 ### Graph Export (optional)
 
@@ -702,7 +705,7 @@ def claude_graph(key: str, **options) -> GraphInstance:
     return graph(key, handlers=[create_claude_agents_handler()], **options)
 ```
 
-Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`, `vercel_graph`.
+Naming convention: `claude_graph`, `openai_graph`, `langchain_graph`, `litellm_graph`, `vercel_graph`, `google_adk_graph`.
 
 ### Native Graph Adapter (optional)
 
@@ -714,6 +717,7 @@ Current adapters:
 - `to_lang_graph(def_coro, opts)` — exported from `launchdarkly_ai_langchain_agents`
 - `to_litellm_agents(def_coro, opts)` — exported from `launchdarkly_ai_litellm_agents`
 - `to_vercel_agents(def_coro, opts)` — exported from `launchdarkly_ai_vercel_agents`
+- `to_adk_agents(def_coro, opts)` — exported from `launchdarkly_ai_google_adk_agents`
 
 ---
 
