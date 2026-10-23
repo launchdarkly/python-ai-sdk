@@ -722,6 +722,21 @@ class TestNoChangeSignal:
         # Refused before the initial reconcile read anything.
         assert source.reads == 0
 
+    async def test_an_is_offline_that_raises_is_treated_as_offline(
+        self, tmp_path: Path
+    ) -> None:
+        class RaisingOffline(FakeLDClient):
+            def is_offline(self) -> bool:
+                raise RuntimeError("config not loaded")
+
+        store = InMemorySkillStore()
+        set_skill_store(store)
+        client = install(RaisingOffline())
+        with pytest.raises(RuntimeError, match=r"offline.*watcher\.notify"):
+            await watch_skills(CountingSource(["a"]).source, tmp_path / "s")
+        assert store._listeners.get(SKILL_OBJECT_KIND, []) == []
+        assert client.flag_tracker.listeners == []
+
     async def test_empty_config_keys_probe_nothing(self, tmp_path: Path) -> None:
         set_skill_store(InMemorySkillStore())
         source = CountingSource([], config_keys=())
@@ -1009,13 +1024,33 @@ class TestVersionBump:
         assert all(a.action != "removed" for r in reports for a in r.actions)
 
 
+class PartlyUnreadableStore(InMemorySkillStore):
+    """A store whose reads raise for the keys in ``unreadable``: an unavailable
+    retrieval for those references, not an ``absent`` one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.unreadable: set[str] = set()
+
+    def get_object(
+        self, kind: str, key: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        if key in self.unreadable:
+            raise ConnectionError(f"store cannot read {key}")
+        return super().get_object(kind, key, version)
+
+
 class TestDroppingAReference:
+    """A dropped reference is pruned on the next reconcile whose retrieval is
+    available. An ``absent`` reference beside it is a per-key outcome and does
+    not hold the prune; only an unavailable retrieval does."""
+
     async def _watch(
         self, tmp_path: Path, make_raw_skill: Any
-    ) -> tuple[InMemorySkillStore, FakeLDClient, Path, Any, list[ReconcileReport]]:
-        store = InMemorySkillStore()
+    ) -> tuple[PartlyUnreadableStore, FakeLDClient, Path, Any, list[ReconcileReport]]:
+        store = PartlyUnreadableStore()
         store.put(make_raw_skill(key="pdf-extraction", version=2))
-        store.put(make_raw_skill(key="triage", version=1))
+        store.put(make_raw_skill(key="triage", version=1, content="triage body"))
         set_skill_store(store)
         client = install(FakeLDClient(ai_config(("pdf-extraction", 2), ("triage", 1))))
         reports: list[ReconcileReport] = []
@@ -1027,9 +1062,10 @@ class TestDroppingAReference:
             on_reconcile=reports.append,
         )
         assert skill_file(root, "pdf-extraction").exists()
+        assert skill_file(root, "triage").exists()
         return store, client, root, watcher, reports
 
-    async def test_the_next_complete_reconcile_prunes_it(
+    async def test_a_clean_drop_prunes_it(
         self, tmp_path: Path, make_raw_skill: Any
     ) -> None:
         _store, client, root, watcher, reports = await self._watch(
@@ -1041,35 +1077,61 @@ class TestDroppingAReference:
             assert wait_until(lambda: watcher.reconciles == 1)
         finally:
             watcher.close()
-        assert ("pdf-extraction", "removed") in [
-            (a.key, a.action) for a in reports[0].actions
+        assert summary(reports[0]) == [
+            ("pdf-extraction", "removed", 2),
+            ("triage", "skipped_current", 1),
         ]
         assert not skill_file(root, "pdf-extraction").exists()
 
-    async def test_an_absent_reference_does_not_hold_the_prune(
+    async def test_an_absent_reference_beside_it_does_not_hold_the_prune(
         self, tmp_path: Path, make_raw_skill: Any
     ) -> None:
-        """An ``absent`` reference keeps only its own key in the requested set; it
-        does not mark the run incomplete, so the dropped skill still goes. This
-        is the reconcile's per-key retention, unchanged by the source form."""
+        """The absent skill keeps its file under its own key, and the run is not
+        incomplete, so the dropped skill still goes in the same run."""
         store, client, root, watcher, reports = await self._watch(
             tmp_path, make_raw_skill
         )
         try:
-            client.value = ai_config(("triage", 1), ("not-yet", 1))
+            del store._versions["triage"]
+            client.value = ai_config(("triage", 1))
             client.flag_tracker.fire(CONFIG_KEY)
             assert wait_until(lambda: watcher.reconciles == 1)
-            assert summary(reports[0]) == [
-                ("not-yet", "error", None),
-                ("pdf-extraction", "removed", 2),
-                ("triage", "skipped_current", 1),
-            ]
+        finally:
+            watcher.close()
+        assert [(a.key, a.action) for a in reports[0].actions] == [
+            ("triage", "error"),
+            ("pdf-extraction", "removed"),
+        ]
+        assert not skill_file(root, "pdf-extraction").exists()
+        assert skill_file(root, "triage").read_text() == "triage body"
+        assert manifest_versions(root) == {"triage": 1}
 
-            store.put(make_raw_skill(key="not-yet", version=1))
+    async def test_an_unavailable_retrieval_holds_the_prune_until_it_is_available(
+        self, tmp_path: Path, make_raw_skill: Any
+    ) -> None:
+        store, client, root, watcher, reports = await self._watch(
+            tmp_path, make_raw_skill
+        )
+        try:
+            store.unreadable.add("next-skill")
+            client.value = ai_config(("triage", 1), ("next-skill", 1))
+            client.flag_tracker.fire(CONFIG_KEY)
+            assert wait_until(lambda: watcher.reconciles == 1)
+            assert all(a.action != "removed" for a in reports[0].actions)
+            assert ("next-skill", "error", None) in summary(reports[0])
+            assert skill_file(root, "pdf-extraction").exists()
+            assert manifest_versions(root) == {"pdf-extraction": 2, "triage": 1}
+
+            store.unreadable.clear()
+            store.put(make_raw_skill(key="next-skill", version=1))
             assert wait_until(lambda: watcher.reconciles == 2)
         finally:
             watcher.close()
-        assert ("not-yet", "written", 1) in summary(reports[1])
+        assert summary(reports[1]) == [
+            ("next-skill", "written", 1),
+            ("pdf-extraction", "removed", 2),
+            ("triage", "skipped_current", 1),
+        ]
         assert not skill_file(root, "pdf-extraction").exists()
 
 

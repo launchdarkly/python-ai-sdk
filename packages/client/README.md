@@ -856,6 +856,10 @@ report, watcher = await watch_skills(
   client has no `flag_tracker` (a client brought to `init_client` that implements only
   `variation`), or when the client is offline. The listener only wakes the watcher; the
   config is read on the watcher's own thread, never on the base SDK's delivery thread.
+- **A dropped skill is pruned on the next reconcile whose retrieval is available.** A skill
+  the store answers `absent` for keeps its file under its own key, reported `error`, and does
+  not stop the dropped skill being pruned in the same run. A store that raises, has not
+  received its initial data, or runs out of `timeout` holds the prune until a later run.
 - **Daemon mode follows skill-store changes only.** With `use_ldd=True`, or
   `ldclient.datasystem.daemon(...)`, the base client has no data source, so its `flag_tracker`
   never fires and nothing reports it. Call `watcher.notify()` yourself if you learn of config

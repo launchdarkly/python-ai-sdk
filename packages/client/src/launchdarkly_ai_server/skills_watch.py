@@ -247,7 +247,9 @@ async def watch_skills(
       on every reconcile, and the watcher also reconciles when one of its
       ``config_keys`` changes in the base client. A version bump replaces the
       file, and a skill the config stops referencing is pruned on the next
-      reconcile whose retrieval completes.
+      reconcile whose retrieval is available. A skill the store answers
+      ``absent`` for beside it keeps its own file and does not hold that prune;
+      a store that raises, has no initial data, or runs out of time does.
 
     Following config changes needs the initialized base LaunchDarkly client's
     ``flag_tracker``; it is never read for a fixed list or ``"*"``. Under daemon
@@ -362,8 +364,13 @@ def _config_flag_tracker() -> Any:
             "flag changes. " + _NO_CONFIG_SIGNAL_REMEDY
         )
     # An offline client still has a flag_tracker, but no data source to fire it.
+    # One that raises is treated as offline, so the caller still gets the remedy.
     is_offline = getattr(client, "is_offline", None)
-    if callable(is_offline) and is_offline():
+    try:
+        offline = callable(is_offline) and is_offline() is True
+    except Exception:
+        offline = True
+    if offline:
         raise RuntimeError(
             "watch_skills cannot follow config changes for this SkillSource: "
             "the AI client is offline, so it never reports flag changes. "
