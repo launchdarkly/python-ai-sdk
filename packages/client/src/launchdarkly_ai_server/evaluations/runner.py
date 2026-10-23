@@ -7,12 +7,17 @@ import json
 import logging
 import time
 import urllib
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
 from ..content import tool_result_string
+from ..conversation import count_sdk_spans
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
     build_message_history,
@@ -21,7 +26,11 @@ from ..judge_scoring import (
     typesafe_judge_entries,
     without_output_format,
 )
-from ..lifecycle import extract_variation
+from ..lifecycle import (
+    _sdk_processor_is_active,
+    effective_capture_content,
+    extract_variation,
+)
 from ..trajectory import (
     TrajectoryRecorder,
     render_row_trajectory,
@@ -50,6 +59,16 @@ from .events import (
     DeterministicScorerCriterionEventPayload,
     LDJudgeCriterionEventPayload,
     TokenUsage,
+)
+from .spans import (
+    bind_evaluation_row,
+    capture_for_call,
+    record_chat,
+    record_evaluation_result,
+    record_tool_calls,
+    set_config_model_identity,
+    set_row_attributes,
+    start_row_span,
 )
 from .tools import (
     EvalTool,
@@ -210,6 +229,66 @@ class ConcurrencyController:
         retry_after: float | None = None,
     ) -> None:
         del provider, retry_after
+
+
+@contextmanager
+def _criterion_span(
+    run_id: str,
+    row_index: int,
+    criterion_type: str,
+    row_span: Any = None,
+) -> Iterator[Any]:
+    """Open ``evaluate {criterion}`` on the SDK tracer, under the row's root.
+
+    Correlation attributes are set here as well as by the span processor, so a
+    plain function still exports them when the processor is the one
+    ``init_client`` registered. This does not build an exporter.
+    """
+    tracer = trace.get_tracer("@launchdarkly/ai-server")
+    parent = trace.set_span_in_context(row_span) if row_span is not None else None
+    with tracer.start_as_current_span(
+        f"evaluate {criterion_type}", context=parent
+    ) as span:
+        span.set_attribute("gen_ai.operation.name", "evaluate")
+        set_row_attributes(span, run_id, row_index)
+        yield span
+
+
+def _finish_criterion_span(
+    span: Any, result: Mapping[str, Any], *, capture: bool | None = None
+) -> None:
+    """Record ``gen_ai.evaluation.result`` with no verdict.
+
+    An ERROR criterion sets span status ERROR and ``error.type``, and does not
+    add a result event. Nothing here writes ``launchdarkly.run.id``.
+    ``capture`` gates the reason on the span. The criterion event keeps it.
+    """
+    if result.get("status") == "COMPLETE":
+        score = result.get("score")
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            span.set_status(Status(StatusCode.ERROR))
+            span.set_attribute("error.type", "invalid_score")
+            return
+        reason = result.get("reason")
+        explanation = reason if isinstance(reason, str) and reason else None
+        record_evaluation_result(
+            span,
+            str(result.get("criterion_type") or ""),
+            float(score),
+            explanation,
+            capture=capture,
+        )
+        span.set_status(Status(StatusCode.OK))
+        return
+    error = result.get("error")
+    message = error.get("message") if isinstance(error, Mapping) else None
+    span.set_status(
+        Status(StatusCode.ERROR, message if isinstance(message, str) else None)
+    )
+    if isinstance(error, Mapping):
+        code = error.get("code")
+        if isinstance(code, str) and code:
+            span.set_attribute("error.type", code)
 
 
 class EvaluationsRunner:
@@ -645,7 +724,15 @@ class EvaluationsRunner:
         config: dict[str, Any],
         tool_handlers: dict[str, ToolImplementation],
         concurrency: int,
+        *,
+        evaluation_run_id: str,
+        row_spans: dict[int, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        """Generate every row.
+
+        ``row_spans`` receives each row's open root span, keyed by row index,
+        for the criteria phase to parent under; the caller ends them.
+        """
         controller = ConcurrencyController(concurrency)
 
         async def invoke(row: DatasetRow) -> dict[str, Any]:
@@ -654,12 +741,46 @@ class EvaluationsRunner:
             # same tool map, so a shared recorder would splice their calls.
             recorder = TrajectoryRecorder()
             row_tool_handlers = recorder.wrap(tool_handlers)
+            row_span: Any = trace.get_current_span()
+            if row_spans is not None:
+                row_span = start_row_span(evaluation_run_id, row.row_index)
+                row_spans[row.row_index] = row_span
             started = datetime.now(UTC)
             started_clock = time.perf_counter()
+            started_ns = time.time_ns()
+            result: Any = None
+            raised: BaseException | None = None
             try:
-                result = await handler(
-                    config, row.input, row_tool_handlers, dict(row.variables)
-                )
+                with (
+                    bind_evaluation_row(evaluation_run_id, row.row_index),
+                    trace.use_span(row_span, end_on_exit=False),
+                    count_sdk_spans() as observer,
+                ):
+                    try:
+                        result = await handler(
+                            config, row.input, row_tool_handlers, dict(row.variables)
+                        )
+                    except Exception as error:
+                        raised = error
+                        raise
+                    finally:
+                        if observer.count == 0 and _sdk_processor_is_active():
+                            capture = capture_for_call(handler)
+                            record_chat(
+                                row_span,
+                                config=config,
+                                user_input=row.input,
+                                variables=row.variables,
+                                started_ns=started_ns,
+                                ended_ns=time.time_ns(),
+                                result=result if isinstance(result, Mapping) else None,
+                                error=raised,
+                                tool_calls=recorder.invocations,
+                                capture=capture,
+                            )
+                            record_tool_calls(
+                                row_span, recorder.invocations, capture=capture
+                            )
                 if not isinstance(result, Mapping):
                     raise TypeError("handler result must be a mapping")
                 completed = datetime.now(UTC)
@@ -680,8 +801,13 @@ class EvaluationsRunner:
                 if isinstance(usage, Mapping):
                     payload["usage"] = dict(usage)
                 controller.record_success(config["provider"]["name"])
+                if row_spans is not None:
+                    row_span.set_status(Status(StatusCode.OK))
                 return payload
             except Exception as error:
+                if row_spans is not None:
+                    row_span.set_attribute("error.type", type(error).__name__)
+                    row_span.set_status(Status(StatusCode.ERROR, f"{error}"))
                 completed = datetime.now(UTC)
                 return {
                     "row_index": row.row_index,
@@ -948,16 +1074,41 @@ class EvaluationsRunner:
         # parse_template pass, so ``{{...}}`` sequences inside generated output
         # or dataset values are never re-expanded into the judge prompt.
         variables = self._judge_variables(row, judge)
+        # Judges get no tools. The handler owns the single parse_template pass.
+        judge_variables = {
+            **variables,
+            "formatting_instructions": FORMATTING_INSTRUCTIONS,
+        }
+        evaluate_span = trace.get_current_span()
+        set_config_model_identity(evaluate_span, resolved.config)
+        started_ns = time.time_ns()
+        result: Any = None
+        raised: BaseException | None = None
         try:
-            result = await execution.handler(
-                dict(resolved.config),
-                variables["response_to_evaluate"],
-                {},
-                {
-                    **variables,
-                    "formatting_instructions": FORMATTING_INSTRUCTIONS,
-                },
-            )
+            with count_sdk_spans() as observer:
+                try:
+                    result = await execution.handler(
+                        dict(resolved.config),
+                        variables["response_to_evaluate"],
+                        {},
+                        judge_variables,
+                    )
+                except Exception as error:
+                    raised = error
+                    raise
+                finally:
+                    if observer.count == 0 and _sdk_processor_is_active():
+                        record_chat(
+                            evaluate_span,
+                            config=resolved.config,
+                            user_input=variables["response_to_evaluate"],
+                            variables=judge_variables,
+                            started_ns=started_ns,
+                            ended_ns=time.time_ns(),
+                            result=result if isinstance(result, Mapping) else None,
+                            error=raised,
+                            capture=capture_for_call(execution.handler),
+                        )
         except Exception as error:
             return self._criterion_error_result(
                 base, started_clock, "handler_raised", f"judge handler raised: {error}"
@@ -1018,22 +1169,51 @@ class EvaluationsRunner:
         criteria: list[Criterion],
         resolved_judges: Mapping[str, JudgeExecution],
         concurrency: int,
+        *,
+        evaluation_run_id: str,
+        row_spans: Mapping[int, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run every (row, criterion) pair, bounded by the run's concurrency."""
+        """Run every (row, criterion) pair, bounded by the run's concurrency.
+
+        Each ``evaluate`` span parents under its row's span in ``row_spans``.
+        """
         controller = ConcurrencyController(concurrency)
+
+        async def score(row: Mapping[str, Any], criterion: Criterion) -> dict[str, Any]:
+            if isinstance(criterion, Scorer):
+                return await self._run_scorer_for_result(row, criterion)
+            return await self._run_ld_judge_for_result(
+                row,
+                criterion,
+                resolved_judges[criterion.key],
+            )
 
         async def run_one(
             row: Mapping[str, Any], criterion: Criterion
         ) -> dict[str, Any]:
             await controller.acquire()
             try:
-                if isinstance(criterion, Scorer):
-                    return await self._run_scorer_for_result(row, criterion)
-                return await self._run_ld_judge_for_result(
-                    row,
-                    criterion,
-                    resolved_judges[criterion.key],
-                )
+                if row.get("status") != "COMPLETE":
+                    # A row that did not generate is never scored, so there is
+                    # no judge or scorer call for an ``evaluate`` span to wrap.
+                    return await score(row, criterion)
+                row_index = row.get("row_index")
+                index = row_index if isinstance(row_index, int) else 0
+                with bind_evaluation_row(evaluation_run_id, index):
+                    with _criterion_span(
+                        evaluation_run_id,
+                        index,
+                        criterion.criterion_type,
+                        (row_spans or {}).get(index),
+                    ) as span:
+                        event = await score(row, criterion)
+                        capture = (
+                            capture_for_call(resolved_judges[criterion.key].handler)
+                            if isinstance(criterion, Judge)
+                            else effective_capture_content(None)
+                        )
+                        _finish_criterion_span(span, event, capture=capture)
+                        return event
             finally:
                 controller.release()
 

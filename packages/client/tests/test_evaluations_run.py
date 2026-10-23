@@ -3367,6 +3367,7 @@ async def test_a_failed_row_keeps_the_calls_made_before_the_handler_raised() -> 
         {"provider": {"name": "OpenAI"}, "model": {"name": "gpt-4o"}},
         {"lookup_order": lambda args: "shipped"},
         1,
+        evaluation_run_id="run-id",
     )
 
     assert results[0]["status"] == "ERROR"
