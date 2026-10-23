@@ -313,6 +313,21 @@ class TestNodeInstructions:
         }
         assert instructions["root"] == "Route for ops."
 
+    async def test_config_turns_are_seeded_before_history(self) -> None:
+        graph = _graph()
+        graph.root.config["messages"] = [
+            {"role": "system", "content": "ignored"},
+            {"role": "user", "content": "Example for {{team}}"},
+        ]
+        await _adapter(graph).invoke(
+            "hi",
+            variables={"team": "ops"},
+            history=[{"role": "user", "content": "earlier"}],
+        )
+        appended = _FakeRunner.created[0].session_service.append_event.await_args_list
+        texts = [call.args[1].content.parts[0].text for call in appended]
+        assert texts == ["Example for ops", "earlier"]
+
 
 class TestModelTransport:
     async def test_nodes_resolve_their_model_with_the_factory_options(self) -> None:

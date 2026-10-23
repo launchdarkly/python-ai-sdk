@@ -17,6 +17,7 @@ from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import (
+    _config_turns,
     _instruction,
     _resolve_model,
     _session_event,
@@ -113,7 +114,7 @@ class _AdkAgents:
                 output, step = await _run_agent(
                     agents[current.key],
                     user_input or "",
-                    seed,
+                    _config_turns(current.config or {}, variables) + list(seed or []),
                 )
                 seed = None
                 for key in usage:
