@@ -79,8 +79,8 @@ from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_t
 from launchdarkly_ai_server import config, graph, resolve_graph
 from launchdarkly_ai_server.experimental.evaluations import init_evaluations
 
-# Agent Skills (experimental: none of these is exported from the package root)
-from launchdarkly_ai_server.experimental.skills import (
+# Agent Skills
+from launchdarkly_ai_server import (
     set_skill_store, SkillStore, InMemorySkillStore, FDv2SkillStore, StoreDiagnostics,
     skill_refs, get_skill, get_skill_result, get_skills, all_skills, write_skills,
     watch_skills, SkillWatcher,
@@ -90,12 +90,12 @@ from launchdarkly_ai_server.experimental.skills import (
 )
 ```
 
-An experimental feature is exported only from its module under
-`launchdarkly_ai_server.experimental`, and its names may change in a minor release. No core
-public type, function or `init_client` option may name it. Core reaches it only through an
-internal hook (as `shutdown` clears the skill store), and an error there is logged, never
-raised into the core call. The experimental part is the SDK's API, not the LaunchDarkly data
-model: `AiConfigRep` still documents the `skills` references a config carries.
+An experimental feature (today only Evaluations from Code) is exported only from its module
+under `launchdarkly_ai_server.experimental`, and its names may change in a minor release. No
+core public type, function or `init_client` option may name it. Agent Skills is core and is
+exported from the package root; `shutdown` still reaches its state only through an internal
+hook (it clears the skill store), and an error there is logged, never raised into
+`shutdown`.
 
 `MAX_SKILL_CONTENT_BYTES` and `SKILL_OBJECT_KIND` are deliberately **not** exported; both stay
 internal to `skills_core`:
@@ -106,7 +106,7 @@ internal to `skills_core`:
   would imply otherwise. An adapter that needs it imports it from
   `launchdarkly_ai_server.skills_core`.
 
-When adding a new core export, add it to `__init__.py`'s imports and `__all__`. An Agent Skills export goes in `experimental/skills.py` instead, and in `EXPERIMENTAL_SKILLS_SURFACE` in `tests/test_skills.py`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
+When adding a new core export, add it to `__init__.py`'s imports and `__all__`, and to `ROOT_SURFACE` in `tests/test_public_surface.py`. An Agent Skills export also goes in `SKILLS_SURFACE` in `tests/test_skills.py`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
 
 ---
 
@@ -212,7 +212,7 @@ Three layers, in increasing order of blast radius:
    (including `null`, or one bad entry) raises `ValueError` rather than returning a partial
    list that would authorize a prune. So does a config that is not a dict, including the
    `None` a failed `inspect_config` returns; only a dict with no `skills` key yields `[]`. `parse_ai_config` deliberately does not check `skills`,
-   so an experimental field cannot fail a core config call (TESTING.md §0.3).
+   so a malformed field cannot fail a config call that does not use skills.
 2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
    through the `SkillStore` seam. Configure a store with `set_skill_store(store)`; with
    none configured the accessors raise
@@ -318,12 +318,12 @@ inside its known-event branches. Empty data on a known event is not JSON either,
 connection the same way: read as `None`, a `delete-object` would be ignored and a
 `payload-transferred` would commit with no selector.
 
-**A put or delete that is valid JSON but has no usable `key` is warned and ignored, for the
-experimental stage.** Its transfer still commits, so a keyless `delete-object` loses its
+**A put or delete that is valid JSON but has no usable `key` is warned and ignored, and
+delivery keeps going.** This is the accepted behaviour, not a provisional one. Its transfer still commits, so a keyless `delete-object` loses its
 revocation and a keyless `put-object` in an `xfer-full` revokes that skill by omission (and
 `write_skills("*")` prunes it). `ldclient` interrupts the stream instead. Interrupting is not
 strictly safer, because a server that keeps resending the object would then block every later
-change, so the choice is to be revisited before 1.0 (TESTING.md §3.25). Pinned by
+change. Pinned by
 `test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits` and
 `test_a_put_with_no_usable_key_in_an_xfer_full_revokes_by_omission`; changing the rule should fail
 them.
@@ -625,8 +625,9 @@ Do not undo any of these as a simplification:
   store), and the stdlib's default formatter drops `extra`, so an `extra`-only record is
   invisible under a plain `logging.basicConfig()`.
 - **`ld.skills.integrity_failure` is documented for customers to match on.** Do not rename it
-  casually. The experimental stage allows a rename in a minor release, but only in every SDK
-  at once and with a changelog entry, because a rename silently breaks customers' alerts.
+  casually. Agent Skills is core, so a rename is a breaking change: it needs a `!` commit (a
+  minor bump while on 0.x, a major after 1.0) in every SDK at once and a changelog entry,
+  because a rename silently breaks customers' alerts.
 - **`sort_keys=True` makes the line byte-identical across SDKs** (modulo `language`), since
   the other implementations build the object in alphabetical key order.
 - **Optional fields are omitted, never nulled**, so a SIEM field-existence check means
@@ -689,10 +690,9 @@ the allowlist is enforced in one place.
 `_clear_state` delegate to `skills_core`. `set_skill_store` and tests use those; none
 should reach into `skills_core` directly.
 
-**Core never imports this feature.** `skills_core` registers `clear_state` with
-`shutdown_hooks.register_shutdown_hook` when it loads, and `shutdown()` runs the registered
-hooks. `lifecycle.py` imports no skills module (TESTING.md §0.3, pinned by
-`test_core_does_not_import_experimental_code`).
+**Lifecycle never imports this feature.** `skills_core` registers `clear_state` with
+`shutdown_hooks.register_shutdown_hook` when it loads (the package root imports it), and
+`shutdown()` runs the registered hooks. `lifecycle.py` imports no skills module.
 
 ### Descriptor-pinned filesystem access
 
@@ -984,6 +984,6 @@ a conversation is out of reach at this layer either way.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
 - Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
-- Do not rename `ld.skills.integrity_failure` in one language only or without a changelog entry, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces, though the experimental stage lets either change in a minor release. See "The integrity-failure log record" above.
+- Do not rename `ld.skills.integrity_failure` in one language only or without a changelog entry, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
 - Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.

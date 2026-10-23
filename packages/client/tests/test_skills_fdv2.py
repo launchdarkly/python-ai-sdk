@@ -34,9 +34,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from launchdarkly_ai_server import skills as skills_module
-from launchdarkly_ai_server import skills_core, skills_fdv2
-from launchdarkly_ai_server.experimental.skills import (
+import launchdarkly_ai_server.skills as skills_module
+
+# Internal submodules, kept out of the public-name import below so they don't read as root exports.
+import launchdarkly_ai_server.skills_core as skills_core
+import launchdarkly_ai_server.skills_fdv2 as skills_fdv2
+from launchdarkly_ai_server import (
     FDv2SkillStore,
     InMemorySkillStore,
     all_skills,
@@ -913,11 +916,12 @@ class TestProtocolReader:
     def test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits(
         self,
     ) -> None:
-        """Pins TESTING.md §3.25's experimental-stage rule: ignored, not fatal.
+        """Pins the keyless-object rule: ignored, not fatal, and delivery keeps
+        going.
 
         The revocation it carried is lost, so ``revoked`` stays served. Base
-        ``ldclient`` interrupts the stream instead; the choice is to be
-        revisited before 1.0, and changing it should fail this test.
+        ``ldclient`` interrupts the stream instead; this SDK's choice is the
+        accepted behaviour, and changing it should fail this test.
         """
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -4363,7 +4367,7 @@ class TestTransportLayering:
         assert _module_imports(skills_fdv2) == stdlib | within_the_feature
 
     def test_nothing_in_the_feature_imports_it(self) -> None:
-        """Only the experimental entry point names it, to re-export
+        """Only the package root names it, to re-export
         ``FDv2SkillStore`` and ``StoreDiagnostics``.
 
         That re-export is the published surface rather than a dependency: it is
@@ -4390,9 +4394,9 @@ class TestTransportLayering:
         ]
 
         assert importers == []
-        # The positive control: the entry point does name it, so an empty result
+        # The positive control: the package root does name it, so an empty result
         # above cannot be a misspelt filename list finding nothing anywhere.
-        entry_point = source_dir / "experimental" / "skills.py"
+        entry_point = source_dir / "__init__.py"
         assert "skills_fdv2" in entry_point.read_text(encoding="utf-8")
 
 
