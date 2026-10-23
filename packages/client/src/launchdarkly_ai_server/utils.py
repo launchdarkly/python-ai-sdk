@@ -72,6 +72,28 @@ def model_parameters(config: AiConfigRep) -> dict[str, Any]:
     return dict(parameters) if isinstance(parameters, dict) else {}
 
 
+def validate_max_retries(max_retries: int | None) -> int | None:
+    """Checks a handler factory's ``max_retries`` option and returns it unchanged.
+
+    ``None`` means the option was not given, so the vendor default applies. Any other value must be
+    a non-negative ``int``; ``0`` is a valid count. ``bool`` is refused even though it subclasses
+    ``int``, since ``max_retries=True`` is a mistake rather than one retry. Factories call this at
+    construction, so a bad value fails when the handler is built rather than on its first call.
+
+    Raises ``TypeError`` for a non-integer and ``ValueError`` for a negative integer. Both messages
+    name the option.
+    """
+    if max_retries is None:
+        return None
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+        raise TypeError(
+            f"max_retries must be a non-negative int or None, got {type(max_retries).__name__}"
+        )
+    if max_retries < 0:
+        raise ValueError(f"max_retries must be non-negative, got {max_retries}")
+    return max_retries
+
+
 def collapse_messages_to_instructions(config: AiConfigRep) -> AiConfigRep:
     """
     When only an agent handler is available for a messages-mode config, collapse

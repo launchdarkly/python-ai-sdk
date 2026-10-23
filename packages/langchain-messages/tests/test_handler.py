@@ -3053,3 +3053,214 @@ class TestConnectionConfigIsNeverForwarded:
         assert "api_key" not in kwargs
         assert "base_url" not in kwargs
         assert kwargs["temperature"] == 0.3
+
+
+class TestMaxRetries:
+    """`max_retries` reaches the chat model the handler builds, and only when set.
+
+    The provider client's own retries are the right layer for rate limits, so an omitted value must
+    leave each class's default in place rather than replace it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _api_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    def test_value_reaches_the_openai_client(self) -> None:
+        import importlib
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        model = handler_mod._make_default_chat_model(CONFIG, importlib, max_retries=7)
+        assert isinstance(model, _REAL_CHAT_OPENAI)
+        assert model.root_async_client.max_retries == 7
+
+    def test_value_reaches_the_anthropic_client(self) -> None:
+        import importlib
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Anthropic"},
+            "model": {"name": "claude-sonnet-4-5"},
+        }
+        model = handler_mod._make_default_chat_model(cfg, importlib, max_retries=7)
+        assert isinstance(model, _REAL_CHAT_ANTHROPIC)
+        assert model._async_client.max_retries == 7
+
+    def test_value_reaches_the_bedrock_constructor(self) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        ctor = MagicMock()
+        ctor.model_fields = _FAKE_BEDROCK_FIELDS
+        imports = MagicMock()
+        imports.import_module.return_value = MagicMock(ChatBedrockConverse=ctor)
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        handler_mod._make_default_chat_model(cfg, imports, max_retries=7)
+        assert ctor.call_args.kwargs["max_retries"] == 7
+
+    def test_omitted_value_keeps_the_vendor_default(self) -> None:
+        import importlib
+
+        import openai
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        model = handler_mod._make_default_chat_model(CONFIG, importlib)
+        assert model.root_async_client.max_retries == openai.DEFAULT_MAX_RETRIES
+
+    def test_config_cannot_set_it(self) -> None:
+        import importlib
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        cfg = {
+            **CONFIG,
+            "model": {"name": "gpt-4o", "parameters": {"max_retries": 50}},
+        }
+        model = handler_mod._make_default_chat_model(cfg, importlib, max_retries=3)
+        assert model.root_async_client.max_retries == 3
+
+    @pytest.mark.asyncio
+    async def test_handler_passes_it_on_invoke_and_stream(self) -> None:
+        ctx, _rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm("default-openai")
+        ctor = MagicMock(return_value=llm)
+        ctor.model_fields = _REAL_CHAT_OPENAI.model_fields
+        handler = create_langchain_messages_handler(max_retries=7)
+        with (
+            ctx,
+            patch.dict(sys.modules, {"langchain_openai": MagicMock(ChatOpenAI=ctor)}),
+        ):
+            await handler(CONFIG, "q", {}, {})
+            assert ctor.call_args.kwargs["max_retries"] == 7
+            ctor.reset_mock()
+            async for _event in await handler.stream(CONFIG, "q", {}, {}):
+                pass
+            assert ctor.call_args.kwargs["max_retries"] == 7
+
+    def test_refused_alongside_a_caller_supplied_model(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        with pytest.raises(ValueError, match="max_retries"):
+            create_langchain_messages_handler(_make_llm("mine"), max_retries=7)
+
+    def test_value_reaches_the_real_bedrock_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        pytest.importorskip("langchain_aws")
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-sonnet-4-5"},
+        }
+        model = handler_mod._make_default_chat_model(cfg, importlib, max_retries=7)
+        # botocore counts attempts, not retries: the first try plus seven retries.
+        assert model.client.meta.config.retries["total_max_attempts"] == 8
+
+    @pytest.mark.parametrize(
+        ("provider", "module", "cls", "fields"),
+        [
+            (
+                "OpenAI",
+                "langchain_openai",
+                "ChatOpenAI",
+                _REAL_CHAT_OPENAI.model_fields,
+            ),
+            (
+                "Anthropic",
+                "langchain_anthropic",
+                "ChatAnthropic",
+                _REAL_CHAT_ANTHROPIC.model_fields,
+            ),
+            ("Bedrock", "langchain_aws", "ChatBedrockConverse", _FAKE_BEDROCK_FIELDS),
+        ],
+    )
+    def test_omitted_value_is_not_passed_to_any_constructor(
+        self, provider: str, module: str, cls: str, fields: Any
+    ) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        ctor = MagicMock()
+        ctor.model_fields = fields
+        imports = MagicMock()
+        imports.import_module.return_value = MagicMock(**{cls: ctor})
+        cfg = {**CONFIG, "provider": {"name": provider}, "model": {"name": "m"}}
+        handler_mod._make_default_chat_model(cfg, imports)
+        imports.import_module.assert_called_with(module)
+        # Hard-coding the vendor default would freeze it when the vendor changes it.
+        assert "max_retries" not in ctor.call_args.kwargs
+
+    def test_omitted_value_keeps_the_anthropic_default(self) -> None:
+        import importlib
+
+        import anthropic
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        cfg = {
+            **CONFIG,
+            "provider": {"name": "Anthropic"},
+            "model": {"name": "claude-sonnet-4-5"},
+        }
+        model = handler_mod._make_default_chat_model(cfg, importlib)
+        assert model._async_client.max_retries == anthropic.DEFAULT_MAX_RETRIES
+
+    def test_explicit_zero_is_the_callers_choice(self) -> None:
+        import importlib
+
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        model = handler_mod._make_default_chat_model(CONFIG, importlib, max_retries=0)
+        assert model.root_async_client.max_retries == 0
+
+    def test_refused_alongside_a_caller_supplied_model_factory(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        def factory(_config: Any) -> Any:
+            return _make_llm("mine")
+
+        with pytest.raises(ValueError, match="max_retries"):
+            create_langchain_messages_handler(factory, max_retries=7)
+
+    @pytest.mark.parametrize("value", [True, 2.5, "3"])
+    def test_non_integer_is_refused_at_construction(self, value: Any) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        with pytest.raises(TypeError, match="max_retries"):
+            create_langchain_messages_handler(max_retries=value)
+
+    def test_negative_is_refused_at_construction(self) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        with pytest.raises(ValueError, match="max_retries"):
+            create_langchain_messages_handler(max_retries=-1)
+
+    def test_convenience_wrapper_forwards_it_to_the_factory(self) -> None:
+        import launchdarkly_ai_langchain_messages.handler as handler_mod
+
+        factory = MagicMock()
+        fake_config = MagicMock()
+        with (
+            patch.object(handler_mod, "_create_langchain_messages_handler", factory),
+            patch.object(handler_mod, "_config", fake_config),
+        ):
+            handler_mod.langchain_messages("k", "q", {}, max_retries=6)
+        assert factory.call_args.kwargs["max_retries"] == 6
+        # config() takes no such argument, so leaving it in kwargs would raise TypeError.
+        assert "max_retries" not in fake_config.call_args.kwargs

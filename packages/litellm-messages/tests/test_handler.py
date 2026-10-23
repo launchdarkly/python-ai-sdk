@@ -742,3 +742,183 @@ class TestForwardsExactlyTheCrossSdkList:
             return completion.call_args.kwargs
 
         assert await probe_forwarded_keys(self._candidates(), call) == LITELLM_MESSAGES
+
+
+class TestMaxRetries:
+    """`max_retries` reaches every `acompletion` call under the keyword the model's route reads.
+
+    TESTING.md A.22: ``max_retries`` on LiteLLM's OpenAI-client routes (``openai``, ``azure``),
+    ``num_retries`` on every other route, never both, and neither when the option is omitted.
+    """
+
+    @staticmethod
+    def _config(model: str, **extra: Any) -> dict[str, Any]:
+        return {**CONFIG, "model": {"name": model}, **extra}
+
+    @pytest.mark.parametrize(
+        ("model", "sent", "withheld"),
+        [
+            ("openai/gpt-4o", "max_retries", "num_retries"),
+            ("gpt-4o", "max_retries", "num_retries"),
+            ("azure/my-deployment", "max_retries", "num_retries"),
+            ("anthropic/claude-sonnet-4-5", "num_retries", "max_retries"),
+            ("bedrock/anthropic.claude-sonnet-4-5", "num_retries", "max_retries"),
+            ("groq/llama-3.1-8b-instant", "num_retries", "max_retries"),
+        ],
+    )
+    async def test_keyword_follows_the_route(
+        self, model: str, sent: str, withheld: str
+    ) -> None:
+        completion = AsyncMock(return_value=_response())
+        await create_litellm_messages_handler(completion=completion, max_retries=8)(
+            self._config(model), "question"
+        )
+        assert completion.call_args.kwargs[sent] == 8
+        # Both at once would retry each failure at two layers.
+        assert withheld not in completion.call_args.kwargs
+
+    async def test_unresolvable_model_gets_litellms_own_loop(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        await create_litellm_messages_handler(completion=completion, max_retries=8)(
+            self._config("my-proxy-alias"), "question"
+        )
+        assert completion.call_args.kwargs["num_retries"] == 8
+        assert "max_retries" not in completion.call_args.kwargs
+
+    async def test_value_reaches_every_tool_loop_turn(self) -> None:
+        call = _tool_call("weather", "call-1", '{"city":"Austin"}')
+        completion = AsyncMock(
+            side_effect=[_response(None, tool_calls=[call]), _response("sunny")]
+        )
+        config = self._config(
+            "openai/gpt-4o",
+            tools={"weather": {"description": "weather", "parameters": {}}},
+        )
+        await create_litellm_messages_handler(completion=completion, max_retries=7)(
+            config, "q", {"weather": AsyncMock(return_value="sunny")}
+        )
+        assert completion.await_count == 2
+        assert [c.kwargs["max_retries"] for c in completion.call_args_list] == [7, 7]
+
+    async def test_value_reaches_every_streamed_tool_loop_turn(self) -> None:
+        first = FakeStream(
+            [
+                _chunk(
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=0,
+                            id="call-1",
+                            function=SimpleNamespace(
+                                name="weather", arguments='{"city":"Oslo"}'
+                            ),
+                        )
+                    ]
+                ),
+            ]
+        )
+        second = FakeStream([_chunk(text="cold")])
+        completion = AsyncMock(side_effect=[first, second])
+        config = {
+            **CONFIG,
+            "tools": {"weather": {"description": "x", "parameters": {}}},
+        }
+        await _events(
+            await create_litellm_messages_handler(
+                completion=completion, max_retries=7
+            ).stream(config, "q", {"weather": AsyncMock(return_value="cold")})
+        )
+        assert completion.await_count == 2
+        assert [c.kwargs["num_retries"] for c in completion.call_args_list] == [7, 7]
+
+    async def test_omitted_value_keeps_the_litellm_default(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        await create_litellm_messages_handler(completion=completion)(CONFIG, "question")
+        assert "max_retries" not in completion.call_args.kwargs
+        assert "num_retries" not in completion.call_args.kwargs
+
+    async def test_explicit_zero_is_the_callers_choice(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        await create_litellm_messages_handler(completion=completion, max_retries=0)(
+            CONFIG, "question"
+        )
+        assert completion.call_args.kwargs["num_retries"] == 0
+
+    async def test_config_cannot_set_it(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        config = self._config(
+            "openai/gpt-4o",
+        )
+        config["model"]["parameters"] = {"max_retries": 50, "num_retries": 50}
+        await create_litellm_messages_handler(completion=completion, max_retries=3)(
+            config, "question"
+        )
+        assert completion.call_args.kwargs["max_retries"] == 3
+        assert "num_retries" not in completion.call_args.kwargs
+
+    @pytest.mark.parametrize("value", [True, 2.5, "3"])
+    def test_non_integer_is_refused_at_construction(self, value: Any) -> None:
+        with pytest.raises(TypeError, match="max_retries"):
+            create_litellm_messages_handler(completion=AsyncMock(), max_retries=value)
+
+    def test_negative_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="max_retries"):
+            create_litellm_messages_handler(completion=AsyncMock(), max_retries=-1)
+
+    @pytest.fixture
+    def always_500(self) -> Any:
+        """A local endpoint that fails every request with a 500, counting them.
+
+        A 500 rather than a 429: LiteLLM backs off exponentially, up to 10 s a wait, only after a
+        rate-limit error, so a 500 keeps the retries immediate.
+        """
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        hits: list[str] = []
+
+        class _Fail(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                hits.append(self.path)
+                self.rfile.read(int(self.headers.get("content-length", 0)))
+                self.send_response(500)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    b'{"type":"error","error":{"type":"api_error","message":"boom"}}'
+                )
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Fail)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}", hits
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    async def test_real_litellm_retries_a_non_openai_route(
+        self, always_500: Any
+    ) -> None:
+        # The completion= stub cannot show LiteLLM honours the keyword, so this runs the real
+        # acompletion. On this route max_retries alone would be ignored: one request, not four.
+        base_url, hits = always_500
+        handler = create_litellm_messages_handler(
+            base_url=base_url, api_key="test-key", max_retries=3
+        )
+        with pytest.raises(Exception):  # noqa: B017 - LiteLLM's error type is not the point
+            await handler(self._config("anthropic/claude-sonnet-4-5"), "q")
+        assert len(hits) == 4
+
+    def test_convenience_wrapper_forwards_it_to_the_handler(self) -> None:
+        factory = MagicMock()
+        config = MagicMock()
+        with (
+            patch.object(handler_mod, "_create_litellm_messages_handler", factory),
+            patch.object(handler_mod, "_config", config),
+        ):
+            litellm_messages("k", "q", {}, max_retries=6)
+        assert factory.call_args.kwargs["max_retries"] == 6
+        # config() takes no such argument, so leaving it in kwargs would raise TypeError.
+        assert "max_retries" not in config.call_args.kwargs
