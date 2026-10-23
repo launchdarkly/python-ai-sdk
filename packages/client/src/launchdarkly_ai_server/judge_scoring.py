@@ -42,23 +42,24 @@ def build_message_history(
     """The conversation a judge is shown, as its ``message_history`` variable.
 
     Ordered as it happened: what was asked, what the agent did, what it
-    answered, then how to format the verdict. Empty parts are skipped, so a
-    run with no tools yields the history it did before trajectories existed.
+    answered, then how to format the verdict. A part whose text is empty is
+    skipped, so a run with no tools yields the history it did before
+    trajectories existed.
 
     The formatting block is appended here, not by callers: judges built from
     the AI Library's default templates read the JSON shape from
     ``{{message_history}}``, and one that stopped being told it would return
     prose and fail every result as invalid output.
 
-    A non-string output is shown as JSON, by the rule tool results follow, so a
-    rubric reads the same text in every SDK.
+    Every part is rendered by the rule tool results follow, so a non-string
+    output is shown as JSON and a rubric reads the same text in every SDK. An
+    output of ``0``, ``False`` or ``{}`` is an answer, and is shown.
     """
-    output_text = tool_result_string(output) if output else None
-    return "\n\n".join(
-        str(part)
-        for part in (user_input, trajectory, output_text, FORMATTING_INSTRUCTIONS)
-        if part
+    texts = (
+        tool_result_string(part)
+        for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
     )
+    return "\n\n".join(text for text in texts if text)
 
 
 def numeric_score(score: Any) -> float | None:
@@ -129,6 +130,10 @@ def parse_judge_response(raw: Any) -> tuple[Any, str]:
     already-decoded mapping. The score is returned untouched — callers apply
     their own policy to non-numeric values via :func:`numeric_score`.
 
+    The reasoning is the first of ``reasoning`` and ``reason`` whose text is
+    not empty, rendered by the tool-result rule: a string as it is, anything
+    else as JSON, never as a Python repr.
+
     Raises ``ValueError`` when the response is not a non-empty JSON object.
     """
     parsed: Any
@@ -140,8 +145,8 @@ def parse_judge_response(raw: Any) -> tuple[Any, str]:
         parsed = None
     if not isinstance(parsed, Mapping) or not parsed:
         raise ValueError("Invalid JSON from judge")
-    reasoning = parsed.get("reasoning") or parsed.get("reason") or ""
-    return parsed.get("score"), str(reasoning)
+    texts = (tool_result_string(parsed.get(key)) for key in ("reasoning", "reason"))
+    return parsed.get("score"), next((text for text in texts if text), "")
 
 
 def without_output_format(config: Any, judge_key: str) -> Any:

@@ -43,6 +43,7 @@ from .api import (
     require_string,
     segment,
 )
+from .canonical_json import canonical_json
 from .criteria import Criterion, Judge, Scorer
 from .events import (
     CriterionEventPayload,
@@ -93,6 +94,17 @@ def _provides_for(
 ) -> tuple[str, Literal["agent", "messages"]] | None:
     """Normalized handler identity; shares :func:`handler_key` with online."""
     return handler_key(handler)
+
+
+def _describe_value(value: Any) -> str:
+    """A value in an error message, as JSON rather than a Python repr, so it reads the same in every SDK.
+
+    A non-finite number is ``NaN`` / ``Infinity``, and a value JSON cannot hold its ``str()``.
+    """
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def describe_handlers(handlers: Sequence[EvalHandler]) -> str:
@@ -733,9 +745,7 @@ class EvaluationsRunner:
             }
             if dataset.id is None:
                 del identity["datasetId"]
-            event_id = hashlib.sha256(
-                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
+            event_id = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
             error = result.get("error")
             generated = {
                 "status": result["status"],
@@ -758,9 +768,7 @@ class EvaluationsRunner:
                     "outputTokens": normalized_usage["output"],
                 }
             content_hash = hashlib.sha256(
-                json.dumps(
-                    generated, sort_keys=True, separators=(",", ":"), default=str
-                ).encode()
+                canonical_json(generated).encode()
             ).hexdigest()
             emitted_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             payload: dict[str, Any] = {
@@ -899,7 +907,7 @@ class EvaluationsRunner:
                     started_clock,
                     "invalid_score",
                     "scorer fn must return a bool or a finite number, "
-                    f"got {score_value!r}",
+                    f"got {_describe_value(score_value)}",
                 )
             score = maybe_score
         if score < 0 or score > 1:
@@ -907,7 +915,7 @@ class EvaluationsRunner:
                 base,
                 started_clock,
                 "invalid_score",
-                f"scorer fn score must be between 0 and 1, got {score_value!r}",
+                f"scorer fn score must be between 0 and 1, got {_describe_value(score_value)}",
             )
         completed = datetime.now(UTC)
         return {
@@ -990,7 +998,7 @@ class EvaluationsRunner:
                 base,
                 started_clock,
                 "invalid_score",
-                f"judge score must be a number between 0 and 1, got {raw_score!r}",
+                f"judge score must be a number between 0 and 1, got {_describe_value(raw_score)}",
             )
         completed = datetime.now(UTC)
         # No verdict: the SDK reports the score and LaunchDarkly rules on it. The
@@ -1080,9 +1088,7 @@ class EvaluationsRunner:
                 }
                 if dataset.id is None:
                     del identity["datasetId"]
-                event_id = hashlib.sha256(
-                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-                ).hexdigest()
+                event_id = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
                 emitted_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
                 usage: TokenUsage | None = None
                 if result["kind"] == "judge" and isinstance(
