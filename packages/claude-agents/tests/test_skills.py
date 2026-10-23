@@ -365,6 +365,22 @@ class TestMaterialization:
         assert held == [["a", "b"], ["a"]]
 
 
+async def test_removes_the_directory_when_closing_the_blocking_spans_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _store(_raw("a", 1))
+    monkeypatch.setattr(handler_mod, "query", _FakeQuery())
+
+    def boom(*_spans: Any) -> None:
+        raise RuntimeError("span cleanup failed")
+
+    monkeypatch.setattr(handler_mod, "end_unfinished_spans", boom)
+    handler = create_claude_agents_skills_handler(skills_temp_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="span cleanup failed"):
+        await _run(handler, "invoke", _config(("a", 1)))
+    assert list(tmp_path.iterdir()) == []
+
+
 async def test_removes_the_directory_when_a_stream_consumer_stops_early(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

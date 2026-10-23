@@ -940,21 +940,26 @@ def _create_claude_agents_handler(
             # the root is the only span carrying the feature_flag event and the launchdarkly.*
             # attributes, so the whole run would vanish from AI Config Monitoring rather than show
             # as incomplete.
-            inference.finish()
-            if cancel_tool_spans is not None:
-                cancel_tool_spans()
-            if (
-                open_root_span is not None
-                and not root_usage_written
-                and inference.run_usage["reported"]
-            ):
-                # The turns that completed were billed, the same reason the failure path reports
-                # them.
-                finish_root_span(open_root_span, config, inference.run_usage["total"])
-            end_unfinished_spans(open_root_span)
-            # Last, after the span tree is closed: the run is over however it ended.
-            if prepared is not None:
-                await prepared.cleanup()
+            try:
+                inference.finish()
+                if cancel_tool_spans is not None:
+                    cancel_tool_spans()
+                if (
+                    open_root_span is not None
+                    and not root_usage_written
+                    and inference.run_usage["reported"]
+                ):
+                    # The turns that completed were billed, the same reason the failure path
+                    # reports them.
+                    finish_root_span(
+                        open_root_span, config, inference.run_usage["total"]
+                    )
+                end_unfinished_spans(open_root_span)
+            finally:
+                # Last, after the span tree is closed, and in its own finally so a raise above
+                # still removes the preparation's temp dir.
+                if prepared is not None:
+                    await prepared.cleanup()
 
     def _stream_impl(
         config: AiConfigRep,
