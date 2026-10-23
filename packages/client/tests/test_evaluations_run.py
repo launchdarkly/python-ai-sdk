@@ -2343,7 +2343,7 @@ async def test_structured_output_reaches_the_judge_as_json(
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
-    rendered = '{"answer": "original", "tags": ["a"], "final": true}'
+    rendered = '{"answer":"original","tags":["a"],"final":true}'
     assert judged["response"] == rendered
     assert rendered in judged["history"]
 

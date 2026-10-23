@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from math import isfinite
 from typing import Any
 
-from .content import tool_result_string
+from .canonical_json import canonical_json
 from .utils import parse_json_with_possible_fences
 
 logger = logging.getLogger(__name__)
@@ -56,10 +56,24 @@ def build_message_history(
     every SDK. An output of ``0`` or ``False`` is an answer, and is shown.
     """
     return "\n\n".join(
-        tool_result_string(part)
+        judge_text(part)
         for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
         if not _is_empty_part(part)
     )
+
+
+def judge_text(value: Any) -> str:
+    """A value as a judge is shown it: a string as it is, ``None`` as ``""``, anything else as JSON.
+
+    The JSON is ``JSON.stringify``'s spelling (no whitespace, keys in insertion
+    order, ``1`` for ``1.0``), not ``json.dumps``'s, so a rubric reads the same
+    text in every SDK.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return canonical_json(value, sort_keys=False)
 
 
 def _is_empty_part(value: Any) -> bool:
@@ -159,7 +173,7 @@ def parse_judge_response(raw: Any) -> tuple[Any, str]:
         raise ValueError("Invalid JSON from judge")
     reasoning = next(
         (
-            tool_result_string(value)
+            judge_text(value)
             for value in (parsed.get("reasoning"), parsed.get("reason"))
             if not _is_empty_part(value)
         ),

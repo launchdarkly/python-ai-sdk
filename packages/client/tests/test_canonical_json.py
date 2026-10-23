@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from launchdarkly_ai_server.evaluations.canonical_json import canonical_json
+from launchdarkly_ai_server.canonical_json import canonical_json
 
 
 @pytest.mark.parametrize(
@@ -112,3 +112,21 @@ def test_content_hash_matches_the_javascript_sdk(
     generated: dict[str, Any], digest: str
 ) -> None:
     assert hashlib.sha256(canonical_json(generated).encode()).hexdigest() == digest
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (1.0, "1"),
+        ("high", '"high"'),
+        ({"b": 2.0, "a": [None]}, '{"b":2,"a":[null]}'),
+        (float("nan"), "NaN"),
+        (float("-inf"), "-Infinity"),
+    ],
+)
+def test_describe_value_is_json_stringify_text_except_non_finite(
+    value: Any, text: str
+) -> None:
+    from launchdarkly_ai_server.evaluations.runner import _describe_value
+
+    assert _describe_value(value) == text

@@ -7,6 +7,7 @@ import pytest
 from launchdarkly_ai_server.judge_scoring import (
     FORMATTING_INSTRUCTIONS,
     build_message_history,
+    judge_text,
     parse_judge_response,
     typesafe_judge_entries,
 )
@@ -41,7 +42,7 @@ class TestParseJudgeResponse:
     def test_non_string_reasoning_is_json_not_a_repr(self) -> None:
         assert parse_judge_response({"score": 1, "reasoning": {"ok": True}}) == (
             1,
-            '{"ok": true}',
+            '{"ok":true}',
         )
         assert parse_judge_response({"score": 1, "reasoning": 0}) == (1, "0")
 
@@ -103,12 +104,12 @@ def test_message_history_renders_a_structured_output_as_json() -> None:
         user_input="q", output={"answer": "oui", "ok": True, "note": None}
     )
     assert history == "\n\n".join(
-        ["q", '{"answer": "oui", "ok": true, "note": null}', FORMATTING_INSTRUCTIONS]
+        ["q", '{"answer":"oui","ok":true,"note":null}', FORMATTING_INSTRUCTIONS]
     )
 
 
 def test_message_history_keeps_non_ascii() -> None:
-    assert '{"city": "Zürich"}' in build_message_history(output={"city": "Zürich"})
+    assert '{"city":"Zürich"}' in build_message_history(output={"city": "Zürich"})
 
 
 @pytest.mark.parametrize("empty", [None, "", {}, []])
@@ -125,3 +126,25 @@ def test_message_history_shows_a_falsy_answer(output: Any, text: str) -> None:
     assert build_message_history(user_input="q", output=output) == "\n\n".join(
         ["q", text, FORMATTING_INSTRUCTIONS]
     )
+
+
+# Each expected string is what JavaScript's JSON.stringify writes for the same value.
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        ("as is", "as is"),
+        (None, ""),
+        (0, "0"),
+        (False, "false"),
+        (1.0, "1"),
+        (-2.0, "-2"),
+        (0.5, "0.5"),
+        (1e21, "1e+21"),
+        ([1.0, "a", None], '[1,"a",null]'),
+        ({"b": 1.0, "a": [True, {}]}, '{"b":1,"a":[true,{}]}'),
+        ({"city": "Zürich"}, '{"city":"Zürich"}'),
+        ({"n": float("nan")}, '{"n":null}'),
+    ],
+)
+def test_judge_text_is_json_stringify_text(value: Any, text: str) -> None:
+    assert judge_text(value) == text

@@ -10,12 +10,14 @@ import urllib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any, Literal, cast
 
-from ..content import tool_result_string
+from ..canonical_json import canonical_json
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
     build_message_history,
+    judge_text,
     numeric_score,
     parse_judge_response,
     typesafe_judge_entries,
@@ -43,7 +45,6 @@ from .api import (
     require_string,
     segment,
 )
-from .canonical_json import canonical_json
 from .criteria import Criterion, Judge, Scorer
 from .events import (
     CriterionEventPayload,
@@ -99,12 +100,12 @@ def _provides_for(
 def _describe_value(value: Any) -> str:
     """A value in an error message, as JSON rather than a Python repr, so it reads the same in every SDK.
 
-    A non-finite number is ``NaN`` / ``Infinity``, and a value JSON cannot hold its ``str()``.
+    Spelled as ``JSON.stringify`` spells it, except that a non-finite number is
+    ``NaN`` / ``Infinity``, and a value JSON cannot hold is its ``str()``.
     """
-    try:
-        return json.dumps(value, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return str(value)
+    if isinstance(value, float) and not isfinite(value):
+        return json.dumps(value)
+    return canonical_json(value, sort_keys=False)
 
 
 def describe_handlers(handlers: Sequence[EvalHandler]) -> str:
@@ -832,7 +833,7 @@ class EvaluationsRunner:
         variables.update(
             {
                 "input": row_result.get("input") or "",
-                "response_to_evaluate": tool_result_string(output),
+                "response_to_evaluate": judge_text(output),
                 "message_history": build_message_history(
                     user_input=row_result.get("input"),
                     trajectory=trajectory,

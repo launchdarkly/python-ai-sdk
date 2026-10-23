@@ -21,18 +21,22 @@ _MAX_SAFE_INTEGER = 2**53 - 1
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
-def canonical_json(value: Any) -> str:
+def canonical_json(value: Any, *, sort_keys: bool = True) -> str:
     """The JCS text of a JSON-like value.
+
+    With ``sort_keys=False`` object keys keep their insertion order, which is
+    ``JSON.stringify``'s output exactly: the form judge text uses, so a judge
+    reads the same text in every SDK. It is not JCS, so never hash it.
 
     The value is first normalized through ``json.dumps(..., default=str)``, so
     a tuple is a list, a non-string key is the string ``json.dumps`` writes for
     it, and a value JSON cannot hold is its ``str()``. A non-finite number is
     written ``null``, as ``JSON.stringify`` writes it.
     """
-    return _encode(json.loads(json.dumps(value, default=str)))
+    return _encode(json.loads(json.dumps(value, default=str)), sort_keys)
 
 
-def _encode(value: Any) -> str:
+def _encode(value: Any, sort_keys: bool = True) -> str:
     if value is None or value is True or value is False:
         return json.dumps(value)
     if isinstance(value, int):
@@ -47,9 +51,13 @@ def _encode(value: Any) -> str:
     if isinstance(value, str):
         return _string(value)
     if isinstance(value, list):
-        return "[" + ",".join(_encode(item) for item in value) + "]"
-    keys = sorted(value, key=_utf16)
-    return "{" + ",".join(f"{_string(key)}:{_encode(value[key])}" for key in keys) + "}"
+        return "[" + ",".join(_encode(item, sort_keys) for item in value) + "]"
+    keys = sorted(value, key=_utf16) if sort_keys else list(value)
+    return (
+        "{"
+        + ",".join(f"{_string(key)}:{_encode(value[key], sort_keys)}" for key in keys)
+        + "}"
+    )
 
 
 def _number(value: float) -> str:
