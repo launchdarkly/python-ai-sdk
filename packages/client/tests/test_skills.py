@@ -394,9 +394,10 @@ SKILLS_SURFACE = frozenset(
         "MANIFEST_VERSION",
     }
 )
-"""Every Agent Skills name the package root exports, spelled out so that any
-addition — an accessor that interprets ``Skill.content``, say — fails here and
-is seen in review."""
+"""Every Agent Skills name the package root exports, spelled out. The check here is
+that each one is exported. What catches an addition (an accessor that interprets
+``Skill.content``, say) is ``test_root_surface_is_exactly_the_snapshot`` in
+``test_public_surface.py``, which compares the whole of ``__all__``."""
 
 
 class TestPackageExports:

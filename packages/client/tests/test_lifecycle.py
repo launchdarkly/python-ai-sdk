@@ -3,7 +3,9 @@ Tests for §3.9 init_client / get_client / shutdown.
 Reference: TESTING.md §3.9
 """
 
+import ast
 import asyncio
+import inspect
 import os
 import subprocess
 import sys
@@ -612,6 +614,22 @@ class TestShutdown:
         assert lifecycle_module._client is None
         assert "Could not clear the Failing Feature state" in caplog.messages
         later.assert_called_once()  # one failing hook does not skip the rest
+
+    def test_lifecycle_imports_no_skills_module(self) -> None:
+        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
+        tree = ast.parse(inspect.getsource(lifecycle_module))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+                # `from . import skills_core` names the module in the alias, not in `module`.
+                imported.update(alias.name for alias in node.names)
+        skills = sorted(
+            name for name in imported if name.rsplit(".", 1)[-1].startswith("skills")
+        )
+        assert skills == []
 
     def test_core_does_not_import_experimental_code(self) -> None:
         """Importing and shutting down core loads no experimental module."""

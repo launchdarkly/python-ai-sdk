@@ -625,8 +625,9 @@ Do not undo any of these as a simplification:
   store), and the stdlib's default formatter drops `extra`, so an `extra`-only record is
   invisible under a plain `logging.basicConfig()`.
 - **`ld.skills.integrity_failure` is documented for customers to match on.** Do not rename it
-  casually. Agent Skills is core, so a rename is a breaking change: it needs a major release
-  in every SDK at once and a changelog entry, because a rename silently breaks customers' alerts.
+  casually. Agent Skills is core, so a rename is a breaking change: it needs a `!` commit (a
+  minor bump while on 0.x, a major after 1.0) in every SDK at once and a changelog entry,
+  because a rename silently breaks customers' alerts.
 - **`sort_keys=True` makes the line byte-identical across SDKs** (modulo `language`), since
   the other implementations build the object in alphabetical key order.
 - **Optional fields are omitted, never nulled**, so a SIEM field-existence check means

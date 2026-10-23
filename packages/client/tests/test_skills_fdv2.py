@@ -34,6 +34,11 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import launchdarkly_ai_server.skills as skills_module
+
+# Internal submodules, kept out of the public-name import below so they don't read as root exports.
+import launchdarkly_ai_server.skills_core as skills_core
+import launchdarkly_ai_server.skills_fdv2 as skills_fdv2
 from launchdarkly_ai_server import (
     FDv2SkillStore,
     InMemorySkillStore,
@@ -41,12 +46,9 @@ from launchdarkly_ai_server import (
     get_skill,
     get_skill_result,
     set_skill_store,
-    skills_core,
-    skills_fdv2,
     watch_skills,
     write_skills,
 )
-from launchdarkly_ai_server import skills as skills_module
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
     DEFAULT_BASE_URI,
