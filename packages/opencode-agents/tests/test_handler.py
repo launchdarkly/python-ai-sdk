@@ -26,6 +26,12 @@ from launchdarkly_ai_opencode_agents import (
 from launchdarkly_ai_opencode_agents.process import _is_healthy
 from launchdarkly_ai_opencode_agents.server import default_model
 from launchdarkly_ai_server import SDKOptions, config, configure
+from tests.forwarding_spec import (
+    OPENCODE_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 _FAKE = Path(__file__).with_name("fake_opencode.py")
 
@@ -1718,3 +1724,70 @@ class TestProcess:
 async def _drain(stream: Any) -> None:
     async for _event in stream:
         pass
+
+
+#: Every field of OpenCode's ``PromptInput`` (the message route's body), in both spellings.
+_PROMPT_INPUT_FIELDS = frozenset(
+    {
+        "sessionID",
+        "session_id",
+        "messageID",
+        "message_id",
+        "model",
+        "agent",
+        "noReply",
+        "no_reply",
+        "tools",
+        "format",
+        "system",
+        "variant",
+        "parts",
+    }
+)
+
+
+class TestForwardsNoModelParameters:
+    """Probes ``invoke`` and ``stream`` one key at a time: no ``model.parameters`` key changes the
+    message body the handler posts, on either path."""
+
+    @staticmethod
+    def _config(parameters: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "instructions": "Be brief.",
+            "model": {"name": "m", "parameters": parameters},
+            "provider": {"name": "Acme"},
+        }
+
+    @staticmethod
+    def _events() -> list[dict[str, Any]]:
+        return [
+            assistant_open("m1"),
+            text_delta("m1", "p1", "Hi"),
+            assistant_completed("m1"),
+        ]
+
+    async def test_invoke(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            handler, script = playing(self._events())
+            await handler(self._config(parameters), "q", None, None)
+            return script.messages[0]
+
+        candidates = candidate_keys(_PROMPT_INPUT_FIELDS, OPENCODE_AGENTS)
+        assert await probe_forwarded_keys(candidates, call) == OPENCODE_AGENTS
+
+    async def test_stream(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            handler, script = playing(self._events())
+            async for _event in await handler.stream(
+                self._config(parameters), "q", None, None
+            ):
+                pass
+            return script.messages[0]
+
+        candidates = candidate_keys(_PROMPT_INPUT_FIELDS, OPENCODE_AGENTS)
+        assert await probe_forwarded_keys(candidates, call) == OPENCODE_AGENTS
+
+    async def test_never_forwarded_keys_do_not_reach_the_body(self) -> None:
+        handler, script = playing(self._events())
+        await handler(self._config(dict(NEVER_FORWARDED_BAG)), "q", None, None)
+        assert not find_leaks(script.messages[0])

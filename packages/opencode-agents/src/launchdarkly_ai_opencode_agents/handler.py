@@ -32,13 +32,29 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.sdk_usage import report_usage
-from launchdarkly_ai_server.utils import number_or_zero
+from launchdarkly_ai_server.utils import model_parameters, number_or_zero
 
 from ._version import PACKAGE_NAME, __version__
 from .process import Command, OpenCodeServe, serve_from
 from .server import ModelResolver, default_model, session_events
 from .spans import fail_span, finish_root_span, mark_ok, start_root_span
+
+#: The ``model.parameters`` keys forwarded into the ``POST /session/{id}/message`` body. None are.
+#: The message route takes no sampling, length, stop, seed, tool-choice or reasoning field: OpenCode
+#: reads those from its own server, agent and provider config, which the handler does not control
+#: per call. The fields the route does take are not forwarded, and why:
+#: * ``parts``, ``model``, ``system``, ``agent``, ``tools``: handler-owned. ``agent`` is the
+#:   ``create_opencode_handler(agent=...)`` argument and also picks the server's tools and
+#:   permissions.
+#: * ``format``: switches where the answer lands (``AssistantMessage.structured``), which the
+#:   reducer does not read.
+#: * ``noReply``: runtime wiring. No assistant turn is produced.
+#: * ``messageID``: server-side session state.
+#: * ``variant``: names a preset from the server's variant map, which depends on the provider,
+#:   the model and the operator's config, and an unknown name is silently ignored.
+_PROMPT_FORWARDED_KEYS: frozenset[str] = frozenset()
 
 
 class OpenCodeSessionError(Exception):
@@ -673,6 +689,9 @@ class OpenCodeHandler(ProviderHandler):
                     model_id=model_id,
                     agent=self._agent,
                     capture=capture,
+                    parameters=select_forwarded_parameters(
+                        model_parameters(config), _PROMPT_FORWARDED_KEYS
+                    ),
                 )
             ) as reduced:
                 async for event in reduced:
@@ -744,6 +763,7 @@ async def _reduce_session(
     model_id: str,
     agent: str | None,
     capture: bool,
+    parameters: Mapping[str, Any],
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Reduce the session ``POST /session`` created. The reducer is unchanged."""
     session_ids: list[str] = []
@@ -752,6 +772,7 @@ async def _reduce_session(
         session_events(
             base_url=base_url,
             password=password,
+            parameters=parameters,
             prompt=prompt,
             system=system,
             provider_id=provider_id,

@@ -152,6 +152,11 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
+def _resolve_host(option: str | None, env_name: str, default: str) -> str:
+    """Resolve a host: option, then env var, then default. Blank counts as unset."""
+    return (option or "").strip() or _env(env_name) or default
+
+
 def _initialized_client() -> Any | None:
     """Return the SDK singleton when one is initialized, otherwise ``None``."""
     try:
@@ -225,10 +230,6 @@ class EvaluationsModule:
         self._ui_base_uri = ui_base_uri.rstrip("/")
         self._runner = EvaluationsRunner(api_client)
         self._tools = ToolsClient(api_client, project_key)
-
-    @property
-    def api(self) -> LDApiClient:
-        return self._api
 
     @property
     def project_key(self) -> str:
@@ -866,7 +867,7 @@ def init_evaluations(
     project_key: str | None = None,
     api_key: str | None = None,
     sdk_key: str | None = None,
-    base_uri: str | None = None,
+    api_base_uri: str | None = None,
     ui_base_uri: str | None = None,
     transport: Transport = urllib_transport,
 ) -> EvaluationsModule:
@@ -907,12 +908,12 @@ def init_evaluations(
 
     api_client = LDApiClient(
         api_key=token,
-        base_uri=base_uri or _env("LD_API_BASE_URI") or DEFAULT_BASE_URI,
+        base_uri=_resolve_host(api_base_uri, "LD_API_BASE_URI", DEFAULT_BASE_URI),
         transport=transport,
     )
     return EvaluationsModule(
         api_client=api_client,
         project_key=resolved_project_key,
         sdk_key=resolved_sdk_key,
-        ui_base_uri=ui_base_uri or _env("LD_UI_BASE_URI") or DEFAULT_UI_BASE_URI,
+        ui_base_uri=_resolve_host(ui_base_uri, "LD_UI_BASE_URI", DEFAULT_UI_BASE_URI),
     )

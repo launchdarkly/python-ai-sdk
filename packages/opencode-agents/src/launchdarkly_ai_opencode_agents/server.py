@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -58,6 +58,7 @@ async def session_events(
     *,
     base_url: str,
     password: str,
+    parameters: Mapping[str, Any],
     prompt: str,
     system: str | None,
     provider_id: str,
@@ -95,7 +96,9 @@ async def session_events(
                 raise OpenCodeHTTPError(f"POST /session -> {created.status_code}")
             session_id = _session_id(created.json())
             session_ids.append(session_id)
+            # Forwarded parameters go first, so the handler's own fields always win.
             body: dict[str, Any] = {
+                **parameters,
                 "parts": [{"type": "text", "text": prompt}],
                 "model": {"providerID": provider_id, "modelID": model_id},
             }
