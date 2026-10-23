@@ -1958,6 +1958,53 @@ class TestConvenienceExport:
         )
 
 
+class TestConvenienceExportHostOptions:
+    """``cwd`` and ``setting_sources`` build the wrapper's handler and never reach ``config()``."""
+
+    @staticmethod
+    async def _bound_query_options(monkeypatch: pytest.MonkeyPatch, **host: Any) -> Any:
+        from launchdarkly_ai_claude_agents import claude_agents
+
+        captured: list[Any] = []
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured.append(kwargs["options"])
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        config_kwargs: dict[str, Any] = {}
+
+        async def _invoke(*_args: Any, **_kwargs: Any) -> Any:
+            return await config_kwargs["handler"](BASE_CONFIG, "q", {})
+
+        def _fake_config(**kwargs: Any) -> Any:
+            config_kwargs.update(kwargs)
+            return type("Inst", (), {"invoke": staticmethod(_invoke)})()
+
+        monkeypatch.setattr(handler_mod, "_config", _fake_config)
+        await claude_agents("cfg-key", "q", {"key": "u1"}, **host)
+        assert "cwd" not in config_kwargs
+        assert "setting_sources" not in config_kwargs
+        assert len(captured) == 1
+        return captured[0]
+
+    async def test_no_host_settings_and_no_cwd_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        opts = await self._bound_query_options(monkeypatch)
+        assert opts.setting_sources == []
+        assert opts.cwd is None
+
+    async def test_forwards_cwd_and_setting_sources_to_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        opts = await self._bound_query_options(
+            monkeypatch, cwd="/srv/app", setting_sources=["user"]
+        )
+        assert opts.cwd == "/srv/app"
+        assert opts.setting_sources == ["user"]
+
+
 # ---------------------------------------------------------------------------
 # §1.2 Path C — None user_input must not produce None prompt.
 # Restored from the pre-rewrite file (not telemetry). Adapted from the old

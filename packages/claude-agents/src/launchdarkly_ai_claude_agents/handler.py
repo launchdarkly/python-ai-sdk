@@ -1204,14 +1204,25 @@ def claude_agents(
     config_key: str,
     user_input: str,
     context: LDContext,
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    setting_sources: list[SettingSource] | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Convenience wrapper: creates a handler and calls config(...).invoke()."""
+    """Convenience wrapper: creates a handler and calls config(...).invoke().
+
+    *cwd* and *setting_sources* build the handler, as on :func:`create_claude_agents_handler`,
+    with the same defaults, and are not passed on to ``config()``.
+    """
     report_usage("claude-agents.claudeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
-        handler=_create_claude_agents_handler(capture_content=capture_content),
+        handler=_create_claude_agents_handler(
+            capture_content=capture_content,
+            cwd=cwd,
+            setting_sources=setting_sources,
+        ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)
