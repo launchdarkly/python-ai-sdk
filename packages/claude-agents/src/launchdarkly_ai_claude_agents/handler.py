@@ -711,8 +711,8 @@ def create_claude_agents_handler(
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. See TELEMETRY-CONTRACT.md section 7.
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. An explicit ``False`` emits only metadata. See TELEMETRY-CONTRACT.md section 7.
 
     *cwd* and *setting_sources* configure the Claude Code process the Agent SDK starts, not the
     model, so they come from the application and never from a config. Each one given is passed to
