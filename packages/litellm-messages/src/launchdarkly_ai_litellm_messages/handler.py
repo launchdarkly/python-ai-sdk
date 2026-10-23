@@ -49,7 +49,8 @@ def _json_schema(output_format: dict[str, Any]) -> dict[str, Any]:
 #: The cross-SDK list for LiteLLM Messages (TESTING.md section 1.12): the ``model.parameters``
 #: keys forwarded to ``litellm.acompletion``. Every other key is dropped. The handler sets
 #: ``model``, ``messages``, ``stream``, ``stream_options``, ``tools`` and ``response_format`` itself,
-#: and ``api_key`` (with ``api_base``) comes from the handler's options, never from the config.
+#: and ``api_key`` (with ``api_base``) and ``max_retries`` come from the handler's options, never
+#: from the config.
 #: ``TestAcompletionAcceptsExactlyTheseKeys`` in this package's tests asserts every named parameter
 #: of ``acompletion`` is classified as forwarded, handler-owned or excluded.
 _COMPLETION_FORWARDED_KEYS = frozenset(
@@ -244,6 +245,7 @@ def _request(
     stream: bool,
     base_url: str | None = None,
     api_key: str | None = None,
+    max_retries: int | None = None,
 ) -> dict[str, Any]:
     parameters = select_forwarded_parameters(
         model_parameters(config_value), _COMPLETION_FORWARDED_KEYS
@@ -260,6 +262,10 @@ def _request(
         parameters["api_base"] = base_url
     if api_key is not None:
         parameters["api_key"] = api_key
+    # LiteLLM hands max_retries to the backing provider's client. Not num_retries, which would also
+    # start LiteLLM's own retry loop around the call, so a failure would be retried at two layers.
+    if max_retries is not None:
+        parameters["max_retries"] = max_retries
     if tools:
         parameters["tools"] = tools
     if stream:
@@ -426,7 +432,18 @@ def create_litellm_messages_handler(
     capture_content: bool | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
+    max_retries: int | None = None,
 ) -> ProviderHandler:
+    """Creates a ``ProviderHandler`` for any model LiteLLM can route to.
+
+    Set *max_retries* to change how many times the backing provider's client retries a failed
+    request (a rate limit, a timeout, a 5xx) before the error reaches the handler. It is passed to
+    ``acompletion`` on every model turn. ``None`` (the default) leaves LiteLLM's own default in
+    place, which depends on the backing provider and is 2 for OpenAI-compatible ones. Raise it
+    when many calls share one rate-limit window, as an evaluation run with many concurrent workers
+    does: two retries is thin when a whole batch hits the same window at once. A custom
+    *completion* receives it as a keyword argument too.
+    """
     report_usage(
         "litellm-messages.createLiteLLMMessagesHandler", PACKAGE_NAME, __version__
     )
@@ -435,6 +452,7 @@ def create_litellm_messages_handler(
         capture_content=capture_content,
         base_url=base_url,
         api_key=api_key,
+        max_retries=max_retries,
     )
 
 
@@ -444,6 +462,7 @@ def _create_litellm_messages_handler(
     capture_content: bool | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
+    max_retries: int | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_litellm_messages_handler`, used by this package's wrappers."""
     content_override = capture_content
@@ -495,6 +514,7 @@ def _create_litellm_messages_handler(
                             stream=False,
                             base_url=base_url,
                             api_key=api_key,
+                            max_retries=max_retries,
                         )
                     )
                     turn_usage = _usage(response)
@@ -581,6 +601,7 @@ def _create_litellm_messages_handler(
             capture_content=effective_capture_content(content_override),
             base_url=base_url,
             api_key=api_key,
+            max_retries=max_retries,
         )
 
     return _create_handler(
@@ -602,6 +623,7 @@ async def _stream(
     capture_content: bool,
     base_url: str | None = None,
     api_key: str | None = None,
+    max_retries: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     messages = _build_messages(config_value, user_input, variables, history)
     tools = _build_tools(config_value, handlers)
@@ -641,6 +663,7 @@ async def _stream(
                         stream=True,
                         base_url=base_url,
                         api_key=api_key,
+                        max_retries=max_retries,
                     )
                 )
                 fragments: dict[int, dict[str, Any]] = {}
@@ -764,11 +787,15 @@ def litellm_messages(
     capture_content = kwargs.pop("capture_content", None)
     base_url = kwargs.pop("base_url", None)
     api_key = kwargs.pop("api_key", None)
+    max_retries = kwargs.pop("max_retries", None)
     report_usage("litellm-messages.litellmMessages", PACKAGE_NAME, __version__)
     return _config(
         key=config_key,
         handler=_create_litellm_messages_handler(
-            capture_content=capture_content, base_url=base_url, api_key=api_key
+            capture_content=capture_content,
+            base_url=base_url,
+            api_key=api_key,
+            max_retries=max_retries,
         ),
         **kwargs,
     ).invoke(user_input, context, variables)

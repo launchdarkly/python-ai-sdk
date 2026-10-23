@@ -378,7 +378,7 @@ async def _run_model_turn(
 
 
 def create_openai_messages_handler(
-    *, capture_content: bool | None = None
+    *, capture_content: bool | None = None, max_retries: int | None = None
 ) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for OpenAI (responses API).
@@ -389,20 +389,33 @@ def create_openai_messages_handler(
     which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
     for this handler. Conversation content is PII, so a run emits only metadata, meaning
     models, token counts, timings and tool names, until capture is turned on.
+
+    Set *max_retries* to change how many times the ``AsyncOpenAI`` client retries a failed
+    request (a rate limit, a timeout, a 5xx) before the error reaches the handler. ``None`` (the
+    default) leaves the client's own default of 2 in place. Raise it when many calls share one
+    rate-limit window, as an evaluation run with many concurrent workers does: two retries is thin
+    when a whole batch hits the same window at once. The retries happen inside the client, so a
+    retried turn is still one ``chat`` span.
     """
     report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
-    return _create_openai_messages_handler(capture_content=capture_content)
+    return _create_openai_messages_handler(
+        capture_content=capture_content, max_retries=max_retries
+    )
 
 
 def _create_openai_messages_handler(
-    *, capture_content: bool | None = None
+    *, capture_content: bool | None = None, max_retries: int | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_openai_messages_handler`, used by this package's wrappers."""
     content_override = capture_content
     import importlib
 
     openai_mod = importlib.import_module("openai")
-    client = openai_mod.AsyncOpenAI()
+    # Passed only when set, so an omitted value keeps the vendor default rather than a copy of it.
+    client_options: dict[str, Any] = {}
+    if max_retries is not None:
+        client_options["max_retries"] = max_retries
+    client = openai_mod.AsyncOpenAI(**client_options)
 
     async def _call_impl(
         config: AiConfigRep,
@@ -847,14 +860,17 @@ def openai_messages(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
-    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
-    # asking for content on spans got a TypeError instead of content.
+    # All three are lifted out of kwargs: capture_content and max_retries configure the handler,
+    # variables belong to the invocation. Leaving any in would pass it to config(), which takes
+    # none of them, so a caller asking for content on spans got a TypeError instead of content.
     report_usage("openai-messages.openaiMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
+    max_retries = kwargs.pop("max_retries", None)
     return _config(
         key=config_key,
-        handler=_create_openai_messages_handler(capture_content=capture_content),
+        handler=_create_openai_messages_handler(
+            capture_content=capture_content, max_retries=max_retries
+        ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)
