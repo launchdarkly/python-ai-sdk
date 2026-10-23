@@ -318,12 +318,12 @@ inside its known-event branches. Empty data on a known event is not JSON either,
 connection the same way: read as `None`, a `delete-object` would be ignored and a
 `payload-transferred` would commit with no selector.
 
-**A put or delete that is valid JSON but has no usable `key` is warned and ignored, for the
-experimental stage.** Its transfer still commits, so a keyless `delete-object` loses its
+**A put or delete that is valid JSON but has no usable `key` is warned and ignored, and
+delivery keeps going.** This is the accepted behaviour, not a provisional one. Its transfer still commits, so a keyless `delete-object` loses its
 revocation and a keyless `put-object` in an `xfer-full` revokes that skill by omission (and
 `write_skills("*")` prunes it). `ldclient` interrupts the stream instead. Interrupting is not
 strictly safer, because a server that keeps resending the object would then block every later
-change, so the choice is to be revisited before 1.0 (TESTING.md §3.25). Pinned by
+change. Pinned by
 `test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits` and
 `test_a_put_with_no_usable_key_in_an_xfer_full_revokes_by_omission`; changing the rule should fail
 them.

@@ -914,11 +914,12 @@ class TestProtocolReader:
     def test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits(
         self,
     ) -> None:
-        """Pins TESTING.md §3.25's experimental-stage rule: ignored, not fatal.
+        """Pins the keyless-object rule: ignored, not fatal, and delivery keeps
+        going.
 
         The revocation it carried is lost, so ``revoked`` stays served. Base
-        ``ldclient`` interrupts the stream instead; the choice is to be
-        revisited before 1.0, and changing it should fail this test.
+        ``ldclient`` interrupts the stream instead; this SDK's choice is the
+        accepted behaviour, and changing it should fail this test.
         """
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
