@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
+from ..content import tool_result_string
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
     build_message_history,
     numeric_score,
     parse_judge_response,
     typesafe_judge_entries,
+    without_output_format,
 )
 from ..lifecycle import extract_variation
 from ..trajectory import (
@@ -369,7 +371,7 @@ class EvaluationsRunner:
             }
             resolved_judge = ResolvedJudge(
                 key=judge.key,
-                config=judge_config,
+                config=dict(without_output_format(judge_config, judge.key)),
                 variation_key=str(meta.get("variationKey") or ""),
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
@@ -822,7 +824,7 @@ class EvaluationsRunner:
         variables.update(
             {
                 "input": row_result.get("input") or "",
-                "response_to_evaluate": output if output is not None else "",
+                "response_to_evaluate": tool_result_string(output),
                 "message_history": build_message_history(
                     user_input=row_result.get("input"),
                     trajectory=trajectory,
@@ -949,7 +951,7 @@ class EvaluationsRunner:
         try:
             result = await execution.handler(
                 dict(resolved.config),
-                row.get("output"),
+                variables["response_to_evaluate"],
                 {},
                 {
                     **variables,

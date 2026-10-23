@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from launchdarkly_ai_server import NativeTool, create_handler
-from launchdarkly_ai_server.evaluations import HttpResponse
+from launchdarkly_ai_server.evaluations.api import HttpResponse
 from launchdarkly_ai_server.experimental.evaluations import (
     AIConfig,
     DatasetRow,
@@ -254,7 +254,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         project_key="proj",
         api_key="token",
         sdk_key="sdk-key",
-        base_uri="https://api.example.com",
+        api_base_uri="https://api.example.com",
         ui_base_uri="https://ui.example.com/",
         transport=transport,
     )
@@ -986,6 +986,39 @@ def hosted_dataset_responses() -> list[HttpResponse]:
             },
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_api_host_env_alone_leaves_result_url_on_default_ui_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The UI host is not derived from the API host: environments do not always
+    # serve both from the same place.
+    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+    monkeypatch.delenv("LD_UI_BASE_URI", raising=False)
+    transport = SequencedTransport(hosted_dataset_responses())
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert all(
+        request["url"].startswith("https://api.staging.example.com/api/v2/")
+        for request in transport.requests
+    )
+    assert result.url == (
+        "https://app.launchdarkly.com/projects/proj/ai/evaluations/"
+        "evaluation-id/runs/run-id"
+    )
 
 
 @pytest.mark.asyncio
@@ -2234,6 +2267,61 @@ async def test_missing_expected_output_renders_empty_judge_variables(
 
 
 @pytest.mark.asyncio
+async def test_structured_output_reaches_the_judge_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page([{"rowIndex": 0, "input": "Question"}], total=1),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    accuracy_judge_variation(monkeypatch)
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    judged: dict[str, str] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "Judge" in prompt_text(config):
+            assert user_input == variables["response_to_evaluate"]
+            judged["response"] = variables["response_to_evaluate"]
+            judged["history"] = variables["message_history"]
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+        return {"output": {"answer": "original", "tags": ["a"], "final": True}}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    rendered = '{"answer": "original", "tags": ["a"], "final": true}'
+    assert judged["response"] == rendered
+    assert rendered in judged["history"]
+
+
+@pytest.mark.asyncio
 async def test_duplicate_criteria_rejected_before_any_request() -> None:
     transport = SequencedTransport([])
     evals = init_evaluations(
@@ -2754,6 +2842,67 @@ async def test_mixed_modes_route_generation_and_judge_to_their_own_handlers(
     assert agent.await_args.args[0]["instructions"] == "Help the user."
     assert messages.await_count == 1
     assert prompt_text(messages.await_args.args[0]) == "Judge {{response_to_evaluate}}"
+
+
+@pytest.mark.asyncio
+async def test_a_judge_configs_output_format_never_reaches_the_judge_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The offline path owns the {score, reasoning} contract like the online paths.
+
+    A judge config's own outputFormat would have the handler constrain the judge
+    model to that schema, so its verdict could never parse.
+    """
+    transport = judge_run_transport()
+    judge_variation(
+        monkeypatch,
+        provider="Anthropic",
+        config={
+            "messages": [
+                {"role": "system", "content": "Judge {{response_to_evaluate}}"}
+            ],
+            "outputFormat": {
+                "type": "json_schema",
+                "properties": {"message": {"type": "string"}},
+            },
+        },
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    judged: list[dict[str, Any]] = []
+
+    async def anthropic_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        judged.append(config)
+        return {"output": '{"score": 0.75, "reasoning": "ok"}'}
+
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.judge_scoring"):
+        result = await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handlers=[
+                create_handler(("OpenAI", "messages"), _generation_only),
+                create_handler(("Anthropic", "messages"), anthropic_judge),
+            ],
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+            criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        )
+
+    assert result.passed is True
+    assert judged
+    assert all("outputFormat" not in config for config in judged)
+    assert judged[0]["messages"][0]["content"] == "Judge {{response_to_evaluate}}"
+    warnings = [r for r in caplog.records if "ignoring outputFormat" in r.message]
+    assert len(warnings) == 1
+    assert "$ld:ai:judge:accuracy" in warnings[0].message
 
 
 @pytest.mark.asyncio
@@ -4121,7 +4270,7 @@ async def test_inline_upload_is_retried_after_a_server_error() -> None:
         ]
     )
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
-    evals.api._sleep = lambda _: None
+    evals._api._sleep = lambda _: None
 
     result = await evals.run(
         key="inline-eval",

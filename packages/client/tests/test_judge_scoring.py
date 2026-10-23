@@ -5,6 +5,8 @@ from typing import Any
 import pytest
 
 from launchdarkly_ai_server.judge_scoring import (
+    FORMATTING_INSTRUCTIONS,
+    build_message_history,
     parse_judge_response,
     typesafe_judge_entries,
 )
@@ -81,3 +83,19 @@ def test_typesafe_entries_keep_label_order() -> None:
             "reason": "",
         },
     ]
+
+
+def test_message_history_renders_a_structured_output_as_json() -> None:
+    history = build_message_history(
+        user_input="q", output={"answer": "oui", "ok": True, "note": None}
+    )
+    assert history == "\n\n".join(
+        ["q", '{"answer": "oui", "ok": true, "note": null}', FORMATTING_INSTRUCTIONS]
+    )
+
+
+def test_message_history_keeps_non_ascii_and_skips_an_empty_output() -> None:
+    assert '{"city": "Zürich"}' in build_message_history(output={"city": "Zürich"})
+    assert build_message_history(user_input="q", output={}) == "\n\n".join(
+        ["q", FORMATTING_INSTRUCTIONS]
+    )

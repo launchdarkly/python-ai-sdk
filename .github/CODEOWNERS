@@ -1,0 +1,2 @@
+# The API reports are the public API contract: a change to one changes a public name or signature.
+/packages/*/api-report/ @launchdarkly/team-ai-agents
