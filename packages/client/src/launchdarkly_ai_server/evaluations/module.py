@@ -2,42 +2,159 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
 import time
-from collections.abc import Mapping
-from typing import Any, cast
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, cast, overload
 
 from ..lifecycle import get_client, init_client
+from ..utils import normalize_mode
 from .api import (
     DEFAULT_BASE_URI,
     EvaluationsError,
     LDApiClient,
     Transport,
+    segment,
     urllib_transport,
 )
 from .criteria import Criterion, Judge
 from .runner import (
     EvalHandler,
     EvaluationsRunner,
-    ToolImplementation,
     _provides_for,
-    _segment,
+    describe_handlers,
+    prompt_mode_error,
+    render_row,
+    select_eval_handler,
 )
-from .types import AIConfig, EvalRunResult, GenerationConfig, RunSummary
+from .tools import EvalTool, ToolsClient, tool_handlers, validate_tools
+from .types import (
+    AIConfig,
+    AIConfigVariation,
+    DatasetRef,
+    DatasetRow,
+    EvalRunResult,
+    GenerationConfig,
+    GenerationOverrides,
+    InlineDatasetRow,
+    RunSummary,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
 SUMMARY_POLL_INTERVAL_SECONDS = 2.0
 SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
+INLINE_ROW_FIELDS = ("rowIdx", "input", "expectedOutput", "variables", "metadata")
+GENERATION_MODES = ("completion", "agent")
+
+
+def _render_inline_row(row: DatasetRow) -> DatasetRow:
+    return render_row(
+        row.row_index,
+        input_value=row.input,
+        expected_value=row.expected_output,
+        variables_value=row.variables,
+        metadata_value=row.metadata,
+    )
+
+
+def _check_string_keys(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"keys must be str, not {type(key).__name__}")
+            _check_string_keys(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_string_keys(item)
+
+
+def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]:
+    """Validate caller-supplied rows, returning them raw and indexed by position.
+
+    Pure, so a malformed row fails before any records are created. Each row
+    is held to the upload schema, so the server cannot reject a batch the
+    harness has already accepted. The values stay unrendered: they are
+    uploaded as stored rows, which the server renders the same way it renders
+    a hosted dataset's.
+    """
+    if not rows:
+        raise EvaluationsError("Inline dataset is empty")
+    normalized: list[DatasetRow] = []
+    for position, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise EvaluationsError(f"Inline dataset row {position} must be a mapping")
+        unknown = sorted(str(key) for key in row if key not in INLINE_ROW_FIELDS)
+        if unknown:
+            raise EvaluationsError(
+                f"Inline dataset row {position} has unknown fields: "
+                + ", ".join(repr(key) for key in unknown)
+                + ". Expected any of: "
+                + ", ".join(repr(key) for key in INLINE_ROW_FIELDS)
+            )
+        row_idx = row.get("rowIdx")
+        if row_idx is not None and (isinstance(row_idx, bool) or row_idx != position):
+            raise EvaluationsError(
+                f"Inline dataset row {position} has rowIdx {row_idx!r}; "
+                "an inline row's index is its position in the list"
+            )
+        row_input = row.get("input")
+        if not isinstance(row_input, str) or not row_input:
+            raise EvaluationsError(
+                f"Inline dataset row {position} input must be a non-empty string"
+            )
+        expected_output = row.get("expectedOutput")
+        if expected_output is not None and not isinstance(expected_output, str):
+            raise EvaluationsError(
+                f"Inline dataset row {position} expectedOutput must be a string"
+            )
+        for field_name in ("variables", "metadata"):
+            value = row.get(field_name)
+            if value is None:
+                continue
+            if not isinstance(value, Mapping):
+                raise EvaluationsError(
+                    f"Inline dataset row {position} {field_name} must be a mapping"
+                )
+            # NaN and Infinity are rejected: json.dumps would otherwise emit
+            # them as bare tokens, which are not valid JSON. Non-str keys are
+            # rejected rather than coerced; json.dumps runs first so circular
+            # references fail there instead of recursing in the key check.
+            try:
+                json.dumps(value, allow_nan=False)
+                _check_string_keys(value)
+            except (TypeError, ValueError) as error:
+                raise EvaluationsError(
+                    f"Inline dataset row {position} {field_name} must be "
+                    f"JSON-encodable without NaN or Infinity: {error}"
+                ) from error
+        variables = row.get("variables")
+        metadata = row.get("metadata")
+        normalized.append(
+            DatasetRow(
+                row_index=position,
+                input=row_input,
+                expected_output=expected_output,
+                variables=dict(variables) if variables else {},
+                metadata=dict(metadata) if metadata is not None else None,
+            )
+        )
+    return normalized
 
 
 def _env(name: str) -> str | None:
     """Read an env var, treating blank/whitespace-only values as unset."""
     value = os.environ.get(name, "").strip()
     return value if value else None
+
+
+def _resolve_host(option: str | None, env_name: str, default: str) -> str:
+    """Resolve a host: option, then env var, then default. Blank counts as unset."""
+    return (option or "").strip() or _env(env_name) or default
 
 
 def _initialized_client() -> Any | None:
@@ -63,9 +180,14 @@ def _is_terminal_summary(summary: RunSummary) -> bool:
     )
 
 
+def _handler_mode(mode: str) -> Literal["agent", "messages"]:
+    """Return the handler mode for a validated generation mode."""
+    return "agent" if mode == "agent" else "messages"
+
+
 def _merge_generation(
-    base: GenerationConfig, override: GenerationConfig | None
-) -> GenerationConfig:
+    base: GenerationOverrides, override: GenerationOverrides | None
+) -> dict[str, Any]:
     """Layer a caller's generation settings over a fetched variation's.
 
     Keys the caller sets replace the fetched ones, except ``parameters``, which
@@ -76,7 +198,7 @@ def _merge_generation(
     """
     merged: dict[str, Any] = dict(base)
     if not override:
-        return cast(GenerationConfig, merged)
+        return merged
     if "instructions" in override or "messages" in override:
         merged.pop("instructions", None)
         merged.pop("messages", None)
@@ -89,7 +211,7 @@ def _merge_generation(
             }
         else:
             merged[field_name] = value
-    return cast(GenerationConfig, merged)
+    return merged
 
 
 class EvaluationsModule:
@@ -98,17 +220,26 @@ class EvaluationsModule:
     def __init__(
         self,
         api_client: LDApiClient,
+        project_key: str,
         sdk_key: str | None,
         ui_base_uri: str = DEFAULT_UI_BASE_URI,
     ) -> None:
         self._api = api_client
+        self._project_key = project_key
         self._sdk_key = sdk_key
         self._ui_base_uri = ui_base_uri.rstrip("/")
         self._runner = EvaluationsRunner(api_client)
+        self._tools = ToolsClient(api_client, project_key)
 
     @property
-    def api(self) -> LDApiClient:
-        return self._api
+    def project_key(self) -> str:
+        """Project that holds this module's evaluations, tools, and datasets."""
+        return self._project_key
+
+    @property
+    def tools(self) -> ToolsClient:
+        """Reader for tools in the LaunchDarkly tool library."""
+        return self._tools
 
     @property
     def sdk_key(self) -> str | None:
@@ -120,18 +251,51 @@ class EvaluationsModule:
         """LaunchDarkly application host used for evaluation-run links."""
         return self._ui_base_uri
 
+    @overload
     async def run(
         self,
         *,
-        project_key: str,
         key: str,
-        dataset: str,
-        handler: EvalHandler,
-        generation: GenerationConfig | None = None,
-        ai_config: AIConfig | None = None,
-        tools: Mapping[str, ToolImplementation] | None = None,
+        dataset: str | Sequence[InlineDatasetRow],
+        generation: GenerationConfig,
+        handler: EvalHandler | None = None,
+        handlers: Sequence[EvalHandler] | None = None,
+        ai_config: None = None,
+        tools: Sequence[EvalTool] | None = None,
         criteria: list[Criterion] | None = None,
-        judge_handlers: list[EvalHandler] | None = None,
+        concurrency: int = 10,
+        poll_interval_seconds: float | None = None,
+        poll_timeout_seconds: float | None = None,
+    ) -> EvalRunResult: ...
+
+    @overload
+    async def run(
+        self,
+        *,
+        key: str,
+        dataset: str | Sequence[InlineDatasetRow],
+        ai_config: AIConfig,
+        generation: GenerationOverrides | None = None,
+        handler: EvalHandler | None = None,
+        handlers: Sequence[EvalHandler] | None = None,
+        tools: Sequence[EvalTool] | None = None,
+        criteria: list[Criterion] | None = None,
+        concurrency: int = 10,
+        poll_interval_seconds: float | None = None,
+        poll_timeout_seconds: float | None = None,
+    ) -> EvalRunResult: ...
+
+    async def run(
+        self,
+        *,
+        key: str,
+        dataset: str | Sequence[InlineDatasetRow],
+        handler: EvalHandler | None = None,
+        handlers: Sequence[EvalHandler] | None = None,
+        generation: GenerationConfig | GenerationOverrides | None = None,
+        ai_config: AIConfig | None = None,
+        tools: Sequence[EvalTool] | None = None,
+        criteria: list[Criterion] | None = None,
         concurrency: int = 10,
         poll_interval_seconds: float | None = None,
         poll_timeout_seconds: float | None = None,
@@ -139,17 +303,35 @@ class EvaluationsModule:
         """
         Create and run an evaluation in the caller's process.
 
-        Each dataset row is generated with ``handler``; every entry in
-        ``criteria`` — LaunchDarkly :class:`Judge` references and local
-        deterministic :class:`Scorer` functions — is then run against each
+        Each dataset row is generated by a handler; every entry in
+        ``criteria`` (LaunchDarkly :class:`Judge` references and local
+        deterministic :class:`Scorer` functions) is then run against each
         generated row, and one evaluation event is emitted per
         ``(row, criterion)`` result.
 
-        A :class:`Judge` is an independent AI Config and may be served by a
-        different provider or mode than ``generation``. ``handler`` runs a judge
-        only when it provides for that judge's provider; pass handlers for any
-        other providers your judges use in ``judge_handlers``. A judge no
-        handler covers fails the run before any records are created.
+        Pass one handler as ``handler`` or a list as ``handlers``, not both.
+        Each handler must declare ``provides_for``: build it with
+        ``create_handler()`` or a provider package's ``create_*_handler()``.
+        The generation config and each judge config select their handler by
+        provider and mode, so one list can hold an OpenAI handler for
+        generation and an Anthropic handler for a judge. The mode must match
+        exactly. A messages handler needs a ``messages`` prompt and an agent
+        handler needs an ``instructions`` prompt. Judges get no tools.
+
+        ``tools`` is a list of :class:`EvalTool`. Construct one to define a tool
+        in code. Call ``evals.tools.get(key, implementation=...)`` to use a
+        tool from the LaunchDarkly tool library, which reads the tool and pins
+        its version at that point. One list may hold both kinds. ``run`` reads
+        no tool from the API, and it checks the list before any network I/O.
+        Handlers receive a ``{key: executable}`` map either way.
+
+        ``dataset`` is either the key of a dataset stored in LaunchDarkly or
+        a sequence of inline rows. Inline rows are mappings in the
+        dataset-rows wire shape
+        (``input``, ``expectedOutput``, ``variables``, ``metadata``, optional
+        ``rowIdx``); each row's index is its position in the list. They are
+        uploaded to the run before any generation starts, and templates in
+        them render exactly as a stored dataset's do.
 
         The returned pass/fail result is derived from LaunchDarkly's run summary.
         A CI script can exit with ``0 if result.passed else 1`` after awaiting
@@ -157,40 +339,51 @@ class EvaluationsModule:
         and a wider ``poll_interval_seconds``; both default to
         ``SUMMARY_POLL_TIMEOUT_SECONDS`` / ``SUMMARY_POLL_INTERVAL_SECONDS``.
 
-        Pass ``ai_config`` to start from an existing AI Config
-        variation instead of a hand-built ``generation``. Its model, provider,
-        parameters, prompt and output format become the defaults, and anything
-        set in ``generation`` overrides them field by field (``parameters``
-        merge key by key). When ``tools`` is omitted the variation's tools are
-        used, so each needs an implementation; pass ``tools`` to replace the
-        set. When ``criteria`` is omitted the variation's attached judges run;
-        pass ``criteria`` (even ``[]``) to replace them.
+        ``generation`` must set ``provider``, ``model`` and ``mode``
+        (``"completion"`` or ``"agent"``). Pass ``ai_config`` instead to start
+        from an existing AI Config variation. The AI Config supplies the mode.
+        The variation's model, provider, parameters, prompt and output format
+        become the defaults, and ``generation`` can override them field by
+        field (``parameters`` merge key by key), except ``mode``. When
+        ``tools`` is omitted the variation's tools are used, so each needs an
+        implementation; pass ``tools`` to replace the set. When ``criteria`` is
+        omitted the variation's attached judges run; pass ``criteria`` (even
+        ``[]``) to replace them.
         """
         if poll_interval_seconds is None:
             poll_interval_seconds = SUMMARY_POLL_INTERVAL_SECONDS
         if poll_timeout_seconds is None:
             poll_timeout_seconds = SUMMARY_POLL_TIMEOUT_SECONDS
         self._validate_run_args(
-            project_key=project_key,
             key=key,
-            dataset=dataset,
-            handler=handler,
             concurrency=concurrency,
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
         )
+        pool = self._validate_handlers(handler, handlers)
+        inline_rows = self._validate_dataset_source(dataset)
         self._validate_config_source(generation=generation, ai_config=ai_config)
+        run_tools = list(tools or [])
+        validate_tools(run_tools, self._project_key)
+        run_tool_handlers = tool_handlers(run_tools)
         pinned_tool_versions: dict[str, int] = {}
         config_label = ""
-        if ai_config is not None:
-            config_label = f"{ai_config.key!r}/{ai_config.variation!r}"
-            ai_config_variation = await asyncio.to_thread(
-                self._runner._fetch_config_variation,
-                project_key,
-                ai_config.key,
-                ai_config.variation,
+        if ai_config is None:
+            run_generation = self._validate_generation(
+                cast(dict[str, Any], dict(generation or {}))
             )
-            generation = _merge_generation(ai_config_variation.generation, generation)
+            generation_handler = self._select_generation_handler(
+                pool, run_generation, "generation"
+            )
+        else:
+            config_label = f"{ai_config.key!r}/{ai_config.variation!r}"
+            (
+                run_generation,
+                generation_handler,
+                ai_config_variation,
+            ) = await self._read_ai_config(
+                ai_config, cast(GenerationOverrides | None, generation), pool
+            )
             if tools is None and ai_config_variation.tool_versions:
                 raise EvaluationsError(
                     f"AI Config variation {config_label} uses tools "
@@ -198,19 +391,26 @@ class EvaluationsModule:
                     + ", ".join(
                         repr(name) for name in ai_config_variation.tool_versions
                     )
-                    + ". Pass tools= with an implementation for each."
+                    + ". Pass tools= with an EvalTool for each."
                 )
+            # A caller who passes tools= replaces the variation's list, so an
+            # empty list runs the variation with no tools.
+            supplied = {tool.key for tool in run_tools}
+            for name in ai_config_variation.tool_versions:
+                if name not in supplied:
+                    logger.warning(
+                        "AI Config variation %s attaches tool %r, which this run "
+                        "does not use.",
+                        config_label,
+                        name,
+                    )
             pinned_tool_versions = ai_config_variation.tool_versions
             if criteria is None:
                 criteria = [
                     Judge(key=judge_key) for judge_key in ai_config_variation.judge_keys
                 ]
-        generation = self._validate_generation(generation)
-        run_tools = dict(tools or {})
         run_criteria = list(criteria or [])
-        run_judge_handlers = list(judge_handlers or [])
         self._validate_criteria(run_criteria)
-        self._validate_judge_handlers(run_judge_handlers)
         ld_judges = [
             criterion for criterion in run_criteria if isinstance(criterion, Judge)
         ]
@@ -218,58 +418,81 @@ class EvaluationsModule:
 
         # The management API client is synchronous; running it in a worker thread
         # keeps the caller's event loop free.
-        # Tool/judge verification is deliberately first: a typo must not create records.
-        resolved_tools = await asyncio.to_thread(
-            self._runner._resolve_tools, project_key, run_tools
-        )
-        # The tool API serves only the latest version, so a variation pinned to
-        # an older one is evaluated against the current schema.
+        # Judge verification is first: a typo must not create records.
+        # A variation pins a tool version. Compare it with the version the run
+        # uses, which tools.get() already read.
+        tools_by_key = {tool.key: tool for tool in run_tools}
         for tool_key, pinned_version in pinned_tool_versions.items():
-            resolved_tool = resolved_tools.get(tool_key)
-            if resolved_tool is not None and resolved_tool.version != pinned_version:
-                logger.warning(
-                    "AI Config variation %s pins tool %r at version %d; "
-                    "evaluating against the latest version %d.",
-                    config_label,
-                    tool_key,
-                    pinned_version,
-                    resolved_tool.version,
-                )
+            tool = tools_by_key.get(tool_key)
+            if tool is None or tool.version is None or tool.version == pinned_version:
+                continue
+            logger.warning(
+                "AI Config variation %s pins tool %r at version %d; "
+                "the run uses version %d.",
+                config_label,
+                tool_key,
+                pinned_version,
+                tool.version,
+            )
         resolved_judges = await self._runner._resolve_judges(
-            project_key, ld_judges, handler, run_judge_handlers
+            self._project_key, ld_judges, pool
         )
-        dataset_ref = await asyncio.to_thread(
-            self._runner._fetch_dataset, project_key, dataset
-        )
-        rows = await asyncio.to_thread(
-            self._runner._get_dataset_rows, project_key, dataset
-        )
+        if isinstance(dataset, str):
+            dataset_ref = await asyncio.to_thread(
+                self._runner._fetch_dataset, self._project_key, dataset
+            )
+            dataset_rows = await asyncio.to_thread(
+                self._runner._get_dataset_rows, self._project_key, dataset
+            )
+        else:
+            dataset_ref = DatasetRef(id=None, key=None)
+            dataset_rows = [_render_inline_row(row) for row in inline_rows]
         evaluation = await asyncio.to_thread(
             self._runner._create_evaluation,
-            project_key,
+            self._project_key,
             key,
-            generation,
-            resolved_tools,
+            run_generation,
+            run_tools,
             run_criteria,
         )
         evaluation_run = await asyncio.to_thread(
             self._runner._create_evaluation_run,
-            project_key,
+            self._project_key,
             evaluation.id,
             dataset_ref.id,
         )
-        config = self._runner._build_handler_config(generation, resolved_tools)
+        if not isinstance(dataset, str):
+            # Must finish before any event is tracked: the run starts with a
+            # placeholder row count of 1, so a result counted before the rows
+            # land would mark the run complete.
+            try:
+                await asyncio.to_thread(
+                    self._runner._upload_dataset_rows,
+                    self._project_key,
+                    evaluation.id,
+                    evaluation_run.id,
+                    inline_rows,
+                )
+            except Exception:
+                # The API cannot mark a run failed; cancelling is the only
+                # terminal state a client can set, and it keeps the run from
+                # sitting PENDING with a partial dataset.
+                await self._cancel_run_after_failed_upload(
+                    self._project_key, evaluation.id, evaluation_run.id
+                )
+                raise
+        config = self._runner._build_handler_config(run_generation, run_tools)
         results = await self._runner._run_rows(
-            rows,
-            handler,
+            dataset_rows,
+            generation_handler,
             config,
-            run_tools,
+            run_tool_handlers,
             concurrency,
         )
         try:
             self._runner._emit_generation_events(
                 client,
-                project_key=project_key,
+                project_key=self._project_key,
                 evaluation=evaluation,
                 evaluation_run=evaluation_run,
                 dataset=dataset_ref,
@@ -278,14 +501,13 @@ class EvaluationsModule:
             if run_criteria:
                 criterion_results = await self._runner._run_criteria_for_results(
                     results,
-                    run_tools,
                     run_criteria,
                     resolved_judges,
                     concurrency,
                 )
                 self._runner._emit_evaluation_events(
                     client,
-                    project_key=project_key,
+                    project_key=self._project_key,
                     evaluation=evaluation,
                     evaluation_run=evaluation_run,
                     dataset=dataset_ref,
@@ -298,15 +520,14 @@ class EvaluationsModule:
             if inspect.isawaitable(flush_result):
                 await flush_result
         summary = await self._poll_summary_until_terminal(
-            project_key,
             evaluation.id,
             evaluation_run.id,
             poll_interval_seconds,
             poll_timeout_seconds,
         )
         url = (
-            f"{self._ui_base_uri}/projects/{_segment(project_key)}/ai/evaluations/"
-            f"{_segment(evaluation.id)}/runs/{_segment(evaluation_run.id)}"
+            f"{self._ui_base_uri}/projects/{segment(self._project_key)}/ai/evaluations/"
+            f"{segment(evaluation.id)}/runs/{segment(evaluation_run.id)}"
         )
         return EvalRunResult(
             # failed_rows counts rows whose criteria were scored and did not
@@ -326,7 +547,6 @@ class EvaluationsModule:
 
     async def _poll_summary_until_terminal(
         self,
-        project_key: str,
         evaluation_id: str,
         run_id: str,
         poll_interval_seconds: float,
@@ -336,7 +556,7 @@ class EvaluationsModule:
         last_summary = None
         while True:
             last_summary = await asyncio.to_thread(
-                self._runner._get_summary, project_key, evaluation_id, run_id
+                self._runner._get_summary, self._project_key, evaluation_id, run_id
             )
             if _is_terminal_summary(last_summary):
                 return last_summary
@@ -407,45 +627,140 @@ class EvaluationsModule:
             )
 
     @staticmethod
-    def _validate_judge_handlers(judge_handlers: list[EvalHandler]) -> None:
-        """Reject judge handlers that cannot be routed by provider and mode.
+    def _validate_handlers(
+        handler: EvalHandler | None,
+        handlers: Sequence[EvalHandler] | None,
+    ) -> list[EvalHandler]:
+        """Return the handler pool, or raise when the arguments are invalid.
 
-        A judge handler is only ever chosen by matching its ``provides_for``
-        against the judge's resolved provider and mode. One without that
-        metadata could never be selected, so it would silently fall through to
-        the generation handler instead of running the judge it was passed for.
+        Exactly one of ``handler`` and ``handlers`` is required. Every handler
+        must be callable and declare ``provides_for``, and no two handlers may
+        declare the same provider and mode.
         """
-        for index, candidate in enumerate(judge_handlers):
+        if handler is not None and handlers is not None:
+            raise EvaluationsError("Pass handler or handlers, not both")
+        if handler is None and handlers is None:
+            raise EvaluationsError(
+                "Pass handler (one handler) or handlers (a list of handlers)"
+            )
+        named: list[tuple[str, EvalHandler]]
+        if handler is not None:
+            named = [("handler", handler)]
+        else:
+            if not isinstance(handlers, list | tuple):
+                raise EvaluationsError("handlers must be a list of handlers")
+            if not handlers:
+                raise EvaluationsError("handlers must not be empty")
+            named = [
+                (f"handlers[{index}]", item) for index, item in enumerate(handlers)
+            ]
+        seen: dict[tuple[str, str], str] = {}
+        for name, candidate in named:
             if not callable(candidate):
-                raise EvaluationsError(f"judge_handlers[{index}] must be callable")
-            if _provides_for(candidate) is None:
+                raise EvaluationsError(f"{name} must be callable")
+            provides_for = _provides_for(candidate)
+            if provides_for is None:
                 raise EvaluationsError(
-                    f"judge_handlers[{index}] does not declare provides_for. "
-                    "Build judge handlers with create_handler() (or a provider "
-                    "package's create_*_handler()) so they can be matched to a "
-                    "judge's provider and mode."
+                    f"{name} does not declare provides_for. Build it with "
+                    "create_handler() or a provider package's create_*_handler() "
+                    "so that it can be matched to a config's provider and mode."
                 )
+            if provides_for in seen:
+                raise EvaluationsError(
+                    f"{seen[provides_for]} and {name} both provide for "
+                    f"{provides_for!r}. Pass one handler for each provider and mode."
+                )
+            seen[provides_for] = name
+        return [candidate for _, candidate in named]
+
+    @staticmethod
+    def _select_generation_handler(
+        pool: list[EvalHandler],
+        generation: GenerationConfig,
+        label: str,
+    ) -> EvalHandler:
+        """Select the generation handler, or raise when none matches.
+
+        Also raises when the prompt does not match the handler's mode.
+        """
+        mode = _handler_mode(generation["mode"])
+        selected = select_eval_handler(pool, generation["provider"], mode)
+        if selected is None:
+            raise EvaluationsError(
+                f"No handler can run {label}: it needs provider "
+                f"{generation['provider']!r} in {generation['mode']!r} mode "
+                f"({mode!r} handlers). The handlers provide for: "
+                f"{describe_handlers(pool)}."
+            )
+        prompt_error = prompt_mode_error(generation, mode)
+        if prompt_error is not None:
+            raise EvaluationsError(
+                f"The {label} {prompt_error}. Handler: {_provides_for(selected)!r}."
+            )
+        return selected
+
+    async def _read_ai_config(
+        self,
+        ai_config: AIConfig,
+        overrides: GenerationOverrides | None,
+        pool: list[EvalHandler],
+    ) -> tuple[GenerationConfig, EvalHandler, AIConfigVariation]:
+        """Read an AI Config variation and select its generation handler.
+
+        Each check runs as soon as the read that supplies its input returns:
+        the mode after the AI Config read, the prompt after the variation
+        read, and the provider after the model config read.
+        """
+        label = f"AI Config {ai_config.key!r} variation {ai_config.variation!r}"
+        config_mode = await asyncio.to_thread(
+            self._runner._fetch_ai_config_mode, self._project_key, ai_config.key
+        )
+        mode = normalize_mode(config_mode)
+        if not any(
+            (provides_for := _provides_for(candidate)) is not None
+            and provides_for[1] == mode
+            for candidate in pool
+        ):
+            raise EvaluationsError(
+                f"AI Config {ai_config.key!r} is in {config_mode!r} mode, which "
+                f"needs a handler in {mode!r} mode. The handlers provide for: "
+                f"{describe_handlers(pool)}."
+            )
+        latest = await asyncio.to_thread(
+            self._runner._fetch_config_variation,
+            self._project_key,
+            ai_config.key,
+            ai_config.variation,
+        )
+        prompt = _merge_generation(
+            AIConfigVariation.from_api(latest, None, mode).generation, overrides
+        )
+        prompt_error = prompt_mode_error(prompt, mode)
+        if prompt_error is not None:
+            raise EvaluationsError(
+                f"{label} is in {config_mode!r} mode: the {prompt_error}."
+            )
+        model_config = await asyncio.to_thread(
+            self._runner._fetch_linked_model_config, self._project_key, latest
+        )
+        variation = AIConfigVariation.from_api(latest, model_config, mode)
+        merged = _merge_generation(variation.generation, overrides)
+        merged["mode"] = "agent" if mode == "agent" else "completion"
+        generation = self._validate_generation(merged)
+        handler = self._select_generation_handler(pool, generation, label)
+        return generation, handler, variation
 
     @staticmethod
     def _validate_run_args(
         *,
-        project_key: str,
         key: str,
-        dataset: str,
-        handler: EvalHandler,
         concurrency: int,
         poll_interval_seconds: float,
         poll_timeout_seconds: float,
     ) -> None:
-        for name, value in (
-            ("project_key", project_key),
-            ("key", key),
-            ("dataset", dataset),
-        ):
+        for name, value in (("key", key),):
             if not value.strip():
                 raise EvaluationsError(f"{name} must not be blank")
-        if not callable(handler):
-            raise EvaluationsError("handler must be callable")
         if concurrency < 1:
             raise EvaluationsError("concurrency must be at least 1")
         for name, seconds in (
@@ -458,10 +773,49 @@ class EvaluationsModule:
             if seconds < 0:
                 raise EvaluationsError(f"{name} must not be negative")
 
+    async def _cancel_run_after_failed_upload(
+        self, project_key: str, evaluation_id: str, run_id: str
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self._runner._cancel_evaluation_run,
+                project_key,
+                evaluation_id,
+                run_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to cancel evaluation run %s after its inline dataset "
+                "upload failed",
+                run_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _validate_dataset_source(
+        dataset: str | Sequence[InlineDatasetRow],
+    ) -> list[DatasetRow]:
+        """Validate the dataset source, returning any inline rows raw.
+
+        A ``str`` is itself a ``Sequence``, so it is always read as a dataset
+        key, never as one row per character. The list is
+        empty for a hosted dataset; an inline one is never empty.
+        """
+        if not isinstance(dataset, Sequence):
+            raise EvaluationsError(
+                "dataset must be a LaunchDarkly dataset key or a sequence of "
+                "inline rows"
+            )
+        if isinstance(dataset, str):
+            if not dataset.strip():
+                raise EvaluationsError("dataset must not be blank")
+            return []
+        return _normalize_inline_rows(dataset)
+
     @staticmethod
     def _validate_config_source(
         *,
-        generation: GenerationConfig | None,
+        generation: GenerationConfig | GenerationOverrides | None,
         ai_config: AIConfig | None,
     ) -> None:
         """Require a generation source before any request is made."""
@@ -472,6 +826,11 @@ class EvaluationsModule:
                     "Config variation"
                 )
             return
+        if generation is not None and "mode" in generation:
+            raise EvaluationsError(
+                "generation.mode cannot be set with ai_config: the AI Config "
+                "supplies the mode"
+            )
         for name, value in (
             ("ai_config.key", ai_config.key),
             ("ai_config.variation", ai_config.variation),
@@ -480,39 +839,58 @@ class EvaluationsModule:
                 raise EvaluationsError(f"{name} must not be blank")
 
     @staticmethod
-    def _validate_generation(generation: GenerationConfig | None) -> GenerationConfig:
+    def _validate_generation(generation: Mapping[str, Any]) -> GenerationConfig:
         """Check the final generation settings, after any fetched variation is merged."""
-        if generation is None:
-            raise EvaluationsError(
-                "Pass generation, or ai_config to evaluate an existing AI "
-                "Config variation"
-            )
         provider = generation.get("provider")
         model = generation.get("model")
         if not isinstance(provider, str) or not provider.strip():
             raise EvaluationsError("generation.provider is required")
         if not isinstance(model, str) or not model.strip():
             raise EvaluationsError("generation.model is required")
+        mode = generation.get("mode")
+        if mode is None:
+            raise EvaluationsError(
+                "generation.mode is required. Set it to 'completion' or 'agent'."
+            )
+        if mode not in GENERATION_MODES:
+            raise EvaluationsError(
+                f"generation.mode must be 'completion' or 'agent', got {mode!r}"
+            )
         if "instructions" in generation and "messages" in generation:
             raise EvaluationsError(
                 "generation.instructions and generation.messages are mutually exclusive"
             )
-        return generation
+        return cast(GenerationConfig, dict(generation))
 
 
 def init_evaluations(
-    api_token: str | None = None,
+    project_key: str | None = None,
+    api_key: str | None = None,
     sdk_key: str | None = None,
-    base_uri: str | None = None,
+    api_base_uri: str | None = None,
     ui_base_uri: str | None = None,
     transport: Transport = urllib_transport,
 ) -> EvaluationsModule:
-    """Resolve credentials and construct the evaluations module."""
-    token = api_token or _env("LD_API_TOKEN")
+    """Resolve credentials and construct the evaluations module.
+
+    ``project_key`` names the project that holds the evaluations, the tools,
+    and the datasets this module uses.
+    """
+    from ..sdk_usage import report_usage
+
+    report_usage("experimental.initEvaluations")
+    resolved_project_key = (project_key or "").strip() or _env("LD_PROJECT_KEY")
+    if not resolved_project_key:
+        raise EvaluationsError(
+            "No LaunchDarkly project key provided. Set the LD_PROJECT_KEY "
+            "environment variable or pass project_key to init_evaluations()."
+        )
+
+    token = api_key or _env("LD_API_TOKEN")
     if not token:
         raise EvaluationsError(
-            "No LaunchDarkly API access token provided. Set the LD_API_TOKEN "
-            "environment variable or pass api_token to init_evaluations()."
+            "No LaunchDarkly API key provided. Set the LD_API_TOKEN "
+            "environment variable or pass api_key to init_evaluations()."
         )
 
     resolved_sdk_key = sdk_key or _env("LD_SDK_KEY")
@@ -529,12 +907,13 @@ def init_evaluations(
             )
 
     api_client = LDApiClient(
-        api_token=token,
-        base_uri=base_uri or _env("LD_API_BASE_URI") or DEFAULT_BASE_URI,
+        api_key=token,
+        base_uri=_resolve_host(api_base_uri, "LD_API_BASE_URI", DEFAULT_BASE_URI),
         transport=transport,
     )
     return EvaluationsModule(
         api_client=api_client,
+        project_key=resolved_project_key,
         sdk_key=resolved_sdk_key,
-        ui_base_uri=ui_base_uri or _env("LD_UI_BASE_URI") or DEFAULT_UI_BASE_URI,
+        ui_base_uri=_resolve_host(ui_base_uri, "LD_UI_BASE_URI", DEFAULT_UI_BASE_URI),
     )

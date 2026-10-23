@@ -90,6 +90,17 @@
         "aiCompletionConfig": { "introduced": "0.1" }
       }
     },
+    "python-ai-typesafe": {
+      "name": "TypeSafe Jev AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/typesafe",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-typesafe"],
+      "releases": { "tag-prefix": "launchdarkly-ai-typesafe-" },
+      "features": {
+        "aiJudgeConfig": { "introduced": "0.1" }
+      }
+    },
     "python-ai-langchain-agents": {
       "name": "LangChain Agents AI SDK for Python",
       "type": "ai-provider",
@@ -97,6 +108,66 @@
       "languages": ["Python"],
       "aiSdkNames": ["launchdarkly-ai-langchain-agents"],
       "releases": { "tag-prefix": "launchdarkly-ai-langchain-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-opencode-agents": {
+      "name": "OpenCode Agents AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/opencode-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-opencode-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-opencode-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-vercel-messages": {
+      "name": "Vercel Messages AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/vercel-messages",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-vercel-messages"],
+      "releases": { "tag-prefix": "launchdarkly-ai-vercel-messages-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-litellm-messages": {
+      "name": "LiteLLM Messages AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/litellm-messages",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-litellm-messages"],
+      "releases": { "tag-prefix": "launchdarkly-ai-litellm-messages-" },
+      "features": {
+        "aiCompletionConfig": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-vercel-agents": {
+      "name": "Vercel Agents AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/vercel-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-vercel-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-vercel-agents-" },
+      "features": {
+        "aiAgentConfig": { "introduced": "0.1" },
+        "aiAgentGraph": { "introduced": "0.1" },
+        "aiTrackMetrics": { "introduced": "0.1" }
+      }
+    },
+    "python-ai-litellm-agents": {
+      "name": "LiteLLM Agents AI SDK for Python",
+      "type": "ai-provider",
+      "path": "packages/litellm-agents",
+      "languages": ["Python"],
+      "aiSdkNames": ["launchdarkly-ai-litellm-agents"],
+      "releases": { "tag-prefix": "launchdarkly-ai-litellm-agents-" },
       "features": {
         "aiAgentConfig": { "introduced": "0.1" },
         "aiAgentGraph": { "introduced": "0.1" },

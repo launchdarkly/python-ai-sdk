@@ -3,10 +3,9 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.4"  # x-release-please-version
-
 from launchdarkly_ai_server import register_ai_sdk_package
 
+from ._version import PACKAGE_NAME, __version__
 from .graph import langchain_graph
 from .handler import create_langchain_agents_handler, langchain_agents
 from .native_graph import to_lang_graph
@@ -18,4 +17,4 @@ __all__ = [
     "to_lang_graph",
 ]
 
-register_ai_sdk_package("launchdarkly-ai-langchain-agents", __version__)
+register_ai_sdk_package(PACKAGE_NAME, __version__)

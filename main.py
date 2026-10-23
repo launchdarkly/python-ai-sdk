@@ -6,6 +6,7 @@ Usage:
 
 Examples:
     python main.py agent                    launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
+    python main.py capture-content          launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py streaming                launch-darkly-documentation-summarizer "Summarise feature flags in 3 bullets"
     python main.py judge                    launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py graph                    my-agent-graph "What is the LaunchDarkly AI SDK?"
@@ -13,10 +14,13 @@ Examples:
     python main.py graph-streaming          travel-agent-flow "I was double charged for my flight"
     python main.py openai-only              my-openai-flag "Tell me about feature flags"
     python main.py langchain                my-langchain-flag "Tell me about feature flags"
+    python main.py litellm                  my-litellm-flag "Tell me about feature flags"
     python main.py claude-agents            launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py openai-agents            launch-darkly-documentation-summarizer-open-ai-only "What is the LaunchDarkly AI SDK?"
     python main.py langchain-agents         launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py langchain-thinking       launch-darkly-documentation-summarizer-messages-claude "Reason it out yourself without any tools: what is 17 times 23?"
+    python main.py vercel-messages          launch-darkly-documentation-summarizer-messages "What is the LaunchDarkly AI SDK?"
+    python main.py vercel-direct            launch-darkly-documentation-summarizer-messages-openai "What is the LaunchDarkly AI SDK?"
     python main.py native-graph             travel-agent-flow "Book me a flight to Paris"
     python main.py native-graph-langchain   travel-agent-flow "Book me a flight to Paris"
 """
@@ -44,6 +48,7 @@ ExampleFn = Callable[[str, str], Coroutine[Any, Any, None]]
 
 EXAMPLES: dict[str, str] = {
     "agent": "examples.agent",
+    "capture-content": "examples.capture_content",
     "streaming": "examples.streaming",
     "graph": "examples.graph_example",
     "graph-history": "examples.graph_history",
@@ -60,8 +65,15 @@ EXAMPLES: dict[str, str] = {
     "langchain-agents": "examples.langchain_agents_example",
     "langchain-messages": "examples.langchain_messages_example",
     "langchain-thinking": "examples.langchain_thinking",
+    "litellm": "examples.litellm_example",
+    "litellm-agents": "examples.litellm_agents_example",
+    "litellm-messages": "examples.litellm_messages_example",
+    "vercel-agents": "examples.vercel_agents_example",
+    "vercel-direct": "examples.vercel_direct",
+    "vercel-messages": "examples.vercel_messages_example",
     "native-graph": "examples.native_graph",
     "native-graph-langchain": "examples.native_graph_langchain",
+    "native-graph-vercel": "examples.native_graph_vercel",
 }
 
 DEFAULT_EXAMPLE = "agent"
@@ -99,10 +111,17 @@ async def main() -> None:
     await shutdown()
 
 
+def _error_message(exc: BaseException) -> str:
+    """Expose a sole nested provider error instead of an opaque TaskGroup wrapper."""
+    if isinstance(exc, BaseExceptionGroup) and len(exc.exceptions) == 1:
+        return _error_message(exc.exceptions[0])
+    return str(exc)
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as exc:
         sys.stdout.flush()
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error: {_error_message(exc)}", file=sys.stderr)
         sys.exit(1)

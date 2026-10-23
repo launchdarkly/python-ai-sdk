@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -12,21 +12,29 @@ from launchdarkly_ai_server import (
     RunUsage,
     SpanMessage,
     SpanMessagePart,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    tool_result_string,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.responses import map_responses_event
+from launchdarkly_ai_server.utils import model_parameters
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     fail_span,
     finish_model_span,
@@ -45,6 +53,165 @@ from .spans import (
     to_tool_definitions,
     tool_arguments,
 )
+
+#: Every key ``AsyncResponses.create``/``.stream`` accept, classified by hand into exactly one of:
+#: forwarded (below), handler-owned (``model``, ``input``, ``previous_response_id``, ``tools``,
+#: ``text``, set by each call site itself), or excluded (below).
+#: ``TestResponsesCreateAcceptsExactlyTheseKeys`` / ``TestResponsesStreamAcceptsExactlyTheseKeys``
+#: in this package's tests assert this classification stays exhaustive as the SDK's own signatures
+#: change. The UI offers several keys the Responses API has never accepted: ``max_tokens``,
+#: ``frequency_penalty``, ``presence_penalty``, ``seed``, ``n``, ``stop``, ``response_format``,
+#: ``logit_bias``, ``logprobs``, ``max_completion_tokens``, ``audio``, ``modalities``,
+#: ``prediction``. Of those, ``max_tokens``/``max_completion_tokens`` are renamed to
+#: ``max_output_tokens`` (see :func:`_apply_max_output_tokens_rename`); the rest are dropped.
+#:
+#: The UI writes reasoning effort as ``reasoning: {"effort": ...}``, the Responses API's own shape,
+#: so ``reasoning`` is forwarded with its ``effort`` and ``summary`` (see :func:`_rebuild_reasoning`)
+#: and no top-level ``reasoning_effort`` is read.
+#:
+#: This is the cross-SDK list for OpenAI Messages (TESTING.md section 1.12). The same list serves
+#: ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves the
+#: same whichever is called. ``max_tool_calls`` is marked not supported in TypeScript there: the JS
+#: ``openai`` SDK's ``responses.create`` has no such parameter, while this SDK's ``create`` and
+#: ``stream`` both take it.
+_RESPONSES_FORWARDED_KEYS = frozenset(
+    {
+        "max_output_tokens",
+        "max_tool_calls",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "reasoning",
+        "service_tier",
+        "temperature",
+        "tool_choice",
+        "top_logprobs",
+        "top_p",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to the API.
+_RESPONSES_MAPPING_KEYS = frozenset({"reasoning"})
+
+#: Accepted by the API but never forwarded, and why:
+#: * ``stream``, ``stream_options``: runtime wiring. The handler chooses blocking vs. streaming
+#:   itself, and ``stream_options`` only means something together with ``stream=True``.
+#: * ``background``: runtime wiring. It returns before the output exists, so the handler would get
+#:   no result.
+#: * ``include``: API-shape switch. It adds output items the handler does not read, such as
+#:   encrypted reasoning or search results.
+#: * ``conversation``, ``context_management``, ``truncation``: server-side state. They carry, trim
+#:   or compact conversation state the server keeps, which conflicts with the input the handler
+#:   builds.
+#: * ``response_id``, ``starting_after``: server-side state. Only ``.stream`` accepts them, to
+#:   resume an existing response rather than start a new one, and ``invoke`` has no equivalent.
+#: * ``store``, ``prompt_cache_retention``: data retention. They decide whether, and for how long,
+#:   the request and its cache stay on the server.
+#: * ``metadata``, ``user``, ``safety_identifier``: identity and attribution. They say who the
+#:   request is for.
+#: * ``prompt``, ``instructions``: prompt content beyond the config's instructions. The handler
+#:   builds the input from the config's own instructions and messages, and a server-side prompt
+#:   template or a second instructions string would replace or add to it.
+#: * ``moderation``: safety configuration.
+#: * ``text_format``: API-shape switch. Only ``.stream`` accepts it, and it is a Python type to
+#:   parse into, which a config cannot express. Structured output goes through ``text``, which the
+#:   handler owns.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_RESPONSES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",
+        "stream_options",
+        "background",
+        "include",
+        "conversation",
+        "context_management",
+        "truncation",
+        "response_id",
+        "starting_after",
+        "store",
+        "prompt_cache_retention",
+        "metadata",
+        "user",
+        "safety_identifier",
+        "prompt",
+        "instructions",
+        "moderation",
+        "text_format",
+        "timeout",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+    }
+)
+
+
+def _apply_max_output_tokens_rename(params: dict[str, Any]) -> dict[str, Any]:
+    """Renames the Chat-Completions-era ``max_tokens``/``max_completion_tokens`` to the Responses
+    API's ``max_output_tokens``, the only one of the three the API actually accepts.
+
+    Precedence when more than one is set: an explicit ``max_output_tokens`` wins outright, then
+    ``max_completion_tokens``, then ``max_tokens``.
+    """
+    max_tokens = params.pop("max_tokens", None)
+    max_completion_tokens = params.pop("max_completion_tokens", None)
+    if "max_output_tokens" not in params:
+        if max_completion_tokens is not None:
+            params["max_output_tokens"] = max_completion_tokens
+        elif max_tokens is not None:
+            params["max_output_tokens"] = max_tokens
+    return params
+
+
+#: The ``reasoning`` sub-keys forwarded, the same two the JS SDK keeps. The deprecated
+#: ``generate_summary`` spelling and anything else are dropped.
+_REASONING_KEYS = ("effort", "summary")
+
+
+def _rebuild_reasoning(params: dict[str, Any]) -> dict[str, Any]:
+    """Keeps only ``effort`` and ``summary`` of a forwarded ``reasoning`` object, and drops a
+    ``reasoning`` with neither."""
+    if "reasoning" in params:
+        reasoning = params.pop("reasoning")
+        kept = {
+            k: reasoning[k] for k in _REASONING_KEYS if reasoning.get(k) is not None
+        }
+        if kept:
+            params["reasoning"] = kept
+    return params
+
+
+def _drop_malformed_tool_choice(params: dict[str, Any]) -> dict[str, Any]:
+    """Drops a ``tool_choice`` that is neither a mode string (``auto``, ``none``, ``required``)
+    nor an object with a string ``type``, the two shapes the Responses API takes. The JS SDK's
+    ``isToolChoice`` applies the same check."""
+    if "tool_choice" in params:
+        value = params["tool_choice"]
+        typed = isinstance(value, Mapping) and isinstance(value.get("type"), str)
+        if not (isinstance(value, str) or typed):
+            del params["tool_choice"]
+    return params
+
+
+def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that reach ``responses.create``/``.stream``:
+    ``max_tokens``/``max_completion_tokens`` renamed to ``max_output_tokens``, then only
+    :data:`_RESPONSES_FORWARDED_KEYS`, with malformed object values dropped and ``reasoning``
+    narrowed to ``effort`` and ``summary``, and a malformed ``tool_choice`` dropped. ``invoke`` and
+    ``stream`` both call this, so they forward the same keys.
+    """
+    return _drop_malformed_tool_choice(
+        _rebuild_reasoning(
+            select_forwarded_parameters(
+                _apply_max_output_tokens_rename(model_parameters(config)),
+                _RESPONSES_FORWARDED_KEYS,
+                mapping_keys=_RESPONSES_MAPPING_KEYS,
+            )
+        )
+    )
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -210,15 +377,28 @@ async def _run_model_turn(
     return response
 
 
-def create_openai_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_openai_messages_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for OpenAI (responses API).
     Requires ``openai`` to be installed as a peer dependency.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
+    report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
+    return _create_openai_messages_handler(capture_content=capture_content)
+
+
+def _create_openai_messages_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
+    """Non-reporting :func:`create_openai_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
     import importlib
 
     openai_mod = importlib.import_module("openai")
@@ -231,6 +411,8 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         th = tool_handlers or {}
         vs = variables or {}
 
@@ -261,7 +443,9 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                 messages=root_messages,
             )
 
+            extra_params = _forwarded_parameters(config)
             params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": input_messages,
             }
@@ -333,7 +517,7 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                         {
                             "type": "function_call_output",
                             "call_id": tc.call_id,
-                            "output": str(result),
+                            "output": tool_result_string(result),
                         }
                     )
 
@@ -341,6 +525,7 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
                     client,
                     config,
                     {
+                        **extra_params,
                         "model": config["model"]["name"],
                         "previous_response_id": response.id,
                         "input": tool_outputs,
@@ -404,14 +589,14 @@ def create_openai_messages_handler(*, capture_content: bool = False) -> Provider
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("OpenAI", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -458,6 +643,7 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
     try:
         tools = _build_tools(config.get("tools") or {})
         input_messages = _build_input_messages(config, user_input, variables, history)
@@ -475,6 +661,7 @@ async def _stream_gen(
         previous_response_id: str | None = None
         current_input: Any = input_messages
         steps = 0
+        item_to_call: dict[str, str] = {}
 
         while True:
             model_span = start_model_span(config, parent)
@@ -489,7 +676,9 @@ async def _stream_gen(
                     tool_definitions=tool_definitions,
                 )
 
+            extra_params = _forwarded_parameters(config)
             stream_params: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "input": current_input,
             }
@@ -505,10 +694,10 @@ async def _stream_gen(
                 stream = client.responses.stream(**stream_params)
                 async with stream as s:
                     async for event in s:
-                        if getattr(event, "type", None) == "response.output_text.delta":
-                            text = getattr(event, "delta", "")
-                            full_output += text
-                            yield {"type": "chunk", "text": text}
+                        for rich in map_responses_event(event, emitter, item_to_call):
+                            if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                                full_output += rich.get("delta") or ""
+                            yield rich
 
                     final_resp = await s.get_final_response()
 
@@ -538,6 +727,10 @@ async def _stream_gen(
                 if getattr(item, "type", None) == "function_call"
             ]
             if not tool_calls:
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -547,6 +740,13 @@ async def _stream_gen(
             steps += 1
 
             previous_response_id = getattr(final_resp, "id", None)
+            for tc in tool_calls:
+                for rich in emitter.tool_start(str(tc.call_id), str(tc.name)):
+                    yield rich
+                for rich in emitter.tool_end(str(tc.call_id), arguments=tc.arguments):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             tool_outputs = []
             for tc in tool_calls:
                 tool_span = start_tool_span(tc.name, tc.call_id, parent)
@@ -579,11 +779,16 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                # The model is sent tool_result_string(result). The stream reports that same text.
+                for rich in emitter.tool_result(
+                    str(tc.call_id), tool_result_string(result)
+                ):
+                    yield rich
                 tool_outputs.append(
                     {
                         "type": "function_call_output",
                         "call_id": tc.call_id,
-                        "output": str(result),
+                        "output": tool_result_string(result),
                     }
                 )
             current_input = tool_outputs
@@ -613,6 +818,10 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, last_response_model, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -641,10 +850,11 @@ def openai_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("openai-messages.openaiMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    return _config(
         key=config_key,
-        handler=create_openai_messages_handler(capture_content=capture_content),
+        handler=_create_openai_messages_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

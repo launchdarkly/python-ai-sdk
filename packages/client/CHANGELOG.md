@@ -1,5 +1,83 @@
 # Changelog
 
+## [0.4.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.3.0...launchdarkly-ai-server-0.4.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **evaluations:** keep the management API client internal ([#202](https://github.com/launchdarkly/python-ai-sdk/issues/202))
+* **evaluations:** rename base uri to match spec ([#199](https://github.com/launchdarkly/python-ai-sdk/issues/199))
+* **evaluations:** add test proving harness edge case matches spec ([#200](https://github.com/launchdarkly/python-ai-sdk/issues/200))
+* **evaluations:** route handlers by provider and mode
+* **evaluations:** mark evaluations from code as experimental ([#157](https://github.com/launchdarkly/python-ai-sdk/issues/157))
+
+### Experimental
+
+* **evaluations:** add test proving harness edge case matches spec ([#200](https://github.com/launchdarkly/python-ai-sdk/issues/200)) ([fa7162e](https://github.com/launchdarkly/python-ai-sdk/commit/fa7162ec3b690ec7800106f5be71398d7c84f49f))
+* **evaluations:** keep the management API client internal ([#202](https://github.com/launchdarkly/python-ai-sdk/issues/202)) ([17270ed](https://github.com/launchdarkly/python-ai-sdk/commit/17270ed9aa3e3000badd3d92d4011b916fad8f04))
+* **evaluations:** mark evaluations from code as experimental ([#157](https://github.com/launchdarkly/python-ai-sdk/issues/157)) ([1389765](https://github.com/launchdarkly/python-ai-sdk/commit/138976570f6893ffae82aa909a79803d142d566c))
+* **evaluations:** rename base uri to match spec ([#199](https://github.com/launchdarkly/python-ai-sdk/issues/199)) ([7d93f9c](https://github.com/launchdarkly/python-ai-sdk/commit/7d93f9c64d708950d83d86f9dfb89f553538d66f))
+* **evaluations:** route handlers by provider and mode ([f62591f](https://github.com/launchdarkly/python-ai-sdk/commit/f62591f9a057d5f9f1ebeabde30b83065020abc7))
+* **evaluations:** Set JSON as standard for output to pass to judge ([#203](https://github.com/launchdarkly/python-ai-sdk/issues/203)) ([ffc728b](https://github.com/launchdarkly/python-ai-sdk/commit/ffc728be95370cca7793cacdb1ead0231334bd5d))
+* **skills:** Correct the HTTP 403 advice now that server-side FDv2 is available to every account ([#178](https://github.com/launchdarkly/python-ai-sdk/issues/178)) ([b17e322](https://github.com/launchdarkly/python-ai-sdk/commit/b17e3220d6576c54ba4ebc7d46f82236557dc8e5))
+
+
+### Features
+
+* **agui:** add a shared reader for handler streams ([#164](https://github.com/launchdarkly/python-ai-sdk/issues/164)) ([fc08dd5](https://github.com/launchdarkly/python-ai-sdk/commit/fc08dd5ce7ab6848934b57718e84dbd2ef2a9510))
+* **AIC-3534:** add a TypeSafe Jev judge handler ([#149](https://github.com/launchdarkly/python-ai-sdk/issues/149)) ([1b41ea4](https://github.com/launchdarkly/python-ai-sdk/commit/1b41ea40a13580a5024b3d478e59effcdaf3e9db))
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+* **langchain:** emit AG-UI text and tool events ([#163](https://github.com/launchdarkly/python-ai-sdk/issues/163)) ([ab5e9e1](https://github.com/launchdarkly/python-ai-sdk/commit/ab5e9e172fd33d26a15c26e84a75b01df31ea54c))
+* **openai:** emit AG-UI text and tool events ([#161](https://github.com/launchdarkly/python-ai-sdk/issues/161)) ([2b1b2d4](https://github.com/launchdarkly/python-ai-sdk/commit/2b1b2d4184959afcb444effa0e92f6ca8703c93d))
+
+
+### Bug Fixes
+
+* **AIC-3570:** re-resolve graph flags on every invoke and stream ([#187](https://github.com/launchdarkly/python-ai-sdk/issues/187)) ([8fdc4d4](https://github.com/launchdarkly/python-ai-sdk/commit/8fdc4d4955bda03ada17c38b72e952a3b8a65a4a))
+* **AIC-3571:** visit every child before its parent in reverse_traverse ([#189](https://github.com/launchdarkly/python-ai-sdk/issues/189)) ([87c73d9](https://github.com/launchdarkly/python-ai-sdk/commit/87c73d9857ced5b916753f80caa943f43e3b31ff))
+* **AIC-3572:** treat a variation without _ldMeta.enabled as disabled ([#184](https://github.com/launchdarkly/python-ai-sdk/issues/184)) ([7a0d260](https://github.com/launchdarkly/python-ai-sdk/commit/7a0d260c5f5bb65360d2332ac6d74ed21309767f))
+* **AIC-3574:** build the LaunchDarkly client off the event loop ([#185](https://github.com/launchdarkly/python-ai-sdk/issues/185)) ([bf03b6c](https://github.com/launchdarkly/python-ai-sdk/commit/bf03b6c1320c26854e51aef3d02784678d81d1f5))
+* **AIC-3576:** record deferred judge scores under the evaluated config ([#190](https://github.com/launchdarkly/python-ai-sdk/issues/190)) ([354d3f1](https://github.com/launchdarkly/python-ai-sdk/commit/354d3f162b5d8e6623c2fdaaad106f711ffd5895))
+* **AIC-3577:** send object tool results to the model as JSON ([#188](https://github.com/launchdarkly/python-ai-sdk/issues/188)) ([dead4bd](https://github.com/launchdarkly/python-ai-sdk/commit/dead4bdce43a1e68416a148073058da81030ab73))
+* **AIC-3596:** name the [otel] extra in the missing-OTel warning ([#186](https://github.com/launchdarkly/python-ai-sdk/issues/186)) ([90ce7bf](https://github.com/launchdarkly/python-ai-sdk/commit/90ce7bfcfd29a1a0ef77eb18b7ecccb851cb3bc3))
+* **client:** match a handler's provides_for after normalizing its mode ([f62591f](https://github.com/launchdarkly/python-ai-sdk/commit/f62591f9a057d5f9f1ebeabde30b83065020abc7))
+* give native graph spans their LaunchDarkly identity ([#121](https://github.com/launchdarkly/python-ai-sdk/issues/121)) ([e863b6d](https://github.com/launchdarkly/python-ai-sdk/commit/e863b6d140bcc52ef058e1df374d40116bbaf762))
+
+## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.4...launchdarkly-ai-server-0.3.0) (2026-10-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **evaluations:** take tools as a list of EvalTool, with inline definitions ([#105](https://github.com/launchdarkly/python-ai-sdk/issues/105))
+* **evaluations:** rename Tool to EvalTool, freeze it, and make tools.get async
+* **evaluations:** take tools as a list of Tool
+
+### Experimental
+
+* **evaluations:** let tools= override a variation's tools ([90b293c](https://github.com/launchdarkly/python-ai-sdk/commit/90b293c17b461c5459dfbd9b7d5e6a9a288d6a89))
+* **evaluations:** Model resolution for remote AI config fetch ([#147](https://github.com/launchdarkly/python-ai-sdk/issues/147)) ([0b4df05](https://github.com/launchdarkly/python-ai-sdk/commit/0b4df05e6d4b5883b44c90c291644cbbf9c53140))
+* **evaluations:** rename Tool to EvalTool, freeze it, and make tools.get async ([4b8a819](https://github.com/launchdarkly/python-ai-sdk/commit/4b8a81936b9345048be7c05cd9842e07a32a421d))
+* **evaluations:** take tools as a list of EvalTool, with inline definitions ([#105](https://github.com/launchdarkly/python-ai-sdk/issues/105)) ([cad1547](https://github.com/launchdarkly/python-ai-sdk/commit/cad1547154270695c0e9a8673a4daa12a8161a35))
+* **evaluations:** take tools as a list of Tool ([0a92b13](https://github.com/launchdarkly/python-ai-sdk/commit/0a92b13a75869361c28a6efb5cf6b94bfdb5907c))
+* **skills:** add experimental Agent Skills under `launchdarkly_ai_server.experimental.skills` ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Features
+
+* **AIC-3495:** record which public helpers an application calls ([#145](https://github.com/launchdarkly/python-ai-sdk/issues/145)) ([19d2c2b](https://github.com/launchdarkly/python-ai-sdk/commit/19d2c2baf35440af57ed57f12f0413e524de27fa))
+* **client:** warn about unrecognized `init_client` options instead of ignoring them silently ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Bug Fixes
+
+* **client:** `init_client` adopts a client only after telemetry setup succeeds, and closes a client it built when setup fails ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+* **client:** `shutdown()` releases the global OpenTelemetry tracer provider the SDK registered, so a later `init_client` exports spans again ([dfb519c](https://github.com/launchdarkly/python-ai-sdk/commit/dfb519ce3ef4514af992c4bd4dddd8adc8f6aeef))
+
+
+### Documentation
+
+* **evaluations:** call the credential an API key, not a token ([7a238e5](https://github.com/launchdarkly/python-ai-sdk/commit/7a238e573f3aaeed62963ccd4338ffb14c9ca573))
+
 ## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.2.3...launchdarkly-ai-server-0.2.4) (2026-09-30)
 
 

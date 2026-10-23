@@ -94,9 +94,9 @@ class Scorer:
     ``fn`` may be sync or async and receives ``(row, output)``, where ``row``
     is the :class:`~launchdarkly_ai_server.evaluations.types.DatasetRow` the
     output was generated from and ``output`` is the generated output. To
-    receive more inputs, declare a third positional parameter. It receives a
-    :class:`ScorerContext`. A function that declares only two parameters is
-    called with two arguments. ``fn`` must return a boolean or a numeric score
+    receive more inputs, declare a required third positional parameter. It
+    receives a :class:`ScorerContext`. Any other function is called with two
+    arguments. ``fn`` must return a boolean or a numeric score
     from 0 to 1. Boolean results are converted to 1.0 or 0.0 before being
     emitted as evaluation events.
 
@@ -117,14 +117,14 @@ class Scorer:
     threshold: float | None = 1.0
     pass_rate_threshold: float | None = None
     success_direction: SuccessDirection = "higher_is_better"
-    accepts_context: bool = field(init=False, repr=False, compare=False)
+    _accepts_context: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("scorer name must not be blank")
         if not callable(self.fn):
             raise ValueError("scorer fn must be callable")
-        object.__setattr__(self, "accepts_context", _accepts_context(self.fn))
+        object.__setattr__(self, "_accepts_context", _takes_context(self.fn))
         _validate_thresholds(
             threshold=self.threshold,
             pass_rate_threshold=self.pass_rate_threshold,
@@ -149,31 +149,30 @@ class Scorer:
 type Criterion = Judge | Scorer
 
 
-def _accepts_context(fn: Callable[..., Any]) -> bool:
-    """Whether ``fn`` declares a third positional parameter for the context.
+def _takes_context(fn: Callable[..., Any]) -> bool:
+    """Whether ``fn`` requires a third positional parameter for the context.
 
-    Raises ``ValueError`` when ``fn`` requires more than three arguments.
-    A function with no inspectable signature is called with two arguments.
+    Only required parameters count, so ``(row, output, extra=None)`` is called
+    with two arguments. Raises ``ValueError`` when ``fn`` requires more than
+    three positional arguments or any keyword-only argument, since every call
+    would fail. A function with no inspectable signature is called with two.
     """
     try:
         parameters = inspect.signature(fn).parameters.values()
     except (TypeError, ValueError):
         return False
+    required = [p for p in parameters if p.default is p.empty]
+    if any(p.kind is inspect.Parameter.KEYWORD_ONLY for p in required):
+        raise ValueError("scorer fn must not require a keyword-only argument")
     positional = [
-        parameter
-        for parameter in parameters
-        if parameter.kind
-        in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        )
+        p
+        for p in required
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
-    required = [
-        parameter for parameter in positional if parameter.default is parameter.empty
-    ]
-    if len(required) > 3:
+    if len(positional) > 3:
         raise ValueError("scorer fn must accept at most (row, output, context)")
-    return len(positional) >= 3
+    return len(positional) == 3
 
 
 def _validate_thresholds(

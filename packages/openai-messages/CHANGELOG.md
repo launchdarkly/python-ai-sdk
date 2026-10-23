@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-messages-0.2.4...launchdarkly-ai-openai-messages-0.2.5) (2026-10-23)
+
+
+### Features
+
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+* **openai:** emit AG-UI text and tool events ([#161](https://github.com/launchdarkly/python-ai-sdk/issues/161)) ([2b1b2d4](https://github.com/launchdarkly/python-ai-sdk/commit/2b1b2d4184959afcb444effa0e92f6ca8703c93d))
+
+
+### Bug Fixes
+
+* **AIC-3577:** send object tool results to the model as JSON ([#188](https://github.com/launchdarkly/python-ai-sdk/issues/188)) ([dead4bd](https://github.com/launchdarkly/python-ai-sdk/commit/dead4bdce43a1e68416a148073058da81030ab73))
+
+## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-messages-0.2.3...launchdarkly-ai-openai-messages-0.2.4) (2026-10-09)
+
+
+### Features
+
+* **AIC-3495:** record which public helpers an application calls ([#145](https://github.com/launchdarkly/python-ai-sdk/issues/145)) ([19d2c2b](https://github.com/launchdarkly/python-ai-sdk/commit/19d2c2baf35440af57ed57f12f0413e524de27fa))
+
 ## [0.2.3](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-openai-messages-0.2.2...launchdarkly-ai-openai-messages-0.2.3) (2026-09-21)
 
 

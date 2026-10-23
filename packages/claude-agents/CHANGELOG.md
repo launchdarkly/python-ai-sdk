@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.6](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.2.5...launchdarkly-ai-claude-agents-0.2.6) (2026-10-23)
+
+
+### Features
+
+* **claude:** emit AG-UI text and tool events ([#165](https://github.com/launchdarkly/python-ai-sdk/issues/165)) ([3f3a0ce](https://github.com/launchdarkly/python-ai-sdk/commit/3f3a0cea17806beba21d839847b3158821600d26))
+* **client:** add configure for SDK defaults ([#158](https://github.com/launchdarkly/python-ai-sdk/issues/158)) ([3736767](https://github.com/launchdarkly/python-ai-sdk/commit/373676797cd810c04548a7c0da32b8ea5f7c02c2))
+
+
+### Bug Fixes
+
+* **AIC-3571:** visit every child before its parent in reverse_traverse ([#189](https://github.com/launchdarkly/python-ai-sdk/issues/189)) ([87c73d9](https://github.com/launchdarkly/python-ai-sdk/commit/87c73d9857ced5b916753f80caa943f43e3b31ff))
+* **AIC-3577:** send object tool results to the model as JSON ([#188](https://github.com/launchdarkly/python-ai-sdk/issues/188)) ([dead4bd](https://github.com/launchdarkly/python-ai-sdk/commit/dead4bdce43a1e68416a148073058da81030ab73))
+* **claude-agents:** fail the run when the CLI reports an API error as success ([#174](https://github.com/launchdarkly/python-ai-sdk/issues/174)) ([3d1a768](https://github.com/launchdarkly/python-ai-sdk/commit/3d1a7683f12e547ecf9c03aac44ab1dc588cd555))
+* give native graph spans their LaunchDarkly identity ([#121](https://github.com/launchdarkly/python-ai-sdk/issues/121)) ([e863b6d](https://github.com/launchdarkly/python-ai-sdk/commit/e863b6d140bcc52ef058e1df374d40116bbaf762))
+
+## [0.2.5](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.2.4...launchdarkly-ai-claude-agents-0.2.5) (2026-10-09)
+
+
+### Features
+
+* **AIC-3495:** record which public helpers an application calls ([#145](https://github.com/launchdarkly/python-ai-sdk/issues/145)) ([19d2c2b](https://github.com/launchdarkly/python-ai-sdk/commit/19d2c2baf35440af57ed57f12f0413e524de27fa))
+
 ## [0.2.4](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.2.3...launchdarkly-ai-claude-agents-0.2.4) (2026-09-30)
 
 

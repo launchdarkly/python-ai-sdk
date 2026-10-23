@@ -7,10 +7,11 @@ span-event recording API, and LaunchDarkly's ingest does not normalise content e
 canonical shape, so a ``gen_ai.content.prompt`` event, which is what these handlers emitted
 before, is read by nothing on the LaunchDarkly side.
 
-**Off by default.** Everything here is conversation content, which is PII. A handler opts in with
-``capture_content=True``; every function below takes that decision as its ``capture`` argument and
-returns without writing when it is false. Passing the flag rather than reading ambient state keeps
-the gate visible at each call site.
+**Off by default.** Everything here is conversation content, which is PII. Handlers resolve
+``capture_content`` to a bool before calling in: an explicit ``True`` or ``False``, otherwise the
+process default from ``configure``, otherwise off. Every function below takes that decision as its
+``capture`` argument and returns without writing when it is false. Passing the flag rather than
+reading ambient state keeps the gate visible at each call site.
 
 Handlers also test the same flag themselves before building the argument, so the check appears
 twice on purpose: the guard here is the safety net that makes a forgotten call site harmless, and
@@ -542,6 +543,22 @@ def set_tool_call_content_attributes(
         )
     if result is not None:
         span.set_attribute("gen_ai.tool.call.result", _stringify_tool_value(result))
+
+
+def tool_result_string(value: Any) -> str:
+    """Render a tool handler's return value as the text sent back to the provider.
+
+    A string passes through unchanged, ``None`` becomes ``""``, and anything else becomes
+    JSON (non-ASCII kept as is). A value JSON cannot encode falls back to ``str(value)``.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _stringify_tool_value(value: Any) -> str:

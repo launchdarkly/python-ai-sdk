@@ -1,12 +1,12 @@
 [project]
 name = "launchdarkly-ai-claude-agents"
-version = "0.2.4"
+version = "0.2.6"
 requires-python = ">=3.12"
 dependencies = [
-  "launchdarkly-ai-server",
+  "launchdarkly-ai-server>=0.4.1",
   "opentelemetry-api>=1.25",
   "anthropic>=0.40",
-  "claude-agent-sdk>=0.2",
+  "claude-agent-sdk>=0.2.121",
 ]
 description = "Anthropic Claude agent handler for LaunchDarkly AI SDK"
 readme = "README.md"

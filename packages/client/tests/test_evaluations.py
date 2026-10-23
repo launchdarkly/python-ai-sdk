@@ -10,13 +10,14 @@ import pytest
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server.evaluations import (
     DEFAULT_BASE_URI,
+    LDApiError,
+    Usage,
+)
+from launchdarkly_ai_server.evaluations.api import HttpResponse, LDApiClient
+from launchdarkly_ai_server.experimental.evaluations import (
     EvalRunResult,
     EvaluationsError,
-    HttpResponse,
-    LDApiClient,
-    LDApiError,
     RunSummary,
-    Usage,
     init_evaluations,
 )
 
@@ -67,34 +68,37 @@ def failing_transport(
 
 
 def test_init_resolves_credentials_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token-from-env")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key-from-env")
 
     evals = init_evaluations(transport=RecordingTransport())
 
-    assert evals.api.api_token == "api-token-from-env"
+    assert evals._api.api_key == "api-token-from-env"
     assert evals.sdk_key == "sdk-key-from-env"
-    assert evals.api.base_uri == DEFAULT_BASE_URI
+    assert evals._api.base_uri == DEFAULT_BASE_URI
     assert evals.ui_base_uri == "https://app.launchdarkly.com"
 
 
 def test_init_prefers_explicit_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token-from-env")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key-from-env")
 
     evals = init_evaluations(
-        api_token="explicit-token",
+        api_key="explicit-token",
         sdk_key="explicit-sdk-key",
         transport=RecordingTransport(),
     )
 
-    assert evals.api.api_token == "explicit-token"
+    assert evals._api.api_key == "explicit-token"
     assert evals.sdk_key == "explicit-sdk-key"
 
 
 def test_missing_api_token_raises_before_network_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.delenv("LD_API_TOKEN", raising=False)
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
 
@@ -105,6 +109,7 @@ def test_missing_api_token_raises_before_network_io(
 def test_blank_api_token_env_is_treated_as_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "   ")
 
     with pytest.raises(EvaluationsError):
@@ -114,6 +119,7 @@ def test_blank_api_token_env_is_treated_as_unset(
 def test_missing_sdk_key_raises_before_network_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
 
@@ -124,6 +130,7 @@ def test_missing_sdk_key_raises_before_network_io(
 def test_blank_sdk_key_env_is_treated_as_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "   ")
 
@@ -134,6 +141,7 @@ def test_blank_sdk_key_env_is_treated_as_unset(
 def test_missing_sdk_key_is_allowed_with_a_byoc_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
     byoc_client = MagicMock()
@@ -149,6 +157,7 @@ def test_missing_sdk_key_is_allowed_with_a_byoc_client(
 def test_missing_sdk_key_raises_when_the_byoc_client_cannot_emit_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.delenv("LD_SDK_KEY", raising=False)
     lifecycle_module._set_client_for_testing(object())
@@ -157,44 +166,153 @@ def test_missing_sdk_key_raises_when_the_byoc_client_cannot_emit_events(
         init_evaluations(transport=failing_transport)
 
 
-def test_base_uri_override_isolated_from_sdk_delivery_uri(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.fixture
+def host_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj")
     monkeypatch.setenv("LD_API_TOKEN", "api-token")
     monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
-    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com/")
-    monkeypatch.setenv("LD_BASE_URI", "https://relay.example.com/")
+    for name in ("LD_API_BASE_URI", "LD_UI_BASE_URI", "LD_BASE_URI"):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
 
-    from_env = init_evaluations(transport=RecordingTransport())
-    explicit = init_evaluations(
-        base_uri="https://other.example.com", transport=RecordingTransport()
+
+def request_url(**options: Any) -> str:
+    """Init the harness, send one management API request, return its URL."""
+    transport = RecordingTransport()
+    evals = init_evaluations(transport=transport, **options)
+    evals._api.get("projects/proj/evaluations")
+    return str(transport.requests[0]["url"])
+
+
+def test_api_host_option_wins_over_env(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+
+    url = request_url(api_base_uri="https://other.example.com")
+
+    assert url == "https://other.example.com/api/v2/projects/proj/evaluations"
+
+
+def test_api_host_env_wins_over_default(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+
+    url = request_url()
+
+    assert url == "https://api.staging.example.com/api/v2/projects/proj/evaluations"
+
+
+def test_api_host_defaults_to_production(host_env: pytest.MonkeyPatch) -> None:
+    assert (
+        request_url() == "https://app.launchdarkly.com/api/v2/projects/proj/evaluations"
     )
 
-    assert from_env.api.base_uri == "https://api.staging.example.com"
-    assert explicit.api.base_uri == "https://other.example.com"
 
-
-def test_ui_base_uri_precedence_and_api_base_isolation(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_api_host_option_falls_through_to_env(
+    host_env: pytest.MonkeyPatch, blank: str
 ) -> None:
-    monkeypatch.setenv("LD_API_TOKEN", "api-token")
-    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
-    monkeypatch.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
-    monkeypatch.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com/")
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
 
-    from_env = init_evaluations(transport=RecordingTransport())
-    explicit = init_evaluations(
+    url = request_url(api_base_uri=blank)
+
+    assert url == "https://api.staging.example.com/api/v2/projects/proj/evaluations"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_api_host_at_both_levels_falls_through_to_default(
+    host_env: pytest.MonkeyPatch, blank: str
+) -> None:
+    host_env.setenv("LD_API_BASE_URI", blank)
+
+    url = request_url(api_base_uri=blank)
+
+    assert url == "https://app.launchdarkly.com/api/v2/projects/proj/evaluations"
+
+
+@pytest.mark.parametrize(
+    "options, env",
+    [
+        ({"api_base_uri": "https://host/"}, None),
+        ({}, "https://host/"),
+    ],
+)
+def test_api_host_trailing_slash_is_stripped(
+    host_env: pytest.MonkeyPatch, options: dict[str, str], env: str | None
+) -> None:
+    if env is not None:
+        host_env.setenv("LD_API_BASE_URI", env)
+
+    assert request_url(**options) == "https://host/api/v2/projects/proj/evaluations"
+
+
+def test_sdk_delivery_host_alone_does_not_move_api_requests(
+    host_env: pytest.MonkeyPatch,
+) -> None:
+    host_env.setenv("LD_BASE_URI", "https://relay.example.com")
+
+    url = request_url()
+
+    assert url == "https://app.launchdarkly.com/api/v2/projects/proj/evaluations"
+
+
+def test_init_evaluations_has_no_base_uri_option(host_env: pytest.MonkeyPatch) -> None:
+    with pytest.raises(TypeError):
+        init_evaluations(base_uri="https://relay.example.com")  # type: ignore[call-arg]
+
+
+def test_ui_host_option_wins_over_env(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com")
+
+    evals = init_evaluations(
         ui_base_uri="https://ui.example.com/", transport=RecordingTransport()
     )
 
-    assert from_env.api.base_uri == "https://api.staging.example.com"
-    assert from_env.ui_base_uri == "https://ui.staging.example.com"
-    assert explicit.ui_base_uri == "https://ui.example.com"
+    assert evals.ui_base_uri == "https://ui.example.com"
+
+
+def test_ui_host_env_wins_over_default(host_env: pytest.MonkeyPatch) -> None:
+    host_env.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com/")
+
+    evals = init_evaluations(transport=RecordingTransport())
+
+    assert evals.ui_base_uri == "https://ui.staging.example.com"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_ui_host_option_falls_through_to_env(
+    host_env: pytest.MonkeyPatch, blank: str
+) -> None:
+    host_env.setenv("LD_UI_BASE_URI", "https://ui.staging.example.com")
+
+    evals = init_evaluations(ui_base_uri=blank, transport=RecordingTransport())
+
+    assert evals.ui_base_uri == "https://ui.staging.example.com"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_ui_host_at_both_levels_falls_through_to_default(
+    host_env: pytest.MonkeyPatch, blank: str
+) -> None:
+    host_env.setenv("LD_UI_BASE_URI", blank)
+
+    evals = init_evaluations(ui_base_uri=blank, transport=RecordingTransport())
+
+    assert evals.ui_base_uri == "https://app.launchdarkly.com"
+
+
+def test_api_host_env_alone_leaves_ui_host_on_default(
+    host_env: pytest.MonkeyPatch,
+) -> None:
+    host_env.setenv("LD_API_BASE_URI", "https://api.staging.example.com")
+
+    evals = init_evaluations(transport=RecordingTransport())
+
+    assert evals._api.base_uri == "https://api.staging.example.com"
+    assert evals.ui_base_uri == "https://app.launchdarkly.com"
 
 
 def test_requests_carry_token_auth_and_json_body() -> None:
     transport = RecordingTransport([HttpResponse(status=201, body='{"key": "run-1"}')])
-    client = LDApiClient(api_token="api-token", transport=transport)
+    client = LDApiClient(api_key="api-token", transport=transport)
 
     result = client.post("projects/proj/evaluations", body={"key": "support-qa"})
 
@@ -211,7 +329,7 @@ def test_requests_carry_token_auth_and_json_body() -> None:
 def test_get_encodes_query_params_and_omits_none() -> None:
     transport = RecordingTransport([HttpResponse(status=200, body='{"items": []}')])
     client = LDApiClient(
-        api_token="api-token", base_uri="https://ld.example.com", transport=transport
+        api_key="api-token", base_uri="https://ld.example.com", transport=transport
     )
 
     client.get("projects/proj/datasets/golden", params={"limit": 50, "offset": None})
@@ -238,7 +356,7 @@ def test_rate_limit_retries_and_honors_retry_after() -> None:
     )
     sleeps: list[float] = []
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=transport,
         max_retries=1,
         sleep=sleeps.append,
@@ -256,7 +374,7 @@ def test_server_error_retries_get_but_not_post() -> None:
         [server_error, HttpResponse(200, '{"ok": true}')]
     )
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=get_transport,
         max_retries=2,
         sleep=lambda _: None,
@@ -268,7 +386,7 @@ def test_server_error_retries_get_but_not_post() -> None:
 
     post_transport = RecordingTransport([server_error])
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=post_transport,
         max_retries=2,
         sleep=lambda _: None,
@@ -296,7 +414,7 @@ def test_transport_failure_is_not_replayed_for_post() -> None:
         raise TimeoutError("timed out")
 
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=timing_out_transport,
         max_retries=2,
         sleep=lambda _: None,
@@ -317,7 +435,7 @@ def test_rate_limited_post_is_retried() -> None:
         ]
     )
     client = LDApiClient(
-        api_token="api-token",
+        api_key="api-token",
         transport=transport,
         max_retries=1,
         sleep=lambda _: None,
@@ -330,11 +448,62 @@ def test_rate_limited_post_is_retried() -> None:
     assert len(transport.requests) == 2
 
 
+def test_idempotent_post_is_retried_after_a_server_error() -> None:
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=503, body='{"message": "unavailable"}'),
+            HttpResponse(status=200, body='{"ok": true}'),
+        ]
+    )
+    client = LDApiClient(
+        api_key="api-token",
+        transport=transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.post(
+        "runs/run-id/dataset-rows", body={"rows": []}, idempotent=True
+    ) == {"ok": True}
+    assert len(transport.requests) == 2
+
+
+def test_idempotent_post_is_replayed_after_a_transport_failure() -> None:
+    attempts: list[str] = []
+
+    def flaky_transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        attempts.append(method)
+        if len(attempts) == 1:
+            raise TimeoutError("timed out")
+        return HttpResponse(status=200, body="")
+
+    client = LDApiClient(
+        api_key="api-token",
+        transport=flaky_transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert (
+        client.post("runs/run-id/dataset-rows", body={"rows": []}, idempotent=True)
+        is None
+    )
+    assert attempts == ["POST", "POST"]
+
+
 def test_forbidden_response_is_not_retried() -> None:
     transport = RecordingTransport(
         [HttpResponse(status=403, body='{"message": "forbidden"}')]
     )
-    client = LDApiClient(api_token="api-token", transport=transport, max_retries=3)
+    client = LDApiClient(api_key="api-token", transport=transport, max_retries=3)
 
     with pytest.raises(LDApiError) as excinfo:
         client.get("projects/proj/evaluations")
@@ -347,7 +516,7 @@ def test_error_response_raises_ld_api_error() -> None:
     transport = RecordingTransport(
         [HttpResponse(status=404, body='{"message": "nope"}')]
     )
-    client = LDApiClient(api_token="api-token", transport=transport)
+    client = LDApiClient(api_key="api-token", transport=transport)
 
     with pytest.raises(LDApiError) as excinfo:
         client.get("projects/proj/ai-tools/missing")
@@ -358,7 +527,7 @@ def test_error_response_raises_ld_api_error() -> None:
 
 def test_empty_response_body_is_none() -> None:
     transport = RecordingTransport([HttpResponse(status=204, body="")])
-    client = LDApiClient(api_token="api-token", transport=transport)
+    client = LDApiClient(api_key="api-token", transport=transport)
 
     assert client.post("projects/proj/evaluations/support-qa/runs") is None
 
@@ -395,3 +564,84 @@ def test_run_summary_and_result() -> None:
     assert RunSummary.from_wire(None) == RunSummary()
     assert result.passed is False
     assert result.run_id == "run-1"
+
+
+def test_project_key_resolves_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj-from-env")
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
+
+    evals = init_evaluations(transport=RecordingTransport())
+
+    assert evals.project_key == "proj-from-env"
+
+
+def test_explicit_project_key_wins_over_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LD_PROJECT_KEY", "proj-from-env")
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
+
+    evals = init_evaluations(project_key="explicit", transport=RecordingTransport())
+
+    assert evals.project_key == "explicit"
+
+
+def test_missing_project_key_raises_before_network_io(monkeypatch) -> None:
+    monkeypatch.delenv("LD_PROJECT_KEY", raising=False)
+    monkeypatch.setenv("LD_API_TOKEN", "api-token")
+    monkeypatch.setenv("LD_SDK_KEY", "sdk-key")
+
+    with pytest.raises(EvaluationsError, match="LD_PROJECT_KEY"):
+        init_evaluations(transport=failing_transport)
+
+
+EXPERIMENTAL_EVALUATIONS_SURFACE = frozenset(
+    {
+        "init_evaluations",
+        "EvaluationsModule",
+        "AIConfig",
+        "GenerationConfig",
+        "GenerationMode",
+        "GenerationOverrides",
+        "DatasetRow",
+        "EvalTool",
+        "Criterion",
+        "Judge",
+        "Scorer",
+        "ScorerContext",
+        "ToolInvocation",
+        "EvalRunResult",
+        "RunSummary",
+        "EvaluationsError",
+    }
+)
+
+
+class TestPackageExports:
+    """
+    Evaluations from Code is experimental: every public name is
+    exported from ``launchdarkly_ai_server.experimental.evaluations`` and none
+    from the package root.
+    """
+
+    def test_experimental_surface_is_exactly_the_documented_set(self) -> None:
+        from launchdarkly_ai_server.experimental import evaluations as experimental
+
+        assert set(experimental.__all__) == EXPERIMENTAL_EVALUATIONS_SURFACE
+        assert len(experimental.__all__) == len(EXPERIMENTAL_EVALUATIONS_SURFACE)
+        for name in EXPERIMENTAL_EVALUATIONS_SURFACE:
+            assert hasattr(experimental, name), name
+
+    def test_experimental_module_defines_no_other_public_name(self) -> None:
+        from launchdarkly_ai_server.experimental import evaluations as experimental
+
+        public = {name for name in dir(experimental) if not name.startswith("_")}
+        assert public == EXPERIMENTAL_EVALUATIONS_SURFACE
+
+    def test_no_evaluations_name_is_exported_from_the_package_root(self) -> None:
+        import launchdarkly_ai_server as package
+        import launchdarkly_ai_server.experimental.evaluations
+
+        for name in EXPERIMENTAL_EVALUATIONS_SURFACE:
+            assert name not in package.__all__, name
+            assert not hasattr(package, name), name

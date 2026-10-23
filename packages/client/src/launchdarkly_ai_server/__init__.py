@@ -3,9 +3,10 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.2.4"  # x-release-please-version
+__version__ = "0.4.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
+from .client import _config as _config
 from .content import (
     SpanMessage,
     SpanMessagePart,
@@ -19,26 +20,15 @@ from .content import (
     set_tool_definition_attributes,
     text_message,
     to_semconv_finish_reason,
+    tool_result_string,
 )
 from .conversation import (
     ConversationIdSpanProcessor,
     conversation_id,
     set_conversation_id_if_absent,
 )
-from .evaluations import (
-    AIConfig,
-    Criterion,
-    DatasetRow,
-    EvalRunResult,
-    EvaluationsError,
-    EvaluationsModule,
-    GenerationConfig,
-    Judge,
-    RunSummary,
-    Scorer,
-    init_evaluations,
-)
 from .graph import GraphInstance, graph, resolve_graph
+from .graph import _graph as _graph
 from .history import (
     any_multimodal,
     compose_history,
@@ -49,6 +39,7 @@ from .history import (
 )
 from .judges import build_judge_tasks, run_judge, run_judges
 from .lifecycle import (
+    configure,
     extract_variation,
     get_client,
     init_client,
@@ -63,6 +54,7 @@ from .registry import (
     resolve_tools,
 )
 from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
+from .sdk_usage import report_usage
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -93,6 +85,7 @@ from .types import (
     ProviderGraphResponse,
     ProviderHandler,
     ProviderResponse,
+    SDKOptions,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -120,12 +113,11 @@ from .utils import (
     parse_usage,
     set_ld_span_attributes,
     set_model_identity_attributes,
-    set_openllmetry_completion,
-    set_openllmetry_prompt,
     set_usage_span_attributes,
     to_ld_context,
     to_usage_dict,
 )
+from .utils import _create_handler as _create_handler
 
 __all__ = [  # noqa: RUF022
     # types
@@ -143,6 +135,7 @@ __all__ = [  # noqa: RUF022
     "HandlerResult",
     "HandlerStreamEvent",
     "InitClientOptions",
+    "SDKOptions",
     "JudgeResult",
     "JudgeRunResult",
     "JudgeTask",
@@ -185,19 +178,8 @@ __all__ = [  # noqa: RUF022
     "to_usage_dict",
     "text_message",
     "to_semconv_finish_reason",
+    "tool_result_string",
     "VariationMeta",
-    # evaluations
-    "AIConfig",
-    "EvalRunResult",
-    "Criterion",
-    "DatasetRow",
-    "EvaluationsError",
-    "EvaluationsModule",
-    "GenerationConfig",
-    "Judge",
-    "RunSummary",
-    "Scorer",
-    "init_evaluations",
     # utils
     "create_handler",
     "make_track_data",
@@ -208,8 +190,6 @@ __all__ = [  # noqa: RUF022
     "parse_template",
     "parse_usage",
     "set_ld_span_attributes",
-    "set_openllmetry_completion",
-    "set_openllmetry_prompt",
     "to_ld_context",
     # history
     "compose_history",
@@ -231,6 +211,7 @@ __all__ = [  # noqa: RUF022
     "execute_and_track",
     "execute_and_stream",
     # lifecycle
+    "configure",
     "init_client",
     "get_client",
     "shutdown",
@@ -239,6 +220,7 @@ __all__ = [  # noqa: RUF022
     "SDK_INFO_CONTEXT",
     "SDK_INFO_EVENT",
     "register_ai_sdk_package",
+    "report_usage",
     # judges
     "build_judge_tasks",
     "run_judge",

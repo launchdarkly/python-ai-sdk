@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,9 +13,9 @@ from launchdarkly_ai_server import (
     SpanMessage,
     SpanMessagePart,
     SpanUsage,
+    _config,
+    _create_handler,
     compose_history,
-    config,
-    create_handler,
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
@@ -27,11 +27,18 @@ from launchdarkly_ai_server import (
     lang_chain_span_usage,
     number_or_zero,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    tool_result_string,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     fail_span,
     finish_model_span,
@@ -44,6 +51,343 @@ from .spans import (
     succeed_span,
     to_tool_definitions,
 )
+
+#: Handler-owned, per model class. The handler always sets the model itself, and each
+#: class exposes that one constructor field under two names (the field and its alias), so a
+#: config value for either must never be forwarded: it would collide with the model the
+#: handler resolves, or override it.
+_CHAT_OPENAI_OWNED_KEYS = frozenset({"model", "model_name"})
+_CHAT_ANTHROPIC_OWNED_KEYS = frozenset({"model", "model_name"})
+_CHAT_BEDROCK_CONVERSE_OWNED_KEYS = frozenset({"model", "model_id"})
+
+#: LangChain's own runtime fields, shared by every chat model class: caching, callbacks, rate
+#: limiting, tracing tags and metadata, streaming mode, message format, and token counting. They
+#: configure how LangChain runs the model in this process, not the model request, and several are
+#: objects or callables a config cannot express. Never forwarded.
+_LANGCHAIN_RUNTIME_KEYS = frozenset(
+    {
+        "cache",
+        "callbacks",
+        "custom_get_token_ids",
+        "disable_streaming",
+        "metadata",
+        "name",
+        "output_version",
+        "profile",
+        "rate_limiter",
+        "streaming",
+        "tags",
+        "verbose",
+    }
+)
+
+#: Every key ``ChatOpenAI`` accepts (field names plus pydantic aliases), classified by hand into
+#: exactly one of: forwarded (below), handler-owned (``model``, always overwritten by the
+#: resolved model name, see ``_model_constructor_kwargs``), or excluded (below).
+#: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
+#: stays exhaustive as the SDK's own pydantic model changes.
+#:
+#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12).
+#: ``reasoning_effort`` and ``seed`` are marked not supported in TypeScript there: the JS
+#: ``ChatOpenAI`` takes them only as per-call options, while this handler sets them on the
+#: constructor, which has a field for each. ``reasoning_effort`` is the Chat Completions field and
+#: does not switch ``ChatOpenAI`` to the Responses API the way ``reasoning`` does.
+_CHAT_OPENAI_FORWARDED_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "max_completion_tokens",
+        "max_tokens",
+        "n",
+        "presence_penalty",
+        "reasoning_effort",
+        "seed",
+        "service_tier",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "top_logprobs",
+        "top_p",
+        "verbosity",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ChatOpenAI``.
+_CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
+
+#: Accepted by ``ChatOpenAI`` but never forwarded, and why:
+#: * ``api_key``, ``openai_api_key``, ``organization``, ``openai_organization``: credentials.
+#: * ``base_url``, ``openai_api_base``, ``openai_proxy``: where requests go.
+#: * ``client``, ``async_client``, ``root_client``, ``root_async_client``, ``http_client``,
+#:   ``http_async_client``, ``http_socket_options``: raw HTTP client objects/settings.
+#: * ``default_headers``, ``default_query``, ``extra_body``, ``model_kwargs``: raw request
+#:   injection. ``model_kwargs`` is merged straight into the request payload, so it would carry
+#:   ``extra_headers``/``extra_query`` or any other excluded key past this list.
+#: * ``max_retries``, ``request_timeout``, ``timeout``, ``stream_chunk_timeout``: retries and
+#:   timeouts.
+#: * ``use_responses_api``, ``use_previous_response_id``, ``include``, ``reasoning``,
+#:   ``truncation``, ``context_management``: API-shape switch. Each one makes ``ChatOpenAI`` call
+#:   the Responses API instead of Chat Completions, which changes the API and response shape the
+#:   handler gets back. ``truncation``, ``context_management`` and ``use_previous_response_id``
+#:   also lean on server-side conversation state.
+#: * ``store``: data retention. It decides whether the request is kept on the server.
+#: * ``prompt_cache_key``: on the spec list, marked not supported in Python, because
+#:   ``ChatOpenAI`` has no such constructor field (it takes it only per call). It is not in the set
+#:   below because ``ChatOpenAI`` does not accept it at all, which the drift test requires of every
+#:   listed key.
+#: * ``stream_usage``, ``include_response_headers``, ``disabled_params``, ``tiktoken_model_name``:
+#:   runtime wiring. They change what the handler gets back and how usage is reported to it.
+#: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
+    "api_key",
+    "openai_api_key",
+    "organization",
+    "openai_organization",
+    "base_url",
+    "openai_api_base",
+    "openai_proxy",
+    "client",
+    "async_client",
+    "root_client",
+    "root_async_client",
+    "http_client",
+    "http_async_client",
+    "http_socket_options",
+    "default_headers",
+    "default_query",
+    "extra_body",
+    "model_kwargs",
+    "max_retries",
+    "request_timeout",
+    "timeout",
+    "stream_chunk_timeout",
+    "stream_usage",
+    "include_response_headers",
+    "disabled_params",
+    "tiktoken_model_name",
+    "use_responses_api",
+    "use_previous_response_id",
+    "include",
+    "reasoning",
+    "truncation",
+    "context_management",
+    "store",
+}
+
+#: Every key ``ChatAnthropic`` accepts (field names plus pydantic aliases), classified the same way
+#: as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``TestChatAnthropicAcceptsExactlyTheseKeys`` in this
+#: package's tests asserts this classification stays exhaustive.
+#:
+#: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
+#: ``max_tokens_to_sample`` is renamed to ``max_tokens`` before this list applies, and a
+#: ``max_tokens`` the config also set wins. ``stop`` is renamed to ``stop_sequences`` the same way, and
+#: a ``stop_sequences`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
+#: ``output_config`` keeps only its ``effort`` (see :func:`_rebuild_anthropic_output_config`).
+_CHAT_ANTHROPIC_FORWARDED_KEYS = frozenset(
+    {
+        "betas",
+        "effort",
+        "max_tokens",
+        "max_tokens_to_sample",
+        "output_config",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "thinking",
+        "top_k",
+        "top_p",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ChatAnthropic``.
+_CHAT_ANTHROPIC_MAPPING_KEYS = frozenset({"output_config", "thinking"})
+
+#: Alias to the name it is renamed to before forwarding. ``ChatAnthropic`` takes both spellings
+#: of the one field, so passing both would leave which one wins to pydantic.
+_CHAT_ANTHROPIC_RENAMES = {
+    "max_tokens_to_sample": "max_tokens",
+    "stop": "stop_sequences",
+}
+
+#: The ``thinking`` variants the Anthropic Messages API takes, each mapped to its required and
+#: optional sub-keys. ``ChatAnthropic`` sends ``thinking`` as written, so one with no ``type``, an
+#: unknown ``type``, or an ``enabled`` type without ``budget_tokens`` is dropped rather than sent
+#: for the API to reject, and other sub-keys are removed. The same shapes as the Claude Messages
+#: handler's.
+_ANTHROPIC_THINKING_SHAPES: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
+    "enabled": (frozenset({"budget_tokens"}), frozenset({"display"})),
+    "adaptive": (frozenset(), frozenset({"display"})),
+    "disabled": (frozenset(), frozenset()),
+}
+
+
+def _rebuild_anthropic_thinking(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilds a forwarded ``thinking`` from :data:`_ANTHROPIC_THINKING_SHAPES`, or drops it."""
+    if "thinking" not in kwargs:
+        return kwargs
+    thinking = kwargs.pop("thinking")
+    kind = thinking.get("type")
+    if not isinstance(kind, str) or kind not in _ANTHROPIC_THINKING_SHAPES:
+        return kwargs
+    required, optional = _ANTHROPIC_THINKING_SHAPES[kind]
+    if any(thinking.get(key) is None for key in required):
+        return kwargs
+    kwargs["thinking"] = {
+        "type": kind,
+        **{
+            k: thinking[k]
+            for k in sorted(required | optional)
+            if thinking.get(k) is not None
+        },
+    }
+    return kwargs
+
+
+def _rebuild_anthropic_output_config(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keeps only ``effort`` of a forwarded ``output_config``, and drops an ``output_config``
+    whose ``effort`` is missing or not a string.
+
+    ``output_config.format`` is Anthropic's structured-output schema. The handler owns structured
+    output through the config's ``outputFormat`` (``with_structured_output``), and ``ChatAnthropic``
+    sends a constructor ``output_config`` on every request, so a ``format`` here would make the
+    reply follow a second, possibly different, schema. It is always removed, as is any other
+    sub-key. The same rule as the Claude Messages handler's.
+    """
+    if "output_config" in kwargs:
+        effort = kwargs.pop("output_config").get("effort")
+        if isinstance(effort, str):
+            kwargs["output_config"] = {"effort": effort}
+    return kwargs
+
+
+#: Accepted by ``ChatAnthropic`` but never forwarded, and why:
+#: * ``anthropic_api_key``, ``api_key``: credentials (field plus alias).
+#: * ``anthropic_api_url``, ``base_url``, ``anthropic_proxy``: where requests go.
+#: * ``inference_geo``: the region inference runs in, which decides where data is processed.
+#: * ``context_management``: server-side state. It has the server clear or compact earlier
+#:   context.
+#: * ``default_headers``, ``model_kwargs``: raw request injection. ``model_kwargs`` is merged
+#:   straight into the request, so it would carry any excluded key past this list.
+#: * ``mcp_servers``: attaches remote MCP servers, which then receive the conversation.
+#: * ``reuse_last_container``: reuses server-side container state from an earlier request, not
+#:   a model setting.
+#: * ``default_request_timeout``, ``timeout``, ``max_retries``: timeouts and retries.
+#: * ``stream_usage``: how usage is reported back to the handler.
+#: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
+#:
+#: Named for the drift test and for review, not read at runtime.
+_CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
+    "anthropic_api_key",
+    "api_key",
+    "anthropic_api_url",
+    "base_url",
+    "anthropic_proxy",
+    "inference_geo",
+    "context_management",
+    "default_headers",
+    "model_kwargs",
+    "mcp_servers",
+    "reuse_last_container",
+    "default_request_timeout",
+    "timeout",
+    "max_retries",
+    "stream_usage",
+}
+
+#: Every key ``ChatBedrockConverse`` accepts (field names plus pydantic aliases), classified the
+#: same way as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``langchain-aws`` is not a dependency of this
+#: package (Bedrock support is opt-in, see ``_make_default_chat_model``), so
+#: ``TestChatBedrockConverseAcceptsExactlyTheseKeys`` in this package's tests skips itself when it
+#: is not installed rather than asserting nothing.
+#:
+#: This is the cross-SDK list for LangChain ChatBedrockConverse (TESTING.md section 1.12).
+#: ``reasoning_effort``, ``stop`` and ``stop_sequences`` are marked not supported in TypeScript
+#: there: the JS ``ChatBedrockConverse`` takes stop sequences only as a per-call option and has no
+#: reasoning effort field, while this class has constructor fields for both. ``stop`` is renamed to
+#: ``stop_sequences`` before this list applies, and a ``stop_sequences`` the config also set wins
+#: (see :data:`_CHAT_BEDROCK_CONVERSE_RENAMES`).
+_CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS = frozenset(
+    {
+        "max_tokens",
+        "performance_config",
+        "reasoning_effort",
+        "service_tier",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "top_p",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ChatBedrockConverse``.
+_CHAT_BEDROCK_CONVERSE_MAPPING_KEYS = frozenset({"performance_config"})
+
+#: Alias to the name it is renamed to before forwarding. ``stop`` is the pydantic alias of
+#: ``stop_sequences``, and ``ChatBedrockConverse`` rejects a call that passes both spellings.
+_CHAT_BEDROCK_CONVERSE_RENAMES = {"stop": "stop_sequences"}
+
+#: Accepted by ``ChatBedrockConverse`` but never forwarded, and why:
+#: * ``bedrock_api_key``, ``api_key``, ``aws_access_key_id``, ``aws_secret_access_key``,
+#:   ``aws_session_token``, ``credentials_profile_name``: credentials.
+#: * ``endpoint_url``, ``base_url``, ``region_name``: where requests go, and the region, which
+#:   decides where data is processed.
+#: * ``client``, ``bedrock_client``, ``config``: raw boto3/botocore client objects and config.
+#: * ``default_headers``, ``additional_model_request_fields``: raw request injection.
+#:   ``additional_model_request_fields`` is passed into the request body unfiltered.
+#: * ``max_retries``, ``timeout``: retries and timeouts.
+#: * ``base_model_id``, ``base_model``, ``provider``: which model the handler is talking to, the
+#:   same identity as ``model_id`` (handler-owned).
+#: * ``additional_model_response_field_paths``, ``raw_blocks``, ``supports_tool_choice_values``:
+#:   the response shape and tool-calling behaviour the handler relies on.
+#: * ``guardrails``, ``guardrail_config``, ``guard_last_turn_only``: safety configuration.
+#: * ``request_metadata``: identity and attribution. It tags the request for whoever reads the
+#:   invocation logs.
+#: * ``system``: prompt content beyond instructions. It adds system prompt blocks on top of the
+#:   config's own instructions.
+#: * ``output_config``: API-shape switch. Its only use is Bedrock's JSON schema output format, the
+#:   structured output the handler owns through the config's ``outputFormat``. Set on the
+#:   constructor, it is sent on every request, including the forced tool call the handler's
+#:   ``with_structured_output`` makes, so the two would constrain the reply at once.
+#: * Everything in :data:`_LANGCHAIN_RUNTIME_KEYS`.
+#:
+#: Named for the drift test and for review, not read at runtime.
+_CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
+    "bedrock_api_key",
+    "api_key",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "credentials_profile_name",
+    "endpoint_url",
+    "base_url",
+    "region_name",
+    "client",
+    "bedrock_client",
+    "config",
+    "default_headers",
+    "additional_model_request_fields",
+    "max_retries",
+    "timeout",
+    "base_model_id",
+    "base_model",
+    "provider",
+    "additional_model_response_field_paths",
+    "raw_blocks",
+    "supports_tool_choice_values",
+    "guardrails",
+    "guardrail_config",
+    "guard_last_turn_only",
+    "request_metadata",
+    "system",
+    "output_config",
+}
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -148,6 +492,21 @@ def _build_messages(
     return messages
 
 
+def _merge_stream_chunk(gathered: Any, chunk: Any) -> Any:
+    """Fold one streamed chunk into the turn the way LangChain does.
+
+    ``AIMessageChunk.tool_calls`` is parsed from that chunk alone. Keeping only
+    the last chunk drops every earlier parallel call and every argument slice
+    that chunk did not repeat. Addition merges chunks by index.
+    """
+    if gathered is None:
+        return chunk
+    try:
+        return gathered + chunk
+    except TypeError:
+        return chunk
+
+
 def _assistant_output_messages(
     content: Any, tool_calls: list[Any] | None
 ) -> list[SpanMessage]:
@@ -226,14 +585,21 @@ def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
 
 
 def _model_constructor_kwargs(
-    config: AiConfigRep, fallback_name: str
+    config: AiConfigRep,
+    fallback_name: str,
+    forwarded_keys: frozenset[str],
+    *,
+    mapping_keys: frozenset[str] = frozenset(),
+    renames: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    raw = (config.get("model") or {}).get("parameters")
-    parameters = dict(raw) if isinstance(raw, dict) else {}
-    provider = str((config.get("provider") or {}).get("name") or "").lower()
-    if provider == "bedrock":
-        parameters.pop("tools", None)
-    # Name from the config always wins over a colliding ``model`` key in the parameter bag.
+    params = model_parameters(config)
+    for alias, name in (renames or {}).items():
+        if alias in params:
+            value = params.pop(alias)
+            params.setdefault(name, value)
+    parameters = select_forwarded_parameters(
+        params, forwarded_keys, mapping_keys=mapping_keys
+    )
     parameters["model"] = _resolved_model_name(config, fallback_name)
     return parameters
 
@@ -248,13 +614,24 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
-    ``model.parameters`` are passed through unchanged.
+    ``model.parameters`` are filtered to that class's forwarded list first. ``tools`` is never on
+    that list, since tools are bound separately from ``config["tools"]``.
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
     if provider == "anthropic":
         lc_anthropic = importlib.import_module("langchain_anthropic")
         return lc_anthropic.ChatAnthropic(
-            **_model_constructor_kwargs(config, "claude-3-5-sonnet-20241022")
+            **_rebuild_anthropic_output_config(
+                _rebuild_anthropic_thinking(
+                    _model_constructor_kwargs(
+                        config,
+                        "claude-3-5-sonnet-20241022",
+                        _CHAT_ANTHROPIC_FORWARDED_KEYS,
+                        mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
+                        renames=_CHAT_ANTHROPIC_RENAMES,
+                    )
+                )
+            )
         )
     if provider == "bedrock":
         try:
@@ -264,9 +641,24 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
                 "Using Bedrock models requires langchain-aws. "
                 "Install it with: pip install langchain-aws"
             ) from exc
-        return lc_aws.ChatBedrockConverse(**_model_constructor_kwargs(config, ""))
+        return lc_aws.ChatBedrockConverse(
+            **_model_constructor_kwargs(
+                config,
+                "",
+                _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
+                mapping_keys=_CHAT_BEDROCK_CONVERSE_MAPPING_KEYS,
+                renames=_CHAT_BEDROCK_CONVERSE_RENAMES,
+            )
+        )
     lc_openai = importlib.import_module("langchain_openai")
-    return lc_openai.ChatOpenAI(**_model_constructor_kwargs(config, "gpt-4o"))
+    return lc_openai.ChatOpenAI(
+        **_model_constructor_kwargs(
+            config,
+            "gpt-4o",
+            _CHAT_OPENAI_FORWARDED_KEYS,
+            mapping_keys=_CHAT_OPENAI_MAPPING_KEYS,
+        )
+    )
 
 
 async def _resolve_base_model(config: AiConfigRep, llm: Any, importlib: Any) -> Any:
@@ -370,7 +762,7 @@ async def _run_structured_turn(
 
 
 def create_langchain_messages_handler(
-    llm: Any = None, *, capture_content: bool = False
+    llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
@@ -381,9 +773,20 @@ def create_langchain_messages_handler(
     config's model name and parameters.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on.
     """
+    report_usage("langchain-messages.createLangChainHandler", PACKAGE_NAME, __version__)
+    return _create_langchain_messages_handler(llm, capture_content=capture_content)
+
+
+def _create_langchain_messages_handler(
+    llm: Any = None, *, capture_content: bool | None = None
+) -> ProviderHandler:
+    """Non-reporting :func:`create_langchain_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
@@ -392,6 +795,8 @@ def create_langchain_messages_handler(
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         import importlib
 
         th = tool_handlers or {}
@@ -620,7 +1025,7 @@ def create_langchain_messages_handler(
                         tool_results.append(
                             ToolMessage(
                                 tool_call_id=tc.get("id") or tc["name"],
-                                content=str(result_val),
+                                content=tool_result_string(result_val),
                             )
                         )
                     conversation_messages.extend(tool_results)
@@ -691,14 +1096,14 @@ def create_langchain_messages_handler(
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("*", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
 
 
@@ -746,6 +1151,7 @@ async def _stream_gen(
     conversation_messages = list(initial_messages)
     full_output: Any = ""
     steps = 0
+    emitter = TurnEmitter(capture_content=capture_content)
 
     ended: set[int] = set()
     open_model_span: Any = None
@@ -782,7 +1188,9 @@ async def _stream_gen(
             open_model_span = model_span
 
             accumulated_content = ""
-            accumulated_tool_calls: list[Any] = []
+            gathered: Any = None
+            tool_chunk_ids: dict[int, str] = {}
+            seen_call_ids: list[str] = []
             # The cache breakdown has to be accumulated alongside the scalars. LangChain reports it
             # per chunk in `usage_metadata.input_token_details`, and synthesizing a usage bag
             # without it would make the streaming span emit `cache_read = 0` where the blocking path
@@ -815,8 +1223,60 @@ async def _stream_gen(
                 async for chunk in chunk_stream:
                     text = lang_chain_content_text(chunk.content)
                     if text:
-                        yield {"type": "chunk", "text": text}
+                        for rich in emitter.text(text):
+                            yield rich
                         accumulated_content += text
+                    for piece in getattr(chunk, "tool_call_chunks", None) or []:
+                        piece_name = (
+                            piece.get("name")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "name", None)
+                        )
+                        piece_id = (
+                            piece.get("id")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "id", None)
+                        )
+                        piece_index = (
+                            piece.get("index")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "index", None)
+                        )
+                        piece_args = (
+                            piece.get("args")
+                            if isinstance(piece, dict)
+                            else getattr(piece, "args", None)
+                        )
+                        # Later chunks often omit id. They carry an index, or,
+                        # when only one call is open, just the args slice.
+                        if isinstance(piece_id, str) and piece_id:
+                            if piece_id not in seen_call_ids:
+                                seen_call_ids.append(piece_id)
+                            if isinstance(piece_index, int):
+                                tool_chunk_ids[piece_index] = piece_id
+                        elif (
+                            isinstance(piece_index, int)
+                            and piece_index in tool_chunk_ids
+                        ):
+                            piece_id = tool_chunk_ids[piece_index]
+                        elif len(seen_call_ids) == 1:
+                            piece_id = seen_call_ids[0]
+                        if (
+                            isinstance(piece_name, str)
+                            and piece_name
+                            and isinstance(piece_id, str)
+                            and piece_id
+                        ):
+                            for rich in emitter.tool_start(piece_id, piece_name):
+                                yield rich
+                        if (
+                            isinstance(piece_id, str)
+                            and piece_id
+                            and isinstance(piece_args, str)
+                            and piece_args
+                        ):
+                            for rich in emitter.tool_args(piece_id, piece_args):
+                                yield rich
                     usage = getattr(chunk, "usage_metadata", None)
                     if usage:
                         usage_reported = True
@@ -829,9 +1289,7 @@ async def _stream_gen(
                         turn_usage.cache_creation += number_or_zero(
                             details.get("cache_creation")
                         )
-                    chunk_tools = getattr(chunk, "tool_calls", None) or []
-                    if chunk_tools:
-                        accumulated_tool_calls = chunk_tools
+                    gathered = _merge_stream_chunk(gathered, chunk)
                     finish_reasons = lang_chain_finish_reasons(chunk) or finish_reasons
                 open_chunk_stream = None
             except Exception as exc:
@@ -856,6 +1314,11 @@ async def _stream_gen(
             # billed these tokens: a content failure is our problem and must not report the run as
             # having spent less than it did.
             run_usage.add(turn_usage if usage_reported else None)
+            accumulated_tool_calls = [
+                tc
+                for tc in (getattr(gathered, "tool_calls", None) or [])
+                if isinstance(tc, dict) and tc.get("name")
+            ]
 
             # Inside a guard for the same reason as the blocking path: a raise while serialising
             # completion content would otherwise leave this span for `finally` to end as abandoned,
@@ -879,6 +1342,13 @@ async def _stream_gen(
                 raise
 
             if not accumulated_tool_calls:
+                for rich in emitter.end_text():
+                    yield rich
+                # A chunk can open a call that never becomes a complete tool
+                # call. Close it before the turn ends, or the client keeps it
+                # open across RUN_FINISHED.
+                for rich in emitter.fail_open():
+                    yield rich
                 full_output = (full_output or "") + accumulated_content
                 break
 
@@ -889,6 +1359,14 @@ async def _stream_gen(
             steps += 1
 
             full_output = (full_output or "") + accumulated_content
+            for tc in accumulated_tool_calls:
+                call_id = str(tc.get("id") or tc["name"])
+                for rich in emitter.tool_start(call_id, str(tc["name"])):
+                    yield rich
+                for rich in emitter.tool_end(call_id, arguments=tc.get("args")):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             assistant_msg = AIMessage(
                 content=accumulated_content, tool_calls=accumulated_tool_calls
             )
@@ -929,11 +1407,20 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                for rich in emitter.tool_result(
+                    str(tc.get("id") or tc["name"]), result_val
+                ):
+                    yield rich
                 tool_results.append(
                     ToolMessage(
-                        tool_call_id=tc.get("id") or tc["name"], content=str(result_val)
+                        tool_call_id=tc.get("id") or tc["name"],
+                        content=tool_result_string(result_val),
                     )
                 )
+            # Chunks can start a call the gathered message then omits. The
+            # calls we ran are already closed; this finishes the rest.
+            for rich in emitter.fail_open():
+                yield rich
             conversation_messages.extend(tool_results)
 
         full_output_str = (
@@ -974,6 +1461,10 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -1013,12 +1504,13 @@ def langchain_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("langchain-messages.langchainMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    return _config(
         key=config_key,
-        handler=create_langchain_messages_handler(
-            llm=llm, capture_content=capture_content
+        handler=_create_langchain_messages_handler(
+            llm, capture_content=capture_content
         ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -11,20 +11,27 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
     parse_template,
+    report_usage,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
+    tool_result_string,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     RawRunUsage,
     fail_span,
@@ -42,12 +49,184 @@ from .spans import (
     to_tool_definitions,
 )
 
-try:
-    import anthropic as _anthropic_mod  # noqa: F401
+#: Every key ``AsyncMessages.create``/``.stream`` accept, classified by hand into exactly one of:
+#: forwarded (below), handler-owned (``model``, ``messages``, ``system``, ``tools``, set by each
+#: call site itself), or excluded (below). ``TestMessagesCreateAcceptsExactlyTheseKeys`` /
+#: ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
+#: classification stays exhaustive as the SDK's own signatures change.
+#:
+#: This is the cross-SDK list for Claude Messages (TESTING.md section 1.12). A top-level
+#: ``effort`` is also accepted and moved into ``output_config.effort`` before this list applies
+#: (see :func:`_rename_effort_to_output_config`), ``output_config`` keeps only its ``effort`` (see
+#: :func:`_rebuild_output_config`), and ``max_tokens`` defaults to 1024. The same list
+#: serves ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves
+#: the same whichever is called.
+_MESSAGES_FORWARDED_KEYS = frozenset(
+    {
+        "cache_control",
+        "max_tokens",
+        "output_config",
+        "service_tier",
+        "stop_sequences",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "top_k",
+        "top_p",
+    }
+)
 
-    _HAS_ANTHROPIC = True
-except ImportError:
-    _HAS_ANTHROPIC = False
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to the API.
+_MESSAGES_MAPPING_KEYS = frozenset(
+    {"cache_control", "output_config", "thinking", "tool_choice"}
+)
+
+#: The typed objects among the forwarded keys, as the ``anthropic`` SDK declares them: for each
+#: key, each ``type`` the API knows, mapped to that variant's required and optional sub-keys
+#: (``ThinkingConfigParam``, ``ToolChoiceParam``, ``CacheControlEphemeralParam``). A value whose
+#: ``type`` is missing or unknown, or that lacks a required sub-key, is dropped; any other sub-key
+#: is removed. The API rejects all of these, so passing them through would only fail the request.
+_TYPED_OBJECT_SHAPES: Mapping[
+    str, Mapping[str, tuple[frozenset[str], frozenset[str]]]
+] = {
+    "thinking": {
+        "enabled": (frozenset({"budget_tokens"}), frozenset({"display"})),
+        "adaptive": (frozenset(), frozenset({"display"})),
+        "disabled": (frozenset(), frozenset()),
+    },
+    "tool_choice": {
+        "auto": (frozenset(), frozenset({"disable_parallel_tool_use"})),
+        "any": (frozenset(), frozenset({"disable_parallel_tool_use"})),
+        "tool": (frozenset({"name"}), frozenset({"disable_parallel_tool_use"})),
+        "none": (frozenset(), frozenset()),
+    },
+    "cache_control": {
+        "ephemeral": (frozenset(), frozenset({"ttl"})),
+    },
+}
+
+
+def _rebuild_typed_object(
+    value: Mapping[str, Any],
+    shapes: Mapping[str, tuple[frozenset[str], frozenset[str]]],
+) -> dict[str, Any] | None:
+    """*value* with only the sub-keys its ``type`` takes, or ``None`` when the type is not in
+    *shapes* or a required sub-key is missing."""
+    kind = value.get("type")
+    if not isinstance(kind, str) or kind not in shapes:
+        return None
+    required, optional = shapes[kind]
+    if any(value.get(key) is None for key in required):
+        return None
+    return {
+        "type": kind,
+        **{
+            k: value[k] for k in sorted(required | optional) if value.get(k) is not None
+        },
+    }
+
+
+def _rebuild_typed_objects(params: dict[str, Any]) -> dict[str, Any]:
+    """Rebuilds each forwarded typed object with :func:`_rebuild_typed_object`, dropping the ones
+    that are malformed. Runs after :func:`select_forwarded_parameters`, so every value here is
+    already a mapping."""
+    for key, shapes in _TYPED_OBJECT_SHAPES.items():
+        if key in params:
+            rebuilt = _rebuild_typed_object(params.pop(key), shapes)
+            if rebuilt is not None:
+                params[key] = rebuilt
+    return params
+
+
+#: Accepted by the API but never forwarded, and why:
+#: * ``stream``: runtime wiring. The handler chooses blocking vs. streaming itself, not via a kwarg.
+#: * ``output_format``: API-shape switch. Only ``.stream`` accepts it, so forwarding it would make
+#:   ``invoke`` and ``stream`` behave differently. Structured output is handler-owned through the
+#:   config's ``outputFormat``, which is also why only ``effort`` of ``output_config`` is
+#:   forwarded.
+#: * ``inference_geo``: data location. The region inference runs in decides where data is
+#:   processed.
+#: * ``container``: server-side state. It selects container state carried over from another
+#:   request, not a model setting.
+#: * ``metadata``, ``user_profile_id``: identity and attribution. They say who the request is for,
+#:   or attribute it to a party other than the caller.
+#: * ``timeout``, ``extra_headers``, ``extra_query``, ``extra_body``: client/connection
+#:   configuration (a request timeout, raw HTTP overrides), never a config-controlled setting.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_MESSAGES_EXCLUDED_KEYS = frozenset(
+    {
+        "stream",
+        "output_format",
+        "inference_geo",
+        "container",
+        "metadata",
+        "user_profile_id",
+        "timeout",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+    }
+)
+
+
+def _rebuild_output_config(params: dict[str, Any]) -> dict[str, Any]:
+    """Keeps only ``effort`` of a forwarded ``output_config``, and drops an ``output_config``
+    whose ``effort`` is missing or not a string.
+
+    ``output_config.format`` is Anthropic's structured-output schema. The handler owns structured
+    output through the config's ``outputFormat`` (see ``_build_messages``), so a ``format`` here
+    would make the reply follow a second, possibly different, schema. It is always removed, as is
+    any other sub-key.
+    """
+    if "output_config" in params:
+        effort = params.pop("output_config").get("effort")
+        if isinstance(effort, str):
+            params["output_config"] = {"effort": effort}
+    return params
+
+
+def _rename_effort_to_output_config(params: dict[str, Any]) -> dict[str, Any]:
+    """Moves a top-level ``effort`` into ``output_config.effort``, the shape the Anthropic Messages
+    API actually accepts (there is no top-level ``effort`` parameter).
+
+    An ``output_config`` the config itself already set wins: if it carries its own string
+    ``effort``, the top-level one is dropped rather than overwriting it. Only ``effort`` of the
+    merged ``output_config`` is forwarded in the end (see :func:`_rebuild_output_config`). This
+    handler does not itself set ``output_config`` (structured output goes through a system-prompt
+    instruction instead, see ``_build_messages``).
+    """
+    effort = params.pop("effort", None)
+    if effort is None:
+        return params
+    existing = params.get("output_config")
+    if isinstance(existing, dict) and isinstance(existing.get("effort"), str):
+        return params
+    params["output_config"] = {
+        **(existing if isinstance(existing, dict) else {}),
+        "effort": effort,
+    }
+    return params
+
+
+def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that reach ``messages.create``/``.stream``: ``effort``
+    moved into ``output_config``, then only :data:`_MESSAGES_FORWARDED_KEYS`, with malformed
+    object values dropped, typed objects rebuilt (see :data:`_TYPED_OBJECT_SHAPES`), and
+    ``output_config`` narrowed to ``effort`` (see :func:`_rebuild_output_config`). ``invoke`` and
+    ``stream`` both call this, so they forward the same keys.
+    """
+    return _rebuild_output_config(
+        _rebuild_typed_objects(
+            select_forwarded_parameters(
+                _rename_effort_to_output_config(model_parameters(config)),
+                _MESSAGES_FORWARDED_KEYS,
+                mapping_keys=_MESSAGES_MAPPING_KEYS,
+            )
+        )
+    )
 
 
 def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
@@ -201,9 +380,8 @@ async def _run_tool_loop(
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {})
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
-    )
+    extra_params = _forwarded_parameters(config)
+    max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
     output = ""
     steps = 0
@@ -222,6 +400,7 @@ async def _run_tool_loop(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,
@@ -328,7 +507,7 @@ async def _run_tool_loop(
                     {
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": str(result),
+                        "content": tool_result_string(result),
                     }
                 )
             conversation.append({"role": "user", "content": tool_results})
@@ -349,16 +528,31 @@ def _is_coroutine(fn: Any) -> bool:
 _MAX_STEPS = 10
 
 
-def create_claude_messages_handler(*, capture_content: bool = False) -> ProviderHandler:
+def create_claude_messages_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
 
     Requires ``anthropic`` to be installed as a peer dependency.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. Conversation content is PII, so a run emits only metadata,
-    meaning models, token counts, timings and tool names, until a caller asks for more. Turning this
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII, so a run emits only metadata, meaning
+    models, token counts, timings and tool names, until capture is turned on. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
+    report_usage(
+        "claude-messages.createClaudeMessagesHandler", PACKAGE_NAME, __version__
+    )
+    return _create_claude_messages_handler(capture_content=capture_content)
+
+
+def _create_claude_messages_handler(
+    *, capture_content: bool | None = None
+) -> ProviderHandler:
+    """Non-reporting :func:`create_claude_messages_handler`, used by this package's wrappers."""
+    content_override = capture_content
     import importlib
 
     anthropic_mod = importlib.import_module("anthropic")
@@ -371,6 +565,8 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         th = tool_handlers or {}
         vs = variables or {}
 
@@ -454,15 +650,46 @@ def create_claude_messages_handler(*, capture_content: bool = False) -> Provider
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
         )
 
-    return create_handler(
+    return _create_handler(
         ("Anthropic", "messages"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
+
+
+def _map_claude_event(
+    event: Any, emitter: TurnEmitter, block_ids: dict[int, str]
+) -> list[dict[str, Any]]:
+    """Map one Messages API stream event onto the AG-UI subset."""
+    kind = getattr(event, "type", None)
+    if kind == "content_block_start":
+        block = getattr(event, "content_block", None)
+        index = getattr(event, "index", None)
+        if getattr(block, "type", None) != "tool_use" or not isinstance(index, int):
+            return []
+        call_id = str(getattr(block, "id", "") or "")
+        block_ids[index] = call_id
+        return emitter.tool_start(call_id, str(getattr(block, "name", "") or ""))
+    if kind == "content_block_delta":
+        delta = getattr(event, "delta", None)
+        delta_type = getattr(delta, "type", None)
+        if delta_type == "text_delta":
+            text = getattr(delta, "text", "")
+            if not isinstance(text, str) or not text:
+                return []
+            return emitter.text(text)
+        if delta_type == "input_json_delta":
+            index = getattr(event, "index", None)
+            call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+            partial = getattr(delta, "partial_json", "")
+            if not isinstance(partial, str):
+                return []
+            return emitter.tool_args(call_id, partial)
+    return []
 
 
 async def _stream_gen(
@@ -494,12 +721,13 @@ async def _stream_gen(
 
     tools = _build_tools(config.get("tools") or {})
     tool_definitions = to_tool_definitions(tools)
-    max_tokens = (config.get("model", {}).get("parameters") or {}).get(
-        "max_tokens", 1024
-    )
+    extra_params = _forwarded_parameters(config)
+    max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
     full_output = ""
     steps = 0
+    emitter = TurnEmitter(capture_content=capture_content)
+    block_ids: dict[int, str] = {}
 
     ended: set[int] = set()
     open_model_span: Any = None
@@ -528,6 +756,7 @@ async def _stream_gen(
             open_model_span = model_span
 
             kwargs: dict[str, Any] = {
+                **extra_params,
                 "model": config["model"]["name"],
                 "max_tokens": max_tokens,
                 "messages": conversation,
@@ -555,15 +784,10 @@ async def _stream_gen(
                 stream = client.messages.stream(**kwargs)
                 async with stream as s:
                     async for event in s:
-                        if (
-                            hasattr(event, "type")
-                            and event.type == "content_block_delta"
-                            and hasattr(event, "delta")
-                            and getattr(event.delta, "type", None) == "text_delta"
-                        ):
-                            text = event.delta.text
-                            full_output += text
-                            yield {"type": "chunk", "text": text}
+                        for rich in _map_claude_event(event, emitter, block_ids):
+                            if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                                full_output += rich.get("delta") or ""
+                            yield rich
 
                     final_msg = await s.get_final_message()
 
@@ -602,6 +826,10 @@ async def _stream_gen(
                 raise
 
             if final_msg.stop_reason != "tool_use":
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 break
 
             if steps >= _MAX_STEPS:
@@ -611,6 +839,17 @@ async def _stream_gen(
             steps += 1
 
             conversation.append({"role": "assistant", "content": final_msg.content})
+            for block in final_msg.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                for rich in emitter.tool_start(str(block.id), str(block.name)):
+                    yield rich
+                for rich in emitter.tool_end(
+                    str(block.id), arguments=getattr(block, "input", None)
+                ):
+                    yield rich
+            for rich in emitter.end_text():
+                yield rich
             tool_results = []
             for block in final_msg.content:
                 if block.type != "tool_use":
@@ -644,13 +883,17 @@ async def _stream_gen(
                 # Cleared on both paths that end the span, and deliberately not in a `finally`:
                 # a `finally` would also clear it for a BaseException, which is the one case where
                 # the span is still open and the outer `finally` is the only thing left to close it.
+                for rich in emitter.tool_result(str(block.id), result):
+                    yield rich
                 tool_results.append(
                     {
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": str(result),
+                        "content": tool_result_string(result),
                     }
                 )
+            for rich in emitter.fail_open():
+                yield rich
             conversation.append({"role": "user", "content": tool_results})
 
         set_output_content_attributes(
@@ -680,6 +923,8 @@ async def _stream_gen(
         if run_usage.reported:
             finish_root_span(span, config, run_usage.total)
         fail_span(span, exc, ended)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success and failure paths, because both already ended their spans through
@@ -708,10 +953,11 @@ def claude_messages(
     # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
     # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
     # asking for content on spans got a TypeError instead of content.
+    report_usage("claude-messages.claudeMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    return _config(
         key=config_key,
-        handler=create_claude_messages_handler(capture_content=capture_content),
+        handler=_create_claude_messages_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

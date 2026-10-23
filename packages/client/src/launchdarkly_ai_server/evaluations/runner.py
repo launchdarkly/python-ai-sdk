@@ -6,17 +6,20 @@ import inspect
 import json
 import logging
 import time
-import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping
+import urllib
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+from ..content import tool_result_string
 from ..judge_scoring import (
     FORMATTING_INSTRUCTIONS,
     build_message_history,
     numeric_score,
     parse_judge_response,
+    typesafe_judge_entries,
+    without_output_format,
 )
 from ..lifecycle import extract_variation
 from ..trajectory import (
@@ -24,15 +27,22 @@ from ..trajectory import (
     render_row_trajectory,
     row_fields,
 )
-from ..types import NativeTool
 from ..utils import (
-    collapse_messages_to_instructions,
+    handler_key,
     normalize_mode,
     parse_template,
     parse_usage,
+    select_handler,
     to_ld_context,
 )
-from .api import EvaluationsError, LDApiClient, LDApiError
+from .api import (
+    EvaluationsError,
+    LDApiClient,
+    LDApiError,
+    require_mapping,
+    require_string,
+    segment,
+)
 from .criteria import Criterion, Judge, Scorer, ScorerContext
 from .events import (
     CriterionEventPayload,
@@ -41,26 +51,33 @@ from .events import (
     LDJudgeCriterionEventPayload,
     TokenUsage,
 )
+from .tools import (
+    EvalTool,
+    ToolImplementation,
+    create_wire_tools,
+    handler_config_tools,
+)
 from .types import (
-    AIConfigVariation,
     DatasetRef,
     DatasetRow,
     EvaluationRef,
     EvaluationRunRef,
     GenerationConfig,
     ResolvedJudge,
-    ResolvedTool,
     RunSummary,
 )
 
 logger = logging.getLogger(__name__)
 
 DATASET_PAGE_SIZE = 200
+DATASET_UPLOAD_BATCH_SIZE = 500
 GENERATION_EVENT_NAME = "$ld:ai:offline-evals:generation"
 CRITERION_EVENT_NAME = "$ld:ai:offline-evals:criterion"
 
 EvalHandler = Callable[..., Awaitable[dict[str, Any]]]
-ToolImplementation = Callable[..., Any] | NativeTool
+
+
+AI_CONFIG_MODES = ("agent", "completion", "judge")
 
 
 @dataclass(frozen=True)
@@ -69,97 +86,61 @@ class JudgeExecution:
 
     resolved: ResolvedJudge
     handler: EvalHandler
-    collapse_messages: bool = False
 
 
 def _provides_for(
     handler: EvalHandler,
 ) -> tuple[str, Literal["agent", "messages"]] | None:
-    provides_for = getattr(handler, "provides_for", None)
-    if (
-        isinstance(provides_for, tuple | list)
-        and len(provides_for) == 2
-        and isinstance(provides_for[0], str)
-    ):
-        return (provides_for[0], normalize_mode(provides_for[1]))
-    return None
+    """Normalized handler identity; shares :func:`handler_key` with online."""
+    return handler_key(handler)
 
 
-def _covers_provider(
-    provides_for: tuple[str, Literal["agent", "messages"]],
-    provider: str | None,
-) -> bool:
-    return provides_for[0] == provider or provides_for[0] == "*"
+def describe_handlers(handlers: Sequence[EvalHandler]) -> str:
+    """Return the ``provides_for`` of each handler, for an error message."""
+    return ", ".join(repr(_provides_for(handler)) for handler in handlers)
 
 
-def _find_judge_handler(
-    judge_handlers: list[EvalHandler],
+def select_eval_handler(
+    handlers: Sequence[EvalHandler],
     provider: str | None,
     mode: Literal["agent", "messages"],
 ) -> EvalHandler | None:
-    """Find a handler for ``provider`` in ``mode``, exact match before wildcard.
+    """Select the handler for ``provider`` and ``mode`` with the ``config()`` rule.
 
-    A wildcard handler is a fallback for multi-provider adapters, so it is only
-    chosen when no handler names the provider outright -- the priority
-    ``config()`` already applies to a generation config. Searching in one pass
-    would instead let the order the caller happened to list its handlers in
-    decide, sending an OpenAI judge through a LangChain adapter that was merely
-    listed first.
+    Returns ``None`` when no handler matches. There is no mode fallback.
     """
-    for exact in (True, False):
-        for candidate in judge_handlers:
-            provides_for = _provides_for(candidate)
-            if provides_for is None or provides_for[1] != mode:
-                continue
-            if exact:
-                if provides_for[0] == provider:
-                    return candidate
-            elif provides_for[0] == "*":
-                return candidate
-    return None
+    if not provider:
+        return None
+    try:
+        selected = select_handler(
+            {"provider": {"name": provider}},
+            {"mode": mode},
+            list(handlers),  # type: ignore[arg-type]
+        )
+    except ValueError:
+        return None
+    return cast(EvalHandler, selected)
 
 
-def _select_judge_handler(
-    resolved: ResolvedJudge,
-    handler: EvalHandler,
-    judge_handlers: list[EvalHandler],
-) -> JudgeExecution | None:
-    """Pick the handler that can run this judge's config, or ``None``.
+def prompt_mode_error(
+    config: Mapping[str, Any],
+    mode: Literal["agent", "messages"],
+) -> str | None:
+    """Return an error when the prompt field does not match the handler mode.
 
-    A judge is an independent AI Config: it may resolve to a different provider
-    and mode than the evaluation's generation config, and a handler built for
-    one provider cannot execute another's config. The priority mirrors the
-    online path (``judges.run_judges``):
-
-    1. a judge handler in the judge's mode, naming its provider outright
-       before any wildcard adapter;
-    2. an agent-mode judge handler for a messages-mode judge, whose messages
-       are collapsed into a single instructions block;
-    3. the generation handler, when it covers the judge's provider.
-
-    A handler that declares no ``provides_for`` is a plain callable doing its
-    own routing -- the same contract it already honours for the generation
-    config -- so it is treated as covering every judge.
+    A messages handler needs ``messages`` and an agent handler needs
+    ``instructions``. A config with neither field is valid. Returns ``None``
+    when the prompt matches.
     """
-    match = _find_judge_handler(judge_handlers, resolved.provider, resolved.mode)
-    if match is not None:
-        return JudgeExecution(resolved=resolved, handler=match)
-    if resolved.mode == "messages":
-        agent_fallback = _find_judge_handler(judge_handlers, resolved.provider, "agent")
-        if agent_fallback is not None:
-            return JudgeExecution(
-                resolved=resolved, handler=agent_fallback, collapse_messages=True
-            )
-    generation_provides_for = _provides_for(handler)
-    if generation_provides_for is None:
-        return JudgeExecution(resolved=resolved, handler=handler)
-    if _covers_provider(generation_provides_for, resolved.provider):
-        return JudgeExecution(
-            resolved=resolved,
-            handler=handler,
-            collapse_messages=(
-                generation_provides_for[1] == "agent" and resolved.mode == "messages"
-            ),
+    if mode == "messages" and config.get("instructions"):
+        return (
+            "prompt needs 'messages' because the handler is a messages "
+            "handler, but it has 'instructions'"
+        )
+    if mode == "agent" and config.get("messages"):
+        return (
+            "prompt needs 'instructions' because the handler is an agent "
+            "handler, but it has 'messages'"
         )
     return None
 
@@ -168,21 +149,37 @@ def _segment(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
 
-def _mapping(value: Any, *, description: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise EvaluationsError(
-            f"LaunchDarkly returned an invalid {description} response"
-        )
-    return value
+def render_row(
+    row_index: int,
+    *,
+    input_value: Any,
+    expected_value: Any,
+    variables_value: Any,
+    metadata_value: Any,
+) -> DatasetRow:
+    """Render one stored dataset row for handler invocation.
 
-
-def _required_string(data: Mapping[str, Any], key: str, description: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value:
-        raise EvaluationsError(
-            f"LaunchDarkly {description} response is missing string field {key!r}"
-        )
-    return value
+    Shared by hosted and inline datasets so a row renders the same whichever
+    path supplied it.
+    """
+    variables = dict(variables_value) if isinstance(variables_value, Mapping) else {}
+    rendered_input = (
+        parse_template(input_value, variables) if isinstance(input_value, str) else None
+    )
+    rendered_expected = (
+        parse_template(expected_value, variables)
+        if isinstance(expected_value, str)
+        else None
+    )
+    variables["input"] = rendered_input
+    variables["expected_output"] = rendered_expected
+    return DatasetRow(
+        row_index=row_index,
+        input=rendered_input,
+        expected_output=rendered_expected,
+        variables=variables,
+        metadata=dict(metadata_value) if isinstance(metadata_value, Mapping) else None,
+    )
 
 
 class ConcurrencyController:
@@ -221,27 +218,51 @@ class EvaluationsRunner:
     def __init__(self, api: LDApiClient) -> None:
         self._api = api
 
+    def _fetch_ai_config_mode(self, project_key: str, config_key: str) -> str:
+        """Read the mode of an AI Config from the management API.
+
+        Returns ``"agent"``, ``"completion"`` or ``"judge"``. An absent mode is
+        ``"completion"``. Raises :class:`EvaluationsError` for any other value,
+        and when the AI Config does not exist.
+        """
+        description = f"AI Config {config_key!r}"
+        path = f"projects/{segment(project_key)}/ai-configs/{segment(config_key)}"
+        try:
+            raw = require_mapping(self._api.get(path), description=description)
+        except LDApiError as error:
+            if error.status == 404:
+                raise EvaluationsError(
+                    f"LaunchDarkly {description} was not found in project {project_key!r}"
+                ) from error
+            raise
+        mode = raw.get("mode", "completion")
+        if mode is None:
+            mode = "completion"
+        if not isinstance(mode, str) or mode not in AI_CONFIG_MODES:
+            raise EvaluationsError(
+                f"LaunchDarkly {description} has an unknown mode {mode!r}. "
+                "Expected one of: " + ", ".join(repr(m) for m in AI_CONFIG_MODES)
+            )
+        return mode
+
     def _fetch_config_variation(
         self,
         project_key: str,
         config_key: str,
         variation_key: str,
-    ) -> AIConfigVariation:
-        """Read an AI Config variation by key from the management API.
+    ) -> Mapping[str, Any]:
+        """Read the latest version of an AI Config variation by key.
 
-        Flag delivery cannot select a variation by key -- it serves whichever
-        variation targeting picks for a context -- so this reads the variation
-        definition directly. Provider and base model parameters live on the
-        linked model config, and are layered the way the served flag payload
-        layers them: model-config parameters first, variation parameters over.
+        Raises :class:`EvaluationsError` when the variation does not exist,
+        has no versions, or has a ``modelConfigKey`` that is not a string.
         """
         description = f"AI Config variation {config_key!r}/{variation_key!r}"
         path = (
-            f"projects/{_segment(project_key)}/ai-configs/{_segment(config_key)}"
-            f"/variations/{_segment(variation_key)}"
+            f"projects/{segment(project_key)}/ai-configs/{segment(config_key)}"
+            f"/variations/{segment(variation_key)}"
         )
         try:
-            raw = _mapping(self._api.get(path), description=description)
+            raw = require_mapping(self._api.get(path), description=description)
         except LDApiError as error:
             if error.status == 404:
                 raise EvaluationsError(
@@ -258,22 +279,25 @@ class EvaluationsRunner:
         if not versions:
             raise EvaluationsError(f"LaunchDarkly {description} has no versions")
         latest = max(versions, key=lambda item: int(item["version"]))
-
-        # Absent or empty means the variation links no model config, so it has
-        # no provider -- flag delivery serves an empty provider name for it too.
-        # Anything other than a string is a response we do not understand.
-        model_config: Mapping[str, Any] | None = None
+        # Absent or empty means that the variation links no model config.
         model_config_key = latest.get("modelConfigKey")
         if model_config_key is not None and not isinstance(model_config_key, str):
             raise EvaluationsError(
                 f"LaunchDarkly {description} has a non-string modelConfigKey: "
                 f"{model_config_key!r}"
             )
-        if model_config_key:
-            model_config = self._fetch_model_config(
-                project_key, model_config_key, latest.get("modelConfigVersion")
-            )
-        return AIConfigVariation.from_api(latest, model_config)
+        return latest
+
+    def _fetch_linked_model_config(
+        self, project_key: str, variation: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        """Read the model config a variation links, or return ``None``."""
+        model_config_key = variation.get("modelConfigKey")
+        if not isinstance(model_config_key, str) or not model_config_key:
+            return None
+        return self._fetch_model_config(
+            project_key, model_config_key, variation.get("modelConfigVersion")
+        )
 
     def _fetch_model_config(
         self,
@@ -282,13 +306,13 @@ class EvaluationsRunner:
         version: Any,
     ) -> Mapping[str, Any]:
         path = (
-            f"projects/{_segment(project_key)}/ai-configs/model-configs/"
-            f"{_segment(model_config_key)}"
+            f"projects/{segment(project_key)}/ai-configs/model-configs/"
+            f"{segment(model_config_key)}"
         )
         # A pinned variation names the model-config version it was built against.
         params = {"version": version} if isinstance(version, int) else None
         try:
-            return _mapping(
+            return require_mapping(
                 self._api.get(path, params=params),
                 description=f"model config {model_config_key!r}",
             )
@@ -300,59 +324,20 @@ class EvaluationsRunner:
                 ) from error
             raise
 
-    def _resolve_tools(
-        self,
-        project_key: str,
-        tools: Mapping[str, ToolImplementation],
-    ) -> dict[str, ResolvedTool]:
-        resolved: dict[str, ResolvedTool] = {}
-        for key, implementation in tools.items():
-            if not callable(implementation) and not isinstance(
-                implementation, NativeTool
-            ):
-                raise EvaluationsError(
-                    f"Tool {key!r} must be callable or a NativeTool instance"
-                )
-            path = f"projects/{_segment(project_key)}/ai-tools/{_segment(key)}"
-            try:
-                raw = _mapping(self._api.get(path), description=f"tool {key!r}")
-            except LDApiError as error:
-                if error.status == 404:
-                    raise EvaluationsError(
-                        f"LaunchDarkly AI tool {key!r} was not found in project {project_key!r}"
-                    ) from error
-                raise
-            version = raw.get("version")
-            if not isinstance(version, int):
-                raise EvaluationsError(
-                    f"LaunchDarkly AI tool {key!r} has no integer version"
-                )
-            schema = raw.get("schema")
-            if not isinstance(schema, Mapping):
-                schema = {}
-            resolved[key] = ResolvedTool(
-                key=key,
-                version=version,
-                description=str(raw.get("description") or ""),
-                schema=dict(schema),
-            )
-        return resolved
-
     async def _resolve_judges(
         self,
         project_key: str,
         judges: list[Judge],
-        handler: EvalHandler,
-        judge_handlers: list[EvalHandler] | None = None,
+        handlers: Sequence[EvalHandler],
     ) -> dict[str, JudgeExecution]:
-        """Resolve LD Judge configs before any evaluation records are created.
+        """Resolve LD Judge configs and select a handler for each one.
 
-        Each judge is paired with the handler that can execute its config here,
-        rather than at scoring time, so a judge no handler covers fails the run
-        before any records exist or any generation spend happens.
+        Runs before any evaluation record is created. Raises one
+        :class:`EvaluationsError` that lists every judge with no handler and
+        every judge whose prompt does not match its handler's mode.
         """
-        available_judge_handlers = list(judge_handlers or [])
         resolved: dict[str, JudgeExecution] = {}
+        problems: list[str] = []
         # variation() rejects a context without kind and key; use the same
         # context shape the emitted evaluation events are attributed to.
         context: dict[str, Any] = {"kind": "evaluation", "key": project_key}
@@ -380,9 +365,13 @@ class EvaluationsRunner:
                 if isinstance(provider_value, Mapping)
                 else None
             )
+            # Judges cannot use tools.
+            judge_config = {
+                name: value for name, value in config.items() if name != "tools"
+            }
             resolved_judge = ResolvedJudge(
                 key=judge.key,
-                config=dict(config),
+                config=dict(without_output_format(judge_config, judge.key)),
                 variation_key=str(meta.get("variationKey") or ""),
                 version=int(meta["version"])
                 if isinstance(meta.get("version"), int)
@@ -392,31 +381,43 @@ class EvaluationsRunner:
                     meta.get("mode") if isinstance(meta.get("mode"), str) else None
                 ),
             )
-            execution = _select_judge_handler(
-                resolved_judge, handler, available_judge_handlers
+            handler = select_eval_handler(
+                handlers, resolved_judge.provider, resolved_judge.mode
             )
-            if execution is None:
-                raise EvaluationsError(
-                    f"No handler can run LaunchDarkly judge {judge.key!r}: its "
-                    f"config is served by provider {resolved_judge.provider!r} in "
-                    f"{resolved_judge.mode!r} mode, which neither the generation "
-                    "handler nor any judge_handlers entry provides for. Pass a "
-                    "handler for that provider to run(judge_handlers=[...])."
+            if handler is None:
+                problems.append(
+                    f"judge {judge.key!r} needs a handler for provider "
+                    f"{resolved_judge.provider!r} in {resolved_judge.mode!r} mode"
                 )
-            resolved[judge.key] = execution
+                continue
+            prompt_error = prompt_mode_error(judge_config, resolved_judge.mode)
+            if prompt_error is not None:
+                problems.append(f"judge {judge.key!r}: {prompt_error}")
+                continue
+            resolved[judge.key] = JudgeExecution(
+                resolved=resolved_judge, handler=handler
+            )
+        if problems:
+            raise EvaluationsError(
+                "Cannot run the judges of this evaluation: "
+                + "; ".join(problems)
+                + f". The handlers provide for: {describe_handlers(handlers)}."
+            )
         return resolved
 
     def _fetch_dataset(self, project_key: str, dataset_key: str) -> DatasetRef:
-        path = f"projects/{_segment(project_key)}/datasets/{_segment(dataset_key)}"
+        path = f"projects/{segment(project_key)}/datasets/{segment(dataset_key)}"
         try:
-            raw = _mapping(self._api.get(path), description=f"dataset {dataset_key!r}")
+            raw = require_mapping(
+                self._api.get(path), description=f"dataset {dataset_key!r}"
+            )
         except LDApiError as error:
             if error.status == 404:
                 raise EvaluationsError(
                     f"LaunchDarkly dataset {dataset_key!r} was not found in project {project_key!r}"
                 ) from error
             raise
-        dataset_id = _required_string(raw, "id", "dataset")
+        dataset_id = require_string(raw, "id", "dataset")
         response_key = raw.get("key", raw.get("name", dataset_key))
         return DatasetRef(id=dataset_id, key=str(response_key))
 
@@ -427,8 +428,8 @@ class EvaluationsRunner:
         *,
         offset: int,
     ) -> Mapping[str, Any]:
-        path = f"projects/{_segment(project_key)}/datasets/{_segment(dataset_key)}/rows"
-        return _mapping(
+        path = f"projects/{segment(project_key)}/datasets/{segment(dataset_key)}/rows"
+        return require_mapping(
             self._api.get(
                 path,
                 params={
@@ -458,44 +459,19 @@ class EvaluationsRunner:
             if not items:
                 break
             for item_value in items:
-                item = _mapping(item_value, description="dataset row")
+                item = require_mapping(item_value, description="dataset row")
                 row_index = item.get("rowIndex")
                 if not isinstance(row_index, int):
                     raise EvaluationsError(
                         "A dataset row is missing its integer rowIndex"
                     )
-                variables_value = item.get("variables")
-                variables = (
-                    dict(variables_value)
-                    if isinstance(variables_value, Mapping)
-                    else {}
-                )
-                input_value = item.get("input")
-                expected_value = item.get("expectedOutput")
-                rendered_input = (
-                    parse_template(input_value, variables)
-                    if isinstance(input_value, str)
-                    else None
-                )
-                rendered_expected = (
-                    parse_template(expected_value, variables)
-                    if isinstance(expected_value, str)
-                    else None
-                )
-                variables["input"] = rendered_input
-                variables["expected_output"] = rendered_expected
-                metadata_value = item.get("metadata")
                 rows.append(
-                    DatasetRow(
-                        row_index=row_index,
-                        input=rendered_input,
-                        expected_output=rendered_expected,
-                        variables=variables,
-                        metadata=(
-                            dict(metadata_value)
-                            if isinstance(metadata_value, Mapping)
-                            else None
-                        ),
+                    render_row(
+                        row_index,
+                        input_value=item.get("input"),
+                        expected_value=item.get("expectedOutput"),
+                        variables_value=item.get("variables"),
+                        metadata_value=item.get("metadata"),
                     )
                 )
             offset += len(items)
@@ -512,7 +488,7 @@ class EvaluationsRunner:
         project_key: str,
         key: str,
         generation: GenerationConfig,
-        tools: Mapping[str, ResolvedTool],
+        tools: Sequence[EvalTool],
         criteria: list[Criterion] | None = None,
     ) -> EvaluationRef:
         body: dict[str, Any] = {
@@ -533,15 +509,13 @@ class EvaluationsRunner:
         if "prompt_snippets" in generation:
             body["promptSnippets"] = generation["prompt_snippets"]
         if tools:
-            body["tools"] = [
-                {"key": tool.key, "version": tool.version} for tool in tools.values()
-            ]
+            body["tools"] = create_wire_tools(tools)
         if criteria:
             body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
 
-        path = f"projects/{_segment(project_key)}/evaluations"
-        raw = _mapping(self._api.post(path, body=body), description="evaluation")
-        evaluation_id = _required_string(raw, "id", "evaluation")
+        path = f"projects/{segment(project_key)}/evaluations"
+        raw = require_mapping(self._api.post(path, body=body), description="evaluation")
+        evaluation_id = require_string(raw, "id", "evaluation")
         response_key = raw.get("name", raw.get("label", key))
         version = raw.get("version")
         return EvaluationRef(
@@ -554,27 +528,79 @@ class EvaluationsRunner:
         self,
         project_key: str,
         evaluation_id: str,
-        dataset_id: str,
+        dataset_id: str | None,
     ) -> EvaluationRunRef:
         path = (
-            f"projects/{_segment(project_key)}/evaluations/"
-            f"{_segment(evaluation_id)}/runs"
+            f"projects/{segment(project_key)}/evaluations/{segment(evaluation_id)}/runs"
         )
-        body: dict[str, Any] = {
-            "source": "api",
-            "datasetId": dataset_id,
-        }
-        raw = _mapping(
+        body: dict[str, Any] = {"source": "api"}
+        if dataset_id is not None:
+            body["datasetId"] = dataset_id
+        raw = require_mapping(
             self._api.post(path, body=body),
             description="evaluation run",
         )
         return self._run_ref(raw)
 
+    def _upload_dataset_rows(
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+        rows: list[DatasetRow],
+    ) -> None:
+        """Upload an inline dataset's raw rows to its run, in bounded batches.
+
+        Uploads are idempotent per ``rowIdx``, so each batch is retried like a
+        GET. Batches go one at a time so a failure names exactly which rows
+        did not land.
+        """
+        path = (
+            f"projects/{_segment(project_key)}/evaluations/"
+            f"{_segment(evaluation_id)}/runs/{_segment(run_id)}/dataset-rows"
+        )
+        for start in range(0, len(rows), DATASET_UPLOAD_BATCH_SIZE):
+            batch = rows[start : start + DATASET_UPLOAD_BATCH_SIZE]
+            body = {
+                "rows": [
+                    {
+                        "rowIdx": row.row_index,
+                        "input": row.input,
+                        "expectedOutput": row.expected_output,
+                        "variables": row.variables,
+                        "metadata": row.metadata,
+                    }
+                    for row in batch
+                ]
+            }
+            try:
+                self._api.post(path, body=body, idempotent=True)
+            except EvaluationsError as error:
+                raise EvaluationsError(
+                    f"Failed to upload inline dataset rows {start}-"
+                    f"{start + len(batch) - 1} of {len(rows)} to evaluation run "
+                    f"{run_id}: {error}"
+                ) from error
+
+    def _cancel_evaluation_run(
+        self,
+        project_key: str,
+        evaluation_id: str,
+        run_id: str,
+    ) -> None:
+        """Cancel a run, retried like a GET: replaying a cancel cannot change
+        its outcome."""
+        path = (
+            f"projects/{_segment(project_key)}/evaluations/"
+            f"{_segment(evaluation_id)}/runs/{_segment(run_id)}/cancel"
+        )
+        self._api.post(path, idempotent=True)
+
     def _run_ref(self, raw: Mapping[str, Any]) -> EvaluationRunRef:
         return EvaluationRunRef(
-            id=_required_string(raw, "id", "evaluation run"),
-            evaluation_id=_required_string(raw, "evaluationId", "evaluation run"),
-            state=_required_string(raw, "state", "evaluation run"),
+            id=require_string(raw, "id", "evaluation run"),
+            evaluation_id=require_string(raw, "evaluationId", "evaluation run"),
+            state=require_string(raw, "state", "evaluation run"),
             status_reason=(
                 str(raw["statusReason"])
                 if raw.get("statusReason") is not None
@@ -585,19 +611,13 @@ class EvaluationsRunner:
     def _build_handler_config(
         self,
         generation: GenerationConfig,
-        tools: Mapping[str, ResolvedTool],
+        tools: Sequence[EvalTool],
     ) -> dict[str, Any]:
         parameters = generation.get("parameters")
         config: dict[str, Any] = {
             "provider": {"name": generation["provider"]},
             "model": {"name": generation["model"], "parameters": parameters},
-            "tools": {
-                key: {
-                    "description": tool.description,
-                    "parameters": tool.schema,
-                }
-                for key, tool in tools.items()
-            },
+            "tools": handler_config_tools(tools),
         }
         snippet_variables = {"snippet": generation.get("prompt_snippets", {})}
         if "instructions" in generation:
@@ -711,6 +731,8 @@ class EvaluationsRunner:
                 "datasetId": dataset.id,
                 "rowIndex": result["row_index"],
             }
+            if dataset.id is None:
+                del identity["datasetId"]
             event_id = hashlib.sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
@@ -748,12 +770,13 @@ class EvaluationsRunner:
                 "emittedAt": emitted_at,
                 "evaluationKey": evaluation.key,
                 "evaluationVersion": evaluation.version,
-                "datasetKey": dataset.key,
                 "status": result["status"],
                 "startedAt": result["started_at"],
                 "generatedAt": result["generated_at"],
                 "latencyMs": result["latency_ms"],
             }
+            if dataset.key is not None:
+                payload["datasetKey"] = dataset.key
             if generated["output"] is not None:
                 payload["output"] = generated["output"]
             if generated["error"] is not None:
@@ -801,7 +824,7 @@ class EvaluationsRunner:
         variables.update(
             {
                 "input": row_result.get("input") or "",
-                "response_to_evaluate": output if output is not None else "",
+                "response_to_evaluate": tool_result_string(output),
                 "message_history": build_message_history(
                     user_input=row_result.get("input"),
                     trajectory=trajectory,
@@ -859,7 +882,7 @@ class EvaluationsRunner:
             metadata=row.get("metadata"),
         )
         try:
-            if scorer.accepts_context:
+            if scorer._accepts_context:
                 context = ScorerContext(
                     tool_calls=tuple(row.get("tool_calls") or ()),
                     tool_calls_omitted=int(row.get("tool_calls_omitted") or 0),
@@ -906,7 +929,6 @@ class EvaluationsRunner:
     async def _run_ld_judge_for_result(
         self,
         row: Mapping[str, Any],
-        tool_handlers: dict[str, ToolImplementation],
         judge: Judge,
         execution: JudgeExecution,
     ) -> dict[str, Any]:
@@ -933,19 +955,11 @@ class EvaluationsRunner:
         # parse_template pass, so ``{{...}}`` sequences inside generated output
         # or dataset values are never re-expanded into the judge prompt.
         variables = self._judge_variables(row, judge)
-        # An agent-mode handler standing in for a messages-mode judge needs the
-        # messages folded into one instructions block, exactly as the online
-        # path does before handing a judge config to an agent handler.
-        judge_config = (
-            collapse_messages_to_instructions(resolved.config)
-            if execution.collapse_messages
-            else resolved.config
-        )
         try:
             result = await execution.handler(
-                dict(judge_config),
-                row.get("output"),
-                tool_handlers,
+                dict(resolved.config),
+                variables["response_to_evaluate"],
+                {},
                 {
                     **variables,
                     "formatting_instructions": FORMATTING_INSTRUCTIONS,
@@ -962,10 +976,17 @@ class EvaluationsRunner:
                 "invalid_judge_output",
                 "judge handler result must be a mapping",
             )
+        judge_output = result.get("output", result.get("response"))
         try:
-            raw_score, reason = parse_judge_response(
-                result.get("output", result.get("response"))
-            )
+            entries = typesafe_judge_entries(judge_output)
+            if entries is not None:
+                # A criterion event is one score. The remaining labels are
+                # available on the online judge_results path. The reason is the
+                # question key: ingest drops a COMPLETE judge event with an
+                # empty reason, and a Jev label has no prose verdict.
+                raw_score, reason = entries[0]["score"], entries[0]["key"]
+            else:
+                raw_score, reason = parse_judge_response(judge_output)
         except ValueError as error:
             return self._criterion_error_result(
                 base, started_clock, "invalid_judge_output", str(error)
@@ -1001,7 +1022,6 @@ class EvaluationsRunner:
     async def _run_criteria_for_results(
         self,
         rows: list[dict[str, Any]],
-        tool_handlers: dict[str, ToolImplementation],
         criteria: list[Criterion],
         resolved_judges: Mapping[str, JudgeExecution],
         concurrency: int,
@@ -1018,7 +1038,6 @@ class EvaluationsRunner:
                     return await self._run_scorer_for_result(row, criterion)
                 return await self._run_ld_judge_for_result(
                     row,
-                    tool_handlers,
                     criterion,
                     resolved_judges[criterion.key],
                 )
@@ -1066,6 +1085,8 @@ class EvaluationsRunner:
                     "rowIndex": result["row_index"],
                     "criterionType": result["criterion_type"],
                 }
+                if dataset.id is None:
+                    del identity["datasetId"]
                 event_id = hashlib.sha256(
                     json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()
@@ -1157,9 +1178,9 @@ class EvaluationsRunner:
         self, project_key: str, evaluation_id: str, run_id: str
     ) -> RunSummary:
         path = (
-            f"projects/{_segment(project_key)}/evaluations/{_segment(evaluation_id)}"
-            f"/runs/{_segment(run_id)}/summary"
+            f"projects/{segment(project_key)}/evaluations/{segment(evaluation_id)}"
+            f"/runs/{segment(run_id)}/summary"
         )
         return RunSummary.from_wire(
-            _mapping(self._api.get(path), description="evaluation run summary")
+            require_mapping(self._api.get(path), description="evaluation run summary")
         )

@@ -22,6 +22,15 @@ from launchdarkly_ai_server import (
 # ---------------------------------------------------------------------------
 
 CONTEXT = {"kind": "user", "key": "u1"}
+_SDK_BOOKKEEPING = {"$ld:ai:sdk:usage", "$ld:ai:sdk:info"}
+
+
+def _generation_calls(client: MagicMock) -> list[Any]:
+    return [
+        call
+        for call in client.track.call_args_list
+        if call[0][0] not in _SDK_BOOKKEEPING
+    ]
 
 
 def _make_client(response: Any = "Hello", usage: dict | None = None) -> MagicMock:
@@ -127,8 +136,8 @@ class TestConfigSingleHandler:
         assert result.track_data["modelKey"] == "my-model"
         assert result.track_data["modelVersion"] == 3
         assert isinstance(result.track_data["modelVersion"], int)
-        assert mock_ld_client.track.call_args_list
-        for call in mock_ld_client.track.call_args_list:
+        assert _generation_calls(mock_ld_client)
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
             assert payload["modelVersion"] == 3
@@ -141,7 +150,7 @@ class TestConfigSingleHandler:
         assert result.track_data is not None
         assert "modelKey" not in result.track_data
         assert "modelVersion" not in result.track_data
-        for call in mock_ld_client.track.call_args_list:
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert "modelKey" not in payload
             assert "modelVersion" not in payload
@@ -174,8 +183,8 @@ class TestConfigSingleHandler:
         m = config(key="flag", handler=_make_handler(stream_chunks=["a", "b"]))
         async for _ in m.stream("q", CONTEXT):
             pass
-        assert mock_ld_client.track.call_args_list
-        for call in mock_ld_client.track.call_args_list:
+        assert _generation_calls(mock_ld_client)
+        for call in _generation_calls(mock_ld_client):
             payload = call[0][2]
             assert payload["modelKey"] == "my-model"
             assert payload["modelVersion"] == 3
@@ -441,6 +450,27 @@ class TestConfigMultiHandler:
         rm = config(key="flag", handler=[h])
         result = await rm.invoke("hi", CONTEXT)
         assert result.response == "normalized"
+
+    @pytest.mark.parametrize(
+        "provides_for", [("TestProvider", "completion"), ["TestProvider", "messages"]]
+    )
+    async def test_handler_tag_is_matched_after_normalizing_its_mode(
+        self, mock_ld_client: MagicMock, provides_for: Any
+    ) -> None:
+        h = _handler_for("TestProvider", "messages", "normalized")
+        h.provides_for = provides_for
+        rm = config(key="flag", handler=[h])
+        result = await rm.invoke("hi", CONTEXT)
+        assert result.response == "normalized"
+
+    async def test_wildcard_tag_is_matched_after_normalizing_its_mode(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        h = _handler_for("*", "messages", "wildcard")
+        h.provides_for = ("*", "completion")
+        rm = config(key="flag", handler=[h])
+        result = await rm.invoke("hi", CONTEXT)
+        assert result.response == "wildcard"
 
     async def test_throws_when_no_provider(self, mock_ld_client: MagicMock) -> None:
         raw = {
@@ -777,6 +807,65 @@ class TestConfigStream:
         events_tracked = [c[0][0] for c in mock_ld_client.track.call_args_list]
         assert "$ld:ai:generation:error" in events_tracked
 
+    async def test_a_plain_async_iterator_exits_cleanly(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        class _Iterator:
+            def __init__(self) -> None:
+                self._events = [
+                    {"type": "chunk", "text": "hi"},
+                    {
+                        "type": "done",
+                        "output": "hi",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                ]
+
+            def __aiter__(self) -> Any:
+                return self
+
+            async def __anext__(self) -> dict[str, Any]:
+                if not self._events:
+                    raise StopAsyncIteration
+                event = self._events.pop(0)
+                return event
+
+        def _stream_fn(
+            cfg: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> _Iterator:
+            iterator = _Iterator()
+            assert not hasattr(iterator, "aclose")
+            return iterator
+
+        async def _noop_fn(
+            cfg: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict[str, Any]:
+            return {"output": "", "usage": {}}
+
+        handler = ProviderHandler(
+            fn=_noop_fn,
+            stream_fn=_stream_fn,
+            provides_for=("TestProvider", "messages"),
+        )
+        events = [
+            event
+            async for event in config(key="flag", handler=handler).stream("q", CONTEXT)
+        ]
+        chunks = [event for event in events if event["type"] == "chunk"]
+        assert chunks == [{"type": "chunk", "text": "hi"}]
+        assert events[-1]["type"] == "done"
+        assert events[-1]["response"] == "hi"
+        tracked = [call[0][0] for call in mock_ld_client.track.call_args_list]
+        assert "$ld:ai:generation:success" in tracked
+
     async def test_ld_context_injected_into_stream_variables(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -1044,6 +1133,7 @@ class TestInvokeJudgeTasks:
         assert task.collapse_messages is False
         assert task.parent_track_data is not None
         assert task.parent_track_data.get("configKey") == "flag"
+        assert task.user_input == "q"
 
     async def test_sets_collapse_messages_for_agent_fallback(
         self, mock_ld_client: MagicMock
@@ -1091,6 +1181,33 @@ class TestInvokeJudgeTasks:
         assert result.judge_tasks is not None
         assert len(result.judge_tasks) == 1
         assert result.judge_tasks[0].collapse_messages is True
+
+    async def test_completion_handler_is_exact_match_for_messages_judge(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        # Registry may keep only a completion-tagged handler after replace.
+        # That must still be an exact messages-mode match (no agent collapse).
+        mock_ld_client.variation = self._make_multi_variation(
+            self._main_variation_with_judge(),
+            self._judge_variation(),
+        )
+
+        async def completion_fn(
+            cfg, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok", "usage": {}}
+
+        h = ProviderHandler(
+            fn=completion_fn, provides_for=("TestProvider", "completion")
+        )  # type: ignore[arg-type]
+        result = await config(key="flag", handler=h, skip_judges=True).invoke(
+            "q", CONTEXT
+        )
+
+        assert result.judge_tasks is not None
+        assert len(result.judge_tasks) == 1
+        assert result.judge_tasks[0].collapse_messages is False
+        assert result.judge_tasks[0].judge_mode == "messages"
 
     async def test_excludes_task_when_no_handler_matches_judge_provider(
         self, mock_ld_client: MagicMock

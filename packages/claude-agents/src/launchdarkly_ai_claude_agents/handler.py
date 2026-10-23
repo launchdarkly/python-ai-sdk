@@ -16,14 +16,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+import os
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from typing import Any
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     HookMatcher,
     ResultMessage,
+    SettingSource,
     StreamEvent,
+    ToolResultBlock,
+    UserMessage,
     query,
 )
 
@@ -35,19 +39,26 @@ from launchdarkly_ai_server import (
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
+    _config,
+    _create_handler,
     compose_history,
-    config,
     content_to_text,
-    create_handler,
     end_span_once,
     end_unfinished_spans,
     parse_template,
+    report_usage,
     set_conversation_id_if_absent,
     set_input_content_attributes,
     set_output_content_attributes,
     set_tool_call_content_attributes,
+    tool_result_string,
 )
+from launchdarkly_ai_server.agui import TurnEmitter
+from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
+from ._version import PACKAGE_NAME, __version__
 from .spans import (
     MCP_TOOL_PREFIX,
     TOOL_MCP_NAME,
@@ -64,6 +75,97 @@ from .spans import (
     start_tool_span,
     succeed_span,
     tool_display_name,
+)
+
+#: Every field ``ClaudeAgentOptions`` declares, classified by hand into exactly one of: forwarded
+#: (below), handler-owned (``model``, ``allowed_tools``, ``mcp_servers``, ``hooks``, ``tools``,
+#: ``system_prompt``, set by each call site itself), or excluded (below).
+#: ``TestClaudeAgentOptionsAcceptsExactlyTheseFields`` in this package's tests asserts this
+#: classification stays exhaustive as the SDK's own dataclass changes.
+#:
+#: Only model and run settings are forwarded: how the model thinks, how long the run may go, and
+#: what it may spend. Everything that configures the host process the SDK launches (its binary,
+#: environment, working directory, file access, permissions, settings files, plugins, sandbox,
+#: session state) stays under the application's control, never a config's.
+#:
+#: This is the cross-SDK list for Claude Agents (TESTING.md section 1.12), shared with the native
+#: graph through :func:`_options_parameters`.
+#:
+#: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
+#: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
+#: for other providers; they are dropped like any other key not listed here.
+_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
+    {
+        "betas",
+        "effort",
+        "fallback_model",
+        "max_budget_usd",
+        "max_thinking_tokens",
+        "max_turns",
+        "thinking",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ClaudeAgentOptions``.
+_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS = frozenset({"thinking"})
+
+#: Accepted by ``ClaudeAgentOptions`` but never forwarded, and why:
+#: * ``cli_path``, ``env``, ``cwd``, ``add_dirs``, ``settings``, ``setting_sources``, ``plugins``,
+#:   ``skills``, ``sandbox``, ``user``, ``extra_args``: which binary runs, with what environment,
+#:   as which user, with what files, settings, plugins, and CLI arguments. A config that could set
+#:   these could run code on, or read files from, the host.
+#: * ``permission_mode``, ``permission_prompt_tool_name``, ``can_use_tool``, ``disallowed_tools``,
+#:   ``strict_mcp_config``, ``agents``: what the agent is allowed to do and which tools or
+#:   subagents it gets. The handler wires tools and permissions itself.
+#: * ``resume``, ``session_id``, ``fork_session``, ``continue_conversation``, ``session_store``,
+#:   ``session_store_flush``, ``enable_file_checkpointing``: session state on the host.
+#: * ``stderr``, ``debug_stderr``, ``include_partial_messages``, ``include_hook_events``,
+#:   ``max_buffer_size``, ``load_timeout_ms``: process I/O and transport plumbing, including the
+#:   streamed message shape the handler reads.
+#: * ``output_format``: structured output, which the handler owns through the config's
+#:   ``outputFormat`` by adding its schema to the system prompt. Forwarding a second schema here
+#:   would have the reply follow one schema while the prompt asks for another.
+#: * ``task_budget``: not one of the agreed run settings yet; ``max_turns`` and ``max_budget_usd``
+#:   cover run limits.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
+    {
+        "add_dirs",
+        "agents",
+        "can_use_tool",
+        "cli_path",
+        "continue_conversation",
+        "cwd",
+        "debug_stderr",
+        "disallowed_tools",
+        "enable_file_checkpointing",
+        "env",
+        "extra_args",
+        "fork_session",
+        "include_hook_events",
+        "include_partial_messages",
+        "load_timeout_ms",
+        "max_buffer_size",
+        "output_format",
+        "permission_mode",
+        "permission_prompt_tool_name",
+        "plugins",
+        "resume",
+        "sandbox",
+        "session_id",
+        "session_store",
+        "session_store_flush",
+        "setting_sources",
+        "settings",
+        "skills",
+        "stderr",
+        "strict_mcp_config",
+        "task_budget",
+        "user",
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -96,7 +198,7 @@ async def build_tool_mcp(
             if not handler:
                 raise ValueError(f'No handler registered for tool "{_name}"')
             result = await handler(args) if _is_coroutine(handler) else handler(args)
-            return {"content": [{"type": "text", "text": str(result)}]}
+            return {"content": [{"type": "text", "text": tool_result_string(result)}]}
 
         mcp_tool = tool_fn(
             tool_name,
@@ -195,6 +297,9 @@ def build_tool_hooks(
     native_tool_map: dict[str, Any],
     parent_context: Any,
     capture_content: bool,
+    *,
+    emitter: TurnEmitter | None = None,
+    pending: list[dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, list[HookMatcher]], ToolTelemetry, AbandonTelemetry, CancelTelemetry
 ]:
@@ -214,6 +319,11 @@ def build_tool_hooks(
     ) -> None:
         if tool_use_id is None:
             return
+        if emitter is not None and pending is not None:
+            if error is None:
+                pending.extend(emitter.tool_result(tool_use_id, result))
+            else:
+                pending.extend(emitter.tool_result(tool_use_id, failed=True))
         span = tool_spans.pop(tool_use_id, None)
         if span is None:
             return
@@ -255,6 +365,11 @@ def build_tool_hooks(
         # out of an unfiled span leaves it open with nothing tracking it: close_open_spans and the
         # teardown both walk this dict, so a span missing from it is a span that never exports.
         tool_spans[use_id] = span
+        if emitter is not None and pending is not None and use_id:
+            pending.extend(emitter.tool_start(use_id, display_name))
+            pending.extend(
+                emitter.tool_end(use_id, arguments=input_data.get("tool_input"))
+            )
         set_tool_call_content_attributes(
             span, capture_content, arguments=input_data.get("tool_input")
         )
@@ -458,15 +573,79 @@ def _opening_of(prompt: str, system_prompt: str | None) -> Opening:
     )
 
 
-def _result_error(subtype: str, errors: list[str] | None) -> str:
-    """Builds the error for a non-success result message.
+def _raise_if_run_failed(message: Any) -> None:
+    """Raises when a result message reports a failed run.
 
-    ``SDKResultError`` carries no ``result`` field, so a run that hit ``error_max_turns`` or
-    ``error_max_budget_usd`` genuinely failed and has to surface as a failure rather than being
-    reported OK with zeroed usage.
+    Two shapes fail. A non-``success`` subtype carries no ``result`` field, so a run that hit
+    ``error_max_turns`` or ``error_max_budget_usd`` genuinely failed and has to surface as a failure
+    rather than being reported OK with zeroed usage.
+
+    The other is a ``success`` subtype with ``is_error`` set, which is how the CLI reports a failed
+    Anthropic API call. Measured against Agent SDK 0.3.220 with a key that had no credits: the run
+    ends ``success``, ``is_error`` true, ``api_error_status`` set, and the error text in ``result`` —
+    so a caller was handed "Credit balance is too low" as the model's answer.
     """
-    detail = f": {'; '.join(errors)}" if errors else ""
-    return f"Claude agent run ended with {subtype}{detail}"
+    if message.subtype != "success":
+        detail = f": {'; '.join(message.errors)}" if message.errors else ""
+        raise RuntimeError(f"Claude agent run ended with {message.subtype}{detail}")
+    if message.is_error is not True:
+        return
+    # ``getattr``: the field arrived with CLI v2.1.110, and older SDKs' dataclass lacks it.
+    status = getattr(message, "api_error_status", None)
+    status_text = f" (HTTP {status})" if isinstance(status, int) else ""
+    detail = f": {message.result}" if message.result else ""
+    raise RuntimeError(
+        f"Claude agent run ended with an error result{status_text}{detail}"
+    )
+
+
+#: The ``thinking`` types ``claude_agent_sdk`` knows (``ThinkingConfig``). It reads
+#: ``thinking["type"]`` when it builds the CLI command, so a ``thinking`` without one raises.
+_THINKING_TYPES = frozenset({"adaptive", "enabled", "disabled"})
+
+#: The ``thinking.display`` values the SDK passes to the CLI (``ThinkingDisplay``).
+_THINKING_DISPLAYS = frozenset({"summarized", "omitted"})
+
+
+def _rebuild_thinking(value: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``thinking`` in the shape ``claude_agent_sdk`` reads, or ``None`` when it is malformed.
+
+    Keeps ``type``, ``budget_tokens`` and ``display`` only, the same sub-keys the JS SDK keeps.
+    The type must be one the SDK knows, and an ``enabled`` thinking must carry an integer
+    ``budget_tokens``: the SDK reads ``thinking["budget_tokens"]`` for it straight away, so one
+    without a budget would raise. ``budgetTokens`` is read as well, as in the JS SDK. ``display``
+    is kept only for a type that takes it and only with a value the SDK knows.
+    """
+    kind = value.get("type")
+    if kind not in _THINKING_TYPES:
+        return None
+    thinking: dict[str, Any] = {"type": kind}
+    if kind == "enabled":
+        budget = value.get("budget_tokens", value.get("budgetTokens"))
+        if not isinstance(budget, int) or isinstance(budget, bool):
+            return None
+        thinking["budget_tokens"] = budget
+    if kind != "disabled" and value.get("display") in _THINKING_DISPLAYS:
+        thinking["display"] = value["display"]
+    return thinking
+
+
+def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that become ``ClaudeAgentOptions`` fields: only
+    :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
+    ``thinking`` rebuilt by :func:`_rebuild_thinking`. The handler and the native graph both call
+    this, so they forward the same keys.
+    """
+    params = select_forwarded_parameters(
+        model_parameters(config),
+        _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
+        mapping_keys=_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS,
+    )
+    if "thinking" in params:
+        thinking = _rebuild_thinking(params.pop("thinking"))
+        if thinking is not None:
+            params["thinking"] = thinking
+    return params
 
 
 def _build_query_options(
@@ -479,19 +658,21 @@ def _build_query_options(
     **extra: Any,
 ) -> ClaudeAgentOptions:
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
+    params = _options_parameters(config)
     kwargs: dict[str, Any] = {
+        **params,
         "model": config["model"]["name"],
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
         "hooks": hooks or {},
+        # Always sent, `[]` when the config attaches no NativeTool. The empty list switches every
+        # Claude Code built-in off; omitting the key leaves the SDK default, which gives every run
+        # the full built-in set, and its read-only tools need no permission. A config turns a
+        # built-in on by attaching its sentinel. User-defined tools go through the MCP server and
+        # are not governed by `tools`.
+        "tools": list(native_tool_names),
         **extra,
     }
-    # Omitted rather than passed empty. `tools=[]` is an explicit "no tools", which switches off the
-    # Claude Code built-ins; leaving the key out keeps the SDK default, which is what a run with only
-    # MCP tools, or none, has always had. A config with no native tools would otherwise silently lose
-    # Read, Bash and the rest.
-    if native_tool_names:
-        kwargs["tools"] = native_tool_names
     if system_prompt:
         kwargs["system_prompt"] = system_prompt
     return ClaudeAgentOptions(**kwargs)
@@ -502,12 +683,64 @@ def _build_query_options(
 # ---------------------------------------------------------------------------
 
 
-def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHandler:
+def _host_query_options(
+    cwd: str | os.PathLike[str] | None,
+    setting_sources: list[SettingSource] | None,
+) -> dict[str, Any]:
+    """The host options for ``query()``: ``setting_sources`` always, ``[]`` unless given; ``cwd``
+    only if given.
+
+    The Agent SDK reads ``setting_sources=None`` as "load every source", which put the host's
+    plugins, skills, hooks, permission rules and ``CLAUDE.md`` into every run (AIC-3584).
+    """
+    options: dict[str, Any] = {
+        "setting_sources": list(setting_sources) if setting_sources is not None else []
+    }
+    if cwd is not None:
+        options["cwd"] = cwd
+    return options
+
+
+def create_claude_agents_handler(
+    *,
+    capture_content: bool | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    setting_sources: list[SettingSource] | None = None,
+) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic's Claude via the claude-agent-sdk.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
-    emitted spans. It defaults to off. See TELEMETRY-CONTRACT.md section 7.
+    emitted spans. ``None`` (the default) reads the process-wide default at invocation,
+    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
+    for this handler. See TELEMETRY-CONTRACT.md section 7.
+
+    *cwd* and *setting_sources* configure the Claude Code process the Agent SDK starts, not the
+    model, so they come from the application and never from a config. Each one given is passed to
+    every ``query()`` call unchanged. *cwd* not given is not sent, which leaves the process's
+    working directory.
+
+    Host settings load only when the application opts in. *setting_sources* not given sends
+    ``[]``, because the Agent SDK's own default loads every source (``user``, ``project``,
+    ``local``), including that host's plugins, skills, hooks, permission rules and ``CLAUDE.md``.
+    Pass the sources to load them, e.g. ``["user", "project", "local"]`` for all. The Agent SDK
+    still reads the managed-settings policy tier, which no option turns off.
     """
+    report_usage("claude-agents.createClaudeAgentsHandler", PACKAGE_NAME, __version__)
+    return _create_claude_agents_handler(
+        capture_content=capture_content, cwd=cwd, setting_sources=setting_sources
+    )
+
+
+def _create_claude_agents_handler(
+    *,
+    capture_content: bool | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    setting_sources: list[SettingSource] | None = None,
+) -> ProviderHandler:
+    """Non-reporting :func:`create_claude_agents_handler`, used by this package's wrappers."""
+    content_override = capture_content
+    # Resolved once, so a caller mutating its list afterwards does not change later runs.
+    host_options = _host_query_options(cwd, setting_sources)
 
     async def _call_impl(
         config: AiConfigRep,
@@ -516,6 +749,8 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        # None follows configure(); an explicit bool overrides it. Read when the call runs.
+        capture_content = effective_capture_content(content_override)
         th = tool_handlers or {}
         vs = variables or {}
 
@@ -580,6 +815,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
                 mcp_allowed_tools,
                 tool_mcp,
                 hooks,
+                **host_options,
             )
 
             output = ""
@@ -602,10 +838,7 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
                         # The CLI's own run-level total is authoritative, so the except clause below
                         # must not overwrite it with the summed-per-response figure.
                         root_usage_written = True
-                        if message.subtype != "success":
-                            raise RuntimeError(
-                                _result_error(message.subtype, message.errors)
-                            )
+                        _raise_if_run_failed(message)
                         result_text = (
                             message.result
                             if isinstance(message.result, str)
@@ -691,15 +924,61 @@ def create_claude_agents_handler(*, capture_content: bool = False) -> ProviderHa
             tool_handlers or {},
             variables or {},
             history,
-            capture_content=capture_content,
+            capture_content=effective_capture_content(content_override),
+            host_options=host_options,
         )
 
-    return create_handler(
+    return _create_handler(
         ("Anthropic", "agent"),
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
-        capture_content=capture_content,
+        capture_content=content_override,
     )
+
+
+def _map_claude_stream_event(
+    event: dict[str, Any],
+    emitter: TurnEmitter,
+    block_ids: dict[int, str],
+    saw_args: set[str],
+) -> list[dict[str, Any]]:
+    """Map one Claude Agent SDK stream event onto the AG-UI subset."""
+    kind = event.get("type")
+    if kind == "content_block_start":
+        block = event.get("content_block") or {}
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            return []
+        index = event.get("index")
+        call_id = str(block.get("id") or "")
+        if isinstance(index, int):
+            block_ids[index] = call_id
+        return emitter.tool_start(
+            call_id, tool_display_name(str(block.get("name") or ""))
+        )
+    if kind == "content_block_delta":
+        delta = event.get("delta") or {}
+        if not isinstance(delta, dict):
+            return []
+        if delta.get("type") == "text_delta":
+            text = delta.get("text") or ""
+            if not isinstance(text, str) or not text:
+                return []
+            return emitter.text(text)
+        if delta.get("type") == "input_json_delta":
+            index = event.get("index")
+            call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+            partial = delta.get("partial_json") or ""
+            if isinstance(partial, str) and partial and call_id:
+                saw_args.add(call_id)
+            return emitter.tool_args(
+                call_id, partial if isinstance(partial, str) else ""
+            )
+    if kind == "content_block_stop":
+        index = event.get("index")
+        call_id = block_ids.get(index, "") if isinstance(index, int) else ""
+        if call_id and call_id in saw_args:
+            return emitter.tool_end(call_id)
+    return []
 
 
 async def _stream_gen(
@@ -710,6 +989,7 @@ async def _stream_gen(
     history: list[dict[str, Any]] | None = None,
     *,
     capture_content: bool = False,
+    host_options: dict[str, Any] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Streams the run, emitting the same span tree as the blocking path.
 
@@ -743,6 +1023,10 @@ async def _stream_gen(
     # stream; a CancelledError means something cancelled the run, usually a timeout, and the
     # consumer chose nothing. The blocking path already tells these apart.
     cancelled = False
+    emitter = TurnEmitter(capture_content=capture_content)
+    pending: list[dict[str, Any]] = []
+    block_ids: dict[int, str] = {}
+    saw_args: set[str] = set()
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -763,7 +1047,11 @@ async def _stream_gen(
         hooks = None
         if native_tool_names or mcp_allowed_tools:
             hooks, tool_telemetry, abandon_tool_spans, _ = build_tool_hooks(
-                native_tool_map, parent, capture_content
+                native_tool_map,
+                parent,
+                capture_content,
+                emitter=emitter,
+                pending=pending,
             )
 
         options = _build_query_options(
@@ -773,34 +1061,51 @@ async def _stream_gen(
             mcp_allowed_tools,
             tool_mcp,
             hooks,
+            **(host_options or _host_query_options(None, None)),
             include_partial_messages=True,
         )
 
         full_output = ""
         gen = query(prompt=query_prompt, options=options)
         async for message in gen:
+            while pending:
+                yield pending.pop(0)
             record_conversation_id(span, message)
             record_native_tools(span, message, capture_content, catalog)
             inference.record(message)
 
             if isinstance(message, StreamEvent):
                 event = message.event
-                if (
-                    event.get("type") == "content_block_delta"
-                    and event.get("delta", {}).get("type") == "text_delta"
+                if event.get("type") == "message_start":
+                    for rich in emitter.end_text():
+                        yield rich
+                for rich in _map_claude_stream_event(
+                    event, emitter, block_ids, saw_args
                 ):
-                    text = event["delta"].get("text", "")
-                    if text:
-                        yield {"type": "chunk", "text": text}
-                        full_output += text
+                    if rich.get("type") == "TEXT_MESSAGE_CONTENT":
+                        full_output += rich.get("delta") or ""
+                    yield rich
+            elif isinstance(message, UserMessage):
+                blocks = message.content if isinstance(message.content, list) else []
+                for block in blocks:
+                    if not isinstance(block, ToolResultBlock):
+                        continue
+                    # Built-in tools have no hook when the config lists none.
+                    # The SDK still yields the result, and that is what closes
+                    # the call instead of fail_open marking it failed.
+                    for rich in emitter.tool_result(
+                        str(block.tool_use_id),
+                        block.content,
+                        failed=bool(getattr(block, "is_error", False)),
+                    ):
+                        yield rich
             elif isinstance(message, ResultMessage):
                 # Before the root, so the children it parents are already closed.
                 inference.finish()
                 raw_usage: dict[str, Any] = dict(message.usage or {})
                 finish_root_span(span, config, raw_usage)
                 root_usage_written = True
-                if message.subtype != "success":
-                    raise RuntimeError(_result_error(message.subtype, message.errors))
+                _raise_if_run_failed(message)
                 final_output = (
                     message.result if message.result is not None else full_output
                 )
@@ -821,6 +1126,12 @@ async def _stream_gen(
                 )
                 mark_ok(span)
                 end_span_once(span, ended)
+                while pending:
+                    yield pending.pop(0)
+                for rich in emitter.end_text():
+                    yield rich
+                for rich in emitter.fail_open():
+                    yield rich
                 yield {"type": "done", "output": final_output, "usage": raw_usage}
                 return
 
@@ -844,6 +1155,12 @@ async def _stream_gen(
         )
         mark_ok(span)
         end_span_once(span, ended)
+        while pending:
+            yield pending.pop(0)
+        for rich in emitter.end_text():
+            yield rich
+        for rich in emitter.fail_open():
+            yield rich
         yield {"type": "done", "output": full_output, "usage": streamed_usage["total"]}
 
     except asyncio.CancelledError:
@@ -856,6 +1173,10 @@ async def _stream_gen(
             finish_root_span(span, config, inference.run_usage["total"])
             root_usage_written = True
         fail_span(span, exc, ended)
+        while pending:
+            yield pending.pop(0)
+        for rich in emitter.fail_open():
+            yield rich
         raise
     finally:
         # A no-op on the success path, where the result message already closed the last response.
@@ -883,13 +1204,25 @@ def claude_agents(
     config_key: str,
     user_input: str,
     context: LDContext,
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    setting_sources: list[SettingSource] | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Convenience wrapper: creates a handler and calls config(...).invoke()."""
+    """Convenience wrapper: creates a handler and calls config(...).invoke().
+
+    *cwd* and *setting_sources* build the handler, as on :func:`create_claude_agents_handler`,
+    with the same defaults, and are not passed on to ``config()``.
+    """
+    report_usage("claude-agents.claudeAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
-    capture_content = kwargs.pop("capture_content", False)
-    return config(
+    capture_content = kwargs.pop("capture_content", None)
+    return _config(
         key=config_key,
-        handler=create_claude_agents_handler(capture_content=capture_content),
+        handler=_create_claude_agents_handler(
+            capture_content=capture_content,
+            cwd=cwd,
+            setting_sources=setting_sources,
+        ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)
