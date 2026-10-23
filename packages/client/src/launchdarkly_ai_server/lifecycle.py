@@ -83,7 +83,8 @@ def effective_capture_content(override: bool | None) -> bool:
 
     An explicit ``True`` or ``False`` — from a convenience wrapper, then from
     the handler factory — wins. ``None`` reads the configured default, which
-    itself defaults to ``False``.
+    itself defaults to ``True``. An explicit ``False`` removes conversation
+    content everywhere, including on offline evaluation spans.
     """
     if override is not None:
         return override

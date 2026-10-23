@@ -902,7 +902,7 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 
 ## Lifecycle Invariants
 
-- **Process defaults.** `configure(options=SDKOptions(capture_content=True))` sets behavior defaults for the process. Call it once at startup, not from request data, and not via `init_client`. Handlers omit `capture_content` to follow it. `shutdown()` restores the built-in defaults.
+- **Process defaults.** The built-in `capture_content` default is on. `configure(options=SDKOptions(capture_content=False))` turns it off for the process. Call `configure` once at startup, not from request data, and not via `init_client`. Handlers omit `capture_content` to follow it. An explicit `False` strips content everywhere, including offline evaluation spans. `shutdown()` restores the built-in default, which is on.
 - **Lazy initialization.** Importing the package does not initialize the LD client. The first API call that needs LaunchDarkly calls `init_client()` internally when `LD_SDK_KEY` is set.
 - **Explicit initialization — SDK path.** `await init_client(options?)` dynamically imports `launchdarkly-server-sdk` at runtime (optional peer dep). If the package is not installed it raises with a clear message.
 - **Explicit initialization — BYOC path.** `await init_client(client)` accepts any pre-initialized object that satisfies `LDClientInterface` — this is the path for custom or edge environments whose SDK has different init semantics.

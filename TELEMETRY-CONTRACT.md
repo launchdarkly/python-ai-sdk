@@ -397,12 +397,13 @@ error for an abandoned stream, so two dashboards would describe the same run dif
 Every handler factory takes `capture_content: bool | None = None`.
 
 `None` reads the process-wide default at invocation (`configure(options=SDKOptions(...))`), which
-is off. `True` or `False` overrides that default for the handler, and an explicit `False` wins
-over a configured `True`. A convenience wrapper's `capture_content` is the per-call override: when
-the caller passes it, that value is what the handler is built with; when they omit it, the wrapper
-passes `None` and the process default applies. Conversation content is personal data. A run emits
-only metadata, meaning models, token counts, timings and tool names, until capture is turned on.
-Turning it on sends the text of every request and response to whatever collector the SDK points at.
+is on. `True` or `False` overrides that default for the handler, and an explicit `False` wins
+over a configured `True`, including on offline evaluation spans. A convenience wrapper's
+`capture_content` is the per-call override: when the caller passes it, that value is what the
+handler is built with; when they omit it, the wrapper passes `None` and the process default
+applies. Conversation content is personal data. The default sends the text of every request and
+response to whatever collector the SDK points at. An explicit `False` emits only metadata, meaning
+models, token counts, timings and tool names.
 
 Guard twice, on purpose. The helper returns without writing when capture is off, which makes a
 forgotten call site harmless. The call site also checks before building the argument, which avoids

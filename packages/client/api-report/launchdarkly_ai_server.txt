@@ -226,9 +226,9 @@ RunUsage  [class, @dataclass]
 SDK_INFO_CONTEXT: LDContext = {'kind': 'ld_ai', 'key': 'ld-internal-tracking', 'anonymous': True}
 SDK_INFO_EVENT = '$ld:ai:sdk:info'
 SDKOptions  [class, @dataclass(frozen=True)]
-  __init__(capture_content: bool = False)
+  __init__(capture_content: bool = True)
   __post_init__() -> None
-  capture_content: bool = False
+  capture_content: bool = True
 set_conversation_id_if_absent(span: Any, conversation: str) -> None
 set_input_content_attributes(span: Any, capture: bool, *, system_instructions: str | None = None, messages: list[SpanMessage] | None = None, tool_definitions: list[ToolDefinitionInput] | None = None) -> None
 set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None
