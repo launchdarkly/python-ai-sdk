@@ -30,7 +30,6 @@ EvalTool  [class, @dataclass(frozen=True)]
 EvaluationsError(Exception)  [class]
 EvaluationsModule  [class]
   __init__(api_client: LDApiClient, project_key: str, sdk_key: str | None, ui_base_uri: str = DEFAULT_UI_BASE_URI)
-  api: LDApiClient  [property]
   project_key: str  [property]
   run(*, key: str, dataset: str | Sequence[InlineDatasetRow], handler: EvalHandler | None = None, handlers: Sequence[EvalHandler] | None = None, generation: GenerationConfig | GenerationOverrides | None = None, ai_config: AIConfig | None = None, tools: Sequence[EvalTool] | None = None, criteria: list[Criterion] | None = None, concurrency: int = 10, poll_interval_seconds: float | None = None, poll_timeout_seconds: float | None = None) -> EvalRunResult  [async]
   sdk_key: str | None  [property]
