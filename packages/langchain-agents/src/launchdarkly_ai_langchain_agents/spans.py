@@ -8,8 +8,8 @@ The shape is ``invoke_agent`` root, one ``chat {model}`` child per model turn, o
 children of it: both take the same parent context, which is the root's. See TELEMETRY-CONTRACT.md
 section 1.
 
-Unlike the Claude and OpenAI handlers, this one does not drive the provider call itself: LangGraph's
-``create_react_agent`` does, and the only hook into its lifecycle is LangChain's callback protocol.
+Unlike the Claude and OpenAI handlers, this one does not drive the provider call itself: LangChain's
+``create_agent`` does, and the only hook into its lifecycle is LangChain's callback protocol.
 :func:`build_span_callbacks` is therefore the center of this module: it returns a
 ``BaseCallbackHandler`` that opens and closes ``chat`` and ``execute_tool`` spans as LangChain
 dispatches ``on_chat_model_start`` / ``on_llm_end`` / ``on_tool_start`` / ``on_tool_end`` events,

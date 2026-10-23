@@ -1,5 +1,5 @@
 """
-LangChain Agents handler — uses LangGraph's create_react_agent / StateGraph.
+LangChain Agents handler — uses LangChain's create_agent / LangGraph's StateGraph.
 Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 """
 
@@ -634,7 +634,7 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 def create_langchain_agents_handler(
     llm: Any = None, *, capture_content: bool | None = None
 ) -> ProviderHandler:
-    """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
+    """Creates a ``ProviderHandler`` for LangChain via ``langchain.agents.create_agent``.
 
     Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
     called after flag evaluation so ``model.parameters`` can be applied unchanged.
@@ -707,13 +707,12 @@ def _create_langchain_agents_handler(
                 )
             base_model = await _resolve_base_model(config, llm)
 
-            langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
-            create_react_agent = langgraph_prebuilt.create_react_agent
+            create_agent = importlib.import_module("langchain.agents").create_agent
             tools = _build_agent_tools(config.get("tools") or {}, th)
-            agent = create_react_agent(
+            agent = create_agent(
                 base_model,
                 tools,
-                **({"prompt": system_prompt} if system_prompt else {}),
+                **({"system_prompt": system_prompt} if system_prompt else {}),
             )
             result = await agent.ainvoke(
                 {"messages": initial_messages},
@@ -864,13 +863,12 @@ async def _stream_gen(
             )
         base_model = await _resolve_base_model(config, llm)
 
-        langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
-        create_react_agent = langgraph_prebuilt.create_react_agent
+        create_agent = importlib.import_module("langchain.agents").create_agent
         tools = _build_agent_tools(config.get("tools") or {}, tool_handlers)
-        agent = create_react_agent(
+        agent = create_agent(
             base_model,
             tools,
-            **({"prompt": system_prompt} if system_prompt else {}),
+            **({"system_prompt": system_prompt} if system_prompt else {}),
         )
 
         run_usage = create_run_usage()
