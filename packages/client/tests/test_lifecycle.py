@@ -276,18 +276,25 @@ class TestInitClientSDKKeyPath:
     async def test_a_failed_telemetry_setup_leaves_no_client_behind(
         self, restore_otel_globals: Any
     ) -> None:
-        # A malformed OTEL_EXPORTER_OTLP_TIMEOUT makes the real _setup_telemetry
-        # raise. _client used to be assigned first, so the next call returned the
-        # half-built client as a silent success with no telemetry, and its
-        # connection was never closed.
+        # _client used to be assigned before _setup_telemetry ran, so after a
+        # telemetry failure the next call returned the half-built client as a
+        # silent success with no telemetry, and its connection was never closed.
+        # The failure is injected: OpenTelemetry 1.45 logs a malformed
+        # OTEL_EXPORTER_OTLP_TIMEOUT and uses its default instead of raising.
         failed = _make_stub_client()
         healthy = _make_stub_client()
         mock_ld = MagicMock()
         mock_ld.Config = MagicMock(return_value=MagicMock())
         mock_ld.LDClient = MagicMock(side_effect=[failed, healthy])
         with patch("importlib.import_module", return_value=mock_ld):
-            bad_env = {"LD_SDK_KEY": "k", "OTEL_EXPORTER_OTLP_TIMEOUT": "soon"}
-            with patch.dict(os.environ, bad_env):
+            with (
+                patch.dict(os.environ, {"LD_SDK_KEY": "k"}),
+                patch.object(
+                    lifecycle_module,
+                    "_setup_telemetry",
+                    side_effect=ValueError("bad config"),
+                ),
+            ):
                 with pytest.raises(ValueError):
                     await init_client()
             assert lifecycle_module._client is None

@@ -119,10 +119,14 @@ _CLAUDE_AGENT_OPTIONS_MAPPING_KEYS = frozenset({"thinking"})
 #:   ``strict_mcp_config``, ``agents``: what the agent is allowed to do and which tools or
 #:   subagents it gets. The handler wires tools and permissions itself.
 #: * ``resume``, ``session_id``, ``fork_session``, ``continue_conversation``, ``session_store``,
-#:   ``session_store_flush``, ``enable_file_checkpointing``: session state on the host.
+#:   ``session_store_flush``, ``enable_file_checkpointing``, ``resume_session_at``,
+#:   ``resume_drops_turn``: session state on the host.
 #: * ``stderr``, ``debug_stderr``, ``include_partial_messages``, ``include_hook_events``,
-#:   ``max_buffer_size``, ``load_timeout_ms``: process I/O and transport plumbing, including the
-#:   streamed message shape the handler reads.
+#:   ``forward_subagent_text``, ``max_buffer_size``, ``load_timeout_ms``: process I/O and transport
+#:   plumbing, including the streamed message shape the handler reads.
+#: * ``verbatim_prompts``: whether Claude Code expands ``@path`` mentions and slash commands in
+#:   the prompt, which decides whether prompt text can make it read host files. The application
+#:   decides that, not a config.
 #: * ``output_format``: structured output, which the handler owns through the config's
 #:   ``outputFormat`` by adding its schema to the system prompt. Forwarding a second schema here
 #:   would have the reply follow one schema while the prompt asks for another.
@@ -145,6 +149,7 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
         "env",
         "extra_args",
         "fork_session",
+        "forward_subagent_text",
         "include_hook_events",
         "include_partial_messages",
         "load_timeout_ms",
@@ -154,6 +159,8 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
         "permission_prompt_tool_name",
         "plugins",
         "resume",
+        "resume_drops_turn",
+        "resume_session_at",
         "sandbox",
         "session_id",
         "session_store",
@@ -165,6 +172,7 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
         "strict_mcp_config",
         "task_budget",
         "user",
+        "verbatim_prompts",
     }
 )
 
