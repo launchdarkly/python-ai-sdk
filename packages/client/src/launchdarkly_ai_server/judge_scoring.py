@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from math import isfinite
 from typing import Any
 
+from .content import tool_result_string
 from .utils import parse_json_with_possible_fences
 
 FORMATTING_INSTRUCTIONS = "\n".join(
@@ -45,10 +46,14 @@ def build_message_history(
     the AI Library's default templates read the JSON shape from
     ``{{message_history}}``, and one that stopped being told it would return
     prose and fail every result as invalid output.
+
+    A non-string output is shown as JSON, by the rule tool results follow, so a
+    rubric reads the same text in every SDK.
     """
+    output_text = tool_result_string(output) if output else None
     return "\n\n".join(
         str(part)
-        for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
+        for part in (user_input, trajectory, output_text, FORMATTING_INSTRUCTIONS)
         if part
     )
 
