@@ -4377,6 +4377,7 @@ class TestTransportLayering:
             "skills_core.py",
             "skills_fs.py",
             "skills_watch.py",
+            "skills_source.py",
             "safe_fs.py",
             "types.py",
             "types_validation.py",

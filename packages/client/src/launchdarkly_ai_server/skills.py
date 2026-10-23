@@ -220,6 +220,11 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
             objects with a valid key and an integer version >= 1. This
             includes ``skills: null``.
     """
+    return _skill_refs(config)
+
+
+def _skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
+    """``skill_refs`` for SDK code, which must not count as a caller's use."""
     if not isinstance(config, dict):
         raise ValueError(
             f"skill_refs was given {type(config).__name__}, not an AI Config. "
