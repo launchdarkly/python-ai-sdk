@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect as _inspect
-import json
 import logging
 import re as _re
 import time
@@ -28,12 +27,22 @@ from .types import (
     UsageDict,
     VariationMeta,
 )
-from .utils import end_span_once, model_stamps_from_meta, select_handler, to_ld_context
+from .utils import (
+    end_span_once,
+    model_stamps_from_meta,
+    select_handler,
+    set_ld_span_attributes,
+    to_ld_context,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_TRAVERSAL_DEPTH = 100
-MAX_GRAPH_CACHE_SIZE = 512
+
+# The built graph's track data is minted before the run's runId. Each run passes its own copy
+# with a fresh runId through route/stream_route opts under this key, so the handoff events
+# emitted inside the build carry the run's id instead of the build's.
+_RUN_TRACK_DATA = "_run_track_data"
 
 
 def _sanitize_name(key: str) -> str:
@@ -110,7 +119,7 @@ async def _build_graph(
 ) -> tuple[GraphDefinition, TrackData, Callable[..., Any]]:
     from .judges import run_judges
     from .lifecycle import extract_variation, get_client
-    from .tracking import execute_and_track
+    from .tracking import _try_get_environment_id, execute_and_track
 
     result = await _fetch_graph_variation(key, context)
     # Convert once so all inner track() calls use an ldclient.Context object.
@@ -129,6 +138,9 @@ async def _build_graph(
         **model_stamps_from_meta(meta),
         "graphKey": key,
     }
+    _environment_id = _try_get_environment_id()
+    if _environment_id:
+        graph_track_data["environmentId"] = _environment_id
 
     if not enabled or not topology:
         return (
@@ -260,7 +272,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -278,7 +290,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -436,7 +448,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": next_node.key,
                     },
@@ -456,7 +468,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": chosen_key,
                     },
@@ -553,7 +565,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -582,7 +594,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": from_node.key,
                         "targetKey": node.key,
                     },
@@ -697,7 +709,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_success",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": next_node.key,
                     },
@@ -728,7 +740,7 @@ async def _build_graph(
                     "$ld:ai:graph:handoff_failure",
                     ld_ctx,
                     {
-                        **graph_track_data,
+                        **opts.get(_RUN_TRACK_DATA, graph_track_data),
                         "sourceKey": node.key,
                         "targetKey": chosen_key,
                     },
@@ -737,7 +749,7 @@ async def _build_graph(
             raise
 
     # ── traverse / reverse_traverse ───────────────────────────────────────────
-    # Async BFS visitors that mirror the TS GraphDefinition.traverse /
+    # Async visitors that mirror the TS GraphDefinition.traverse /
     # reverseTraverse. The visitor fn receives (node, ctx) and its return value
     # is stored in ctx[node_key]. Both handle sync and async visitors.
 
@@ -777,33 +789,23 @@ async def _build_graph(
         return ctx.get(root_node.key)
 
     async def reverse_traverse(fn: Any, ctx: dict[str, Any] | None = None) -> Any:
-        """Visit nodes leaf-first (terminal nodes first, root last)."""
+        """Visit every child before its parents (post-order DFS, each node once, root last)."""
         if root_node is None:
             return None
         ctx = ctx if ctx is not None else {}
-        terminals = terminal_nodes()
-        if not terminals:
-            return None
         visited: set[str] = set()
-        frontier: list[str] = [n.key for n in terminals]
-        iterations = 0
-        while frontier and iterations < MAX_TRAVERSAL_DEPTH:
-            iterations += 1
-            next_frontier: list[str] = []
-            for node_key in frontier:
-                if node_key in visited:
-                    continue
-                visited.add(node_key)
-                if node_key == root_node.key:
-                    continue
-                node = nodes.get(node_key)
-                if node:
-                    ctx[node_key] = await _call_visitor(fn, node, ctx)
-                for parent in get_parent_nodes(node_key):
-                    if parent.key not in visited:
-                        next_frontier.append(parent.key)
-            frontier = next_frontier
-        ctx[root_node.key] = await _call_visitor(fn, root_node, ctx)
+
+        async def visit(node_key: str) -> None:
+            if node_key in visited:
+                return
+            visited.add(node_key)
+            for child in get_child_nodes(node_key):
+                await visit(child.key)
+            node = nodes.get(node_key)
+            if node:
+                ctx[node_key] = await _call_visitor(fn, node, ctx)
+
+        await visit(root_node.key)
         return ctx.get(root_node.key)
 
     graph_def = GraphDefinition(
@@ -864,9 +866,6 @@ class GraphInstance:
     ) -> None:
         self._key = key
         self._options = options
-        self._cache: dict[
-            str, tuple[GraphDefinition, TrackData, Callable[..., Any]]
-        ] = {}
 
     async def invoke(
         self,
@@ -913,27 +912,19 @@ class GraphInstance:
                 "use resolve_graph() with a framework-native runner."
             )
 
-        try:
-            cache_key: str | None = json.dumps(context, sort_keys=True)
-        except (TypeError, ValueError):
-            cache_key = None
-        if cache_key is not None and cache_key in self._cache:
-            built = self._cache[cache_key]
-        else:
-            built = await _build_graph(self._key, context, resolved_options)
-            if cache_key is not None:
-                if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
-                    # Evict an arbitrary entry to keep the cache bounded.
-                    self._cache.pop(next(iter(self._cache)))
-                self._cache[cache_key] = built
-        graph_def, graph_track_data, _ = built
+        built = await _build_graph(self._key, context, resolved_options)
+        graph_def, built_track_data, _ = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
 
+        graph_track_data: TrackData = {**built_track_data, "runId": str(uuid.uuid4())}
+
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
-            span.set_attribute("launchdarkly.graph.key", self._key)
+            set_ld_span_attributes(
+                span, {"__ld": graph_track_data, "ldContext": context}
+            )
 
             start_time = time.monotonic()
             total_usage = {"input": 0, "output": 0, "total": 0}
@@ -963,7 +954,10 @@ class GraphInstance:
                         1,
                     )
                     entered += 1
-                    opts: dict[str, Any] = {"variables": variables}
+                    opts: dict[str, Any] = {
+                        "variables": variables,
+                        _RUN_TRACK_DATA: graph_track_data,
+                    }
                     if previous_node:
                         opts["from"] = previous_node
                     # History seeds the entry point only. After the root hop, nodes
@@ -1144,26 +1138,17 @@ class GraphInstance:
                 "use resolve_graph() with a framework-native runner."
             )
 
-        try:
-            cache_key: str | None = json.dumps(context, sort_keys=True)
-        except (TypeError, ValueError):
-            cache_key = None
-        if cache_key is not None and cache_key in self._cache:
-            built = self._cache[cache_key]
-        else:
-            built = await _build_graph(self._key, context, resolved_options)
-            if cache_key is not None:
-                if len(self._cache) >= MAX_GRAPH_CACHE_SIZE:
-                    self._cache.pop(next(iter(self._cache)))
-                self._cache[cache_key] = built
-        graph_def, graph_track_data, stream_route = built
+        built = await _build_graph(self._key, context, resolved_options)
+        graph_def, built_track_data, stream_route = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
 
+        graph_track_data: TrackData = {**built_track_data, "runId": str(uuid.uuid4())}
+
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
-        span.set_attribute("launchdarkly.graph.key", self._key)
+        set_ld_span_attributes(span, {"__ld": graph_track_data, "ldContext": context})
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()
@@ -1194,7 +1179,10 @@ class GraphInstance:
                     1,
                 )
                 entered += 1
-                route_opts: dict[str, Any] = {"variables": variables}
+                route_opts: dict[str, Any] = {
+                    "variables": variables,
+                    _RUN_TRACK_DATA: graph_track_data,
+                }
                 if previous_node:
                     route_opts["from"] = previous_node
                 # History seeds the entry point only. After the root hop, nodes

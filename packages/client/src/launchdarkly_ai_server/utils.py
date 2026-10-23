@@ -52,6 +52,26 @@ def _create_handler(
     )
 
 
+def model_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """
+    Returns ``config['model']['parameters']`` as a fresh dict, or ``{}`` when it
+    is absent or not a usable mapping.
+
+    This is the single place handler packages read provider tuning values from.
+    Values are forwarded to the provider as-is, keyed by whatever name the
+    LaunchDarkly UI wrote (already snake_case for every Python provider SDK
+    here), so no case conversion happens on the way through. Callers must
+    filter the result to their own forwarded-keys list (see
+    ``parameter_forwarding.select_forwarded_parameters``) before merging it
+    into a provider call; nothing else here is safe to forward as-is.
+
+    Never reads ``model.custom`` — that field is not forwarded to providers.
+    """
+    model = config.get("model") if isinstance(config, dict) else None
+    parameters = model.get("parameters") if isinstance(model, dict) else None
+    return dict(parameters) if isinstance(parameters, dict) else {}
+
+
 def collapse_messages_to_instructions(config: AiConfigRep) -> AiConfigRep:
     """
     When only an agent handler is available for a messages-mode config, collapse
@@ -73,6 +93,27 @@ def normalize_mode(mode: str | None) -> Literal["agent", "messages"]:
     ``'agent'`` → ``'agent'``; everything else → ``'messages'``.
     """
     return "agent" if mode == "agent" else "messages"
+
+
+def handler_key(
+    handler: Any,
+) -> tuple[str, Literal["agent", "messages"]] | None:
+    """Return the normalized ``(provider, mode)`` identity for *handler*.
+
+    ``completion`` and ``messages`` are the same mode. A list tag is accepted
+    the same as a tuple. Online and offline share this helper:
+    :func:`select_handler` matches on it, :meth:`Registry.register` replaces on
+    it, online judges (``run_judges`` / ``run_judge``) match on it, and the
+    evaluations harness rejects duplicates on it.
+    """
+    provides_for = getattr(handler, "provides_for", None)
+    if (
+        isinstance(provides_for, tuple | list)
+        and len(provides_for) == 2
+        and isinstance(provides_for[0], str)
+    ):
+        return (provides_for[0], normalize_mode(provides_for[1]))
+    return None
 
 
 def number_or_zero(value: Any) -> int:
@@ -517,25 +558,18 @@ def select_handler(
 
     mode = normalize_mode(meta.get("mode") if isinstance(meta, dict) else None)
 
-    exact = next((h for h in handlers if h.provides_for == (provider, mode)), None)
+    exact = next((h for h in handlers if handler_key(h) == (provider, mode)), None)
     if exact:
         return exact
 
-    wildcard = next(
-        (
-            h
-            for h in handlers
-            if h.provides_for and h.provides_for[0] == "*" and h.provides_for[1] == mode
-        ),
-        None,
-    )
+    wildcard = next((h for h in handlers if handler_key(h) == ("*", mode)), None)
     if wildcard:
         return wildcard
 
     if strict:
         has_coverage = any(
-            h.provides_for
-            and (h.provides_for[0] == provider or h.provides_for[0] == "*")
+            (key := handler_key(h)) is not None
+            and (key[0] == provider or key[0] == "*")
             for h in handlers
         )
         if not has_coverage:
@@ -543,7 +577,11 @@ def select_handler(
         raise ValueError(f"Handler for provider {provider} with mode {mode} not found")
 
     by_provider = next(
-        (h for h in handlers if h.provides_for and h.provides_for[0] == provider),
+        (
+            h
+            for h in handlers
+            if (key := handler_key(h)) is not None and key[0] == provider
+        ),
         None,
     )
     if by_provider:
@@ -613,9 +651,11 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
     Builds the standard tracking payload for a graph node event.
     Shared by all native graph adapters (openai-agents, claude-agents, langchain-agents).
     """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
     meta = node.meta if isinstance(node.meta, dict) else {}
     config = node.config if isinstance(node.config, dict) else {}
-    return {
+    track_data: dict[str, Any] = {
         "runId": run_id,
         "configKey": node.key,
         "variationKey": meta.get("variationKey", ""),
@@ -625,6 +665,40 @@ def make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, A
         **model_stamps_from_meta(meta),
         "graphKey": graph_key,
     }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
+
+
+def make_graph_track_data(graph_key: str, run_id: str) -> dict[str, Any]:
+    """
+    Builds the tracking payload for a native graph run as a whole.
+
+    The graph flag is itself the AI Config the trace belongs to, so its key is
+    both the config key and the graph key -- the same choice ``graph.py`` makes
+    for the SDK's own graph runner. There is no model or variation to report: a
+    graph flag carries a topology, and ``GraphDefinition`` does not expose its
+    ``_ldMeta``.
+
+    Native graph adapters pass this to ``set_ld_span_attributes`` so the
+    ``launchdarkly.graph`` span can be found by an AI Config Monitoring query.
+    """
+    from .tracking import _try_get_environment_id  # late import: tracking imports utils
+
+    track_data: dict[str, Any] = {
+        "runId": run_id,
+        "configKey": graph_key,
+        "variationKey": "",
+        "version": 1,
+        "modelName": "",
+        "providerName": "",
+        "graphKey": graph_key,
+    }
+    environment_id = _try_get_environment_id()
+    if environment_id:
+        track_data["environmentId"] = environment_id
+    return track_data
 
 
 def _usable_context_key(value: Any) -> str | None:

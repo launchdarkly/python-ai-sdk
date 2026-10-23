@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import logging
 import os
 from typing import Any
 
-from . import skills
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
+from .shutdown_hooks import run_shutdown_hooks
 from .types import InitClientOptions, SDKOptions
 from .utils import model_stamps_from_meta
 
@@ -199,8 +200,8 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
 
     except ImportError:
         logger.warning(
-            "OpenTelemetry packages not installed. Run `pip install opentelemetry-sdk` "
-            "to enable telemetry."
+            "OpenTelemetry packages not installed. Run "
+            '`pip install "launchdarkly-ai-server[otel]"` to enable telemetry.'
         )
         return None
 
@@ -301,7 +302,30 @@ async def init_client(
 
     ld_config = config_cls(sdk_key, **config_kwargs)
     # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
-    ld_client = client_cls(ld_config, start_wait=10)
+    # Built in a thread so that wait does not stall the caller's event loop.
+    build = asyncio.ensure_future(
+        asyncio.to_thread(client_cls, ld_config, start_wait=10)
+    )
+    try:
+        ld_client = await asyncio.shield(build)
+    except asyncio.CancelledError:
+        # The thread can't be stopped: close the client it finishes building, or its
+        # streaming connection outlives this cancelled call.
+        build.add_done_callback(_close_abandoned_client)
+        raise
+
+    # A concurrent first call may have won while this one was connecting: keep
+    # its client and close ours, so only one streaming connection survives.
+    if _client is not None:
+        try:
+            close_result = ld_client.close()
+            if inspect.isawaitable(close_result):
+                await close_result
+        except Exception:
+            pass
+        flush_ai_sdk_info(_client)
+        flush_sdk_usage(_client)
+        return _client
 
     # As on the BYOC path: only a fully set-up client becomes the singleton. We
     # built this one, so close it on failure — it holds a streaming connection
@@ -320,6 +344,24 @@ async def init_client(
     flush_ai_sdk_info(_client)
     flush_sdk_usage(_client)
     return _client
+
+
+def _close_abandoned_client(build: asyncio.Future[Any]) -> None:
+    """Closes a client whose ``init_client`` call was cancelled while it was being built."""
+    if build.cancelled() or build.exception() is not None:
+        return
+    try:
+        close_result = build.result().close()
+        if inspect.isawaitable(close_result):
+            # The loop keeps only a weak reference to the task; hold it until it is done.
+            task = asyncio.ensure_future(close_result)
+            _closing_tasks.add(task)
+            task.add_done_callback(_closing_tasks.discard)
+    except Exception:
+        pass
+
+
+_closing_tasks: set[asyncio.Future[Any]] = set()
 
 
 def _release_otel_globals() -> None:
@@ -354,21 +396,14 @@ def _release_otel_globals() -> None:
         logger.debug("Could not release the global OTel tracer provider", exc_info=True)
 
 
-def _clear_experimental_state() -> None:
-    """Clears experimental feature state. A failure is logged, never raised."""
-    try:
-        skills._clear_state()
-    except Exception:
-        logger.warning("Could not clear the Agent Skills state", exc_info=True)
-
-
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also clears any experimental feature state, such as a configured skill
-    store, and restores process-wide SDK defaults from ``configure``.
+    Also runs the registered shutdown hooks, which clear the state of any
+    experimental feature in use, and restores process-wide SDK defaults from
+    ``configure``.
 
     When telemetry was running, this also releases the process-global tracer
     provider so a later ``init_client`` can install its own — see
@@ -380,7 +415,7 @@ async def shutdown() -> None:
     local_provider = _tracer_provider
     owned_globals = _owns_otel_globals
 
-    _clear_experimental_state()
+    run_shutdown_hooks()
 
     # Null the singleton before any awaits so a second call is a no-op.
     # Options reset even when no client was initialized: configure() does not
@@ -434,9 +469,8 @@ def _reset_for_testing() -> None:
     _owns_otel_globals = False
     _sdk_options = SDKOptions()
     _ai_invoked = False
-    # Directly, not through _clear_experimental_state: a failed reset should
-    # fail the test rather than leak state into the next one.
-    skills._clear_state()
+    # A failed reset should fail the test rather than leak state into the next one.
+    run_shutdown_hooks(raise_errors=True)
     # Mirrors shutdown(): without this a suite that inits more than once leaves
     # every later span on the first test's provider.
     if owned_globals:
@@ -540,13 +574,13 @@ async def extract_variation(
             f"Variation '{config_key}' returned None (flag may be disabled)."
         )
 
-    if isinstance(raw, dict) and raw.get("_ldMeta", {}).get("enabled") is False:
+    # Only an explicit ``_ldMeta.enabled`` counts as enabled (spec §3.10, as in JS and Go).
+    ld_meta = (raw.get("_ldMeta") or {}) if isinstance(raw, dict) else {}
+    if not isinstance(ld_meta, dict) or not ld_meta.get("enabled"):
         raise RuntimeError(f"Variation '{config_key}' is disabled.")
 
-    # Extract meta from _ldMeta if present
-    ld_meta = raw.get("_ldMeta", {}) if isinstance(raw, dict) else {}
     meta = {
-        "enabled": ld_meta.get("enabled", True),
+        "enabled": True,
         "variationKey": ld_meta.get("variationKey", ""),
         "version": ld_meta.get("version", 1),
         "mode": ld_meta.get("mode"),

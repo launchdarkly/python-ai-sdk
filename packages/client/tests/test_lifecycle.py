@@ -3,13 +3,18 @@ Tests for §3.9 init_client / get_client / shutdown.
 Reference: TESTING.md §3.9
 """
 
+import asyncio
 import os
+import subprocess
+import sys
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
+import launchdarkly_ai_server.shutdown_hooks as shutdown_hooks
 from launchdarkly_ai_server import get_client, init_client, inspect_config, shutdown
 from launchdarkly_ai_server.lifecycle import _reset_for_testing
 from launchdarkly_ai_server.sdk_info import (
@@ -323,6 +328,69 @@ class TestInitClientSDKKeyPath:
                     result = await init_client()
         assert result is stub
 
+    async def test_builds_the_sdk_client_off_the_event_loop(self) -> None:
+        # LDClient blocks up to start_wait (10 s) while it connects; built on the
+        # loop, that stalls every other task in the app.
+        stub = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(
+            side_effect=lambda *_a, **_k: (time.sleep(0.3), stub)[1]
+        )
+        ticks = 0
+
+        async def tick() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        ticker = asyncio.create_task(tick())
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    assert await init_client() is stub
+        ticker.cancel()
+        assert ticks >= 5
+
+    async def test_concurrent_first_calls_end_with_one_client(self) -> None:
+        first, second = _make_stub_client(), _make_stub_client()
+        built = iter([first, second])
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(
+            side_effect=lambda *_a, **_k: (time.sleep(0.05), next(built))[1]
+        )
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    a, b = await asyncio.gather(init_client(), init_client())
+        assert a is b is get_client()
+        extra = second if a is first else first
+        extra.close.assert_awaited_once()
+        a.close.assert_not_called()
+
+    async def test_cancelled_call_closes_the_client_still_being_built(self) -> None:
+        # The thread can't be stopped, so the client it finishes building after the
+        # cancel holds a streaming connection that nothing else would close.
+        stub = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(
+            side_effect=lambda *_a, **_k: (time.sleep(0.2), stub)[1]
+        )
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    task = asyncio.create_task(init_client())
+                    await asyncio.sleep(0.05)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    await asyncio.sleep(0.4)
+        stub.close.assert_awaited_once()
+        assert lifecycle_module._client is None
+
 
 # ---------------------------------------------------------------------------
 # OTel degradation
@@ -335,17 +403,13 @@ class TestInitClientOtelMissing:
 
         stub = _make_stub_client()
 
-        def _broken_setup(key: str, opts: Any = None) -> None:
-            _logging.getLogger("launchdarkly_ai_server.lifecycle").warning(
-                "OpenTelemetry packages not installed. Run `pip install opentelemetry-sdk`"
-            )
-
+        # A None entry makes the real import inside _setup_telemetry raise ImportError.
         with caplog.at_level(_logging.WARNING):
-            with patch.object(
-                lifecycle_module, "_setup_telemetry", side_effect=_broken_setup
-            ):
+            with patch.dict(sys.modules, {"opentelemetry.sdk.trace": None}):
                 await init_client(client=stub)
-        assert any("OpenTelemetry" in m for m in caplog.messages)
+        hints = [m for m in caplog.messages if "OpenTelemetry" in m]
+        assert len(hints) == 1
+        assert 'pip install "launchdarkly-ai-server[otel]"' in hints[0]
 
     async def test_still_resolves_successfully(self) -> None:
         stub = _make_stub_client()
@@ -532,18 +596,38 @@ class TestShutdown:
         stub = _make_stub_client()
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=stub)
+        later = MagicMock()
+
+        def failing() -> None:
+            raise RuntimeError("clear failed")
+
         with (
-            patch.object(
-                lifecycle_module.skills,
-                "_clear_state",
-                side_effect=RuntimeError("clear failed"),
-            ),
+            patch.dict(shutdown_hooks._hooks, clear=False),
             caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
         ):
+            shutdown_hooks.register_shutdown_hook("Failing Feature", failing)
+            shutdown_hooks.register_shutdown_hook("Later Feature", later)
             await shutdown()  # must not raise
         stub.close.assert_called_once()
         assert lifecycle_module._client is None
-        assert "Could not clear the Agent Skills state" in caplog.messages
+        assert "Could not clear the Failing Feature state" in caplog.messages
+        later.assert_called_once()  # one failing hook does not skip the rest
+
+    def test_core_does_not_import_experimental_code(self) -> None:
+        """Core never hooks into experimental code (TESTING.md §0.3)."""
+        script = (
+            "import asyncio, sys\n"
+            "import launchdarkly_ai_server\n"
+            "asyncio.run(launchdarkly_ai_server.shutdown())\n"
+            "loaded = sorted(m for m in sys.modules if m.startswith("
+            "('launchdarkly_ai_server.skills', 'launchdarkly_ai_server.evaluations',"
+            " 'launchdarkly_ai_server.experimental')))\n"
+            "print(','.join(loaded))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, check=True
+        )
+        assert result.stdout.strip() == ""
 
     async def test_completes_teardown_even_if_flush_throws(self) -> None:
         stub = _make_stub_client()
@@ -944,3 +1028,35 @@ class TestInspectConfig:
         assert result["enabled"] is False
         assert result["config"] is None
         assert result["meta"] is None
+
+
+# ---------------------------------------------------------------------------
+# extract_variation — missing enabled flag
+# ---------------------------------------------------------------------------
+
+
+class TestExtractVariationMissingEnabled:
+    # Spec §3.10: only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
+    @pytest.mark.parametrize("ld_meta", [None, {}], ids=["no_ldMeta", "empty_ldMeta"])
+    async def test_raises_when_enabled_is_missing(
+        self, ld_meta: dict[str, Any] | None
+    ) -> None:
+        raw: dict[str, Any] = {
+            "model": {"name": "claude-3-5"},
+            "provider": {"name": "Anthropic"},
+            "instructions": "You are helpful.",
+        }
+        if ld_meta is not None:
+            raw["_ldMeta"] = ld_meta
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(return_value=raw)
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            with pytest.raises(RuntimeError, match="'my-flag' is disabled"):
+                await lifecycle_module.extract_variation("my-flag", ctx)
+            assert (await inspect_config("my-flag", ctx))["enabled"] is False

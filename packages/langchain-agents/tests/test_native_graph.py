@@ -5,6 +5,7 @@ Reference: TESTING.md §2.2, §2.x.3
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
 
 from launchdarkly_ai_langchain_agents.native_graph import (
     _build_node_tools,
@@ -19,6 +21,12 @@ from launchdarkly_ai_langchain_agents.native_graph import (
     to_lang_graph,
 )
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from tests.forwarding_spec import (
+    LANGCHAIN_CHAT_OPENAI,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -172,6 +180,7 @@ def _make_langgraph_mocks(ai_msg: Any) -> dict[str, Any]:
 
     mock_lc_openai = MagicMock()
     mock_lc_openai.ChatOpenAI = MagicMock(return_value=mock_chat_model)
+    mock_lc_openai.ChatOpenAI.model_fields = _REAL_CHAT_OPENAI.model_fields
 
     mock_gm = MagicMock()
     mock_gm.add_messages = MagicMock(return_value=MagicMock())
@@ -238,6 +247,72 @@ def _patch_imports(mocks: dict[str, Any]) -> Any:
 # ---------------------------------------------------------------------------
 # §2.2 Generic topology
 # ---------------------------------------------------------------------------
+
+
+def _recording_trace() -> tuple[Any, Any, list[Any]]:
+    """A real tracer behind the module's ``trace`` lookup, with every span's ``end`` spied.
+
+    Returns the stand-in ``trace`` module, the exporter holding finished spans, and the
+    ``end`` spies, so a test can check both what was exported and how often each span ended.
+    """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    end_spies: list[Any] = []
+
+    def _start_span(name: str, *args: Any, **kwargs: Any) -> Any:
+        span = tracer.start_span(name, *args, **kwargs)
+        span.end = MagicMock(wraps=span.end)  # type: ignore[method-assign]
+        end_spies.append(span.end)
+        return span
+
+    fake_trace = MagicMock()
+    fake_trace.get_tracer.return_value.start_span.side_effect = _start_span
+    return fake_trace, exporter, end_spies
+
+
+def _assert_one_failed_graph_span(
+    exporter: Any, end_spies: list[Any], message: str, track_calls: list[Any]
+) -> None:
+    from opentelemetry.trace import StatusCode
+
+    assert [spy.call_count for spy in end_spies] == [1]
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description == message
+    assert [e.name for e in span.events].count("exception") == 1
+    assert (span.attributes or {}).get("launchdarkly.graph.key") == "test-graph"
+
+    failures = [d for e, d in track_calls if e == "$ld:ai:graph:invocation_failure"]
+    assert len(failures) == 1
+    assert failures[0]["configKey"] == "test-graph"
+    assert failures[0]["graphKey"] == "test-graph"
+
+
+def _assert_two_runs_two_run_ids(
+    exporter: Any, track_calls_per_run: list[list[tuple[str, Any]]]
+) -> None:
+    """Each run's graph span carries the ``runId`` of that run's graph-level events,
+    and the two runs carry different ids."""
+    spans = [s for s in exporter.get_finished_spans() if s.name == "launchdarkly.graph"]
+    assert len(spans) == 2
+    span_run_ids = [(s.attributes or {}).get("launchdarkly.run.id") for s in spans]
+    for span_run_id, run_calls in zip(span_run_ids, track_calls_per_run, strict=True):
+        assert span_run_id
+        graph_events = [d for e, d in run_calls if e.startswith("$ld:ai:graph:")]
+        assert graph_events
+        for data in graph_events:
+            assert data["runId"] == span_run_id
+    assert span_run_ids[0] != span_run_ids[1]
 
 
 class TestToLangGraphTopology:
@@ -443,6 +518,200 @@ class TestToLangGraphLangChainSpecific:
 
         assert "$ld:ai:graph:invocation_success" in track_calls
         assert "$ld:ai:graph:path" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_graph_span_carries_config_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The graph span must identify the config so Monitoring can link the trace."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        mock_span = MagicMock()
+        mock_trace = MagicMock()
+        mock_trace.get_tracer.return_value.start_span.return_value = mock_span
+
+        ai_msg = _make_ai_msg("done")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with _patch_imports(mocks):
+            with patch.object(ng_mod, "get_client", return_value=MagicMock()):
+                with patch.object(ng_mod, "trace", mock_trace):
+                    with patch.object(ng_mod, "_HAS_OTEL", True):
+                        await to_lang_graph(
+                            _make_def_promise(graph_def),
+                            opts={"context": ctx},
+                        ).invoke("hi")
+
+        attrs = {c[0][0]: c[0][1] for c in mock_span.set_attribute.call_args_list}
+        assert attrs["launchdarkly.operation.type"] == "gen_ai"
+        assert attrs["launchdarkly.config.key"] == "test-graph"
+        assert attrs["launchdarkly.graph.key"] == "test-graph"
+        assert attrs["launchdarkly.run.id"]
+        assert "launchdarkly.variation.key" in attrs
+        assert attrs["context.contextKeys.user"] == "u1"
+
+        events = {c[0][0]: c[0][1] for c in mock_span.add_event.call_args_list}
+        assert events["feature_flag"] == {
+            "feature_flag.key": "test-graph",
+            "feature_flag.provider.name": "LaunchDarkly",
+            "feature_flag.set.id": "env-123",
+            "feature_flag.context.id": "u1",
+            "feature_flag.contextKeys": '{"user":"u1"}',
+        }
+
+    @pytest.mark.asyncio
+    async def test_tracking_events_carry_the_environment_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_ENVIRONMENT_ID", "env-123")
+        payloads: list[Any] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: payloads.append(data)
+        )
+
+        ai_msg = _make_ai_msg("done")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+                node_fn = mocks["_node_fns"]["root"]
+                await node_fn({"messages": []})
+
+        assert payloads
+        for data in payloads:
+            assert data["environmentId"] == "env-123"
+
+    @pytest.mark.asyncio
+    async def test_graph_events_are_keyed_to_the_graph(self) -> None:
+        """Graph-level events carry the graph key, like the graph span and graph()."""
+        calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: calls.append((evt, data))
+        )
+
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+        graph_def = _make_graph_def()
+        ctx = {"kind": "user", "key": "u1"}
+
+        with _patch_imports(mocks):
+            with patch(
+                "launchdarkly_ai_langchain_agents.native_graph.get_client",
+                return_value=mock_ld_client,
+            ):
+                await to_lang_graph(
+                    _make_def_promise(graph_def),
+                    opts={"context": ctx},
+                ).invoke("hi")
+
+        graph_events = [
+            (e, d)
+            for e, d in calls
+            if e
+            in (
+                "$ld:ai:graph:invocation_success",
+                "$ld:ai:graph:duration:total",
+                "$ld:ai:graph:total_tokens",
+            )
+        ]
+        assert len(graph_events) == 3
+        for _, data in graph_events:
+            assert data["configKey"] == "test-graph"
+            assert data["graphKey"] == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_each_runner_call_gets_its_own_run_id(self) -> None:
+        """Two calls on one runner: each span shares its run's id, and the ids differ."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        fake_trace, exporter, _ = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+        graph_def = _make_graph_def()
+
+        with _patch_imports(mocks):
+            with patch.object(ng_mod, "trace", fake_trace):
+                with patch.object(ng_mod, "_HAS_OTEL", True):
+                    with patch.object(
+                        ng_mod, "get_client", return_value=mock_ld_client
+                    ):
+                        # A task, unlike a bare coroutine, can be awaited on each call.
+                        runner = to_lang_graph(
+                            asyncio.ensure_future(_make_def_promise(graph_def)),
+                            opts={"context": {"kind": "user", "key": "u1"}},
+                        )
+                        await runner.invoke("first")
+                        first_run_calls = len(track_calls)
+                        await runner.invoke("second")
+
+        _assert_two_runs_two_run_ids(
+            exporter,
+            [track_calls[:first_run_calls], track_calls[first_run_calls:]],
+        )
+
+    @pytest.mark.asyncio
+    async def test_graph_setup_error_fails_the_graph_span(self) -> None:
+        """A compile error before the run ends one ERROR span and tracks the failure."""
+        import launchdarkly_ai_langchain_agents.native_graph as ng_mod
+
+        fake_trace, exporter, end_spies = _recording_trace()
+        track_calls: list[tuple[str, Any]] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append((evt, data))
+        )
+
+        mocks = _make_langgraph_mocks(_make_ai_msg("done"))
+
+        class _BadCompileStateGraph:
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_node(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_edge(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def add_conditional_edges(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def compile(self) -> Any:
+                raise ValueError("bad graph")
+
+        mocks["langgraph.graph"].StateGraph = _BadCompileStateGraph
+        graph_def = _make_graph_def()
+
+        with _patch_imports(mocks):
+            with patch.object(ng_mod, "trace", fake_trace):
+                with patch.object(ng_mod, "_HAS_OTEL", True):
+                    with patch.object(
+                        ng_mod, "get_client", return_value=mock_ld_client
+                    ):
+                        with pytest.raises(ValueError, match="bad graph"):
+                            await to_lang_graph(
+                                _make_def_promise(graph_def),
+                                opts={"context": {"kind": "user", "key": "u1"}},
+                            ).invoke("hi")
+
+        _assert_one_failed_graph_span(exporter, end_spies, "bad graph", track_calls)
 
     @pytest.mark.asyncio
     async def test_node_function_emits_graph_node(self) -> None:
@@ -1010,3 +1279,78 @@ class TestWorkflowStateAnnotationsResolve:
 
         assert isinstance(result, dict)
         assert "response" in result
+
+
+class TestNativeGraphNeverForwardedParameters:
+    @pytest.mark.asyncio
+    async def test_default_chat_openai_receives_no_never_forwarded_key(self) -> None:
+        ai_msg = _make_ai_msg("final")
+        mocks = _make_langgraph_mocks(ai_msg)
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {
+                            "name": "gpt-4o",
+                            "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.2},
+                        },
+                        "instructions": "help",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+
+        async def _visit(fn: Any, ctx: Any = None) -> None:
+            if graph_def.root is not None:
+                await fn(graph_def.root)
+
+        graph_def.traverse = _visit
+
+        with _patch_imports(mocks):
+            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+
+        assert mocks["langchain_openai"].ChatOpenAI.call_args.kwargs == {
+            "temperature": 0.2,
+            "model": "gpt-4o",
+        }
+
+
+class TestNativeGraphForwardsExactlyTheCrossSdkList:
+    """The native graph's default ``ChatOpenAI`` takes the same forwarded list as the handler's,
+    so a probe of one node finds exactly the cross-SDK ChatOpenAI list."""
+
+    @pytest.mark.asyncio
+    async def test_default_chat_openai(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            mocks = _make_langgraph_mocks(_make_ai_msg("final"))
+            graph_def = _make_graph_def(
+                nodes={
+                    "root": {
+                        "key": "root",
+                        "config": {
+                            "model": {"name": "gpt-4o", "parameters": parameters},
+                            "instructions": "help",
+                        },
+                        "meta": {"variationKey": "v1", "version": 1},
+                        "edges": [],
+                        "is_terminal": True,
+                    }
+                }
+            )
+
+            async def _visit(fn: Any, ctx: Any = None) -> None:
+                if graph_def.root is not None:
+                    await fn(graph_def.root)
+
+            graph_def.traverse = _visit
+            with _patch_imports(mocks):
+                await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+            return mocks["langchain_openai"].ChatOpenAI.call_args.kwargs
+
+        expected = LANGCHAIN_CHAT_OPENAI
+        candidates = candidate_keys(_REAL_CHAT_OPENAI.model_fields, expected)
+        assert await probe_forwarded_keys(candidates, call) == expected

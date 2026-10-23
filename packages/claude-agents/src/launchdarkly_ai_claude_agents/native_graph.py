@@ -5,6 +5,7 @@ query() calls, mirroring the TypeScript toClaudeAgents implementation.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 import types
@@ -19,8 +20,10 @@ from launchdarkly_ai_server import (
     get_client,
     make_track_data,
     report_usage,
+    set_ld_span_attributes,
     to_ld_context,
 )
+from launchdarkly_ai_server.utils import make_graph_track_data
 
 from ._version import PACKAGE_NAME, __version__
 
@@ -34,6 +37,9 @@ except ImportError:
 
 from launchdarkly_ai_claude_agents.handler import (
     _build_hooks,
+    _host_query_options,
+    _options_parameters,
+    _raise_if_run_failed,
     build_prompt,
     build_query_prompt,
     build_tool_mcp,
@@ -44,6 +50,8 @@ TOOL_MCP_NAME = "tool-mcp"
 SUBAGENT_MCP_NAME = "subagents"
 MCP_TOOL_PREFIX = f"mcp__{TOOL_MCP_NAME}__"
 SUBAGENT_TOOL_PREFIX = f"mcp__{SUBAGENT_MCP_NAME}__"
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_name(key: str) -> str:
@@ -108,6 +116,7 @@ async def _run_query(
     run_id: str,
     child_subagent_tools: list[Any],
     history: list[dict[str, Any]] | None = None,
+    host_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import importlib
 
@@ -152,7 +161,10 @@ async def _run_query(
 
     hooks = _build_hooks(native_tool_map)
 
+    params = _options_parameters(node.config)
+
     options = ClaudeAgentOptions(
+        **params,
         # Explicitly set the available built-in tools (empty list disables all).
         # When no native tools are needed, disable built-in tools so Claude
         # cannot call WebSearch/Bash/etc. and get stuck waiting for permission
@@ -168,6 +180,10 @@ async def _run_query(
         else [],
         mcp_servers=mcp_servers,
         hooks=hooks or {},
+        # `setting_sources` always, `[]` unless the application gave sources: the Agent SDK reads
+        # `None` as "load every source", which would put the host's plugins, skills, hooks and
+        # CLAUDE.md into every node's run. `cwd` only if given.
+        **(host_options or _host_query_options(None, None)),
         **({"system_prompt": system_prompt} if system_prompt else {}),
     )
 
@@ -182,6 +198,9 @@ async def _run_query(
     try:
         async for message in gen:
             if isinstance(message, ResultMessage):
+                # Raising fails the graph at the root, and fails the tool call at a sub-agent,
+                # instead of answering with an empty string or with the API's error text.
+                _raise_if_run_failed(message)
                 output = message.result or ""
                 raw_usage = message.usage or {}
                 break
@@ -208,10 +227,16 @@ def to_claude_agents(
     Converts a resolved ``GraphDefinition`` into a nested query() multi-agent
     execution where each child node becomes a sub-agent tool.
 
+    *opts* takes ``context``, ``tool_handlers``, and the host options ``cwd`` and
+    ``setting_sources``, which behave as on ``create_claude_agents_handler`` and are sent to
+    every node's ``query()``, root and sub-agents alike.
+
     Returns an object with a ``.invoke(input, variables)`` coroutine.
     """
     report_usage("claude-agents.toClaudeAgents", PACKAGE_NAME, __version__)
     _opts = opts or {}
+    # Resolved once, so a caller mutating its list afterwards does not change later runs.
+    host_options = _host_query_options(_opts.get("cwd"), _opts.get("setting_sources"))
 
     async def invoke(
         input_text: str = "",
@@ -240,31 +265,45 @@ def to_claude_agents(
         )
         raw_handlers: dict[str, Any] = _opts.get("tool_handlers") or {}
 
+        start_time = time.monotonic()
+        run_id = str(uuid.uuid4())
         tracer_name = "@launchdarkly/ai-claude-agents"
         if _HAS_OTEL:
             span = trace.get_tracer(tracer_name).start_span("launchdarkly.graph")
-            span.set_attribute("launchdarkly.graph.key", def_obj.key)
         else:
             span = None
-
-        start_time = time.monotonic()
-        run_id = str(uuid.uuid4())
         path: list[str] = []
         total_usage = {"input": 0, "output": 0, "total": 0}
         subagent_tool_ctx: dict[str, Any] = {}
 
+        # One try covers setup and the run, so a setup error (a sub-agent tool
+        # that fails to build) is recorded on the span and tracked as an
+        # invocation failure, like a run error. The span ends exactly once, in
+        # the finally.
         try:
+            if span:
+                set_ld_span_attributes(
+                    span,
+                    {
+                        "__ld": make_graph_track_data(def_obj.key, run_id),
+                        "ldContext": raw_ld_context,
+                    },
+                )
 
             async def _build_node(node: GraphNode) -> None:
                 if node.key == root.key:
                     return
 
                 node_key = _sanitize_name(node.key)
-                child_tools = [
-                    subagent_tool_ctx[e.target_key]
-                    for e in node.edges
-                    if e.target_key in subagent_tool_ctx
-                ]
+                child_tools = []
+                for e in node.edges:
+                    if e.target_key not in subagent_tool_ctx:
+                        # The root is never a tool, so only an edge back to the root or into a cycle lands here.
+                        logger.warning(
+                            'Dropping cyclic edge "%s" -> "%s"', node.key, e.target_key
+                        )
+                        continue
+                    child_tools.append(subagent_tool_ctx[e.target_key])
 
                 async def _subagent_execute(
                     args: Any, _node: GraphNode = node
@@ -299,6 +338,7 @@ def to_claude_agents(
                         def_obj.key,
                         run_id,
                         child_tools,
+                        host_options=host_options,
                     )
                     total_usage["input"] += result["usage"]["input"]
                     total_usage["output"] += result["usage"]["output"]
@@ -355,29 +395,18 @@ def to_claude_agents(
                     )
             root_start = time.monotonic()
 
-            try:
-                result = await _run_query(
-                    root,
-                    input_text,
-                    vs,
-                    raw_handlers,
-                    ld_context,
-                    def_obj.key,
-                    run_id,
-                    root_child_tools,
-                    history,
-                )
-            except Exception as exc:
-                if span:
-                    span.record_exception(exc)
-                    span.set_status(SpanStatusCode.ERROR, str(exc))
-                    span.end()
-                if ld_context:
-                    td = make_track_data(root, def_obj.key, run_id)
-                    get_client().track(
-                        "$ld:ai:graph:invocation_failure", ld_context, td, 1
-                    )
-                raise
+            result = await _run_query(
+                root,
+                input_text,
+                vs,
+                raw_handlers,
+                ld_context,
+                def_obj.key,
+                run_id,
+                root_child_tools,
+                history,
+                host_options=host_options,
+            )
 
             final_output = result["output"]
             root_usage = result["usage"]
@@ -411,30 +440,38 @@ def to_claude_agents(
                 span.set_attribute("gen_ai.usage.input_tokens", total_usage["input"])
                 span.set_attribute("gen_ai.usage.output_tokens", total_usage["output"])
                 span.set_attribute("gen_ai.usage.total_tokens", total_usage["total"])
-                span.set_status(SpanStatusCode.OK)
-                span.end()
 
             if ld_context:
-                root_td = make_track_data(root, def_obj.key, run_id)
+                graph_td = make_graph_track_data(def_obj.key, run_id)
                 client = get_client()
                 client.track(
-                    "$ld:ai:graph:duration:total", ld_context, root_td, graph_dur
+                    "$ld:ai:graph:duration:total", ld_context, graph_td, graph_dur
                 )
                 client.track(
                     "$ld:ai:graph:total_tokens",
                     ld_context,
-                    root_td,
+                    graph_td,
                     total_usage["total"],
                 )
-                client.track("$ld:ai:graph:invocation_success", ld_context, root_td, 1)
+                client.track("$ld:ai:graph:invocation_success", ld_context, graph_td, 1)
 
+            if span:
+                span.set_status(SpanStatusCode.OK)
             return {"response": final_output, "usage": total_usage}
-
         except Exception as exc:
             if span:
                 span.record_exception(exc)
                 span.set_status(SpanStatusCode.ERROR, str(exc))
-                span.end()
+            if ld_context:
+                get_client().track(
+                    "$ld:ai:graph:invocation_failure",
+                    ld_context,
+                    make_graph_track_data(def_obj.key, run_id),
+                    1,
+                )
             raise
+        finally:
+            if span:
+                span.end()
 
     return types.SimpleNamespace(invoke=invoke)
