@@ -166,6 +166,7 @@ from .utils import (
     to_usage_dict,
 )
 from .utils import _create_handler as _create_handler
+from .utils import validate_max_retries as validate_max_retries
 
 # Deprecated: the 0.5.0 name. Removed in the next major release.
 FDv2SkillStore = LaunchDarklySkillStore
