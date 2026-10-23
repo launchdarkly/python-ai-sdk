@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from agents import ModelSettings, RunConfig
@@ -13,6 +13,7 @@ from agents.lifecycle import RunHooksBase
 from openai.types.shared import Reasoning
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
+from pydantic import ValidationError
 
 from launchdarkly_ai_server import (
     AiConfigRep,
@@ -35,22 +36,67 @@ from launchdarkly_ai_server import (
     text_message,
 )
 from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 
 ModelFactory = Callable[[str, dict[str, Any]], Any]
-_MODEL_SETTING_FIELDS = {
-    "temperature",
-    "top_p",
-    "frequency_penalty",
-    "presence_penalty",
-    "tool_choice",
-    "parallel_tool_calls",
-    "max_tokens",
-    "reasoning",
-    "verbosity",
-    "store",
-}
+
+#: Every field ``agents.ModelSettings`` declares, classified by hand into exactly one of: forwarded
+#: (below) or excluded. These are the fields ``LitellmModel`` actually sends to
+#: ``litellm.acompletion``. ``max_turns`` is not a ``ModelSettings`` field: it is read separately
+#: for ``Runner.run``. ``TestModelSettingsAcceptsExactlyTheseFields`` in this package's tests
+#: asserts this classification stays exhaustive as the SDK's own dataclass changes.
+_MODEL_SETTINGS_FORWARDED_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "max_tokens",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning",
+        "temperature",
+        "tool_choice",
+        "top_p",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ModelSettings``.
+_MODEL_SETTINGS_MAPPING_KEYS = frozenset({"reasoning"})
+
+#: Declared by ``ModelSettings`` but never forwarded, and why:
+#: * ``verbosity``: ``LitellmModel`` never reads it, so it would be silently dropped.
+#: * ``context_management``, ``truncation``: server-side state.
+#: * ``store``, ``prompt_cache_retention``: data retention.
+#: * ``metadata``: identity and attribution. ``LitellmModel`` passes it to ``acompletion``.
+#: * ``include_usage``: runtime wiring. It changes how usage is reported back to the handler.
+#: * ``response_include``, ``top_logprobs``: API-shape switch. They add output the handler does not
+#:   read.
+#: * ``retry``: client/connection configuration.
+#: * ``extra_headers``, ``extra_query``, ``extra_body``, ``extra_args``: raw request overrides.
+#:   ``extra_args`` is merged straight into the ``acompletion`` call, where it would reach
+#:   ``api_base``, ``mock_response`` and the rest.
+#:
+#: Named for the drift test and for review, not read at runtime.
+_MODEL_SETTINGS_EXCLUDED_KEYS = frozenset(
+    {
+        "verbosity",
+        "context_management",
+        "truncation",
+        "store",
+        "prompt_cache_retention",
+        "metadata",
+        "include_usage",
+        "response_include",
+        "top_logprobs",
+        "retry",
+        "extra_headers",
+        "extra_query",
+        "extra_body",
+        "extra_args",
+    }
+)
 _RUN_CONFIG = RunConfig(tracing_disabled=True)
 
 
@@ -97,34 +143,16 @@ class _JsonSchemaOutput(AgentOutputSchemaBase):
         return json.loads(json_str)
 
 
-# AI Configs are authored in snake_case, but a caller may also pass camelCase (spec §2.x.1:
-# "either spelling is read"). snake_case wins when a bag sets both.
-_CAMEL_TO_SNAKE_FIELDS = {
-    "topP": "top_p",
-    "maxTurns": "max_turns",
-    "frequencyPenalty": "frequency_penalty",
-    "presencePenalty": "presence_penalty",
-    "toolChoice": "tool_choice",
-    "parallelToolCalls": "parallel_tool_calls",
-    "maxTokens": "max_tokens",
-}
-
-
-def _normalized_parameters(raw: dict[str, Any]) -> dict[str, Any]:
-    result = dict(raw)
-    for camel, snake in _CAMEL_TO_SNAKE_FIELDS.items():
-        if camel in result:
-            value = result.pop(camel)
-            result.setdefault(snake, value)
-    return result
-
-
 def _model_config(config_value: AiConfigRep) -> tuple[str, dict[str, Any]]:
+    """The model name and the forwarded ``model.parameters``: the ``ModelSettings`` keys plus
+    ``max_turns`` for the run. The handler and the native graph both call this, so they forward
+    the same keys."""
     model = config_value.get("model") or {}
-    raw = model.get("parameters")
-    allowed = _MODEL_SETTING_FIELDS | {"max_turns"}
-    normalized = _normalized_parameters(raw) if isinstance(raw, dict) else {}
-    parameters = {key: value for key, value in normalized.items() if key in allowed}
+    parameters = select_forwarded_parameters(
+        model_parameters(config_value),
+        _MODEL_SETTINGS_FORWARDED_KEYS | {"max_turns"},
+        mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
+    )
     return str(model.get("name") or ""), parameters
 
 
@@ -141,20 +169,22 @@ def _litellm_model(
 
 
 def _model_settings(parameters: dict[str, Any]) -> ModelSettings:
-    settings = {
-        key: value for key, value in parameters.items() if key in _MODEL_SETTING_FIELDS
-    }
-    # Only ``effort`` and ``summary`` reach the model, as in the TypeScript SDK; any other
-    # key, or a non-object value, is dropped rather than failing ModelSettings validation.
+    """Builds ``ModelSettings`` from the forwarded parameters.
+
+    ``reasoning`` keeps only ``effort``, rebuilt as the SDK's ``Reasoning`` type: ``LitellmModel``
+    sends it as ``reasoning_effort`` and logs a warning on every call that also sets ``summary``.
+    A ``reasoning`` with no ``effort``, or one the ``Reasoning`` type rejects, is dropped. ``tool_choice`` is forwarded only as a string;
+    ``ModelSettings`` rejects an object value while the Agent is built, so one is dropped.
+    """
+    settings = select_forwarded_parameters(parameters, _MODEL_SETTINGS_FORWARDED_KEYS)
     reasoning = settings.pop("reasoning", None)
-    if isinstance(reasoning, dict):
-        picked = {
-            k: reasoning[k]
-            for k in ("effort", "summary")
-            if reasoning.get(k) is not None
-        }
-        if picked:
-            settings["reasoning"] = Reasoning(**picked)
+    if isinstance(reasoning, Mapping) and reasoning.get("effort") is not None:
+        try:
+            settings["reasoning"] = Reasoning(effort=reasoning["effort"])
+        except ValidationError:
+            pass
+    if not isinstance(settings.get("tool_choice", ""), str):
+        del settings["tool_choice"]
     return ModelSettings(**settings)
 
 

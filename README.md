@@ -89,6 +89,7 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-litellm-agents`](packages/litellm-agents/README.md) | `*` (any) | `agent` | OpenAI Agents SDK with LiteLLM models |
 | [`launchdarkly-ai-vercel-messages`](packages/vercel-messages/README.md) | `*` (any) | `messages` | Vercel AI SDK with AI Gateway routing |
 | [`launchdarkly-ai-vercel-agents`](packages/vercel-agents/README.md) | `*` (any) | `agent` | Native Vercel `ai.Agent` loop and graph adapter |
+| [`launchdarkly-ai-typesafe`](packages/typesafe/README.md) | TypeSafe | `messages` | TypeSafe Jev judge handler |
 | [`launchdarkly-ai-google-adk-agents`](packages/google-adk-agents/README.md) | Google | `agent` | Google ADK agent loop and graph adapter |
 
 ## Quick Start

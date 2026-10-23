@@ -11,11 +11,15 @@ halves of that contract so the paths cannot drift.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from math import isfinite
 from typing import Any
 
+from .content import tool_result_string
 from .utils import parse_json_with_possible_fences
+
+logger = logging.getLogger(__name__)
 
 FORMATTING_INSTRUCTIONS = "\n".join(
     [
@@ -45,10 +49,14 @@ def build_message_history(
     the AI Library's default templates read the JSON shape from
     ``{{message_history}}``, and one that stopped being told it would return
     prose and fail every result as invalid output.
+
+    A non-string output is shown as JSON, by the rule tool results follow, so a
+    rubric reads the same text in every SDK.
     """
+    output_text = tool_result_string(output) if output else None
     return "\n\n".join(
         str(part)
-        for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
+        for part in (user_input, trajectory, output_text, FORMATTING_INSTRUCTIONS)
         if part
     )
 
@@ -63,6 +71,55 @@ def numeric_score(score: Any) -> float | None:
         return None
     value = float(score)
     return value if isfinite(value) else None
+
+
+def typesafe_judge_entries(raw: Any) -> list[dict[str, Any]] | None:
+    """Parse a TypeSafe handler payload into question key, score, event key, and reason.
+
+    Returns ``None`` when ``raw`` is not a TypeSafe multi-result payload, so a
+    classic ``{"score", "reasoning"}`` judge stays on :func:`parse_judge_response`.
+    Raises ``ValueError`` when the payload claims to be TypeSafe but is malformed.
+    """
+    parsed: Any
+    if isinstance(raw, str):
+        parsed = parse_json_with_possible_fences(raw)
+    elif isinstance(raw, Mapping):
+        parsed = raw
+    else:
+        parsed = None
+    if not isinstance(parsed, Mapping) or parsed.get("kind") != "typesafe":
+        return None
+    results = parsed.get("results")
+    if not isinstance(results, list) or not results:
+        raise ValueError("TypeSafe judge output is missing results")
+    entries: list[dict[str, Any]] = []
+    for item in results:
+        if (
+            not isinstance(item, Mapping)
+            or not isinstance(item.get("key"), str)
+            or not item["key"]
+        ):
+            raise ValueError("TypeSafe judge result is missing a key")
+        score = numeric_score(item.get("score"))
+        if score is None:
+            raise ValueError(
+                f"TypeSafe judge result {item['key']!r} is missing a finite score"
+            )
+        event_key = item.get("eventKey")
+        if not isinstance(event_key, str) or not event_key:
+            raise ValueError(
+                f"TypeSafe judge result {item['key']!r} is missing an eventKey"
+            )
+        reason = item.get("reason")
+        entries.append(
+            {
+                "key": item["key"],
+                "score": score,
+                "eventKey": event_key,
+                "reason": reason if isinstance(reason, str) else "",
+            }
+        )
+    return entries
 
 
 def parse_judge_response(raw: Any) -> tuple[Any, str]:
@@ -85,3 +142,25 @@ def parse_judge_response(raw: Any) -> tuple[Any, str]:
         raise ValueError("Invalid JSON from judge")
     reasoning = parsed.get("reasoning") or parsed.get("reason") or ""
     return parsed.get("score"), str(reasoning)
+
+
+def without_output_format(config: Any, judge_key: str) -> Any:
+    """Return a judge config with its ``outputFormat`` removed.
+
+    A judge is an ordinary AI Config, so it can carry an ``outputFormat`` JSON
+    Schema. The verdict shape belongs to this module, not to the judge's
+    author, and every provider handler that honors ``outputFormat`` would
+    constrain the judge model to the author's schema instead, so the verdict
+    could never parse. Every judge path strips the field before a config
+    reaches a handler or a :class:`JudgeTask`, and says so once per judge.
+
+    Returns ``config`` itself when the key is absent. Never mutates it: it
+    came from ``extract_variation`` and may be cached.
+    """
+    if not isinstance(config, Mapping) or "outputFormat" not in config:
+        return config
+    logger.warning(
+        "Judge '%s': ignoring outputFormat - a judge must return {score, reasoning}.",
+        judge_key,
+    )
+    return {k: v for k, v in config.items() if k != "outputFormat"}

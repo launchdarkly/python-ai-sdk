@@ -133,6 +133,26 @@ class TestJudgeEvaluation:
         # Allow scheduling slack, but nothing close to the 50ms of post-end work.
         assert span.end_time - ended_at < 20_000_000
 
+    async def test_later_labels_keep_the_first_evaluation_attributes(self) -> None:
+        async with with_judge_evaluation("jev-judge") as record:
+            with _tracer.start_as_current_span("invoke_agent"):
+                pass
+            record(0.25, None, "jev-judge.accuracy")
+            record(0.93, None, "jev-judge.tone")
+        span = next(s for s in finished() if s.name == "invoke_agent")
+        assert span.attributes is not None
+        assert span.attributes["gen_ai.evaluation.name"] == "jev-judge.accuracy"
+        assert span.attributes["gen_ai.evaluation.score.value"] == 0.25
+        events = [e for e in span.events if e.name == "gen_ai.evaluation.result"]
+        assert [e.attributes["gen_ai.evaluation.name"] for e in events] == [
+            "jev-judge.accuracy",
+            "jev-judge.tone",
+        ]
+        assert [e.attributes["gen_ai.evaluation.score.value"] for e in events] == [
+            0.25,
+            0.93,
+        ]
+
 
 class TestProcessorScope:
     """The processor is registered on the *global* provider, so it sees every span in the process.

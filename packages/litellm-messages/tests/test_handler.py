@@ -19,6 +19,12 @@ from launchdarkly_ai_litellm_messages import (
     create_litellm_messages_handler,
     litellm_messages,
 )
+from tests.forwarding_spec import (
+    LITELLM_MESSAGES,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 CONFIG: dict[str, Any] = {
     "provider": {"name": "Anthropic"},
@@ -660,3 +666,79 @@ class TestTelemetryAndConvenience:
         instance.invoke.assert_called_once_with(
             "hello", {"kind": "user", "key": "u"}, {"name": "Ada"}
         )
+
+
+class TestNeverForwardedParameters:
+    """No credential, endpoint, routing, or request-injection key in ``model.parameters`` reaches
+    ``litellm.acompletion``, on invoke or stream."""
+
+    @staticmethod
+    def _config() -> dict[str, Any]:
+        return {
+            **CONFIG,
+            "model": {
+                **CONFIG["model"],
+                "parameters": {**NEVER_FORWARDED_BAG, "temperature": 0.1},
+            },
+        }
+
+    async def test_invoke_forwards_none_of_them(self) -> None:
+        completion = AsyncMock(return_value=_response())
+        await create_litellm_messages_handler(completion=completion)(
+            self._config(), "q"
+        )
+        request = completion.call_args.kwargs
+        assert request["temperature"] == 0.1
+        assert not find_leaks(request)
+
+    async def test_stream_forwards_none_of_them(self) -> None:
+        completion = AsyncMock(return_value=FakeStream([_chunk(text="hi")]))
+        await _events(
+            await create_litellm_messages_handler(completion=completion).stream(
+                self._config(), "q"
+            )
+        )
+        request = completion.call_args.kwargs
+        assert request["temperature"] == 0.1
+        assert not find_leaks(request)
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change the
+    ``litellm.acompletion`` call are exactly the cross-SDK LiteLLM Messages list, on both paths."""
+
+    @staticmethod
+    def _candidates() -> frozenset[str]:
+        import inspect
+
+        import litellm
+
+        return candidate_keys(
+            inspect.signature(litellm.acompletion).parameters, LITELLM_MESSAGES
+        )
+
+    @staticmethod
+    def _config(parameters: dict[str, Any]) -> dict[str, Any]:
+        return {**CONFIG, "model": {**CONFIG["model"], "parameters": parameters}}
+
+    async def test_invoke(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            completion = AsyncMock(return_value=_response())
+            await create_litellm_messages_handler(completion=completion)(
+                self._config(parameters), "q"
+            )
+            return completion.call_args.kwargs
+
+        assert await probe_forwarded_keys(self._candidates(), call) == LITELLM_MESSAGES
+
+    async def test_stream(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            completion = AsyncMock(return_value=FakeStream([_chunk(text="hi")]))
+            await _events(
+                await create_litellm_messages_handler(completion=completion).stream(
+                    self._config(parameters), "q"
+                )
+            )
+            return completion.call_args.kwargs
+
+        assert await probe_forwarded_keys(self._candidates(), call) == LITELLM_MESSAGES

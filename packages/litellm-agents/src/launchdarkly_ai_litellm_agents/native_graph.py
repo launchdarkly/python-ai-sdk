@@ -246,11 +246,15 @@ def to_litellm_agents(
                 async def on_agent_start(self, context: Any, agent: Any) -> None:
                     _enter(agent.name)
 
+            # Only the root node's `max_turns` applies. The whole graph is one `Runner.run`, and
+            # the Agents SDK counts turns once for that run, across every handoff.
+            root_max_turns = _model_config(graph.root.config)[1].get("max_turns")
             result = await agents.Runner.run(
                 built[graph.root.key],
                 runner_input,
                 hooks=_LDHooks(),
                 run_config=RunConfig(tracing_disabled=True),
+                **({"max_turns": root_max_turns} if root_max_turns is not None else {}),
             )
             if span:
                 span.set_status(SpanStatusCode.OK)
