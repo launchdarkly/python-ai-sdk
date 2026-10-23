@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.4.0...launchdarkly-ai-server-0.5.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* handlers now forward the AI Config's model parameters to the provider, limited to each handler's list in TESTING.md 1.12. Configs that set parameters which used to be ignored now take effect.
+
+### Experimental
+
+* **evaluations:** normalize text behaviors ([7cee8c8](https://github.com/launchdarkly/python-ai-sdk/commit/7cee8c8667ecfa2ec4b939accbcb1c633071e81a))
+* **skills:** default FDv2SkillStore endpoints from LD_BASE_URI and LD_STREAM_URI ([1629123](https://github.com/launchdarkly/python-ai-sdk/commit/16291234427b487e35c8a7fb4eba2884bd9876d2))
+
+
+### Bug Fixes
+
+* **client:** show a judge an output of 0 or false, and render non-string values as JSON ([7cee8c8](https://github.com/launchdarkly/python-ai-sdk/commit/7cee8c8667ecfa2ec4b939accbcb1c633071e81a))
+* **client:** strip whitespace from LD_BASE_URI, LD_STREAM_URI and LD_EVENTS_URI in init_client ([1629123](https://github.com/launchdarkly/python-ai-sdk/commit/16291234427b487e35c8a7fb4eba2884bd9876d2))
+* **judges:** a judge config's outputFormat must not reach the provider ([#86](https://github.com/launchdarkly/python-ai-sdk/issues/86)) ([d8b893d](https://github.com/launchdarkly/python-ai-sdk/commit/d8b893d003bdad7f060c9a73acb74eb1d1e1f4c7))
+* pass AI Config model parameters through to every provider handler ([#107](https://github.com/launchdarkly/python-ai-sdk/issues/107)) ([e3afb3f](https://github.com/launchdarkly/python-ai-sdk/commit/e3afb3f2c19ebf7085f84e94cd5a53f2bbe929ae))
+
 ## [0.4.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.3.0...launchdarkly-ai-server-0.4.0) (2026-10-23)
 
 

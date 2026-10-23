@@ -1,6 +1,6 @@
 [project]
 name = "launchdarkly-ai-openai-messages"
-version = "0.2.5"
+version = "0.3.0"
 requires-python = ">=3.12"
 dependencies = [
   "launchdarkly-ai-server>=0.4.1",
