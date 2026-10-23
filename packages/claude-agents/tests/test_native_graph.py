@@ -15,6 +15,12 @@ import pytest
 import launchdarkly_ai_claude_agents.native_graph as _claude_ng
 from launchdarkly_ai_claude_agents.native_graph import to_claude_agents
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
+from tests.forwarding_spec import (
+    CLAUDE_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -22,10 +28,21 @@ from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, Native
 
 
 def _make_result_msg(
-    text: str = "result", input_tokens: int = 5, output_tokens: int = 3
+    text: str | None = "result",
+    input_tokens: int = 5,
+    output_tokens: int = 3,
+    subtype: str = "success",
+    is_error: bool = False,
+    errors: list[str] | None = None,
+    api_error_status: int | None = None,
 ) -> Any:
     m = MagicMock()
     m.__class__.__name__ = "ResultMessage"
+    # Set explicitly: an unset MagicMock attribute is truthy, so `is_error` would read as an error.
+    m.subtype = subtype
+    m.is_error = is_error
+    m.errors = errors
+    m.api_error_status = api_error_status
     m.result = text
     m.usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
     return m
@@ -471,6 +488,119 @@ class TestToClaudeAgentsTopology:
         assert "response" in result
 
 
+class TestToClaudeAgentsHostIsolation:
+    """Every ``query()`` the adapter makes switches the built-ins off unless a node attaches one,
+    and loads none of the host's Claude Code settings unless ``opts`` names sources. The host
+    options in ``opts`` reach every node, root and sub-agents alike.
+    """
+
+    @staticmethod
+    async def _root_options(
+        tool_handlers: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        mock_sdk = _make_sdk_mock("done")
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(
+                _make_def_promise(_make_graph_def()),
+                opts={"tool_handlers": tool_handlers or {}},
+            ).invoke("hi")
+        assert len(captured) == 1
+        return captured[0]
+
+    @staticmethod
+    async def _root_and_leaf_options(
+        **host: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Runs a root with one leaf sub-agent, which the root calls, and returns the options
+        each node's ``query()`` received."""
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {"model": {"name": "claude-3"}, "instructions": "root"},
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [{"source_key": "root", "target_key": "leaf"}],
+                    "is_terminal": False,
+                },
+                "leaf": {
+                    "key": "leaf",
+                    "config": {"model": {"name": "claude-3"}, "instructions": "leaf"},
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                },
+            },
+            edges=[{"source_key": "root", "target_key": "leaf"}],
+        )
+        leaf_tool: list[Any] = []
+
+        def _tool_factory(name: str, desc: str, schema: Any) -> Any:
+            def _dec(fn: Any) -> Any:
+                if "leaf" in name:
+                    leaf_tool.append(fn)
+                return fn
+
+            return _dec
+
+        mock_sdk = _make_sdk_mock("done")
+        mock_sdk.tool = MagicMock(side_effect=_tool_factory)
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        result_msg = _make_result_msg("done")
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            if kwargs["options"].get("system_prompt") == "root":
+                await leaf_tool[0]({"input": "sub-query"})
+            yield result_msg
+
+        mock_sdk.query = _query
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def), opts=host).invoke("hi")
+        by_node = {kw["system_prompt"]: kw for kw in captured}
+        assert sorted(by_node) == ["leaf", "root"]
+        return by_node["root"], by_node["leaf"]
+
+    @pytest.mark.asyncio
+    async def test_sends_an_empty_tool_list_with_no_native_tools(self) -> None:
+        opts = await self._root_options()
+        assert opts["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_sends_the_native_tool_names(self) -> None:
+        opts = await self._root_options({"run-bash": NativeTool("Bash")})
+        assert opts["tools"] == ["Bash"]
+
+    @pytest.mark.asyncio
+    async def test_loads_no_host_settings_and_sends_no_cwd_by_default(self) -> None:
+        for opts in await self._root_and_leaf_options():
+            assert opts["setting_sources"] == []
+            assert "cwd" not in opts
+
+    @pytest.mark.asyncio
+    async def test_forwards_cwd_and_setting_sources_to_root_and_leaf(self) -> None:
+        for opts in await self._root_and_leaf_options(
+            cwd="/srv/app", setting_sources=["user"]
+        ):
+            assert opts["cwd"] == "/srv/app"
+            assert opts["setting_sources"] == ["user"]
+
+
 # ---------------------------------------------------------------------------
 # Anthropic-specific specs
 # ---------------------------------------------------------------------------
@@ -537,6 +667,42 @@ class TestToClaudeAgentsAnthropicSpecific:
 
         assert len(created_tools) == 1
         assert "child" in created_tools[0]
+
+    @pytest.mark.asyncio
+    async def test_cyclic_edge_is_dropped_with_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_sdk = _make_sdk_mock("done")
+
+        # root -> a -> b -> a: post-order builds b while a is still unbuilt.
+        def _node(key: str, target: str) -> dict[str, Any]:
+            return {
+                "key": key,
+                "config": {"model": {"name": "claude-3"}, "instructions": key},
+                "meta": {},
+                "edges": [{"source_key": key, "target_key": target}],
+                "is_terminal": False,
+            }
+
+        edges = [("root", "a"), ("a", "b"), ("b", "a")]
+        graph_def = _make_graph_def(
+            nodes={
+                "root": _node("root", "a"),
+                "a": _node("a", "b"),
+                "b": _node("b", "a"),
+            },
+            edges=[{"source_key": s, "target_key": t} for s, t in edges],
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        assert 'Dropping cyclic edge "b" -> "a"' in caplog.text
 
     @pytest.mark.asyncio
     async def test_emits_handoff_success_when_sub_agent_tool_invoked(self) -> None:
@@ -847,6 +1013,126 @@ class TestToClaudeAgentsAnthropicSpecific:
 
         assert "$ld:ai:graph:invocation_failure" in track_calls
 
+    # Measured against Agent SDK 0.3.220: an Anthropic API failure arrives as a `success` result
+    # with `is_error` set and the error text in `result`. The adapter used to return that text as
+    # the answer, and it ignored error subtypes entirely.
+    @pytest.mark.asyncio
+    async def test_root_api_error_result_fails_the_graph(self) -> None:
+        track_calls: list[str] = []
+        mock_ld_client = MagicMock()
+        mock_ld_client.track = MagicMock(
+            side_effect=lambda evt, ctx, data, val: track_calls.append(evt)
+        )
+        mock_sdk = _make_sdk_mock()
+        error_msg = _make_result_msg(
+            "Credit balance is too low", 0, 0, is_error=True, api_error_status=400
+        )
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield error_msg
+
+        mock_sdk.query = _query
+        mock_sdk.ResultMessage = type(error_msg)
+        ctx = {"kind": "user", "key": "test"}
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with patch.object(_claude_ng, "get_client", return_value=mock_ld_client):
+                with pytest.raises(RuntimeError, match="Credit balance is too low"):
+                    await to_claude_agents(
+                        _make_def_promise(_make_graph_def()),
+                        opts={"context": ctx},
+                    ).invoke("hi")
+
+        assert "$ld:ai:graph:invocation_failure" in track_calls
+        assert "$ld:ai:graph:invocation_success" not in track_calls
+
+    @pytest.mark.asyncio
+    async def test_root_error_subtype_fails_the_graph(self) -> None:
+        mock_sdk = _make_sdk_mock()
+        error_msg = _make_result_msg(
+            None,
+            subtype="error_max_turns",
+            is_error=True,
+            errors=["turn limit reached"],
+        )
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            yield error_msg
+
+        mock_sdk.query = _query
+        mock_sdk.ResultMessage = type(error_msg)
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError, match=r"error_max_turns.*turn limit reached"
+            ):
+                await to_claude_agents(_make_def_promise(_make_graph_def())).invoke(
+                    "hi"
+                )
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_api_error_fails_its_tool_call(self) -> None:
+        child_node = {
+            "key": "child",
+            "config": {"model": {"name": "claude-3"}, "instructions": "child"},
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [],
+            "is_terminal": True,
+        }
+        root_node = {
+            "key": "root",
+            "config": {"model": {"name": "claude-3"}, "instructions": "root"},
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [{"source_key": "root", "target_key": "child"}],
+            "is_terminal": False,
+        }
+        graph_def = _make_graph_def(
+            nodes={"root": root_node, "child": child_node},
+            edges=[{"source_key": "root", "target_key": "child"}],
+        )
+        child_tool_fn: list[Any] = []
+
+        def _tool_factory(name: str, desc: str, schema: Any) -> Any:
+            def _dec(fn: Any) -> Any:
+                if "child" in name:
+                    child_tool_fn.append(fn)
+                return fn
+
+            return _dec
+
+        mock_sdk = _make_sdk_mock("root-done")
+        mock_sdk.tool = MagicMock(side_effect=_tool_factory)
+        error_msg = _make_result_msg(
+            "Credit balance is too low", 0, 0, is_error=True, api_error_status=400
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+            async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+                yield error_msg
+
+            mock_sdk.query = _query
+            mock_sdk.ResultMessage = type(error_msg)
+            assert child_tool_fn
+            with pytest.raises(RuntimeError, match="Credit balance is too low"):
+                await child_tool_fn[0]({"input": "sub-query"})
+
     @pytest.mark.asyncio
     async def test_returns_root_query_result(self) -> None:
         mock_sdk = _make_sdk_mock("expected output")
@@ -1036,3 +1322,119 @@ class TestNativeGraphConversationId:
         assert (graph_spans[0].attributes or {}).get(
             GEN_AI_CONVERSATION_ID
         ) == "thread-graph"
+
+
+class TestNativeGraphModelParameters:
+    @pytest.mark.asyncio
+    async def test_node_options_take_run_settings_and_nothing_never_forwarded(
+        self,
+    ) -> None:
+        """Each node runs its own query with options built from its own config, so a node's
+        ``max_turns`` applies to that node."""
+        mock_sdk = _make_sdk_mock("done")
+        nodes = {
+            "root": {
+                "key": "root",
+                "config": {
+                    "model": {
+                        "name": "claude-3",
+                        "parameters": {**NEVER_FORWARDED_BAG, "max_turns": 7},
+                    },
+                    "instructions": "be helpful",
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [],
+                "is_terminal": True,
+            }
+        }
+        graph_def = _make_graph_def(nodes=nodes)
+
+        captured_options: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured_options.append(kw), kw)[1]
+        )
+
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+
+        assert captured_options
+        for opts in captured_options:
+            assert opts["max_turns"] == 7
+            assert not find_leaks(opts)
+
+
+def _build_cli_command(options_kwargs: dict[str, Any]) -> list[str]:
+    """The CLI command the real ``claude_agent_sdk`` would launch for one node's options, built by
+    the SDK's own transport with a stand-in binary. The mocked hooks and MCP servers are left out,
+    since only the forwarded settings are being checked."""
+    from claude_agent_sdk import ClaudeAgentOptions
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    options = ClaudeAgentOptions(
+        **{
+            k: v
+            for k, v in options_kwargs.items()
+            if k not in {"hooks", "mcp_servers", "can_use_tool"}
+        },
+        cli_path="/bin/echo",
+    )
+    return SubprocessCLITransport(prompt="q", options=options)._build_command()
+
+
+class TestNativeGraphForwardsExactlyTheCrossSdkList:
+    """The native graph builds each node's options with the handler's own forwarding, so a probe
+    of one node finds exactly the cross-SDK Claude Agents list."""
+
+    @pytest.mark.asyncio
+    async def test_root_node_options(self) -> None:
+        import dataclasses
+
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        async def call(parameters: dict[str, Any]) -> object:
+            mock_sdk = _make_sdk_mock("done")
+            nodes = {
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": "claude-3", "parameters": parameters},
+                        "instructions": "be helpful",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+            captured: list[dict[str, Any]] = []
+            mock_sdk.ClaudeAgentOptions = MagicMock(
+                side_effect=lambda **kw: (captured.append(kw), kw)[1]
+            )
+            with patch(
+                "importlib.import_module",
+                side_effect=lambda n: (
+                    mock_sdk if n == "claude_agent_sdk" else __import__(n)
+                ),
+            ):
+                await to_claude_agents(
+                    _make_def_promise(_make_graph_def(nodes=nodes))
+                ).invoke("hi")
+            # The real SDK builds its CLI command from each node's options, so a value it
+            # cannot read fails the probe here.
+            for kw in captured:
+                _build_cli_command(kw)
+            return [
+                {k: v for k, v in kw.items() if k not in {"hooks", "mcp_servers"}}
+                for kw in captured
+            ]
+
+        candidates = candidate_keys(
+            (f.name for f in dataclasses.fields(ClaudeAgentOptions)), CLAUDE_AGENTS
+        )
+        assert await probe_forwarded_keys(candidates, call) == CLAUDE_AGENTS

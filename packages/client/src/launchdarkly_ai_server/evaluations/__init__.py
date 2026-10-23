@@ -3,20 +3,18 @@
 from .api import (
     DEFAULT_BASE_URI,
     EvaluationsError,
-    HttpResponse,
-    LDApiClient,
     LDApiError,
-    Transport,
-    urllib_transport,
 )
-from .criteria import Criterion, Judge, Scorer, SuccessDirection
+from .criteria import Criterion, Judge, Scorer
 from .module import EvaluationsModule, init_evaluations
-from .tools import EvalTool, ToolsClient
+from .tools import EvalTool
 from .types import (
     AIConfig,
     DatasetRow,
     EvalRunResult,
     GenerationConfig,
+    GenerationMode,
+    GenerationOverrides,
     RunSummary,
     Usage,
 )
@@ -31,16 +29,12 @@ __all__ = [
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
-    "HttpResponse",
+    "GenerationMode",
+    "GenerationOverrides",
     "Judge",
-    "LDApiClient",
     "LDApiError",
     "RunSummary",
     "Scorer",
-    "SuccessDirection",
-    "ToolsClient",
-    "Transport",
     "Usage",
     "init_evaluations",
-    "urllib_transport",
 ]

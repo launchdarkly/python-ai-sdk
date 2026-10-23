@@ -914,9 +914,10 @@ _REQUEST_ADVICE = (
 )
 
 _FORBIDDEN_ADVICE = (
-    "The FDv2 protocol is opt-in per LaunchDarkly account and is served as HTTP "
-    "403 while it is off. Skill delivery needs it enabled; contact LaunchDarkly "
-    "support to enable it for your account."
+    "The SDK-facing FDv2 endpoints are available to every LaunchDarkly account, "
+    "so check that the SDK key is the environment's server-side SDK key and that "
+    "no proxy in between is refusing the request. If neither explains it, "
+    "contact LaunchDarkly support."
 )
 
 

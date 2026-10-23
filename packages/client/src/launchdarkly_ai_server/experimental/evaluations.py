@@ -16,6 +16,8 @@ from ..evaluations.types import (
     DatasetRow,
     EvalRunResult,
     GenerationConfig,
+    GenerationMode,
+    GenerationOverrides,
     RunSummary,
 )
 
@@ -26,6 +28,8 @@ __all__ = [  # noqa: RUF022
     # run() arguments
     "AIConfig",
     "GenerationConfig",
+    "GenerationMode",
+    "GenerationOverrides",
     "DatasetRow",
     "EvalTool",
     # criteria
