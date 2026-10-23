@@ -36,6 +36,7 @@ class _JudgeEvalCapture:
     released: bool = False
     span: Any = None
     pending_end: Callable[[], None] | None = None
+    mirrored: bool = False
 
 
 # Every tracer this SDK creates is named "@launchdarkly/ai-<package>". The processor is registered
@@ -82,7 +83,12 @@ def _conversation_id_from(ctx: otel_context.Context | None) -> str | None:
 
 
 def _record_evaluation(
-    span: Any, name: str, score: float, explanation: str | None = None
+    span: Any,
+    name: str,
+    score: float,
+    explanation: str | None = None,
+    *,
+    mirror_attributes: bool = True,
 ) -> None:
     """Write the judge score as a ``gen_ai.evaluation.result`` event plus mirrored attributes.
 
@@ -99,6 +105,10 @@ def _record_evaluation(
     if explanation:
         attrs["gen_ai.evaluation.explanation"] = explanation
     span.add_event("gen_ai.evaluation.result", attrs)
+    # A classifier records one event per label. Span attributes hold a single name and
+    # score, so only the first evaluation is mirrored. Later events keep their own attributes.
+    if not mirror_attributes:
+        return
     for key, value in attrs.items():
         span.set_attribute(key, value)
 
@@ -237,9 +247,18 @@ async def with_judge_evaluation(name: str) -> AsyncIterator[RecordEvaluation]:
     """
     capture = _JudgeEvalCapture(name=name)
 
-    def record(score: float, explanation: str | None = None) -> None:
+    def record(
+        score: float, explanation: str | None = None, name: str | None = None
+    ) -> None:
         if capture.span is not None:
-            _record_evaluation(capture.span, capture.name, score, explanation)
+            _record_evaluation(
+                capture.span,
+                name or capture.name,
+                score,
+                explanation,
+                mirror_attributes=not capture.mirrored,
+            )
+            capture.mirrored = True
 
     token = otel_context.attach(otel_context.set_value(_EVAL_KEY, capture))
     try:

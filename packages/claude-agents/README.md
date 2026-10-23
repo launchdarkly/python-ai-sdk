@@ -34,6 +34,46 @@ async def main():
 asyncio.run(main())
 ```
 
+### Handler options
+
+`create_claude_agents_handler()` takes keyword arguments:
+
+| Option | Default | Description |
+|---|---|---|
+| `capture_content` | `None` | Put prompts, model output, and tool arguments and results on the emitted spans. `None` follows `configure()`, which is off by default. |
+| `cwd` | the process's working directory | Working directory for the Claude Code process the Agent SDK starts. A `str` or path-like. |
+| `setting_sources` | `[]` (none) | Which Claude Code settings sources to load: `"user"` (`~/.claude/settings.json`), `"project"` (`.claude/settings.json`, and `CLAUDE.md`), `"local"` (`.claude/settings.local.json`). |
+
+These configure the host process, not the model, so only your application can set them. A flag's model parameters can't set or override either one. `claude_agents()`, `claude_graph()` and `to_claude_agents()` take `cwd` and `setting_sources` too, with the same defaults.
+
+> **A run loads none of the host's Claude Code settings unless you opt in.** The Claude Agent SDK's own default loads the user, project and local settings of the machine it runs on, including their plugins, skills, hooks, permission rules and `CLAUDE.md`. This handler sends `setting_sources=[]` instead, so an agent runs from its LaunchDarkly config alone. To load host settings, name the sources:
+>
+> ```python
+> create_claude_agents_handler(setting_sources=["user", "project", "local"])
+> ```
+>
+> The Agent SDK still reads the managed-settings policy tier (managed settings files and MDM) whatever you pass.
+
+#### Migrating from a version that loaded host settings
+
+Earlier versions left `setting_sources` unset, so the Agent SDK loaded every settings source on the host. A run now loads none of them. Anything a deployment configured through those files stops applying, including:
+
+- plugins, skills, hooks, permission rules and `CLAUDE.md`
+- the `env` block, for example `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX`, and proxy variables
+- `apiKeyHelper` and `model`
+
+A deployment that reaches Bedrock, Vertex or a gateway through `~/.claude/settings.json` fails to authenticate after the upgrade. To fix it, either set those variables in the process environment, or load the source that holds them:
+
+```python
+create_claude_agents_handler(setting_sources=["user"])
+claude_agents("my-ai-config-flag", user_input, context, setting_sources=["user"])
+claude_graph("support-graph", setting_sources=["user"])
+to_claude_agents(
+    resolve_graph("support-graph", context=context),
+    {"context": context, "setting_sources": ["user"]},
+)
+```
+
 ### Convenience wrapper
 
 ```python
@@ -99,6 +139,8 @@ asyncio.run(main())
 - Emits an OTel span and LaunchDarkly telemetry for every call.
 
 ## Built-in Claude Tools
+
+A run has no Claude Code built-in tools (`Read`, `Bash`, and the rest) unless its config attaches them. Tools you define in the flag config are always available to the model through the handler's MCP server, whatever built-ins are attached.
 
 This package exports `NativeTool` sentinels for Claude Code built-in capabilities. Place them as values in `tool_handlers` to enable the corresponding native Claude tool without writing a handler function:
 

@@ -15,6 +15,12 @@ from launchdarkly_ai_litellm_agents import (
     create_litellm_agents_handler,
     litellm_agents,
 )
+from tests.forwarding_spec import (
+    LITELLM_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 CONFIG: dict[str, Any] = {
     "provider": {"name": "Anthropic"},
@@ -305,47 +311,64 @@ class TestAgentToolsAndRun:
             is True
         )
 
-    def test_model_settings_keep_the_shared_allowlist_and_type_reasoning(
-        self,
-    ) -> None:
+    def test_model_settings_keep_the_allowlist_and_type_reasoning(self) -> None:
         settings = handler_mod._model_settings(
             {
                 "temperature": 0.1,
                 "verbosity": "low",
+                "store": True,
                 "reasoning": {"effort": "high", "summary": "auto", "smuggled": 1},
                 "metadata": {"team": "a"},
                 "include_usage": True,
                 "top_logprobs": 2,
             }
         )
-        assert isinstance(settings.reasoning, Reasoning)
-        assert settings.reasoning.effort == "high"
-        assert settings.reasoning.summary == "auto"
-        assert settings.verbosity == "low"
+        assert settings.reasoning == Reasoning(effort="high")
         assert settings.temperature == 0.1
+        assert settings.verbosity is None
+        assert settings.store is None
         assert settings.metadata is None
         assert settings.include_usage is None
         assert settings.top_logprobs is None
 
-    @pytest.mark.parametrize("reasoning", ["high", {"smuggled": 1}, None])
+    @pytest.mark.parametrize(
+        "reasoning",
+        [
+            "high",
+            {"smuggled": 1},
+            {"summary": "auto"},
+            None,
+            {"effort": "bogus"},
+            {"effort": 3},
+        ],
+    )
     def test_unusable_reasoning_is_dropped(self, reasoning: Any) -> None:
-        assert handler_mod._model_settings({"reasoning": reasoning}).reasoning is None
+        _, parameters = handler_mod._model_config(
+            {"model": {"name": "m", "parameters": {"reasoning": reasoning}}}
+        )
+        assert handler_mod._model_settings(parameters).reasoning is None
 
-    def test_model_config_reads_either_spelling_and_snake_case_wins(self) -> None:
+    def test_string_tool_choice_is_forwarded(self) -> None:
+        settings = handler_mod._model_settings({"tool_choice": "required"})
+        assert settings.tool_choice == "required"
+
+    def test_object_tool_choice_is_dropped_without_failing(self) -> None:
+        settings = handler_mod._model_settings(
+            {"tool_choice": {"type": "auto"}, "temperature": 0.1}
+        )
+        assert settings.tool_choice is None
+        assert settings.temperature == 0.1
+
+    def test_camel_case_spellings_are_not_read(self) -> None:
         config = {
             **CONFIG,
             "model": {
                 **CONFIG["model"],
-                "parameters": {
-                    "topP": 0.4,
-                    "maxTurns": 5,
-                    "top_p": 0.9,
-                },
+                "parameters": {"topP": 0.4, "maxTurns": 5, "top_p": 0.9},
             },
         }
         _, parameters = handler_mod._model_config(config)
-        assert parameters["top_p"] == 0.9
-        assert parameters["max_turns"] == 5
+        assert parameters == {"top_p": 0.9}
 
     async def test_history_uses_agents_sdk_structured_input(self) -> None:
         run = AsyncMock(
@@ -594,3 +617,123 @@ class TestConvenienceWrapper:
         instance.invoke.assert_called_once_with(
             "hello", {"kind": "user", "key": "u"}, {"name": "Ada"}
         )
+
+
+#: ``LitellmModel`` takes ``tool_choice`` only as a string, so the probe uses one.
+_SAMPLE_OVERRIDES = {"tool_choice": "required"}
+
+
+def _probe_candidates() -> frozenset[str]:
+    import dataclasses
+
+    from agents import ModelSettings
+
+    return candidate_keys(
+        (f.name for f in dataclasses.fields(ModelSettings)), LITELLM_AGENTS
+    )
+
+
+def _probe_config(parameters: dict[str, Any]) -> dict[str, Any]:
+    return {**CONFIG, "model": {**CONFIG["model"], "parameters": parameters}}
+
+
+class _Captured:
+    """What one handler call handed the SDK from the config: the factory's parameters, the
+    ``ModelSettings``, and the ``Runner`` call's keyword arguments."""
+
+    def __init__(self) -> None:
+        self.factory_parameters: list[dict[str, Any]] = []
+
+    def factory(self, _name: str, parameters: dict[str, Any]) -> object:
+        self.factory_parameters.append(parameters)
+        return object()
+
+    def result(self, runner_call: Any) -> object:
+        kwargs = dict(runner_call.call_args.kwargs)
+        kwargs.pop("hooks", None)
+        kwargs.pop("run_config", None)
+        return (
+            self.factory_parameters[-1],
+            FakeAgent.created[-1]["model_settings"],
+            kwargs,
+        )
+
+
+class TestNeverForwardedParameters:
+    """No credential, endpoint, routing, or request-injection key in ``model.parameters`` reaches
+    the model factory, ``ModelSettings`` or the ``Runner`` call."""
+
+    def setup_method(self) -> None:
+        FakeAgent.created.clear()
+
+    async def test_invoke_forwards_none_of_them(self) -> None:
+        captured = _Captured()
+        agents = _agents_module()
+        with _patch_agents(agents):
+            await create_litellm_agents_handler(model_factory=captured.factory)(
+                _probe_config({**NEVER_FORWARDED_BAG, "temperature": 0.1}), "q"
+            )
+        factory_parameters, settings, run_kwargs = captured.result(agents.Runner.run)
+        assert factory_parameters == {"temperature": 0.1}
+        assert settings.temperature == 0.1
+        assert not find_leaks((settings, run_kwargs))
+
+    async def test_stream_forwards_none_of_them(self) -> None:
+        captured = _Captured()
+        agents = _agents_module()
+        with _patch_agents(agents):
+            handler = create_litellm_agents_handler(model_factory=captured.factory)
+            [
+                event
+                async for event in await handler.stream(
+                    _probe_config({**NEVER_FORWARDED_BAG, "temperature": 0.1}), "q"
+                )
+            ]
+        factory_parameters, settings, run_kwargs = captured.result(
+            agents.Runner.run_streamed
+        )
+        assert factory_parameters == {"temperature": 0.1}
+        assert settings.temperature == 0.1
+        assert not find_leaks((settings, run_kwargs))
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change what the model
+    factory, ``ModelSettings`` or the ``Runner`` call receive are exactly the LiteLLM Agents
+    list, on both paths."""
+
+    async def test_invoke(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            FakeAgent.created.clear()
+            captured = _Captured()
+            agents = _agents_module()
+            with _patch_agents(agents):
+                await create_litellm_agents_handler(model_factory=captured.factory)(
+                    _probe_config(parameters), "q"
+                )
+            return captured.result(agents.Runner.run)
+
+        forwarded = await probe_forwarded_keys(
+            _probe_candidates(), call, overrides=_SAMPLE_OVERRIDES
+        )
+        assert forwarded == LITELLM_AGENTS
+
+    async def test_stream(self) -> None:
+        async def call(parameters: dict[str, Any]) -> object:
+            FakeAgent.created.clear()
+            captured = _Captured()
+            agents = _agents_module()
+            with _patch_agents(agents):
+                handler = create_litellm_agents_handler(model_factory=captured.factory)
+                [
+                    event
+                    async for event in await handler.stream(
+                        _probe_config(parameters), "q"
+                    )
+                ]
+            return captured.result(agents.Runner.run_streamed)
+
+        forwarded = await probe_forwarded_keys(
+            _probe_candidates(), call, overrides=_SAMPLE_OVERRIDES
+        )
+        assert forwarded == LITELLM_AGENTS

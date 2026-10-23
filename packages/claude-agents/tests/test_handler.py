@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    ClaudeAgentOptions,
     ResultMessage,
     StreamEvent,
     SystemMessage,
@@ -43,6 +44,12 @@ from launchdarkly_ai_claude_agents.handler import (
     partition_tools,
 )
 from launchdarkly_ai_server import ConversationIdSpanProcessor, conversation_id
+from tests.forwarding_spec import (
+    CLAUDE_AGENTS,
+    candidate_keys,
+    probe_forwarded_keys,
+)
+from tests.never_forwarded import NEVER_FORWARDED_BAG, find_leaks
 
 # ---------------------------------------------------------------------------
 # A real tracer provider, reset between tests
@@ -1606,6 +1613,125 @@ class TestHistoryAndVariables:
         assert [e.name for e in root().events] == ["feature_flag"]
 
 
+class TestModelParametersForwarding:
+    async def _run_and_capture_options(
+        self, config: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> Any:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        await create_claude_agents_handler()(config, "q")
+        return captured["options"]
+
+    async def test_max_turns_from_config_reaches_options(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "model": {**BASE_CONFIG["model"], "parameters": {"max_turns": 3}},
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 3
+
+    async def test_config_cannot_override_model_or_system_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {
+                    "model": "not-the-real-model",
+                    "system_prompt": "not-the-real-prompt",
+                },
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.model == BASE_CONFIG["model"]["name"]
+        assert options.system_prompt != "not-the-real-prompt"
+
+    async def test_unset_when_no_parameters(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._run_and_capture_options(BASE_CONFIG, monkeypatch)
+        assert options.max_turns is None
+
+    async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``ClaudeAgentOptions`` has no ``temperature``/``top_p``/``top_k``/``max_tokens``/
+        ``stop_sequences``/``tool_choice``/``metadata`` fields, all of which the LaunchDarkly UI's
+        model parameters panel offers for other providers. Forwarding one unfiltered raises
+        ``TypeError`` before any request is made; the filter must drop them instead.
+        """
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {
+                    "temperature": 0.2,
+                    "top_p": 0.5,
+                    "top_k": 10,
+                    "max_tokens": 256,
+                    "stop_sequences": ["STOP"],
+                    "tool_choice": "auto",
+                    "metadata": {"user_id": "u1"},
+                    "max_turns": 3,
+                },
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 3
+        for rejected in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "stop_sequences",
+            "tool_choice",
+            "metadata",
+        ):
+            assert not hasattr(options, rejected) or getattr(options, rejected) is None
+
+    async def test_no_never_forwarded_key_reaches_the_query_options(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every credential, endpoint, request-injection, remote-tool, and host-process key,
+        including the real ``ClaudeAgentOptions`` fields ``cli_path``, ``env``, ``cwd``,
+        ``add_dirs``, ``permission_mode`` and ``can_use_tool``, is dropped on the way to
+        ``query``; the agreed run setting still lands."""
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {**NEVER_FORWARDED_BAG, "max_turns": 2},
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 2
+        assert not find_leaks(options)
+
+    async def test_temperature_top_p_and_max_turns_run_without_type_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A realistic combination of UI-offered keys must not raise, and the one real field
+        (``max_turns``) must still land."""
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                **BASE_CONFIG["model"],
+                "parameters": {"temperature": 0.3, "top_p": 0.8, "max_turns": 5},
+            },
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.max_turns == 5
+
+
 class TestFinishReasonMapping:
     async def test_tool_use_maps_to_tool_calls(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1832,6 +1958,53 @@ class TestConvenienceExport:
         )
 
 
+class TestConvenienceExportHostOptions:
+    """``cwd`` and ``setting_sources`` build the wrapper's handler and never reach ``config()``."""
+
+    @staticmethod
+    async def _bound_query_options(monkeypatch: pytest.MonkeyPatch, **host: Any) -> Any:
+        from launchdarkly_ai_claude_agents import claude_agents
+
+        captured: list[Any] = []
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured.append(kwargs["options"])
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        config_kwargs: dict[str, Any] = {}
+
+        async def _invoke(*_args: Any, **_kwargs: Any) -> Any:
+            return await config_kwargs["handler"](BASE_CONFIG, "q", {})
+
+        def _fake_config(**kwargs: Any) -> Any:
+            config_kwargs.update(kwargs)
+            return type("Inst", (), {"invoke": staticmethod(_invoke)})()
+
+        monkeypatch.setattr(handler_mod, "_config", _fake_config)
+        await claude_agents("cfg-key", "q", {"key": "u1"}, **host)
+        assert "cwd" not in config_kwargs
+        assert "setting_sources" not in config_kwargs
+        assert len(captured) == 1
+        return captured[0]
+
+    async def test_no_host_settings_and_no_cwd_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        opts = await self._bound_query_options(monkeypatch)
+        assert opts.setting_sources == []
+        assert opts.cwd is None
+
+    async def test_forwards_cwd_and_setting_sources_to_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        opts = await self._bound_query_options(
+            monkeypatch, cwd="/srv/app", setting_sources=["user"]
+        )
+        assert opts.cwd == "/srv/app"
+        assert opts.setting_sources == ["user"]
+
+
 # ---------------------------------------------------------------------------
 # §1.2 Path C — None user_input must not produce None prompt.
 # Restored from the pre-rewrite file (not telemetry). Adapted from the old
@@ -2026,25 +2199,148 @@ class TestMultimodalHistoryReachesTheProvider:
         assert turns[-1]["message"]["content"] == [IMAGE_BLOCK]
 
 
-class TestBuiltinsSurviveAnEmptyToolList:
-    """`tools=[]` is not the same as omitting `tools`.
+_PATHS = ["invoke", "stream"]
 
-    An explicit empty list switches off the Claude Code built-ins. Omitting the key leaves the SDK
-    default, which is what a run with only MCP tools, or none at all, has always had. Passing the
-    empty list silently cost such a run Read, Bash and the rest.
+
+async def _query_options(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Any,
+    path: str,
+    config: dict[str, Any] | None = None,
+    tool_handlers: dict[str, Any] | None = None,
+) -> Any:
+    """Runs one invoke or stream through *handler* and returns the options ``query()`` received."""
+    captured: list[Any] = []
+
+    async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+        captured.append(kwargs["options"])
+        yield result_message()
+
+    monkeypatch.setattr(handler_mod, "query", _query)
+    cfg = config if config is not None else BASE_CONFIG
+    if path == "invoke":
+        await handler(cfg, "q", tool_handlers or {})
+    else:
+        await _collect(await handler.stream(cfg, "q", tool_handlers or {}))
+    assert len(captured) == 1
+    return captured[0]
+
+
+@pytest.mark.parametrize("path", _PATHS)
+class TestHostOptionsAndBuiltinToolSet:
+    """TESTING.md §2.x Claude Agents Handler — host options and built-in tool set.
+
+    ``cwd`` and ``setting_sources`` configure the CLI process, so only the application sets them.
+    ``setting_sources`` not given sends ``[]``: the Agent SDK's own ``None`` loads every settings
+    source on the host. ``tools=[]`` is sent, not omitted, when a config attaches no native tool,
+    because omitting it gives every run the full built-in set.
     """
 
-    def test_no_native_tools_omits_the_key_entirely(self) -> None:
-        from launchdarkly_ai_claude_agents.handler import _build_query_options
+    async def test_forwards_cwd_and_setting_sources(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        h = create_claude_agents_handler(cwd="/srv/app", setting_sources=["project"])
+        opts = await _query_options(monkeypatch, h, path)
+        assert opts.cwd == "/srv/app"
+        assert opts.setting_sources == ["project"]
 
-        opts = _build_query_options(BASE_CONFIG, None, [], [], None, None)
-        assert not hasattr(opts, "tools") or getattr(opts, "tools", None) is None
+    async def test_sends_no_setting_sources_and_no_cwd_by_default(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        opts = await _query_options(monkeypatch, create_claude_agents_handler(), path)
+        # `None` is the dataclass default, so "not sent" is `None` here, never "".
+        assert opts.cwd is None
+        assert opts.setting_sources == []
 
-    def test_native_tools_are_still_passed(self) -> None:
-        from launchdarkly_ai_claude_agents.handler import _build_query_options
+    async def test_loads_host_settings_only_when_the_application_opts_in(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        all_sources: list[Any] = ["user", "project", "local"]
+        h = create_claude_agents_handler(setting_sources=all_sources)
+        opts = await _query_options(monkeypatch, h, path)
+        assert opts.setting_sources == ["user", "project", "local"]
 
-        opts = _build_query_options(BASE_CONFIG, None, ["Read"], [], None, None)
-        assert opts.tools == ["Read"]
+    async def test_forwards_an_explicit_empty_setting_sources(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        h = create_claude_agents_handler(setting_sources=[])
+        opts = await _query_options(monkeypatch, h, path)
+        assert opts.setting_sources == []
+
+    async def test_a_path_like_cwd_is_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch, path: str, tmp_path: Any
+    ) -> None:
+        opts = await _query_options(
+            monkeypatch, create_claude_agents_handler(cwd=tmp_path), path
+        )
+        assert opts.cwd == tmp_path
+
+    async def test_no_config_sets_or_overrides_a_host_option(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "model": {
+                "name": "claude-opus-4-5",
+                "parameters": {
+                    "cwd": "/from-config",
+                    "setting_sources": ["user"],
+                    "settingSources": ["user"],
+                    "plugins": [{"type": "local", "path": "/from-config"}],
+                    "skills": "all",
+                },
+            },
+        }
+        from_config = await _query_options(
+            monkeypatch, create_claude_agents_handler(), path, config
+        )
+        assert from_config.cwd is None
+        assert from_config.plugins == []
+        assert from_config.skills is None
+        # The handler's own default, not the config's `["user"]`.
+        assert from_config.setting_sources == []
+        overridden = await _query_options(
+            monkeypatch, create_claude_agents_handler(cwd="/srv/app"), path, config
+        )
+        assert overridden.cwd == "/srv/app"
+
+    async def test_sends_an_empty_tool_list_when_the_config_has_no_tools(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        opts = await _query_options(monkeypatch, create_claude_agents_handler(), path)
+        assert opts.tools == []
+
+    async def test_only_user_defined_tools_send_an_empty_tool_list_and_stay_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        opts = await _query_options(
+            monkeypatch,
+            create_claude_agents_handler(),
+            path,
+            TOOL_CONFIG,
+            {"search": MagicMock(return_value="ok")},
+        )
+        assert opts.tools == []
+        assert "mcp__tool-mcp__search" in opts.allowed_tools
+
+    async def test_sends_exactly_the_native_tool_provider_names(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        from launchdarkly_ai_claude_agents import ClaudeBash, ClaudeRead
+        from launchdarkly_ai_server import NATIVE_TOOL_KEY
+
+        # The client hands the handler a tracking stub with the sentinel stashed on it.
+        read, bash = MagicMock(), MagicMock()
+        setattr(read, NATIVE_TOOL_KEY, ClaudeRead)
+        setattr(bash, NATIVE_TOOL_KEY, ClaudeBash)
+        opts = await _query_options(
+            monkeypatch,
+            create_claude_agents_handler(),
+            path,
+            BASE_CONFIG,
+            {"read": read, "bash": bash},
+        )
+        assert sorted(opts.tools) == ["Bash", "Read"]
 
 
 class TestAbandonedToolSpansAreNotErrors:
@@ -2393,6 +2689,176 @@ class TestToolSpanSurvivesAContentFailure:
 
         tool = named("execute_tool ")[0]
         assert tool.end_time is not None
+
+
+#: ``ClaudeAgentOptions`` fields the handler fills with fresh objects on every call (hook
+#: closures, the tool MCP server), so they differ between calls whatever the config says. Every
+#: config-settable field is still compared.
+_PER_CALL_FIELDS = frozenset({"hooks", "mcp_servers"})
+
+
+def _comparable(options: Any) -> dict[str, Any]:
+    import dataclasses
+
+    return {
+        f.name: getattr(options, f.name)
+        for f in dataclasses.fields(options)
+        if f.name not in _PER_CALL_FIELDS
+    }
+
+
+class TestForwardsExactlyTheCrossSdkList:
+    """Probes ``invoke`` and ``stream`` one key at a time: the keys that change the
+    ``ClaudeAgentOptions`` handed to ``query`` are exactly the cross-SDK Claude Agents list, on
+    both paths."""
+
+    @staticmethod
+    def _candidates() -> frozenset[str]:
+        import dataclasses
+
+        return candidate_keys(
+            (f.name for f in dataclasses.fields(ClaudeAgentOptions)), CLAUDE_AGENTS
+        )
+
+    @staticmethod
+    def _config(parameters: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **BASE_CONFIG,
+            "model": {**BASE_CONFIG["model"], "parameters": parameters},
+        }
+
+    def _patch_query(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            build_cli_command(kwargs["options"])
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        return captured
+
+    async def test_invoke(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = self._patch_query(monkeypatch)
+        h = create_claude_agents_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            await h(self._config(parameters), "q")
+            return _comparable(captured["options"])
+
+        assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_AGENTS
+
+    async def test_stream(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = self._patch_query(monkeypatch)
+        h = create_claude_agents_handler()
+
+        async def call(parameters: dict[str, Any]) -> object:
+            await _collect(await h.stream(self._config(parameters), "q"))
+            return _comparable(captured["options"])
+
+        assert await probe_forwarded_keys(self._candidates(), call) == CLAUDE_AGENTS
+
+
+def build_cli_command(options: Any) -> list[str]:
+    """The CLI command ``claude_agent_sdk`` would launch for *options*, built by the SDK's own
+    transport (with a stand-in binary), so an option value the SDK cannot read raises here the
+    way it would at run time."""
+    import dataclasses
+
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    transport = SubprocessCLITransport(
+        prompt="q", options=dataclasses.replace(options, cli_path="/bin/echo")
+    )
+    return transport._build_command()
+
+
+class TestThinkingIsRebuilt:
+    @staticmethod
+    def _thinking(value: Any) -> Any:
+        from launchdarkly_ai_claude_agents.handler import _options_parameters
+
+        return _options_parameters({"model": {"parameters": {"thinking": value}}}).get(
+            "thinking"
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ({"type": "adaptive"}, {"type": "adaptive"}),
+            (
+                {"type": "adaptive", "display": "summarized"},
+                {"type": "adaptive", "display": "summarized"},
+            ),
+            (
+                {"type": "enabled", "budget_tokens": 1024, "extra": 1},
+                {"type": "enabled", "budget_tokens": 1024},
+            ),
+            (
+                {"type": "enabled", "budgetTokens": 2048, "display": "omitted"},
+                {"type": "enabled", "budget_tokens": 2048, "display": "omitted"},
+            ),
+            (
+                {"type": "disabled", "budget_tokens": 1, "display": "omitted"},
+                {"type": "disabled"},
+            ),
+            (
+                {"type": "adaptive", "display": "verbose"},
+                {"type": "adaptive"},
+            ),
+        ],
+    )
+    def test_a_known_type_keeps_only_the_sub_keys_the_sdk_reads(
+        self, value: Any, expected: Any
+    ) -> None:
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        assert self._thinking(value) == expected
+        build_cli_command(ClaudeAgentOptions(thinking=expected))
+
+    @pytest.mark.parametrize("value", [{"budget_tokens": 1024}, {"type": "enabled"}])
+    def test_the_shapes_the_sdk_cannot_read_are_dropped(self, value: Any) -> None:
+        """Both raise ``KeyError`` in the SDK's command builder when passed through."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        with pytest.raises(KeyError):
+            build_cli_command(ClaudeAgentOptions(thinking=value))
+        assert self._thinking(value) is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"type": "enabled", "budget_tokens": "1024"},
+            {"type": "enabled", "budget_tokens": True},
+            {"type": "on", "budget_tokens": 1024},
+            {"type": None},
+        ],
+    )
+    def test_an_unknown_type_or_a_malformed_budget_is_dropped(self, value: Any) -> None:
+        assert self._thinking(value) is None
+
+
+class TestMalformedObjectValuesAreDropped:
+    def test_a_thinking_that_is_not_an_object_and_output_format_are_dropped(
+        self,
+    ) -> None:
+        from launchdarkly_ai_claude_agents.handler import _options_parameters
+
+        params = _options_parameters(
+            {
+                "model": {
+                    "parameters": {
+                        "thinking": "adaptive",
+                        "output_format": "json",
+                        "max_turns": 3,
+                    }
+                }
+            }
+        )
+        assert params == {"max_turns": 3}
 
 
 async def test_a_builtin_tool_result_is_not_marked_failed(

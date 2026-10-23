@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.2.0...launchdarkly-ai-python-0.3.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* **evaluations:** mark evaluations from code as experimental ([#157](https://github.com/launchdarkly/python-ai-sdk/issues/157))
+
+### Experimental
+
+* **evaluations:** mark evaluations from code as experimental ([#157](https://github.com/launchdarkly/python-ai-sdk/issues/157)) ([1389765](https://github.com/launchdarkly/python-ai-sdk/commit/138976570f6893ffae82aa909a79803d142d566c))
+
 ## [0.2.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.1.8...launchdarkly-ai-python-0.2.0) (2026-10-09)
 
 

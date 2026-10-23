@@ -259,6 +259,8 @@ class TestOwnedParameters:
                     "temperature": 0.2,
                     "metadata": {"a": 1},
                     "safety_identifier": "user-1",
+                    "min_p": 0.1,
+                    "repetition_penalty": 1.2,
                     "extra_headers": {
                         "Authorization": "Bearer attacker-key",
                         "ai-language-model-id": "openai/gpt-5-pro",
@@ -270,11 +272,14 @@ class TestOwnedParameters:
         }
         await create_vercel_messages_handler()(config, "hello")
         kwargs = ai_runtime.InferenceRequestParams.call_args.kwargs
-        assert kwargs["metadata"] == {"a": 1}
-        assert kwargs["safety_identifier"] == "user-1"
+        assert "metadata" not in kwargs
+        assert "safety_identifier" not in kwargs
         assert "extra_headers" not in kwargs
         assert "extra_query" not in kwargs
         assert "extra_body" not in kwargs
+        assert set(kwargs) == {"sampling"}
+        ai_runtime.MinPSamplerParams.assert_not_called()
+        ai_runtime.RepetitionPenaltyParams.assert_not_called()
         forwarded = repr(kwargs)
         assert "attacker-key" not in forwarded
         assert "gpt-5-pro" not in forwarded

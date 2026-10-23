@@ -1,0 +1,40 @@
+name: API compatibility
+
+# A breaking change to a public name or signature must be declared with `!` in the PR
+# title, and a release's versions must match the changes since each package's last
+# release. See scripts/api_breaking.py.
+
+on:
+  pull_request:
+    # edited / labeled / unlabeled: a new title or the api-compatible label re-runs the check.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  api-compatibility:
+    name: API compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit and every release tag
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv lock
+      - run: uv sync --all-packages
+      - name: A breaking change is declared
+        if: github.head_ref != 'release-please--branches--main'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: uv run python -m scripts.api_breaking pr --base "$BASE" --title "$TITLE" --labels "$LABELS"
+      - name: The release versions match their changes
+        if: github.head_ref == 'release-please--branches--main'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: uv run python -m scripts.api_breaking release --base "$BASE" --labels "$LABELS"

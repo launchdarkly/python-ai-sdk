@@ -1,4 +1,4 @@
-.PHONY: start test typecheck lint format format-check lint-fix build clean
+.PHONY: start test typecheck lint format format-check lint-fix build clean api-report api-report-check
 
 # Run main.py (uv run python main.py)
 start:
@@ -16,6 +16,14 @@ test:
 # local and CI agree. The test suites are not currently mypy-clean under `strict`.
 typecheck:
 	uv run mypy packages/*/src
+
+# Write every package's API report (packages/*/api-report/); commit the result
+api-report:
+	uv run python scripts/api_report.py
+
+# Fail if any API report is out of date (also run by `make test`)
+api-report-check:
+	uv run python scripts/api_report.py --check
 
 # Check for lint errors
 lint:
