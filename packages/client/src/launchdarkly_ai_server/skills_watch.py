@@ -22,8 +22,9 @@ import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from .sdk_usage import report_usage
 from .skills_core import SKILL_OBJECT_KIND, get_store
-from .skills_fs import OnUnavailable, write_skills
+from .skills_fs import OnUnavailable, _write_skills
 from .types import ReconcileReport, Skill, SkillReference
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ class SkillWatcher:
     def _reconcile_once(self) -> None:
         try:
             report = asyncio.run(
-                write_skills(
+                _write_skills(
                     self._request,
                     self._root,
                     prune=self._prune,
@@ -224,6 +225,7 @@ async def watch_skills(
             ``add_listener`` (use ``write_skills`` for a one-shot reconcile).
         ValueError: If *debounce* is negative, ``NaN``, or infinite.
     """
+    report_usage("client.watchSkills")
     store = get_store()
     if store is None:
         raise RuntimeError(
@@ -260,7 +262,7 @@ async def watch_skills(
     )
     try:
         # Run on the caller's task, so a bad root raises to the caller.
-        report = await write_skills(
+        report = await _write_skills(
             skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
         )
     except BaseException:
