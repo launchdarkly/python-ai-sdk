@@ -11,8 +11,13 @@ Text deltas go to stdout. Run and tool events go to stderr, the same split as
 ``conversation_id`` and iterated outside it, the same shape as
 ``examples/streaming.py``.
 
-Not registered in ``main.py``. ``run`` takes the same ``(flag key, user input)``
-pair as the other examples.
+``TOOL_CALL_ARGS`` deltas and ``TOOL_CALL_RESULT`` content are empty unless
+``capture_content`` is on, through ``configure(options=SDKOptions(capture_content=True))``
+or the handler factory's ``capture_content=True``. The tool name and call id are
+always sent.
+
+Usage (via main.py):
+    python main.py agui-stream <flag-key> "<user input>"
 """
 
 from __future__ import annotations
