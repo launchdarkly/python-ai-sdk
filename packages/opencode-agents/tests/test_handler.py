@@ -1540,7 +1540,7 @@ class TestProcess:
         assert "--print-logs" not in argv
         assert "--log-level" not in argv
         assert records[0]["cwd"] == str(script.cwd.resolve())
-        assert records[0]["config"] == str(script.config.resolve())
+        assert records[0]["config"] == os.path.abspath(script.config)
         paths = [item["path"] for item in script.requests]
         assert "/event" in paths
         assert "/session" in paths
