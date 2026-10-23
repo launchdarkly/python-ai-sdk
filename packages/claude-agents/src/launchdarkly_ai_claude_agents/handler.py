@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from typing import Any
 
 from claude_agent_sdk import (
@@ -53,6 +53,8 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -71,6 +73,97 @@ from .spans import (
     start_tool_span,
     succeed_span,
     tool_display_name,
+)
+
+#: Every field ``ClaudeAgentOptions`` declares, classified by hand into exactly one of: forwarded
+#: (below), handler-owned (``model``, ``allowed_tools``, ``mcp_servers``, ``hooks``, ``tools``,
+#: ``system_prompt``, set by each call site itself), or excluded (below).
+#: ``TestClaudeAgentOptionsAcceptsExactlyTheseFields`` in this package's tests asserts this
+#: classification stays exhaustive as the SDK's own dataclass changes.
+#:
+#: Only model and run settings are forwarded: how the model thinks, how long the run may go, and
+#: what it may spend. Everything that configures the host process the SDK launches (its binary,
+#: environment, working directory, file access, permissions, settings files, plugins, sandbox,
+#: session state) stays under the application's control, never a config's.
+#:
+#: This is the cross-SDK list for Claude Agents (TESTING.md section 1.12), shared with the native
+#: graph through :func:`_options_parameters`.
+#:
+#: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
+#: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
+#: for other providers; they are dropped like any other key not listed here.
+_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
+    {
+        "betas",
+        "effort",
+        "fallback_model",
+        "max_budget_usd",
+        "max_thinking_tokens",
+        "max_turns",
+        "thinking",
+    }
+)
+
+#: Forwarded keys whose value must be an object. A config value of any other type is malformed
+#: and dropped rather than passed to ``ClaudeAgentOptions``.
+_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS = frozenset({"thinking"})
+
+#: Accepted by ``ClaudeAgentOptions`` but never forwarded, and why:
+#: * ``cli_path``, ``env``, ``cwd``, ``add_dirs``, ``settings``, ``setting_sources``, ``plugins``,
+#:   ``skills``, ``sandbox``, ``user``, ``extra_args``: which binary runs, with what environment,
+#:   as which user, with what files, settings, plugins, and CLI arguments. A config that could set
+#:   these could run code on, or read files from, the host.
+#: * ``permission_mode``, ``permission_prompt_tool_name``, ``can_use_tool``, ``disallowed_tools``,
+#:   ``strict_mcp_config``, ``agents``: what the agent is allowed to do and which tools or
+#:   subagents it gets. The handler wires tools and permissions itself.
+#: * ``resume``, ``session_id``, ``fork_session``, ``continue_conversation``, ``session_store``,
+#:   ``session_store_flush``, ``enable_file_checkpointing``: session state on the host.
+#: * ``stderr``, ``debug_stderr``, ``include_partial_messages``, ``include_hook_events``,
+#:   ``max_buffer_size``, ``load_timeout_ms``: process I/O and transport plumbing, including the
+#:   streamed message shape the handler reads.
+#: * ``output_format``: structured output, which the handler owns through the config's
+#:   ``outputFormat`` by adding its schema to the system prompt. Forwarding a second schema here
+#:   would have the reply follow one schema while the prompt asks for another.
+#: * ``task_budget``: not one of the agreed run settings yet; ``max_turns`` and ``max_budget_usd``
+#:   cover run limits.
+#:
+#: Named for the drift test and for review, not read at runtime: the forwarded list above already
+#: leaves these out, so nothing needs to subtract them again.
+_CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
+    {
+        "add_dirs",
+        "agents",
+        "can_use_tool",
+        "cli_path",
+        "continue_conversation",
+        "cwd",
+        "debug_stderr",
+        "disallowed_tools",
+        "enable_file_checkpointing",
+        "env",
+        "extra_args",
+        "fork_session",
+        "include_hook_events",
+        "include_partial_messages",
+        "load_timeout_ms",
+        "max_buffer_size",
+        "output_format",
+        "permission_mode",
+        "permission_prompt_tool_name",
+        "plugins",
+        "resume",
+        "sandbox",
+        "session_id",
+        "session_store",
+        "session_store_flush",
+        "setting_sources",
+        "settings",
+        "skills",
+        "stderr",
+        "strict_mcp_config",
+        "task_budget",
+        "user",
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -504,6 +597,55 @@ def _raise_if_run_failed(message: Any) -> None:
     )
 
 
+#: The ``thinking`` types ``claude_agent_sdk`` knows (``ThinkingConfig``). It reads
+#: ``thinking["type"]`` when it builds the CLI command, so a ``thinking`` without one raises.
+_THINKING_TYPES = frozenset({"adaptive", "enabled", "disabled"})
+
+#: The ``thinking.display`` values the SDK passes to the CLI (``ThinkingDisplay``).
+_THINKING_DISPLAYS = frozenset({"summarized", "omitted"})
+
+
+def _rebuild_thinking(value: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``thinking`` in the shape ``claude_agent_sdk`` reads, or ``None`` when it is malformed.
+
+    Keeps ``type``, ``budget_tokens`` and ``display`` only, the same sub-keys the JS SDK keeps.
+    The type must be one the SDK knows, and an ``enabled`` thinking must carry an integer
+    ``budget_tokens``: the SDK reads ``thinking["budget_tokens"]`` for it straight away, so one
+    without a budget would raise. ``budgetTokens`` is read as well, as in the JS SDK. ``display``
+    is kept only for a type that takes it and only with a value the SDK knows.
+    """
+    kind = value.get("type")
+    if kind not in _THINKING_TYPES:
+        return None
+    thinking: dict[str, Any] = {"type": kind}
+    if kind == "enabled":
+        budget = value.get("budget_tokens", value.get("budgetTokens"))
+        if not isinstance(budget, int) or isinstance(budget, bool):
+            return None
+        thinking["budget_tokens"] = budget
+    if kind != "disabled" and value.get("display") in _THINKING_DISPLAYS:
+        thinking["display"] = value["display"]
+    return thinking
+
+
+def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
+    """The config's ``model.parameters`` that become ``ClaudeAgentOptions`` fields: only
+    :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
+    ``thinking`` rebuilt by :func:`_rebuild_thinking`. The handler and the native graph both call
+    this, so they forward the same keys.
+    """
+    params = select_forwarded_parameters(
+        model_parameters(config),
+        _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
+        mapping_keys=_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS,
+    )
+    if "thinking" in params:
+        thinking = _rebuild_thinking(params.pop("thinking"))
+        if thinking is not None:
+            params["thinking"] = thinking
+    return params
+
+
 def _build_query_options(
     config: AiConfigRep,
     system_prompt: str | None,
@@ -514,7 +656,9 @@ def _build_query_options(
     **extra: Any,
 ) -> ClaudeAgentOptions:
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
+    params = _options_parameters(config)
     kwargs: dict[str, Any] = {
+        **params,
         "model": config["model"]["name"],
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},

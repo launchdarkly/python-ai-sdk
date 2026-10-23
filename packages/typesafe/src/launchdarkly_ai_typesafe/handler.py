@@ -37,6 +37,12 @@ from .questions import (
 # The conversation processor only holds spans from tracers named "@launchdarkly/...".
 _TRACER = trace.get_tracer("@launchdarkly/ai-typesafe")
 
+#: ``model.parameters`` keys forwarded to ``AsyncTypeSafeClient.system_one``. None: it takes the
+#: state, the questions and the model name, and its remaining arguments (``retry``, ``timeout``,
+#: ``extra_headers``, ``extra_body``, ``assets``, ``response_model``) are runtime wiring or
+#: request content, not inference settings.
+_SYSTEM_ONE_FORWARDED_KEYS: frozenset[str] = frozenset()
+
 
 def _sdk_question(question: Mapping[str, Any]) -> Any:
     instructions = question["instructions"]

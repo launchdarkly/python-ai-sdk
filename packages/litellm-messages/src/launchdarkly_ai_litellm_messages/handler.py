@@ -31,6 +31,8 @@ from launchdarkly_ai_server import (
     to_semconv_finish_reason,
 )
 from launchdarkly_ai_server.lifecycle import effective_capture_content
+from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
+from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 
@@ -44,10 +46,13 @@ def _json_schema(output_format: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-# Generation settings only. Connection and credential keys (api_base, api_key,
-# base_url, extra_headers, aws_*, vertex_*, ...) stay out: LiteLLM reads them
-# as call arguments, and an AI Config must not choose where the provider key goes.
-_FORWARDED_PARAMETERS = frozenset(
+#: The cross-SDK list for LiteLLM Messages (TESTING.md section 1.12): the ``model.parameters``
+#: keys forwarded to ``litellm.acompletion``. Every other key is dropped. The handler sets
+#: ``model``, ``messages``, ``stream``, ``stream_options``, ``tools`` and ``response_format`` itself,
+#: and ``api_key`` (with ``api_base``) comes from the handler's options, never from the config.
+#: ``TestAcompletionAcceptsExactlyTheseKeys`` in this package's tests asserts every named parameter
+#: of ``acompletion`` is classified as forwarded, handler-owned or excluded.
+_COMPLETION_FORWARDED_KEYS = frozenset(
     {
         "frequency_penalty",
         "max_completion_tokens",
@@ -60,6 +65,60 @@ _FORWARDED_PARAMETERS = frozenset(
         "temperature",
         "tool_choice",
         "top_p",
+    }
+)
+
+#: Accepted by ``litellm.acompletion`` but never forwarded, and why:
+#: * ``store``: data retention.
+#: * ``user``, ``safety_identifier``: identity and attribution.
+#: * ``timeout``, ``base_url``, ``api_version``, ``deployment_id``, ``model_list``,
+#:   ``shared_session``: credentials, endpoints and connection settings. ``shared_session`` is a
+#:   live HTTP session object.
+#: * ``extra_headers``: raw request injection.
+#: * ``functions``, ``function_call``: the deprecated spelling of ``tools``, which the handler owns.
+#: * ``enable_json_schema_validation``: runtime wiring.
+#: * ``n``: switches the response shape. The handler reads only ``choices[0]``, and a streamed
+#:   ``n > 1`` interleaves the choices.
+#: * ``logprobs``, ``top_logprobs``, ``modalities``, ``audio``, ``prediction``,
+#:   ``include_server_side_tool_invocations``: API-shape switches. They add or change output the
+#:   handler does not read.
+#: * ``web_search_options``: a remote, server-side tool.
+#: * ``thinking``, ``logit_bias``, ``service_tier``, ``prompt_cache_key``, ``verbosity``: model
+#:   settings LiteLLM translates per backing provider and may reject for one that lacks them. Left
+#:   off until each is confirmed safe across the providers LiteLLM fronts.
+#:
+#: Everything ``acompletion`` reads only through ``**kwargs`` (``api_base``,
+#: ``custom_llm_provider``, ``fallbacks``, ``num_retries``, ``mock_response``, ``aws_*``,
+#: ``vertex_*``, ...) is dropped the same way. Named for the drift test and for review, not read at
+#: runtime.
+_COMPLETION_EXCLUDED_KEYS = frozenset(
+    {
+        "store",
+        "user",
+        "safety_identifier",
+        "timeout",
+        "base_url",
+        "api_version",
+        "deployment_id",
+        "model_list",
+        "shared_session",
+        "extra_headers",
+        "functions",
+        "function_call",
+        "enable_json_schema_validation",
+        "n",
+        "logprobs",
+        "top_logprobs",
+        "modalities",
+        "audio",
+        "prediction",
+        "include_server_side_tool_invocations",
+        "web_search_options",
+        "thinking",
+        "logit_bias",
+        "service_tier",
+        "prompt_cache_key",
+        "verbosity",
     }
 )
 _MAX_TOOL_TURNS = 10
@@ -186,16 +245,8 @@ def _request(
     base_url: str | None = None,
     api_key: str | None = None,
 ) -> dict[str, Any]:
-    model = config_value.get("model") or {}
-    raw_parameters = model.get("parameters")
-    parameters = (
-        {
-            key: value
-            for key, value in raw_parameters.items()
-            if key in _FORWARDED_PARAMETERS
-        }
-        if isinstance(raw_parameters, dict)
-        else {}
+    parameters = select_forwarded_parameters(
+        model_parameters(config_value), _COMPLETION_FORWARDED_KEYS
     )
     parameters.update(
         {
@@ -204,7 +255,7 @@ def _request(
             "stream": stream,
         }
     )
-    # Connection settings come from the handler, never from model.parameters (see above).
+    # Connection settings come from the handler, never from model.parameters.
     if base_url is not None:
         parameters["api_base"] = base_url
     if api_key is not None:
