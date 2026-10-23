@@ -1238,30 +1238,34 @@ async def _stream_gen(
             yield rich
         raise
     finally:
-        # A no-op on the success path, where the result message already closed the last response.
-        # On the error and abandonment paths this is the only thing that ends a chat span still
-        # open, and the exporter only receives ended spans.
-        inference.finish()
-        # A no-op on the success and failure paths; on abandonment it is the only chance to close
-        # the tree, including any tool span whose PostToolUse hook never fired, and the only chance
-        # to report what the responses that did arrive cost.
-        if id(span) not in ended:
-            # Abandonment, not failure: UNSET plus the abandoned marker, the same as the model
-            # span and the root get just below.
-            if abandon_tool_spans is not None:
-                abandon_tool_spans(ended, cancelled=cancelled)
-            if not root_usage_written and inference.run_usage["reported"]:
-                finish_root_span(span, config, inference.run_usage["total"])
-        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
-        # Same reasoning as the blocking path: a bare exit through this generator's boundary
-        # abandons the vendor's own generator if it is not closed explicitly.
         try:
-            if gen is not None:
-                await gen.aclose()  # type: ignore[attr-defined]
+            # A no-op on the success path, where the result message already closed the last
+            # response. On the error and abandonment paths this is the only thing that ends a chat
+            # span still open, and the exporter only receives ended spans.
+            inference.finish()
+            # A no-op on the success and failure paths; on abandonment it is the only chance to
+            # close the tree, including any tool span whose PostToolUse hook never fired, and the
+            # only chance to report what the responses that did arrive cost.
+            if id(span) not in ended:
+                # Abandonment, not failure: UNSET plus the abandoned marker, the same as the model
+                # span and the root get just below.
+                if abandon_tool_spans is not None:
+                    abandon_tool_spans(ended, cancelled=cancelled)
+                if not root_usage_written and inference.run_usage["reported"]:
+                    finish_root_span(span, config, inference.run_usage["total"])
+            end_span_once(span, ended, abandoned=True, cancelled=cancelled)
         finally:
-            # Last, after the span tree is closed: the run is over however it ended.
-            if prepared is not None:
-                await prepared.cleanup()
+            # In their own finally, so a raise closing the spans still closes the vendor's
+            # generator and removes the preparation's temp dir. Same reasoning as the blocking
+            # path: a bare exit through this generator's boundary abandons the vendor's own
+            # generator if it is not closed explicitly.
+            try:
+                if gen is not None:
+                    await gen.aclose()  # type: ignore[attr-defined]
+            finally:
+                # Last, after the span tree is closed: the run is over however it ended.
+                if prepared is not None:
+                    await prepared.cleanup()
 
 
 def claude_agents(

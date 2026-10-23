@@ -381,6 +381,26 @@ async def test_removes_the_directory_when_closing_the_blocking_spans_raises(
     assert list(tmp_path.iterdir()) == []
 
 
+async def test_removes_the_directory_when_closing_the_stream_spans_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _store(_raw("a", 1))
+    monkeypatch.setattr(handler_mod, "query", _FakeQuery())
+    end_span_once = handler_mod.end_span_once
+
+    def boom(span: Any, ended: set[int], **kwargs: Any) -> None:
+        # Only the teardown call: the success path ends the root without `abandoned`.
+        if kwargs.get("abandoned"):
+            raise RuntimeError("span cleanup failed")
+        end_span_once(span, ended, **kwargs)
+
+    monkeypatch.setattr(handler_mod, "end_span_once", boom)
+    handler = create_claude_agents_skills_handler(skills_temp_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="span cleanup failed"):
+        await _run(handler, "stream", _config(("a", 1)))
+    assert list(tmp_path.iterdir()) == []
+
+
 async def test_removes_the_directory_when_a_stream_consumer_stops_early(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
