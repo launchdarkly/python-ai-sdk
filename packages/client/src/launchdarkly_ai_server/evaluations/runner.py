@@ -26,7 +26,11 @@ from ..judge_scoring import (
     typesafe_judge_entries,
     without_output_format,
 )
-from ..lifecycle import effective_capture_content, extract_variation
+from ..lifecycle import (
+    _sdk_processor_is_active,
+    effective_capture_content,
+    extract_variation,
+)
 from ..trajectory import (
     TrajectoryRecorder,
     render_row_trajectory,
@@ -760,7 +764,7 @@ class EvaluationsRunner:
                         raised = error
                         raise
                     finally:
-                        if observer.count == 0:
+                        if observer.count == 0 and _sdk_processor_is_active():
                             capture = capture_for_call(handler)
                             record_chat(
                                 row_span,
@@ -1093,7 +1097,7 @@ class EvaluationsRunner:
                     raised = error
                     raise
                 finally:
-                    if observer.count == 0:
+                    if observer.count == 0 and _sdk_processor_is_active():
                         record_chat(
                             evaluate_span,
                             config=resolved.config,

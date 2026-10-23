@@ -521,15 +521,18 @@ class EvaluationsModule:
         finally:
             # Generation results already queued on the SDK event buffer must
             # reach LaunchDarkly even when the criteria phase fails. Spans
-            # follow on the provider init_client already registered.
-            for row_span in row_spans.values():
-                row_span.end()
+            # follow on the provider init_client already registered. A span
+            # that fails to end must not skip the event flush.
             try:
-                flush_result = client.flush()
-                if inspect.isawaitable(flush_result):
-                    await flush_result
+                for row_span in row_spans.values():
+                    row_span.end()
             finally:
-                _flush_tracer_provider()
+                try:
+                    flush_result = client.flush()
+                    if inspect.isawaitable(flush_result):
+                        await flush_result
+                finally:
+                    _flush_tracer_provider()
         summary = await self._poll_summary_until_terminal(
             evaluation.id,
             evaluation_run.id,

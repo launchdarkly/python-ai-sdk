@@ -72,6 +72,18 @@ def stub_sdk_client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 @pytest.fixture
 def span_export() -> Iterator[tuple[InMemorySpanExporter, list[str]]]:
     """Install the SDK processor on a provider whose project id is the SDK key."""
+    yield from _install_provider(sdk_processor=True)
+
+
+@pytest.fixture
+def foreign_span_export() -> Iterator[tuple[InMemorySpanExporter, list[str]]]:
+    """A provider someone else registered, without the SDK processor."""
+    yield from _install_provider(sdk_processor=False)
+
+
+def _install_provider(
+    *, sdk_processor: bool
+) -> Iterator[tuple[InMemorySpanExporter, list[str]]]:
     saved = otel_trace._TRACER_PROVIDER
     otel_trace._TRACER_PROVIDER = None
     otel_trace._TRACER_PROVIDER_SET_ONCE = Once()
@@ -84,7 +96,8 @@ def span_export() -> Iterator[tuple[InMemorySpanExporter, list[str]]]:
             }
         )
     )
-    provider.add_span_processor(ConversationIdSpanProcessor())
+    if sdk_processor:
+        provider.add_span_processor(ConversationIdSpanProcessor())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     otel_trace.set_tracer_provider(provider)
     flushed: list[str] = []
@@ -642,6 +655,52 @@ async def test_handler_spans_carry_the_row_and_the_tool_call(
     assert "tool_calls" not in generation
     assert _TOOL_ARGUMENTS not in json.dumps(generation)
     assert _TOOL_RESULT not in json.dumps(generation)
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_provider_gets_no_second_copy_of_handler_spans(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    foreign_span_export: tuple[InMemorySpanExporter, list[str]],
+) -> None:
+    # Without the SDK processor the span count stays 0 even though the handler
+    # traced itself, so the runner must not write its own chat spans too.
+    exporter, _flushed = foreign_span_export
+    patch_judge(monkeypatch)
+    evals = init_evaluations(
+        project_key="proj",
+        api_key="token",
+        sdk_key="sdk-key",
+        transport=one_row_transport(),
+    )
+    tracer = otel_trace.get_tracer("@launchdarkly/ai-server")
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        with tracer.start_as_current_span("invoke_agent"):
+            with tracer.start_as_current_span("chat gpt-4o"):
+                pass
+        if "Judge" in config.get("instructions", ""):
+            return {"output": '{"score": 0.9, "reasoning": "ok"}'}
+        return {"output": "done"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=declare(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "agent"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+    )
+
+    by_name = spans_by_name(exporter)
+    # One from the generation and one from the judge, each written once.
+    assert len(by_name["chat gpt-4o"]) == 2
+    assert len(by_name["invoke_agent"]) == 2
 
 
 @pytest.mark.asyncio
