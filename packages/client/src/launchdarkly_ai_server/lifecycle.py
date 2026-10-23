@@ -401,8 +401,8 @@ async def shutdown() -> None:
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also runs the registered shutdown hooks, which clear the state of any
-    experimental feature in use, and restores process-wide SDK defaults from
+    Also runs the registered shutdown hooks, which clear feature state such as
+    the configured skill store, and restores process-wide SDK defaults from
     ``configure``.
 
     When telemetry was running, this also releases the process-global tracer

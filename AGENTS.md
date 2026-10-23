@@ -86,10 +86,10 @@ Every public module has a committed API report at `packages/<package>/api-report
 
 PRs are squash-merged with the PR title as the commit message, and release-please builds each package's changelog from those messages.
 
-- **A change to an experimental feature uses that feature's scope:** `skills` (Agent Skills) and `evaluations` (Evaluations from Code). `feat`, `fix` and `perf` commits with one of these scopes are listed under **Experimental** (`changelog-sections` in `release-please-config.json`), for example `feat(skills): watch skills for revocations`. Any other scope, such as `client`, lists the change as a core feature or fix.
-- **Use exactly one scope.** `feat(skills,client):` matches no Experimental row, so it lands under Features.
+- **A change to an experimental feature uses that feature's scope:** `evaluations` (Evaluations from Code). `feat`, `fix` and `perf` commits with that scope are listed under **Experimental** (`changelog-sections` in `release-please-config.json`), for example `feat(evaluations): score rows in parallel`. Any other scope, such as `client` or `skills`, lists the change as a core feature or fix. Agent Skills is core, so `feat(skills):` lands under Features.
+- **Use exactly one scope.** `feat(evaluations,client):` matches no Experimental row, so it lands under Features.
 - **A PR that changes both core and experimental behaviour** should be split. If it can't be, add a `BEGIN_COMMIT_OVERRIDE` block to its description with one conventional-commit line per change. An override also corrects a merged PR's title, as long as the release PR hasn't merged yet.
-- **A breaking experimental change** uses `!` while the package is 0.x: `feat(skills)!:` bumps the minor version, which is what an experimental break is allowed. After 1.0, `!` would force a major release. Use `feat(skills):` without `!` instead, and say the change is breaking in the title.
+- **A breaking experimental change** uses `!` while the package is 0.x: `feat(evaluations)!:` bumps the minor version, which is what an experimental break is allowed. After 1.0, `!` would force a major release. Use `feat(evaluations):` without `!` instead, and say the change is breaking in the title.
 - **When a feature is promoted to core,** remove its rows from `changelog-sections`.
 
 The rule is specified in `TESTING.md` §0.3 in `launchdarkly/ai-sdks-monorepo`.

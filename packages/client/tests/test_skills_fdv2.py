@@ -34,18 +34,19 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from launchdarkly_ai_server import skills as skills_module
-from launchdarkly_ai_server import skills_core, skills_fdv2
-from launchdarkly_ai_server.experimental.skills import (
+from launchdarkly_ai_server import (
     FDv2SkillStore,
     InMemorySkillStore,
     all_skills,
     get_skill,
     get_skill_result,
     set_skill_store,
+    skills_core,
+    skills_fdv2,
     watch_skills,
     write_skills,
 )
+from launchdarkly_ai_server import skills as skills_module
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 from launchdarkly_ai_server.skills_fdv2 import (
     DEFAULT_BASE_URI,
@@ -4363,7 +4364,7 @@ class TestTransportLayering:
         assert _module_imports(skills_fdv2) == stdlib | within_the_feature
 
     def test_nothing_in_the_feature_imports_it(self) -> None:
-        """Only the experimental entry point names it, to re-export
+        """Only the package root names it, to re-export
         ``FDv2SkillStore`` and ``StoreDiagnostics``.
 
         That re-export is the published surface rather than a dependency: it is
@@ -4390,9 +4391,9 @@ class TestTransportLayering:
         ]
 
         assert importers == []
-        # The positive control: the entry point does name it, so an empty result
+        # The positive control: the package root does name it, so an empty result
         # above cannot be a misspelt filename list finding nothing anywhere.
-        entry_point = source_dir / "experimental" / "skills.py"
+        entry_point = source_dir / "__init__.py"
         assert "skills_fdv2" in entry_point.read_text(encoding="utf-8")
 
 

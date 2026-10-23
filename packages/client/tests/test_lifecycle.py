@@ -614,13 +614,13 @@ class TestShutdown:
         later.assert_called_once()  # one failing hook does not skip the rest
 
     def test_core_does_not_import_experimental_code(self) -> None:
-        """Core never hooks into experimental code (TESTING.md §0.3)."""
+        """Importing and shutting down core loads no experimental module."""
         script = (
             "import asyncio, sys\n"
             "import launchdarkly_ai_server\n"
             "asyncio.run(launchdarkly_ai_server.shutdown())\n"
             "loaded = sorted(m for m in sys.modules if m.startswith("
-            "('launchdarkly_ai_server.skills', 'launchdarkly_ai_server.evaluations',"
+            "('launchdarkly_ai_server.evaluations',"
             " 'launchdarkly_ai_server.experimental')))\n"
             "print(','.join(loaded))\n"
         )
@@ -870,8 +870,8 @@ class TestInspectConfig:
         assert result["meta"] is not None
 
     async def test_a_malformed_skills_field_does_not_fail_core_calls(self) -> None:
-        """Agent Skills is experimental, so its field cannot break a core call
-        (TESTING.md §0.3). ``skill_refs`` rejects it instead."""
+        """A malformed ``skills`` field cannot break a config call that does
+        not use skills. ``skill_refs`` rejects it instead."""
         stub = _make_stub_client()
         stub.variation = AsyncMock(
             return_value={
