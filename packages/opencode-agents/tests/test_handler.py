@@ -209,6 +209,27 @@ class Script:
             found.extend(record.get("requests") or [])
         return found
 
+    @property
+    def session_bodies(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for record in self._records():
+            found.extend(record.get("session_bodies") or [])
+        return found
+
+    @property
+    def mcp_calls(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for record in self._records():
+            found.extend(record.get("mcp_calls") or [])
+        return found
+
+    @property
+    def mcp_disconnects(self) -> list[str]:
+        found: list[str] = []
+        for record in self._records():
+            found.extend(record.get("mcp_disconnects") or [])
+        return found
+
 
 _scripts: list[Script] = []
 
@@ -288,7 +309,20 @@ class TestSurface:
         import launchdarkly_ai_opencode_agents as package
 
         assert set(package.__all__) == {
+            "OpenCodeApplyPatch",
+            "OpenCodeBash",
+            "OpenCodeEdit",
+            "OpenCodeGlob",
+            "OpenCodeGrep",
+            "OpenCodeList",
+            "OpenCodeRead",
             "OpenCodeSessionError",
+            "OpenCodeSkill",
+            "OpenCodeTask",
+            "OpenCodeTodoWrite",
+            "OpenCodeWebFetch",
+            "OpenCodeWebSearch",
+            "OpenCodeWrite",
             "create_opencode_handler",
             "opencode_agents",
         }

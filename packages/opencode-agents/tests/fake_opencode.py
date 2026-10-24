@@ -84,9 +84,12 @@ class _Server:
         self.spec = spec
         self.state_dir = state_dir
         self.sessions: list[str] = []
+        self.session_bodies: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
         self.aborts: list[str] = []
         self.requests: list[dict[str, str]] = []
+        self.mcp_calls: list[dict[str, Any]] = []
+        self.mcp_disconnects: list[str] = []
         self.second_read = threading.Event()
         self.release = threading.Event()
         self._lock = threading.Lock()
@@ -120,9 +123,12 @@ class _Server:
             "username": os.environ.get("OPENCODE_SERVER_USERNAME", ""),
             "password": os.environ.get("OPENCODE_SERVER_PASSWORD", ""),
             "sessions": self.sessions,
+            "session_bodies": self.session_bodies,
             "messages": self.messages,
             "aborts": self.aborts,
             "requests": self.requests,
+            "mcp_calls": self.mcp_calls,
+            "mcp_disconnects": self.mcp_disconnects,
         }
         path = os.path.join(self.state_dir, f"{os.getpid()}.json")
         temporary = path + ".tmp"
@@ -228,8 +234,20 @@ class _Server:
                     "ses" if not self.sessions else f"ses-{len(self.sessions) + 1}"
                 )
                 self.sessions.append(session_id)
+                self.session_bodies.append(json.loads(body.decode()) if body else {})
                 self._write()
                 return 200, {"id": session_id}
+            if path == "/mcp":
+                parsed = json.loads(body.decode()) if body else {}
+                self.mcp_calls.append(parsed)
+                self._write()
+                name = parsed.get("name", "")
+                return 200, {"status": {name: {"status": "connected"}}}
+            if path.endswith("/disconnect") and path.startswith("/mcp/"):
+                name = path[len("/mcp/") : -len("/disconnect")]
+                self.mcp_disconnects.append(name)
+                self._write()
+                return 200, True
             if path.endswith("/message"):
                 self.messages.append(json.loads(body.decode()) if body else {})
                 self._write()
