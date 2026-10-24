@@ -495,6 +495,11 @@ HOOK_BASED_TOOL_HANDLERS: dict[str, str] = {
     "claude-agents": "launchdarkly_ai_claude_agents.handler",
     "openai-agents": "launchdarkly_ai_openai_agents.handler",
     "langchain-agents": "launchdarkly_ai_langchain_agents.handler",
+    # Not hook-based in the vendor-SDK sense -- there is no vendor SDK here,
+    # only OpenCode's own bus. The reducer plays the same role: it is the one
+    # object whose tool-part transitions open and close `execute_tool` spans,
+    # so it needs the same abandon/close split as a hook object does.
+    "opencode-agents": "launchdarkly_ai_opencode_agents.handler",
 }
 
 
