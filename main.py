@@ -50,6 +50,7 @@ EXAMPLES: dict[str, str] = {
     "agent": "examples.agent",
     "capture-content": "examples.capture_content",
     "streaming": "examples.streaming",
+    "agui-stream": "examples.agui_stream",
     "graph": "examples.graph_example",
     "graph-history": "examples.graph_history",
     "graph-streaming": "examples.graph_streaming",
