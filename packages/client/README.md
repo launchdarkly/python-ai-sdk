@@ -825,7 +825,7 @@ Keep a fixed list for a set that genuinely does not change for the life of the p
 `config_skills(key, context)` returns a `SkillSource`: a requested set that is read on every
 reconcile instead of being fixed when you call `watch_skills`. The watcher also re-reconciles
 when that AI Config changes in the base LaunchDarkly client, so a version bump or an unpinned
-skill reaches the disk within `debounce`.
+skill reaches the disk once changes have been quiet for `debounce`.
 
 ```python
 from launchdarkly_ai_server import config_skills, init_client, watch_skills
