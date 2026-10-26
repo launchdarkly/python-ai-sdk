@@ -883,9 +883,8 @@ class TestFollowingConfigChanges:
         """One window merges store and config notifications alike.
 
         Spread out so only the debounce can merge them, as in the store-only
-        coalescing test, and with the same result: the wake flag is cleared
-        before the window, so a change arriving inside it schedules exactly one
-        further pass. Every reconcile reads the source exactly once.
+        coalescing test, and with the same result: each change restarts the
+        window, so the whole mixed burst is one reconcile and one read.
         """
         store = InMemorySkillStore()
         set_skill_store(store)
@@ -899,10 +898,11 @@ class TestFollowingConfigChanges:
                 else:
                     store.put(make_raw_skill(key=f"skill-{i}"))
                 time.sleep(0.1)
-            assert wait_until(lambda: watcher.reconciles >= 2)
+            assert wait_until(lambda: watcher.reconciles >= 1)
+            # Settle well past another window, so a second would have landed.
             time.sleep(1.5)
-            assert watcher.reconciles == 2
-            assert source.reads == 1 + 2
+            assert watcher.reconciles == 1
+            assert source.reads == 1 + 1
         finally:
             watcher.close()
 
