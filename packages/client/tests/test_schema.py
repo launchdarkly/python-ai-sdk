@@ -106,9 +106,9 @@ class TestParseAiConfigSkills:
     """
     ``skills`` is passed through unvalidated.
 
-    Agent Skills is experimental, so a malformed ``skills`` field must not fail
-    a core config call (TESTING.md §0.3). ``skill_refs`` validates the field
-    where the references are used; see ``TestSkillRefs`` in test_skills.py.
+    A malformed ``skills`` field must not fail a config call that does not use
+    skills. ``skill_refs`` validates the field where the references are used;
+    see ``TestSkillRefs`` in test_skills.py.
     """
 
     def _base(self, **extra: Any) -> dict[str, Any]:

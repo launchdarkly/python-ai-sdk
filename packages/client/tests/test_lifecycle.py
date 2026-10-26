@@ -3,7 +3,9 @@ Tests for §3.9 init_client / get_client / shutdown.
 Reference: TESTING.md §3.9
 """
 
+import ast
 import asyncio
+import inspect
 import os
 import subprocess
 import sys
@@ -649,14 +651,30 @@ class TestShutdown:
         assert "Could not clear the Failing Feature state" in caplog.messages
         later.assert_called_once()  # one failing hook does not skip the rest
 
+    def test_lifecycle_imports_no_skills_module(self) -> None:
+        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
+        tree = ast.parse(inspect.getsource(lifecycle_module))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+                # `from . import skills_core` names the module in the alias, not in `module`.
+                imported.update(alias.name for alias in node.names)
+        skills = sorted(
+            name for name in imported if name.rsplit(".", 1)[-1].startswith("skills")
+        )
+        assert skills == []
+
     def test_core_does_not_import_experimental_code(self) -> None:
-        """Core never hooks into experimental code (TESTING.md §0.3)."""
+        """Importing and shutting down core loads no experimental module."""
         script = (
             "import asyncio, sys\n"
             "import launchdarkly_ai_server\n"
             "asyncio.run(launchdarkly_ai_server.shutdown())\n"
             "loaded = sorted(m for m in sys.modules if m.startswith("
-            "('launchdarkly_ai_server.skills', 'launchdarkly_ai_server.evaluations',"
+            "('launchdarkly_ai_server.evaluations',"
             " 'launchdarkly_ai_server.experimental')))\n"
             "print(','.join(loaded))\n"
         )
@@ -906,8 +924,8 @@ class TestInspectConfig:
         assert result["meta"] is not None
 
     async def test_a_malformed_skills_field_does_not_fail_core_calls(self) -> None:
-        """Agent Skills is experimental, so its field cannot break a core call
-        (TESTING.md §0.3). ``skill_refs`` rejects it instead."""
+        """A malformed ``skills`` field cannot break a config call that does
+        not use skills. ``skill_refs`` rejects it instead."""
         stub = _make_stub_client()
         stub.variation = AsyncMock(
             return_value={
