@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any
 
 import httpx
@@ -245,6 +246,43 @@ class TestToolBridgeProtocol:
                 chunks = response.aiter_bytes()
                 first = await asyncio.wait_for(chunks.__anext__(), timeout=5)
                 assert b"connected" in first
+        finally:
+            await bridge.stop()
+
+    async def test_stop_ends_the_sse_handler_while_the_client_is_connected(
+        self,
+    ) -> None:
+        # The GET thread must exit when stop() runs, even if the client
+        # has not closed. Otherwise HTTP/1.1 keep-alive leaves it blocked
+        # in readline() and a shared process leaks one thread per call.
+        bridge = ToolBridge()
+        await bridge.start()
+        before = {thread.ident for thread in threading.enumerate()}
+        try:
+            async with httpx.AsyncClient() as http:
+                async with http.stream(
+                    "GET",
+                    f"{bridge.base_url}/mcp/run-1",
+                    headers={"Authorization": f"Bearer {bridge.token}"},
+                ) as response:
+                    assert response.status_code == 200
+                    await asyncio.wait_for(
+                        response.aiter_bytes().__anext__(), timeout=5
+                    )
+                    await bridge.stop()
+                    leftover: list[threading.Thread] = []
+                    for _ in range(40):
+                        leftover = [
+                            thread
+                            for thread in threading.enumerate()
+                            if thread.ident not in before
+                            and thread.is_alive()
+                            and thread.name.startswith("Thread-")
+                        ]
+                        if not leftover:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert leftover == []
         finally:
             await bridge.stop()
 
