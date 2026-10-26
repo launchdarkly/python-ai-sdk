@@ -64,6 +64,7 @@ from .skills import (
     set_skill_store,
     skill_refs,
 )
+from .skills import _skill_refs as _skill_refs
 from .skills_core import SkillStore
 from .skills_fdv2 import FDv2SkillStore, StoreDiagnostics
 from .skills_fs import (
@@ -73,6 +74,7 @@ from .skills_fs import (
     OnUnavailable,
     write_skills,
 )
+from .skills_fs import _write_skills as _write_skills
 from .skills_watch import SkillWatcher, watch_skills
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (

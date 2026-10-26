@@ -15,20 +15,19 @@ from collections.abc import Sequence
 
 from claude_agent_sdk import SettingSource
 
+# ``_skill_refs`` and ``_write_skills`` are the non-reporting forms of ``skill_refs`` and
+# ``write_skills``. A run reports only the factory's own helper event: the customer called
+# ``create_claude_agents_skills_handler``, not ``skill_refs`` or ``write_skills``, so sending
+# ``client.skillRefs`` or ``client.writeSkills`` from here would attribute calls they never made.
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
     ReconcileReport,
     SkillReference,
+    _skill_refs,
+    _write_skills,
     report_usage,
 )
-
-# The non-reporting forms of ``skill_refs`` and ``write_skills``. A run reports only the
-# factory's own helper event: the customer called ``create_claude_agents_skills_handler``, not
-# ``skill_refs`` or ``write_skills``, so sending ``client.skillRefs`` or ``client.writeSkills``
-# from here would attribute calls they never made.
-from launchdarkly_ai_server.skills import _skill_refs
-from launchdarkly_ai_server.skills_fs import _write_skills
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import QueryPreparation, _create_claude_agents_handler
