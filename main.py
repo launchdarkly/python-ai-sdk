@@ -18,6 +18,7 @@ Examples:
     python main.py claude-agents            launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py openai-agents            launch-darkly-documentation-summarizer-open-ai-only "What is the LaunchDarkly AI SDK?"
     python main.py langchain-agents         launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
+    python main.py google-adk-agents        launch-darkly-documentation-summarizer "What is the LaunchDarkly AI SDK?"
     python main.py langchain-thinking       launch-darkly-documentation-summarizer-messages-claude "Reason it out yourself without any tools: what is 17 times 23?"
     python main.py vercel-messages          launch-darkly-documentation-summarizer-messages "What is the LaunchDarkly AI SDK?"
     python main.py vercel-direct            launch-darkly-documentation-summarizer-messages-openai "What is the LaunchDarkly AI SDK?"
@@ -63,6 +64,7 @@ EXAMPLES: dict[str, str] = {
     "openai-only": "examples.openai_only",
     "langchain": "examples.langchain_example",
     "langchain-agents": "examples.langchain_agents_example",
+    "google-adk-agents": "examples.google_adk_agents_example",
     "langchain-messages": "examples.langchain_messages_example",
     "langchain-thinking": "examples.langchain_thinking",
     "litellm": "examples.litellm_example",

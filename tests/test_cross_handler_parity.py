@@ -1,11 +1,11 @@
-"""Cross-handler invariants: the six handlers must agree with each other.
+"""Cross-handler invariants: the handlers must agree with each other.
 
-Every handler package tests its own spans. Nothing tested that the six agree, and that is exactly
+Every handler package tests its own spans. Nothing tested that they agree, and that is exactly
 how they drifted apart: each was correct on its own terms while a single run emitted `chat` spans
 that disagreed about what a finish reason or a cached token was.
 
 These tests are the oracle for that. They live outside the packages because no package can own an
-invariant about all six.
+invariant about every handler.
 
 There are two kinds of check here.
 
@@ -44,6 +44,7 @@ HANDLERS: dict[str, str] = {
     "opencode-agents": "launchdarkly_ai_opencode_agents.spans",
     "vercel-messages": "launchdarkly_ai_vercel_messages.spans",
     "vercel-agents": "launchdarkly_ai_vercel_agents.spans",
+    "google-adk-agents": "launchdarkly_ai_google_adk_agents.spans",
 }
 
 #: `claude-agents` builds its `chat` span inside an inference tracker rather than in a standalone
@@ -495,6 +496,7 @@ HOOK_BASED_TOOL_HANDLERS: dict[str, str] = {
     "claude-agents": "launchdarkly_ai_claude_agents.handler",
     "openai-agents": "launchdarkly_ai_openai_agents.handler",
     "langchain-agents": "launchdarkly_ai_langchain_agents.handler",
+    "google-adk-agents": "launchdarkly_ai_google_adk_agents.handler",
 }
 
 
