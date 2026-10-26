@@ -1,9 +1,8 @@
 """
-Agent Skills for Claude Agents (experimental).
+Agent Skills for Claude Agents.
 
 ``create_claude_agents_skills_handler`` builds a Claude Agents handler that gives each run the
-skills attached to its variation. This name may change in a minor release, so review the
-changelog when you upgrade.
+skills attached to its variation. Exported from the package root.
 """
 
 from __future__ import annotations
@@ -16,18 +15,22 @@ from collections.abc import Sequence
 
 from claude_agent_sdk import SettingSource
 
+# ``_skill_refs`` and ``_write_skills`` are the non-reporting forms of ``skill_refs`` and
+# ``write_skills``. A run reports only the factory's own helper event: the customer called
+# ``create_claude_agents_skills_handler``, not ``skill_refs`` or ``write_skills``, so sending
+# ``client.skillRefs`` or ``client.writeSkills`` from here would attribute calls they never made.
 from launchdarkly_ai_server import (
     AiConfigRep,
     ProviderHandler,
     ReconcileReport,
     SkillReference,
+    _skill_refs,
+    _write_skills,
     report_usage,
-    skill_refs,
-    write_skills,
 )
 
-from .._version import PACKAGE_NAME, __version__
-from ..handler import QueryPreparation, _create_claude_agents_handler
+from ._version import PACKAGE_NAME, __version__
+from .handler import QueryPreparation, _create_claude_agents_handler
 
 __all__ = ["create_claude_agents_skills_handler"]
 
@@ -88,17 +91,17 @@ async def _prepare_skills(
     Fails closed: if any skill cannot be written, the run does not start. The variation names
     that skill, so running without it would run a different agent from the one configured.
     """
-    refs = skill_refs(config)
+    refs = _skill_refs(config)
     if not refs:
         return None
 
     run_dir = os.path.realpath(tempfile.mkdtemp(prefix=_RUN_DIR_PREFIX, dir=parent))
     try:
         plugin_root = os.path.join(run_dir, PLUGIN_NAME)
-        # ``write_skills`` creates only the missing leaf of its root.
+        # ``_write_skills`` creates only the missing leaf of its root.
         os.mkdir(plugin_root)
         # A fresh directory: there is nothing to prune, and nothing else writes here.
-        report = await write_skills(
+        report = await _write_skills(
             refs, os.path.join(plugin_root, "skills"), prune=False
         )
         if not report.ok:
@@ -134,11 +137,12 @@ def create_claude_agents_skills_handler(
     *skills_temp_dir*: the parent of the directory each run writes its skills into, by default
     ``tempfile.gettempdir()``.
 
-    On every invoke and stream, the variation's ``skills`` are written with ``write_skills``,
-    through the store configured with ``set_skill_store``, into a new directory under
-    *skills_temp_dir*. That directory is passed to ``query()`` as a local plugin, only those
-    skills are enabled, the ``Skill`` tool is turned on, and the directory is removed when the
-    run ends. A variation with no skills runs exactly as with ``create_claude_agents_handler``.
+    On every invoke and stream, the variation's ``skills`` are written, as ``write_skills``
+    writes them, through the store configured with ``set_skill_store`` into a new directory
+    under *skills_temp_dir*. That directory is passed to ``query()`` as a local plugin, only
+    those skills are enabled, the ``Skill`` tool is turned on, and the directory is removed
+    when the run ends. A variation with no skills runs exactly as with
+    ``create_claude_agents_handler``.
 
     ``setting_sources`` is always sent, ``[]`` unless given. ``claude-agent-sdk`` would
     otherwise load the ``user`` and ``project`` settings sources whenever ``skills`` is set.
@@ -152,9 +156,7 @@ def create_claude_agents_skills_handler(
         import os
 
         from launchdarkly_ai_server import FDv2SkillStore, config, set_skill_store
-        from launchdarkly_ai_claude_agents.experimental.skills import (
-            create_claude_agents_skills_handler,
-        )
+        from launchdarkly_ai_claude_agents import create_claude_agents_skills_handler
 
         store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
         store.wait_for_skills(timeout=10)
@@ -163,7 +165,7 @@ def create_claude_agents_skills_handler(
         triage = config(key="triage-agent", handler=create_claude_agents_skills_handler())
     """
     report_usage(
-        "experimental.createClaudeAgentsSkillsHandler", PACKAGE_NAME, __version__
+        "claude-agents.createClaudeAgentsSkillsHandler", PACKAGE_NAME, __version__
     )
 
     async def _prepare(config: AiConfigRep) -> QueryPreparation | None:

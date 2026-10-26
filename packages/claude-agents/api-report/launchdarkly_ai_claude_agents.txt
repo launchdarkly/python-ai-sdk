@@ -14,5 +14,6 @@ ClaudeWebFetch = NativeTool('WebFetch')
 ClaudeWebSearch = NativeTool('WebSearch')
 ClaudeWrite = NativeTool('Write')
 create_claude_agents_handler(*, capture_content: bool | None = None, cwd: str | os.PathLike[str] | None = None, setting_sources: list[SettingSource] | None = None) -> ProviderHandler
+create_claude_agents_skills_handler(*, capture_content: bool | None = None, cwd: str | os.PathLike[str] | None = None, setting_sources: list[SettingSource] | None = None, skills_temp_dir: str | os.PathLike[str] | None = None) -> ProviderHandler
 partition_tools(config_tools: dict[str, Any] | None, tool_handlers: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[str]]
 to_claude_agents(def_promise: Any, opts: dict[str, Any] | None = None) -> Any

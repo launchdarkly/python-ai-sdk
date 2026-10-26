@@ -12,8 +12,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import subprocess
-import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -28,8 +26,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 import launchdarkly_ai_claude_agents.handler as handler_mod
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_claude_agents import ClaudeRead, create_claude_agents_handler
-from launchdarkly_ai_claude_agents.experimental.skills import (
+from launchdarkly_ai_claude_agents import (
+    ClaudeRead,
+    create_claude_agents_handler,
     create_claude_agents_skills_handler,
 )
 from launchdarkly_ai_server import (
@@ -198,15 +197,15 @@ class TestRoutingAndOptions:
             "agent",
         )
 
-    def test_is_absent_from_the_package_root(self) -> None:
-        """A fresh interpreter, so this module's own import of the entry point doesn't count."""
-        probe = (
-            "import sys, launchdarkly_ai_claude_agents as p;"
-            "assert 'launchdarkly_ai_claude_agents.experimental' not in sys.modules;"
-            "assert not hasattr(p, 'create_claude_agents_skills_handler');"
-            "assert 'create_claude_agents_skills_handler' not in p.__all__"
+    def test_is_exported_from_the_package_root(self) -> None:
+        import launchdarkly_ai_claude_agents as package_root
+        import launchdarkly_ai_claude_agents.skills as skills_mod
+
+        assert "create_claude_agents_skills_handler" in package_root.__all__
+        assert (
+            package_root.create_claude_agents_skills_handler
+            is skills_mod.create_claude_agents_skills_handler
         )
-        subprocess.run([sys.executable, "-c", probe], check=True)
 
     @pytest.mark.parametrize("path", _PATHS)
     async def test_forwards_the_host_options(
@@ -247,10 +246,10 @@ class TestRoutingAndOptions:
     ) -> None:
         """No store is configured: a variation with no skills needs none."""
         cfg = dict(BASE_CONFIG) if skills is None else {**BASE_CONFIG, "skills": skills}
-        core, experimental = _FakeQuery(), _FakeQuery()
+        core, with_skills = _FakeQuery(), _FakeQuery()
         monkeypatch.setattr(handler_mod, "query", core)
         await _run(create_claude_agents_handler(cwd="/srv/app"), path, cfg)
-        monkeypatch.setattr(handler_mod, "query", experimental)
+        monkeypatch.setattr(handler_mod, "query", with_skills)
         await _run(
             create_claude_agents_skills_handler(
                 cwd="/srv/app", skills_temp_dir=tmp_path
@@ -258,10 +257,10 @@ class TestRoutingAndOptions:
             path,
             cfg,
         )
-        assert experimental.options == core.options
-        assert experimental.options.plugins == []
-        assert experimental.options.skills is None
-        assert "Skill" not in experimental.options.tools
+        assert with_skills.options == core.options
+        assert with_skills.options.plugins == []
+        assert with_skills.options.skills is None
+        assert "Skill" not in with_skills.options.tools
         assert list(tmp_path.iterdir()) == []
 
 
@@ -457,7 +456,7 @@ async def test_concurrent_invokes_do_not_share_a_directory(
 async def test_a_failed_removal_is_logged_and_does_not_replace_the_outcome(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    import launchdarkly_ai_claude_agents.experimental.skills as skills_mod
+    import launchdarkly_ai_claude_agents.skills as skills_mod
 
     _store(_raw("a", 1))
     monkeypatch.setattr(handler_mod, "query", _FakeQuery())
