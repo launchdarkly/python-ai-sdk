@@ -91,6 +91,10 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 | [`launchdarkly-ai-vercel-agents`](packages/vercel-agents/README.md) | `*` (any) | `agent` | Native Vercel `ai.Agent` loop and graph adapter |
 | [`launchdarkly-ai-typesafe`](packages/typesafe/README.md) | TypeSafe | `messages` | TypeSafe Jev judge handler |
 
+### Versioning
+
+From 1.0.0 every package in this SDK is released at the same version, so install them at matching versions. Each package depends on `launchdarkly-ai-server` within the same major (`>=1.0,<2`), and a breaking change in any package is a new major for all of them. Names exported from `launchdarkly_ai_server.experimental` are the exception: they may change in a minor release.
+
 ## Quick Start
 
 ### 1. Install

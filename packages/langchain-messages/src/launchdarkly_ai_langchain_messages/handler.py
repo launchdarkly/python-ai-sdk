@@ -620,7 +620,13 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
     if provider == "anthropic":
-        lc_anthropic = importlib.import_module("langchain_anthropic")
+        try:
+            lc_anthropic = importlib.import_module("langchain_anthropic")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Anthropic models requires langchain-anthropic. "
+                "Install it with: pip install langchain-anthropic"
+            ) from exc
         return lc_anthropic.ChatAnthropic(
             **_rebuild_anthropic_output_config(
                 _rebuild_anthropic_thinking(
@@ -651,7 +657,13 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
                 renames=_CHAT_BEDROCK_CONVERSE_RENAMES,
             )
         )
-    lc_openai = importlib.import_module("langchain_openai")
+    try:
+        lc_openai = importlib.import_module("langchain_openai")
+    except ImportError as exc:
+        raise ImportError(
+            "Using OpenAI models requires langchain-openai. "
+            "Install it with: pip install langchain-openai"
+        ) from exc
     return lc_openai.ChatOpenAI(
         **_model_constructor_kwargs(
             config,
