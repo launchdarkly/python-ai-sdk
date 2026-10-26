@@ -95,7 +95,7 @@ Raw AI config dict as returned by ``parse_ai_config``. Fields include
 ``model``, ``provider``, at least one of ``instructions``, ``messages``, or a
 non-empty ``classifiers`` list, and an optional ``skills`` array of
 ``{key, version}`` references. Parsing does not validate ``skills``; read it
-with ``launchdarkly_ai_server.experimental.skills.skill_refs``, which does.
+with ``launchdarkly_ai_server.skill_refs``, which does.
 """
 
 VariationMeta = dict[str, Any]

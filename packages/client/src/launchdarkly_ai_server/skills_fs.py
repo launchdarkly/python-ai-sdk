@@ -45,6 +45,7 @@ from .safe_fs import (
     pinned_directory,
     unlink_file,
 )
+from .sdk_usage import report_usage
 from .skills_core import (
     NO_STORE_MESSAGE,
     Resolution,
@@ -179,6 +180,21 @@ async def write_skills(
     large reconcile blocks the event loop. Wrap it in ``asyncio.to_thread`` if
     that matters. Descriptor pinning of the root requires POSIX; see ``safe_fs``.
     """
+    report_usage("client.writeSkills")
+    return await _write_skills(
+        skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
+    )
+
+
+async def _write_skills(
+    skills: Sequence[Skill | SkillReference | str] | str | SkillSource,
+    root: str | os.PathLike[str],
+    *,
+    prune: bool = True,
+    timeout: float = 10.0,
+    on_unavailable: OnUnavailable = "keep",
+) -> ReconcileReport:
+    """``write_skills`` without the usage report, for the watcher's reconciles."""
     # Typed as closed sets, but untyped callers can pass anything.
     if on_unavailable not in ("keep", "raise"):
         raise ValueError(

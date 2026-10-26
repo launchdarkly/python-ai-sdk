@@ -33,9 +33,7 @@ from typing import Any
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import skills as skills_module
-from launchdarkly_ai_server import skills_fs, skills_source, skills_watch
-from launchdarkly_ai_server.experimental.skills import (
+from launchdarkly_ai_server import (
     MANIFEST_FILENAME,
     InMemorySkillStore,
     ReconcileReport,
@@ -44,9 +42,13 @@ from launchdarkly_ai_server.experimental.skills import (
     SkillSource,
     config_skills,
     set_skill_store,
+    skills_fs,
+    skills_source,
+    skills_watch,
     watch_skills,
     write_skills,
 )
+from launchdarkly_ai_server import skills as skills_module
 from launchdarkly_ai_server.sdk_usage import SDK_USAGE_EVENT, reset_sdk_usage
 from launchdarkly_ai_server.skills_core import SKILL_OBJECT_KIND
 
@@ -409,25 +411,25 @@ class TestConfigSkillsTelemetry:
         skills_module._set_emitter_for_testing(recording_emitter)
         client = install(FakeLDClient(ai_config(("pdf-extraction", 2))))
         source = config_skills(CONFIG_KEY, CONTEXT)
-        assert client.usage_helpers() == ["experimental.configSkills"]
+        assert client.usage_helpers() == ["client.configSkills"]
 
         for _ in range(3):
             await source.refs()  # type: ignore[misc]
 
         # Three evaluations, and nothing tracked but the one usage event: no
-        # $ld:ai:* telemetry, no experimental.skillRefs, no skills signal.
+        # $ld:ai:* telemetry, no client.skillRefs, no skills signal.
         assert len(client.variation_calls) == 3
         assert client.tracked == [
             (SDK_USAGE_EVENT, client.tracked[0][1]),
         ]
-        assert client.usage_helpers() == ["experimental.configSkills"]
+        assert client.usage_helpers() == ["client.configSkills"]
         assert recording_emitter.records == []
 
     async def test_usage_is_reported_before_the_arguments_are_checked(self) -> None:
         client = install(FakeLDClient())
         with pytest.raises(TypeError, match="empty"):
             config_skills("", CONTEXT)
-        assert client.usage_helpers() == ["experimental.configSkills"]
+        assert client.usage_helpers() == ["client.configSkills"]
 
     async def test_write_and_watch_given_a_config_source_report_no_skill_refs(
         self, tmp_path: Path, make_raw_skill: Any
@@ -447,8 +449,12 @@ class TestConfigSkillsTelemetry:
             watcher.close()
 
         assert len(client.variation_calls) == 3
-        assert "experimental.skillRefs" not in client.usage_helpers()
-        assert client.usage_helpers().count("experimental.configSkills") == 1
+        # Each read, re-reconciles included, adds nothing: only the three calls report.
+        assert sorted(client.usage_helpers()) == [
+            "client.configSkills",
+            "client.watchSkills",
+            "client.writeSkills",
+        ]
 
 
 # ---------------------------------------------------------------------------

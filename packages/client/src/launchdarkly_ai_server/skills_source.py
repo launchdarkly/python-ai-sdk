@@ -52,7 +52,7 @@ def config_skills(key: str, context: LDContext) -> SkillSource:
     For several configs, or a client brought to ``init_client`` without a
     ``flag_tracker``, build a ``SkillSource`` by hand.
     """
-    report_usage("experimental.configSkills")
+    report_usage("client.configSkills")
 
     async def refs() -> list[SkillReference]:
         return await _read_config_skills(key, context)

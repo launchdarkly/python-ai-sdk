@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from launchdarkly_ai_server.experimental.skills import (
+from launchdarkly_ai_server import (
     InMemorySkillStore,
     set_skill_store,
     watch_skills,

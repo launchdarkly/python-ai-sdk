@@ -26,8 +26,9 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from .lifecycle import get_client
+from .sdk_usage import report_usage
 from .skills_core import SKILL_OBJECT_KIND, get_store
-from .skills_fs import OnUnavailable, write_skills
+from .skills_fs import OnUnavailable, _write_skills
 from .types import ReconcileReport, Skill, SkillReference, SkillSource
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,7 @@ class SkillWatcher:
     def _reconcile_once(self) -> None:
         try:
             report = asyncio.run(
-                write_skills(
+                _write_skills(
                     self._request,
                     self._root,
                     prune=self._prune,
@@ -281,11 +282,12 @@ async def watch_skills(
             offline: such a watcher would never hear about a config change.
         ValueError: If *debounce* is negative, ``NaN``, or infinite.
     """
+    report_usage("client.watchSkills")
     store = get_store()
     if store is None:
         raise RuntimeError(
             "watch_skills needs a configured skill store. Configure one with "
-            "set_skill_store(store) from launchdarkly_ai_server.experimental.skills."
+            "set_skill_store(store) from launchdarkly_ai_server."
         )
     add_listener = getattr(store, "add_listener", None)
     if not callable(add_listener):
@@ -321,7 +323,7 @@ async def watch_skills(
         if isinstance(skills, SkillSource) and skills.config_keys:
             watcher._follow_configs(_config_flag_tracker(), skills.config_keys)
         # Run on the caller's task, so a bad root raises to the caller.
-        report = await write_skills(
+        report = await _write_skills(
             skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
         )
     except BaseException:

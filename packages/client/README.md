@@ -33,8 +33,8 @@ No code changes are required — `init_client()` detects the packages at runtime
 | Variable | Required | Description |
 |---|---|---|
 | `LD_SDK_KEY` | Yes | LaunchDarkly server-side SDK key |
-| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging) |
-| `LD_STREAM_URI` | No | Override the streaming URI |
+| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging). `FDv2SkillStore` reads it too when given no URI option |
+| `LD_STREAM_URI` | No | Override the streaming URI. `FDv2SkillStore` reads it too when given no URI option |
 | `LD_EVENTS_URI` | No | Override the events URI |
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
@@ -471,11 +471,7 @@ asyncio.run(main())
 
 ---
 
-### Agent Skills (experimental)
-
-> **Experimental.** Import Agent Skills from `launchdarkly_ai_server.experimental.skills`;
-> none of these names is exported from the package root. They may change in a minor release,
-> so review the changelog when you upgrade.
+### Agent Skills
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
@@ -487,9 +483,9 @@ import asyncio
 import hashlib
 from pathlib import Path
 
-from launchdarkly_ai_server import init_client, inspect_config
-from launchdarkly_ai_server.experimental.skills import (
-    InMemorySkillStore, get_skill, set_skill_store, skill_refs, write_skills,
+from launchdarkly_ai_server import (
+    InMemorySkillStore, get_skill, init_client, inspect_config, set_skill_store,
+    skill_refs, write_skills,
 )
 
 SKILL_MD = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
@@ -627,9 +623,8 @@ ERROR ld.skills.integrity_failure {"action":"withheld","event":"ld.skills.integr
 ```
 
 **Match on `ld.skills.integrity_failure`.** It is the name LaunchDarkly's AI SDKs share for this
-record. While Agent Skills is experimental, the event name, its fields, and its `reason_code`
-values may change in a minor release; any such change gets a changelog entry under
-**Experimental**, so review it before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
+record. A change to the event name, its fields, or its `reason_code` values gets a changelog
+entry, so review the changelog before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
 AI SDKs for the same input.
 
 | Field | Description |
@@ -687,7 +682,7 @@ retrieval, verification, and telemetry as `get_skill`, but reports which of five
 happened instead of collapsing them all to `None`.
 
 ```python
-from launchdarkly_ai_server.experimental.skills import get_skill_result
+from launchdarkly_ai_server import get_skill_result
 
 outcome = await get_skill_result("pdf-extraction")
 
@@ -735,9 +730,7 @@ authenticated with the environment's server-side SDK key.
 ```python
 import os
 
-from launchdarkly_ai_server.experimental.skills import (
-    FDv2SkillStore, set_skill_store, watch_skills,
-)
+from launchdarkly_ai_server import FDv2SkillStore, set_skill_store, watch_skills
 
 store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
 if not store.wait_for_skills(timeout=10):
@@ -792,6 +785,11 @@ never followed, so a 3xx stops delivery instead of forwarding the key to the `Lo
 **Polling and streaming have separate hosts.** By default `/sdk/poll` goes to
 `https://sdk.launchdarkly.com` and `/sdk/stream` to `https://stream.launchdarkly.com`. Pass
 `base_uri` alone to use one host for both, or `stream_uri` as well to set them independently.
+With neither option, the store reads `LD_BASE_URI` and `LD_STREAM_URI` in their place, once, when
+it is constructed, the same variables `init_client()` reads. So a process pointed at a staging or
+private instance by its environment gets its skills from there too. `LD_BASE_URI` alone moves both
+endpoints, as `base_uri` alone does. That differs from `init_client()`, where flag streaming stays
+on its default host unless `LD_STREAM_URI` is set.
 
 **`close()` is final.** A closed store still answers from the content it received, but
 `start()` afterwards raises, so delivery is guaranteed stopped even if the join times out.
@@ -830,8 +828,7 @@ when that AI Config changes in the base LaunchDarkly client, so a version bump o
 skill reaches the disk within `debounce`.
 
 ```python
-from launchdarkly_ai_server import init_client
-from launchdarkly_ai_server.experimental.skills import config_skills, watch_skills
+from launchdarkly_ai_server import config_skills, init_client, watch_skills
 
 await init_client()  # config_skills needs an initialized client; it never creates one
 report, watcher = await watch_skills(

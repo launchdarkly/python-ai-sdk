@@ -3,7 +3,9 @@ Tests for §3.9 init_client / get_client / shutdown.
 Reference: TESTING.md §3.9
 """
 
+import ast
 import asyncio
+import inspect
 import os
 import subprocess
 import sys
@@ -391,6 +393,42 @@ class TestInitClientSDKKeyPath:
         stub.close.assert_awaited_once()
         assert lifecycle_module._client is None
 
+    @staticmethod
+    async def _config_kwargs(env: dict[str, str]) -> dict[str, Any]:
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=_make_stub_client())
+        names = ("LD_BASE_URI", "LD_STREAM_URI", "LD_EVENTS_URI")
+        base = {k: v for k, v in os.environ.items() if k not in names}
+        with patch.dict(
+            os.environ, {**base, "LD_SDK_KEY": "test-key", **env}, clear=True
+        ):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    await init_client()
+        return dict(mock_ld.Config.call_args.kwargs)
+
+    async def test_strips_whitespace_from_the_uri_variables(self) -> None:
+        kwargs = await self._config_kwargs(
+            {
+                "LD_BASE_URI": "  https://sdk.example.com\n",
+                "LD_STREAM_URI": "\thttps://stream.example.com ",
+                "LD_EVENTS_URI": " https://events.example.com ",
+            }
+        )
+        assert kwargs == {
+            "base_uri": "https://sdk.example.com",
+            "stream_uri": "https://stream.example.com",
+            "events_uri": "https://events.example.com",
+        }
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    async def test_a_blank_uri_variable_is_unset(self, blank: str) -> None:
+        kwargs = await self._config_kwargs(
+            {"LD_BASE_URI": blank, "LD_STREAM_URI": blank, "LD_EVENTS_URI": blank}
+        )
+        assert kwargs == {}
+
 
 # ---------------------------------------------------------------------------
 # OTel degradation
@@ -613,14 +651,30 @@ class TestShutdown:
         assert "Could not clear the Failing Feature state" in caplog.messages
         later.assert_called_once()  # one failing hook does not skip the rest
 
+    def test_lifecycle_imports_no_skills_module(self) -> None:
+        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
+        tree = ast.parse(inspect.getsource(lifecycle_module))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+                # `from . import skills_core` names the module in the alias, not in `module`.
+                imported.update(alias.name for alias in node.names)
+        skills = sorted(
+            name for name in imported if name.rsplit(".", 1)[-1].startswith("skills")
+        )
+        assert skills == []
+
     def test_core_does_not_import_experimental_code(self) -> None:
-        """Core never hooks into experimental code (TESTING.md §0.3)."""
+        """Importing and shutting down core loads no experimental module."""
         script = (
             "import asyncio, sys\n"
             "import launchdarkly_ai_server\n"
             "asyncio.run(launchdarkly_ai_server.shutdown())\n"
             "loaded = sorted(m for m in sys.modules if m.startswith("
-            "('launchdarkly_ai_server.skills', 'launchdarkly_ai_server.evaluations',"
+            "('launchdarkly_ai_server.evaluations',"
             " 'launchdarkly_ai_server.experimental')))\n"
             "print(','.join(loaded))\n"
         )
@@ -870,8 +924,8 @@ class TestInspectConfig:
         assert result["meta"] is not None
 
     async def test_a_malformed_skills_field_does_not_fail_core_calls(self) -> None:
-        """Agent Skills is experimental, so its field cannot break a core call
-        (TESTING.md §0.3). ``skill_refs`` rejects it instead."""
+        """A malformed ``skills`` field cannot break a config call that does
+        not use skills. ``skill_refs`` rejects it instead."""
         stub = _make_stub_client()
         stub.variation = AsyncMock(
             return_value={

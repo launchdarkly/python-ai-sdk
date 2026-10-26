@@ -1,5 +1,7 @@
 """Tests for TESTING.md §3.27 helper usage events."""
 
+import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,20 +11,31 @@ import launchdarkly_ai_server.lifecycle as lifecycle_module
 import launchdarkly_ai_server.sdk_usage as sdk_usage_module
 from launchdarkly_ai_server import (
     SDK_INFO_CONTEXT,
+    FDv2SkillStore,
+    InMemorySkillStore,
     ProviderHandler,
+    SkillReference,
     __version__,
+    all_skills,
     build_judge_tasks,
     config,
+    config_skills,
     create_handler,
+    get_skill,
+    get_skill_result,
+    get_skills,
     graph,
     init_client,
     inspect_config,
     resolve_graph,
     run_judge,
+    set_skill_store,
     shutdown,
+    skill_refs,
+    watch_skills,
+    write_skills,
 )
 from launchdarkly_ai_server.experimental.evaluations import init_evaluations
-from launchdarkly_ai_server.experimental.skills import config_skills
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 HELPER = "client.buildJudgeTasks"
@@ -153,10 +166,6 @@ def _call(helper: str) -> Any:
 
         create_handler(("OpenAI", "messages"), _fn)
         return None
-    if helper == "experimental.configSkills":
-        # Builds the source without reading it: the report is on the call.
-        config_skills("k", CONTEXT)
-        return None
     assert helper == "experimental.initEvaluations", helper
     try:
         init_evaluations()
@@ -184,7 +193,6 @@ async def client() -> Any:
         "client.runJudge",
         "client.buildJudgeTasks",
         "client.createHandler",
-        "experimental.configSkills",
         "experimental.initEvaluations",
     ],
 )
@@ -505,3 +513,152 @@ async def test_package_name_without_version_reports_the_core(
     assert len(calls) == 1
     assert calls[0].args[2]["helperPackageName"] == "launchdarkly-ai-server"
     assert calls[0].args[2]["helperPackageVersion"] == __version__
+
+
+# ---------------------------------------------------------------------------
+# Agent Skills helpers (§3.27)
+# ---------------------------------------------------------------------------
+
+SKILL_KEY = "test-skill"
+_SKILL_CONFIG: dict[str, Any] = {
+    **_ENABLED_CONFIG,
+    "skills": [{"key": SKILL_KEY, "version": 1}],
+}
+
+
+def _skill_store(make_raw_skill: Any) -> InMemorySkillStore:
+    store = InMemorySkillStore()
+    store.put(make_raw_skill(key=SKILL_KEY, version=1))
+    set_skill_store(store)
+    return store
+
+
+async def _call_skill_helper(helper: str, root: Path) -> None:
+    if helper == "client.allSkills":
+        await all_skills()
+    elif helper == "client.configSkills":
+        # Builds the source without reading it: the report is on the call.
+        config_skills("k", CONTEXT)
+    elif helper == "client.getSkill":
+        await get_skill(SKILL_KEY)
+    elif helper == "client.getSkillResult":
+        await get_skill_result(SKILL_KEY)
+    elif helper == "client.getSkills":
+        await get_skills([SKILL_KEY])
+    elif helper == "client.skillRefs":
+        skill_refs(_SKILL_CONFIG)
+    elif helper == "client.watchSkills":
+        _report, watcher = await watch_skills("*", root, debounce=0.05)
+        watcher.close()
+    else:
+        assert helper == "client.writeSkills", helper
+        await write_skills("*", root)
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        "client.allSkills",
+        "client.configSkills",
+        "client.getSkill",
+        "client.getSkillResult",
+        "client.getSkills",
+        "client.skillRefs",
+        "client.watchSkills",
+        "client.writeSkills",
+    ],
+)
+async def test_skill_helper_sends_one_usage_event(
+    client: MagicMock, helper: str, tmp_path: Path, make_raw_skill: Any
+) -> None:
+    _skill_store(make_raw_skill)
+    await _call_skill_helper(helper, tmp_path / "skills")
+    _expect_usage(client, helper)
+    # One call emits only its own helper, and never an experimental.* skills ID.
+    assert _helpers(client) == [helper]
+
+
+async def test_get_skill_reports_once_per_client(
+    client: MagicMock, make_raw_skill: Any
+) -> None:
+    _skill_store(make_raw_skill)
+    await get_skill(SKILL_KEY)
+    await get_skill(SKILL_KEY)
+    _expect_usage(client, "client.getSkill")
+
+    await shutdown()
+    fresh = await _install()
+    # shutdown clears the store, so configure it again.
+    _skill_store(make_raw_skill)
+    await get_skill(SKILL_KEY)
+    _expect_usage(fresh, "client.getSkill")
+
+
+async def test_skill_refs_before_client_is_sent_on_init() -> None:
+    await shutdown()
+    lifecycle_module._reset_for_testing()
+    skill_refs(_SKILL_CONFIG)
+    client = _client()
+    assert _usage(client) == []
+    with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+        await init_client(client=client)
+    _expect_usage(client, "client.skillRefs")
+    await shutdown()
+
+
+async def test_get_skill_without_store_still_reports(client: MagicMock) -> None:
+    with pytest.raises(RuntimeError):
+        await get_skill(SKILL_KEY)
+    _expect_usage(client, "client.getSkill")
+
+
+async def test_watch_skills_reconciles_report_no_write_skills(
+    client: MagicMock, tmp_path: Path, make_raw_skill: Any
+) -> None:
+    store = _skill_store(make_raw_skill)
+    _report, watcher = await watch_skills("*", tmp_path / "skills", debounce=0.05)
+    try:
+        assert _helpers(client) == ["client.watchSkills"]
+        store.put(make_raw_skill(key="other", version=1))
+        deadline = time.monotonic() + 10
+        while watcher.reconciles < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert watcher.reconciles >= 1
+        assert _helpers(client) == ["client.watchSkills"]
+    finally:
+        watcher.close()
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [[SkillReference(key=SKILL_KEY, version=1)], [SKILL_KEY], "*"],
+    ids=["reference", "string", "star"],
+)
+async def test_write_skills_resolves_without_reporting_accessors(
+    client: MagicMock, tmp_path: Path, make_raw_skill: Any, request_: Any
+) -> None:
+    _skill_store(make_raw_skill)
+    await write_skills(request_, tmp_path / "skills")
+    assert _helpers(client) == ["client.writeSkills"]
+
+
+@pytest.mark.parametrize(
+    ("helper", "silent"),
+    [
+        ("client.getSkills", "client.getSkill"),
+        ("client.getSkillResult", "client.getSkill"),
+        ("client.getSkill", "client.getSkillResult"),
+    ],
+)
+async def test_accessors_do_not_report_each_other(
+    client: MagicMock, make_raw_skill: Any, helper: str, silent: str, tmp_path: Path
+) -> None:
+    _skill_store(make_raw_skill)
+    await _call_skill_helper(helper, tmp_path)
+    assert _usage(client, silent) == []
+
+
+async def test_store_setup_is_not_a_helper(client: MagicMock) -> None:
+    set_skill_store(InMemorySkillStore())
+    FDv2SkillStore("sdk-test-key")
+    assert _usage(client) == []
