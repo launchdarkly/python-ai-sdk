@@ -8,6 +8,7 @@ a conforming MCP streamable-HTTP client would: ``initialize``, then
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -220,18 +221,40 @@ class TestToolBridgeProtocol:
         finally:
             await bridge.stop()
 
-    async def test_get_is_not_offered(self) -> None:
-        # This bridge never pushes an unsolicited message, so it does not
-        # implement the SSE half of the streamable-HTTP transport.
+    async def test_get_opens_a_live_sse_stream_not_405(self) -> None:
+        # OpenCode's MCP client (1.18.4) opens this GET right after
+        # initialize and treats a non-2xx answer as a dead server, never
+        # sending tools/list — confirmed live against the real binary. A
+        # bare 405 here, which earlier code sent, reproduces that failure.
+        # This test reads one live chunk rather than only the status line,
+        # so a handler that writes headers then raises before any body
+        # still fails it.
+        bridge = ToolBridge()
+        await bridge.start()
+        try:
+            async with (
+                httpx.AsyncClient() as http,
+                http.stream(
+                    "GET",
+                    f"{bridge.base_url}/mcp/run-1",
+                    headers={"Authorization": f"Bearer {bridge.token}"},
+                ) as response,
+            ):
+                assert response.status_code == 200
+                assert response.headers["content-type"] == "text/event-stream"
+                chunks = response.aiter_bytes()
+                first = await asyncio.wait_for(chunks.__anext__(), timeout=5)
+                assert b"connected" in first
+        finally:
+            await bridge.stop()
+
+    async def test_get_without_a_token_is_still_rejected(self) -> None:
         bridge = ToolBridge()
         await bridge.start()
         try:
             async with httpx.AsyncClient() as http:
-                response = await http.get(
-                    f"{bridge.base_url}/mcp/run-1",
-                    headers={"Authorization": f"Bearer {bridge.token}"},
-                )
-                assert response.status_code == 405
+                response = await http.get(f"{bridge.base_url}/mcp/run-1")
+                assert response.status_code == 401
         finally:
             await bridge.stop()
 

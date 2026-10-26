@@ -7,12 +7,19 @@ tag). A plain callable in ``tool_handlers`` is therefore served from a
 minimal MCP endpoint this module starts per call, which the handler attaches
 to the running ``opencode serve`` instance with ``POST /mcp``.
 
-This endpoint answers in MCP streamable-HTTP "JSON response" mode: every
-``tools/call`` gets exactly one JSON-RPC response body, with no
-server-initiated SSE stream. That is a conforming subset of the transport
-(a server with nothing to push to the client is not required to stream), and
-it is all this bridge needs: OpenCode is the only client, and it never needs
-an unsolicited message from this side.
+Every JSON-RPC call (``initialize``, ``tools/list``, ``tools/call``) gets
+exactly one JSON response on the ``POST`` that sent it; this bridge never
+pushes a message of its own. The transport still requires the optional half
+of streamable HTTP: OpenCode's MCP client (1.18.4) opens a standalone ``GET``
+right after ``initialize`` and, if that does not come back as a live
+``text/event-stream``, marks the server connection failed before ever
+sending ``tools/list`` -- confirmed live against the ``opencode`` 1.18.4
+linux-x64 binary, where a bare ``405`` on that ``GET`` left ``POST /mcp``
+reporting ``{"status": "failed"}`` and no ``tools/list`` request ever
+arrived. The spec allows ``405`` here (RFC: a server with nothing to push
+"MAY" answer the optional stream that way), but this client does not treat
+it as optional, so the bridge opens the stream and leaves it running rather
+than refuse it.
 
 The stdlib has no asyncio HTTP server, and this package otherwise depends on
 nothing beyond ``httpx`` and ``opentelemetry-api``. Bringing in an ASGI stack
@@ -47,6 +54,12 @@ _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 #: far too short for that. ``register_mcp_bridge`` sends this as the
 #: connection's own ``timeout``, in milliseconds.
 CALL_TIMEOUT_SECONDS = 600.0
+
+#: How often the open GET stream writes an SSE comment line while idle.
+#: Loopback has no proxy to time the connection out; this only guards
+#: against a future intermediary doing so, and bounds how long `stop()`
+#: can be left waiting for that handler thread to notice it should exit.
+_SSE_KEEPALIVE_SECONDS = 15.0
 
 _PROTOCOL_VERSION = "2025-06-18"
 _SERVER_NAME = "launchdarkly-ai-opencode-agents"
@@ -97,6 +110,9 @@ class ToolBridge:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._port = 0
+        #: Set by stop() so an open GET's keepalive loop exits promptly
+        #: instead of leaking a thread for up to _SSE_KEEPALIVE_SECONDS.
+        self._stopping = threading.Event()
 
     @property
     def token(self) -> str:
@@ -131,10 +147,37 @@ class ToolBridge:
             def log_message(self, fmt: str, *args: Any) -> None:
                 return
 
+            def _sse_chunk(self, data: bytes) -> None:
+                self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+
             def do_GET(self) -> None:
-                # No server-initiated messages: this bridge never needs the
-                # SSE half of the streamable-HTTP transport.
-                self.send_error(405)
+                if not bridge._authorized(self.headers):
+                    self.send_error(401)
+                    return
+                # This bridge never pushes a message of its own, but
+                # OpenCode's MCP client treats a non-2xx answer to this GET
+                # as a dead server and never sends tools/list (see module
+                # docstring). Open the stream and hold it until stop().
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    # Sent immediately, not only on the first keepalive
+                    # interval: a caller confirming the stream is live
+                    # (including this package's own tests) should not have
+                    # to wait _SSE_KEEPALIVE_SECONDS for the first byte.
+                    self._sse_chunk(b": connected\n\n")
+                    while not bridge._stopping.wait(_SSE_KEEPALIVE_SECONDS):
+                        self._sse_chunk(b": keepalive\n\n")
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                try:
+                    self._sse_chunk(b"")
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
 
             def do_POST(self) -> None:
                 if not bridge._authorized(self.headers):
@@ -172,6 +215,10 @@ class ToolBridge:
         return self.base_url
 
     async def stop(self) -> None:
+        # Wakes any open GET's keepalive wait so that request thread ends
+        # on its own; server_close() below only closes the listening
+        # socket, not sockets already accepted into a handler thread.
+        self._stopping.set()
         server = self._server
         self._server = None
         if server is not None:
