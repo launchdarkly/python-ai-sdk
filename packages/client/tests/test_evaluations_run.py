@@ -338,6 +338,14 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     assert "inputTokens" not in event
     assert "outputTokens" not in event
     assert len(event["eventId"]) == len(event["contentHash"]) == 64
+    # The canonical JSON of what was generated, which every SDK can produce.
+    assert (
+        event["contentHash"]
+        == hashlib.sha256(
+            b'{"error":null,"output":"generated: Order A19","status":"COMPLETE",'
+            b'"usage":{"inputTokens":10,"outputTokens":4}}'
+        ).hexdigest()
+    )
     assert event["emittedAt"].endswith("Z")
     assert datetime.fromisoformat(event["emittedAt"]).tzinfo is not None
     assert {"input", "expected_output", "metadata", "variables"}.isdisjoint(event)
@@ -2125,12 +2133,28 @@ def accuracy_judge_variation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("judge_output", "expected_code"),
+    ("judge_output", "expected_code", "expected_message"),
     [
-        ('{"score": "high (0.9)", "reasoning": "confident"}', "invalid_score"),
-        ('{"score": 3, "reasoning": "confident"}', "invalid_score"),
-        ('{"score": NaN, "reasoning": "confident"}', "invalid_score"),
-        ("the answer looks right to me", "invalid_judge_output"),
+        (
+            '{"score": "high (0.9)", "reasoning": "confident"}',
+            "invalid_score",
+            'judge score must be a number between 0 and 1, got "high (0.9)"',
+        ),
+        (
+            '{"score": 3, "reasoning": "confident"}',
+            "invalid_score",
+            "judge score must be a number between 0 and 1, got 3",
+        ),
+        (
+            '{"score": NaN, "reasoning": "confident"}',
+            "invalid_score",
+            "judge score must be a number between 0 and 1, got NaN",
+        ),
+        (
+            "the answer looks right to me",
+            "invalid_judge_output",
+            "Invalid JSON from judge",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -2139,6 +2163,7 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
     stub_sdk_client: MagicMock,
     judge_output: str,
     expected_code: str,
+    expected_message: str,
 ) -> None:
     transport = judge_run_transport()
     accuracy_judge_variation(monkeypatch)
@@ -2169,6 +2194,8 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
     judge_event = next(event for event in events if event.get("kind") == "judge")
     assert judge_event["status"] == "ERROR"
     assert judge_event["error"]["code"] == expected_code
+    # The bad value is shown as JSON, not a Python repr, as in every SDK.
+    assert judge_event["error"]["message"] == expected_message
     assert judge_event["errorMessage"] == judge_event["error"]["message"]
     assert "score" not in judge_event
     stub_sdk_client.flush.assert_awaited()
@@ -2316,7 +2343,7 @@ async def test_structured_output_reaches_the_judge_as_json(
         criteria=[Judge(key="$ld:ai:judge:accuracy")],
     )
 
-    rendered = '{"answer": "original", "tags": ["a"], "final": true}'
+    rendered = '{"answer":"original","tags":["a"],"final":true}'
     assert judged["response"] == rendered
     assert rendered in judged["history"]
 
