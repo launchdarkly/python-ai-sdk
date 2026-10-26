@@ -36,7 +36,10 @@ from opentelemetry.trace import StatusCode as SpanStatusCode
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_opencode_agents import (
+    OpenCodeApplyPatch,
     OpenCodeBash,
+    OpenCodeEdit,
+    OpenCodeSkill,
     OpenCodeWebFetch,
     OpenCodeWrite,
     create_opencode_handler,
@@ -403,6 +406,58 @@ class TestSessionPermission:
         assert permission == [
             {"permission": "*", "action": "deny", "pattern": "*"},
             {"permission": "edit", "action": "allow", "pattern": "*"},
+        ]
+
+    @pytest.mark.parametrize("sentinel", [OpenCodeEdit, OpenCodeApplyPatch])
+    async def test_offering_only_edit_or_apply_patch_sends_the_edit_permission(
+        self, sentinel: Any
+    ) -> None:
+        handler, script = playing([assistant_open("m1"), assistant_completed("m1")])
+        config = {
+            "instructions": "Be brief.",
+            "model": {"name": "m"},
+            "provider": {"name": "Acme"},
+            "tools": {"change": {"name": "change", "type": "function"}},
+        }
+        await _drain(
+            await handler.stream(config, "hi", _wrapped({"change": sentinel}), None)
+        )
+        assert script.session_bodies[-1]["permission"] == [
+            {"permission": "*", "action": "deny", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*"},
+        ]
+
+    async def test_skill_is_denied_unless_it_is_offered(self) -> None:
+        handler, script = playing([assistant_open("m1"), assistant_completed("m1")])
+        config = {
+            "instructions": "Be brief.",
+            "model": {"name": "m"},
+            "provider": {"name": "Acme"},
+            "tools": {
+                "run_shell": {"name": "run_shell", "type": "function"},
+                "load_skill": {"name": "load_skill", "type": "function"},
+            },
+        }
+        await _drain(
+            await handler.stream(
+                config, "hi", _wrapped({"run_shell": OpenCodeBash}), None
+            )
+        )
+        denied = script.session_bodies[-1]["permission"]
+        assert {"permission": "skill", "action": "allow", "pattern": "*"} not in denied
+        assert denied == [
+            {"permission": "*", "action": "deny", "pattern": "*"},
+            {"permission": "bash", "action": "allow", "pattern": "*"},
+        ]
+
+        await _drain(
+            await handler.stream(
+                config, "hi", _wrapped({"load_skill": OpenCodeSkill}), None
+            )
+        )
+        assert script.session_bodies[-1]["permission"] == [
+            {"permission": "*", "action": "deny", "pattern": "*"},
+            {"permission": "skill", "action": "allow", "pattern": "*"},
         ]
 
     async def test_a_bridge_that_does_not_connect_fails_the_call(self) -> None:
