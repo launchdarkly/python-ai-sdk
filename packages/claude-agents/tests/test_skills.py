@@ -32,10 +32,13 @@ from launchdarkly_ai_claude_agents import ClaudeRead, create_claude_agents_handl
 from launchdarkly_ai_claude_agents.experimental.skills import (
     create_claude_agents_skills_handler,
 )
-from launchdarkly_ai_server import NATIVE_TOOL_KEY, config, init_client, shutdown
-from launchdarkly_ai_server.experimental.skills import (
+from launchdarkly_ai_server import (
+    NATIVE_TOOL_KEY,
     InMemorySkillStore,
+    config,
+    init_client,
     set_skill_store,
+    shutdown,
 )
 
 # ---------------------------------------------------------------------------

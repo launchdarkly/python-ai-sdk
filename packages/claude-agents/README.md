@@ -139,8 +139,7 @@ asyncio.run(main())
 
 ```python
 import os
-from launchdarkly_ai_server import config
-from launchdarkly_ai_server.experimental.skills import FDv2SkillStore, set_skill_store
+from launchdarkly_ai_server import FDv2SkillStore, config, set_skill_store
 from launchdarkly_ai_claude_agents.experimental.skills import (
     create_claude_agents_skills_handler,
 )
