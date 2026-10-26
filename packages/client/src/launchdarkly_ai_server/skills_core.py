@@ -3,7 +3,7 @@ Agent Skills internals shared by ``skills`` and ``skills_fs``: the store
 interface and configured store, telemetry, integrity verification, and store
 resolution.
 
-Package-internal except ``SkillStore``, which ``experimental.skills`` re-exports. This
+Package-internal except ``SkillStore``, which the package root re-exports. This
 module imports neither ``skills`` nor ``skills_fs``.
 
 **Everything a store returns is untrusted.** Key, version, size and content hash
@@ -94,7 +94,7 @@ INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode)
 
 NO_STORE_MESSAGE = (
     "No skill store is configured, so skill content cannot be retrieved. Configure "
-    "one with set_skill_store(store) from launchdarkly_ai_server.experimental.skills "
+    "one with set_skill_store(store) from launchdarkly_ai_server "
     "— FDv2SkillStore receives content from LaunchDarkly, and InMemorySkillStore is "
     "available for local development and testing."
 )

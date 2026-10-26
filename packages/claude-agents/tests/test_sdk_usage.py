@@ -1,21 +1,33 @@
 """Tests for TESTING.md §3.27 — claude-agents."""
 
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from claude_agent_sdk import ResultMessage
 
+import launchdarkly_ai_claude_agents.handler as handler_mod
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_claude_agents import (
     claude_agents,
     claude_graph,
     create_claude_agents_handler,
+    create_claude_agents_skills_handler,
     to_claude_agents,
 )
 from launchdarkly_ai_claude_agents._version import PACKAGE_NAME
 from launchdarkly_ai_claude_agents._version import __version__ as PACKAGE_VERSION
-from launchdarkly_ai_server import SDK_INFO_CONTEXT, __version__, init_client, shutdown
+from launchdarkly_ai_server import (
+    SDK_INFO_CONTEXT,
+    InMemorySkillStore,
+    __version__,
+    init_client,
+    set_skill_store,
+    shutdown,
+)
 
 CONTEXT = {"kind": "user", "key": "user-1"}
 
@@ -55,6 +67,11 @@ async def client() -> Any:
         ("claude-agents.createClaudeAgentsHandler", create_claude_agents_handler),
         ("claude-agents.claudeGraph", lambda: claude_graph("k")),
         ("claude-agents.toClaudeAgents", lambda: to_claude_agents(None)),
+        # Its own ID, and not also the core factory's.
+        (
+            "claude-agents.createClaudeAgentsSkillsHandler",
+            create_claude_agents_skills_handler,
+        ),
     ],
 )
 async def test_helper_sends_one_usage_event(
@@ -118,6 +135,54 @@ async def test_native_adapter_invoke_reports_only_the_adapter(
     with pytest.raises(ValueError, match="disabled"):
         await runner.invoke("q")
     assert _helpers(client) == ["claude-agents.toClaudeAgents"]
+
+
+_SKILL_BODY = "---\nname: a\n---\nSkill a.\n"
+_SKILLS_CONFIG: dict[str, Any] = {
+    "model": {"name": "claude-opus-4-5"},
+    "provider": {"name": "Anthropic"},
+    "instructions": "You are helpful.",
+    "skills": [{"key": "a", "version": 1}],
+}
+
+
+async def _fake_query(**_kwargs: Any) -> Any:
+    yield ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="sess-1",
+        usage={"input_tokens": 3, "output_tokens": 2},
+        result="done",
+    )
+
+
+@pytest.mark.parametrize("path", ["invoke", "stream"])
+async def test_skills_run_reports_only_the_factory(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
+) -> None:
+    """A run with skills reads the variation's references and writes the skills on the
+    customer's behalf. They never called ``skill_refs`` or ``write_skills``, so neither
+    ``client.skillRefs`` nor ``client.writeSkills`` is sent for them."""
+    store = InMemorySkillStore()
+    store.put(
+        {
+            "key": "a",
+            "version": 1,
+            "content": _SKILL_BODY,
+            "contentHash": hashlib.sha256(_SKILL_BODY.encode()).hexdigest(),
+        }
+    )
+    set_skill_store(store)
+    monkeypatch.setattr(handler_mod, "query", _fake_query)
+    handler = create_claude_agents_skills_handler(skills_temp_dir=tmp_path)
+    if path == "invoke":
+        await handler(_SKILLS_CONFIG, "q", {})
+    else:
+        await _drain(await handler.stream(_SKILLS_CONFIG, "q", {}))
+    assert _helpers(client) == ["claude-agents.createClaudeAgentsSkillsHandler"]
 
 
 async def test_held_helper_flushes_with_its_package() -> None:

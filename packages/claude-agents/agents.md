@@ -30,6 +30,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 | `src/launchdarkly_ai_claude_agents/graph.py` | `claude_graph()` convenience wrapper around `graph()` |
 | `src/launchdarkly_ai_claude_agents/native_graph.py` | `to_claude_agents()` native graph adapter |
 | `src/launchdarkly_ai_claude_agents/builtins.py` | Pre-constructed `NativeTool` sentinels for Claude built-in tools |
+| `src/launchdarkly_ai_claude_agents/skills.py` | `create_claude_agents_skills_handler()`, exported from the package root |
 | `src/launchdarkly_ai_claude_agents/__init__.py` | Package exports |
 | `src/launchdarkly_ai_claude_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
@@ -39,15 +40,21 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 
 ```python
 # Factory — returns a ProviderHandler with provides_for attached
-def create_claude_agents_handler() -> ProviderHandler: ...
+def create_claude_agents_handler(
+    *,
+    capture_content: bool | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    setting_sources: list[SettingSource] | None = None,
+) -> ProviderHandler: ...
 
-# Convenience wrapper — equivalent to config(key=config_key, handler=create_claude_agents_handler()).invoke(user_input, context)
-def claude_agents(config_key: str, user_input: str, context: dict, **kwargs) -> ProviderResponse: ...
+# Convenience wrapper — equivalent to config(key=config_key, handler=create_claude_agents_handler(cwd=cwd, setting_sources=setting_sources)).invoke(user_input, context)
+def claude_agents(config_key: str, user_input: str, context: dict, *, cwd=None, setting_sources=None, **kwargs) -> ProviderResponse: ...
 
-# Graph convenience wrapper — equivalent to graph(key, options, handlers=[create_claude_agents_handler()])
-def claude_graph(key: str, options: dict | None = None): ...
+# Graph convenience wrapper — equivalent to graph(key, handlers=[create_claude_agents_handler(cwd=cwd, setting_sources=setting_sources)], **options)
+def claude_graph(key: str, *, cwd=None, setting_sources=None, **options): ...
 
-# Native graph adapter — builds a Claude code-agents graph from a resolved GraphDefinition
+# Native graph adapter — builds a Claude code-agents graph from a resolved GraphDefinition.
+# opts: context, tool_handlers, and the host options cwd and setting_sources
 def to_claude_agents(def_promise: Awaitable[dict], opts: dict | None = None): ...
 
 # NativeTool sentinels for Claude Code built-in capabilities
@@ -98,6 +105,14 @@ Tools are delivered via an in-process MCP server, not as raw JSON schema defs. T
 5. Allowed tools are prefixed: `mcp__tool-mcp__<tool_name>`.
 
 If `config.tools` is absent, the MCP server is not created and `allowed_tools` is an empty list.
+
+**`tools` is always sent, and it is `[]` when the config attaches no `NativeTool`.** The explicit empty list switches every Claude Code built-in off. Omitting the key would leave the Agent SDK default, the full built-in set, on every run, and the read-only tools in it need no permission. A config turns a built-in on by attaching its sentinel (`ClaudeRead`, `ClaudeBash`, …). User-defined tools go through the MCP server and are not governed by `tools`. `to_claude_agents` follows the same rule.
+
+### 2a. Host options (`cwd`, `setting_sources`)
+
+`create_claude_agents_handler(cwd=..., setting_sources=...)` takes two trusted, app-supplied options and passes them to every `query()` call, blocking and streaming. `_options_parameters` forwards only the allowlisted model and run settings from `model.parameters`, and both keys are in `_CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS`, so a config can neither set nor override them. **`setting_sources` is always sent, `[]` unless the application gives sources**: the Agent SDK reads `None` as "load every source", which put the host's plugins, skills, hooks, permission rules and `CLAUDE.md` into every run (AIC-3584). `[]` still lets the SDK read the managed-settings policy tier. `cwd` is sent only when given. Settings-file `env` (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX`, proxy variables), `apiKeyHelper` and `model` come from those sources too, so `[]` drops them; the README's migration note covers this.
+
+`claude_agents()` and `claude_graph()` take `cwd` and `setting_sources` keyword-only and build the handler with them, so neither reaches `config()` or `graph()`. `to_claude_agents()` reads them from `opts` and passes `_host_query_options(...)` to every node's `query()`, root and sub-agents. All four entry points share `_host_query_options`, so all four default to `[]`.
 
 ### 3. Agentic Loop
 
@@ -153,6 +168,20 @@ On error: `span.record_exception(exc)`, status set to ERROR, span ended, error r
 `session_id` from the `init` message when the caller supplied none. Write-if-absent: the caller
 id wins. An app that opens a fresh CLI session per turn and re-feeds history must pass its own
 conversation id, or each turn becomes its own conversation.
+
+### 5. Agent Skills (`skills.py`)
+
+`create_claude_agents_skills_handler(...)` is exported from the package root. It reports `claude-agents.createClaudeAgentsSkillsHandler` and builds the handler through `_create_claude_agents_handler(..., _prepare=...)`.
+
+`_prepare` is a package-internal hook, a private keyword argument of the internal factory only, so `create_claude_agents_handler`'s signature stays unchanged. It runs at the start of every invoke and stream, inside the `invoke_agent` span, and returns `None` (the run is exactly the core handler's) or a `QueryPreparation`. That holds extra `query()` options, extra built-ins appended to `tools` (never to `allowed_tools`), and a `cleanup` that both paths await last in their `finally`.
+
+For a variation with skills, `_prepare_skills`:
+
+1. `tempfile.mkdtemp(prefix="ld-skills-", dir=skills_temp_dir)`, then `os.path.realpath`, then `os.mkdir(<dir>/launchdarkly)`.
+2. `write_skills(skill_refs(config), <dir>/launchdarkly/skills, prune=False)`. A report that is not `ok` raises, naming each failed key, and `query()` is never called.
+3. Returns `plugins=[{"type": "local", "path": <dir>/launchdarkly}]`, `skills=["launchdarkly:<key>", ...]` and `extra_builtins=["Skill"]`.
+
+The plugin's name comes from its directory's base name, so no manifest is written. The skill names are qualified because a bare name would also match a host plugin's skill. `claude-agent-sdk`'s `SdkPluginConfig` has no `skipMcpDiscovery` key, so unlike TypeScript the plugin entry carries only `type` and `path`. The directory holds no `.mcp.json`, so there is nothing to discover. `setting_sources` is never `None` here, because the core handler always sends it. With `skills` set and `setting_sources=None`, `claude-agent-sdk` sends `--setting-sources=user,project`. The tool hooks are installed whenever `Skill` is in `tools`, so a `Skill` call gets an `execute_tool Skill` span. The directory is removed with a synchronous `shutil.rmtree`, so a cancellation during teardown cannot interrupt it. There's no shared root, no watcher and no prune: every run writes exactly its own variation's references, which is also how detaching a skill takes effect.
 
 ---
 

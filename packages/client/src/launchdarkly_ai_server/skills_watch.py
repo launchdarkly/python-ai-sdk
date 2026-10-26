@@ -3,10 +3,11 @@ Agent Skills — keep skills on disk in sync as delivery changes.
 
 ``write_skills`` is a one-shot reconcile of what the store holds now.
 ``watch_skills`` re-runs it whenever the store reports a change. With ``"*"``,
-a skill revoked in LaunchDarkly is removed from disk within a debounce interval
-rather than at the next restart. An explicit list is fixed: a skill the store
-answers ``absent`` for keeps its files and reports an error, and a config change
-that unpins a skill or moves it to a new version is not seen.
+a skill revoked in LaunchDarkly is removed from disk once delivery has been
+quiet for a debounce interval, rather than at the next restart. An explicit
+list is fixed: a skill the store answers ``absent`` for keeps its files and
+reports an error, and a config change that unpins a skill or moves it to a new
+version is not seen.
 
 ``on_unavailable="keep"`` remains the default, so an outage never deletes the
 application's skill files.
@@ -22,16 +23,18 @@ import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from .sdk_usage import report_usage
 from .skills_core import SKILL_OBJECT_KIND, get_store
-from .skills_fs import OnUnavailable, write_skills
+from .skills_fs import OnUnavailable, _write_skills
 from .types import ReconcileReport, Skill, SkillReference
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DEBOUNCE_SECONDS = 0.5
 """
-Default debounce, in seconds: how long to wait after a change before
-reconciling, so a payload of many skills triggers one reconcile, not one each.
+Default debounce, in seconds: how long delivery must stay quiet after a change
+before reconciling, so a payload of many skills triggers one reconcile, not one
+each.
 """
 
 
@@ -104,17 +107,24 @@ class SkillWatcher:
                 continue
             if self._stop.is_set():
                 return
-            # Clear before the debounce so a change arriving mid-debounce
-            # triggers another pass instead of being swallowed by this one.
-            self._wake.clear()
-            if self._stop.wait(self._debounce):
-                return
+            # A trailing debounce: wait until a whole window passes with no new
+            # change, so a burst spread across the window reconciles once. The
+            # reconcile reads the store after the last window, so it sees every
+            # change in the burst. Clearing before each window, not after the
+            # reconcile, means a change arriving during the reconcile itself
+            # still schedules one more pass instead of being swallowed by it.
+            while True:
+                self._wake.clear()
+                if self._stop.wait(self._debounce):
+                    return
+                if not self._wake.is_set():
+                    break
             self._reconcile_once()
 
     def _reconcile_once(self) -> None:
         try:
             report = asyncio.run(
-                write_skills(
+                _write_skills(
                     self._request,
                     self._root,
                     prune=self._prune,
@@ -205,8 +215,9 @@ async def watch_skills(
     the store's lifetime.
 
     Args:
-        debounce: Seconds to wait after a change before reconciling. Must be a
-            non-negative finite number.
+        debounce: Seconds delivery must stay quiet after a change before
+            reconciling; each further change restarts the wait, so a burst
+            reconciles once. Must be a non-negative finite number.
         on_reconcile: Called with each re-reconcile's report (not the initial
             one). Exceptions it raises are logged and do not stop the watcher.
 
@@ -224,11 +235,12 @@ async def watch_skills(
             ``add_listener`` (use ``write_skills`` for a one-shot reconcile).
         ValueError: If *debounce* is negative, ``NaN``, or infinite.
     """
+    report_usage("client.watchSkills")
     store = get_store()
     if store is None:
         raise RuntimeError(
             "watch_skills needs a configured skill store. Configure one with "
-            "set_skill_store(store) from launchdarkly_ai_server.experimental.skills."
+            "set_skill_store(store) from launchdarkly_ai_server."
         )
     add_listener = getattr(store, "add_listener", None)
     if not callable(add_listener):
@@ -260,7 +272,7 @@ async def watch_skills(
     )
     try:
         # Run on the caller's task, so a bad root raises to the caller.
-        report = await write_skills(
+        report = await _write_skills(
             skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
         )
     except BaseException:

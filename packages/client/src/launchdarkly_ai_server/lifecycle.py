@@ -290,9 +290,9 @@ async def init_client(
         )
 
     config_kwargs: dict[str, str] = {}
-    base_uri = opts.get("baseUri") or os.environ.get("LD_BASE_URI")
-    stream_uri = opts.get("streamUri") or os.environ.get("LD_STREAM_URI")
-    events_uri = opts.get("eventsUri") or os.environ.get("LD_EVENTS_URI")
+    base_uri = opts.get("baseUri") or _env("LD_BASE_URI")
+    stream_uri = opts.get("streamUri") or _env("LD_STREAM_URI")
+    events_uri = opts.get("eventsUri") or _env("LD_EVENTS_URI")
     if base_uri:
         config_kwargs["base_uri"] = base_uri
     if stream_uri:
@@ -401,8 +401,8 @@ async def shutdown() -> None:
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also runs the registered shutdown hooks, which clear the state of any
-    experimental feature in use, and restores process-wide SDK defaults from
+    Also runs the registered shutdown hooks, which clear feature state such as
+    the configured skill store, and restores process-wide SDK defaults from
     ``configure``.
 
     When telemetry was running, this also releases the process-global tracer
