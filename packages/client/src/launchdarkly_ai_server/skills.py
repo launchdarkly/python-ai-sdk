@@ -204,7 +204,8 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
     """
     Returns the skill references attached to a resolved AI Config.
 
-    Pure: no network, store, or telemetry. Returns ``[]`` when the config has no
+    Pure apart from the one-time helper usage event (``$ld:ai:sdk:usage``): no
+    network, store, or skills telemetry. Returns ``[]`` when the config has no
     ``skills`` field. Typical use: ``await get_skills(skill_refs(config))``.
 
     The config parser does not validate ``skills``, so a malformed field does

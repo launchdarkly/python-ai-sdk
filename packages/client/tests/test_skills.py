@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
+import launchdarkly_ai_server.sdk_usage as sdk_usage_module
 import launchdarkly_ai_server.skills as skills_module
 from launchdarkly_ai_server import (
     InMemorySkillStore,
@@ -257,7 +258,7 @@ class TestSkillTypes:
 
 
 class TestSkillRefs:
-    """Pure projection of the config's skills array."""
+    """Projection of the config's skills array; no store, client, or skills signal."""
 
     def _config(self, **extra: Any) -> dict[str, Any]:
         base: dict[str, Any] = {
@@ -359,11 +360,20 @@ class TestSkillRefs:
         refs = skill_refs(self._config(skills=[{"key": "a" * 256, "version": 1}]))
         assert refs == [SkillReference(key="a" * 256, version=1)]
 
-    def test_requires_no_client_or_store(self, mock_ld_client: Any) -> None:
-        """No store configured, no client initialized — still a pure projection."""
-        refs = skill_refs(self._config(skills=[{"key": "a", "version": 2}]))
-        assert refs == [SkillReference(key="a", version=2)]
-        mock_ld_client.track.assert_not_called()
+    def test_requires_no_client_or_store(self) -> None:
+        """No store configured, no client initialized: skill_refs still projects,
+        and its usage event is held until init (delivery: test_sdk_usage.py)."""
+        assert lifecycle_module._client is None
+        with pytest.raises(RuntimeError):
+            require_store()
+        # Usage state is not part of reset_skill_state; clear it so "held" is this call's.
+        sdk_usage_module.reset_sdk_usage()
+        try:
+            refs = skill_refs(self._config(skills=[{"key": "a", "version": 2}]))
+            assert refs == [SkillReference(key="a", version=2)]
+            assert list(sdk_usage_module._pending) == ["client.skillRefs"]
+        finally:
+            sdk_usage_module.reset_sdk_usage()
 
 
 SKILLS_SURFACE = frozenset(

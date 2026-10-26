@@ -207,7 +207,9 @@ through an injectable store, and materialized onto disk for agent runtimes to di
 Three layers, in increasing order of blast radius:
 
 1. **Reference discovery** — `skill_refs(config)` projects the config's `skills` array into
-   typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
+   typed `SkillReference` values. Needs no client or store, and makes no network call. Its
+   only side effect is the one-time helper usage event (see the Telemetry seam); it records
+   no skills signal.
    It also validates the array, and **fails closed**: a present but malformed field
    (including `null`, or one bad entry) raises `ValueError` rather than returning a partial
    list that would authorize a prune. So does a config that is not a dict, including the
@@ -587,8 +589,15 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
 Skills telemetry goes through a private emitter with one method, `record(signal,
 properties)`, whose default is a **no-op** — nothing leaves the process in this release. Do
 not use `client.track()`: it needs an LD context, spends the customer's event volume, lands
-in their data export, and is silenced by offline mode. No LD context is involved anywhere in
-this feature.
+in their data export, and is silenced by offline mode. No skills signal carries an LD context.
+
+**The one exception is the SDK-wide helper usage event.** Each public skills helper calls
+`report_usage("client.<helper>")` (`sdk_usage.py`), which sends `$ld:ai:sdk:usage` through
+`client.track()` with `SDK_INFO_CONTEXT`, once per helper per client, holding it until init
+when no client exists yet. The SDK's other public helpers (`config`, `graph`, judges, handler
+factories) report the same event, and it carries the helper's name and package, never a skill key, version, content or hash. It is
+not a skills signal: do not remove it as a violation of the rule above, and do not add skill
+data to it.
 
 Exactly three signals exist, and the list is an **allowlist, not a floor**:
 
@@ -982,7 +991,7 @@ a conversation is out of reach at this layer either way.
 - Do not weaken the `parse_ai_config` validation — handler packages rely on `config` being valid when they receive it.
 - `parse_usage` must continue to accept `input_tokens/output_tokens`, `inputTokens/outputTokens`, and `input/output` as all existing handlers return one of these variants.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
-- Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
+- Do not route skills telemetry through `client.track()`, and do not give any skills signal an LD context. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions. The one `client.track()` path is the SDK-wide helper usage event (`report_usage`, see "Telemetry seam"); it carries no skill data and is not a skills signal.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
 - Do not rename `ld.skills.integrity_failure` in one language only or without a changelog entry, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
 - Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
