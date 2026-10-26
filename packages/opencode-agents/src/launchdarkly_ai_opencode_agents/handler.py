@@ -150,6 +150,10 @@ class _Reducer:
         ] = []
         self._part_text: dict[str, str] = {}
         self._usage_ids: set[str] = set()
+        # Closed chat spans, including completions that carried no tokens.
+        # _usage_ids only records a message once tokens exist, so it cannot
+        # be the guard against opening a second chat for the same id.
+        self._closed_chat_ids: set[str] = set()
         self._input = 0
         self._output = 0
         self._cache_read = 0
@@ -478,12 +482,14 @@ class _Reducer:
         if isinstance(message_id, str) and isinstance(role, str):
             self._roles[message_id] = role
             if role == "assistant":
-                # A second message.updated that already carried tokens closed
-                # this chat span. Opening again would export a second chat
-                # for the same id. _usage_ids is that "already recorded" set.
+                # A completed message.updated closes this chat span and
+                # removes it from _model_spans. A later completion for the
+                # same id, including one with no tokens, must not open
+                # another. _usage_ids is not that set: it is filled only
+                # when the completion carries a tokens mapping.
                 if (
                     message_id not in self._model_spans
-                    and message_id not in self._usage_ids
+                    and message_id not in self._closed_chat_ids
                 ):
                     self._model_spans[message_id] = start_model_span(
                         self._config, self._parent
@@ -522,6 +528,7 @@ class _Reducer:
                 self._add_usage(tokens)
                 self._usage_ids.add(message_id)
         self._close_model_span(message_id, info.get("tokens"))
+        self._closed_chat_ids.add(message_id)
         return events
 
     def _close_model_span(

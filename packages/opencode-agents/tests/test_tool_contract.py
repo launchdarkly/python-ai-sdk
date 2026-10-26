@@ -770,6 +770,25 @@ class TestToolSpans:
         assert len(chat_spans) == 1
         assert chat_spans[0].ended == 1
 
+    async def test_a_tokenless_second_completion_does_not_open_another_chat_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tracer = self._tracer(monkeypatch)
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                assistant_completed("m1"),
+                assistant_completed("m1", tokens={"input": 4, "output": 2}),
+            ]
+        )
+        seen = [event async for event in await handler.stream({}, "hi", None, None)]
+        chat_spans = [s for s in tracer.spans if s.name.startswith("chat ")]
+        assert len(chat_spans) == 1
+        assert chat_spans[0].ended == 1
+        # The closed span is not rewritten. Tokens on the later completion
+        # still count once, on the run.
+        assert seen[-1]["usage"] == {"input_tokens": 4, "output_tokens": 2}
+
     async def test_cancelling_the_stream_marks_open_spans_cancelled(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
