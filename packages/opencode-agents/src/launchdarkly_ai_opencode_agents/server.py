@@ -180,6 +180,21 @@ async def register_mcp_bridge(
         )
         if response.status_code >= 400:
             raise OpenCodeHTTPError(f"POST /mcp -> {response.status_code}")
+        # HTTP 200 is the status map MCP.add stored, not a connection. The
+        # route returns that map keyed by server name; a server whose status
+        # is anything but "connected" is not callable.
+        try:
+            reported = response.json()
+        except ValueError as exc:
+            raise OpenCodeHTTPError(
+                "POST /mcp returned a body that is not JSON"
+            ) from exc
+        entry = reported.get(name) if isinstance(reported, dict) else None
+        state = entry.get("status") if isinstance(entry, dict) else None
+        if state != "connected":
+            raise OpenCodeHTTPError(
+                f"POST /mcp registered {name!r} but its status is {state!r}"
+            )
 
 
 async def disconnect_mcp_bridge(*, base_url: str, password: str, name: str) -> None:

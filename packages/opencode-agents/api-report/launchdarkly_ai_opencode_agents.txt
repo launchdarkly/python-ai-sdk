@@ -6,7 +6,6 @@ OpenCodeBash = NativeTool('bash')
 OpenCodeEdit = NativeTool('edit')
 OpenCodeGlob = NativeTool('glob')
 OpenCodeGrep = NativeTool('grep')
-OpenCodeList = NativeTool('list')
 OpenCodeRead = NativeTool('read')
 OpenCodeSessionError(Exception)  [class]
 OpenCodeSkill = NativeTool('skill')

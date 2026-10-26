@@ -19,6 +19,7 @@ MCP client.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -31,14 +32,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from opentelemetry.trace import StatusCode as SpanStatusCode
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_opencode_agents import (
     OpenCodeBash,
     OpenCodeWebFetch,
+    OpenCodeWrite,
     create_opencode_handler,
 )
 from launchdarkly_ai_opencode_agents.handler import _build_tool_ruleset, _plan_tools
+from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
 from launchdarkly_ai_server import NativeTool, wrap_tool_handlers
 
 CONTEXT = {"kind": "user", "key": "user-1"}
@@ -134,7 +138,13 @@ def assistant_completed(
 class Script:
     """A fake ``opencode`` executable. The handler starts and stops it."""
 
-    def __init__(self, events: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        mode: str = "script",
+        mcp_status: str = "connected",
+    ) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="oc-fake-"))
         self.cwd = self.root / "work"
         self.cwd.mkdir()
@@ -144,7 +154,8 @@ class Script:
         self.state.mkdir()
         self.spec_path = self.root / "spec.json"
         self.spec_path.write_text(
-            json.dumps({"mode": "script", "events": events}), encoding="utf-8"
+            json.dumps({"mode": mode, "events": events, "mcp_status": mcp_status}),
+            encoding="utf-8",
         )
         _scripts.append(self)
 
@@ -342,6 +353,17 @@ class TestPlanTools:
             {"permission": "*", "action": "deny", "pattern": "*"}
         ]
 
+    def test_write_and_apply_patch_are_the_edit_permission(self) -> None:
+        assert _build_tool_ruleset(["write"]) == [
+            {"permission": "*", "action": "deny", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*"},
+        ]
+        # All three tool ids are one grant, sent once.
+        assert _build_tool_ruleset(["edit", "write", "apply_patch"]) == [
+            {"permission": "*", "action": "deny", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*"},
+        ]
+
 
 class TestSessionPermission:
     """What the handler actually sends OpenCode, through the fake server."""
@@ -365,6 +387,41 @@ class TestSessionPermission:
         assert {"permission": "bash", "action": "allow", "pattern": "*"} in permission
         # Only the offered tool is allowed -- not every config tool.
         assert len(permission) == 2
+
+    async def test_offering_only_write_sends_the_edit_permission(self) -> None:
+        handler, script = playing([assistant_open("m1"), assistant_completed("m1")])
+        config = {
+            "instructions": "Be brief.",
+            "model": {"name": "m"},
+            "provider": {"name": "Acme"},
+            "tools": {"save": {"name": "save", "type": "function"}},
+        }
+        await _drain(
+            await handler.stream(config, "hi", _wrapped({"save": OpenCodeWrite}), None)
+        )
+        permission = script.session_bodies[-1]["permission"]
+        assert permission == [
+            {"permission": "*", "action": "deny", "pattern": "*"},
+            {"permission": "edit", "action": "allow", "pattern": "*"},
+        ]
+
+    async def test_a_bridge_that_does_not_connect_fails_the_call(self) -> None:
+        async def get_weather(args: dict[str, Any]) -> str:
+            return f"sunny in {args['city']}"
+
+        script = Script(
+            [assistant_open("m1"), assistant_completed("m1")], mcp_status="failed"
+        )
+        handler = create_opencode_handler(**script.handler_args())
+        with pytest.raises(OpenCodeHTTPError, match="its status is 'failed'"):
+            await _drain(
+                await handler.stream(
+                    _CONFIG_WITH_TOOLS,
+                    "hi",
+                    _wrapped({"get_weather": get_weather}),
+                    None,
+                )
+            )
 
     async def test_a_callable_tool_registers_an_mcp_bridge_then_disconnects(
         self,
@@ -589,9 +646,7 @@ class TestToolSpans:
         assert span.attributes["gen_ai.tool.name"] == "run_shell"
         assert span.attributes["gen_ai.tool.call.id"] == "c1"
         assert span.ended == 1
-        assert (
-            span.status != "ERROR_SENTINEL"
-        )  # set_status was called with OK, not asserted here
+        assert span.status == SpanStatusCode.OK
         # The NativeTool's own tracking stub fired exactly once.
         tool_call_events = [
             call
@@ -643,6 +698,51 @@ class TestToolSpans:
         assert chat_spans[0].attributes["gen_ai.usage.output_tokens"] == 5
         assert chat_spans[1].attributes["gen_ai.usage.input_tokens"] == 3
         assert all(span.ended == 1 for span in chat_spans)
+
+    async def test_a_second_completion_does_not_open_another_chat_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tracer = self._tracer(monkeypatch)
+        handler, _script = playing(
+            [
+                assistant_open("m1"),
+                assistant_completed("m1", tokens={"input": 10, "output": 5}),
+                assistant_completed("m1", tokens={"input": 10, "output": 5}),
+            ]
+        )
+        await _drain(await handler.stream({}, "hi", None, None))
+        chat_spans = [s for s in tracer.spans if s.name.startswith("chat ")]
+        assert len(chat_spans) == 1
+        assert chat_spans[0].ended == 1
+
+    async def test_cancelling_the_stream_marks_open_spans_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tracer = self._tracer(monkeypatch)
+        script = Script([], mode="open")
+        handler = create_opencode_handler(**script.handler_args())
+
+        async def consume() -> None:
+            async for _event in await handler.stream({}, "hi", None, None):
+                pass
+
+        task = asyncio.create_task(consume())
+        for _ in range(50):
+            if any(span.name.startswith("chat ") for span in tracer.spans):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("chat span never opened")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        chat_spans = [s for s in tracer.spans if s.name.startswith("chat ")]
+        assert len(chat_spans) == 1
+        assert chat_spans[0].attributes.get("launchdarkly.run.cancelled") is True
+        assert "launchdarkly.stream.abandoned" not in chat_spans[0].attributes
+        roots = [s for s in tracer.spans if s.name == "invoke_agent"]
+        assert roots[0].attributes.get("launchdarkly.run.cancelled") is True
+        assert "launchdarkly.stream.abandoned" not in roots[0].attributes
 
     async def test_abandoning_the_stream_marks_open_spans_abandoned_not_failed(
         self, monkeypatch: pytest.MonkeyPatch, mock_ld_client: MagicMock

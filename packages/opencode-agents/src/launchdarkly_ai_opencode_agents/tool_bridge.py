@@ -175,7 +175,9 @@ class ToolBridge:
         server = self._server
         self._server = None
         if server is not None:
-            server.shutdown()
+            # shutdown() waits for the serve thread, up to the poll interval.
+            # Doing that on the event loop stalls every other task on it.
+            await asyncio.to_thread(server.shutdown)
             server.server_close()
         thread = self._thread
         self._thread = None

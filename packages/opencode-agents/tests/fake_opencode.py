@@ -242,7 +242,10 @@ class _Server:
                 self.mcp_calls.append(parsed)
                 self._write()
                 name = parsed.get("name", "")
-                return 200, {"status": {name: {"status": "connected"}}}
+                # The real route returns MCP.add's status map itself, keyed
+                # by server name, not a wrapper around that map.
+                status = self.spec.get("mcp_status", "connected")
+                return 200, {name: {"status": status}}
             if path.endswith("/disconnect") and path.startswith("/mcp/"):
                 name = path[len("/mcp/") : -len("/disconnect")]
                 self.mcp_disconnects.append(name)

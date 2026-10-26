@@ -5,12 +5,15 @@ corresponding OpenCode built-in capability for one call. Every other
 built-in, including one not named here, is denied for that call: an AI
 Config variation with no tools gets a model with no tools at all.
 
-Ids verified against the OpenCode source at tag ``v1.18.4``
-(``packages/opencode/src/tool/*.ts``). ``OpenCodeList`` is the one
-exception: it mirrors Vega's own ``_PINNABLE_BUILTIN_TOOLS`` pin
-(``ai/vega-agentcore/vega_agentcore/opencode_config.py``) even though that
-tag ships no ``list`` tool file. Passing a name OpenCode does not currently
-serve is harmless — it simply never matches a tool the model is offered.
+Ids are the tool files under ``packages/opencode/src/tool/`` at tag
+``v1.18.4``. That tag has no ``list`` tool, so this package does not export
+one.
+
+``OpenCodeWrite`` and ``OpenCodeApplyPatch`` are the same grant as
+``OpenCodeEdit``. OpenCode's ``Permission.disabled`` remaps ``write`` and
+``apply_patch`` onto the single ``edit`` permission before it matches a
+rule, so an allow for any one of the three allows all three. The session
+ruleset sends ``edit``.
 
 Example::
 
@@ -34,7 +37,6 @@ OpenCodeEdit = NativeTool("edit")
 OpenCodeWrite = NativeTool("write")
 OpenCodeGlob = NativeTool("glob")
 OpenCodeGrep = NativeTool("grep")
-OpenCodeList = NativeTool("list")
 OpenCodeTask = NativeTool("task")
 OpenCodeSkill = NativeTool("skill")
 OpenCodeTodoWrite = NativeTool("todowrite")

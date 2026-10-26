@@ -314,7 +314,6 @@ class TestSurface:
             "OpenCodeEdit",
             "OpenCodeGlob",
             "OpenCodeGrep",
-            "OpenCodeList",
             "OpenCodeRead",
             "OpenCodeSessionError",
             "OpenCodeSkill",

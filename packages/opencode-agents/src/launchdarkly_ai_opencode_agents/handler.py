@@ -478,7 +478,13 @@ class _Reducer:
         if isinstance(message_id, str) and isinstance(role, str):
             self._roles[message_id] = role
             if role == "assistant":
-                if message_id not in self._model_spans:
+                # A second message.updated that already carried tokens closed
+                # this chat span. Opening again would export a second chat
+                # for the same id. _usage_ids is that "already recorded" set.
+                if (
+                    message_id not in self._model_spans
+                    and message_id not in self._usage_ids
+                ):
                     self._model_spans[message_id] = start_model_span(
                         self._config, self._parent
                     )
@@ -767,6 +773,19 @@ def _plan_tools(config: AiConfigRep, tool_handlers: dict[str, Any] | None) -> _T
     return plan
 
 
+#: ``Permission.disabled`` remaps these tool ids onto ``edit`` before
+#: ``findLast``. An allow rule whose permission is ``write`` or
+#: ``apply_patch`` never matches. An allow for ``edit`` enables all three.
+_EDIT_FAMILY = frozenset({"edit", "write", "apply_patch"})
+
+
+def _permission_for(name: str) -> str:
+    """The permission OpenCode actually matches for one offered tool id."""
+    if name in _EDIT_FAMILY:
+        return "edit"
+    return name
+
+
 def _build_tool_ruleset(offered_names: list[str]) -> list[dict[str, str]]:
     """OpenCode's session-level ``permission`` ruleset for one call's offered tools.
 
@@ -778,10 +797,19 @@ def _build_tool_ruleset(offered_names: list[str]) -> list[dict[str, str]]:
     opencode.json agent config's own static permission. An empty
     *offered_names* still sends the deny-all rule: a variation with no tools
     gets a model with no tools, not the host's default catalog.
+
+    ``write`` and ``apply_patch`` are not sent as their own permissions.
+    OpenCode remaps both onto ``edit`` before matching, so any of the three
+    emits one ``edit`` allow, and that one grant covers all three tools.
     """
     ruleset = [{"permission": "*", "action": "deny", "pattern": "*"}]
+    sent: set[str] = set()
     for name in offered_names:
-        ruleset.append({"permission": name, "action": "allow", "pattern": "*"})
+        permission = _permission_for(name)
+        if permission in sent:
+            continue
+        sent.add(permission)
+        ruleset.append({"permission": permission, "action": "allow", "pattern": "*"})
     return ruleset
 
 
@@ -859,6 +887,11 @@ class OpenCodeHandler(ProviderHandler):
         ended: set[int] = set()
         open_tool_spans: dict[str, Any] = {}
         open_model_spans: dict[str, Any] = {}
+        # GeneratorExit is a consumer who stopped reading (abandoned).
+        # CancelledError is a timeout or task.cancel(); except Exception
+        # does not see it, so the finally would otherwise stamp
+        # launchdarkly.stream.abandoned. cancelled wins in end_span_once.
+        cancelled = False
         provider_id, model_id = self._model(config if isinstance(config, dict) else {})
         system = _system_text(config, variables)
         prompt = _user_prompt(config, user_input, history, variables)
@@ -956,6 +989,9 @@ class OpenCodeHandler(ProviderHandler):
             if usage is not None:
                 done["usage"] = usage
             yield done
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as exc:
             close_open_spans(open_tool_spans, open_model_spans, exc)
             fail_span(span, exc, ended)
@@ -969,8 +1005,10 @@ class OpenCodeHandler(ProviderHandler):
                 await bridge.stop()
             if owned is not None:
                 await owned.stop()
-            abandon_open_spans(open_tool_spans, open_model_spans, ended)
-            end_span_once(span, ended)
+            abandon_open_spans(
+                open_tool_spans, open_model_spans, ended, cancelled=cancelled
+            )
+            end_span_once(span, ended, cancelled=cancelled)
 
     async def _call_impl(
         self,
