@@ -8,13 +8,17 @@ import re
 import time
 import types
 import uuid
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, TypedDict
 
 from agents import RunConfig
 
 from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
+    LDContext,
+    NativeGraphRunner,
+    NativeTool,
     compose_history,
     get_client,
     make_track_data,
@@ -64,10 +68,22 @@ def _instructions(node: GraphNode, variables: dict[str, Any]) -> str | None:
     )
 
 
+class LiteLLMNativeGraphOptions(TypedDict, total=False):
+    """Options for :func:`to_litellm_agents`."""
+
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+    context: LDContext
+    """LaunchDarkly context used for tracking events. Required for LD telemetry."""
+    model_factory: ModelFactory
+    """Builds the model for a node from its name and parameters. Defaults to ``LitellmModel``."""
+    base_url: str
+    api_key: str
+
+
 def to_litellm_agents(
-    definition: Any,
-    opts: dict[str, Any] | None = None,
-) -> Any:
+    definition: Awaitable[GraphDefinition],
+    opts: LiteLLMNativeGraphOptions | None = None,
+) -> NativeGraphRunner:
     report_usage("litellm-agents.toLiteLLMAgents", PACKAGE_NAME, __version__)
     options = opts or {}
 
@@ -311,4 +327,10 @@ def to_litellm_agents(
             if span:
                 span.end()
 
-    return types.SimpleNamespace(invoke=invoke)
+    # A class, not a SimpleNamespace, so mypy checks invoke against NativeGraphRunner.
+    _invoke = invoke
+
+    class _Runner:
+        invoke = staticmethod(_invoke)
+
+    return _Runner()

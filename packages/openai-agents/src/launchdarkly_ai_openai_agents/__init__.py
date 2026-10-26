@@ -9,10 +9,11 @@ from . import native_graph  # noqa: F401
 from ._version import PACKAGE_NAME, __version__
 from .graph import openai_graph
 from .handler import create_openai_agent_handler, openai_agents
-from .native_graph import to_openai_agents
+from .native_graph import OpenAINativeGraphOptions, to_openai_agents
 from .utils import build_output_type
 
 __all__ = [
+    "OpenAINativeGraphOptions",
     "build_output_type",
     "create_openai_agent_handler",
     "openai_agents",

@@ -453,6 +453,18 @@ class TestToolExecutionLoop:
                 await captured_fns[0](key="val")
 
     @pytest.mark.asyncio
+    async def test_native_tool_is_not_called(self) -> None:
+        # Offline evaluations pass a NativeTool through unwrapped; it is not callable.
+        from launchdarkly_ai_server import NativeTool
+
+        run = _built_tool(
+            {"web-search": {"description": "d", "parameters": {}}},
+            {"web-search": NativeTool("WebSearch")},
+        )
+        with pytest.raises(ValueError, match="No handler"):
+            await run(query="q")
+
+    @pytest.mark.asyncio
     async def test_tool_handler_throws_propagates(self) -> None:
         mocks = _make_langchain_mock()
         captured_fns: list[Any] = []

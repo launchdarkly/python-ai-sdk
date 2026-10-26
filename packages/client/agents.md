@@ -922,11 +922,13 @@ There is deliberately **no** `python-dotenv` here: `lifecycle.py` reads `os.envi
 
 Install with `pip install "launchdarkly-ai-server[otel]"`; see [OTel Setup](#otel-setup) for the endpoint variables.
 
-### Resolved dynamically, declared nowhere
+### Optional extra (`[project.optional-dependencies] ld`)
 
 | Package | Why |
 |---|---|
-| `launchdarkly-server-sdk` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. Undeclared because the BYOC path (`init_client(client=...)`) supplies its own client and should not have to install an unused SDK. Absent ⇒ a `RuntimeError` naming the `pip install`, only on the path that needs it. |
+| `launchdarkly-server-sdk>=9.18.3,<10` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. An extra, not a dependency, because the BYOC path (`init_client(client=...)`) supplies its own client and should not have to install an unused SDK. Declared at all so pip can resolve a compatible version: before the extra existed, nothing bounded it. Absent ⇒ a `RuntimeError` naming the `pip install`, only on the path that needs it. |
+
+Install with `pip install "launchdarkly-ai-server[ld]"`.
 
 ### Dev-only (workspace root `[dependency-groups] dev`) — the ones with a contract attached
 
@@ -994,7 +996,7 @@ a conversation is out of reach at this layer either way.
 ## Invariants to Preserve
 
 - Do not add dependencies on any `launchdarkly-ai-*` handler package. This package has no upward dependencies.
-- Do not add a hard dependency on `launchdarkly-server-sdk`. It must remain an optional peer, discovered via dynamic `importlib.import_module`.
+- Do not add a hard dependency on `launchdarkly-server-sdk`. It must remain optional (the `[ld]` extra), discovered via dynamic `importlib.import_module`.
 - Handler packages must import `LDContext` from `launchdarkly-ai-server` — not directly from any LD SDK.
 - Do not weaken the `parse_ai_config` validation — handler packages rely on `config` being valid when they receive it.
 - `parse_usage` must continue to accept `input_tokens/output_tokens`, `inputTokens/outputTokens`, and `input/output` as all existing handlers return one of these variants.

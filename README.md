@@ -96,15 +96,15 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 ### 1. Install
 
 ```bash
-pip install launchdarkly-ai-python launchdarkly-server-sdk launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-python[ld]" launchdarkly-ai-openai-messages
 ```
 
-`launchdarkly-ai-python` is a thin barrel that re-exports all of `launchdarkly-ai-server`. The base LaunchDarkly Python SDK is a peer dependency rather than a bundled one, so install `launchdarkly-server-sdk` alongside it. `init_client()` discovers it at runtime, or you can skip it entirely by passing a pre-initialized client with `init_client(client=my_client)`.
+`launchdarkly-ai-python` is a thin barrel that re-exports all of `launchdarkly-ai-server`. The base LaunchDarkly Python SDK is an optional dependency rather than a bundled one; the `[ld]` extra installs `launchdarkly-server-sdk`. `init_client()` discovers it at runtime, or you can skip it entirely by passing a pre-initialized client with `init_client(client=my_client)`.
 
 **With telemetry** (recommended for production) — traces export to the LaunchDarkly Observability dashboard:
 
 ```bash
-pip install "launchdarkly-ai-python[otel]" launchdarkly-server-sdk launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-python[ld,otel]" launchdarkly-ai-openai-messages
 ```
 
 No code changes are needed — `init_client()` detects whether the OTel packages are present at runtime and configures the tracer provider automatically. If they are absent, the SDK logs a one-time warning and continues normally.
@@ -571,7 +571,7 @@ When running inside `graph()`, every node's events carry the graph key, tool inv
 
 ### Optional dependencies
 
-The OpenTelemetry SDK packages are **optional** — detected at runtime via `importlib`. The LaunchDarkly server SDK (`launchdarkly-server-sdk`) is also an optional dependency; pass a pre-initialized client to `init_client(client=...)` if you bring your own.
+The OpenTelemetry SDK packages are **optional** — detected at runtime via `importlib`. The LaunchDarkly server SDK (`launchdarkly-server-sdk`) is also an optional dependency, installed by the `[ld]` extra; pass a pre-initialized client to `init_client(client=...)` if you bring your own.
 
 **OTel packages** (installed via `pip install "launchdarkly-ai-python[otel]"` or `pip install "launchdarkly-ai-server[otel]"`):
 - **If installed:** `init_client()` sets up a `TracerProvider` with a GZIP-compressed OTLP HTTP exporter and W3C trace-context/baggage propagators — no code changes needed.

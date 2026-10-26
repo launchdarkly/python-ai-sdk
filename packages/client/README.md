@@ -11,10 +11,10 @@ All handler packages (`launchdarkly-ai-*`) depend on this package.
 ### Without telemetry
 
 ```bash
-pip install launchdarkly-ai-server
+pip install "launchdarkly-ai-server[ld]"
 ```
 
-`launchdarkly-server-sdk` is an optional dependency — include it for standard usage, or pass a pre-initialized client to `init_client(client=...)` if you bring your own.
+`launchdarkly-server-sdk` is an optional dependency, installed by the `[ld]` extra — include it for standard usage, or pass a pre-initialized client to `init_client(client=...)` if you bring your own.
 
 The SDK works fully without the OpenTelemetry packages — feature flags evaluate, handlers run, and LaunchDarkly AI events are tracked. Spans are created as no-ops. If you call `init_client()` without the OTel packages installed, the SDK logs a single warning and continues normally.
 

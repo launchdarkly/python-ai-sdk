@@ -5,7 +5,7 @@ OpenCode handler for `launchdarkly-ai-server`. `async with handler` starts `open
 **`provides_for`:** `['*', 'agent']` — matches an agent-mode variation for any provider.
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-opencode-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-opencode-agents
 ```
 
 ```python

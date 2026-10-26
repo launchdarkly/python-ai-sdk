@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
@@ -390,7 +391,7 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 
 def _build_agent_tools(
     config_tools: dict[str, Any],
-    tool_handlers: dict[str, Any],
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     import importlib
 
@@ -403,7 +404,8 @@ def _build_agent_tools(
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
             fn = tool_handlers.get(_name)
-            if not fn:
+            # A NativeTool reaches here unwrapped on the offline evaluations path.
+            if not callable(fn):
                 raise ValueError(f'No handler registered for tool "{_name}"')
             # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
             # routing records the selected edge on the call itself; awaiting a plain
@@ -660,7 +662,7 @@ def _create_langchain_agents_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -791,7 +793,7 @@ def _create_langchain_agents_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -817,7 +819,7 @@ async def _stream_gen(
     llm: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,

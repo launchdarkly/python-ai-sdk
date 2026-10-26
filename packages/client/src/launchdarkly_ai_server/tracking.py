@@ -202,10 +202,13 @@ async def execute_and_track(
     # with an empty result. One recorder per invocation; they run concurrently.
     exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
     recorder = TrajectoryRecorder()
-    tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
-        ld_ctx,
-        track_data,
+    # Copied into the handler contract's type: dict is invariant in its values.
+    tracked_tool_handlers: dict[str, Callable[..., Any] | NativeTool] = dict(
+        wrap_tool_handlers(
+            recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+            ld_ctx,
+            track_data,
+        )
     )
     merged_variables: dict[str, Any] = {
         **(variables or {}),
@@ -302,10 +305,13 @@ async def execute_and_stream(
 
     exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
     recorder = TrajectoryRecorder()
-    tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
-        ld_ctx,
-        track_data,
+    # Copied into the handler contract's type: dict is invariant in its values.
+    tracked_tool_handlers: dict[str, Callable[..., Any] | NativeTool] = dict(
+        wrap_tool_handlers(
+            recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+            ld_ctx,
+            track_data,
+        )
     )
     merged_variables: dict[str, Any] = {
         **(variables or {}),

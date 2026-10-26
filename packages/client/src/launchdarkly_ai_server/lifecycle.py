@@ -10,7 +10,7 @@ from typing import Any
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
 from .shutdown_hooks import run_shutdown_hooks
-from .types import InitClientOptions, SDKOptions
+from .types import InitClientOptions, LDClientInterface, SDKOptions
 from .utils import model_stamps_from_meta
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
-_client: Any = None
+_client: LDClientInterface | None = None
 _tracer_provider: Any = None
 # True only when *this* SDK's call to trace.set_tracer_provider actually took
 # effect. "We built a provider" is not the same as "we own the global": the set
@@ -96,7 +96,7 @@ def note_ai_invocation() -> None:
     _ai_invoked = True
 
 
-def get_client() -> Any:
+def get_client() -> LDClientInterface:
     """
     Returns the singleton LaunchDarkly client.
     Raises ``RuntimeError`` if ``init_client`` has not been called yet.
@@ -208,8 +208,8 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
 
 async def init_client(
     options: InitClientOptions | None = None,
-    client: Any = None,
-) -> Any:
+    client: LDClientInterface | None = None,
+) -> LDClientInterface:
     """
     Initializes the singleton LaunchDarkly client.
 
@@ -278,7 +278,8 @@ async def init_client(
         except ImportError:
             raise RuntimeError(
                 "LaunchDarkly server SDK not installed. "
-                "Run `pip install launchdarkly-server-sdk` or pass a pre-initialized client."
+                'Run `pip install "launchdarkly-ai-server[ld]"` (installs launchdarkly-server-sdk) '
+                "or pass a pre-initialized client."
             ) from None
 
     # Initialize LD client — Config wraps the SDK key and URI overrides; LDClient takes a Config.

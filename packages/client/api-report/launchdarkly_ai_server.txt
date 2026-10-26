@@ -42,7 +42,7 @@ FDv2SkillStore  [class]
   remove_listener(kind: str, fn: Callable[[dict[str, Any]], Any]) -> None
   start() -> FDv2SkillStore
   wait_for_skills(timeout: float = 10.0) -> bool
-get_client() -> Any
+get_client() -> LDClientInterface
 get_skill(key: str, *, version: int | None = None) -> Skill | None  [async]
 get_skill_result(key: str, *, version: int | None = None) -> SkillOutcome  [async]
 get_skills(refs: Sequence[SkillReference | str]) -> list[Skill]  [async]
@@ -88,7 +88,7 @@ HandlerResult = dict[str, Any]
 HandlerStreamEvent  [class]
 has_multimodal_content(content: MessageContent) -> bool
 image_block_to_url(block: dict[str, Any]) -> str
-init_client(options: InitClientOptions | None = None, client: Any = None) -> Any  [async]
+init_client(options: InitClientOptions | None = None, client: LDClientInterface | None = None) -> LDClientInterface  [async]
 InitClientOptions = dict[str, Any]
 InMemorySkillStore  [class]
   __init__(objects: dict[str, dict[str, Any]] | None = None)
@@ -138,11 +138,11 @@ lang_chain_content_text(content: Any) -> str
 lang_chain_finish_reasons(source: Any) -> list[str] | None
 lang_chain_span_messages(messages: list[Any]) -> tuple[str | None, list[SpanMessage]]
 lang_chain_span_usage(usage: dict[str, Any] | None) -> SpanUsage | None
-LDClientInterface  [class]
-  close() -> None  [async]
-  flush() -> None  [async]
-  track(event_name: str, context: LDContext, data: Any = None, metric_value: float | None = None) -> None
-  variation(key: str, context: LDContext, default_value: Any) -> Any  [async]
+LDClientInterface(Protocol)  [class]
+  close() -> Any
+  flush() -> Any
+  track(event_name: str, context: Any, data: Any = None, metric_value: float | None = None, /) -> Any
+  variation(key: str, context: Any, default_value: Any, /) -> Any
 LDContext = dict[str, Any]
 make_track_data(node: GraphNode, graph_key: str, run_id: str) -> dict[str, Any]
 MANIFEST_FILENAME = '.launchdarkly-skills.json'
@@ -152,6 +152,8 @@ Message  [class]
   role: Literal['user', 'assistant', 'system']
 model_stamps_from_meta(meta: Any) -> dict[str, Any]
 NATIVE_TOOL_KEY: str = '__ld_native_tool__'
+NativeGraphRunner(Protocol)  [class]
+  invoke(input_text: str = '', variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> Awaitable[dict[str, Any]]
 NativeTool  [class]
   __init__(tool_name: str)
   id: object = object()
@@ -180,11 +182,11 @@ ProviderGraphResponse  [class, @dataclass]
   usage: UsageDict
 ProviderHandler  [class]
   __init__(fn: _HandlerFn, provides_for: tuple[str, Literal['agent', 'messages']] | None = None, stream_fn: _StreamFn | None = None, capture_content: bool | None = None)
-  __call__(config: AiConfigRep, user_input: str | None = None, tool_handlers: dict[str, Any] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> HandlerResult  [async]
+  __call__(config: AiConfigRep, user_input: str | None = None, tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> HandlerResult  [async]
   capture_content: bool  [property]
   has_stream: bool  [property]
   provides_for: tuple[str, Literal['agent', 'messages']] | None = provides_for
-  stream(config: AiConfigRep, user_input: str | None = None, tool_handlers: dict[str, Any] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[dict[str, Any], None]  [async]
+  stream(config: AiConfigRep, user_input: str | None = None, tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[dict[str, Any], None]  [async]
 ProviderResponse(Generic[T])  [class, @dataclass]
   __init__(response: T, usage: UsageDict, judge_results: dict[str, JudgeResult] | None = None, judge_tasks: list[JudgeTask] | None = None, track_data: TrackData | None = None)
   judge_results: dict[str, JudgeResult] | None = None

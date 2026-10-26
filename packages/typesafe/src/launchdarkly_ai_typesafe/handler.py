@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from opentelemetry import trace
@@ -12,6 +12,7 @@ from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 
 from launchdarkly_ai_server import (
     AiConfigRep,
+    NativeTool,
     ProviderHandler,
     _create_handler,
     report_usage,
@@ -98,7 +99,7 @@ def create_typesafe_handler(*, capture_content: bool | None = None) -> ProviderH
     async def _call(
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:

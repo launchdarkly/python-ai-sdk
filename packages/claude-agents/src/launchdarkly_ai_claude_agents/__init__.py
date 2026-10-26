@@ -27,13 +27,14 @@ from .handler import (
     create_claude_agents_handler,
     partition_tools,
 )
-from .native_graph import to_claude_agents
+from .native_graph import ClaudeNativeGraphOptions, to_claude_agents
 
 __all__ = [
     "ClaudeBash",
     "ClaudeEdit",
     "ClaudeGlob",
     "ClaudeGrep",
+    "ClaudeNativeGraphOptions",
     "ClaudeNotebookEdit",
     "ClaudeRead",
     "ClaudeTodoWrite",

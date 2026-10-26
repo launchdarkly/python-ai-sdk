@@ -417,7 +417,7 @@ async def _run_conversation(
     user_input: str | None,
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None,
-    tool_handlers: dict[str, Any] | None,
+    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
     parent: Any,
     *,
     structured: bool,
@@ -541,7 +541,7 @@ def _create_vercel_messages_handler(
     async def invoke(
         cfg: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -594,7 +594,7 @@ def _create_vercel_messages_handler(
     async def stream(
         cfg: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:

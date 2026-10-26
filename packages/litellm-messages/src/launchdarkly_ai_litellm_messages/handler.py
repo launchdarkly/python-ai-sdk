@@ -12,6 +12,7 @@ from opentelemetry.trace import StatusCode
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanUsage,
     _config,
@@ -205,7 +206,7 @@ def _build_messages(
 
 
 def _build_tools(
-    config_value: AiConfigRep, tool_handlers: dict[str, Any]
+    config_value: AiConfigRep, tool_handlers: dict[str, Callable[..., Any] | NativeTool]
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -455,7 +456,7 @@ def _create_litellm_messages_handler(
     async def call(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -567,7 +568,7 @@ def _create_litellm_messages_handler(
     def stream(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:

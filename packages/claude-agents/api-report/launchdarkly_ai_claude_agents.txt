@@ -7,6 +7,11 @@ ClaudeBash = NativeTool('Bash')
 ClaudeEdit = NativeTool('Edit')
 ClaudeGlob = NativeTool('Glob')
 ClaudeGrep = NativeTool('Grep')
+ClaudeNativeGraphOptions(TypedDict, total=False)  [class]
+  context: LDContext
+  cwd: str | os.PathLike[str]
+  setting_sources: list[SettingSource]
+  tool_handlers: dict[str, Callable[..., Any] | NativeTool]
 ClaudeNotebookEdit = NativeTool('NotebookEdit')
 ClaudeRead = NativeTool('Read')
 ClaudeTodoWrite = NativeTool('TodoWrite')
@@ -14,5 +19,5 @@ ClaudeWebFetch = NativeTool('WebFetch')
 ClaudeWebSearch = NativeTool('WebSearch')
 ClaudeWrite = NativeTool('Write')
 create_claude_agents_handler(*, capture_content: bool | None = None, cwd: str | os.PathLike[str] | None = None, setting_sources: list[SettingSource] | None = None) -> ProviderHandler
-partition_tools(config_tools: dict[str, Any] | None, tool_handlers: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[str]]
-to_claude_agents(def_promise: Any, opts: dict[str, Any] | None = None) -> Any
+partition_tools(config_tools: dict[str, Any] | None, tool_handlers: dict[str, Callable[..., Any] | NativeTool]) -> tuple[dict[str, Any], dict[str, Any], list[str]]
+to_claude_agents(def_promise: Awaitable[GraphDefinition], opts: ClaudeNativeGraphOptions | None = None) -> NativeGraphRunner

@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncGenerator, AsyncIterable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
 from contextlib import aclosing
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanUsage,
@@ -642,7 +643,7 @@ class OpenCodeHandler(ProviderHandler):
         self,
         config: AiConfigRep,
         user_input: str | None,
-        tool_handlers: dict[str, Any] | None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -724,7 +725,7 @@ class OpenCodeHandler(ProviderHandler):
         self,
         config: AiConfigRep,
         user_input: str | None,
-        tool_handlers: dict[str, Any] | None,
+        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
