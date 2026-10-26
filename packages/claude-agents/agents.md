@@ -30,7 +30,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 | `src/launchdarkly_ai_claude_agents/graph.py` | `claude_graph()` convenience wrapper around `graph()` |
 | `src/launchdarkly_ai_claude_agents/native_graph.py` | `to_claude_agents()` native graph adapter |
 | `src/launchdarkly_ai_claude_agents/builtins.py` | Pre-constructed `NativeTool` sentinels for Claude built-in tools |
-| `src/launchdarkly_ai_claude_agents/experimental/skills.py` | Experimental `create_claude_agents_skills_handler()`. Not imported by the package `__init__.py` |
+| `src/launchdarkly_ai_claude_agents/skills.py` | `create_claude_agents_skills_handler()`, exported from the package root |
 | `src/launchdarkly_ai_claude_agents/__init__.py` | Package exports |
 | `src/launchdarkly_ai_claude_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
@@ -169,11 +169,11 @@ On error: `span.record_exception(exc)`, status set to ERROR, span ended, error r
 id wins. An app that opens a fresh CLI session per turn and re-feeds history must pass its own
 conversation id, or each turn becomes its own conversation.
 
-### 5. Agent Skills (experimental, `experimental/skills.py`)
+### 5. Agent Skills (`skills.py`)
 
-`create_claude_agents_skills_handler(...)` is importable only from `launchdarkly_ai_claude_agents.experimental.skills`, and the package root never imports it (a test checks this in a fresh interpreter). It reports `experimental.createClaudeAgentsSkillsHandler` and builds the handler through `_create_claude_agents_handler(..., _prepare=...)`.
+`create_claude_agents_skills_handler(...)` is exported from the package root. It reports `claude-agents.createClaudeAgentsSkillsHandler` and builds the handler through `_create_claude_agents_handler(..., _prepare=...)`.
 
-`_prepare` is a package-internal hook, a private keyword argument of the internal factory only, so core names nothing experimental. It runs at the start of every invoke and stream, inside the `invoke_agent` span, and returns `None` (the run is exactly the core handler's) or a `QueryPreparation`. That holds extra `query()` options, extra built-ins appended to `tools` (never to `allowed_tools`), and a `cleanup` that both paths await last in their `finally`.
+`_prepare` is a package-internal hook, a private keyword argument of the internal factory only, so `create_claude_agents_handler`'s signature stays unchanged. It runs at the start of every invoke and stream, inside the `invoke_agent` span, and returns `None` (the run is exactly the core handler's) or a `QueryPreparation`. That holds extra `query()` options, extra built-ins appended to `tools` (never to `allowed_tools`), and a `cleanup` that both paths await last in their `finally`.
 
 For a variation with skills, `_prepare_skills`:
 
