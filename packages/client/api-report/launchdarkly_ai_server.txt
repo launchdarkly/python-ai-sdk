@@ -7,6 +7,7 @@ build_judge_tasks(*, config: AiConfigRep, user_context: LDContext, handler: Prov
 compose(a: Registry, b: Registry) -> Registry
 compose_history(*, history: list[dict[str, Any]], user_input: str | None = None, config_messages: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]
 config(*, key: str, handler: ProviderHandler | list[ProviderHandler] | None = None, tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None, registry: Any = None, skip_judges: bool = False) -> ConfigInstance
+config_skills(key: str, context: LDContext) -> SkillSource
 ConfigInstance  [class]
   __init__(key: str, handler: ProviderHandler | list[ProviderHandler] | None, tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None, registry: Any, skip_judges: bool = False)
   invoke(user_input: str | None, context: LDContext, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> ProviderResponse[Any]  [async]
@@ -258,11 +259,15 @@ SkillReference  [class, @dataclass(frozen=True)]
   __init__(key: str, version: int)
   key: str
   version: int
+SkillSource  [class, @dataclass(frozen=True, init=False)]
+  __init__(refs: Callable[[], Sequence[SkillReference | str] | Awaitable[Sequence[SkillReference | str]]], config_keys: Sequence[str] = ())
+  config_keys: tuple[str, ...]
+  refs: Callable[[], Sequence[SkillReference | str] | Awaitable[Sequence[SkillReference | str]]]
 SkillStore(Protocol)  [class]
   all_objects(kind: str) -> dict[str, dict[str, Any]]
   get_object(kind: str, key: str, version: int | None = None) -> dict[str, Any] | None
 SkillWatcher  [class]
-  __init__(request: Sequence[Skill | SkillReference | str] | str, root: str | os.PathLike[str], store: Any, *, prune: bool, timeout: float, on_unavailable: OnUnavailable, debounce: float, on_reconcile: Callable[[ReconcileReport], Any] | None)
+  __init__(request: Sequence[Skill | SkillReference | str] | str | SkillSource, root: str | os.PathLike[str], store: Any, *, prune: bool, timeout: float, on_unavailable: OnUnavailable, debounce: float, on_reconcile: Callable[[ReconcileReport], Any] | None)
   __enter__() -> SkillWatcher
   __exit__(*_exc: Any) -> None
   close(timeout: float = 15.0) -> None
@@ -322,6 +327,6 @@ UsageDict  [class, @dataclass]
   output: int = 0
   total: int = 0
 VariationMeta = dict[str, Any]
-watch_skills(skills: Sequence[Skill | SkillReference | str] | str, root: str | os.PathLike[str], *, prune: bool = True, timeout: float = 10.0, on_unavailable: OnUnavailable = 'keep', debounce: float = DEFAULT_DEBOUNCE_SECONDS, on_reconcile: Callable[[ReconcileReport], Any] | None = None) -> tuple[ReconcileReport, SkillWatcher]  [async]
+watch_skills(skills: Sequence[Skill | SkillReference | str] | str | SkillSource, root: str | os.PathLike[str], *, prune: bool = True, timeout: float = 10.0, on_unavailable: OnUnavailable = 'keep', debounce: float = DEFAULT_DEBOUNCE_SECONDS, on_reconcile: Callable[[ReconcileReport], Any] | None = None) -> tuple[ReconcileReport, SkillWatcher]  [async]
 wrap_tool_handlers(tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None, user_context: LDContext, track_data: TrackData) -> dict[str, Callable[..., Any]]
-write_skills(skills: Sequence[Skill | SkillReference | str] | str, root: str | os.PathLike[str], *, prune: bool = True, timeout: float = 10.0, on_unavailable: OnUnavailable = 'keep') -> ReconcileReport  [async]
+write_skills(skills: Sequence[Skill | SkillReference | str] | str | SkillSource, root: str | os.PathLike[str], *, prune: bool = True, timeout: float = 10.0, on_unavailable: OnUnavailable = 'keep') -> ReconcileReport  [async]

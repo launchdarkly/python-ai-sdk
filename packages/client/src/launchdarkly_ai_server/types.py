@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, TypeVar
 
@@ -610,6 +610,71 @@ class ReconcileReport:
     def errors(self) -> list[ReconcileAction]:
         """The ``error`` actions, in ``actions`` order."""
         return [a for a in self.actions if a.action == "error"]
+
+
+@dataclass(frozen=True, init=False)
+class SkillSource:
+    """
+    A requested set of skills that is read when it is needed, not fixed when
+    the call is made. Immutable.
+
+    ``write_skills`` reads it once per call; ``watch_skills`` reads it on every
+    reconcile, and re-reconciles when one of the AI Configs named in
+    ``config_keys`` changes. ``config_skills(key, context)`` builds the common
+    case, one AI Config evaluated for one context.
+
+    ``refs`` raising, or answering anything other than a sequence of
+    ``SkillReference`` values and key strings, is a failed retrieval: nothing on
+    disk changes. Raise to say "I could not tell"; never return ``[]`` for it,
+    because ``[]`` prunes every skill the root manages.
+    """
+
+    refs: Callable[
+        [], Sequence[SkillReference | str] | Awaitable[Sequence[SkillReference | str]]
+    ]
+    """Zero-argument callable, sync or async, returning the current references."""
+    config_keys: tuple[str, ...]
+    """The AI Config keys whose changes should make a watcher read ``refs`` again."""
+
+    def __init__(
+        self,
+        refs: Callable[
+            [],
+            Sequence[SkillReference | str] | Awaitable[Sequence[SkillReference | str]],
+        ],
+        config_keys: Sequence[str] = (),
+    ) -> None:
+        """
+        Raises:
+            TypeError: If *refs* is not callable, or *config_keys* is a string
+                or holds anything but non-empty strings. A bare string would be
+                followed as one-character keys, none of which ever changes.
+        """
+        if not callable(refs):
+            raise TypeError(
+                f"SkillSource refs must be callable, got {type(refs).__name__}"
+            )
+        if isinstance(config_keys, (str, bytes)):
+            raise TypeError(
+                "SkillSource config_keys must be a sequence of config keys, not a "
+                f"single string; got {config_keys!r}. Pass ({config_keys!r},)."
+            )
+        if not isinstance(config_keys, Sequence):
+            raise TypeError(
+                "SkillSource config_keys must be a sequence of config keys, got "
+                f"{type(config_keys).__name__}"
+            )
+        keys = tuple(config_keys)
+        for key in keys:
+            if not isinstance(key, str):
+                raise TypeError(
+                    "SkillSource config_keys must hold only strings, got "
+                    f"{type(key).__name__}"
+                )
+            if not key:
+                raise TypeError("SkillSource config_keys must not hold an empty key")
+        object.__setattr__(self, "refs", refs)
+        object.__setattr__(self, "config_keys", keys)
 
 
 # ---------------------------------------------------------------------------

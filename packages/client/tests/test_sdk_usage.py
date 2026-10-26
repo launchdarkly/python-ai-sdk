@@ -19,6 +19,7 @@ from launchdarkly_ai_server import (
     all_skills,
     build_judge_tasks,
     config,
+    config_skills,
     create_handler,
     get_skill,
     get_skill_result,
@@ -535,6 +536,9 @@ def _skill_store(make_raw_skill: Any) -> InMemorySkillStore:
 async def _call_skill_helper(helper: str, root: Path) -> None:
     if helper == "client.allSkills":
         await all_skills()
+    elif helper == "client.configSkills":
+        # Builds the source without reading it: the report is on the call.
+        config_skills("k", CONTEXT)
     elif helper == "client.getSkill":
         await get_skill(SKILL_KEY)
     elif helper == "client.getSkillResult":
@@ -555,6 +559,7 @@ async def _call_skill_helper(helper: str, root: Path) -> None:
     "helper",
     [
         "client.allSkills",
+        "client.configSkills",
         "client.getSkill",
         "client.getSkillResult",
         "client.getSkills",

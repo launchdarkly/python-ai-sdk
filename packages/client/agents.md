@@ -32,7 +32,8 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
 | `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `FDv2SkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
-| `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
+| `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener, and for a `SkillSource` the base client's `flag_tracker` listener, to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
+| `src/launchdarkly_ai_server/skills_source.py` | Agent Skills, config-scoped requested set — `config_skills(key, context)`, which evaluates one AI Config per read and classifies every failure as a raised read, never `[]`. With `skills_watch`, the only skills module that imports `lifecycle`, and it takes only `get_client` |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, `DirectoryMissing`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
@@ -83,7 +84,7 @@ from launchdarkly_ai_server.experimental.evaluations import init_evaluations
 from launchdarkly_ai_server import (
     set_skill_store, SkillStore, InMemorySkillStore, FDv2SkillStore, StoreDiagnostics,
     skill_refs, get_skill, get_skill_result, get_skills, all_skills, write_skills,
-    watch_skills, SkillWatcher,
+    watch_skills, SkillWatcher, SkillSource, config_skills,
     Skill, SkillReference, SkillOutcome, ReconcileAction, ReconcileReport,
     SKILL_FILENAME, MANIFEST_FILENAME, MANIFEST_VERSION,
     ReconcileActionKind, OnUnavailable, SkillOutcomeReason,  # the three closed-set unions
@@ -221,7 +222,16 @@ Three layers, in increasing order of blast radius:
    an actionable `RuntimeError`. A delivery transport can be added behind the seam
    without touching the public API.
 3. **Materialization** — `write_skills(skills, root)` writes `<root>/<key>/SKILL.md` and
-   reconciles against a manifest at `<root>/.launchdarkly-skills.json`.
+   reconciles against a manifest at `<root>/.launchdarkly-skills.json`. `skills` may be a
+   `SkillSource` (`types.py`), whose `refs` is read once per reconcile; `skills_fs`
+   recognizes it by type and never imports `skills_source`. A source that raises or answers
+   anything but a sequence of valid references and keys is a run-level unavailable
+   retrieval, never an empty set.
+
+`config_skills(key, context)` is the documented form for config-scoped materialization
+under `watch_skills`. Do not write examples that feed `skill_refs(inspect_config(...))` to
+`watch_skills`: that is a fixed list, so the watcher never follows the config. At boot,
+with `write_skills`, either form is safe.
 
 ### The store seam, and why version is part of the lookup
 
@@ -972,16 +982,34 @@ true. Tampered content must never trigger deletion.
 
 ### 6. Expecting revocation to reach a boot-only `write_skills` deployment
 
-Even with `watch_skills`, only the `"*"` form removes a revoked skill from disk. With an
-explicit list such as `skill_refs(config)`, the list is fixed: a skill the store answers
-`absent` for is reported as an `error` and its files are kept, and the watcher listens only to
-the skill store, so unpinning a skill or moving it to a new version is not seen until the refs
-are read again.
+Even with `watch_skills`, a fixed list never follows its config. With an explicit list such
+as `skill_refs(config)`, a skill the store answers `absent` for is reported as an `error` and
+its files are kept, and unpinning a skill or moving it to a new version is not seen until the
+refs are read again. `"*"` prunes a skill deleted from the library; `config_skills(key,
+context)` is re-read on every reconcile and on every change to its config, so a version bump
+replaces the file and an unpinned skill is pruned.
 
 Without `watch_skills`, the revocation bound is process lifetime: a skill revoked after boot
 stays on disk until the process reconciles again, so a restart (or an explicit re-run of
 `write_skills`) is the incident-response action — and content an agent has already read into
 a conversation is out of reach at this layer either way.
+
+### 7. Reading a `SkillSource` inside the flag listener, or answering `[]` for "I could not tell"
+
+The base SDK calls `flag_tracker` listeners on the thread applying flag data, and under FDv2
+while holding the store lock every `variation()` takes. `SkillWatcher._on_flag_change` must
+only set the wake flag; the source is read on the watcher's worker. A source (hand-built or
+`config_skills`) that returns `[]` when evaluation fails tells the reconcile that every
+skill was revoked, so it prunes them all. Raise instead. For the same reason the
+`config_skills` `variation` default is `None`: any default that reads as a disabled variation
+would turn "client not ready" into "no skills".
+
+A client without a working change signal (no client, no `flag_tracker`, `is_offline()`) makes
+`watch_skills` raise for a source with `config_keys`. Do not turn that into a silent no-op: a
+watcher that never hears about config changes looks exactly like one whose config never
+changed. Daemon mode passes the probe and never fires; that gap is documented, not detected.
+Tests use a hand-built fake client, never a `MagicMock`, which passes the probe and never
+fires.
 
 ---
 

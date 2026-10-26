@@ -124,6 +124,8 @@ ROOT_SURFACE = frozenset(
         "StoreDiagnostics",
         "watch_skills",
         "SkillWatcher",
+        "SkillSource",
+        "config_skills",
         "skill_refs",
         "get_skill",
         "get_skill_result",

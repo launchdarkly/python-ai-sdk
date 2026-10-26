@@ -75,6 +75,7 @@ from .skills_fs import (
     write_skills,
 )
 from .skills_fs import _write_skills as _write_skills
+from .skills_source import config_skills
 from .skills_watch import SkillWatcher, watch_skills
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
@@ -114,6 +115,7 @@ from .types import (
     SkillOutcome,
     SkillOutcomeReason,
     SkillReference,
+    SkillSource,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -273,6 +275,9 @@ __all__ = [  # noqa: RUF022
     "StoreDiagnostics",
     "watch_skills",
     "SkillWatcher",
+    # Agent Skills: a requested set read on every reconcile, following AI Config changes
+    "SkillSource",
+    "config_skills",
     # Agent Skills: accessors
     "skill_refs",
     "get_skill",
