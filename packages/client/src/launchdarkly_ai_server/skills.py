@@ -223,6 +223,13 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
             includes ``skills: null``.
     """
     report_usage("client.skillRefs")
+    return _skill_refs(config)
+
+
+def _skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
+    """``skill_refs`` without the usage report, for handlers that read a variation's skills on
+    the customer's behalf: the customer never called ``skill_refs``, so no ``client.skillRefs``
+    event may be sent for them."""
     if not isinstance(config, dict):
         raise ValueError(
             f"skill_refs was given {type(config).__name__}, not an AI Config. "

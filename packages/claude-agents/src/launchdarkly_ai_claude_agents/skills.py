@@ -21,9 +21,14 @@ from launchdarkly_ai_server import (
     ReconcileReport,
     SkillReference,
     report_usage,
-    skill_refs,
-    write_skills,
 )
+
+# The non-reporting forms of ``skill_refs`` and ``write_skills``. A run reports only the
+# factory's own helper event: the customer called ``create_claude_agents_skills_handler``, not
+# ``skill_refs`` or ``write_skills``, so sending ``client.skillRefs`` or ``client.writeSkills``
+# from here would attribute calls they never made.
+from launchdarkly_ai_server.skills import _skill_refs
+from launchdarkly_ai_server.skills_fs import _write_skills
 
 from ._version import PACKAGE_NAME, __version__
 from .handler import QueryPreparation, _create_claude_agents_handler
@@ -87,17 +92,17 @@ async def _prepare_skills(
     Fails closed: if any skill cannot be written, the run does not start. The variation names
     that skill, so running without it would run a different agent from the one configured.
     """
-    refs = skill_refs(config)
+    refs = _skill_refs(config)
     if not refs:
         return None
 
     run_dir = os.path.realpath(tempfile.mkdtemp(prefix=_RUN_DIR_PREFIX, dir=parent))
     try:
         plugin_root = os.path.join(run_dir, PLUGIN_NAME)
-        # ``write_skills`` creates only the missing leaf of its root.
+        # ``_write_skills`` creates only the missing leaf of its root.
         os.mkdir(plugin_root)
         # A fresh directory: there is nothing to prune, and nothing else writes here.
-        report = await write_skills(
+        report = await _write_skills(
             refs, os.path.join(plugin_root, "skills"), prune=False
         )
         if not report.ok:
@@ -133,11 +138,12 @@ def create_claude_agents_skills_handler(
     *skills_temp_dir*: the parent of the directory each run writes its skills into, by default
     ``tempfile.gettempdir()``.
 
-    On every invoke and stream, the variation's ``skills`` are written with ``write_skills``,
-    through the store configured with ``set_skill_store``, into a new directory under
-    *skills_temp_dir*. That directory is passed to ``query()`` as a local plugin, only those
-    skills are enabled, the ``Skill`` tool is turned on, and the directory is removed when the
-    run ends. A variation with no skills runs exactly as with ``create_claude_agents_handler``.
+    On every invoke and stream, the variation's ``skills`` are written, as ``write_skills``
+    writes them, through the store configured with ``set_skill_store`` into a new directory
+    under *skills_temp_dir*. That directory is passed to ``query()`` as a local plugin, only
+    those skills are enabled, the ``Skill`` tool is turned on, and the directory is removed
+    when the run ends. A variation with no skills runs exactly as with
+    ``create_claude_agents_handler``.
 
     ``setting_sources`` is always sent, ``[]`` unless given. ``claude-agent-sdk`` would
     otherwise load the ``user`` and ``project`` settings sources whenever ``skills`` is set.
