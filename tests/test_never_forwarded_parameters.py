@@ -29,6 +29,8 @@ from tests.never_forwarded import (
 #: checked against ``discover_handler_modules`` so a new handler module must be added here.
 FORWARDED_LISTS: dict[str, set[str]] = {
     "launchdarkly_ai_claude_agents.handler": {"_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS"},
+    # Delegates to the core handler above, which forwards the parameters.
+    "launchdarkly_ai_claude_agents.experimental.skills": set(),
     "launchdarkly_ai_claude_messages.handler": {"_MESSAGES_FORWARDED_KEYS"},
     "launchdarkly_ai_openai_agents.handler": {"_MODEL_SETTINGS_FORWARDED_KEYS"},
     "launchdarkly_ai_openai_messages.handler": {"_RESPONSES_FORWARDED_KEYS"},

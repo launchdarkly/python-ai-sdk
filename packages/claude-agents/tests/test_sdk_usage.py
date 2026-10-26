@@ -15,6 +15,9 @@ from launchdarkly_ai_claude_agents import (
 )
 from launchdarkly_ai_claude_agents._version import PACKAGE_NAME
 from launchdarkly_ai_claude_agents._version import __version__ as PACKAGE_VERSION
+from launchdarkly_ai_claude_agents.experimental.skills import (
+    create_claude_agents_skills_handler,
+)
 from launchdarkly_ai_server import SDK_INFO_CONTEXT, __version__, init_client, shutdown
 
 CONTEXT = {"kind": "user", "key": "user-1"}
@@ -55,6 +58,11 @@ async def client() -> Any:
         ("claude-agents.createClaudeAgentsHandler", create_claude_agents_handler),
         ("claude-agents.claudeGraph", lambda: claude_graph("k")),
         ("claude-agents.toClaudeAgents", lambda: to_claude_agents(None)),
+        # Its own ID, and not also the core factory's.
+        (
+            "experimental.createClaudeAgentsSkillsHandler",
+            create_claude_agents_skills_handler,
+        ),
     ],
 )
 async def test_helper_sends_one_usage_event(

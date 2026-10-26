@@ -393,6 +393,42 @@ class TestInitClientSDKKeyPath:
         stub.close.assert_awaited_once()
         assert lifecycle_module._client is None
 
+    @staticmethod
+    async def _config_kwargs(env: dict[str, str]) -> dict[str, Any]:
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=_make_stub_client())
+        names = ("LD_BASE_URI", "LD_STREAM_URI", "LD_EVENTS_URI")
+        base = {k: v for k, v in os.environ.items() if k not in names}
+        with patch.dict(
+            os.environ, {**base, "LD_SDK_KEY": "test-key", **env}, clear=True
+        ):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    await init_client()
+        return dict(mock_ld.Config.call_args.kwargs)
+
+    async def test_strips_whitespace_from_the_uri_variables(self) -> None:
+        kwargs = await self._config_kwargs(
+            {
+                "LD_BASE_URI": "  https://sdk.example.com\n",
+                "LD_STREAM_URI": "\thttps://stream.example.com ",
+                "LD_EVENTS_URI": " https://events.example.com ",
+            }
+        )
+        assert kwargs == {
+            "base_uri": "https://sdk.example.com",
+            "stream_uri": "https://stream.example.com",
+            "events_uri": "https://events.example.com",
+        }
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    async def test_a_blank_uri_variable_is_unset(self, blank: str) -> None:
+        kwargs = await self._config_kwargs(
+            {"LD_BASE_URI": blank, "LD_STREAM_URI": blank, "LD_EVENTS_URI": blank}
+        )
+        assert kwargs == {}
+
 
 # ---------------------------------------------------------------------------
 # OTel degradation

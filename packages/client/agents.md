@@ -305,6 +305,14 @@ resumes in place once the cause is fixed, clearing the terminal reason through
   answer) surfaces as an `HTTPError` that `_classify_status` maps to a fatal, non-retried
   failure.
 
+**Polling and streaming have different default hosts.** `GET /sdk/poll` uses `DEFAULT_BASE_URI`
+(`sdk.launchdarkly.com`) and `GET /sdk/stream` uses `DEFAULT_STREAM_URI`
+(`stream.launchdarkly.com`). A lone `base_uri` applies to both. When neither option is given, the
+constructor reads `LD_BASE_URI` / `LD_STREAM_URI` (blank is unset) in their place and applies the
+same rule. An option given turns the environment off for both, and `_require_https_uri` names the
+variable when its value is refused. `test_skills_fdv2.py` clears both variables with an autouse
+fixture, so a developer shell cannot move the default-host assertions.
+
 **A known stream event whose data is not JSON drops the connection; it is never skipped.**
 `_iter_sse` logs a WARNING and raises `_RecoverableTransportError`, as the base SDK's FDv2
 stream interrupts on a `JSONDecodeError`, so the in-flight payload is abandoned and the

@@ -30,6 +30,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 | `src/launchdarkly_ai_claude_agents/graph.py` | `claude_graph()` convenience wrapper around `graph()` |
 | `src/launchdarkly_ai_claude_agents/native_graph.py` | `to_claude_agents()` native graph adapter |
 | `src/launchdarkly_ai_claude_agents/builtins.py` | Pre-constructed `NativeTool` sentinels for Claude built-in tools |
+| `src/launchdarkly_ai_claude_agents/experimental/skills.py` | Experimental `create_claude_agents_skills_handler()`. Not imported by the package `__init__.py` |
 | `src/launchdarkly_ai_claude_agents/__init__.py` | Package exports |
 | `src/launchdarkly_ai_claude_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
@@ -167,6 +168,20 @@ On error: `span.record_exception(exc)`, status set to ERROR, span ended, error r
 `session_id` from the `init` message when the caller supplied none. Write-if-absent: the caller
 id wins. An app that opens a fresh CLI session per turn and re-feeds history must pass its own
 conversation id, or each turn becomes its own conversation.
+
+### 5. Agent Skills (experimental, `experimental/skills.py`)
+
+`create_claude_agents_skills_handler(...)` is importable only from `launchdarkly_ai_claude_agents.experimental.skills`, and the package root never imports it (a test checks this in a fresh interpreter). It reports `experimental.createClaudeAgentsSkillsHandler` and builds the handler through `_create_claude_agents_handler(..., _prepare=...)`.
+
+`_prepare` is a package-internal hook, a private keyword argument of the internal factory only, so core names nothing experimental. It runs at the start of every invoke and stream, inside the `invoke_agent` span, and returns `None` (the run is exactly the core handler's) or a `QueryPreparation`. That holds extra `query()` options, extra built-ins appended to `tools` (never to `allowed_tools`), and a `cleanup` that both paths await last in their `finally`.
+
+For a variation with skills, `_prepare_skills`:
+
+1. `tempfile.mkdtemp(prefix="ld-skills-", dir=skills_temp_dir)`, then `os.path.realpath`, then `os.mkdir(<dir>/launchdarkly)`.
+2. `write_skills(skill_refs(config), <dir>/launchdarkly/skills, prune=False)`. A report that is not `ok` raises, naming each failed key, and `query()` is never called.
+3. Returns `plugins=[{"type": "local", "path": <dir>/launchdarkly}]`, `skills=["launchdarkly:<key>", ...]` and `extra_builtins=["Skill"]`.
+
+The plugin's name comes from its directory's base name, so no manifest is written. The skill names are qualified because a bare name would also match a host plugin's skill. `claude-agent-sdk`'s `SdkPluginConfig` has no `skipMcpDiscovery` key, so unlike TypeScript the plugin entry carries only `type` and `path`. The directory holds no `.mcp.json`, so there is nothing to discover. `setting_sources` is never `None` here, because the core handler always sends it. With `skills` set and `setting_sources=None`, `claude-agent-sdk` sends `--setting-sources=user,project`. The tool hooks are installed whenever `Skill` is in `tools`, so a `Skill` call gets an `execute_tool Skill` span. The directory is removed with a synchronous `shutil.rmtree`, so a cancellation during teardown cannot interrupt it. There's no shared root, no watcher and no prune: every run writes exactly its own variation's references, which is also how detaching a skill takes effect.
 
 ---
 

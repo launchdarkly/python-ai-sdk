@@ -33,8 +33,8 @@ No code changes are required — `init_client()` detects the packages at runtime
 | Variable | Required | Description |
 |---|---|---|
 | `LD_SDK_KEY` | Yes | LaunchDarkly server-side SDK key |
-| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging) |
-| `LD_STREAM_URI` | No | Override the streaming URI |
+| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging). `FDv2SkillStore` reads it too when given no URI option |
+| `LD_STREAM_URI` | No | Override the streaming URI. `FDv2SkillStore` reads it too when given no URI option |
 | `LD_EVENTS_URI` | No | Override the events URI |
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
@@ -781,6 +781,11 @@ never followed, so a 3xx stops delivery instead of forwarding the key to the `Lo
 **Polling and streaming have separate hosts.** By default `/sdk/poll` goes to
 `https://sdk.launchdarkly.com` and `/sdk/stream` to `https://stream.launchdarkly.com`. Pass
 `base_uri` alone to use one host for both, or `stream_uri` as well to set them independently.
+With neither option, the store reads `LD_BASE_URI` and `LD_STREAM_URI` in their place, once, when
+it is constructed, the same variables `init_client()` reads. So a process pointed at a staging or
+private instance by its environment gets its skills from there too. `LD_BASE_URI` alone moves both
+endpoints, as `base_uri` alone does. That differs from `init_client()`, where flag streaming stays
+on its default host unless `LD_STREAM_URI` is set.
 
 **`close()` is final.** A closed store still answers from the content it received, but
 `start()` afterwards raises, so delivery is guaranteed stopped even if the join times out.
