@@ -1,9 +1,8 @@
 """
-Agent Skills for Claude Agents (experimental).
+Agent Skills for Claude Agents.
 
 ``create_claude_agents_skills_handler`` builds a Claude Agents handler that gives each run the
-skills attached to its variation. This name may change in a minor release, so review the
-changelog when you upgrade.
+skills attached to its variation. Exported from the package root.
 """
 
 from __future__ import annotations
@@ -26,8 +25,8 @@ from launchdarkly_ai_server import (
     write_skills,
 )
 
-from .._version import PACKAGE_NAME, __version__
-from ..handler import QueryPreparation, _create_claude_agents_handler
+from ._version import PACKAGE_NAME, __version__
+from .handler import QueryPreparation, _create_claude_agents_handler
 
 __all__ = ["create_claude_agents_skills_handler"]
 
@@ -152,9 +151,7 @@ def create_claude_agents_skills_handler(
         import os
 
         from launchdarkly_ai_server import FDv2SkillStore, config, set_skill_store
-        from launchdarkly_ai_claude_agents.experimental.skills import (
-            create_claude_agents_skills_handler,
-        )
+        from launchdarkly_ai_claude_agents import create_claude_agents_skills_handler
 
         store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
         store.wait_for_skills(timeout=10)
@@ -163,7 +160,7 @@ def create_claude_agents_skills_handler(
         triage = config(key="triage-agent", handler=create_claude_agents_skills_handler())
     """
     report_usage(
-        "experimental.createClaudeAgentsSkillsHandler", PACKAGE_NAME, __version__
+        "claude-agents.createClaudeAgentsSkillsHandler", PACKAGE_NAME, __version__
     )
 
     async def _prepare(config: AiConfigRep) -> QueryPreparation | None:

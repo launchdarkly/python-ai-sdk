@@ -28,6 +28,7 @@ from .handler import (
     partition_tools,
 )
 from .native_graph import to_claude_agents
+from .skills import create_claude_agents_skills_handler
 
 __all__ = [
     "ClaudeBash",
@@ -45,6 +46,7 @@ __all__ = [
     "claude_agents",
     "claude_graph",
     "create_claude_agents_handler",
+    "create_claude_agents_skills_handler",
     "partition_tools",
     "to_claude_agents",
 ]
