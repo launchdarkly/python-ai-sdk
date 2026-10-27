@@ -243,6 +243,35 @@ class TestInitClientSDKKeyPath:
             with pytest.raises(RuntimeError, match="SDK key"):
                 await init_client()
 
+    def test_never_loads_a_dotenv_file(self, tmp_path: Any) -> None:
+        """A library must not load the app's .env: importing and init read os.environ only."""
+        (tmp_path / ".env").write_text(
+            "LD_SDK_KEY=from-dotenv\nAIC_DOTENV_SENTINEL=1\n"
+        )
+        script = (
+            "import asyncio, os\n"
+            "import launchdarkly_ai_server\n"
+            "import launchdarkly_ai_server.experimental\n"
+            "try:\n"
+            "    asyncio.run(launchdarkly_ai_server.init_client())\n"
+            "except RuntimeError as err:\n"
+            "    print('init:', err)\n"
+            "print('sentinel:', os.environ.get('AIC_DOTENV_SENTINEL'))\n"
+            "print('key:', os.environ.get('LD_SDK_KEY'))\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "SDK key" in result.stdout
+        assert "sentinel: None" in result.stdout
+        assert "key: None" in result.stdout
+
     async def test_uses_options_sdk_key_over_env_var(self) -> None:
         stub_client = _make_stub_client()
         mock_ld = MagicMock()
