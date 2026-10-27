@@ -120,7 +120,7 @@ ROOT_SURFACE = frozenset(
         "set_skill_store",
         "SkillStore",
         "InMemorySkillStore",
-        "FDv2SkillStore",
+        "LaunchDarklySkillStore",
         "StoreDiagnostics",
         "watch_skills",
         "SkillWatcher",

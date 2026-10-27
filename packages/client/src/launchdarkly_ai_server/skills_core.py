@@ -95,7 +95,7 @@ INTEGRITY_REASON_CODES: frozenset[str] = frozenset(get_args(IntegrityReasonCode)
 NO_STORE_MESSAGE = (
     "No skill store is configured, so skill content cannot be retrieved. Configure "
     "one with set_skill_store(store) from launchdarkly_ai_server "
-    "— FDv2SkillStore receives content from LaunchDarkly, and InMemorySkillStore is "
+    "— LaunchDarklySkillStore receives content from LaunchDarkly, and InMemorySkillStore is "
     "available for local development and testing."
 )
 """What the accessors report when no store is configured. Callers match on

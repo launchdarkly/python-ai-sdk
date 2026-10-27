@@ -66,7 +66,7 @@ from .skills import (
 )
 from .skills import _skill_refs as _skill_refs
 from .skills_core import SkillStore
-from .skills_fdv2 import FDv2SkillStore, StoreDiagnostics
+from .skills_fdv2 import LaunchDarklySkillStore, StoreDiagnostics
 from .skills_fs import (
     MANIFEST_FILENAME,
     MANIFEST_VERSION,
@@ -271,7 +271,7 @@ __all__ = [  # noqa: RUF022
     "SkillStore",
     "InMemorySkillStore",
     # Agent Skills: LaunchDarkly delivery store and on-change re-reconcile
-    "FDv2SkillStore",
+    "LaunchDarklySkillStore",
     "StoreDiagnostics",
     "watch_skills",
     "SkillWatcher",
