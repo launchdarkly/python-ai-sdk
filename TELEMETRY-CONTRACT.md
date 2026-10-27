@@ -98,6 +98,7 @@ able to tell from the trace which path ran.
 | `launchdarkly.stream.abandoned` | `True`, only when abandoned | `end_span_once` |
 | `gen_ai.evaluation.name` | judge config key, judge roots only | `with_judge_evaluation`, see section 4a |
 | `gen_ai.evaluation.score.value` | numeric score, judge roots only | `with_judge_evaluation`, see section 4a |
+| `gen_ai.evaluation.explanation` | judge reasoning, judge roots only, gated by section 7 | `with_judge_evaluation`, see section 4a |
 
 The root also carries one span event, `feature_flag`, with these event attributes:
 
@@ -226,17 +227,18 @@ SDK writes a `gen_ai.evaluation.result` span event on that `invoke_agent` span:
 |---|---|
 | `gen_ai.evaluation.name` | judge config key |
 | `gen_ai.evaluation.score.value` | numeric score, only when the judge returned a finite number |
+| `gen_ai.evaluation.explanation` | the judge's reasoning, gated. See section 7 |
 
 The same keys are mirrored as span attributes, so section 2 lists them too.
 `gen_ai.evaluation.score.label` is not invented.
 The existing `track(evaluationMetricKey)` call is unchanged and still feeds AI Config Monitoring —
 a judge that returns a non-numeric score emits no evaluation event but still tracks the metric.
 
-`gen_ai.evaluation.explanation` is deliberately **not** emitted. The judge's reasoning is
-model-generated prose about the user's conversation — content, under section 7 — and content
-attributes require `captureContent` / `capture_content`, a handler-factory option this layer does
-not receive. The reasoning is still returned to the caller in `judgeResults` / `judge_results`;
-only the telemetry copy is withheld. Exporting it needs its own opt-in.
+`gen_ai.evaluation.explanation` is content under section 7. The judge's reasoning is
+model-generated prose about the user's conversation, so it follows the judge handler's own
+`capture_content` decision. It is written by default, and an explicit `False` on the judge's
+handler or the process default withholds it. The reasoning is always returned to the caller in
+`judgeResults` / `judge_results`; only the telemetry copy is gated.
 
 ---
 
