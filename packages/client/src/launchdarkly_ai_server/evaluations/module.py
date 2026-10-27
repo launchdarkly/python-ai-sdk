@@ -10,7 +10,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast, overload
 
-from ..lifecycle import get_client, init_client
+from ..lifecycle import _flush_tracer_provider, get_client, init_client
 from ..utils import normalize_mode
 from .api import (
     DEFAULT_BASE_URI,
@@ -482,14 +482,17 @@ class EvaluationsModule:
                 )
                 raise
         config = self._runner._build_handler_config(run_generation, run_tools)
-        results = await self._runner._run_rows(
-            dataset_rows,
-            generation_handler,
-            config,
-            run_tool_handlers,
-            concurrency,
-        )
+        row_spans: dict[int, Any] = {}
         try:
+            results = await self._runner._run_rows(
+                dataset_rows,
+                generation_handler,
+                config,
+                run_tool_handlers,
+                concurrency,
+                evaluation_run_id=evaluation_run.id,
+                row_spans=row_spans,
+            )
             self._runner._emit_generation_events(
                 client,
                 project_key=self._project_key,
@@ -504,6 +507,8 @@ class EvaluationsModule:
                     run_criteria,
                     resolved_judges,
                     concurrency,
+                    evaluation_run_id=evaluation_run.id,
+                    row_spans=row_spans,
                 )
                 self._runner._emit_evaluation_events(
                     client,
@@ -515,10 +520,19 @@ class EvaluationsModule:
                 )
         finally:
             # Generation results already queued on the SDK event buffer must
-            # reach LaunchDarkly even when the criteria phase fails.
-            flush_result = client.flush()
-            if inspect.isawaitable(flush_result):
-                await flush_result
+            # reach LaunchDarkly even when the criteria phase fails. Spans
+            # follow on the provider init_client already registered. A span
+            # that fails to end must not skip the event flush.
+            try:
+                for row_span in row_spans.values():
+                    row_span.end()
+            finally:
+                try:
+                    flush_result = client.flush()
+                    if inspect.isawaitable(flush_result):
+                        await flush_result
+                finally:
+                    _flush_tracer_provider()
         summary = await self._poll_summary_until_terminal(
             evaluation.id,
             evaluation_run.id,

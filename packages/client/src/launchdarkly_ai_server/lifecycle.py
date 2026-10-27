@@ -396,6 +396,46 @@ def _release_otel_globals() -> None:
         logger.debug("Could not release the global OTel tracer provider", exc_info=True)
 
 
+def _sdk_processor_is_active() -> bool:
+    """Whether the active tracer provider carries ``ConversationIdSpanProcessor``.
+
+    Only then does ``count_sdk_spans`` see a handler's spans. Under a foreign
+    provider the count stays 0 even when the handler traced itself, so a
+    caller that falls back to writing spans on a 0 count would write them twice.
+    """
+    if _owns_otel_globals:
+        return True
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return False
+    from .conversation import ConversationIdSpanProcessor
+
+    # ponytail: reads the SDK TracerProvider's private processor list; a provider
+    # without it (proxy, vendor wrapper) reads as foreign, which only skips the fallback.
+    multi = getattr(trace.get_tracer_provider(), "_active_span_processor", None)
+    processors = getattr(multi, "_span_processors", ())
+    return any(isinstance(p, ConversationIdSpanProcessor) for p in processors)
+
+
+def _flush_tracer_provider() -> None:
+    """Export spans queued on the provider ``init_client`` registered.
+
+    A provider without ``force_flush`` (the API proxy) is a no-op.
+    """
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return
+    flush = getattr(trace.get_tracer_provider(), "force_flush", None)
+    if flush is None:
+        return
+    try:
+        flush()
+    except Exception:
+        logger.debug("Could not flush OpenTelemetry spans", exc_info=True)
+
+
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
