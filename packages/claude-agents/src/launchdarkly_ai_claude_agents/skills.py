@@ -155,10 +155,10 @@ def create_claude_agents_skills_handler(
 
         import os
 
-        from launchdarkly_ai_server import FDv2SkillStore, config, set_skill_store
+        from launchdarkly_ai_server import LaunchDarklySkillStore, config, set_skill_store
         from launchdarkly_ai_claude_agents import create_claude_agents_skills_handler
 
-        store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
+        store = LaunchDarklySkillStore(os.environ["LD_SDK_KEY"]).start()
         store.wait_for_skills(timeout=10)
         set_skill_store(store)
 

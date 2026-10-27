@@ -403,7 +403,7 @@ def _available_store(deadline: float, subject: str) -> SkillStore | _RetrievalBl
                 "the skill store has not received its initial data, so "
                 f"{subject} could not be retrieved and nothing on disk was "
                 "changed. Wait for delivery before reconciling: "
-                "FDv2SkillStore.wait_for_skills(timeout) returns True once the "
+                "LaunchDarklySkillStore.wait_for_skills(timeout) returns True once the "
                 "first payload has arrived."
             )
         )

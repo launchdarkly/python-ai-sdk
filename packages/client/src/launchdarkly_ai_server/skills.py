@@ -58,7 +58,7 @@ def set_skill_store(store: SkillStore | None) -> None:
     replacement.
 
     Args:
-        store: ``FDv2SkillStore`` to receive skills from LaunchDarkly, or
+        store: ``LaunchDarklySkillStore`` to receive skills from LaunchDarkly, or
             ``InMemorySkillStore`` for local development and tests.
 
     Raises:

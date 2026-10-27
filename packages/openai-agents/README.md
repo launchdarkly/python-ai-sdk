@@ -19,12 +19,12 @@ Set `OPENAI_API_KEY` in your environment (the OpenAI SDK reads it automatically)
 ```python
 import asyncio
 from launchdarkly_ai_server import config, shutdown
-from launchdarkly_ai_openai_agents import create_openai_agent_handler
+from launchdarkly_ai_openai_agents import create_openai_agents_handler
 
 async def main():
     result = await config(
         key="my-ai-config-flag",
-        handler=create_openai_agent_handler(),
+        handler=create_openai_agents_handler(),
         tool_handlers={"search": lambda q: "..."},
     ).invoke("Summarize today's changelog", {"kind": "user", "key": "user-123"})
 
@@ -60,7 +60,7 @@ asyncio.run(main())
 
 ### Agent graphs — `openai_graph()`
 
-Runs a LaunchDarkly agent graph with the OpenAI agent handler pre-bound. Equivalent to calling the base `graph()` with `handlers=[create_openai_agent_handler()]`. See the [core client docs](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#graphkey-options) for the full `graph()` API.
+Runs a LaunchDarkly agent graph with the OpenAI agent handler pre-bound. Equivalent to calling the base `graph()` with `handlers=[create_openai_agents_handler()]`. See the [core client docs](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#graphkey-options) for the full `graph()` API.
 
 ```python
 import asyncio
