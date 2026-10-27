@@ -21,6 +21,24 @@ from launchdarkly_ai_opencode_agents.tool_bridge import (
     sanitize,
 )
 
+_BRIDGE_RUNTIME_SECRET: str | None = None
+
+
+def _bridge_runtime_probe(_args: dict[str, object]) -> str:
+    return _BRIDGE_RUNTIME_SECRET or "missing"
+
+
+def _weather_sync(args: dict[str, Any]) -> str:
+    return f"sunny in {args['city']}"
+
+
+async def _echo_async(args: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, "echo": args}
+
+
+def _weather_boom(_args: dict[str, Any]) -> str:
+    raise ValueError("no such city")
+
 
 def test_sanitize_matches_opencodes_own_regex() -> None:
     # mcp/catalog.ts: `value.replace(/[^a-zA-Z0-9_-]/g, "_")`.
@@ -107,13 +125,41 @@ class TestToolBridgeProtocol:
         finally:
             await bridge.stop()
 
+    async def test_tools_call_runs_callables_in_a_sandbox(self) -> None:
+        global _BRIDGE_RUNTIME_SECRET
+        _BRIDGE_RUNTIME_SECRET = "parent-only"
+        bridge = ToolBridge()
+        bridge.register(
+            "probe",
+            description="",
+            parameters={},
+            fn=_bridge_runtime_probe,
+        )
+        await bridge.start()
+        try:
+            response = await self._post(
+                bridge.base_url,
+                bridge.token,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 31,
+                    "method": "tools/call",
+                    "params": {"name": "probe", "arguments": {}},
+                },
+            )
+            result = response.json()["result"]
+            assert result["isError"] is False
+            assert result["content"][0]["text"] == "missing"
+        finally:
+            await bridge.stop()
+
     async def test_tools_call_runs_a_sync_handler_and_wraps_the_result(self) -> None:
         bridge = ToolBridge()
         bridge.register(
             "get_weather",
             description="",
             parameters={},
-            fn=lambda args: f"sunny in {args['city']}",
+            fn=_weather_sync,
         )
         await bridge.start()
         try:
@@ -134,11 +180,8 @@ class TestToolBridgeProtocol:
             await bridge.stop()
 
     async def test_tools_call_awaits_an_async_handler(self) -> None:
-        async def handler(args: dict[str, Any]) -> dict[str, Any]:
-            return {"ok": True, "echo": args}
-
         bridge = ToolBridge()
-        bridge.register("echo", description="", parameters={}, fn=handler)
+        bridge.register("echo", description="", parameters={}, fn=_echo_async)
         await bridge.start()
         try:
             response = await self._post(
@@ -162,11 +205,8 @@ class TestToolBridgeProtocol:
             await bridge.stop()
 
     async def test_a_raising_handler_comes_back_as_an_mcp_tool_error(self) -> None:
-        def boom(args: dict[str, Any]) -> str:
-            raise ValueError("no such city")
-
         bridge = ToolBridge()
-        bridge.register("get_weather", description="", parameters={}, fn=boom)
+        bridge.register("get_weather", description="", parameters={}, fn=_weather_boom)
         await bridge.start()
         try:
             response = await self._post(

@@ -77,6 +77,7 @@ from .skills_fs import (
 from .skills_fs import _write_skills as _write_skills
 from .skills_source import config_skills
 from .skills_watch import SkillWatcher, watch_skills
+from .tool_sandbox import Sandbox, SandboxError, invoke_tool_callable
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -169,6 +170,9 @@ __all__ = [  # noqa: RUF022
     "HandlerStreamEvent",
     "InitClientOptions",
     "SDKOptions",
+    "Sandbox",
+    "SandboxError",
+    "invoke_tool_callable",
     "JudgeResult",
     "JudgeRunResult",
     "JudgeTask",

@@ -48,6 +48,11 @@ from launchdarkly_ai_opencode_agents.handler import _build_tool_ruleset, _plan_t
 from launchdarkly_ai_opencode_agents.server import OpenCodeHTTPError
 from launchdarkly_ai_server import NativeTool, wrap_tool_handlers
 
+
+async def _contract_get_weather(args: dict[str, Any]) -> str:
+    return f"sunny in {args['city']}"
+
+
 CONTEXT = {"kind": "user", "key": "user-1"}
 _TRACK_DATA: dict[str, Any] = {
     "runId": "run-1",
@@ -576,9 +581,6 @@ class TestToolBridgeEndToEnd:
     async def test_the_registered_bridge_answers_a_real_tools_call(
         self, mock_ld_client: MagicMock
     ) -> None:
-        async def get_weather(args: dict[str, Any]) -> str:
-            return f"sunny in {args['city']}"
-
         handler, script = playing(
             [
                 assistant_open("m1"),
@@ -587,7 +589,10 @@ class TestToolBridgeEndToEnd:
         )
         agen = (
             await handler.stream(
-                _CONFIG_WITH_TOOLS, "hi", _wrapped({"get_weather": get_weather}), None
+                _CONFIG_WITH_TOOLS,
+                "hi",
+                _wrapped({"get_weather": _contract_get_weather}),
+                None,
             )
         ).__aiter__()
         first = await agen.__anext__()

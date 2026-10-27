@@ -91,6 +91,7 @@ InputTokenDetails  [class, @dataclass]
   cache_read: int = 0
   uncached: int = 0
 inspect_config(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
+invoke_tool_callable(fn: ToolCallable, arguments: Any, *, timeout: float = _DEFAULT_TIMEOUT_SECONDS) -> Any  [async]
 is_content_blocks(content: MessageContent) -> bool
 JudgeResult  [class, @dataclass]
   __init__(usage: UsageDict, response: str, score: float, event_key: str | None = None)
@@ -224,6 +225,13 @@ RunUsage  [class, @dataclass]
   add(turn: SpanUsage | None) -> None
   reported: bool  [property]
   total: SpanUsage = field(default_factory=SpanUsage)
+Sandbox  [class]
+  __init__(fn: ToolCallable)
+  __call__(arguments: Any) -> Awaitable[Any] | Any
+  __repr__() -> str
+  __slots__ = ('_fn',)
+  wrapped: ToolCallable  [property]
+SandboxError(RuntimeError)  [class]
 SDK_INFO_CONTEXT: LDContext = {'kind': 'ld_ai', 'key': 'ld-internal-tracking', 'anonymous': True}
 SDK_INFO_EVENT = '$ld:ai:sdk:info'
 SDKOptions  [class, @dataclass(frozen=True)]

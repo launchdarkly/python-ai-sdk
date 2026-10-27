@@ -322,13 +322,27 @@ class ToolBridge:
         }
 
 
+def _sandbox_target(fn: ToolCallable) -> ToolCallable:
+    from launchdarkly_ai_server.tool_sandbox import Sandbox
+
+    if isinstance(fn, Sandbox):
+        return fn.wrapped
+    return fn
+
+
 async def _invoke(fn: ToolCallable, arguments: Any) -> tuple[str, bool]:
     from launchdarkly_ai_server import tool_result_string
+    from launchdarkly_ai_server.tool_sandbox import invoke_tool_callable
 
     try:
-        result = fn(arguments)
-        if asyncio.iscoroutine(result):
-            result = await result
+        target = getattr(fn, "_ld_tool_target", None)
+        if target is not None:
+            track = getattr(fn, "_ld_tool_track", None)
+            if track is not None:
+                track()
+            result = await invoke_tool_callable(_sandbox_target(target), arguments)
+        else:
+            result = await invoke_tool_callable(fn, arguments)
         return tool_result_string(result), False
     except Exception as exc:
         return str(exc), True

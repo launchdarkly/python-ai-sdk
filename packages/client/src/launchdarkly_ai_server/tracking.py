@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from .agui import HANDLER_RICH_TYPES, TEXT_MESSAGE_CONTENT, TEXT_TYPES
+from .tool_sandbox import Sandbox
 from .trajectory import HANDOFF_TOOL_PREFIX, TrajectoryRecorder, render_trajectory
 from .types import (
     NATIVE_TOOL_KEY,
@@ -94,6 +95,32 @@ def wrap_tool_handlers(
                 return stub
 
             wrapped[name] = _make_native_stub(name, native)
+        elif isinstance(fn, Sandbox):
+            sandbox = fn
+
+            def _make_sandbox_wrapper(
+                tool_name: str, boxed: Sandbox
+            ) -> Callable[..., Any]:
+                def track_call() -> None:
+                    get_client().track(
+                        "$ld:ai:tool_call",
+                        user_context,
+                        {**track_data, "toolKey": tool_name},
+                        1,
+                    )
+
+                async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                    from .tool_sandbox import invoke_tool_callable
+
+                    track_call()
+                    arguments = args[0] if args else kwargs
+                    return await invoke_tool_callable(boxed.wrapped, arguments)
+
+                setattr(wrapper, "_ld_tool_target", boxed.wrapped)
+                setattr(wrapper, "_ld_tool_track", track_call)
+                return wrapper
+
+            wrapped[name] = _make_sandbox_wrapper(name, sandbox)
         else:
 
             def _make_regular_wrapper(
@@ -109,16 +136,21 @@ def wrap_tool_handlers(
 
                     return handoff_wrapper
 
-                async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                def track_call() -> None:
                     get_client().track(
                         "$ld:ai:tool_call",
                         user_context,
                         {**track_data, "toolKey": tool_name},
                         1,
                     )
+
+                async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                    track_call()
                     result = original(*args, **kwargs)
                     return await result if inspect.isawaitable(result) else result
 
+                setattr(wrapper, "_ld_tool_target", original)
+                setattr(wrapper, "_ld_tool_track", track_call)
                 return wrapper
 
             wrapped[name] = _make_regular_wrapper(name, fn)
