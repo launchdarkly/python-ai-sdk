@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.3.0...launchdarkly-ai-python-0.4.0) (2026-10-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **skills:** promote Agent Skills to core ([#210](https://github.com/launchdarkly/python-ai-sdk/issues/210))
+
+### Features
+
+* **skills:** promote Agent Skills to core ([#210](https://github.com/launchdarkly/python-ai-sdk/issues/210)) ([715815f](https://github.com/launchdarkly/python-ai-sdk/commit/715815fb37b1fd3f5a537bbd5b3a6237b90fc9fb))
+
 ## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.2.0...launchdarkly-ai-python-0.3.0) (2026-10-23)
 
 

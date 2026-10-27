@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.2.6...launchdarkly-ai-claude-agents-0.3.0) (2026-10-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **skills:** promote Agent Skills to core ([#210](https://github.com/launchdarkly/python-ai-sdk/issues/210))
+* **claude-agents:** switch the built-ins off by default and load no host settings ([#201](https://github.com/launchdarkly/python-ai-sdk/issues/201))
+* handlers now forward the AI Config's model parameters to the provider, limited to each handler's list in TESTING.md 1.12. Configs that set parameters which used to be ignored now take effect.
+
+### Features
+
+* **skills:** export the Claude Agents skills handler from the package root ([#217](https://github.com/launchdarkly/python-ai-sdk/issues/217)) ([5d46dbb](https://github.com/launchdarkly/python-ai-sdk/commit/5d46dbbf55a3c008a28dfa72345dd9d542d00603))
+* **skills:** promote Agent Skills to core ([#210](https://github.com/launchdarkly/python-ai-sdk/issues/210)) ([715815f](https://github.com/launchdarkly/python-ai-sdk/commit/715815fb37b1fd3f5a537bbd5b3a6237b90fc9fb))
+
+
+### Bug Fixes
+
+* **claude-agents:** switch the built-ins off by default and load no host settings ([#201](https://github.com/launchdarkly/python-ai-sdk/issues/201)) ([f99d538](https://github.com/launchdarkly/python-ai-sdk/commit/f99d5384353b439a221c556b4103dde783e6a150))
+* pass AI Config model parameters through to every provider handler ([#107](https://github.com/launchdarkly/python-ai-sdk/issues/107)) ([e3afb3f](https://github.com/launchdarkly/python-ai-sdk/commit/e3afb3f2c19ebf7085f84e94cd5a53f2bbe929ae))
+
 ## [0.2.6](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.2.5...launchdarkly-ai-claude-agents-0.2.6) (2026-10-23)
 
 
