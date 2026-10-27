@@ -14,6 +14,10 @@ import pytest
 from launchdarkly_ai_server import NativeTool, create_handler
 from launchdarkly_ai_server.evaluations.api import HttpResponse
 from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner
+from launchdarkly_ai_server.evaluations.tools import (
+    create_wire_tools,
+    handler_config_tools,
+)
 from launchdarkly_ai_server.evaluations.types import (
     DatasetRef,
     EvaluationRef,
@@ -1283,6 +1287,30 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
             [
                 EvalTool(
                     key="lookup_order",
+                    implementation=lookup_order,
+                    schema={1: {"type": "string"}},  # type: ignore[dict-item]
+                )
+            ],
+            r"'lookup_order' schema must be JSON-serializable.*"
+            r"keys must be str, not int \(got 1\)",
+            id="schema_has_a_non_string_key",
+        ),
+        pytest.param(
+            [
+                EvalTool(
+                    key="lookup_order",
+                    implementation=lookup_order,
+                    schema={"anyOf": [{"type": "object"}, {None: "x"}]},
+                )
+            ],
+            r"'lookup_order' schema must be JSON-serializable.*"
+            r"keys must be str, not NoneType \(got None\)",
+            id="schema_has_a_non_string_key_inside_a_list",
+        ),
+        pytest.param(
+            [
+                EvalTool(
+                    key="lookup_order",
                     implementation="not a function",
                     schema=ORDER_SCHEMA,
                 )
@@ -1385,37 +1413,100 @@ async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
     ]
 
 
+def library_tool_response(key: str) -> HttpResponse:
+    return response(
+        200,
+        {"key": key, "version": 7, "description": "", "schema": {"type": "object"}},
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_repeated_tool_key_is_rejected_with_zero_requests() -> None:
+@pytest.mark.parametrize(
+    ("first", "second", "library_keys", "match"),
+    [
+        pytest.param(
+            "library",
+            "inline",
+            ["lookup_order"],
+            r"'lookup_order' \(inline\) collides with 'lookup_order' \(library\)",
+            id="library_and_inline",
+        ),
+        pytest.param(
+            "inline",
+            "inline",
+            [],
+            r"'lookup_order' \(inline\) collides with 'lookup_order' \(inline\)",
+            id="inline_twice",
+        ),
+        pytest.param(
+            "library",
+            "library",
+            ["lookup_order"],
+            r"'lookup_order' \(library\) collides with 'lookup_order' \(library\)",
+            id="library_twice",
+        ),
+    ],
+)
+async def test_a_repeated_tool_key_names_both_sources_with_zero_requests(
+    first: str, second: str, library_keys: list[str], match: str
+) -> None:
     """One key names one tool, whichever source each entry came from."""
-    transport = SequencedTransport([])
+    transport = SequencedTransport([library_tool_response(key) for key in library_keys])
     evals = init_evaluations(
         project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
     )
+    library_tool = (
+        await evals.tools.get("lookup_order", implementation=lookup_order)
+        if library_keys
+        else None
+    )
+
+    def entry(source: str) -> EvalTool:
+        if source == "library":
+            assert library_tool is not None
+            return library_tool
+        return EvalTool(
+            key="lookup_order", implementation=refund_order, schema=ORDER_SCHEMA
+        )
+
+    reads = len(transport.requests)
+    with pytest.raises(EvaluationsError, match=match):
+        await evals.run(
+            key="eval-key",
+            dataset="golden",
+            handler=tagged(successful_handler),
+            tools=[entry(first), entry(second)],
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+        )
+
+    assert len(transport.requests) == reads
+
+
+@pytest.mark.asyncio
+async def test_keys_equal_under_case_folding_collide_with_zero_requests() -> None:
+    """``straße`` and ``strasse`` are both lowercase, and fold to one key."""
+    transport = SequencedTransport([library_tool_response("strasse")])
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    library_tool = await evals.tools.get("strasse", implementation=lookup_order)
 
     with pytest.raises(
-        EvaluationsError, match=r"'lookup_order' appears more than once"
+        EvaluationsError,
+        match=r"'straße' \(inline\) collides with 'strasse' \(library\)",
     ):
         await evals.run(
             key="eval-key",
             dataset="golden",
             handler=tagged(successful_handler),
             tools=[
-                EvalTool(
-                    key="lookup_order",
-                    implementation=lookup_order,
-                    schema=ORDER_SCHEMA,
-                ),
-                EvalTool(
-                    key="lookup_order",
-                    implementation=refund_order,
-                    schema=ORDER_SCHEMA,
-                ),
+                library_tool,
+                EvalTool(key="straße", implementation=refund_order, schema={}),
             ],
             generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
 
-    assert transport.requests == []
+    assert len(transport.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -4032,6 +4123,81 @@ def test_an_inline_tool_requires_a_schema() -> None:
 
     tool = EvalTool(key="lookup_order", implementation=lookup_order, schema={})
     assert tool.schema == {}
+
+
+def test_a_tool_holds_its_own_copy_of_the_schema() -> None:
+    """Changing the caller's dict afterwards changes nothing the tool sends."""
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"order_id": {"type": "string"}},
+    }
+    tool = EvalTool(key="lookup_order", implementation=lookup_order, schema=schema)
+
+    schema["properties"]["order_id"]["type"] = "integer"
+    schema["extra"] = True
+
+    expected = {"type": "object", "properties": {"order_id": {"type": "string"}}}
+    assert tool.schema == expected
+    assert tool.to_create_wire()["schema"] == expected
+    assert handler_config_tools([tool])["lookup_order"]["parameters"] == expected
+
+
+def test_a_handler_config_does_not_share_the_create_body_schema() -> None:
+    expected = json.loads(json.dumps(ORDER_SCHEMA))
+    tool = EvalTool(
+        key="lookup_order",
+        implementation=lookup_order,
+        schema=json.loads(json.dumps(ORDER_SCHEMA)),
+    )
+
+    config_tools = handler_config_tools([tool])
+    config_tools["lookup_order"]["parameters"]["properties"]["order_id"] = {}
+    wire = create_wire_tools([tool])
+    wire[0]["schema"]["required"].append("note")
+
+    assert tool.schema == expected
+    assert tool.to_create_wire()["schema"] == expected
+    assert handler_config_tools([tool])["lookup_order"]["parameters"] == expected
+
+
+@pytest.mark.asyncio
+async def test_a_schema_changed_after_construction_is_not_what_is_sent() -> None:
+    transport = SequencedTransport(hosted_dataset_responses())
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    schema = json.loads(json.dumps(ORDER_SCHEMA))
+    tool = EvalTool(key="lookup_order", implementation=lookup_order, schema=schema)
+    seen: dict[str, Any] = {}
+
+    async def handler(
+        config: dict[str, Any],
+        user_input: str | None,
+        tool_handlers: dict[str, Callable[..., Any]],
+        variables: dict[str, Any],
+    ) -> dict[str, Any]:
+        seen["parameters"] = json.loads(
+            json.dumps(config["tools"]["lookup_order"]["parameters"])
+        )
+        # A handler that changes its config cannot change the tool.
+        config["tools"]["lookup_order"]["parameters"]["required"].clear()
+        return {"output": "ok"}
+
+    # Not valid JSON, so the run would fail if this reached validation.
+    schema["default"] = float("nan")
+
+    await evals.run(
+        key="eval-key",
+        dataset="golden",
+        handler=tagged(handler),
+        tools=[tool],
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert transport.requests[2]["body"]["tools"][0]["schema"] == ORDER_SCHEMA
+    assert seen["parameters"] == ORDER_SCHEMA
+    assert tool.schema == ORDER_SCHEMA
+    assert tool.to_create_wire()["schema"] == ORDER_SCHEMA
 
 
 def test_a_tool_cannot_be_reassigned_to_a_library_tool() -> None:
