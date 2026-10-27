@@ -92,7 +92,7 @@ def _install_provider(
         resource=Resource.create(
             {
                 "service.name": "python-sdk",
-                "highlight.project_id": "sdk-key",
+                "launchdarkly.project_id": "sdk-key",
             }
         )
     )
@@ -347,7 +347,7 @@ async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge
     ]
     for span in spans:
         assert span.resource is not None
-        assert span.resource.attributes["highlight.project_id"] == "sdk-key"
+        assert span.resource.attributes["launchdarkly.project_id"] == "sdk-key"
         assert_row_attributes(span.attributes)
         assert span.status.status_code == StatusCode.OK
 
