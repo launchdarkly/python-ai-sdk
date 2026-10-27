@@ -66,7 +66,7 @@ from .skills import (
 )
 from .skills import _skill_refs as _skill_refs
 from .skills_core import SkillStore
-from .skills_fdv2 import FDv2SkillStore, StoreDiagnostics
+from .skills_fdv2 import LaunchDarklySkillStore, StoreDiagnostics
 from .skills_fs import (
     MANIFEST_FILENAME,
     MANIFEST_VERSION,
@@ -148,6 +148,9 @@ from .utils import (
     to_usage_dict,
 )
 from .utils import _create_handler as _create_handler
+
+# Deprecated: the 0.5.0 name. Removed in the next major release.
+FDv2SkillStore = LaunchDarklySkillStore
 
 __all__ = [  # noqa: RUF022
     # types
@@ -271,6 +274,7 @@ __all__ = [  # noqa: RUF022
     "SkillStore",
     "InMemorySkillStore",
     # Agent Skills: LaunchDarkly delivery store and on-change re-reconcile
+    "LaunchDarklySkillStore",
     "FDv2SkillStore",
     "StoreDiagnostics",
     "watch_skills",
