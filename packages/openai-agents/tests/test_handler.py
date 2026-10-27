@@ -26,7 +26,7 @@ from launchdarkly_ai_openai_agents.handler import (
     create_openai_agents_handler,
     openai_agents,
 )
-from launchdarkly_ai_openai_agents.utils import build_output_type
+from launchdarkly_ai_openai_agents.utils import _build_output_type
 from tests.forwarding_spec import (
     OPENAI_AGENTS,
     candidate_keys,
@@ -1691,7 +1691,7 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format (build_output_type)
+# §1.9 Output format (_build_output_type)
 # ---------------------------------------------------------------------------
 
 
@@ -1839,22 +1839,22 @@ class TestModelParametersForwarding:
 
 class TestOutputFormat:
     def test_absent_output_format_no_change(self) -> None:
-        assert build_output_type(None) is None
+        assert _build_output_type(None) is None
 
     def test_output_format_sets_output_type_on_agent(self) -> None:
         schema = {"type": "object", "properties": {"name": {"type": "string"}}}
-        result = build_output_type(schema)
+        result = _build_output_type(schema)
         assert result is not None
         assert result["type"] == "json_schema"
         assert "schema" in result
 
     def test_absent_output_format_returns_plain_string(self) -> None:
-        result = build_output_type({})
+        result = _build_output_type({})
         assert result is None
 
     def test_output_format_returns_parsed_object(self) -> None:
         schema = {"type": "object", "properties": {"count": {"type": "integer"}}}
-        result = build_output_type(schema)
+        result = _build_output_type(schema)
         assert result is not None
         assert result["schema"]["properties"]["count"]["type"] == "integer"
 

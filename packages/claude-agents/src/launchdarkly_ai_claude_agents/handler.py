@@ -174,7 +174,7 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
 # ---------------------------------------------------------------------------
 
 
-async def build_tool_mcp(
+async def _build_tool_mcp(
     config_tools: dict[str, Any],
     handlers: dict[str, Any],
 ) -> Any:
@@ -211,7 +211,7 @@ async def build_tool_mcp(
     return create_server(name=TOOL_MCP_NAME, version="1.0.0", tools=tool_objs)
 
 
-def partition_tools(
+def _partition_tools(
     config_tools: dict[str, Any] | None,
     tool_handlers: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
@@ -242,7 +242,7 @@ def partition_tools(
 def _native_tool_aliases(tool_handlers: dict[str, Any]) -> dict[str, str]:
     """AI Config key → provider tool name, for the config's native tools only.
 
-    ``partition_tools``'s ``native_tool_map`` is keyed the other way round, by provider name, which
+    ``_partition_tools``'s ``native_tool_map`` is keyed the other way round, by provider name, which
     loses the AI Config key, and the key is what a config's declared schema is filed under.
     :class:`~.spans.ToolCatalog` needs both ends to report one tool once, under the name the model
     saw, with the schema the config gave it.
@@ -438,7 +438,7 @@ def build_tool_hooks(
 # ---------------------------------------------------------------------------
 
 
-def build_prompt(
+def _build_prompt(
     config: AiConfigRep,
     user_input: str | None,
     variables: dict[str, Any],
@@ -794,7 +794,7 @@ def _create_claude_agents_handler(
         # truthily, and this handler's own suite is built on mock spans in places.
         open_root_span: Any = span
 
-        prompt, system_prompt = build_prompt(config, user_input, vs, history)
+        prompt, system_prompt = _build_prompt(config, user_input, vs, history)
         query_prompt = build_query_prompt(config, user_input, vs, history, prompt)
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
@@ -803,7 +803,7 @@ def _create_claude_agents_handler(
             )
         opening = _opening_of(prompt, system_prompt)
 
-        native_tool_map, user_config_tools, native_tool_names = partition_tools(
+        native_tool_map, user_config_tools, native_tool_names = _partition_tools(
             config.get("tools"), th
         )
         catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(th))
@@ -831,7 +831,7 @@ def _create_claude_agents_handler(
             prepared = await _prepare(config) if _prepare is not None else None
             extra_builtins = prepared.extra_builtins if prepared is not None else []
             tool_mcp = (
-                await build_tool_mcp(user_config_tools, th)
+                await _build_tool_mcp(user_config_tools, th)
                 if user_config_tools
                 else None
             )
@@ -1055,11 +1055,11 @@ async def _stream_gen(
     span = start_root_span(config, variables)
     parent = parent_context_of(span)
 
-    prompt, system_prompt = build_prompt(config, user_input, variables, history)
+    prompt, system_prompt = _build_prompt(config, user_input, variables, history)
     query_prompt = build_query_prompt(config, user_input, variables, history, prompt)
     opening = _opening_of(prompt, system_prompt)
 
-    native_tool_map, user_config_tools, native_tool_names = partition_tools(
+    native_tool_map, user_config_tools, native_tool_names = _partition_tools(
         config.get("tools"), tool_handlers
     )
     catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(tool_handlers))
@@ -1094,7 +1094,7 @@ async def _stream_gen(
         prepared = await prepare(config) if prepare is not None else None
         extra_builtins = prepared.extra_builtins if prepared is not None else []
         tool_mcp = (
-            await build_tool_mcp(user_config_tools, tool_handlers)
+            await _build_tool_mcp(user_config_tools, tool_handlers)
             if user_config_tools
             else None
         )

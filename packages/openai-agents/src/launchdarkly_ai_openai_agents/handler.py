@@ -341,7 +341,7 @@ def _build_agent_and_prompt(
     # `outputFormat` is not wired into `Agent(output_type=...)` here, matching this handler's
     # pre-existing behaviour (and unlike the TypeScript handler, which does wire it): the Python
     # Agents SDK requires a concrete Python type for `output_type`, not a raw JSON Schema dict (see
-    # `utils.build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
+    # `utils._build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
     # change, not a telemetry one, so it is left alone. `_call_impl` still returns the parsed
     # `final_output` object as-is when `outputFormat` is configured, matching the pre-existing
     # return-shape contract.

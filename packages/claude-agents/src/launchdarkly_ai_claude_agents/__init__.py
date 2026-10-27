@@ -21,11 +21,8 @@ from .builtins import (
 )
 from .graph import claude_graph
 from .handler import (
-    build_prompt,
-    build_tool_mcp,
     claude_agents,
     create_claude_agents_handler,
-    partition_tools,
 )
 from .native_graph import to_claude_agents
 from .skills import create_claude_agents_skills_handler
@@ -41,13 +38,10 @@ __all__ = [
     "ClaudeWebFetch",
     "ClaudeWebSearch",
     "ClaudeWrite",
-    "build_prompt",
-    "build_tool_mcp",
     "claude_agents",
     "claude_graph",
     "create_claude_agents_handler",
     "create_claude_agents_skills_handler",
-    "partition_tools",
     "to_claude_agents",
 ]
 
