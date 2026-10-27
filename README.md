@@ -183,7 +183,7 @@ Returns a `ConfigInstance` with `.invoke(user_input, context, variables?)` and `
 import asyncio
 from launchdarkly_ai_server import config, create_handler, shutdown
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_openai_agents import create_openai_agent_handler
+from launchdarkly_ai_openai_agents import create_openai_agents_handler
 from launchdarkly_ai_claude_agents import create_claude_agents_handler
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
@@ -208,7 +208,7 @@ router = config(
     tool_handlers={"search": lambda q: "..."},
     handler=[
         create_openai_messages_handler(),
-        create_openai_agent_handler(),
+        create_openai_agents_handler(),
         create_claude_agents_handler(),
         create_claude_messages_handler(),
     ],
@@ -457,10 +457,10 @@ You can call `register()` more than once to add handlers or tools incrementally.
 ```python
 from launchdarkly_ai_server import Registry
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_openai_agents import create_openai_agent_handler
+from launchdarkly_ai_openai_agents import create_openai_agents_handler
 
 openai_registry = Registry(
-    handlers=[create_openai_messages_handler(), create_openai_agent_handler()],
+    handlers=[create_openai_messages_handler(), create_openai_agents_handler()],
     tools={"get-prefs": get_preferences_fn},
 )
 ```
