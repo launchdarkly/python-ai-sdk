@@ -314,7 +314,7 @@ The primary entry point for AI config invocations. Accepts either a single handl
 import asyncio
 from launchdarkly_ai_server import config, shutdown
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_openai_agents import create_openai_agent_handler
+from launchdarkly_ai_openai_agents import create_openai_agents_handler
 from launchdarkly_ai_claude_agents import create_claude_agents_handler
 
 # Single handler — must match the flag variation's provider+mode, or raises.
@@ -339,7 +339,7 @@ async def main():
         tool_handlers={"search": search_fn},
         handler=[
             create_openai_messages_handler(),  # provides_for: ["OpenAI", "messages"]
-            create_openai_agent_handler(),     # provides_for: ["OpenAI", "agent"]
+            create_openai_agents_handler(),    # provides_for: ["OpenAI", "agent"]
             create_claude_agents_handler(),    # provides_for: ["Anthropic", "agent"]
         ],
     )
