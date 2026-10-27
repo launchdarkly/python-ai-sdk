@@ -29,6 +29,7 @@ execute_and_track(*, config_key: str, config: AiConfigRep, meta: VariationMeta, 
 ExecuteStreamDoneEvent = dict[str, Any]
 ExecuteStreamEvent = dict[str, Any]
 extract_variation(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
+FDv2SkillStore = LaunchDarklySkillStore
 get_client() -> Any
 get_skill(key: str, *, version: int | None = None) -> Skill | None  [async]
 get_skill_result(key: str, *, version: int | None = None) -> SkillOutcome  [async]

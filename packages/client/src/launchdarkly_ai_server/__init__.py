@@ -149,6 +149,9 @@ from .utils import (
 )
 from .utils import _create_handler as _create_handler
 
+# Deprecated: the 0.5.0 name. Removed in the next major release.
+FDv2SkillStore = LaunchDarklySkillStore
+
 __all__ = [  # noqa: RUF022
     # types
     "NATIVE_TOOL_KEY",
@@ -272,6 +275,7 @@ __all__ = [  # noqa: RUF022
     "InMemorySkillStore",
     # Agent Skills: LaunchDarkly delivery store and on-change re-reconcile
     "LaunchDarklySkillStore",
+    "FDv2SkillStore",
     "StoreDiagnostics",
     "watch_skills",
     "SkillWatcher",
