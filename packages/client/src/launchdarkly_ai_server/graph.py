@@ -338,11 +338,18 @@ async def _build_graph(
                     if not chosen:
                         chosen.append(t)
                     # Selecting an edge does not end the turn; execution continues until the
-                    # model produces its final text. A "transferring now" reply reads as though
-                    # control has already left, and the model stops short of its own work.
+                    # model produces its final text. The text has to hold for a node with work
+                    # of its own and for a pure router, and nothing in the graph says which a
+                    # node is. A "transferring now" reply reads as though control has already
+                    # left, and a node with a real tool stops short of calling it, so the
+                    # result says "recorded". Asking for a "final response" invites a router,
+                    # which has no answer of its own, to write the target's; that reply
+                    # streams to the caller and reaches the target as the previous response.
                     return (
                         f"Handoff to {t} recorded. "
-                        "Finish your own work and provide your final response."
+                        f"{t} takes over when your turn ends. "
+                        "Finish your own part, then end your turn. "
+                        f"Do not answer for {t}."
                     )
 
                 return _fn
@@ -355,8 +362,10 @@ async def _build_graph(
                 (node.config.get("instructions") or "")
                 + (
                     "\n\nComplete your task using your available tools first. "
-                    "Only once you have your final answer, call exactly one transfer "
-                    "tool to route to the next agent."
+                    "Only once your own part is done, call exactly one transfer "
+                    "tool to route to the next agent. "
+                    "Do not answer the parts of the request that belong to the agent "
+                    "you route to."
                 )
             ),
             "tools": {

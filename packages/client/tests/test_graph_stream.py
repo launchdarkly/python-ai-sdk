@@ -27,6 +27,21 @@ from launchdarkly_ai_server.conversation import (
 
 CONTEXT = {"kind": "user", "key": "u1"}
 
+# TESTING.md §3.15a pins these byte for byte; every SDK sends the same text.
+ROUTING_SUFFIX = (
+    "\n\nComplete your task using your available tools first. Only once your own "
+    "part is done, call exactly one transfer tool to route to the next agent. Do "
+    "not answer the parts of the request that belong to the agent you route to."
+)
+
+
+def handoff_result_for(target: str) -> str:
+    return (
+        f"Handoff to {target} recorded. {target} takes over when your turn ends. "
+        f"Finish your own part, then end your turn. Do not answer for {target}."
+    )
+
+
 _exporter = InMemorySpanExporter()
 _provider = TracerProvider()
 _provider.add_span_processor(ConversationIdSpanProcessor())
@@ -748,6 +763,89 @@ class TestGraphStreamMultiEdge:
         assert (
             stream_tools["__handoff_agent_b"]() == invoke_tools["__handoff_agent_b"]()
         )
+
+    @pytest.mark.parametrize("mode", ["invoke", "stream"])
+    @pytest.mark.parametrize("own_tool", [True, False], ids=["own_tool", "no_tools"])
+    async def test_routing_text_matches_the_spec(
+        self, mock_ld_client: MagicMock, mode: str, own_tool: bool
+    ) -> None:
+        """TESTING.md §3.15a pins both strings byte for byte across SDKs (AIC-3601).
+
+        The same text goes to a node with a tool of its own and to one with none,
+        since the graph has no router role to branch on. ``<target>`` is the raw
+        target key (``agent-b``), not the sanitized tool name.
+        """
+        root_config = _node_variation("I am root")
+        if own_tool:
+            root_config["tools"] = {
+                "lookup": {
+                    "name": "lookup",
+                    "type": "function",
+                    "description": "",
+                    "parameters": {},
+                }
+            }
+
+        async def variation_side_effect(key: str, ctx: dict, default: Any) -> Any:
+            if key == "graph-key":
+                return {
+                    "root": "root-node",
+                    "edges": {
+                        "root-node": [{"key": "agent-a"}, {"key": "agent-b"}],
+                    },
+                }
+            if key == "root-node":
+                return root_config
+            return _node_variation("Be helpful.")
+
+        mock_ld_client.variation = AsyncMock(side_effect=variation_side_effect)
+
+        _usage = {"input_tokens": 1, "output_tokens": 1}
+        received: list[tuple[Any, Any, str]] = []
+
+        async def run_root(config: Any, tool_handlers: Any) -> None:
+            if config.get("instructions", "").startswith("I am root"):
+                if "lookup" in config.get("tools", {}):
+                    assert await tool_handlers["lookup"]({"id": "A1"}) == "shipped"
+                result = tool_handlers["__handoff_agent_b"]()
+                received.append((config, tool_handlers, result))
+
+        async def fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            await run_root(config, tool_handlers)
+            return {"output": "ok", "usage": _usage}
+
+        async def stream_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> AsyncGenerator:  # type: ignore[override]
+            await run_root(config, tool_handlers)
+            yield {"type": "chunk", "text": "ok"}
+            yield {"type": "done", "output": "ok", "usage": _usage}
+
+        h = ProviderHandler(
+            fn=fn, provides_for=("TestProvider", "messages"), stream_fn=stream_fn
+        )
+        g = graph(
+            "graph-key",
+            handlers=[h],
+            tool_handlers={"lookup": lambda args: "shipped"},
+        )
+        if mode == "invoke":
+            await g.invoke("hi", CONTEXT)
+        else:
+            await _collect(g.stream("hi", CONTEXT))
+
+        assert len(received) == 1
+        config, tool_handlers, handoff_result = received[0]
+        assert config["instructions"] == "I am root" + ROUTING_SUFFIX
+        assert handoff_result == handoff_result_for("agent-b")
+        assert tool_handlers["__handoff_agent_a"]() == handoff_result_for("agent-a")
+
+        handoff_names = {"__handoff_agent_a", "__handoff_agent_b"}
+        own_names = {"lookup"} if own_tool else set()
+        assert set(config["tools"]) == handoff_names | own_names
+        assert handoff_names | own_names <= set(tool_handlers)
 
 
 # ---------------------------------------------------------------------------
