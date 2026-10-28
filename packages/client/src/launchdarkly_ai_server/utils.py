@@ -806,6 +806,10 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     span.set_attribute("launchdarkly.run.id", ld.get("runId", ""))
     if ld.get("graphKey"):
         span.set_attribute("launchdarkly.graph.key", ld["graphKey"])
+    extra = variables.get("__ld_span")
+    if isinstance(extra, dict):
+        for name, value in extra.items():
+            span.set_attribute(name, value)
 
     feature_flag_attrs: dict[str, str] = {
         "feature_flag.key": ld.get("configKey", ""),

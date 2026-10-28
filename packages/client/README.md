@@ -308,6 +308,34 @@ result = await evals.run(
 
 **The list is checked before any network I/O.** A blank key, an uppercase key, a `schema` that is not a JSON object, a schema that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued. A repeated key fails too, and keys are compared without case. A `NativeTool` is valid only for a library tool, because the provider supplies its schema.
 
+### Shadow Requests (experimental)
+
+A Shadow Request runs another variation of an AI Config in the background on the same input, and reports it on the normal AI metrics with `isShadow: true`. LaunchDarkly attaches shadow requests to a targeting rule or the fallthrough. The shadow's response is discarded, and your response, latency and events are unchanged. Shadow runs use your provider account, so they are billed like real calls.
+
+Nothing runs until you enable it:
+
+```python
+from launchdarkly_ai_server.experimental.shadow_requests import enable_shadow_requests
+
+enable_shadow_requests()               # run sampled shadows in the background, 30 s timeout
+enable_shadow_requests(timeout_s=10)   # or pick the timeout
+```
+
+Shadows run for `config().invoke()` and `config().stream()`, not for graphs or judges. A shadow makes no tool calls and runs no judges. Call `disable_shadow_requests()` to turn them off.
+
+To run shadows on your own queue or worker instead, pass `on_task`. It receives a picklable `ShadowTask` before your handler runs and must only enqueue it. Run the task later with `run_shadow`:
+
+```python
+from launchdarkly_ai_server.experimental.shadow_requests import enable_shadow_requests, run_shadow
+
+enable_shadow_requests(on_task=queue.put_nowait)
+
+# in the worker
+result = await run_shadow(task, handlers=[create_openai_messages_handler()])
+```
+
+These names may change in a minor release.
+
 ### `config(**args)`
 
 The primary entry point for AI config invocations. Accepts either a single handler or a list of handlers and routes to the correct one at invoke-time based on the flag variation's provider and mode.

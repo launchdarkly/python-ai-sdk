@@ -601,13 +601,26 @@ async def extract_variation(
     # The real ldclient.variation() expects an ldclient.Context, not a plain dict.
     # Convert when running against the real SDK; test mocks accept dicts directly.
     ld_context = to_ld_context(client, context)
-    # variation() is synchronous in the real Python LD SDK; AsyncMock in tests.
-    variation_result = client.variation(config_key, ld_context, None)
-    raw = (
-        await variation_result
-        if inspect.isawaitable(variation_result)
-        else variation_result
-    )
+    # The reason is only read while an invocation hook is registered, so an app
+    # with none keeps calling variation() exactly as before (spec §9.6).
+    from .invocation_hooks import has_invocation_hooks
+
+    reason: Any = None
+    if has_invocation_hooks():
+        detail_result = client.variation_detail(config_key, ld_context, None)
+        detail = (
+            await detail_result if inspect.isawaitable(detail_result) else detail_result
+        )
+        raw = getattr(detail, "value", None)
+        reason = getattr(detail, "reason", None)
+    else:
+        # variation() is synchronous in the real Python LD SDK; AsyncMock in tests.
+        variation_result = client.variation(config_key, ld_context, None)
+        raw = (
+            await variation_result
+            if inspect.isawaitable(variation_result)
+            else variation_result
+        )
 
     if raw is None:
         raise RuntimeError(
@@ -629,9 +642,9 @@ async def extract_variation(
         **model_stamps_from_meta(ld_meta),
     }
 
-    # Strip _ldMeta for config parsing
+    # Strip _ldMeta and shadowConfiguration for config parsing
     config_raw = (
-        {k: v for k, v in raw.items() if k != "_ldMeta"}
+        {k: v for k, v in raw.items() if k not in ("_ldMeta", "shadowConfiguration")}
         if isinstance(raw, dict)
         else raw
     )
@@ -642,4 +655,4 @@ async def extract_variation(
             f"Invalid AI config variation for '{config_key}': {result.error['message']}"
         )
 
-    return {"config": result.data, "meta": meta}
+    return {"config": result.data, "meta": meta, "raw": raw, "reason": reason}

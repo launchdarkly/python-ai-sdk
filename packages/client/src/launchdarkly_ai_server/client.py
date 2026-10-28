@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from typing import Any
 
 from .agui import StableProjector, judge_completed_stream
 from .conversation import bind_conversation_id
+from .invocation_hooks import (
+    InvocationEvent,
+    has_invocation_hooks,
+    run_invocation_hooks,
+)
 from .judge_scoring import judge_text
 from .judges import _build_judge_tasks, run_judges
 from .lifecycle import extract_variation
@@ -43,6 +49,39 @@ def _resolve_output_format_response(
         return raw_response
     parsed = parse_json_with_possible_fences(raw_response)
     return parsed if parsed is not None else raw_response
+
+
+def _run_hooks(
+    *,
+    config_key: str,
+    variation: dict[str, Any],
+    meta: VariationMeta,
+    context: LDContext,
+    user_input: str | None,
+    history: list[dict[str, Any]] | None,
+    variables: dict[str, Any] | None,
+    handlers: list[ProviderHandler],
+    run_id: str,
+) -> None:
+    if not has_invocation_hooks():
+        return
+    raw = variation.get("raw")
+    run_invocation_hooks(
+        InvocationEvent(
+            config_key=config_key,
+            value=raw if isinstance(raw, dict) else {},
+            reason=variation.get("reason"),
+            context=context,
+            user_input=user_input,
+            history=history,
+            variables=variables,
+            handlers=handlers,
+            run_id=run_id,
+            variation_key=str(meta.get("variationKey", ""))
+            if isinstance(meta, dict)
+            else "",
+        )
+    )
 
 
 class ConfigInstance:
@@ -98,6 +137,18 @@ class ConfigInstance:
         if not resolved_handler_list:
             raise ValueError("No handlers provided to config()")
         handler = select_handler(config, meta, resolved_handler_list)
+        run_id = str(uuid.uuid4())
+        _run_hooks(
+            config_key=self._key,
+            variation=variation,
+            meta=meta,
+            context=context,
+            user_input=user_input,
+            history=history,
+            variables=variables,
+            handlers=resolved_handler_list,
+            run_id=run_id,
+        )
 
         result = await execute_and_track(
             config_key=self._key,
@@ -109,6 +160,7 @@ class ConfigInstance:
             tool_handlers=resolved_tools,
             variables=variables,
             history=history,
+            run_id=run_id,
         )
 
         raw_response = result["response"]
@@ -228,6 +280,18 @@ class ConfigInstance:
         sink["tools"] = resolved_tools
         sink["provider"] = provider
         sink["model"] = model
+        run_id = str(uuid.uuid4())
+        _run_hooks(
+            config_key=self._key,
+            variation=variation,
+            meta=meta,
+            context=context,
+            user_input=user_input,
+            history=history,
+            variables=variables,
+            handlers=resolved_handler_list,
+            run_id=run_id,
+        )
 
         async with aclosing(
             execute_and_stream(
@@ -240,6 +304,7 @@ class ConfigInstance:
                 tool_handlers=resolved_tools,
                 variables=variables,
                 history=history,
+                run_id=run_id,
             )
         ) as source:
             async for event in source:
