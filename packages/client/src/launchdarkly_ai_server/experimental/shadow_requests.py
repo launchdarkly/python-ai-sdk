@@ -239,7 +239,7 @@ def _on_invocation(event: InvocationEvent) -> None:
                 "ownerId": entry.get("ownerId", ""),
             },
             span_attributes={
-                "launchdarkly.shadow": True,
+                "launchdarkly.is_shadow": True,
                 "launchdarkly.shadow.request.id": entry["id"],
                 "launchdarkly.shadow.primary.variation.key": event.variation_key,
             },

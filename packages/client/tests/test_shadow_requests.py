@@ -628,17 +628,17 @@ class TestEvents:
             mock_span,
             {
                 "__ld": {"configKey": "flag", "variationKey": "b", "runId": "r"},
-                "__ld_span": {"launchdarkly.shadow": True},
+                "__ld_span": {"launchdarkly.is_shadow": True},
             },
         )
-        mock_span.set_attribute.assert_any_call("launchdarkly.shadow", True)
+        mock_span.set_attribute.assert_any_call("launchdarkly.is_shadow", True)
 
     async def test_shadow_span_attributes_reach_the_handler(self) -> None:
         sr.enable_shadow_requests()
         _, _, b = await _invoke(_make_client(_variation_a()))
         span_attrs = b.calls[0]["variables"]["__ld_span"]
         assert span_attrs == {
-            "launchdarkly.shadow": True,
+            "launchdarkly.is_shadow": True,
             "launchdarkly.shadow.request.id": "shadow-1",
             "launchdarkly.shadow.primary.variation.key": "a",
         }
