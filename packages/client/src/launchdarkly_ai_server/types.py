@@ -692,13 +692,15 @@ class SDKOptions:
     """Process-wide behavior defaults, applied by :func:`configure`.
 
     ``capture_content`` is the default for writing prompts, model output, tool
-    arguments, tool results, and judge explanations. It is a default, not a
-    ceiling: an explicit ``True`` or ``False`` on a handler factory or a
-    convenience wrapper overrides it. Further process-wide defaults are added
-    as fields on this object.
+    arguments, tool results, and judge explanations. The built-in value is
+    ``True``: a process that never calls ``configure`` sends that text. It is a
+    default, not a ceiling: an explicit ``True`` or ``False`` on a handler
+    factory or a convenience wrapper overrides it, and an explicit ``False``
+    removes the text everywhere, including on offline evaluation spans. Further
+    process-wide defaults are added as fields on this object.
     """
 
-    capture_content: bool = False
+    capture_content: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture_content, bool):
