@@ -89,7 +89,7 @@ from .spans import (
 #: environment, working directory, file access, permissions, settings files, plugins, sandbox,
 #: session state) stays under the application's control, never a config's.
 #:
-#: This is the cross-SDK list for Claude Agents (TESTING.md section 1.12), shared with the native
+#: This is the cross-SDK list for Claude Agents, shared with the native
 #: graph through :func:`_options_parameters`.
 #:
 #: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/

@@ -1,6 +1,5 @@
 """
-Tests for §3.9 init_client / get_client / shutdown.
-Reference: TESTING.md §3.9
+Tests for init_client / get_client / shutdown.
 """
 
 import ast
@@ -724,7 +723,7 @@ class TestShutdown:
 
 
 # ---------------------------------------------------------------------------
-# OTel setup details (§3.9)
+# OTel setup details
 # ---------------------------------------------------------------------------
 
 
@@ -1119,7 +1118,7 @@ class TestInspectConfig:
 
 
 class TestExtractVariationMissingEnabled:
-    # Spec §3.10: only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
+    # Only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
     @pytest.mark.parametrize("ld_meta", [None, {}], ids=["no_ldMeta", "empty_ldMeta"])
     async def test_raises_when_enabled_is_missing(
         self, ld_meta: dict[str, Any] | None

@@ -1,7 +1,7 @@
 """
 Tests for launchdarkly-ai-openai-agents handler.
 
-TELEMETRY-CONTRACT.md sections 1-9 for the span tree, and TESTING.md §1 for the generic handler
+TELEMETRY-CONTRACT.md sections 1-9 for the span tree, and the generic handler
 behaviours. Rewritten from the pre-span-work version: this handler drives the ``agents`` SDK's own
 ``Runner``, which owns the per-turn loop, so a test drives spans by calling the ``RunHooks``
 callbacks (``on_llm_start`` / ``on_llm_end`` / ``on_tool_start`` / ``on_tool_end``) the way the real
@@ -356,7 +356,7 @@ def _recording() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory
+# Factory
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +378,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -524,7 +524,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 / §1.4 Tool conversion and execution
+# Tool conversion and execution
 # ---------------------------------------------------------------------------
 
 
@@ -619,7 +619,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (pre-span-era; restored, not telemetry)
+# Tool execution loop (pre-span-era; restored, not telemetry)
 # ---------------------------------------------------------------------------
 
 
@@ -1184,7 +1184,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling (top-level, no partial usage)
+# Error handling (top-level, no partial usage)
 # ---------------------------------------------------------------------------
 
 
@@ -1287,7 +1287,7 @@ class TestCancellationEndsEverySpan:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1691,7 +1691,7 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format (_build_output_type)
+# Output format (_build_output_type)
 # ---------------------------------------------------------------------------
 
 
@@ -1878,12 +1878,12 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None prompt
+# None user_input must not produce None prompt
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the prompt passed to
+    """When user_input is None, the prompt passed to
     Runner.run must be '' (empty string), not None."""
 
     async def test_none_user_input_instructions_path_prompt_is_empty_string(

@@ -1,4 +1,4 @@
-"""The cross-SDK forwarded-key lists (TESTING.md section 1.12), shared by every package's tests.
+"""The cross-SDK forwarded-key lists, shared by every package's tests.
 
 Each list names the ``model.parameters`` keys a handler forwards, in the config's own spelling, so
 a key the handler renames (``effort``, ``max_tokens``, ``text``) is listed under the name the config

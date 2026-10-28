@@ -416,7 +416,7 @@ class TestPartitionTools:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion — restored from the pre-rewrite file (not telemetry).
+# Tool conversion — restored from the pre-rewrite file (not telemetry).
 # ``_partition_tools`` kept its 3-tuple return, so these run byte-for-byte.
 # ---------------------------------------------------------------------------
 
@@ -444,7 +444,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (via _build_tool_mcp) — restored from the pre-rewrite
+# Tool execution loop (via _build_tool_mcp) — restored from the pre-rewrite
 # file. ``_build_tool_mcp`` kept its lazy ``importlib.import_module`` pattern
 # (native_graph.py depends on it), so the old SDK-mocking approach still works
 # unmodified for this one.
@@ -2006,7 +2006,7 @@ class TestConvenienceExportHostOptions:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None prompt.
+# None user_input must not produce None prompt.
 # Restored from the pre-rewrite file (not telemetry). Adapted from the old
 # ``_patch_query``/mocked-module approach to ``monkeypatch.setattr(handler_mod, "query", ...)``,
 # since ``query`` is now resolved once at import time rather than through
@@ -2015,7 +2015,7 @@ class TestConvenienceExportHostOptions:
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the prompt passed to
+    """When user_input is None, the prompt passed to
     the provider must be '' (empty string), not None."""
 
     async def test_none_user_input_instructions_path_prompt_is_empty_string(
@@ -2228,7 +2228,7 @@ async def _query_options(
 
 @pytest.mark.parametrize("path", _PATHS)
 class TestHostOptionsAndBuiltinToolSet:
-    """TESTING.md §2.x Claude Agents Handler — host options and built-in tool set.
+    """Claude Agents Handler — host options and built-in tool set.
 
     ``cwd`` and ``setting_sources`` configure the CLI process, so only the application sets them.
     ``setting_sources`` not given sends ``[]``: the Agent SDK's own ``None`` loads every settings

@@ -86,7 +86,7 @@ except ImportError:  # pragma: no cover - `agents` is a hard dependency of this 
 #: ``TestModelSettingsAcceptsExactlyTheseFields`` in this package's tests asserts this
 #: classification stays exhaustive as the SDK's own dataclass changes.
 #:
-#: This is the cross-SDK list for OpenAI Agents (TESTING.md section 1.12), less the two keys that
+#: This is the cross-SDK list for OpenAI Agents, less the two keys that
 #: are not ``ModelSettings`` fields: ``max_turns`` goes to the run, and ``text`` is read only for
 #: ``text.verbosity``, which becomes ``verbosity`` (see :func:`_apply_text_verbosity`).
 _MODEL_SETTINGS_FORWARDED_KEYS = frozenset(

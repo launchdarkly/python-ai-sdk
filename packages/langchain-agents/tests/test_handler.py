@@ -1,7 +1,6 @@
 """
 Tests for launchdarkly-ai-langchain-agents handler.
-Covers §1.1–1.9 (generic) and §2.x.1 span name.
-Reference: TESTING.md §1, §2.x (LangChain)
+Covers the generic handler tests and the LangChain span name.
 """
 
 from __future__ import annotations
@@ -112,14 +111,14 @@ def _patch_lc(mocks: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.x.0 Agent creation API (Python: create_react_agent from langgraph.prebuilt)
+# Agent creation API (Python: create_react_agent from langgraph.prebuilt)
 # ---------------------------------------------------------------------------
 
 
 class TestAgentCreationAPI:
     @pytest.mark.asyncio
     async def test_calls_create_react_agent_not_createAgent(self) -> None:
-        """§2.x.0 — Python handler must call create_react_agent from langgraph.prebuilt."""
+        """Python handler must call create_react_agent from langgraph.prebuilt."""
         captured: dict[str, Any] = {"called": False, "args": None, "kwargs": None}
 
         mock_agent = AsyncMock()
@@ -172,7 +171,7 @@ class TestAgentCreationAPI:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory
+# Factory
 # ---------------------------------------------------------------------------
 
 
@@ -209,7 +208,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -329,7 +328,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -406,7 +405,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -628,7 +627,7 @@ class TestToolExecutionLoop:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Telemetry
+# Telemetry
 # ---------------------------------------------------------------------------
 
 
@@ -1312,7 +1311,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1373,7 +1372,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1570,7 +1569,7 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)
+# Streaming telemetry (do not patch _HAS_OTEL=False)
 # ---------------------------------------------------------------------------
 
 
@@ -1715,7 +1714,7 @@ class TestStreamingTelemetry:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format
+# Output format
 # ---------------------------------------------------------------------------
 
 
@@ -1767,12 +1766,12 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not raise or produce None content
+# None user_input must not raise or produce None content
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: _build_initial_messages must not pass None to
+    """_build_initial_messages must not pass None to
     HumanMessage when user_input is None."""
 
     def test_none_user_input_no_none_human_message_content(self) -> None:
@@ -1803,7 +1802,7 @@ class TestNoneUserInput:
         for arg in captured_human_args:
             assert arg is not None, (
                 "HumanMessage was constructed with None content; "
-                "must use '' when user_input is None (TESTING.md §1.2 Path C)"
+                "must use '' when user_input is None"
             )
 
 

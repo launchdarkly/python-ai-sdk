@@ -50,7 +50,7 @@ MAX_STEPS = 10
 #: :func:`_renamed_parameters`. Every other key is dropped. The handler sets ``model``,
 #: ``messages``, ``tools`` and ``output_type`` itself, and runs the tool loop.
 #:
-#: This is the Vercel AI SDK list from TESTING.md section 1.12 as the Python ``ai`` library can
+#: This is the cross-SDK Vercel AI SDK list as the Python ``ai`` library can
 #: send it. ``stop_sequences`` is on the JS list but the Python library has no field for it.
 #: ``parallel_tool_calls``, ``max_tool_calls``, ``service_tier`` and ``prompt_cache_key`` are
 #: Python-only: the library takes them as typed request params, while the JS AI SDK can reach them

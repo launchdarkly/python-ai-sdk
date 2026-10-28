@@ -1,6 +1,5 @@
 """
-Tests for §5 launchdarkly-ai-python re-export barrel.
-Reference: TESTING.md §5
+Tests for the launchdarkly-ai-python re-export barrel.
 """
 
 import importlib

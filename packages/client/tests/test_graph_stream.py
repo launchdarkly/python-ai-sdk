@@ -1,6 +1,5 @@
 """
-Tests for §3.15a ``graph().stream()``.
-Reference: TESTING.md §3.15a, Appendix A.4 / A.13.
+Tests for ``graph().stream()``.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from launchdarkly_ai_server.conversation import (
 
 CONTEXT = {"kind": "user", "key": "u1"}
 
-# TESTING.md §3.15a pins these byte for byte; every SDK sends the same text.
+# These are pinned byte for byte; every SDK sends the same text.
 ROUTING_SUFFIX = (
     "\n\nComplete your task using your available tools first. Only once your own "
     "part is done, call exactly one transfer tool to route to the next agent. Do "
@@ -769,7 +768,7 @@ class TestGraphStreamMultiEdge:
     async def test_routing_text_matches_the_spec(
         self, mock_ld_client: MagicMock, mode: str, own_tool: bool
     ) -> None:
-        """TESTING.md §3.15a pins both strings byte for byte across SDKs (AIC-3601).
+        """Both strings are pinned byte for byte across SDKs (AIC-3601).
 
         The same text goes to a node with a tool of its own and to one with none,
         since the graph has no router role to branch on. ``<target>`` is the raw
@@ -849,7 +848,7 @@ class TestGraphStreamMultiEdge:
 
 
 # ---------------------------------------------------------------------------
-# Conversation id + OTel parenting + abandonment (§3.15a / A.4)
+# Conversation id + OTel parenting + abandonment
 # ---------------------------------------------------------------------------
 
 
