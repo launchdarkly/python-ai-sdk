@@ -44,6 +44,8 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
 
+`init_client()` also sets the `launchdarkly.project_id` resource attribute to the resolved SDK key, not the project's ID.
+
 ### Run an evaluation from code
 
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
