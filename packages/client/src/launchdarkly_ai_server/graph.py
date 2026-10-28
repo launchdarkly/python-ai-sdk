@@ -895,7 +895,7 @@ class GraphInstance:
         from opentelemetry import trace
 
         from .judges import run_judges
-        from .lifecycle import effective_capture_content, get_client
+        from .lifecycle import get_client
 
         ld_ctx = to_ld_context(get_client(), context)
 
@@ -928,9 +928,7 @@ class GraphInstance:
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
             set_ld_span_attributes(
-                span,
-                {"__ld": graph_track_data, "ldContext": context},
-                capture_content=effective_capture_content(None),
+                span, {"__ld": graph_track_data, "ldContext": context}
             )
 
             start_time = time.monotonic()
@@ -1122,7 +1120,7 @@ class GraphInstance:
         from opentelemetry.trace import Status, StatusCode, set_span_in_context
 
         from .judges import run_judges
-        from .lifecycle import effective_capture_content, get_client
+        from .lifecycle import get_client
 
         resolved_input = user_input or ""
         ld_ctx = to_ld_context(get_client(), context)
@@ -1155,11 +1153,7 @@ class GraphInstance:
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
-        set_ld_span_attributes(
-            span,
-            {"__ld": graph_track_data, "ldContext": context},
-            capture_content=effective_capture_content(None),
-        )
+        set_ld_span_attributes(span, {"__ld": graph_track_data, "ldContext": context})
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()
