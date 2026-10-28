@@ -35,6 +35,20 @@ def reset_singleton() -> None:
     reset_ai_sdk_info(clear_known=True)
 
 
+@pytest.fixture(autouse=True)
+def clear_endpoint_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ``init_client`` passes ``LD_BASE_URI``, ``LD_STREAM_URI`` and
+    ``LD_EVENTS_URI`` to ``Config``, so tests asserting the exact ``Config``
+    call fail when any is set. A developer shell can set them, and so can a
+    ``.env`` file: importing ``litellm`` during collection runs
+    ``load_dotenv()``, which walks up from the working directory. All three
+    are cleared around each test, and restored after.
+    """
+    for name in ("LD_BASE_URI", "LD_STREAM_URI", "LD_EVENTS_URI"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def restore_otel_globals() -> Any:
     """Snapshot and restore the real OTel trace globals around one test.
