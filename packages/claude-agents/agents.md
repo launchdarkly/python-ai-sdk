@@ -30,7 +30,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 | `src/launchdarkly_ai_claude_agents/graph.py` | `claude_graph()` convenience wrapper around `graph()` |
 | `src/launchdarkly_ai_claude_agents/native_graph.py` | `to_claude_agents()` native graph adapter |
 | `src/launchdarkly_ai_claude_agents/builtins.py` | Pre-constructed `NativeTool` sentinels for Claude built-in tools |
-| `src/launchdarkly_ai_claude_agents/experimental/skills.py` | Experimental `create_claude_agents_skills_handler()`. Not imported by the package `__init__.py` |
+| `src/launchdarkly_ai_claude_agents/skills.py` | `create_claude_agents_skills_handler()`, exported from the package root |
 | `src/launchdarkly_ai_claude_agents/__init__.py` | Package exports |
 | `src/launchdarkly_ai_claude_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
@@ -74,7 +74,7 @@ ClaudeNotebookEdit: NativeTool
 
 ## Implementation Details
 
-### 1. Prompt Construction (`build_prompt`)
+### 1. Prompt Construction (`_build_prompt`)
 
 The handler uses a flat `prompt` + optional `system_prompt` shape that the `claude_agent_sdk.query()` call accepts:
 
@@ -94,7 +94,7 @@ neither?
 
 Note: the `messages` path collapses conversation history into a single flat string — roles are not individually structured. This is a limitation of the agent SDK's `query()` interface.
 
-### 2. Tool Wiring (`build_tool_mcp`)
+### 2. Tool Wiring (`_build_tool_mcp`)
 
 Tools are delivered via an in-process MCP server, not as raw JSON schema defs. The pipeline:
 
@@ -169,11 +169,11 @@ On error: `span.record_exception(exc)`, status set to ERROR, span ended, error r
 id wins. An app that opens a fresh CLI session per turn and re-feeds history must pass its own
 conversation id, or each turn becomes its own conversation.
 
-### 5. Agent Skills (experimental, `experimental/skills.py`)
+### 5. Agent Skills (`skills.py`)
 
-`create_claude_agents_skills_handler(...)` is importable only from `launchdarkly_ai_claude_agents.experimental.skills`, and the package root never imports it (a test checks this in a fresh interpreter). It reports `experimental.createClaudeAgentsSkillsHandler` and builds the handler through `_create_claude_agents_handler(..., _prepare=...)`.
+`create_claude_agents_skills_handler(...)` is exported from the package root. It reports `claude-agents.createClaudeAgentsSkillsHandler` and builds the handler through `_create_claude_agents_handler(..., _prepare=...)`.
 
-`_prepare` is a package-internal hook, a private keyword argument of the internal factory only, so core names nothing experimental. It runs at the start of every invoke and stream, inside the `invoke_agent` span, and returns `None` (the run is exactly the core handler's) or a `QueryPreparation`. That holds extra `query()` options, extra built-ins appended to `tools` (never to `allowed_tools`), and a `cleanup` that both paths await last in their `finally`.
+`_prepare` is a package-internal hook, a private keyword argument of the internal factory only, so `create_claude_agents_handler`'s signature stays unchanged. It runs at the start of every invoke and stream, inside the `invoke_agent` span, and returns `None` (the run is exactly the core handler's) or a `QueryPreparation`. That holds extra `query()` options, extra built-ins appended to `tools` (never to `allowed_tools`), and a `cleanup` that both paths await last in their `finally`.
 
 For a variation with skills, `_prepare_skills`:
 
@@ -238,4 +238,4 @@ Span names and attributes are described in [Implementation Details → Telemetry
 - **MCP tool name prefix**: tools registered in the MCP server are accessible as `mcp__tool-mcp__<name>`. The `allowed_tools` list must use this prefix; omitting it will cause the agent to not invoke any tools.
 - **Async generator teardown**: always use `break` inside `async for` (not `return`) and wrap the loop in `try/finally: await gen.aclose()`. See TESTING.md Appendix A.4.
 - **`message.usage` shape**: the raw usage dict from the `claude_agent_sdk` is passed through directly to `parse_usage`. It accepts `input_tokens`/`output_tokens` which the SDK provides.
-- **Native tools** (`ClaudeWebSearch`, etc.) are registered in `tool_handlers` as `NativeTool` sentinel instances (not callables). The handler's `partition_tools` function separates them from user-defined tools — native tools go into `native_tool_names` for the agent's built-in access, user tools go through the MCP server.
+- **Native tools** (`ClaudeWebSearch`, etc.) are registered in `tool_handlers` as `NativeTool` sentinel instances (not callables). The handler's `_partition_tools` function separates them from user-defined tools — native tools go into `native_tool_names` for the agent's built-in access, user tools go through the MCP server.

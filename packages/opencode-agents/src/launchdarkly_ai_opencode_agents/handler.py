@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Mapping
 from contextlib import aclosing
 from typing import Any
 
 from launchdarkly_ai_server import (
+    NATIVE_TOOL_KEY,
     AiConfigRep,
     NativeTool,
     ProviderHandler,
@@ -29,6 +31,7 @@ from launchdarkly_ai_server import (
     parse_template,
     set_input_content_attributes,
     set_output_content_attributes,
+    set_tool_call_content_attributes,
     text_message,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
@@ -39,8 +42,28 @@ from launchdarkly_ai_server.utils import model_parameters, number_or_zero
 
 from ._version import PACKAGE_NAME, __version__
 from .process import Command, OpenCodeServe, serve_from
-from .server import ModelResolver, default_model, session_events
-from .spans import fail_span, finish_root_span, mark_ok, start_root_span
+from .server import (
+    MESSAGE_TIMEOUT_SECONDS,
+    ModelResolver,
+    default_model,
+    disconnect_mcp_bridge,
+    register_mcp_bridge,
+    session_events,
+)
+from .spans import (
+    abandon_open_spans,
+    close_open_spans,
+    fail_span,
+    finish_model_span,
+    finish_root_span,
+    mark_ok,
+    parent_context_of,
+    start_model_span,
+    start_root_span,
+    start_tool_span,
+    succeed_span,
+)
+from .tool_bridge import ToolBridge, bridge_tool_name
 
 #: The ``model.parameters`` keys forwarded into the ``POST /session/{id}/message`` body. None are.
 #: The message route takes no sampling, length, stop, seed, tool-choice or reasoning field: OpenCode
@@ -79,11 +102,43 @@ class _Reducer:
     Events whose ``sessionID`` is not *session_id* are ignored. A missing
     ``sessionID`` is kept. The reducer does not adopt the first session it
     sees. A ``session.idle`` for this session ends the iterable.
+
+    Also opens and closes this run's ``chat`` and ``execute_tool`` spans, at
+    the same two places text and tool events are already derived from the
+    bus: one ``chat`` span per assistant message id, one ``execute_tool``
+    span per tool call id. *open_tool_spans* and *open_model_spans* are
+    owned by the caller, so a teardown outside this reducer (abandonment,
+    the run raising) can still find and close whatever is left open.
+    *tool_display_names* maps the name OpenCode reports for a tool part
+    (a native tool's own id, or a bridged tool's composed MCP name) back to
+    the AI Config key a span should show; an unmapped name is shown as-is.
+    *tool_native_stubs* holds the zero-arg ``$ld:ai:tool_call`` tracking stub
+    for a ``NativeTool`` entry, called once per call id when its span opens —
+    a bridged tool's own tracked wrapper already does this when the bridge
+    calls it, so it has no entry here.
     """
 
-    def __init__(self, *, capture_content: bool, session_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        capture_content: bool,
+        session_id: str,
+        config: AiConfigRep,
+        parent: Any,
+        open_tool_spans: dict[str, Any],
+        open_model_spans: dict[str, Any],
+        tool_display_names: Mapping[str, str],
+        tool_native_stubs: Mapping[str, Callable[[], None]],
+    ) -> None:
         self._emitter = TurnEmitter(capture_content=capture_content)
+        self._capture = capture_content
         self._session_id = session_id
+        self._config = config
+        self._parent = parent
+        self._tool_spans = open_tool_spans
+        self._model_spans = open_model_spans
+        self._tool_display_names = tool_display_names
+        self._tool_native_stubs = tool_native_stubs
         self._started: set[str] = set()
         self._text_message_id: str | None = None
         self._text_open = False
@@ -96,6 +151,10 @@ class _Reducer:
         ] = []
         self._part_text: dict[str, str] = {}
         self._usage_ids: set[str] = set()
+        # Closed chat spans, including completions that carried no tokens.
+        # _usage_ids only records a message once tokens exist, so it cannot
+        # be the guard against opening a second chat for the same id.
+        self._closed_chat_ids: set[str] = set()
         self._input = 0
         self._output = 0
         self._cache_read = 0
@@ -357,6 +416,7 @@ class _Reducer:
         if status == "running":
             if "input" not in state or not name:
                 return []
+            self._open_tool_span(call_id, name, state.get("input"))
             events = self._emitter.tool_start(call_id, name)
             if any(event.get("type") == "TOOL_CALL_START" for event in events):
                 self._started.add(call_id)
@@ -364,6 +424,11 @@ class _Reducer:
             return events
         if status not in ("completed", "error"):
             return []
+        if name:
+            # A call that skipped straight to completed/error without a
+            # recorded `running` state still needs its span opened once,
+            # with whatever input this status carries.
+            self._open_tool_span(call_id, name, state.get("input"))
         opened: list[dict[str, Any]] = []
         if name:
             started = self._emitter.tool_start(call_id, name)
@@ -372,10 +437,42 @@ class _Reducer:
             opened.extend(started)
             opened.extend(self._emitter.tool_end(call_id, arguments=state.get("input")))
         if status == "error":
+            self._close_tool_span(call_id, failed=True, result=None)
             opened.extend(self._emitter.tool_result(call_id, failed=True))
         else:
-            opened.extend(self._emitter.tool_result(call_id, state.get("output")))
+            output = state.get("output")
+            self._close_tool_span(call_id, failed=False, result=output)
+            opened.extend(self._emitter.tool_result(call_id, output))
         return opened
+
+    def _open_tool_span(self, call_id: str, provider_name: str, arguments: Any) -> None:
+        """Opens one ``execute_tool`` span for *call_id*, once.
+
+        Also fires a ``NativeTool``'s tracking stub, the first and only time
+        its span opens — mirroring the Claude handler's ``PreToolUse`` hook,
+        which calls the same kind of stub when it opens its own tool span.
+        A bridged (callable) tool has no stub here: its tracked wrapper
+        already emits ``$ld:ai:tool_call`` when the bridge invokes it.
+        """
+        if call_id in self._tool_spans:
+            return
+        stub = self._tool_native_stubs.get(provider_name)
+        if stub is not None:
+            stub()
+        display_name = self._tool_display_names.get(provider_name, provider_name)
+        span = start_tool_span(display_name, call_id, self._parent)
+        self._tool_spans[call_id] = span
+        set_tool_call_content_attributes(span, self._capture, arguments=arguments)
+
+    def _close_tool_span(self, call_id: str, *, failed: bool, result: Any) -> None:
+        span = self._tool_spans.pop(call_id, None)
+        if span is None:
+            return
+        if failed:
+            fail_span(span, OpenCodeSessionError(f"tool call {call_id} failed"))
+            return
+        set_tool_call_content_attributes(span, self._capture, result=result)
+        succeed_span(span)
 
     def _message(self, info: Mapping[str, Any]) -> list[dict[str, Any]]:
         message_id = info.get("id")
@@ -386,6 +483,18 @@ class _Reducer:
         if isinstance(message_id, str) and isinstance(role, str):
             self._roles[message_id] = role
             if role == "assistant":
+                # A completed message.updated closes this chat span and
+                # removes it from _model_spans. A later completion for the
+                # same id, including one with no tokens, must not open
+                # another. _usage_ids is not that set: it is filled only
+                # when the completion carries a tokens mapping.
+                if (
+                    message_id not in self._model_spans
+                    and message_id not in self._closed_chat_ids
+                ):
+                    self._model_spans[message_id] = start_model_span(
+                        self._config, self._parent
+                    )
                 # A reserved id is not an open AG-UI message. Only text that
                 # TurnEmitter has already yielded can take a parent or be split.
                 late_completion = (
@@ -419,7 +528,17 @@ class _Reducer:
             if isinstance(tokens, Mapping):
                 self._add_usage(tokens)
                 self._usage_ids.add(message_id)
+        self._close_model_span(message_id, info.get("tokens"))
+        self._closed_chat_ids.add(message_id)
         return events
+
+    def _close_model_span(
+        self, message_id: str, tokens: Mapping[str, Any] | None
+    ) -> None:
+        span = self._model_spans.pop(message_id, None)
+        if span is None:
+            return
+        finish_model_span(span, self._config, _message_usage(tokens))
 
     def _add_usage(self, tokens: Mapping[str, Any]) -> None:
         self._saw_usage = True
@@ -430,6 +549,25 @@ class _Reducer:
             self._saw_cache = True
             self._cache_read += number_or_zero(cache.get("read"))
             self._cache_write += number_or_zero(cache.get("write"))
+
+
+def _message_usage(tokens: Any) -> SpanUsage:
+    """One assistant message's own token counts, as a ``chat`` span wants them.
+
+    Separate from ``_Reducer._add_usage``, which accumulates the run's total
+    for the ``done`` event: a ``chat`` span reports the one message it
+    belongs to, not the run so far.
+    """
+    if not isinstance(tokens, Mapping):
+        return SpanUsage()
+    cache = tokens.get("cache")
+    cache = cache if isinstance(cache, Mapping) else {}
+    return SpanUsage(
+        input=number_or_zero(tokens.get("input")),
+        output=number_or_zero(tokens.get("output")),
+        cache_read=number_or_zero(cache.get("read")),
+        cache_creation=number_or_zero(cache.get("write")),
+    )
 
 
 def _string_id(value: object) -> str | None:
@@ -579,6 +717,110 @@ def opencode_agents(
     ).invoke(user_input, context, variables, history)
 
 
+class _CallableEntry:
+    __slots__ = ("description", "fn", "parameters")
+
+    def __init__(
+        self, description: str, parameters: Mapping[str, Any], fn: Callable[[Any], Any]
+    ) -> None:
+        self.description = description
+        self.parameters = parameters
+        self.fn = fn
+
+
+class _ToolPlan:
+    """What one call offers OpenCode, derived from ``config["tools"]`` and ``tool_handlers``.
+
+    *offered_names* and *tool_display_names* start populated with every
+    ``NativeTool`` entry. The handler appends a bridged (callable) tool's
+    composed MCP name to both once the bridge, if any, has started and that
+    name is known — a bridged tool's model-visible name depends on the
+    per-call bridge's generated server name, which does not exist yet when
+    this plan is built.
+    """
+
+    def __init__(self) -> None:
+        self.callables: dict[str, _CallableEntry] = {}
+        self.native_stubs: dict[str, Callable[[], None]] = {}
+        self.offered_names: list[str] = []
+        self.tool_display_names: dict[str, str] = {}
+
+
+def _plan_tools(config: AiConfigRep, tool_handlers: dict[str, Any] | None) -> _ToolPlan:
+    """Partitions the offered tools into native pass-throughs and bridged callables.
+
+    "Offered" is the request-scoped authorization boundary: a config tool key
+    with no entry in *tool_handlers* is not served, and a *tool_handlers*
+    entry whose key the config does not declare is not served either. See
+    AGENTS.md's tool-handling contract and the matching rule already stated
+    for the JS SDK's handlers.
+    """
+    plan = _ToolPlan()
+    config_tools = config.get("tools") if isinstance(config, dict) else None
+    config_tools = config_tools if isinstance(config_tools, dict) else {}
+    handlers = tool_handlers or {}
+    for key, tool_cfg in config_tools.items():
+        stub = handlers.get(key)
+        if stub is None:
+            continue
+        native = getattr(stub, NATIVE_TOOL_KEY, None)
+        if native is not None:
+            provider_name = native.tool_name
+            plan.offered_names.append(provider_name)
+            plan.tool_display_names[provider_name] = key
+            plan.native_stubs[provider_name] = stub
+            continue
+        cfg = tool_cfg if isinstance(tool_cfg, dict) else {}
+        description = cfg.get("description")
+        parameters = cfg.get("parameters")
+        plan.callables[key] = _CallableEntry(
+            description=description if isinstance(description, str) else "",
+            parameters=parameters if isinstance(parameters, dict) else {},
+            fn=stub,
+        )
+    return plan
+
+
+#: ``Permission.disabled`` remaps these tool ids onto ``edit`` before
+#: ``findLast``. An allow rule whose permission is ``write`` or
+#: ``apply_patch`` never matches. An allow for ``edit`` enables all three.
+_EDIT_FAMILY = frozenset({"edit", "write", "apply_patch"})
+
+
+def _permission_for(name: str) -> str:
+    """The permission OpenCode actually matches for one offered tool id."""
+    if name in _EDIT_FAMILY:
+        return "edit"
+    return name
+
+
+def _build_tool_ruleset(offered_names: list[str]) -> list[dict[str, str]]:
+    """OpenCode's session-level ``permission`` ruleset for one call's offered tools.
+
+    The first rule denies every tool. ``Permission.disabled`` resolves the
+    *last* matching rule (``findLast`` over the agent's static permission
+    followed by this ruleset), so each later per-name allow rule takes
+    precedence for the tool it names and nothing else gains visibility by
+    accident — and this ruleset, being appended last, always wins over the
+    opencode.json agent config's own static permission. An empty
+    *offered_names* still sends the deny-all rule: a variation with no tools
+    gets a model with no tools, not the host's default catalog.
+
+    ``write`` and ``apply_patch`` are not sent as their own permissions.
+    OpenCode remaps both onto ``edit`` before matching, so any of the three
+    emits one ``edit`` allow, and that one grant covers all three tools.
+    """
+    ruleset = [{"permission": "*", "action": "deny", "pattern": "*"}]
+    sent: set[str] = set()
+    for name in offered_names:
+        permission = _permission_for(name)
+        if permission in sent:
+            continue
+        sent.add(permission)
+        ruleset.append({"permission": permission, "action": "allow", "pattern": "*"})
+    return ruleset
+
+
 class OpenCodeHandler(ProviderHandler):
     """Handler whose async context owns one ``opencode serve`` process."""
 
@@ -647,13 +889,21 @@ class OpenCodeHandler(ProviderHandler):
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        del tool_handlers
         capture = effective_capture_content(self._capture_content_override)
         span = start_root_span(config, variables or {})
+        parent = parent_context_of(span)
         ended: set[int] = set()
+        open_tool_spans: dict[str, Any] = {}
+        open_model_spans: dict[str, Any] = {}
+        # GeneratorExit is a consumer who stopped reading (abandoned).
+        # CancelledError is a timeout or task.cancel(); except Exception
+        # does not see it, so the finally would otherwise stamp
+        # launchdarkly.stream.abandoned. cancelled wins in end_span_once.
+        cancelled = False
         provider_id, model_id = self._model(config if isinstance(config, dict) else {})
         system = _system_text(config, variables)
         prompt = _user_prompt(config, user_input, history, variables)
+        plan = _plan_tools(config, tool_handlers)
         # A context-owned process outlives this stream, so a caller timeout
         # that cancels the stream cannot cancel its shutdown.
         owned: OpenCodeServe | None = None
@@ -668,6 +918,8 @@ class OpenCodeHandler(ProviderHandler):
             owned = self._serve.spawn()
             base_url = ""
             password = ""
+        bridge: ToolBridge | None = None
+        bridge_name: str | None = None
         try:
             set_input_content_attributes(
                 span,
@@ -678,6 +930,31 @@ class OpenCodeHandler(ProviderHandler):
             if owned is not None:
                 base_url = await owned.start()
                 password = owned.password
+            if plan.callables:
+                bridge = ToolBridge()
+                for key, entry in plan.callables.items():
+                    bridge.register(
+                        key,
+                        description=entry.description,
+                        parameters=entry.parameters,
+                        fn=entry.fn,
+                    )
+                await bridge.start()
+                run_id = secrets.token_hex(8)
+                bridge_name = f"ld_{run_id}"
+                await register_mcp_bridge(
+                    base_url=base_url,
+                    password=password,
+                    name=bridge_name,
+                    url=f"{bridge.base_url}/mcp/{run_id}",
+                    token=bridge.token,
+                    timeout_ms=int(MESSAGE_TIMEOUT_SECONDS * 1000),
+                )
+                for key in plan.callables:
+                    composed = bridge_tool_name(bridge_name, key)
+                    plan.offered_names.append(composed)
+                    plan.tool_display_names[composed] = key
+            permission = _build_tool_ruleset(plan.offered_names)
             created = _Created()
             async with aclosing(
                 _reduce_session(
@@ -693,6 +970,13 @@ class OpenCodeHandler(ProviderHandler):
                     parameters=select_forwarded_parameters(
                         model_parameters(config), _PROMPT_FORWARDED_KEYS
                     ),
+                    permission=permission,
+                    config=config,
+                    parent=parent,
+                    open_tool_spans=open_tool_spans,
+                    open_model_spans=open_model_spans,
+                    tool_display_names=plan.tool_display_names,
+                    tool_native_stubs=plan.native_stubs,
                 )
             ) as reduced:
                 async for event in reduced:
@@ -713,13 +997,26 @@ class OpenCodeHandler(ProviderHandler):
             if usage is not None:
                 done["usage"] = usage
             yield done
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as exc:
+            close_open_spans(open_tool_spans, open_model_spans, exc)
             fail_span(span, exc, ended)
             raise
         finally:
+            if bridge_name is not None:
+                await disconnect_mcp_bridge(
+                    base_url=base_url, password=password, name=bridge_name
+                )
+            if bridge is not None:
+                await bridge.stop()
             if owned is not None:
                 await owned.stop()
-            end_span_once(span, ended)
+            abandon_open_spans(
+                open_tool_spans, open_model_spans, ended, cancelled=cancelled
+            )
+            end_span_once(span, ended, cancelled=cancelled)
 
     async def _call_impl(
         self,
@@ -765,6 +1062,13 @@ async def _reduce_session(
     agent: str | None,
     capture: bool,
     parameters: Mapping[str, Any],
+    permission: list[dict[str, str]] | None,
+    config: AiConfigRep,
+    parent: Any,
+    open_tool_spans: dict[str, Any],
+    open_model_spans: dict[str, Any],
+    tool_display_names: Mapping[str, str],
+    tool_native_stubs: Mapping[str, Callable[[], None]],
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Reduce the session ``POST /session`` created. The reducer is unchanged."""
     session_ids: list[str] = []
@@ -780,11 +1084,21 @@ async def _reduce_session(
             model_id=model_id,
             agent=agent,
             session_ids=session_ids,
+            permission=permission,
         )
     ) as raw_events:
         async for raw in raw_events:
             if reducer is None:
-                reducer = _Reducer(capture_content=capture, session_id=session_ids[0])
+                reducer = _Reducer(
+                    capture_content=capture,
+                    session_id=session_ids[0],
+                    config=config,
+                    parent=parent,
+                    open_tool_spans=open_tool_spans,
+                    open_model_spans=open_model_spans,
+                    tool_display_names=tool_display_names,
+                    tool_native_stubs=tool_native_stubs,
+                )
             async with aclosing(reducer.reduce(_once(raw))) as reduced:
                 async for event in reduced:
                     yield event

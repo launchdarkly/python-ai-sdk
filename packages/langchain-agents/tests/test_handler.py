@@ -532,8 +532,8 @@ class TestToolExecutionLoop:
             if not chosen:
                 chosen.append("billing")
             return (
-                "Handoff to billing recorded. "
-                "Finish your own work and provide your final response."
+                "Handoff to billing recorded. billing takes over when your turn ends. "
+                "Finish your own part, then end your turn. Do not answer for billing."
             )
 
         tool = _built_tool(
@@ -541,8 +541,8 @@ class TestToolExecutionLoop:
             {"__handoff_billing": handoff},
         )
         assert await tool() == (
-            "Handoff to billing recorded. "
-            "Finish your own work and provide your final response."
+            "Handoff to billing recorded. billing takes over when your turn ends. "
+            "Finish your own part, then end your turn. Do not answer for billing."
         )
         assert chosen == ["billing"]
 

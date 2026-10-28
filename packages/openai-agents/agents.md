@@ -39,9 +39,9 @@ That means the LaunchDarkly flag variation must have `provider.name == "OpenAI"`
 
 ```python
 # Factory — returns a ProviderHandler with provides_for attached
-def create_openai_agent_handler() -> ProviderHandler: ...
+def create_openai_agents_handler() -> ProviderHandler: ...
 
-# Convenience wrapper — equivalent to config(key=config_key, handler=create_openai_agent_handler()).invoke(user_input, context)
+# Convenience wrapper — equivalent to config(key=config_key, handler=create_openai_agents_handler()).invoke(user_input, context)
 def openai_agents(config_key: str, user_input: str, context: dict, **kwargs) -> ProviderResponse: ...
 
 # Graph convenience wrapper

@@ -381,10 +381,12 @@ SKILLS_SURFACE = frozenset(
         "set_skill_store",
         "SkillStore",
         "InMemorySkillStore",
-        "FDv2SkillStore",
+        "LaunchDarklySkillStore",
         "StoreDiagnostics",
         "watch_skills",
         "SkillWatcher",
+        "SkillSource",
+        "config_skills",
         "skill_refs",
         "get_skill",
         "get_skill_result",
@@ -769,9 +771,11 @@ class TestStoreConfiguration:
             await get_skill("a")
         message = str(reported.value)
         assert "set_skill_store" in message
-        assert "FDv2SkillStore" in message
+        assert "LaunchDarklySkillStore" in message
         assert "InMemorySkillStore" in message
-        assert message.index("FDv2SkillStore") < message.index("InMemorySkillStore")
+        assert message.index("LaunchDarklySkillStore") < message.index(
+            "InMemorySkillStore"
+        )
 
     async def test_shutdown_clears_the_store(
         self, make_raw_skill: Any, mock_ld_client: Any
@@ -1518,7 +1522,7 @@ class TestVersionPinning:
 
         The interface never promised a map key spells a skill key, either: a store
         holding several versions of one key has reason to spell it
-        ``key:version``, which is exactly what ``FDv2SkillStore`` does. Pinned
+        ``key:version``, which is exactly what ``LaunchDarklySkillStore`` does. Pinned
         because the asymmetry with the pinned path is surprising enough to
         invite a "fix" that would break every multi-version store.
         """

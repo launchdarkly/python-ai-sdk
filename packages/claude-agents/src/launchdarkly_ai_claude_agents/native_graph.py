@@ -42,13 +42,13 @@ except ImportError:
 
 from launchdarkly_ai_claude_agents.handler import (
     _build_hooks,
+    _build_prompt,
+    _build_tool_mcp,
     _host_query_options,
     _options_parameters,
+    _partition_tools,
     _raise_if_run_failed,
-    build_prompt,
     build_query_prompt,
-    build_tool_mcp,
-    partition_tools,
 )
 
 TOOL_MCP_NAME = "tool-mcp"
@@ -134,16 +134,16 @@ async def _run_query(
     track_data = make_track_data(node, graph_key, run_id)
     wrapped = _wrap_native_tools(tool_handlers, ld_context, track_data)
 
-    prompt, system_prompt = build_prompt(node.config, input_text, variables)
+    prompt, system_prompt = _build_prompt(node.config, input_text, variables)
     query_prompt = build_query_prompt(
         node.config, input_text, variables, history, prompt
     )
-    native_tool_map, user_config_tools, native_tool_names = partition_tools(
+    native_tool_map, user_config_tools, native_tool_names = _partition_tools(
         node.config.get("tools"), wrapped
     )
 
     tool_mcp = (
-        await build_tool_mcp(user_config_tools, wrapped) if user_config_tools else None
+        await _build_tool_mcp(user_config_tools, wrapped) if user_config_tools else None
     )
     child_mcp = (
         create_server(

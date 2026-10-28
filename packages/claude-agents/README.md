@@ -131,20 +131,16 @@ async def main():
 asyncio.run(main())
 ```
 
-## Agent Skills (experimental)
-
-> **Experimental.** Imported from `launchdarkly_ai_claude_agents.experimental.skills`. The name and behavior may change in a minor release, and each change is listed under **Experimental** in the changelog.
+## Agent Skills
 
 `create_claude_agents_handler()` doesn't give the model a variation's skills. `create_claude_agents_skills_handler()` does. It takes the same options, plus `skills_temp_dir`.
 
 ```python
 import os
-from launchdarkly_ai_server import FDv2SkillStore, config, set_skill_store
-from launchdarkly_ai_claude_agents.experimental.skills import (
-    create_claude_agents_skills_handler,
-)
+from launchdarkly_ai_server import LaunchDarklySkillStore, config, set_skill_store
+from launchdarkly_ai_claude_agents import create_claude_agents_skills_handler
 
-store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
+store = LaunchDarklySkillStore(os.environ["LD_SDK_KEY"]).start()
 store.wait_for_skills(timeout=10)
 set_skill_store(store)
 

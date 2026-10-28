@@ -11,14 +11,15 @@ import launchdarkly_ai_server.lifecycle as lifecycle_module
 import launchdarkly_ai_server.sdk_usage as sdk_usage_module
 from launchdarkly_ai_server import (
     SDK_INFO_CONTEXT,
-    FDv2SkillStore,
     InMemorySkillStore,
+    LaunchDarklySkillStore,
     ProviderHandler,
     SkillReference,
     __version__,
     all_skills,
     build_judge_tasks,
     config,
+    config_skills,
     create_handler,
     get_skill,
     get_skill_result,
@@ -535,6 +536,9 @@ def _skill_store(make_raw_skill: Any) -> InMemorySkillStore:
 async def _call_skill_helper(helper: str, root: Path) -> None:
     if helper == "client.allSkills":
         await all_skills()
+    elif helper == "client.configSkills":
+        # Builds the source without reading it: the report is on the call.
+        config_skills("k", CONTEXT)
     elif helper == "client.getSkill":
         await get_skill(SKILL_KEY)
     elif helper == "client.getSkillResult":
@@ -555,6 +559,7 @@ async def _call_skill_helper(helper: str, root: Path) -> None:
     "helper",
     [
         "client.allSkills",
+        "client.configSkills",
         "client.getSkill",
         "client.getSkillResult",
         "client.getSkills",
@@ -655,5 +660,5 @@ async def test_accessors_do_not_report_each_other(
 
 async def test_store_setup_is_not_a_helper(client: MagicMock) -> None:
     set_skill_store(InMemorySkillStore())
-    FDv2SkillStore("sdk-test-key")
+    LaunchDarklySkillStore("sdk-test-key")
     assert _usage(client) == []

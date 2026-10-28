@@ -21,7 +21,9 @@ These checks are non-relaxable; see ``agents.md``, *Security posture*.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -67,6 +69,7 @@ from .types import (
     ReconcileReport,
     Skill,
     SkillReference,
+    SkillSource,
 )
 from .types_validation import (
     is_valid_skill_key,
@@ -131,7 +134,7 @@ class _PendingWrite:
 
 
 async def write_skills(
-    skills: Sequence[Skill | SkillReference | str] | str,
+    skills: Sequence[Skill | SkillReference | str] | str | SkillSource,
     root: str | os.PathLike[str],
     *,
     prune: bool = True,
@@ -141,9 +144,16 @@ async def write_skills(
     """
     Materializes skills under a managed root at ``<root>/<key>/SKILL.md``.
 
-    *skills* is a sequence of ``Skill`` / ``SkillReference`` / key strings, or
-    ``"*"`` for every skill the store holds. ``Skill`` values are written as-is;
-    references and keys resolve through the configured store.
+    *skills* is a sequence of ``Skill`` / ``SkillReference`` / key strings,
+    ``"*"`` for every skill the store holds, or a ``SkillSource`` such as
+    ``config_skills(key, context)``, whose ``refs`` is read once and treated as
+    the sequence it returns. ``Skill`` values are written as-is; references and
+    keys resolve through the configured store.
+
+    A source that raises, or returns anything but a sequence of
+    ``SkillReference`` values and valid key strings, is an unavailable
+    retrieval: nothing is written or pruned, and ``on_unavailable`` decides
+    between a run-level error action and ``RuntimeError``. It is not retried.
 
     The reconcile is driven by a manifest, ``<root>/.launchdarkly-skills.json``:
     it only overwrites or deletes files the manifest records as written by the
@@ -151,9 +161,12 @@ async def write_skills(
 
     - ``prune``: remove previously managed skills that are no longer requested.
       This is how revocation takes effect.
-    - ``timeout``: seconds, non-negative and finite. Bounds retrieval, writes and
-      pruning; checked between steps, not mid-operation. The manifest rewrite
-      always runs.
+    - ``timeout``: seconds, non-negative and finite. Bounds reading a source,
+      retrieval, writes and pruning; checked between steps, not mid-operation.
+      An async source still pending at the deadline is cancelled; a
+      synchronous one cannot be interrupted, and a slow one uses up the time
+      left for everything after it. ``0`` never reads a source. The manifest
+      rewrite always runs.
     - ``on_unavailable``: ``"keep"`` reports content that could not be retrieved
       and leaves existing files alone; ``"raise"`` raises ``RuntimeError``.
 
@@ -174,7 +187,7 @@ async def write_skills(
 
 
 async def _write_skills(
-    skills: Sequence[Skill | SkillReference | str] | str,
+    skills: Sequence[Skill | SkillReference | str] | str | SkillSource,
     root: str | os.PathLike[str],
     *,
     prune: bool = True,
@@ -196,6 +209,13 @@ async def _write_skills(
 
     deadline = time.monotonic() + timeout
     root_path = _resolve_root(root)
+
+    # Read before the root is pinned, so no descriptor is held across an await.
+    requested: Sequence[Skill | SkillReference | str] | str | _RetrievalBlocked = (
+        await _read_source(skills, deadline)
+        if isinstance(skills, SkillSource)
+        else skills
+    )
 
     # Pinned once and held for the whole reconcile. None where the *at() family
     # is absent; the path-based checks are then the only defense.
@@ -222,7 +242,12 @@ async def _write_skills(
             # Run-level failure: there is no single skill key to hang it off.
             actions.append(_run_error(manifest_error))
 
-        requests, incomplete = _resolve_requests(skills, deadline, on_unavailable)
+        if isinstance(requested, _RetrievalBlocked):
+            requests, incomplete = _unavailable_run(requested.reason, on_unavailable)
+        else:
+            requests, incomplete = _resolve_requests(
+                requested, deadline, on_unavailable
+            )
 
         written, write_timed_out = _write_all(
             root_path, root_fd, requests, entries, deadline
@@ -378,11 +403,78 @@ def _available_store(deadline: float, subject: str) -> SkillStore | _RetrievalBl
                 "the skill store has not received its initial data, so "
                 f"{subject} could not be retrieved and nothing on disk was "
                 "changed. Wait for delivery before reconciling: "
-                "FDv2SkillStore.wait_for_skills(timeout) returns True once the "
+                "LaunchDarklySkillStore.wait_for_skills(timeout) returns True once the "
                 "first payload has arrived."
             )
         )
     return store
+
+
+async def _read_source(
+    source: SkillSource, deadline: float
+) -> list[SkillReference | str] | _RetrievalBlocked:
+    """
+    Reads *source* once: its answer as a list, or why there is none.
+
+    Every failure is a retrieval that failed before any key was known, never an
+    empty answer, which would prune every managed skill.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _RetrievalBlocked(
+            _unavailable(
+                "the timeout was exhausted before the skill source could be read"
+            )
+        )
+    try:
+        answer = source.refs()
+        if inspect.isawaitable(answer):
+            answer = await asyncio.wait_for(answer, remaining)
+    except TimeoutError:
+        return _RetrievalBlocked(
+            _unavailable(
+                f"the skill source did not answer within the {remaining:.3g}s left "
+                "of the timeout"
+            )
+        )
+    except Exception as exc:
+        return _RetrievalBlocked(
+            _unavailable(f"the skill source raised {type(exc).__name__}: {exc}")
+        )
+
+    rejection = _source_answer_rejection(answer)
+    if rejection is not None:
+        return _RetrievalBlocked(_unavailable(f"the skill source returned {rejection}"))
+    return list(answer)
+
+
+def _source_answer_rejection(answer: Any) -> str | None:
+    """
+    Why a source's answer is unusable, or ``None``.
+
+    An invalid entry rejects the whole answer rather than being dropped:
+    dropping it would shorten the requested set and prune that skill.
+    """
+    if isinstance(answer, (str, bytes)) or not isinstance(answer, Sequence):
+        return (
+            f"{type(answer).__name__}, not a sequence of SkillReference values "
+            "and key strings"
+        )
+    for index, item in enumerate(answer):
+        if isinstance(item, SkillReference):
+            if not is_valid_skill_key(item.key):
+                return f"an invalid skill key {item.key!r} at index {index}"
+            if not is_valid_skill_version(item.version):
+                return f"an invalid version {item.version!r} for '{item.key}'"
+        elif isinstance(item, str):
+            if not is_valid_skill_key(item):
+                return f"an invalid skill key {item!r} at index {index}"
+        else:
+            return (
+                f"{type(item).__name__} at index {index}; a source answers "
+                "SkillReference values and key strings only"
+            )
+    return None
 
 
 def _resolve_requests(

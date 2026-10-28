@@ -209,6 +209,27 @@ class Script:
             found.extend(record.get("requests") or [])
         return found
 
+    @property
+    def session_bodies(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for record in self._records():
+            found.extend(record.get("session_bodies") or [])
+        return found
+
+    @property
+    def mcp_calls(self) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for record in self._records():
+            found.extend(record.get("mcp_calls") or [])
+        return found
+
+    @property
+    def mcp_disconnects(self) -> list[str]:
+        found: list[str] = []
+        for record in self._records():
+            found.extend(record.get("mcp_disconnects") or [])
+        return found
+
 
 _scripts: list[Script] = []
 
@@ -288,7 +309,19 @@ class TestSurface:
         import launchdarkly_ai_opencode_agents as package
 
         assert set(package.__all__) == {
+            "OpenCodeApplyPatch",
+            "OpenCodeBash",
+            "OpenCodeEdit",
+            "OpenCodeGlob",
+            "OpenCodeGrep",
+            "OpenCodeRead",
             "OpenCodeSessionError",
+            "OpenCodeSkill",
+            "OpenCodeTask",
+            "OpenCodeTodoWrite",
+            "OpenCodeWebFetch",
+            "OpenCodeWebSearch",
+            "OpenCodeWrite",
             "create_opencode_handler",
             "opencode_agents",
         }
@@ -1184,6 +1217,10 @@ class TestInvocation:
         assert "{{response_to_evaluate}}" not in systems[1]
         assert "{{message_history}}" not in systems[1]
         assert "Hi" in systems[1]
+        # The judge calls with tool_handlers=None, so its session is deny-all.
+        assert script.session_bodies[1]["permission"] == [
+            {"permission": "*", "action": "deny", "pattern": "*"}
+        ]
 
     async def test_the_wrapper_posts_history_on_a_fresh_session(
         self, mock_ld_client: MagicMock
@@ -1539,8 +1576,11 @@ class TestProcess:
         assert argv[argv.index("--hostname") + 1] == "127.0.0.1"
         assert "--print-logs" not in argv
         assert "--log-level" not in argv
-        assert records[0]["cwd"] == str(script.cwd.resolve())
-        assert records[0]["config"] == os.path.abspath(script.config)
+        # The child records getcwd() and OPENCODE_CONFIG. On macOS /var is
+        # /private/var, and abspath does not resolve that symlink. Compare
+        # the resolved path on both sides.
+        assert Path(records[0]["cwd"]).resolve() == script.cwd.resolve()
+        assert Path(records[0]["config"]).resolve() == script.config.resolve()
         paths = [item["path"] for item in script.requests]
         assert "/event" in paths
         assert "/session" in paths

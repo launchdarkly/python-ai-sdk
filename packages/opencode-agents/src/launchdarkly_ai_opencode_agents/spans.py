@@ -13,6 +13,7 @@ from typing import Any
 from launchdarkly_ai_server import (
     AiConfigRep,
     SpanUsage,
+    end_span_once,
     set_ld_span_attributes,
     set_model_identity_attributes,
     set_usage_span_attributes,
@@ -139,8 +140,49 @@ def fail_span(span: Any, error: BaseException, tracker: set[int] | None = None) 
     span.record_exception(error)
     span.set_status(SpanStatusCode.ERROR, str(error))
     if tracker is not None:
-        from launchdarkly_ai_server import end_span_once
-
         end_span_once(span, tracker)
     else:
         span.end()
+
+
+#: A call id (tool spans) or message id (model spans) to its still-open span.
+Spans = dict[str, Any]
+
+
+def close_open_spans(tools: Spans, models: Spans, error: BaseException) -> None:
+    """Fails every ``execute_tool`` and ``chat`` span still open.
+
+    For the path where the run raises mid-stream: the reducer's own closing
+    logic never got to run for a call or a message that was still in flight,
+    so whatever is left in either dict would otherwise export as a span that
+    never ended.
+    """
+    for span in list(tools.values()):
+        fail_span(span, error)
+    tools.clear()
+    for span in list(models.values()):
+        fail_span(span, error)
+    models.clear()
+
+
+# The parity suite's body extractor is indentation-based. A signature that
+# wraps, then returns to column 0 for ``) -> None:``, is read as the whole
+# body, and that body no longer contains ``abandoned=True``. Keep this
+# definition on one physical line. E501 is ignored; ruff format is not.
+# fmt: off
+def abandon_open_spans(tools: Spans, models: Spans, ended: set[int], cancelled: bool = False) -> None:
+# fmt: on
+    """Ends every ``execute_tool`` and ``chat`` span still open.
+
+    A consumer who stopped reading leaves each span UNSET and marked
+    ``launchdarkly.stream.abandoned``. A ``CancelledError`` (a timeout, or
+    ``task.cancel()``) passes *cancelled*: ``end_span_once`` then writes
+    ``launchdarkly.run.cancelled`` and does not write the abandoned
+    attribute. *cancelled* wins when both are set.
+    """
+    for span in list(tools.values()):
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
+    tools.clear()
+    for span in list(models.values()):
+        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
+    models.clear()

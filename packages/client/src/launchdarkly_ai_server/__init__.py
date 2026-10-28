@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.4.0"  # x-release-please-version
+__version__ = "0.5.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .client import _config as _config
@@ -64,8 +64,9 @@ from .skills import (
     set_skill_store,
     skill_refs,
 )
+from .skills import _skill_refs as _skill_refs
 from .skills_core import SkillStore
-from .skills_fdv2 import FDv2SkillStore, StoreDiagnostics
+from .skills_fdv2 import LaunchDarklySkillStore, StoreDiagnostics
 from .skills_fs import (
     MANIFEST_FILENAME,
     MANIFEST_VERSION,
@@ -73,6 +74,8 @@ from .skills_fs import (
     OnUnavailable,
     write_skills,
 )
+from .skills_fs import _write_skills as _write_skills
+from .skills_source import config_skills
 from .skills_watch import SkillWatcher, watch_skills
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
@@ -113,6 +116,7 @@ from .types import (
     SkillOutcome,
     SkillOutcomeReason,
     SkillReference,
+    SkillSource,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -145,6 +149,9 @@ from .utils import (
     to_usage_dict,
 )
 from .utils import _create_handler as _create_handler
+
+# Deprecated: the 0.5.0 name. Removed in the next major release.
+FDv2SkillStore = LaunchDarklySkillStore
 
 __all__ = [  # noqa: RUF022
     # types
@@ -269,10 +276,14 @@ __all__ = [  # noqa: RUF022
     "SkillStore",
     "InMemorySkillStore",
     # Agent Skills: LaunchDarkly delivery store and on-change re-reconcile
+    "LaunchDarklySkillStore",
     "FDv2SkillStore",
     "StoreDiagnostics",
     "watch_skills",
     "SkillWatcher",
+    # Agent Skills: a requested set read on every reconcile, following AI Config changes
+    "SkillSource",
+    "config_skills",
     # Agent Skills: accessors
     "skill_refs",
     "get_skill",

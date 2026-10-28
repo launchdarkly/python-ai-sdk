@@ -445,7 +445,7 @@ class TestToClaudeAgentsTopology:
                 opts={"tool_handlers": {"my-tool": _my_handler}},
             ).invoke("input")
 
-        # create_sdk_mcp_server is called from build_tool_mcp for user config tools
+        # create_sdk_mcp_server is called from _build_tool_mcp for user config tools
         assert mock_sdk.create_sdk_mcp_server.called
 
     @pytest.mark.asyncio
@@ -1247,7 +1247,7 @@ class TestToClaudeAgentsAnthropicSpecific:
 
     @pytest.mark.asyncio
     async def test_build_tool_mcp_throws_when_tool_not_in_handlers(self) -> None:
-        from launchdarkly_ai_claude_agents.handler import build_tool_mcp
+        from launchdarkly_ai_claude_agents.handler import _build_tool_mcp
 
         mock_sdk = MagicMock()
         mock_sdk.tool = MagicMock(side_effect=lambda name, desc, schema: lambda fn: fn)
@@ -1261,7 +1261,7 @@ class TestToClaudeAgentsAnthropicSpecific:
         ):
             config_tools = {"missing-tool": {"description": "d", "parameters": {}}}
             handlers: dict[str, Any] = {}
-            await build_tool_mcp(config_tools, handlers)
+            await _build_tool_mcp(config_tools, handlers)
             # The actual error is raised when the fn is *called*, not when mcp is built
 
 
