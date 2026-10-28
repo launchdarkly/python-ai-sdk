@@ -1,7 +1,7 @@
 """
 Agent Skills — the FDv2 delivery transport.
 
-``FDv2SkillStore`` is the ``SkillStore`` that receives skills from LaunchDarkly
+``LaunchDarklySkillStore`` is the ``SkillStore`` that receives skills from LaunchDarkly
 over ``GET /sdk/poll`` or ``GET /sdk/stream``, authenticated with the
 environment's server-side SDK key. It holds raw wire objects and serves them to
 the accessors; it uses only the standard library.
@@ -173,20 +173,20 @@ def _require_server_side_credential(sdk_key: str) -> None:
     """
     if not isinstance(sdk_key, str) or not sdk_key.strip():
         raise ValueError(
-            "FDv2SkillStore requires a LaunchDarkly server-side SDK key "
+            "LaunchDarklySkillStore requires a LaunchDarkly server-side SDK key "
             "(sdk-...); none was given."
         )
     key = sdk_key.strip()
     if key.startswith(_MOBILE_KEY_PREFIX):
         raise ValueError(
-            "FDv2SkillStore was given a mobile key (mob-...). Agent Skills are a "
+            "LaunchDarklySkillStore was given a mobile key (mob-...). Agent Skills are a "
             "server-side feature: skill content is customer-confidential and is "
             "never delivered to a mobile or client-side process. Use the "
             "environment's server-side SDK key (sdk-...)."
         )
     if _CLIENT_SIDE_ID.match(key):
         raise ValueError(
-            "FDv2SkillStore was given what looks like a client-side environment "
+            "LaunchDarklySkillStore was given what looks like a client-side environment "
             "ID. Agent Skills are a server-side feature: skill content is "
             "customer-confidential and is never delivered to a client-side "
             "process. Use the environment's server-side SDK key (sdk-...)."
@@ -194,7 +194,7 @@ def _require_server_side_credential(sdk_key: str) -> None:
     if not key.startswith(_SERVER_KEY_PREFIX):
         # Warn only: private instances and test doubles may use unprefixed keys.
         logger.warning(
-            "The credential given to FDv2SkillStore does not look like a "
+            "The credential given to LaunchDarklySkillStore does not look like a "
             "LaunchDarkly server-side SDK key (sdk-...). Skills are delivered "
             "only to server-side credentials; if this is a client-side or mobile "
             "credential the connection will be rejected or will deliver nothing."
@@ -214,7 +214,7 @@ def _require_https_uri(base_uri: str, option: str = "base_uri") -> None:
     """
     if not isinstance(base_uri, str) or not base_uri.strip():
         raise ValueError(
-            f"FDv2SkillStore requires an https:// URI for {option}; none was given."
+            f"LaunchDarklySkillStore requires an https:// URI for {option}; none was given."
         )
     parts = urllib.parse.urlsplit(base_uri.strip())
     if parts.scheme == "https" and parts.hostname:
@@ -223,7 +223,7 @@ def _require_https_uri(base_uri: str, option: str = "base_uri") -> None:
         return
     if parts.scheme == "http":
         raise ValueError(
-            f"FDv2SkillStore refuses {option} {base_uri!r}: a plain http:// URI "
+            f"LaunchDarklySkillStore refuses {option} {base_uri!r}: a plain http:// URI "
             "would send the server-side SDK key in cleartext. Use https:// "
             "(the defaults are https://sdk.launchdarkly.com for polling and "
             "https://stream.launchdarkly.com for streaming). Plain http:// is "
@@ -231,7 +231,7 @@ def _require_https_uri(base_uri: str, option: str = "base_uri") -> None:
             "serving a local test double."
         )
     raise ValueError(
-        f"FDv2SkillStore refuses {option} {base_uri!r}: expected an https:// URI "
+        f"LaunchDarklySkillStore refuses {option} {base_uri!r}: expected an https:// URI "
         "with a host, such as https://sdk.launchdarkly.com."
     )
 
@@ -1358,14 +1358,14 @@ def _backoff_delay(
 # ---------------------------------------------------------------------------
 
 
-class FDv2SkillStore:
+class LaunchDarklySkillStore:
     """
     A ``SkillStore`` fed by LaunchDarkly's SDK-facing FDv2 delivery channel.
 
     Constructed with the environment's server-side SDK key, started explicitly,
     and passed to ``set_skill_store``::
 
-        store = FDv2SkillStore(sdk_key=os.environ["LD_SDK_KEY"])
+        store = LaunchDarklySkillStore(sdk_key=os.environ["LD_SDK_KEY"])
         store.start()
         if not store.wait_for_skills(timeout=10):
             ...  # no payload yet: see is_initialized
@@ -1529,7 +1529,7 @@ class FDv2SkillStore:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def start(self) -> FDv2SkillStore:
+    def start(self) -> LaunchDarklySkillStore:
         """
         Starts the delivery thread. Idempotent; returns ``self`` so it chains.
 
@@ -1542,10 +1542,10 @@ class FDv2SkillStore:
         with self._lock:
             if self._closed:
                 raise RuntimeError(
-                    "This FDv2SkillStore has been closed, and close() is final: "
+                    "This LaunchDarklySkillStore has been closed, and close() is final: "
                     "delivery cannot be resumed, so a restarted store would "
                     "report itself started and never deliver. Construct a new "
-                    "FDv2SkillStore to resume delivery. Held content is still "
+                    "LaunchDarklySkillStore to resume delivery. Held content is still "
                     "readable from the closed store."
                 )
             # Read before the rearm clears ``_failed_reason``: a thread inside
@@ -1608,7 +1608,7 @@ class FDv2SkillStore:
         ):
             thread.join(timeout=timeout)
 
-    def __enter__(self) -> FDv2SkillStore:
+    def __enter__(self) -> LaunchDarklySkillStore:
         return self.start()
 
     def __exit__(self, *_exc: Any) -> None:
@@ -1694,7 +1694,7 @@ class FDv2SkillStore:
         """
         if kind != SKILL_OBJECT_KIND:
             raise ValueError(
-                f"FDv2SkillStore notifies only {SKILL_OBJECT_KIND!r} changes, so "
+                f"LaunchDarklySkillStore notifies only {SKILL_OBJECT_KIND!r} changes, so "
                 f"a listener on {kind!r} would never fire. Register it on "
                 f"{SKILL_OBJECT_KIND!r}."
             )

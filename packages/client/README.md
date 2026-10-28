@@ -33,8 +33,8 @@ No code changes are required — `init_client()` detects the packages at runtime
 | Variable | Required | Description |
 |---|---|---|
 | `LD_SDK_KEY` | Yes | LaunchDarkly server-side SDK key |
-| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging). `FDv2SkillStore` reads it too when given no URI option |
-| `LD_STREAM_URI` | No | Override the streaming URI. `FDv2SkillStore` reads it too when given no URI option |
+| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging). `LaunchDarklySkillStore` reads it too when given no URI option |
+| `LD_STREAM_URI` | No | Override the streaming URI. `LaunchDarklySkillStore` reads it too when given no URI option |
 | `LD_EVENTS_URI` | No | Override the events URI |
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
@@ -314,7 +314,7 @@ The primary entry point for AI config invocations. Accepts either a single handl
 import asyncio
 from launchdarkly_ai_server import config, shutdown
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_openai_agents import create_openai_agent_handler
+from launchdarkly_ai_openai_agents import create_openai_agents_handler
 from launchdarkly_ai_claude_agents import create_claude_agents_handler
 
 # Single handler — must match the flag variation's provider+mode, or raises.
@@ -339,7 +339,7 @@ async def main():
         tool_handlers={"search": search_fn},
         handler=[
             create_openai_messages_handler(),  # provides_for: ["OpenAI", "messages"]
-            create_openai_agent_handler(),     # provides_for: ["OpenAI", "agent"]
+            create_openai_agents_handler(),    # provides_for: ["OpenAI", "agent"]
             create_claude_agents_handler(),    # provides_for: ["Anthropic", "agent"]
         ],
     )
@@ -670,8 +670,8 @@ worth alerting on too.
 verification passes, and the usual cause is a bug in a custom `SkillStore` adapter (a stale
 cache entry, a colliding key, a wrong index lookup) rather than tampering, so neither inflates
 LaunchDarkly's integrity counter. Both still write this record, so a rule on
-`ld.skills.integrity_failure` catches them. If `FDv2SkillStore` is your only store, treat them
-like `hash_mismatch`; behind a custom adapter, suspect the adapter first.
+`ld.skills.integrity_failure` catches them. If `LaunchDarklySkillStore` is your only store,
+treat them like `hash_mismatch`; behind a custom adapter, suspect the adapter first.
 
 `get_skill` returns `None` for a `version_mismatch` like any other failure, so this record is
 the only place it is visible unless you use `get_skill_result`, which reports it as the
@@ -725,16 +725,16 @@ be resolved and log a count at WARN. Use `get_skill_result` per key when you nee
 #### Receiving skills from LaunchDarkly
 
 `InMemorySkillStore` is for tests and bring-your-own-content. In production, skill content
-arrives through `FDv2SkillStore`, which uses LaunchDarkly's SDK-facing FDv2 delivery channel
+arrives through `LaunchDarklySkillStore`, which uses LaunchDarkly's SDK-facing FDv2 delivery channel
 (the `GET /sdk/poll` and `GET /sdk/stream` endpoints the base SDK's FDv2 data source uses),
 authenticated with the environment's server-side SDK key.
 
 ```python
 import os
 
-from launchdarkly_ai_server import FDv2SkillStore, set_skill_store, watch_skills
+from launchdarkly_ai_server import LaunchDarklySkillStore, set_skill_store, watch_skills
 
-store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
+store = LaunchDarklySkillStore(os.environ["LD_SDK_KEY"]).start()
 if not store.wait_for_skills(timeout=10):
     # No payload arrived. Reconciling now would find an empty store; see below.
     print(f"skill delivery has not answered yet: {store.failed or 'still waiting'}")
@@ -752,9 +752,9 @@ finally:
 **A reconcile that runs before delivery answers does not prune.** A store still waiting for its
 first payload looks the same as an environment with no skills, and `write_skills("*")` would
 otherwise treat that as every skill revoked and delete the files from a previous run.
-`FDv2SkillStore` reports readiness through the optional `is_initialized()`; until it is true, a
-reconcile reports the retrieval unavailable (`report.ok` is `False`, and the error says why)
-and leaves the disk alone.
+`LaunchDarklySkillStore` reports readiness through the optional `is_initialized()`; until it
+is true, a reconcile reports the retrieval unavailable (`report.ok` is `False`, and the error
+says why) and leaves the disk alone.
 
 **A 422 means this connection will never be assigned a skill payload, and delivery stops.**
 Every request declares the payload it wants (`kinds=agent-skill`), and LaunchDarkly answers
@@ -914,7 +914,7 @@ that skips verification.
 | `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `skills` is a sequence of `Skill` / `SkillReference` / key strings, `"*"`, or a `SkillSource`, which is read once; a source that raises or answers anything malformed is an unavailable retrieval. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative or non-finite `timeout`, or an unrecognised `on_unavailable`. `timeout=0` is valid and makes every skill report an error. **Performs synchronous filesystem I/O — see the note below.** |
 | `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `is_initialized()`, `add_listener(kind, fn)` / `remove_listener(kind, fn)`. A store without `is_initialized()` is treated as initialized. Both shipped stores deliver only the skill kind, so `add_listener` on any other kind raises. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
-| `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `close()` is **final** — `start()` afterwards raises. `poll_interval`, `read_timeout`, `initial_backoff` and `max_backoff` must be positive and finite, and `initial_backoff` may not exceed `max_backoff`. **Server-side only.** See *Receiving skills from LaunchDarkly* above. |
+| `LaunchDarklySkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `close()` is **final** — `start()` afterwards raises. `poll_interval`, `read_timeout`, `initial_backoff` and `max_backoff` must be positive and finite, and `initial_backoff` may not exceed `max_backoff`. **Server-side only.** See *Receiving skills from LaunchDarkly* above. |
 | `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, and, for a `SkillSource`, on every change to one of its `config_keys`, so revocation takes effect once changes have been quiet for `debounce` rather than at the next restart. `watcher.notify()` schedules a reconcile through the same debounce. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 

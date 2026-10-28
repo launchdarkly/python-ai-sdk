@@ -120,6 +120,7 @@ ROOT_SURFACE = frozenset(
         "set_skill_store",
         "SkillStore",
         "InMemorySkillStore",
+        "LaunchDarklySkillStore",
         "FDv2SkillStore",
         "StoreDiagnostics",
         "watch_skills",
@@ -154,3 +155,9 @@ def test_root_surface_is_exactly_the_snapshot() -> None:
     assert len(package.__all__) == len(ROOT_SURFACE), "duplicate name in __all__"
     for name in ROOT_SURFACE:
         assert hasattr(package, name), name
+
+
+def test_deprecated_fdv2_skill_store_name_is_the_same_class() -> None:
+    from launchdarkly_ai_server import FDv2SkillStore, LaunchDarklySkillStore
+
+    assert FDv2SkillStore is LaunchDarklySkillStore

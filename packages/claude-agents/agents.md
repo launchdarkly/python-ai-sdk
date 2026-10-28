@@ -74,7 +74,7 @@ ClaudeNotebookEdit: NativeTool
 
 ## Implementation Details
 
-### 1. Prompt Construction (`build_prompt`)
+### 1. Prompt Construction (`_build_prompt`)
 
 The handler uses a flat `prompt` + optional `system_prompt` shape that the `claude_agent_sdk.query()` call accepts:
 
@@ -94,7 +94,7 @@ neither?
 
 Note: the `messages` path collapses conversation history into a single flat string — roles are not individually structured. This is a limitation of the agent SDK's `query()` interface.
 
-### 2. Tool Wiring (`build_tool_mcp`)
+### 2. Tool Wiring (`_build_tool_mcp`)
 
 Tools are delivered via an in-process MCP server, not as raw JSON schema defs. The pipeline:
 
@@ -238,4 +238,4 @@ Span names and attributes are described in [Implementation Details → Telemetry
 - **MCP tool name prefix**: tools registered in the MCP server are accessible as `mcp__tool-mcp__<name>`. The `allowed_tools` list must use this prefix; omitting it will cause the agent to not invoke any tools.
 - **Async generator teardown**: always use `break` inside `async for` (not `return`) and wrap the loop in `try/finally: await gen.aclose()`. See TESTING.md Appendix A.4.
 - **`message.usage` shape**: the raw usage dict from the `claude_agent_sdk` is passed through directly to `parse_usage`. It accepts `input_tokens`/`output_tokens` which the SDK provides.
-- **Native tools** (`ClaudeWebSearch`, etc.) are registered in `tool_handlers` as `NativeTool` sentinel instances (not callables). The handler's `partition_tools` function separates them from user-defined tools — native tools go into `native_tool_names` for the agent's built-in access, user tools go through the MCP server.
+- **Native tools** (`ClaudeWebSearch`, etc.) are registered in `tool_handlers` as `NativeTool` sentinel instances (not callables). The handler's `_partition_tools` function separates them from user-defined tools — native tools go into `native_tool_names` for the agent's built-in access, user tools go through the MCP server.

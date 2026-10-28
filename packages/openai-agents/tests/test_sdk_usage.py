@@ -8,7 +8,7 @@ import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_openai_agents import (
-    create_openai_agent_handler,
+    create_openai_agents_handler,
     openai_agents,
     openai_graph,
     to_openai_agents,
@@ -52,7 +52,7 @@ async def client() -> Any:
     ("helper", "call"),
     [
         ("openai-agents.openaiAgents", lambda: openai_agents("k", "q", CONTEXT)),
-        ("openai-agents.createOpenAIAgentHandler", create_openai_agent_handler),
+        ("openai-agents.createOpenAIAgentHandler", create_openai_agents_handler),
         ("openai-agents.openaiGraph", lambda: openai_graph("k")),
         ("openai-agents.toOpenAIAgents", lambda: to_openai_agents(None)),
     ],
@@ -125,7 +125,7 @@ async def test_held_helper_flushes_with_its_package() -> None:
     await shutdown()
     lifecycle_module._reset_for_testing()
     try:
-        create_openai_agent_handler()
+        create_openai_agents_handler()
     except Exception:
         pass  # The factory may need credentials; it reports first.
     installed = _fake()

@@ -11,8 +11,8 @@ import launchdarkly_ai_server.lifecycle as lifecycle_module
 import launchdarkly_ai_server.sdk_usage as sdk_usage_module
 from launchdarkly_ai_server import (
     SDK_INFO_CONTEXT,
-    FDv2SkillStore,
     InMemorySkillStore,
+    LaunchDarklySkillStore,
     ProviderHandler,
     SkillReference,
     __version__,
@@ -660,5 +660,5 @@ async def test_accessors_do_not_report_each_other(
 
 async def test_store_setup_is_not_a_helper(client: MagicMock) -> None:
     set_skill_store(InMemorySkillStore())
-    FDv2SkillStore("sdk-test-key")
+    LaunchDarklySkillStore("sdk-test-key")
     assert _usage(client) == []
