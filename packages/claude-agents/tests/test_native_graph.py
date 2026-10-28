@@ -1415,6 +1415,13 @@ class TestNativeGraphModelParameters:
         assert "env" not in invalid
         assert invalid["thinking"] == {"type": "disabled"}
 
+        malformed = await node_options({"thinking": {"type": "enabled"}})
+        assert malformed["thinking"] == {"type": "disabled"}
+
+        effort_only = await node_options({"effort": "low"})
+        assert effort_only["effort"] == "low"
+        assert effort_only["thinking"] == {"type": "disabled"}
+
         budget_only = await node_options({"max_thinking_tokens": 2048})
         assert budget_only["max_thinking_tokens"] == 2048
         assert "thinking" not in budget_only
