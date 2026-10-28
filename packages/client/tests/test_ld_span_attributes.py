@@ -19,6 +19,14 @@ LD_FIXTURE = {
 }
 
 
+RAW_VARIATION: dict[str, Any] = {
+    "model": {"name": "gpt-x", "parameters": {"temperature": 0.5}},
+    "provider": {"name": "openai"},
+    "messages": [{"role": "system", "content": "Olá"}],
+    "_ldMeta": {"enabled": True, "variationKey": "variation-a"},
+}
+
+
 class FakeSpan:
     def __init__(self) -> None:
         self.attributes: dict[str, Any] = {}
@@ -214,21 +222,34 @@ class TestResultVariant:
         set_ld_span_attributes(span, {"__ld": ld})
         assert "feature_flag.result.variant" not in _feature_flag(span)
 
-    def test_value_is_the_raw_variation_serialized_like_the_tracing_hook(
+    def test_capture_on_writes_the_raw_variation_like_the_tracing_hook(
         self,
     ) -> None:
-        raw = {
-            "model": {"name": "gpt-x", "parameters": {"temperature": 0.5}},
-            "provider": {"name": "openai"},
-            "messages": [{"role": "system", "content": "Olá"}],
-            "_ldMeta": {"enabled": True, "variationKey": "variation-a"},
-        }
         span = FakeSpan()
-        set_ld_span_attributes(span, {**_vars(None), "__ldValue": raw})
+        set_ld_span_attributes(
+            span, {**_vars(None), "__ldValue": RAW_VARIATION}, capture_content=True
+        )
         # ldotel's TracingHook writes json.dumps(detail.value) with defaults.
-        assert _feature_flag(span)["feature_flag.result.value"] == json.dumps(raw)
+        assert _feature_flag(span)["feature_flag.result.value"] == json.dumps(
+            RAW_VARIATION
+        )
 
-    def test_value_is_absent_without_an_evaluated_value(self) -> None:
+    def test_capture_off_writes_the_variation_key_not_the_prompt(self) -> None:
         span = FakeSpan()
-        set_ld_span_attributes(span, {"__ld": {**LD_FIXTURE, "variationKey": ""}})
+        set_ld_span_attributes(span, {**_vars(None), "__ldValue": RAW_VARIATION})
+        assert _feature_flag(span)["feature_flag.result.value"] == '"variation-a"'
+
+    def test_capture_on_without_a_raw_variation_falls_back_to_the_key(self) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(span, _vars(None), capture_content=True)
+        assert _feature_flag(span)["feature_flag.result.value"] == '"variation-a"'
+
+    @pytest.mark.parametrize("capture", [True, False])
+    def test_no_raw_variation_and_no_key_omits_the_value(self, capture: bool) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(
+            span,
+            {"__ld": {**LD_FIXTURE, "variationKey": ""}},
+            capture_content=capture,
+        )
         assert "feature_flag.result.value" not in _feature_flag(span)

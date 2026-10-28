@@ -106,7 +106,7 @@ The root also carries one span event, `feature_flag`, with these event attribute
 | `feature_flag.key` | config key |
 | `feature_flag.provider.name` | `LaunchDarkly` |
 | `feature_flag.result.variant` | variation key, only when non-empty (graph spans may have none) |
-| `feature_flag.result.value` | `json.dumps` of the raw variation as the LaunchDarkly SDK returned it (`_ldMeta` included), same serialization as the `ldotel` tracing hook with value inclusion on; not gated by content capture; absent when there is no evaluated value (native-graph spans) |
+| `feature_flag.result.value` | with content capture on (the existing `capture_content` setting, including the `configure()` default) and a raw variation present: `json.dumps` of the variation as the LaunchDarkly SDK returned it (`_ldMeta` included), the same serialization as the `ldotel` tracing hook with value inclusion on. Otherwise, when the variation key is non-empty: `json.dumps` of the key (for example `"\"v1\""`), which also covers `graph()` roots. Otherwise absent (native-graph spans) |
 | `feature_flag.set.id` | environment id, only when present |
 | `feature_flag.context.id` | canonical context key, only when `variables.ldContext` has a usable identity |
 | `feature_flag.contextKeys` | compact JSON of per-kind keys, only when identity is present |

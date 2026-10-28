@@ -802,7 +802,7 @@ def _create_langchain_messages_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` can tell an open root from a
         # closed one without asking the span. A mock span answers `is_recording()` truthily, and the
@@ -1140,7 +1140,7 @@ async def _stream_gen(
 
     base_model = await _resolve_base_model(config, llm, importlib)
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     initial_messages = _build_messages(config, user_input, variables, history)

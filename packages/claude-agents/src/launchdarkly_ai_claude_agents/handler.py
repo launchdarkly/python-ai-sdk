@@ -787,7 +787,7 @@ def _create_claude_agents_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the finally below can tell an open root
         # from a closed one without asking the span. A mock span answers `is_recording()`
@@ -1052,7 +1052,7 @@ async def _stream_gen(
     exit abandons it, and asyncio's finalizer later raises ``RuntimeError`` when it is suspended
     inside a real await in the SDK.
     """
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     prompt, system_prompt = _build_prompt(config, user_input, variables, history)

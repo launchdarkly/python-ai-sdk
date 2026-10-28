@@ -846,9 +846,8 @@ class TestRootSpanAttributes:
                     "feature_flag.key": "my-config",
                     "feature_flag.provider.name": "LaunchDarkly",
                     "feature_flag.result.variant": "v1",
-                    "feature_flag.result.value": (
-                        '{"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}}'
-                    ),
+                    # Content capture is off, so the key stands in for the variation.
+                    "feature_flag.result.value": '"v1"',
                     "feature_flag.set.id": "env-1",
                 },
             )

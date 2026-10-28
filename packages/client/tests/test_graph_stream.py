@@ -6,6 +6,7 @@ Reference: TESTING.md §3.15a, Appendix A.4 / A.13.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -987,6 +988,46 @@ class TestGraphStreamOtel:
         flag_events = [e for e in graph_spans[0].events if e.name == "feature_flag"]
         assert len(flag_events) == 1
         assert (flag_events[0].attributes or {})["feature_flag.key"] == "graph-key"
+
+    @pytest.mark.parametrize("mode", ["invoke", "stream"])
+    async def test_graph_span_event_carries_the_graph_variation(
+        self, mode: str
+    ) -> None:
+        """A graph root has no raw variation, so its result value is the JSON-encoded key."""
+        client = _make_client(
+            {
+                "root": "root-node",
+                "edges": {"root-node": [{"key": "leaf-node"}]},
+                "_ldMeta": {"enabled": True, "variationKey": "graph-v1", "version": 3},
+            }
+        )
+        lifecycle_module._set_client_for_testing(client)
+        try:
+            g = graph("graph-key", handlers=[_make_streaming_handler(["ok"])])
+            if mode == "invoke":
+                await g.invoke("hi", CONTEXT)
+            else:
+                await _collect(g.stream("hi", CONTEXT))
+        finally:
+            lifecycle_module._reset_for_testing()
+
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
+        event = next(e for e in graph_spans[0].events if e.name == "feature_flag")
+        attrs = event.attributes or {}
+        assert attrs["feature_flag.result.variant"] == "graph-v1"
+        assert attrs["feature_flag.result.value"] == json.dumps("graph-v1")
+
+    async def test_graph_span_without_a_variation_key_omits_the_result(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        await graph("graph-key", handlers=[_make_streaming_handler(["ok"])]).invoke(
+            "hi", CONTEXT
+        )
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
+        event = next(e for e in graph_spans[0].events if e.name == "feature_flag")
+        attrs = event.attributes or {}
+        assert "feature_flag.result.variant" not in attrs
+        assert "feature_flag.result.value" not in attrs
 
     async def test_graph_parent_captured_at_stream_call_time(
         self, mock_ld_client: MagicMock
