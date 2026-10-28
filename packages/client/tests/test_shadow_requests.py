@@ -114,11 +114,13 @@ class _Recorder:
         *,
         raises: bool = False,
         sleep_s: float = 0,
+        error: Exception | None = None,
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self._output = output
         self._raises = raises
         self._sleep_s = sleep_s
+        self._error = error
         self.handler = ProviderHandler(fn=self._fn, provides_for=(provider, "messages"))  # type: ignore[arg-type]
 
     async def _fn(
@@ -140,6 +142,8 @@ class _Recorder:
         )
         if self._sleep_s:
             await asyncio.sleep(self._sleep_s)
+        if self._error is not None:
+            raise self._error
         if self._raises:
             raise RuntimeError("shadow boom")
         return {
@@ -449,6 +453,34 @@ class TestRunning:
         names = [e[0] for e in _shadow_events(client)]
         assert "$ld:ai:generation:error" in names
         assert "$ld:ai:duration:total" in names
+
+    async def test_timeout_is_tracked_once(self) -> None:
+        sr.enable_shadow_requests(timeout_s=0.05)
+        client = _use(_make_client(_variation_a()))
+        a = _Recorder("TestProvider", "real answer")
+        b = _Recorder("ShadowProvider", sleep_s=1)
+        await config(key="flag", handler=[a.handler, b.handler]).invoke("hi", CONTEXT)
+        await sr._wait_for_shadows_for_testing()
+        names = [e[0] for e in _shadow_events(client)]
+        assert names.count("$ld:ai:generation:error") == 1
+        assert names.count("$ld:ai:duration:total") == 1
+
+    async def test_handler_timeout_error_is_tracked_once(self) -> None:
+        tasks: list[sr.ShadowTask] = []
+        sr.enable_shadow_requests(on_task=tasks.append)
+        client = _make_client(_variation_a())
+        await _invoke(client)
+        b = _Recorder("ShadowProvider", error=TimeoutError("provider timeout"))
+        result = await sr.run_shadow(tasks[0], [b.handler])
+        names = [e[0] for e in _shadow_events(client)]
+        assert result.error == "provider timeout"
+        assert names.count("$ld:ai:generation:error") == 1
+        assert names.count("$ld:ai:duration:total") == 1
+
+    @pytest.mark.parametrize("timeout_s", [0, -1, float("inf"), float("nan")])
+    def test_timeout_must_be_positive_and_finite(self, timeout_s: float) -> None:
+        with pytest.raises(ValueError):
+            sr.enable_shadow_requests(timeout_s=timeout_s)
 
     async def test_real_run_is_unchanged(self) -> None:
         baseline_client = _make_client(_variation_a())

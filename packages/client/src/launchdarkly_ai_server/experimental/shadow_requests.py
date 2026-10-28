@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -30,7 +31,6 @@ from ..utils import (
     model_stamps_from_meta,
     parse_usage,
     select_handler,
-    to_ld_context,
 )
 
 __all__ = [
@@ -101,8 +101,8 @@ def enable_shadow_requests(
     sampled shadow, before the real handler runs, and must only enqueue it.
     """
     report_usage("experimental.enableShadowRequests")
-    if not timeout_s > 0:
-        raise ValueError("timeout_s must be greater than 0")
+    if not (math.isfinite(timeout_s) and timeout_s > 0):
+        raise ValueError("timeout_s must be a finite number greater than 0")
     global _settings
     _settings = _Settings(timeout_s=timeout_s, on_task=on_task)
     register_invocation_hook(_FEATURE, _on_invocation)
@@ -274,27 +274,22 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
             usage=parse_usage({}), track_data=track_data, error=str(err)
         )
 
-    start = time.monotonic()
     try:
-        result = await asyncio.wait_for(
-            execute_and_track(
-                config_key=task.config_key,
-                config=task.shadow_config,
-                meta=task.shadow_meta,
-                user_context=task.user_context,
-                handler=handler,
-                user_input=task.user_input,
-                tool_handlers=None,
-                variables=task.variables,
-                history=list(task.history) if task.history else None,
-                run_id=run_id,
-                extra_track_data=extra,
-                span_attributes=task.span_attributes,
-            ),
-            timeout=task.timeout_s,
+        result = await execute_and_track(
+            config_key=task.config_key,
+            config=task.shadow_config,
+            meta=task.shadow_meta,
+            user_context=task.user_context,
+            handler=_with_deadline(handler, task.timeout_s),
+            user_input=task.user_input,
+            tool_handlers=None,
+            variables=task.variables,
+            history=list(task.history) if task.history else None,
+            run_id=run_id,
+            extra_track_data=extra,
+            span_attributes=task.span_attributes,
         )
-    except TimeoutError:
-        _track_timeout(task, track_data, int((time.monotonic() - start) * 1000))
+    except _ShadowTimeout:
         return ShadowResult(
             usage=parse_usage({}), track_data=track_data, error="timeout"
         )
@@ -305,15 +300,23 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
     return ShadowResult(usage=result["usage"], track_data=result["track_data"])
 
 
-def _track_timeout(
-    task: ShadowTask, track_data: dict[str, Any], elapsed_ms: int
-) -> None:
-    from ..lifecycle import get_client
+class _ShadowTimeout(Exception):
+    pass
 
-    try:
-        client = get_client()
-        ld_ctx = to_ld_context(client, task.user_context)
-        client.track("$ld:ai:duration:total", ld_ctx, track_data, elapsed_ms)
-        client.track("$ld:ai:generation:error", ld_ctx, track_data, 1)
-    except Exception:
-        logger.debug("Could not track a shadow timeout", exc_info=True)
+
+def _with_deadline(handler: ProviderHandler, timeout_s: float) -> ProviderHandler:
+    async def timed(*args: Any) -> Any:
+        deadline = asyncio.timeout(timeout_s)
+        try:
+            async with deadline:
+                return await handler(*args)
+        except TimeoutError:
+            if deadline.expired():
+                raise _ShadowTimeout("timeout") from None
+            raise
+
+    return ProviderHandler(
+        fn=timed,
+        provides_for=handler.provides_for,
+        capture_content=handler.capture_content,
+    )
