@@ -524,6 +524,51 @@ class TestGraphStream:
         # done holds only the graph-level judge; per-node results are not merged into it.
         assert "judgeResults" not in events[-1]
 
+    async def test_node_judges_stay_on_node_done_when_a_graph_judge_runs(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        leaf_judge = {
+            "leaf-judge": {
+                "usage": {"input": 1, "output": 1, "total": 2},
+                "response": "good",
+                "score": 0.9,
+            }
+        }
+        graph_judge = {
+            "graph-judge": {
+                "usage": {"input": 1, "output": 1, "total": 2},
+                "response": "whole",
+                "score": 0.5,
+            }
+        }
+
+        async def judges_for(**kwargs: Any) -> dict[str, Any]:
+            config = kwargs["config"]
+            judges = (config.get("judgeConfiguration") or {}).get("judges") or []
+            if judges and judges[0]["key"] == "graph-judge":
+                return graph_judge
+            return leaf_judge if config.get("instructions") == "I am leaf" else {}
+
+        with patch(
+            "launchdarkly_ai_server.judges.run_judges",
+            new_callable=AsyncMock,
+            side_effect=judges_for,
+        ):
+            events = await _collect(
+                graph(
+                    "graph-key",
+                    handlers=[_make_streaming_handler(["ok"])],
+                    graph_judge="graph-judge",
+                ).stream("hi", CONTEXT)
+            )
+        leaf_done = next(
+            e
+            for e in events
+            if e["type"] == "node_done" and e["nodeKey"] == "leaf-node"
+        )
+        assert leaf_done["judgeResults"] == leaf_judge
+        assert events[-1]["judgeResults"] == graph_judge
+
     async def test_per_node_judge_receives_the_trajectory(
         self, mock_ld_client: MagicMock
     ) -> None:

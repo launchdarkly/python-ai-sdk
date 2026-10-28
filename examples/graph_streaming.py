@@ -42,8 +42,14 @@ async def run(key: str, user_input: str) -> None:
         elif event["type"] == "node_start":
             print(f"\n[node_start] {event['nodeKey']}", file=sys.stderr)
         elif event["type"] == "node_done":
+            # A node's own judge results, when one of its judges produced a score.
+            judged = (
+                f" judgeResults={json.dumps(event['judgeResults'])}"
+                if event.get("judgeResults")
+                else ""
+            )
             print(
-                f"\n[node_done] {event['nodeKey']} usage={json.dumps(event.get('usage'))}",
+                f"\n[node_done] {event['nodeKey']} usage={json.dumps(event.get('usage'))}{judged}",
                 file=sys.stderr,
             )
         elif event["type"] == "handoff":
