@@ -2,12 +2,17 @@
 
 Usage: uv run python scripts/check_packaging.py <dist-dir>
 
-For each package, in a fresh virtualenv with only what its install command pulls in:
+For each package, in a fresh virtualenv with the package alone, no extras:
 
 1. every public module imports, and every name in its ``__all__`` resolves;
-2. every module its source imports unconditionally is installed. That includes lazy
-   imports (``importlib.import_module("openai")`` inside a factory), which step 1 never
-   reaches. Imports under ``except ImportError`` or ``TYPE_CHECKING`` are optional.
+2. every module its source imports unconditionally comes from a distribution the
+   package declares. Installed is not enough: a module another dependency happens to
+   pull in still fails. That includes lazy imports (``importlib.import_module("openai")``
+   inside a factory), which step 1 never reaches. Imports under ``except ImportError``
+   or ``TYPE_CHECKING`` are optional.
+
+Installing with no extras is what proves the optional dependencies stay optional: core
+loads without ``launchdarkly-server-sdk`` and the OpenTelemetry SDK.
 
 Then each declared extra gets a venv of its own, installed as ``<package>[<extra>]``,
 and the modules it promises in ``EXTRA_IMPORTS`` must import there. An extra missing
@@ -25,6 +30,7 @@ Third-party dependencies resolve from PyPI against the declared ranges.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import subprocess
@@ -37,8 +43,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The extras the README's install command uses.
-README_EXTRAS = {"launchdarkly-ai-server": ("ld",), "launchdarkly-ai-python": ("ld",)}
 # What each declared extra must make importable.
 _OTEL = ["opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.http"]
 EXTRA_IMPORTS = {
@@ -73,12 +77,34 @@ for name in sys.argv[1:]:
     importlib.import_module(name)
 """
 
-INSTALLED_CHECK = """
-import importlib.util, sys
-missing = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is None]
-if missing:
-    sys.exit("imported but not installed: " + ", ".join(missing))
+# Prints which installed distributions provide each module, so the caller can compare
+# them with what the package declares. ``null`` means the module is not installed.
+PROVIDERS = """
+import importlib.metadata, importlib.util, json, sys
+dists = importlib.metadata.packages_distributions()
+print(json.dumps({
+    name: dists.get(name, []) if importlib.util.find_spec(name) else None
+    for name in sys.argv[1:]
+}))
 """
+
+
+def _normalize(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def undeclared_imports(
+    providers: dict[str, list[str] | None], declared: set[str]
+) -> list[str]:
+    """Each import that no declared distribution provides, with the reason."""
+    problems = []
+    for module, dists in sorted(providers.items()):
+        if dists is None:
+            problems.append(f"{module} (not installed)")
+        elif not {_normalize(d) for d in dists} & declared:
+            found = ", ".join(sorted(dists)) or "no distribution"
+            problems.append(f"{module} (from {found}, not declared)")
+    return problems
 
 
 @dataclass(frozen=True)
@@ -105,12 +131,21 @@ class Package:
                 requested.update(x.strip() for x in m.group(2).split(","))
         return f"[{','.join(sorted(requested))}]" if requested else ""
 
+    def declared(self) -> set[str]:
+        """The package itself and its required dependencies, normalized."""
+        names = {_normalize(self.name)}
+        for req in self.dependencies:
+            m = _REQUIREMENT.match(req)
+            if m:
+                names.add(_normalize(m.group(1)))
+        return names
+
 
 @dataclass(frozen=True)
 class Run:
     package: Package
     extras: tuple[str, ...]
-    """Extras to install; the README's for the base run, one declared extra otherwise."""
+    """Extras to install: none for the base run, one declared extra otherwise."""
     base: bool
 
     @property
@@ -128,13 +163,8 @@ def runs(found: list[Package]) -> list[Run]:
     ]
     if unmapped:
         raise SystemExit(f"no EXTRA_IMPORTS entry for: {', '.join(unmapped)}")
-    base = [Run(p, README_EXTRAS.get(p.name, ()), base=True) for p in found]
-    return base + [
-        Run(p, (e,), base=False)
-        for p in found
-        for e in p.optional
-        if (e,) != README_EXTRAS.get(p.name)
-    ]
+    base = [Run(p, (), base=True) for p in found]
+    return base + [Run(p, (e,), base=False) for p in found for e in p.optional]
 
 
 def _catches_import_error(handler: ast.ExceptHandler) -> bool:
@@ -274,12 +304,25 @@ def check(run: Run, dist: Path, internal: list[str], tmp: Path) -> tuple[bool, s
         *install,
         # -I: import from the installed wheel, never the source tree.
         [str(python), "-I", "-c", PUBLIC_CHECK, *package.public],
-        [str(python), "-I", "-c", IMPORT_CHECK, *extra_imports],
-        [str(python), "-I", "-c", INSTALLED_CHECK, *package.imports],
     ]
-    return _run_steps(
-        run.label, steps, f"ok   {run.label}: {', '.join(package.public)}"
+    ok, output = _run_steps(run.label, steps, "")
+    if not ok:
+        return ok, output
+    result = subprocess.run(
+        [str(python), "-I", "-c", PROVIDERS, *package.imports],
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0:
+        return False, output + result.stderr + f"FAIL {run.label}\n"
+    problems = undeclared_imports(json.loads(result.stdout), package.declared())
+    if problems:
+        return False, (
+            output
+            + f"imported but not declared: {'; '.join(problems)}\n"
+            + f"FAIL {run.label}\n"
+        )
+    return True, output + f"ok   {run.label}: {', '.join(package.public)}\n"
 
 
 def _run_steps(label: str, steps: list[list[str]], ok: str) -> tuple[bool, str]:

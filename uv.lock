@@ -1426,15 +1426,19 @@ version = "0.2.0"
 source = { editable = "packages/litellm-agents" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
+    { name = "openai" },
     { name = "openai-agents", extra = ["litellm"] },
     { name = "opentelemetry-api" },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "launchdarkly-ai-server", editable = "packages/client" },
+    { name = "openai", specifier = ">=2.44" },
     { name = "openai-agents", extras = ["litellm"], specifier = ">=0.17" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
+    { name = "pydantic", specifier = ">=2.13" },
 ]
 
 [[package]]
@@ -1463,6 +1467,7 @@ dependencies = [
     { name = "openai" },
     { name = "openai-agents" },
     { name = "opentelemetry-api" },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
@@ -1471,6 +1476,7 @@ requires-dist = [
     { name = "openai", specifier = ">=2.44" },
     { name = "openai-agents", specifier = ">=0.17" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
+    { name = "pydantic", specifier = ">=2.13" },
 ]
 
 [[package]]
@@ -1582,6 +1588,7 @@ dependencies = [
     { name = "ai" },
     { name = "launchdarkly-ai-server" },
     { name = "opentelemetry-api" },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
@@ -1589,6 +1596,7 @@ requires-dist = [
     { name = "ai", specifier = ">=0.7,<0.8" },
     { name = "launchdarkly-ai-server", editable = "packages/client" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
+    { name = "pydantic", specifier = ">=2.13" },
 ]
 
 [[package]]
@@ -1599,6 +1607,7 @@ dependencies = [
     { name = "ai" },
     { name = "launchdarkly-ai-server" },
     { name = "opentelemetry-api" },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
@@ -1606,6 +1615,7 @@ requires-dist = [
     { name = "ai", specifier = ">=0.7,<0.8" },
     { name = "launchdarkly-ai-server", editable = "packages/client" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
+    { name = "pydantic", specifier = ">=2.13" },
 ]
 
 [[package]]

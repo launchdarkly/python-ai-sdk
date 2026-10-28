@@ -85,6 +85,46 @@ def test_every_declared_extra_is_checked() -> None:
     planned = {run.label for run in check_packaging.runs(check_packaging.packages())}
     assert "launchdarkly-ai-langchain-messages[anthropic]" in planned
     assert "launchdarkly-ai-python[otel]" in planned
+    assert "launchdarkly-ai-server[ld]" in planned
+
+
+def test_core_is_checked_without_extras() -> None:
+    planned = check_packaging.runs(check_packaging.packages())
+    base = {run.package.name: run.extras for run in planned if run.base}
+    assert base["launchdarkly-ai-server"] == ()
+    assert base["launchdarkly-ai-python"] == ()
+
+
+def test_an_undeclared_dynamic_import_fails(tmp_path: Path) -> None:
+    source = """
+        import importlib
+
+        def factory():
+            return importlib.import_module("langchain_anthropic")
+    """
+    package = check_packaging.Package(
+        name="launchdarkly-ai-example",
+        public=[],
+        imports=_scan(tmp_path, source),
+        dependencies=["langchain-core>=1.6"],
+    )
+    # Installed, because another dependency pulled it in, but not declared.
+    providers = {"langchain_anthropic": ["langchain-anthropic"]}
+    assert check_packaging.undeclared_imports(providers, package.declared()) == [
+        "langchain_anthropic (from langchain-anthropic, not declared)"
+    ]
+
+
+def test_declared_and_missing_imports() -> None:
+    declared = {"launchdarkly-ai-example", "typing-extensions"}
+    providers: dict[str, list[str] | None] = {
+        "launchdarkly_ai_example": ["launchdarkly_ai_example"],
+        "typing_extensions": ["typing_extensions"],
+        "absent": None,
+    }
+    assert check_packaging.undeclared_imports(providers, declared) == [
+        "absent (not installed)"
+    ]
 
 
 def test_an_extra_without_expected_imports_fails() -> None:
