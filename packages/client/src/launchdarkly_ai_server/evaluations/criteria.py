@@ -16,7 +16,6 @@ type SuccessDirection = Literal["higher_is_better", "lower_is_better"]
 #: it would be recorded and never ruled on; defaulting is what keeps a judge
 #: usable as a gate without every caller restating the obvious.
 DEFAULT_JUDGE_THRESHOLD = 0.5
-DEFAULT_PASS_RATE_THRESHOLD = 0.95
 
 
 @dataclass(frozen=True)
@@ -35,7 +34,7 @@ class Judge:
 
     key: str
     threshold: float | None = DEFAULT_JUDGE_THRESHOLD
-    pass_rate_threshold: float | None = DEFAULT_PASS_RATE_THRESHOLD
+    pass_rate_threshold: float | None = None
     ground_truth_context: str | None = None
 
     def __post_init__(self) -> None:
@@ -89,7 +88,7 @@ class Scorer:
     name: str
     fn: ScorerFn
     threshold: float | None = 1.0
-    pass_rate_threshold: float | None = DEFAULT_PASS_RATE_THRESHOLD
+    pass_rate_threshold: float | None = None
     success_direction: SuccessDirection = "higher_is_better"
 
     def __post_init__(self) -> None:
@@ -149,11 +148,8 @@ def _criteria_options(
     options: dict[str, Any] = {}
     if threshold is not None:
         options["threshold"] = threshold
-    options["passRateThreshold"] = (
-        DEFAULT_PASS_RATE_THRESHOLD
-        if pass_rate_threshold is None
-        else pass_rate_threshold
-    )
+    if pass_rate_threshold is not None:
+        options["passRateThreshold"] = pass_rate_threshold
     if ground_truth_context is not None:
         options["groundTruthContext"] = ground_truth_context
     return options
