@@ -16,6 +16,12 @@ class TestReexports:
                 f"launchdarkly_ai_python is missing re-export: {name!r}"
             )
 
+    def test_all_matches_server(self) -> None:
+        server = importlib.import_module("launchdarkly_ai_server")
+        barrel = importlib.import_module("launchdarkly_ai_python")
+
+        assert barrel.__all__ == server.__all__
+
     def test_reexported_values_are_identical_references(self) -> None:
         server = importlib.import_module("launchdarkly_ai_server")
         barrel = importlib.import_module("launchdarkly_ai_python")
