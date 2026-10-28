@@ -44,6 +44,7 @@ EvalRunResult  [class, @dataclass]
   url: str
 EvalTool  [class, @dataclass(frozen=True)]
   __init__(key: str, implementation: ToolImplementation, schema: dict[str, Any], description: str = '')
+  __post_init__() -> None
   description: str = ''
   implementation: ToolImplementation
   key: str

@@ -17,6 +17,7 @@ from .api import (
     EvaluationsError,
     LDApiClient,
     Transport,
+    check_string_keys,
     segment,
     urllib_transport,
 )
@@ -60,17 +61,6 @@ def _render_inline_row(row: DatasetRow) -> DatasetRow:
         variables_value=row.variables,
         metadata_value=row.metadata,
     )
-
-
-def _check_string_keys(value: Any) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"keys must be str, not {type(key).__name__}")
-            _check_string_keys(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _check_string_keys(item)
 
 
 def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]:
@@ -126,7 +116,7 @@ def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]
             # references fail there instead of recursing in the key check.
             try:
                 json.dumps(value, allow_nan=False)
-                _check_string_keys(value)
+                check_string_keys(value)
             except (TypeError, ValueError) as error:
                 raise EvaluationsError(
                     f"Inline dataset row {position} {field_name} must be "
