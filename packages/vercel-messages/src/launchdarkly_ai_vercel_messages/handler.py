@@ -122,7 +122,7 @@ _TOOL_CHOICE_MODES = frozenset({"auto", "none", "required"})
 
 
 def _renamed_parameters(params: dict[str, Any]) -> dict[str, Any]:
-    """Applies the section 1.12 renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
+    """Applies the cross-SDK renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
     which wins over ``max_tokens``, and an explicit ``reasoning`` wins over ``reasoning_effort``."""
     for alias in ("max_completion_tokens", "max_tokens"):
         value = params.pop(alias, None)
