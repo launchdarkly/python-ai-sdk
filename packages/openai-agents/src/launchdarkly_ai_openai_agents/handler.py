@@ -341,7 +341,7 @@ def _build_agent_and_prompt(
     # `outputFormat` is not wired into `Agent(output_type=...)` here, matching this handler's
     # pre-existing behaviour (and unlike the TypeScript handler, which does wire it): the Python
     # Agents SDK requires a concrete Python type for `output_type`, not a raw JSON Schema dict (see
-    # `utils.build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
+    # `utils._build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
     # change, not a telemetry one, so it is left alone. `_call_impl` still returns the parsed
     # `final_output` object as-is when `outputFormat` is configured, matching the pre-existing
     # return-shape contract.
@@ -646,7 +646,7 @@ def _usage_from_error(error: BaseException) -> SpanUsage | None:
     return to_span_usage(usage)
 
 
-def create_openai_agent_handler(
+def create_openai_agents_handler(
     *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK.
@@ -658,13 +658,13 @@ def create_openai_agent_handler(
     meaning models, token counts, timings and tool names.
     """
     report_usage("openai-agents.createOpenAIAgentHandler", PACKAGE_NAME, __version__)
-    return _create_openai_agent_handler(capture_content=capture_content)
+    return _create_openai_agents_handler(capture_content=capture_content)
 
 
-def _create_openai_agent_handler(
+def _create_openai_agents_handler(
     *, capture_content: bool | None = None
 ) -> ProviderHandler:
-    """Non-reporting :func:`create_openai_agent_handler`, used by this package's wrappers."""
+    """Non-reporting :func:`create_openai_agents_handler`, used by this package's wrappers."""
     content_override = capture_content
 
     async def _call_impl(
@@ -943,6 +943,6 @@ def openai_agents(
     capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
-        handler=_create_openai_agent_handler(capture_content=capture_content),
+        handler=_create_openai_agents_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

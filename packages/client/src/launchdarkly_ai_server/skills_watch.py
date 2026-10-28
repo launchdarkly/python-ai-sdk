@@ -304,7 +304,7 @@ async def watch_skills(
             "watch_skills needs a skill store that implements add_listener(kind, "
             "fn); the configured store does not, so delivery changes cannot be "
             "observed. Use write_skills for a one-shot reconcile, or configure a "
-            "store with a delivery transport (FDv2SkillStore)."
+            "store with a delivery transport (LaunchDarklySkillStore)."
         )
     # A bare ``< 0`` check misses both non-finite values: ``Event.wait(nan)``
     # returns immediately (no debouncing) and ``Event.wait(inf)`` never returns.

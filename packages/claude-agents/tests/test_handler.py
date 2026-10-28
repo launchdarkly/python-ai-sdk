@@ -38,10 +38,10 @@ from opentelemetry.trace import StatusCode
 
 import launchdarkly_ai_claude_agents.handler as handler_mod
 from launchdarkly_ai_claude_agents.handler import (
+    _build_prompt,
     _native_tool_aliases,
-    build_prompt,
+    _partition_tools,
     create_claude_agents_handler,
-    partition_tools,
 )
 from launchdarkly_ai_server import ConversationIdSpanProcessor, conversation_id
 from tests.forwarding_spec import (
@@ -274,18 +274,18 @@ class TestFactory:
 
 class TestPromptConstruction:
     def test_instructions_become_system_prompt(self) -> None:
-        prompt, system = build_prompt(BASE_CONFIG, "hi", {})
+        prompt, system = _build_prompt(BASE_CONFIG, "hi", {})
         assert prompt == "hi"
         assert system == "You are helpful."
 
     def test_no_instructions_no_system_prompt(self) -> None:
-        prompt, system = build_prompt({"model": {"name": "m"}}, "hi", {})
+        prompt, system = _build_prompt({"model": {"name": "m"}}, "hi", {})
         assert system is None
         assert prompt == "hi"
 
     def test_variable_substitution(self) -> None:
         cfg = {**BASE_CONFIG, "instructions": "Hello {{name}}."}
-        _, system = build_prompt(cfg, "hi", {"name": "Ada"})
+        _, system = _build_prompt(cfg, "hi", {"name": "Ada"})
         assert system == "Hello Ada."
 
     # --- restored from the pre-rewrite file (not telemetry); byte-for-byte, only
@@ -293,18 +293,18 @@ class TestPromptConstruction:
 
     def test_path_a_instructions(self) -> None:
         config = _make_config(instructions="You are a helper.")
-        prompt, system = build_prompt(config, "hi", {})
+        prompt, system = _build_prompt(config, "hi", {})
         assert prompt == "hi"
         assert system == "You are a helper."
 
     def test_path_a_variable_substitution(self) -> None:
         config = _make_config(instructions="Hello {{name}}!")
-        _, system = build_prompt(config, "hi", {"name": "Alice"})
+        _, system = _build_prompt(config, "hi", {"name": "Alice"})
         assert system == "Hello Alice!"
 
     def test_path_a_unresolved_placeholder_preserved(self) -> None:
         config = _make_config(instructions="Hello {{name}}!")
-        _, system = build_prompt(config, "hi", {})
+        _, system = _build_prompt(config, "hi", {})
         assert "{{name}}" in (system or "")
 
     def test_path_b_messages_system_extracted(self) -> None:
@@ -314,7 +314,7 @@ class TestPromptConstruction:
                 {"role": "user", "content": "hey"},
             ]
         )
-        prompt, system = build_prompt(config, "question", {})
+        prompt, system = _build_prompt(config, "question", {})
         assert system == "Be concise."
         assert "hey" in prompt
         assert "question" in prompt
@@ -325,7 +325,7 @@ class TestPromptConstruction:
                 {"role": "user", "content": "my name is {{name}}"},
             ]
         )
-        prompt, _ = build_prompt(config, "q", {"name": "Alice"})
+        prompt, _ = _build_prompt(config, "q", {"name": "Alice"})
         assert "Alice" in prompt
 
     def test_path_b_user_input_appended_as_final_turn(self) -> None:
@@ -334,12 +334,12 @@ class TestPromptConstruction:
                 {"role": "user", "content": "old message"},
             ]
         )
-        prompt, _ = build_prompt(config, "new input", {})
+        prompt, _ = _build_prompt(config, "new input", {})
         assert "new input" in prompt
 
     def test_path_c_empty_user_input_no_throw(self) -> None:
         config = _make_config(instructions="be helpful")
-        prompt, system = build_prompt(config, "", {})
+        prompt, system = _build_prompt(config, "", {})
         assert prompt == ""
         assert system is not None
 
@@ -348,7 +348,7 @@ class TestPromptConstruction:
             instructions="Use instructions.",
             messages=[{"role": "system", "content": "Use messages."}],
         )
-        _prompt, system = build_prompt(config, "q", {})
+        _prompt, system = _build_prompt(config, "q", {})
         assert system == "Use instructions."
 
     def test_messages_mode_extracts_system_and_flattens_history_into_prompt(
@@ -361,30 +361,30 @@ class TestPromptConstruction:
                 {"role": "user", "content": "context line"},
             ],
         }
-        prompt, system = build_prompt(cfg, "final question", {})
+        prompt, system = _build_prompt(cfg, "final question", {})
         assert system == "Be terse."
         assert "context line" in prompt
         assert prompt.endswith("final question")
 
     def test_history_not_appended_to_system_prompt(self) -> None:
         history = [{"role": "user", "content": "earlier"}]
-        _, system = build_prompt(BASE_CONFIG, "hi", {}, history=history)
+        _, system = _build_prompt(BASE_CONFIG, "hi", {}, history=history)
         assert system == "You are helpful."
         assert "You are helpful." in (system or "")
 
     def test_no_user_input_defaults_to_empty_string(self) -> None:
-        prompt, _ = build_prompt(BASE_CONFIG, None, {})
+        prompt, _ = _build_prompt(BASE_CONFIG, None, {})
         assert prompt == ""
 
 
 # ---------------------------------------------------------------------------
-# partition_tools / native tool aliases
+# _partition_tools / native tool aliases
 # ---------------------------------------------------------------------------
 
 
 class TestPartitionTools:
     def test_user_tool_goes_to_mcp_bucket(self) -> None:
-        native_map, user_tools, native_names = partition_tools(
+        native_map, user_tools, native_names = _partition_tools(
             TOOL_CONFIG["tools"], {"search": lambda _: "r"}
         )
         assert native_map == {}
@@ -399,7 +399,7 @@ class TestPartitionTools:
         # stashed under NATIVE_TOOL_KEY, not the NativeTool instance itself.
         stub = lambda: None  # noqa: E731
         setattr(stub, NATIVE_TOOL_KEY, ClaudeWebSearch)
-        _native_map, user_tools, native_names = partition_tools(
+        _native_map, user_tools, native_names = _partition_tools(
             {"webSearch": {"name": "webSearch"}}, {"webSearch": stub}
         )
         assert native_names == ["WebSearch"]
@@ -417,7 +417,7 @@ class TestPartitionTools:
 
 # ---------------------------------------------------------------------------
 # §1.3 Tool conversion — restored from the pre-rewrite file (not telemetry).
-# ``partition_tools`` kept its 3-tuple return, so these run byte-for-byte.
+# ``_partition_tools`` kept its 3-tuple return, so these run byte-for-byte.
 # ---------------------------------------------------------------------------
 
 
@@ -427,25 +427,25 @@ class TestToolConversion:
             "my-tool": {"description": "does stuff", "parameters": {"type": "object"}}
         }
         handlers = {"my-tool": AsyncMock(return_value="ok")}
-        _, user_tools, _ = partition_tools(config_tools, handlers)
+        _, user_tools, _ = _partition_tools(config_tools, handlers)
         assert "my-tool" in user_tools
 
     def test_multiple_tools_all_included(self) -> None:
         config_tools = {"tool-a": {}, "tool-b": {}}
         handlers = {"tool-a": AsyncMock(), "tool-b": AsyncMock()}
-        _, user_tools, _ = partition_tools(config_tools, handlers)
+        _, user_tools, _ = _partition_tools(config_tools, handlers)
         assert "tool-a" in user_tools
         assert "tool-b" in user_tools
 
     def test_empty_tools_no_tools_sent(self) -> None:
-        _, user_tools, native_names = partition_tools({}, {})
+        _, user_tools, native_names = _partition_tools({}, {})
         assert not user_tools
         assert not native_names
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (via build_tool_mcp) — restored from the pre-rewrite
-# file. ``build_tool_mcp`` kept its lazy ``importlib.import_module`` pattern
+# §1.4 Tool execution loop (via _build_tool_mcp) — restored from the pre-rewrite
+# file. ``_build_tool_mcp`` kept its lazy ``importlib.import_module`` pattern
 # (native_graph.py depends on it), so the old SDK-mocking approach still works
 # unmodified for this one.
 # ---------------------------------------------------------------------------
@@ -464,7 +464,7 @@ class _MockResultMessageForToolMcp:
 
 def _patch_query_for_tool_mcp(messages: list[Any]) -> Any:
     """Patches ``claude_agent_sdk`` for the one restored test that exercises
-    ``build_tool_mcp`` directly, which still resolves the SDK lazily.
+    ``_build_tool_mcp`` directly, which still resolves the SDK lazily.
     """
 
     async def _query(**kwargs: Any) -> AsyncIterator[Any]:
@@ -486,14 +486,14 @@ def _patch_query_for_tool_mcp(messages: list[Any]) -> Any:
 
 class TestToolExecutionLoop:
     async def test_tool_not_found_throws(self) -> None:
-        from launchdarkly_ai_claude_agents.handler import build_tool_mcp
+        from launchdarkly_ai_claude_agents.handler import _build_tool_mcp
 
         config_tools = {"my-tool": {"description": "d", "parameters": {}}}
         handlers: dict[str, Any] = {}  # no handler registered
 
-        # The execute closure inside build_tool_mcp raises if handler missing
+        # The execute closure inside _build_tool_mcp raises if handler missing
         with _patch_query_for_tool_mcp([_MockResultMessageForToolMcp()]):
-            mcp = await build_tool_mcp(config_tools, handlers)
+            mcp = await _build_tool_mcp(config_tools, handlers)
             # Directly call the stored execute fn
             for t in getattr(mcp, "tools", None) or []:
                 fn = getattr(t, "_fn", getattr(t, "fn", None))
@@ -2065,8 +2065,8 @@ class TestNoneUserInput:
 
 
 # ---------------------------------------------------------------------------
-# History parameter (build_prompt) — restored from the pre-rewrite file
-# (not telemetry); byte-for-byte, calling build_prompt directly.
+# History parameter (_build_prompt) — restored from the pre-rewrite file
+# (not telemetry); byte-for-byte, calling _build_prompt directly.
 # ---------------------------------------------------------------------------
 
 
@@ -2078,21 +2078,21 @@ class TestHistory:
 
     def test_history_not_stuffed_into_system_prompt(self) -> None:
         config = _make_config(instructions="Be concise.")
-        _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
+        _, system = _build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
         assert system is not None
         assert "Be concise." in system
         assert "Conversation History:" not in system
 
     def test_empty_history_treated_like_no_history(self) -> None:
         config = _make_config(instructions="Be concise.")
-        _, system_with_empty = build_prompt(config, "hi", {}, [])
-        _, system_without = build_prompt(config, "hi", {})
+        _, system_with_empty = _build_prompt(config, "hi", {}, [])
+        _, system_without = _build_prompt(config, "hi", {})
         assert system_with_empty == system_without
         assert "Conversation History:" not in (system_with_empty or "")
 
     def test_history_without_instructions_keeps_system_none(self) -> None:
         config = _make_config()
-        _, system = build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
+        _, system = _build_prompt(config, "hi", {}, self.SAMPLE_HISTORY)
         assert system is None or "Conversation History:" not in system
 
 

@@ -115,7 +115,7 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
     if OTel packages are not installed (graceful degradation).
 
     This function:
-    - Stamps ``service.name``, ``highlight.project_id``, and (when set)
+    - Stamps ``service.name``, ``launchdarkly.project_id``, and (when set)
       ``deployment.environment`` resource attributes, mirroring the TS SDK.
     - Registers W3C trace context and baggage propagators.
     - Configures GZIP compression on the OTLP exporter.
@@ -153,7 +153,7 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
         resource_attrs: dict[str, str] = {
             "service.name": opts.get("serviceName")
             or os.environ.get("LD_SERVICE_NAME", "python-sdk"),
-            "highlight.project_id": sdk_key,
+            "launchdarkly.project_id": sdk_key,
         }
         environment = opts.get("environment") or os.environ.get("LD_ENVIRONMENT")
         if environment:

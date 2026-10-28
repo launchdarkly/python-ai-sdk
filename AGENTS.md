@@ -482,7 +482,7 @@ Each handler package must export a **factory function** that:
 - Initializes any provider-specific resources.
 - Returns the handler callable with `provides_for` attached via `create_handler`.
 
-The naming convention is `create_<provider>_handler()`. For example: `create_claude_agents_handler()`, `create_openai_agent_handler()`.
+The naming convention is `create_<provider>_handler()`. For example: `create_claude_agents_handler()`, `create_openai_agents_handler()`.
 
 **Always use `create_handler` to build and return the handler.**
 

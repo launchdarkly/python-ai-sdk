@@ -1002,13 +1002,6 @@ class EvaluationsRunner:
             "kind": "scorer",
             "started_at": started.isoformat().replace("+00:00", "Z"),
         }
-        if row.get("status") != "COMPLETE":
-            return self._criterion_error_result(
-                base,
-                started_clock,
-                "generation_incomplete",
-                "generation did not complete",
-            )
         dataset_row = DatasetRow(
             row_index=row["row_index"],
             input=row.get("input"),
@@ -1072,13 +1065,6 @@ class EvaluationsRunner:
             "variation_key": resolved.variation_key,
             "version": resolved.version,
         }
-        if row.get("status") != "COMPLETE":
-            return self._criterion_error_result(
-                base,
-                started_clock,
-                "generation_incomplete",
-                "generation did not complete",
-            )
         # The config is passed unrendered: the handler owns the single
         # parse_template pass, so ``{{...}}`` sequences inside generated output
         # or dataset values are never re-expanded into the judge prompt.
@@ -1182,7 +1168,7 @@ class EvaluationsRunner:
         evaluation_run_id: str,
         row_spans: Mapping[int, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run every (row, criterion) pair, bounded by the run's concurrency.
+        """Run every (generated row, criterion) pair, bounded by the run's concurrency.
 
         Each ``evaluate`` span parents under its row's span in ``row_spans``.
         """
@@ -1202,10 +1188,6 @@ class EvaluationsRunner:
         ) -> dict[str, Any]:
             await controller.acquire()
             try:
-                if row.get("status") != "COMPLETE":
-                    # A row that did not generate is never scored, so there is
-                    # no judge or scorer call for an ``evaluate`` span to wrap.
-                    return await score(row, criterion)
                 row_index = row.get("row_index")
                 index = row_index if isinstance(row_index, int) else 0
                 with bind_evaluation_row(evaluation_run_id, index):
@@ -1226,9 +1208,17 @@ class EvaluationsRunner:
             finally:
                 controller.release()
 
+        # A row that did not generate gets no criterion result at all: its
+        # generation ERROR event already settled it as failed, and a criterion
+        # event for it would be unaccounted for in the backend's row counts.
+        generated = [row for row in rows if row.get("status") == "COMPLETE"]
         return list(
             await asyncio.gather(
-                *(run_one(row, criterion) for row in rows for criterion in criteria)
+                *(
+                    run_one(row, criterion)
+                    for row in generated
+                    for criterion in criteria
+                )
             )
         )
 
@@ -1280,11 +1270,15 @@ class EvaluationsRunner:
                         input_tokens=normalized_usage["input"],
                         output_tokens=normalized_usage["output"],
                     )
+                # The cause code stays internal: ingest reads only a top-level
+                # integer ``errorCode`` and ``errorMessage``, and no integers are
+                # assigned to criterion causes yet, so only the message is sent.
                 error = result.get("error")
                 error_message: str | None = None
                 if result["status"] == "ERROR":
-                    if isinstance(error, Mapping) and error.get("message"):
-                        error_message = str(error["message"])
+                    if isinstance(error, Mapping):
+                        message = error.get("message")
+                        error_message = str(message) if message else "Unknown error"
                     else:
                         error_message = str(error) if error else "Unknown error"
                 common_payload: dict[str, Any] = {
@@ -1306,7 +1300,6 @@ class EvaluationsRunner:
                     "latency_ms": result["latency_ms"],
                     "score": result.get("score"),
                     "reason": result.get("reason"),
-                    "error": error,
                     "error_message": error_message,
                 }
                 payload_model: CriterionEventPayload

@@ -31,7 +31,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
-| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `FDv2SkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
+| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `LaunchDarklySkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
 | `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener, and for a `SkillSource` the base client's `flag_tracker` listener, to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_source.py` | Agent Skills, config-scoped requested set — `config_skills(key, context)`, which evaluates one AI Config per read and classifies every failure as a raised read, never `[]`. With `skills_watch`, the only skills module that imports `lifecycle`, and it takes only `get_client` |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
@@ -82,7 +82,7 @@ from launchdarkly_ai_server.experimental.evaluations import init_evaluations
 
 # Agent Skills
 from launchdarkly_ai_server import (
-    set_skill_store, SkillStore, InMemorySkillStore, FDv2SkillStore, StoreDiagnostics,
+    set_skill_store, SkillStore, InMemorySkillStore, LaunchDarklySkillStore, StoreDiagnostics,
     skill_refs, get_skill, get_skill_result, get_skills, all_skills, write_skills,
     watch_skills, SkillWatcher, SkillSource, config_skills,
     Skill, SkillReference, SkillOutcome, ReconcileAction, ReconcileReport,
@@ -270,7 +270,7 @@ user's files.
 
 ### The delivery transport, and the one field that will bite you
 
-`FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
+`LaunchDarklySkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
 `GET /sdk/stream`, server-side SDK key in `Authorization`, `kinds` + `basis` params,
 `If-None-Match`/304). It sits below the store interface and produces raw objects in the
 shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**.
@@ -571,7 +571,7 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   directory skips its unlink, drops the manifest entry, and reports `removed` while the
   revoked skill stays on disk.
 - **Every numeric option rejects non-finite values, not just negative ones.**
-  `write_skills`'s `timeout`, `watch_skills`'s `debounce`, and `FDv2SkillStore`'s
+  `write_skills`'s `timeout`, `watch_skills`'s `debounce`, and `LaunchDarklySkillStore`'s
   `poll_interval` and `read_timeout` share one rule. `nan` and `inf` both pass a `< 0` check
   and then mean opposite things downstream: an unbounded vs. an already-expired deadline, a
   zero vs. a never-closing coalescing window, a poll loop that spins vs. one that stops while
@@ -819,7 +819,7 @@ create false confidence. The operator's verification steps are in the README.
 `timeout` is a monotonic deadline, checked before each retrieval, each write, and each prune;
 only the final manifest rewrite runs past it, so files already written are never orphaned.
 Bounded retries are **not** implemented at this layer; retry policy belongs to the delivery
-transport (`FDv2SkillStore`'s capped backoff). Why:
+transport (`LaunchDarklySkillStore`'s capped backoff). Why:
 
 1. **There is nothing transient to retry.** `SkillStore.get_object` is a synchronous
    in-process read of already-delivered data, modelled on the LaunchDarkly data-store API. A
@@ -853,6 +853,7 @@ pip install "launchdarkly-ai-python[otel]"
 **Other env vars / options read by `init_client()`:**
 - `LD_SERVICE_NAME` / `options["serviceName"]` — sets `service.name` resource attribute (default: `'python-sdk'`)
 - `LD_ENVIRONMENT` / `options["environment"]` — sets `deployment.environment` resource attribute
+- Not configurable: the `launchdarkly.project_id` resource attribute is always set to the resolved SDK key, not the project's ID
 
 **Graceful degradation:** if any OTel package is missing, telemetry is silently skipped and a `logger.warning` is emitted. The LD client still initializes and all AI API calls work normally.
 
