@@ -98,6 +98,7 @@ able to tell from the trace which path ran.
 | `launchdarkly.stream.abandoned` | `True`, only when abandoned | `end_span_once` |
 | `gen_ai.evaluation.name` | judge config key, judge roots only | `with_judge_evaluation`, see section 4a |
 | `gen_ai.evaluation.score.value` | numeric score, judge roots only | `with_judge_evaluation`, see section 4a |
+| `gen_ai.evaluation.explanation` | judge reasoning, judge roots only, gated by section 7 | `with_judge_evaluation`, see section 4a |
 
 The root also carries one span event, `feature_flag`, with these event attributes:
 
@@ -228,17 +229,18 @@ SDK writes a `gen_ai.evaluation.result` span event on that `invoke_agent` span:
 |---|---|
 | `gen_ai.evaluation.name` | judge config key |
 | `gen_ai.evaluation.score.value` | numeric score, only when the judge returned a finite number |
+| `gen_ai.evaluation.explanation` | the judge's reasoning, gated. See section 7 |
 
 The same keys are mirrored as span attributes, so section 2 lists them too.
 `gen_ai.evaluation.score.label` is not invented.
 The existing `track(evaluationMetricKey)` call is unchanged and still feeds AI Config Monitoring —
 a judge that returns a non-numeric score emits no evaluation event but still tracks the metric.
 
-`gen_ai.evaluation.explanation` is deliberately **not** emitted. The judge's reasoning is
-model-generated prose about the user's conversation — content, under section 7 — and content
-attributes require `captureContent` / `capture_content`, a handler-factory option this layer does
-not receive. The reasoning is still returned to the caller in `judgeResults` / `judge_results`;
-only the telemetry copy is withheld. Exporting it needs its own opt-in.
+`gen_ai.evaluation.explanation` is content under section 7. The judge's reasoning is
+model-generated prose about the user's conversation, so it follows the judge handler's own
+`capture_content` decision. It is written by default, and an explicit `False` on the judge's
+handler or the process default withholds it. The reasoning is always returned to the caller in
+`judgeResults` / `judge_results`; only the telemetry copy is gated.
 
 ---
 
@@ -399,12 +401,13 @@ error for an abandoned stream, so two dashboards would describe the same run dif
 Every handler factory takes `capture_content: bool | None = None`.
 
 `None` reads the process-wide default at invocation (`configure(options=SDKOptions(...))`), which
-is off. `True` or `False` overrides that default for the handler, and an explicit `False` wins
-over a configured `True`. A convenience wrapper's `capture_content` is the per-call override: when
-the caller passes it, that value is what the handler is built with; when they omit it, the wrapper
-passes `None` and the process default applies. Conversation content is personal data. A run emits
-only metadata, meaning models, token counts, timings and tool names, until capture is turned on.
-Turning it on sends the text of every request and response to whatever collector the SDK points at.
+is on. `True` or `False` overrides that default for the handler, and an explicit `False` wins
+over a configured `True`, including on offline evaluation spans. A convenience wrapper's
+`capture_content` is the per-call override: when the caller passes it, that value is what the
+handler is built with; when they omit it, the wrapper passes `None` and the process default
+applies. Conversation content is personal data. The default sends the text of every request and
+response to whatever collector the SDK points at. An explicit `False` emits only metadata, meaning
+models, token counts, timings and tool names.
 
 Guard twice, on purpose. The helper returns without writing when capture is off, which makes a
 forgotten call site harmless. The call site also checks before building the argument, which avoids

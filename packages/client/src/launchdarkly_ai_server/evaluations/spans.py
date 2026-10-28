@@ -13,8 +13,8 @@ when the handler opened no SDK span of its own, so a call is never traced twice.
 
 These spans export to the customer's project on the SDK key. They follow the
 same content gate as every other span: the handler's explicit override when it
-has one, otherwise the process default, which is off. An explicit ``True``
-exports the transcript on these spans too. The ``$ld:ai:offline-evals:*``
+has one, otherwise the process default, which is on. An explicit ``False``
+strips the transcript on these spans too. The ``$ld:ai:offline-evals:*``
 events never carry the transcript.
 """
 
