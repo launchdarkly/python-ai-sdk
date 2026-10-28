@@ -44,6 +44,8 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
 
+`init_client()` also sets the `launchdarkly.project_id` resource attribute to the resolved SDK key, not the project's ID.
+
 ### Run an evaluation from code (experimental)
 
 > **Experimental.** Import Evaluations from Code from `launchdarkly_ai_server.experimental.evaluations`;
