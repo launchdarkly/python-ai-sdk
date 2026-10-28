@@ -144,6 +144,21 @@ ROOT_SURFACE = frozenset(
         "SKILL_FILENAME",
         "MANIFEST_FILENAME",
         "MANIFEST_VERSION",
+        # Evaluations from Code
+        "init_evaluations",
+        "EvaluationsModule",
+        "AIConfig",
+        "GenerationConfig",
+        "GenerationMode",
+        "GenerationOverrides",
+        "DatasetRow",
+        "EvalTool",
+        "Criterion",
+        "Judge",
+        "Scorer",
+        "EvalRunResult",
+        "RunSummary",
+        "EvaluationsError",
     }
 )
 
