@@ -212,6 +212,8 @@ async def execute_and_track(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
+    if isinstance(meta, dict) and "evaluatedValue" in meta:
+        merged_variables["__ldValue"] = meta["evaluatedValue"]
 
     start_time = time.monotonic()
 
@@ -312,6 +314,8 @@ async def execute_and_stream(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
+    if isinstance(meta, dict) and "evaluatedValue" in meta:
+        merged_variables["__ldValue"] = meta["evaluatedValue"]
 
     start_time = time.monotonic()
     full_text = ""

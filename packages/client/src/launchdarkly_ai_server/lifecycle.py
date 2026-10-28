@@ -627,6 +627,10 @@ async def extract_variation(
         # Pinned model-config identity; keys are omitted when absent so that
         # tracking payloads never carry ``None`` values.
         **model_stamps_from_meta(ld_meta),
+        # The variation exactly as the LD SDK returned it, ``_ldMeta`` included.
+        # Written to the root span's ``feature_flag`` event as
+        # ``feature_flag.result.value``; never copied into tracking payloads.
+        "evaluatedValue": raw,
     }
 
     # Strip _ldMeta for config parsing
