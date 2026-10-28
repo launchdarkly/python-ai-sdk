@@ -362,7 +362,7 @@ async def _run_tool_loop(
     config: AiConfigRep,
     messages: list[dict[str, Any]],
     system: str | None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     *,
     capture_content: bool = False,
     parent: Any = None,
@@ -562,7 +562,7 @@ def _create_claude_messages_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -640,7 +640,7 @@ def _create_claude_messages_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -697,7 +697,7 @@ async def _stream_gen(
     client: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,

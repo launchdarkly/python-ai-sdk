@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypedDict
 
 import ai
@@ -86,7 +86,7 @@ def _track(
 class VercelNativeGraphOptions(TypedDict, total=False):
     """Options for :func:`to_vercel_agents`."""
 
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
     context: LDContext
     """LaunchDarkly context used for tracking events. Required for LD telemetry."""
     model: ModelSource

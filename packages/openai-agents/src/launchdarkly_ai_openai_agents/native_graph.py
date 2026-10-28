@@ -10,7 +10,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypedDict
 
 from launchdarkly_ai_server import (
@@ -65,7 +65,7 @@ def _build_instructions(node: GraphNode, variables: dict[str, Any]) -> str | Non
 
 def _build_node_tools(
     node: GraphNode,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     import importlib
 
@@ -101,7 +101,7 @@ def _build_node_tools(
 class OpenAINativeGraphOptions(TypedDict, total=False):
     """Options for :func:`to_openai_agents`."""
 
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
     context: LDContext
     """LaunchDarkly context used for tracking events. Required for LD telemetry."""
 
@@ -149,7 +149,7 @@ def to_openai_agents(
         if not root:
             raise ValueError(f'Graph "{def_obj.key}" has no root node')
 
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] = (
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] = (
             _opts.get("tool_handlers") or {}
         )
         raw_ld_context = _opts.get("context")

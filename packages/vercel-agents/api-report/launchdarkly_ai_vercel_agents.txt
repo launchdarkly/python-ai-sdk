@@ -7,4 +7,4 @@ VercelNativeGraphOptions(TypedDict, total=False)  [class]
   context: LDContext
   model: ModelSource
   model_factory: ModelSource
-  tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+  tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]

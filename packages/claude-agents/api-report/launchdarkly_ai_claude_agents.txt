@@ -9,7 +9,7 @@ ClaudeNativeGraphOptions(TypedDict, total=False)  [class]
   context: LDContext
   cwd: str | os.PathLike[str]
   setting_sources: list[SettingSource]
-  tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+  tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
 ClaudeNotebookEdit = NativeTool('NotebookEdit')
 ClaudeRead = NativeTool('Read')
 ClaudeTodoWrite = NativeTool('TodoWrite')

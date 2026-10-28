@@ -4,7 +4,7 @@ import inspect
 import os
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -53,7 +53,7 @@ def _try_get_environment_id() -> str | None:
 
 
 def wrap_tool_handlers(
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
     user_context: LDContext,
     track_data: TrackData,
 ) -> dict[str, Callable[..., Any]]:
@@ -128,7 +128,7 @@ def wrap_tool_handlers(
 
 def _exposed_tool_keys(
     config: AiConfigRep,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
 ) -> list[str]:
     """The tool keys this config offered the model, in declaration order.
 
@@ -163,7 +163,7 @@ async def execute_and_track(
     user_context: LDContext,
     handler: ProviderHandler,
     user_input: str | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
@@ -202,13 +202,10 @@ async def execute_and_track(
     # with an empty result. One recorder per invocation; they run concurrently.
     exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
     recorder = TrajectoryRecorder()
-    # Copied into the handler contract's type: dict is invariant in its values.
-    tracked_tool_handlers: dict[str, Callable[..., Any] | NativeTool] = dict(
-        wrap_tool_handlers(
-            recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
-            ld_ctx,
-            track_data,
-        )
+    tracked_tool_handlers = wrap_tool_handlers(
+        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+        ld_ctx,
+        track_data,
     )
     merged_variables: dict[str, Any] = {
         **(variables or {}),
@@ -265,7 +262,7 @@ async def execute_and_stream(
     user_context: LDContext,
     handler: ProviderHandler,
     user_input: str | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
@@ -305,13 +302,10 @@ async def execute_and_stream(
 
     exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
     recorder = TrajectoryRecorder()
-    # Copied into the handler contract's type: dict is invariant in its values.
-    tracked_tool_handlers: dict[str, Callable[..., Any] | NativeTool] = dict(
-        wrap_tool_handlers(
-            recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
-            ld_ctx,
-            track_data,
-        )
+    tracked_tool_handlers = wrap_tool_handlers(
+        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+        ld_ctx,
+        track_data,
     )
     merged_variables: dict[str, Any] = {
         **(variables or {}),

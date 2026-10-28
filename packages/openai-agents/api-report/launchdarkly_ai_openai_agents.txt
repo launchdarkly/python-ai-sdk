@@ -4,5 +4,5 @@ openai_agents(config_key: str, user_input: str, context: LDContext, **kwargs: An
 openai_graph(key: str, **options: Any) -> Any
 OpenAINativeGraphOptions(TypedDict, total=False)  [class]
   context: LDContext
-  tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+  tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
 to_openai_agents(def_promise: Awaitable[GraphDefinition], opts: OpenAINativeGraphOptions | None = None) -> NativeGraphRunner

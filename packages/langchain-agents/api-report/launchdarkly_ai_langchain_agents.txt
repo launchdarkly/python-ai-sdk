@@ -5,5 +5,5 @@ langchain_graph(key: str, llm: Any = None, **options: Any) -> Any
 LangChainNativeGraphOptions(TypedDict, total=False)  [class]
   context: LDContext
   model_factory: Callable[[GraphNode], Any]
-  tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+  tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
 to_lang_graph(def_promise: Awaitable[GraphDefinition], opts: LangChainNativeGraphOptions | None = None) -> NativeGraphRunner

@@ -8,6 +8,8 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from scripts import check_packaging
 
 
@@ -77,3 +79,35 @@ def test_stdlib_and_relative_imports_are_skipped(tmp_path: Path) -> None:
         from .sub import other
     """
     assert _scan(tmp_path, source) == []
+
+
+def test_every_declared_extra_is_checked() -> None:
+    planned = {run.label for run in check_packaging.runs(check_packaging.packages())}
+    assert "launchdarkly-ai-langchain-messages[anthropic]" in planned
+    assert "launchdarkly-ai-python[otel]" in planned
+
+
+def test_an_extra_without_expected_imports_fails() -> None:
+    package = check_packaging.Package(
+        name="launchdarkly-ai-example",
+        public=[],
+        imports=[],
+        optional={"new": ["some-dist>=1"]},
+    )
+    with pytest.raises(SystemExit, match=r"launchdarkly-ai-example\[new\]"):
+        check_packaging.runs([package])
+
+
+def test_overrides_restate_extras_requested_on_an_internal_dependency() -> None:
+    package = check_packaging.Package(
+        name="launchdarkly-ai-python",
+        public=[],
+        imports=[],
+        dependencies=["launchdarkly-ai-server>=0.4.1"],
+        optional={
+            "ld": ["launchdarkly-ai-server[ld]"],
+            "otel": ["launchdarkly-ai-server[otel]"],
+        },
+    )
+    assert package.override_extras("launchdarkly-ai-server", ("otel",)) == "[otel]"
+    assert package.override_extras("launchdarkly-ai-server", ()) == ""

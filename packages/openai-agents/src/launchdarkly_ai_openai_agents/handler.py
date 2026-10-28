@@ -207,7 +207,7 @@ def _model_settings_parameters(config: AiConfigRep) -> dict[str, Any]:
 
 def _build_agent_tools(
     config_tools: dict[str, Any],
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK, which
     # excludes an unregistered tool from the catalog entirely. This difference predates the span
@@ -285,7 +285,7 @@ def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
 def _build_agent_and_prompt(
     config: AiConfigRep,
     user_input: str | None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, str | list[dict[str, Any]], str | None]:
@@ -671,7 +671,7 @@ def _create_openai_agents_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -754,7 +754,7 @@ def _create_openai_agents_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -789,7 +789,7 @@ def _stringify_output(value: Any) -> str:
 async def _stream_gen(
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,

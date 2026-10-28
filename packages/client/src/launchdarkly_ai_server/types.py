@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, Protocol, TypeVar
 
@@ -23,7 +23,9 @@ class LDClientInterface(Protocol):
     """
     Structural type for any LaunchDarkly client; ``ldclient.LDClient`` satisfies it.
 
-    Methods may be sync or async: the SDK awaits any awaitable result. ``context`` is
+    ``variation``, ``flush`` and ``close`` may be sync or async: the SDK awaits any
+    awaitable result. ``track`` must be synchronous: the SDK calls it from sync code and
+    drops the result, so an ``async def track`` would never send an event. ``context`` is
     ``Any`` because ``ldclient`` takes an ``ldclient.Context``, which the SDK builds from
     an ``LDContext`` before the call. Parameters are positional-only so implementations
     may name them freely (``ldclient`` calls the third ``variation`` argument ``default``).
@@ -38,7 +40,7 @@ class LDClientInterface(Protocol):
         data: Any = None,
         metric_value: float | None = None,
         /,
-    ) -> Any: ...
+    ) -> None: ...
 
     def flush(self) -> Any: ...
 
@@ -136,7 +138,7 @@ _HandlerFn = Callable[
     [
         AiConfigRep,
         str | None,
-        dict[str, Callable[..., Any] | NativeTool] | None,
+        Mapping[str, Callable[..., Any] | NativeTool] | None,
         dict[str, Any] | None,
         list[dict[str, Any]] | None,
     ],
@@ -146,7 +148,7 @@ _StreamFn = Callable[
     [
         AiConfigRep,
         str | None,
-        dict[str, Callable[..., Any] | NativeTool] | None,
+        Mapping[str, Callable[..., Any] | NativeTool] | None,
         dict[str, Any] | None,
         list[dict[str, Any]] | None,
     ],
@@ -204,7 +206,7 @@ class ProviderHandler:
         self,
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> HandlerResult:
@@ -217,7 +219,7 @@ class ProviderHandler:
         self,
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:

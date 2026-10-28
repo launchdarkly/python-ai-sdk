@@ -625,7 +625,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
         except ImportError as exc:
             raise ImportError(
                 "Using Anthropic models requires langchain-anthropic. "
-                "Install it with: pip install langchain-anthropic"
+                'Install it with: pip install "launchdarkly-ai-langchain-messages[anthropic]"'
             ) from exc
         return lc_anthropic.ChatAnthropic(
             **_rebuild_anthropic_output_config(
@@ -646,7 +646,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
         except ImportError as exc:
             raise ImportError(
                 "Using Bedrock models requires langchain-aws. "
-                "Install it with: pip install langchain-aws"
+                'Install it with: pip install "launchdarkly-ai-langchain-messages[aws]"'
             ) from exc
         return lc_aws.ChatBedrockConverse(
             **_model_constructor_kwargs(
@@ -662,7 +662,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     except ImportError as exc:
         raise ImportError(
             "Using OpenAI models requires langchain-openai. "
-            "Install it with: pip install langchain-openai"
+            'Install it with: pip install "launchdarkly-ai-langchain-messages[openai]"'
         ) from exc
     return lc_openai.ChatOpenAI(
         **_model_constructor_kwargs(
@@ -804,7 +804,7 @@ def _create_langchain_messages_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -1098,7 +1098,7 @@ def _create_langchain_messages_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -1124,7 +1124,7 @@ async def _stream_gen(
     llm: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,

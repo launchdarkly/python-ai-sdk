@@ -95,6 +95,8 @@ Tier 0 — Core Client           (launchdarkly-ai-server)
 
 From 1.0.0 every package in this SDK is released at the same version, so install them at matching versions. Each package depends on `launchdarkly-ai-server` within the same major (`>=1.0,<2`), and a breaking change in any package is a new major for all of them. Names exported from `launchdarkly_ai_server.experimental` are the exception: they may change in a minor release.
 
+Third-party dependency floors are the versions CI tests against, not the oldest release that might work. A floor moves down only when the test suite runs at the lower version.
+
 ## Quick Start
 
 ### 1. Install

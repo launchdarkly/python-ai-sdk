@@ -10,7 +10,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypedDict
 
 from claude_agent_sdk import SettingSource
@@ -64,7 +64,7 @@ def _sanitize_name(key: str) -> str:
 
 
 def _wrap_native_tools(
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     ld_context: Any,
     track_data: dict[str, Any],
 ) -> dict[str, Any]:
@@ -115,7 +115,7 @@ async def _run_query(
     node: GraphNode,
     input_text: str,
     variables: dict[str, Any],
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     ld_context: Any,
     graph_key: str,
     run_id: str,
@@ -227,7 +227,7 @@ async def _run_query(
 class ClaudeNativeGraphOptions(TypedDict, total=False):
     """Options for :func:`to_claude_agents`."""
 
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
     context: LDContext
     """LaunchDarkly context used for tracking events. Required for LD telemetry."""
     cwd: str | os.PathLike[str]
@@ -278,7 +278,7 @@ def to_claude_agents(
             if raw_ld_context is not None
             else None
         )
-        raw_handlers: dict[str, Any] = _opts.get("tool_handlers") or {}
+        raw_handlers: Mapping[str, Any] = _opts.get("tool_handlers") or {}
 
         start_time = time.monotonic()
         run_id = str(uuid.uuid4())

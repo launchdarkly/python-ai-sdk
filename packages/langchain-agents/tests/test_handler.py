@@ -2703,7 +2703,7 @@ class TestModelSource:
         ):
             with pytest.raises(
                 ImportError,
-                match=r"pip install langchain-aws",
+                match=r"pip install \"launchdarkly-ai-langchain-agents\[aws\]\"",
             ):
                 handler_mod._make_default_chat_model(cfg)
 

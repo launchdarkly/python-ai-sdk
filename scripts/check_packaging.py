@@ -9,6 +9,10 @@ For each package, in a fresh virtualenv with only what its install command pulls
    imports (``importlib.import_module("openai")`` inside a factory), which step 1 never
    reaches. Imports under ``except ImportError`` or ``TYPE_CHECKING`` are optional.
 
+Then each declared extra gets a venv of its own, installed as ``<package>[<extra>]``,
+and the modules it promises in ``EXTRA_IMPORTS`` must import there. An extra missing
+from ``EXTRA_IMPORTS`` fails the check, so a new extra cannot go unverified.
+
 Catches what the workspace test run cannot, because the workspace installs every
 package's dependencies at once: an import the package does not declare, a declared range
 that will not install, an extra that does not deliver what it promises.
@@ -21,24 +25,35 @@ Third-party dependencies resolve from PyPI against the declared ranges.
 from __future__ import annotations
 
 import ast
+import os
+import re
 import subprocess
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The extras the README's install command uses, and what each must make importable.
-EXTRAS = {"launchdarkly-ai-server": "[ld]", "launchdarkly-ai-python": "[ld]"}
+# The extras the README's install command uses.
+README_EXTRAS = {"launchdarkly-ai-server": ("ld",), "launchdarkly-ai-python": ("ld",)}
+# What each declared extra must make importable.
+_OTEL = ["opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.http"]
 EXTRA_IMPORTS = {
-    "launchdarkly-ai-server": ["ldclient"],
-    "launchdarkly-ai-python": ["ldclient"],
+    ("launchdarkly-ai-server", "ld"): ["ldclient"],
+    ("launchdarkly-ai-server", "otel"): _OTEL,
+    ("launchdarkly-ai-python", "ld"): ["ldclient"],
+    ("launchdarkly-ai-python", "otel"): _OTEL,
+    ("launchdarkly-ai-langchain-agents", "anthropic"): ["langchain_anthropic"],
+    ("launchdarkly-ai-langchain-agents", "aws"): ["langchain_aws"],
+    ("launchdarkly-ai-langchain-messages", "openai"): ["langchain_openai"],
+    ("launchdarkly-ai-langchain-messages", "anthropic"): ["langchain_anthropic"],
+    ("launchdarkly-ai-langchain-messages", "aws"): ["langchain_aws"],
 }
-# A uv override replaces every requirement on its name, extras included, so restate
-# the extras a package's own extra requests on an internal dependency.
-OVERRIDE_EXTRAS = {("launchdarkly-ai-python", "launchdarkly-ai-server"): "[ld]"}
+
+_REQUIREMENT = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[([^\]]*)\])?")
 
 _IMPORT_ERRORS = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
 
@@ -48,6 +63,14 @@ for name in sys.argv[1:]:
     module = importlib.import_module(name)
     for attr in getattr(module, "__all__", []):
         getattr(module, attr)
+"""
+
+# Third-party modules an extra installs: their ``__all__`` is not our contract, and may
+# name lazy attributes that need further extras (``langchain_aws.ChatAnthropicBedrock``).
+IMPORT_CHECK = """
+import importlib, sys
+for name in sys.argv[1:]:
+    importlib.import_module(name)
 """
 
 INSTALLED_CHECK = """
@@ -65,6 +88,53 @@ class Package:
     """Modules whose ``__all__`` is the public contract."""
     imports: list[str]
     """Top-level modules the source imports unconditionally."""
+    dependencies: list[str] = field(default_factory=list)
+    optional: dict[str, list[str]] = field(default_factory=dict)
+    """``[project.optional-dependencies]``: extra name to its requirements."""
+
+    def override_extras(self, dep: str, extras: tuple[str, ...]) -> str:
+        """The extras this install requests on ``dep``, as ``[a,b]`` or ``""``.
+
+        A uv override replaces every requirement on its name, extras included, so the
+        override for an internal dependency must restate them.
+        """
+        requested: set[str] = set()
+        for req in [*self.dependencies, *(r for e in extras for r in self.optional[e])]:
+            m = _REQUIREMENT.match(req)
+            if m and m.group(1) == dep and m.group(2):
+                requested.update(x.strip() for x in m.group(2).split(","))
+        return f"[{','.join(sorted(requested))}]" if requested else ""
+
+
+@dataclass(frozen=True)
+class Run:
+    package: Package
+    extras: tuple[str, ...]
+    """Extras to install; the README's for the base run, one declared extra otherwise."""
+    base: bool
+
+    @property
+    def label(self) -> str:
+        return self.package.name + (f"[{','.join(self.extras)}]" if self.extras else "")
+
+
+def runs(found: list[Package]) -> list[Run]:
+    """The base install of every package, then one run per declared extra."""
+    unmapped = [
+        f"{p.name}[{e}]"
+        for p in found
+        for e in p.optional
+        if (p.name, e) not in EXTRA_IMPORTS
+    ]
+    if unmapped:
+        raise SystemExit(f"no EXTRA_IMPORTS entry for: {', '.join(unmapped)}")
+    base = [Run(p, README_EXTRAS.get(p.name, ()), base=True) for p in found]
+    return base + [
+        Run(p, (e,), base=False)
+        for p in found
+        for e in p.optional
+        if (e,) != README_EXTRAS.get(p.name)
+    ]
 
 
 def _catches_import_error(handler: ast.ExceptHandler) -> bool:
@@ -141,11 +211,14 @@ def packages() -> list[Package]:
             for p in config["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
         ]
         reported = [p.stem for p in (pyproject.parent / "api-report").glob("*.txt")]
+        project = config["project"]
         found.append(
             Package(
-                name=config["project"]["name"],
+                name=project["name"],
                 public=sorted({*top_level, *reported}),
                 imports=source_imports(pyproject.parent / "src"),
+                dependencies=project.get("dependencies", []),
+                optional=project.get("optional-dependencies", {}),
             )
         )
     return found
@@ -158,21 +231,26 @@ def wheel_for(dist: Path, name: str) -> Path:
     return matches[0]
 
 
-def check(package: Package, dist: Path, internal: list[str], tmp: Path) -> bool:
+def check(run: Run, dist: Path, internal: list[str], tmp: Path) -> tuple[bool, str]:
+    """Returns whether the run passed, and its output, buffered so parallel logs stay whole."""
+    package = run.package
     name = package.name
-    venv = tmp / name
+    slug = run.label.replace("[", "-").replace("]", "").replace(",", "-")
+    venv = tmp / slug
     python = venv / "bin" / "python"
-    requirement = f"{name}{EXTRAS.get(name, '')} @ {wheel_for(dist, name).as_uri()}"
+    extras = f"[{','.join(run.extras)}]" if run.extras else ""
+    requirement = f"{name}{extras} @ {wheel_for(dist, name).as_uri()}"
     # Overriding the package being installed would drop its own extras.
-    overrides = tmp / f"{name}.overrides.txt"
+    overrides = tmp / f"{slug}.overrides.txt"
     overrides.write_text(
         "".join(
-            f"{dep}{OVERRIDE_EXTRAS.get((name, dep), '')} @ {wheel_for(dist, dep).as_uri()}\n"
+            f"{dep}{package.override_extras(dep, run.extras)} @ {wheel_for(dist, dep).as_uri()}\n"
             for dep in internal
             if dep != name
         )
     )
-    steps = [
+    extra_imports = [m for e in run.extras for m in EXTRA_IMPORTS[(name, e)]]
+    install = [
         ["uv", "venv", "--quiet", "--python", "3.12", str(venv)],
         [
             "uv",
@@ -185,23 +263,33 @@ def check(package: Package, dist: Path, internal: list[str], tmp: Path) -> bool:
             str(overrides),
             requirement,
         ],
+    ]
+    if not run.base:
+        # The base run already checked the package itself; this one checks the extra.
+        steps = [*install, [str(python), "-I", "-c", IMPORT_CHECK, *extra_imports]]
+        return _run_steps(
+            run.label, steps, f"ok   {run.label}: {', '.join(extra_imports)}"
+        )
+    steps = [
+        *install,
         # -I: import from the installed wheel, never the source tree.
         [str(python), "-I", "-c", PUBLIC_CHECK, *package.public],
-        [
-            str(python),
-            "-I",
-            "-c",
-            INSTALLED_CHECK,
-            *package.imports,
-            *EXTRA_IMPORTS.get(name, []),
-        ],
+        [str(python), "-I", "-c", IMPORT_CHECK, *extra_imports],
+        [str(python), "-I", "-c", INSTALLED_CHECK, *package.imports],
     ]
+    return _run_steps(
+        run.label, steps, f"ok   {run.label}: {', '.join(package.public)}"
+    )
+
+
+def _run_steps(label: str, steps: list[list[str]], ok: str) -> tuple[bool, str]:
+    output = []
     for step in steps:
-        if subprocess.run(step).returncode != 0:
-            print(f"FAIL {name}", file=sys.stderr)
-            return False
-    print(f"ok   {name}: {', '.join(package.public)}")
-    return True
+        result = subprocess.run(step, capture_output=True, text=True)
+        output += [result.stdout, result.stderr]
+        if result.returncode != 0:
+            return False, "".join(output) + f"FAIL {label}\n"
+    return True, "".join(output) + ok + "\n"
 
 
 def main() -> int:
@@ -209,11 +297,20 @@ def main() -> int:
         raise SystemExit(__doc__)
     dist = Path(sys.argv[1]).resolve()
     found = packages()
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        internal = [p.name for p in found]
-        failed = [p.name for p in found if not check(p, dist, internal, Path(tmp_dir))]
+    internal = [p.name for p in found]
+    planned = runs(found)
+    failed = []
+    with (
+        tempfile.TemporaryDirectory() as tmp_dir,
+        ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool,
+    ):
+        results = pool.map(lambda r: check(r, dist, internal, Path(tmp_dir)), planned)
+        for run, (ok, output) in zip(planned, results, strict=True):
+            print(output, end="", flush=True)
+            if not ok:
+                failed.append(run.label)
     if failed:
-        print(f"{len(failed)} package(s) failed: {', '.join(failed)}", file=sys.stderr)
+        print(f"{len(failed)} check(s) failed: {', '.join(failed)}", file=sys.stderr)
         return 1
     return 0
 

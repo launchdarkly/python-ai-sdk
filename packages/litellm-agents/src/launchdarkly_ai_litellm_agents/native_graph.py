@@ -8,7 +8,7 @@ import re
 import time
 import types
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypedDict
 
 from agents import RunConfig
@@ -71,7 +71,7 @@ def _instructions(node: GraphNode, variables: dict[str, Any]) -> str | None:
 class LiteLLMNativeGraphOptions(TypedDict, total=False):
     """Options for :func:`to_litellm_agents`."""
 
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
     context: LDContext
     """LaunchDarkly context used for tracking events. Required for LD telemetry."""
     model_factory: ModelFactory

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from typing import Any
 
 from opentelemetry import trace
@@ -206,7 +206,8 @@ def _build_messages(
 
 
 def _build_tools(
-    config_value: AiConfigRep, tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+    config_value: AiConfigRep,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -367,7 +368,7 @@ async def _invoke_tool(handler: Any, arguments: dict[str, Any]) -> Any:
 
 async def _execute_tools(
     calls: list[Any],
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
     parent: Any,
     ended: set[int],
     *,
@@ -456,7 +457,7 @@ def _create_litellm_messages_handler(
     async def call(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -568,7 +569,7 @@ def _create_litellm_messages_handler(
     def stream(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -596,7 +597,7 @@ async def _stream(
     completion: Completion,
     config_value: AiConfigRep,
     user_input: str | None,
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None,
     *,

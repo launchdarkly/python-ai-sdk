@@ -2828,7 +2828,10 @@ class TestModelSource:
         imports.import_module.side_effect = ModuleNotFoundError(
             "No module named 'langchain_aws'"
         )
-        with pytest.raises(ImportError, match=r"pip install langchain-aws"):
+        with pytest.raises(
+            ImportError,
+            match=r"pip install \"launchdarkly-ai-langchain-messages\[aws\]\"",
+        ):
             handler_mod._make_default_chat_model(cfg, imports)
 
     @pytest.mark.asyncio

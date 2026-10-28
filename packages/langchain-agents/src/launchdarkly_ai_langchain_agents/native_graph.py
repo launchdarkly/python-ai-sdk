@@ -9,7 +9,7 @@ import inspect
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, TypedDict
 
 from launchdarkly_ai_server import (
@@ -71,7 +71,7 @@ def _build_system_prompt(node: GraphNode, variables: dict[str, Any]) -> str | No
 
 def _build_node_tools(
     node: GraphNode,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     import importlib
 
@@ -126,7 +126,7 @@ def _extract_usage(msg: Any) -> dict[str, int]:
 class LangChainNativeGraphOptions(TypedDict, total=False):
     """Options for :func:`to_lang_graph`."""
 
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
     model_factory: Callable[[GraphNode], Any]
     """Builds the chat model for a node. Defaults to ``ChatOpenAI``."""
     context: LDContext
@@ -183,7 +183,7 @@ def to_lang_graph(
         if not root:
             raise ValueError(f'Graph "{def_obj.key}" has no root node')
 
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] = (
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] = (
             _opts.get("tool_handlers") or {}
         )
         model_factory = _opts.get("model_factory")

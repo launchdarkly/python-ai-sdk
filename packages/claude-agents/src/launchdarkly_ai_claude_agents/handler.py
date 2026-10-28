@@ -176,7 +176,7 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
 
 async def _build_tool_mcp(
     config_tools: dict[str, Any],
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
 ) -> Any:
     """Build an in-process SDK MCP server from LD config tools + handler functions.
 
@@ -213,7 +213,7 @@ async def _build_tool_mcp(
 
 def _partition_tools(
     config_tools: dict[str, Any] | None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """
     Returns (native_tool_map, user_config_tools, native_tool_names).
@@ -240,7 +240,7 @@ def _partition_tools(
 
 
 def _native_tool_aliases(
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> dict[str, str]:
     """AI Config key → provider tool name, for the config's native tools only.
 
@@ -780,7 +780,7 @@ def _create_claude_agents_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -966,7 +966,7 @@ def _create_claude_agents_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -1037,7 +1037,7 @@ def _map_claude_stream_event(
 async def _stream_gen(
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,

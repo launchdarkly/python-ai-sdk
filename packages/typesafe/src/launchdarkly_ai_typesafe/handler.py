@@ -99,7 +99,7 @@ def create_typesafe_handler(*, capture_content: bool | None = None) -> ProviderH
     async def _call(
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:

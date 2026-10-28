@@ -266,7 +266,7 @@ async def _call_tool(handler: Any, arguments: dict[str, Any]) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
-def _tools(config_value: AiConfigRep, handlers: dict[str, Any]) -> list[Any]:
+def _tools(config_value: AiConfigRep, handlers: Mapping[str, Any]) -> list[Any]:
     import importlib
 
     FunctionTool = importlib.import_module("agents").FunctionTool
@@ -503,7 +503,7 @@ class _SpanningHooks(RunHooksBase[Any, Any]):
 def _agent_and_prompt(
     config_value: AiConfigRep,
     user_input: str | None,
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None,
     model_factory: ModelFactory,
@@ -573,7 +573,7 @@ def _create_litellm_agents_handler(
     async def call(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -639,7 +639,7 @@ def _create_litellm_agents_handler(
     def stream(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -664,7 +664,7 @@ def _create_litellm_agents_handler(
 async def _stream(
     config_value: AiConfigRep,
     user_input: str | None,
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None,
     model_factory: ModelFactory,

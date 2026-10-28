@@ -7,5 +7,5 @@ LiteLLMNativeGraphOptions(TypedDict, total=False)  [class]
   base_url: str
   context: LDContext
   model_factory: ModelFactory
-  tool_handlers: dict[str, Callable[..., Any] | NativeTool]
+  tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
 to_litellm_agents(definition: Awaitable[GraphDefinition], opts: LiteLLMNativeGraphOptions | None = None) -> NativeGraphRunner
