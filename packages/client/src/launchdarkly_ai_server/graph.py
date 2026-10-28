@@ -577,12 +577,16 @@ async def _build_graph(
                     1,
                 )
 
-            yield {
+            # The node's own judges; omitted when none produced a result, as on done.
+            node_done: GraphStreamEvent = {
                 "type": "node_done",
                 "nodeKey": node.key,
                 "response": response,
                 "usage": usage,
             }
+            if judge_results:
+                node_done["judgeResults"] = judge_results
+            yield node_done
             if outcome is not None:
                 outcome.clear()
                 outcome.update(
@@ -721,12 +725,16 @@ async def _build_graph(
                     1,
                 )
 
-            yield {
+            # The node's own judges; omitted when none produced a result, as on done.
+            node_done: GraphStreamEvent = {
                 "type": "node_done",
                 "nodeKey": node.key,
                 "response": response,
                 "usage": usage,
             }
+            if judge_results:
+                node_done["judgeResults"] = judge_results
+            yield node_done
             if outcome is not None:
                 outcome.clear()
                 outcome.update(

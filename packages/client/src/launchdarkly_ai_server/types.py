@@ -389,7 +389,7 @@ StreamEvent = dict[str, Any]  # StreamChunkEvent | StreamDoneEvent
 # Graph stream events (camelCase public fields, matching the TypeScript SDK)
 # node_start: {type, nodeKey}
 # chunk: {type, text, nodeKey}
-# node_done: {type, nodeKey, response, usage}
+# node_done: {type, nodeKey, response, usage, judgeResults?}  (the node's own judges)
 # handoff: {type, sourceKey, targetKey}
 # done: {type, response, usage, judgeResults?}
 GraphStreamEvent = dict[str, Any]
