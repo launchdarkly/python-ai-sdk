@@ -337,14 +337,10 @@ async def _build_graph(
                 def _fn(*a: Any, **kw: Any) -> str:
                     if not chosen:
                         chosen.append(t)
-                    # Selecting an edge does not end the turn; execution continues until the
-                    # model produces its final text. The text has to hold for a node with work
-                    # of its own and for a pure router, and nothing in the graph says which a
-                    # node is. A "transferring now" reply reads as though control has already
-                    # left, and a node with a real tool stops short of calling it, so the
-                    # result says "recorded". Asking for a "final response" invites a router,
-                    # which has no answer of its own, to write the target's; that reply
-                    # streams to the caller and reaches the target as the previous response.
+                    # Both routing strings are pinned byte for byte in TESTING.md §3.15a, which
+                    # gives the reasons: "recorded" keeps a node with a real tool from skipping
+                    # it, and asking for no "final response" keeps a router from answering for
+                    # its target.
                     return (
                         f"Handoff to {t} recorded. "
                         f"{t} takes over when your turn ends. "
