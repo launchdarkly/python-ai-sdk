@@ -690,7 +690,9 @@ class TestRootSpanAttributes:
         assert attrs["launchdarkly.variation.key"] == "v"
         assert attrs["launchdarkly.run.id"] == "r"
         assert attrs["launchdarkly.graph.key"] == "g"
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
 
     async def test_child_spans_carry_no_launchdarkly_identity(
         self, mock_openai: MagicMock
@@ -873,14 +875,28 @@ class TestChatSpanAttributes:
 class TestContentCapture:
     """TELEMETRY-CONTRACT.md section 7."""
 
-    async def test_emits_no_content_at_all_by_default(
+    async def test_emits_content_by_default(self, mock_openai: MagicMock) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx:
+            await create_openai_messages_handler()(CONFIG, "q", {}, {})
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(
         self, mock_openai: MagicMock
     ) -> None:
         ctx, rec = _recording()
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         with ctx:
-            await create_openai_messages_handler()(CONFIG, "q", {}, {})
+            await create_openai_messages_handler(capture_content=False)(
+                CONFIG, "q", {}, {}
+            )
         for span in rec.spans:
             content_keys = [
                 k
@@ -2315,7 +2331,7 @@ class TestStreamingTelemetry:
         assert StatusCode.ERROR in rec.root.statuses
         assert rec.root.ended == 1
 
-    async def test_emits_no_content_by_default_on_the_streaming_path(
+    async def test_emits_content_by_default_on_the_streaming_path(
         self, mock_openai: MagicMock
     ) -> None:
         self._patch_stream(mock_openai, ["hi"])
@@ -2324,6 +2340,20 @@ class TestStreamingTelemetry:
 
         with ctx:
             async for _ in await create_openai_messages_handler().stream(CONFIG, "q"):
+                pass
+        assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self, mock_openai: MagicMock
+    ) -> None:
+        self._patch_stream(mock_openai, ["hi"])
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx:
+            async for _ in await create_openai_messages_handler(
+                capture_content=False
+            ).stream(CONFIG, "q"):
                 pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []

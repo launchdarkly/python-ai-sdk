@@ -519,8 +519,8 @@ class TestToolExecutionLoop:
             if not chosen:
                 chosen.append("billing")
             return (
-                "Handoff to billing recorded. "
-                "Finish your own work and provide your final response."
+                "Handoff to billing recorded. billing takes over when your turn ends. "
+                "Finish your own part, then end your turn. Do not answer for billing."
             )
 
         tool = _built_tool(
@@ -528,8 +528,8 @@ class TestToolExecutionLoop:
             {"__handoff_billing": handoff},
         )
         assert await tool() == (
-            "Handoff to billing recorded. "
-            "Finish your own work and provide your final response."
+            "Handoff to billing recorded. billing takes over when your turn ends. "
+            "Finish your own part, then end your turn. Do not answer for billing."
         )
         assert chosen == ["billing"]
 
@@ -995,7 +995,9 @@ class TestRootSpanAttributes:
         assert attrs["launchdarkly.variation.key"] == "v"
         assert attrs["launchdarkly.run.id"] == "r"
         assert attrs["launchdarkly.graph.key"] == "g"
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
 
     @pytest.mark.asyncio
     async def test_child_spans_carry_no_launchdarkly_identity(self) -> None:
@@ -1135,11 +1137,24 @@ class TestContentCapture:
     """TELEMETRY-CONTRACT.md section 7."""
 
     @pytest.mark.asyncio
-    async def test_emits_no_content_at_all_by_default(self) -> None:
+    async def test_emits_content_by_default(self) -> None:
         ctx, rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("hi")])
         with ctx:
             await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm, capture_content=False)(
+                BASE_CONFIG, "q"
+            )
         for span in rec.spans:
             content_keys = [
                 k
@@ -1681,13 +1696,29 @@ class TestStreamingTelemetry:
         assert rec.root.ended == 1
 
     @pytest.mark.asyncio
-    async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
+    async def test_emits_content_by_default_on_the_streaming_path(self) -> None:
         ctx, rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("hi")])
         with ctx:
             async for _ in await create_langchain_agents_handler(llm).stream(
                 BASE_CONFIG, "q", {}, {}
             ):
+                pass
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            async for _ in await create_langchain_agents_handler(
+                llm, capture_content=False
+            ).stream(BASE_CONFIG, "q", {}, {}):
                 pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []

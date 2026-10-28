@@ -767,12 +767,18 @@ class TestOtelSetup:
 
         return created_resources, mock_exporter_cls
 
-    def test_stamps_highlight_project_id(self) -> None:
-        """highlight.project_id resource attribute must equal the resolved SDK key."""
+    def test_stamps_launchdarkly_project_id(self) -> None:
+        """launchdarkly.project_id resource attribute must equal the resolved SDK key."""
         created_resources, _ = self._setup_with_mock_exporter("my-sdk-key")
         assert any(
-            r.get("highlight.project_id") == "my-sdk-key" for r in created_resources
+            r.get("launchdarkly.project_id") == "my-sdk-key" for r in created_resources
         )
+
+    def test_stamps_no_highlight_project_id(self) -> None:
+        """launchdarkly.project_id is the only project id the resource carries."""
+        created_resources, _ = self._setup_with_mock_exporter("my-sdk-key")
+        assert created_resources
+        assert all("highlight.project_id" not in r for r in created_resources)
 
     def test_registers_w3c_propagators(self) -> None:
         """init_client must register a CompositePropagator with W3C trace context and baggage propagators."""

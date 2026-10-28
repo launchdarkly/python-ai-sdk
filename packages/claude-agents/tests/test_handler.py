@@ -862,7 +862,25 @@ class TestChatAttributes:
 
 
 class TestContentCapture:
-    async def test_emits_no_content_at_all_by_default(
+    async def test_emits_content_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler_mod,
+            "query",
+            _fake_query(
+                [
+                    assistant_message(content=[TextBlock(text="hi")]),
+                    result_message("hi"),
+                ]
+            ),
+        )
+        await create_claude_agents_handler()(BASE_CONFIG, "q")
+        [chat] = named("chat ")
+        assert "gen_ai.input.messages" in chat.attributes
+        assert "gen_ai.output.messages" in chat.attributes
+
+    async def test_emits_no_content_when_capture_content_is_false(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
@@ -872,14 +890,14 @@ class TestContentCapture:
                 [init_message(tools=["Read"]), assistant_message(), result_message()]
             ),
         )
-        await create_claude_agents_handler()(TOOL_CONFIG, "q")
+        await create_claude_agents_handler(capture_content=False)(TOOL_CONFIG, "q")
         for span in (root(), *named("chat ")):
             assert "gen_ai.input.messages" not in span.attributes
             assert "gen_ai.output.messages" not in span.attributes
             assert "gen_ai.system_instructions" not in span.attributes
             assert "gen_ai.tool.definitions" not in span.attributes
 
-    async def test_root_carries_no_content_by_default_either(
+    async def test_root_carries_no_output_when_capture_is_false(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
@@ -887,7 +905,7 @@ class TestContentCapture:
             "query",
             _fake_query([assistant_message(), result_message("hi")]),
         )
-        await create_claude_agents_handler()(BASE_CONFIG, "q")
+        await create_claude_agents_handler(capture_content=False)(BASE_CONFIG, "q")
         assert "gen_ai.output.messages" not in root().attributes
 
     async def test_tool_call_arguments_and_result_gated_by_capture(
@@ -925,7 +943,7 @@ class TestContentCapture:
             yield result_message("done")
 
         monkeypatch.setattr(handler_mod, "query", _query)
-        await create_claude_agents_handler()(
+        await create_claude_agents_handler(capture_content=False)(
             TOOL_CONFIG, "q", {"search": lambda _: "r"}
         )
         [tool_span] = named("execute_tool ")
@@ -1610,7 +1628,11 @@ class TestHistoryAndVariables:
         assert attrs["launchdarkly.config.key"] == "cfg"
         assert attrs["launchdarkly.variation.key"] == "var"
         assert attrs["launchdarkly.run.id"] == "run-1"
-        assert [e.name for e in root().events] == ["feature_flag"]
+        assert [
+            event.name
+            for event in root().events
+            if not event.name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
 
 
 class TestModelParametersForwarding:

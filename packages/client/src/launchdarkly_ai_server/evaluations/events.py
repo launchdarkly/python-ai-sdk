@@ -52,7 +52,6 @@ class CriterionEventPayload:
     evaluation_version: int | None = None
     score: float | None = None
     reason: str | None = None
-    error: dict[str, Any] | None = None
     error_message: str | None = None
 
     def to_track_payload(self) -> dict[str, Any]:
@@ -76,7 +75,6 @@ class CriterionEventPayload:
             "latencyMs": self.latency_ms,
             "score": self.score,
             "reason": self.reason,
-            "error": self.error,
             "errorMessage": self.error_message,
         }
         return {key: value for key, value in payload.items() if value is not None}

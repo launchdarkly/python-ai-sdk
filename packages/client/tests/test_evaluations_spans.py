@@ -89,7 +89,7 @@ def _install_provider(
         resource=Resource.create(
             {
                 "service.name": "python-sdk",
-                "highlight.project_id": "sdk-key",
+                "launchdarkly.project_id": "sdk-key",
             }
         )
     )
@@ -265,7 +265,7 @@ def lookup_order_tool() -> EvalTool:
 
 @pytest.fixture
 def capture_on() -> Iterator[None]:
-    """Transcript-shape cases run with capture on. The built-in default is off."""
+    """Transcript-shape cases pin capture on, independent of the process default."""
     _reset_for_testing()
     configure(options=SDKOptions(capture_content=True))
     yield
@@ -344,7 +344,7 @@ async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge
     ]
     for span in spans:
         assert span.resource is not None
-        assert span.resource.attributes["highlight.project_id"] == "sdk-key"
+        assert span.resource.attributes["launchdarkly.project_id"] == "sdk-key"
         assert_row_attributes(span.attributes)
         assert span.status.status_code == StatusCode.OK
 
@@ -828,16 +828,63 @@ def _write_captured_row(*, capture: bool | None = None) -> None:
 def test_offline_spans_follow_the_capture_content_gate(
     span_export: tuple[InMemorySpanExporter, list[str]],
 ) -> None:
-    """Evaluation spans omit the transcript by default and export it when capture is on.
+    """Evaluation spans export the transcript by default and omit it when capture is off.
 
-    An explicit true on the call still writes it when the process default is false.
+    An explicit false on the call removes it while the process default is on. An explicit
+    true on the call still writes it when the process default is false.
     """
     exporter, _flushed = span_export
     _reset_for_testing()
     try:
-        assert SDKOptions().capture_content is False
-        assert effective_capture_content(None) is False
+        assert SDKOptions().capture_content is True
+        assert effective_capture_content(None) is True
 
+        _write_captured_row()
+        by_name = spans_by_name(exporter)
+        chat_attributes = by_name["chat gpt-4o"][0].attributes or {}
+        assert "Answer about capitals" in str(
+            chat_attributes["gen_ai.system_instructions"]
+        )
+        rendered_input = str(chat_attributes["gen_ai.input.messages"])
+        assert "Where is Paris?" in rendered_input
+        assert "earlier capitals" in rendered_input
+        assert "France" in str(chat_attributes["gen_ai.output.messages"])
+        assert "lookup" in str(chat_attributes["gen_ai.tool.definitions"])
+        tool_attributes = by_name["execute_tool lookup"][0].attributes or {}
+        assert tool_attributes["gen_ai.tool.call.arguments"] == '{"q":"Paris"}'
+        assert tool_attributes["gen_ai.tool.call.result"] == "France"
+        explanation = next(
+            event.attributes
+            for event in by_name["evaluate accuracy"][0].events
+            if event.name == "gen_ai.evaluation.result"
+        )
+        assert explanation is not None
+        assert explanation["gen_ai.evaluation.explanation"] == "matches the capital"
+        assert explanation["gen_ai.evaluation.name"] == "accuracy"
+        assert explanation["gen_ai.evaluation.score.value"] == 0.9
+
+        exporter.clear()
+        _write_captured_row(capture=False)
+        by_name = spans_by_name(exporter)
+        for attributes in (
+            by_name["chat gpt-4o"][0].attributes or {},
+            by_name["execute_tool lookup"][0].attributes or {},
+        ):
+            for key in _CONTENT_KEYS:
+                assert key not in attributes
+        stripped = next(
+            event.attributes
+            for event in by_name["evaluate accuracy"][0].events
+            if event.name == "gen_ai.evaluation.result"
+        )
+        assert stripped is not None
+        assert "gen_ai.evaluation.explanation" not in stripped
+        assert stripped["gen_ai.evaluation.name"] == "accuracy"
+        assert stripped["gen_ai.evaluation.score.value"] == 0.9
+
+        exporter.clear()
+        configure(options=SDKOptions(capture_content=False))
+        assert effective_capture_content(None) is False
         _write_captured_row()
         by_name = spans_by_name(exporter)
         for attributes in (
@@ -861,32 +908,6 @@ def test_offline_spans_follow_the_capture_content_gate(
         )
 
         exporter.clear()
-        configure(options=SDKOptions(capture_content=True))
-        assert effective_capture_content(None) is True
-        _write_captured_row()
-        by_name = spans_by_name(exporter)
-        chat_attributes = by_name["chat gpt-4o"][0].attributes or {}
-        assert "Answer about capitals" in str(
-            chat_attributes["gen_ai.system_instructions"]
-        )
-        rendered_input = str(chat_attributes["gen_ai.input.messages"])
-        assert "Where is Paris?" in rendered_input
-        assert "earlier capitals" in rendered_input
-        assert "France" in str(chat_attributes["gen_ai.output.messages"])
-        assert "lookup" in str(chat_attributes["gen_ai.tool.definitions"])
-        tool_attributes = by_name["execute_tool lookup"][0].attributes or {}
-        assert tool_attributes["gen_ai.tool.call.arguments"] == '{"q":"Paris"}'
-        assert tool_attributes["gen_ai.tool.call.result"] == "France"
-        explanation = next(
-            event.attributes
-            for event in by_name["evaluate accuracy"][0].events
-            if event.name == "gen_ai.evaluation.result"
-        )
-        assert explanation is not None
-        assert explanation["gen_ai.evaluation.explanation"] == "matches the capital"
-
-        exporter.clear()
-        configure(options=SDKOptions(capture_content=False))
         _write_captured_row(capture=True)
         kept = spans_by_name(exporter)["chat gpt-4o"][0].attributes or {}
         assert "Where is Paris?" in str(kept["gen_ai.input.messages"])
