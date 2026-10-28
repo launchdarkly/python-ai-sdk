@@ -11,7 +11,8 @@
       "extra-files": [
         "src/launchdarkly_ai_server/__init__.py"
       ],
-      "component": "launchdarkly-ai-server"
+      "component": "launchdarkly-ai-server",
+      \"release-as\": \"1.0.0\"
     },
     "packages/ai": {
       "release-type": "python",
@@ -22,7 +23,8 @@
       "extra-files": [
         "src/launchdarkly_ai/__init__.py"
       ],
-      "component": "launchdarkly-ai-python"
+      "component": "launchdarkly-ai-python",
+      \"release-as\": \"1.0.0\"
     },
     "packages/claude-agents": {
       "release-type": "python",
@@ -33,7 +35,8 @@
       "extra-files": [
         "src/launchdarkly_ai_claude_agents/_version.py"
       ],
-      "component": "launchdarkly-ai-claude-agents"
+      "component": "launchdarkly-ai-claude-agents",
+      \"release-as\": \"1.0.0\"
     },
     "packages/claude-messages": {
       "release-type": "python",
@@ -44,7 +47,8 @@
       "extra-files": [
         "src/launchdarkly_ai_claude_messages/_version.py"
       ],
-      "component": "launchdarkly-ai-claude-messages"
+      "component": "launchdarkly-ai-claude-messages",
+      \"release-as\": \"1.0.0\"
     },
     "packages/openai-agents": {
       "release-type": "python",
@@ -55,7 +59,8 @@
       "extra-files": [
         "src/launchdarkly_ai_openai_agents/_version.py"
       ],
-      "component": "launchdarkly-ai-openai-agents"
+      "component": "launchdarkly-ai-openai-agents",
+      \"release-as\": \"1.0.0\"
     },
     "packages/vercel-agents": {
       "release-type": "python",
@@ -66,7 +71,8 @@
       "extra-files": [
         "src/launchdarkly_ai_vercel_agents/_version.py"
       ],
-      "component": "launchdarkly-ai-vercel-agents"
+      "component": "launchdarkly-ai-vercel-agents",
+      \"release-as\": \"1.0.0\"
     },
     "packages/litellm-agents": {
       "release-type": "python",
@@ -77,7 +83,8 @@
       "extra-files": [
         "src/launchdarkly_ai_litellm_agents/_version.py"
       ],
-      "component": "launchdarkly-ai-litellm-agents"
+      "component": "launchdarkly-ai-litellm-agents",
+      \"release-as\": \"1.0.0\"
     },
     "packages/openai-messages": {
       "release-type": "python",
@@ -88,7 +95,8 @@
       "extra-files": [
         "src/launchdarkly_ai_openai_messages/_version.py"
       ],
-      "component": "launchdarkly-ai-openai-messages"
+      "component": "launchdarkly-ai-openai-messages",
+      \"release-as\": \"1.0.0\"
     },
     "packages/vercel-messages": {
       "release-type": "python",
@@ -99,7 +107,8 @@
       "extra-files": [
         "src/launchdarkly_ai_vercel_messages/_version.py"
       ],
-      "component": "launchdarkly-ai-vercel-messages"
+      "component": "launchdarkly-ai-vercel-messages",
+      \"release-as\": \"1.0.0\"
     },
     "packages/litellm-messages": {
       "release-type": "python",
@@ -110,7 +119,8 @@
       "extra-files": [
         "src/launchdarkly_ai_litellm_messages/_version.py"
       ],
-      "component": "launchdarkly-ai-litellm-messages"
+      "component": "launchdarkly-ai-litellm-messages",
+      \"release-as\": \"1.0.0\"
     },
     "packages/langchain-agents": {
       "release-type": "python",
@@ -121,7 +131,8 @@
       "extra-files": [
         "src/launchdarkly_ai_langchain_agents/_version.py"
       ],
-      "component": "launchdarkly-ai-langchain-agents"
+      "component": "launchdarkly-ai-langchain-agents",
+      \"release-as\": \"1.0.0\"
     },
     "packages/langchain-messages": {
       "release-type": "python",
@@ -132,7 +143,8 @@
       "extra-files": [
         "src/launchdarkly_ai_langchain_messages/_version.py"
       ],
-      "component": "launchdarkly-ai-langchain-messages"
+      "component": "launchdarkly-ai-langchain-messages",
+      \"release-as\": \"1.0.0\"
     },
     "packages/opencode-agents": {
       "release-type": "python",
@@ -143,7 +155,8 @@
       "extra-files": [
         "src/launchdarkly_ai_opencode_agents/_version.py"
       ],
-      "component": "launchdarkly-ai-opencode-agents"
+      "component": "launchdarkly-ai-opencode-agents",
+      \"release-as\": \"1.0.0\"
     },
     "packages/typesafe": {
       "release-type": "python",
@@ -154,7 +167,8 @@
       "extra-files": [
         "src/launchdarkly_ai_typesafe/_version.py"
       ],
-      "component": "launchdarkly-ai-typesafe"
+      "component": "launchdarkly-ai-typesafe",
+      \"release-as\": \"1.0.0\"
     }
   },
   "changelog-sections": [
