@@ -659,7 +659,7 @@ class TestShutdown:
     async def test_a_failure_clearing_experimental_state_is_logged_not_raised(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Experimental behaviour must not break a core call (TESTING.md §0.3)."""
+        """Experimental behaviour must not break a core call."""
         stub = _make_stub_client()
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=stub)

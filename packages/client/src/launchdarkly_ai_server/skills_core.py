@@ -192,7 +192,7 @@ def clear_state() -> None:
 
 
 # Registered on load, so core's ``shutdown()`` clears this state without
-# importing any Agent Skills module (TESTING.md §0.3).
+# importing any Agent Skills module.
 register_shutdown_hook("Agent Skills", clear_state)
 
 
