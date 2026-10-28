@@ -790,7 +790,12 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
 
     Span event (required for AI Config Monitoring Traces tab correlation):
     ``name='feature_flag'`` with ``feature_flag.key``,
-    ``feature_flag.provider.name``, ``feature_flag.set.id`` (when
+    ``feature_flag.provider.name``, ``feature_flag.result.variant`` (the
+    served variation key, when non-empty), ``feature_flag.result.value``
+    (``json.dumps`` of the raw variation in ``variables['__ldValue']``, as the
+    ``ldotel`` tracing hook writes it with value inclusion on; omitted when
+    there is no evaluated value, e.g. native-graph spans),
+    ``feature_flag.set.id`` (when
     ``LD_ENVIRONMENT_ID`` is set or the TS SDK auto-resolved it),
     ``feature_flag.context.id``, and ``feature_flag.contextKeys`` (when
     ``ldContext`` has a usable identity).
@@ -811,6 +816,13 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
         "feature_flag.key": ld.get("configKey", ""),
         "feature_flag.provider.name": "LaunchDarkly",
     }
+    variation_key = ld.get("variationKey")
+    if isinstance(variation_key, str) and variation_key:
+        feature_flag_attrs["feature_flag.result.variant"] = variation_key
+    if "__ldValue" in variables:
+        feature_flag_attrs["feature_flag.result.value"] = json.dumps(
+            variables["__ldValue"]
+        )
     if ld.get("environmentId"):
         feature_flag_attrs["feature_flag.set.id"] = ld["environmentId"]
 

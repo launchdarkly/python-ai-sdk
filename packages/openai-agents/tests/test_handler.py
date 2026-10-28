@@ -834,7 +834,8 @@ class TestRootSpanAttributes:
                 "variationKey": "v1",
                 "runId": "run-abc",
                 "environmentId": "env-1",
-            }
+            },
+            "__ldValue": {"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}},
         }
         with ctx, _patched_agents(agents_mod):
             await create_openai_agents_handler()(CONFIG, "q", {}, vs)
@@ -844,6 +845,10 @@ class TestRootSpanAttributes:
                 {
                     "feature_flag.key": "my-config",
                     "feature_flag.provider.name": "LaunchDarkly",
+                    "feature_flag.result.variant": "v1",
+                    "feature_flag.result.value": (
+                        '{"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}}'
+                    ),
                     "feature_flag.set.id": "env-1",
                 },
             )

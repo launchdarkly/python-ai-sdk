@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -194,3 +195,40 @@ def test_malformed_ld_context_emits_none_of_the_three_and_does_not_throw(
     span = FakeSpan()
     set_ld_span_attributes(span, variables)
     _assert_no_context_identity(span)
+
+
+class TestResultVariant:
+    def test_variant_is_the_variation_key(self) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(span, _vars(None))
+        assert _feature_flag(span)["feature_flag.result.variant"] == "variation-a"
+
+    @pytest.mark.parametrize("variation_key", ["", None])
+    def test_empty_or_missing_variation_key_omits_the_variant(
+        self, variation_key: Any
+    ) -> None:
+        ld = {**LD_FIXTURE, "variationKey": variation_key}
+        if variation_key is None:
+            del ld["variationKey"]
+        span = FakeSpan()
+        set_ld_span_attributes(span, {"__ld": ld})
+        assert "feature_flag.result.variant" not in _feature_flag(span)
+
+    def test_value_is_the_raw_variation_serialized_like_the_tracing_hook(
+        self,
+    ) -> None:
+        raw = {
+            "model": {"name": "gpt-x", "parameters": {"temperature": 0.5}},
+            "provider": {"name": "openai"},
+            "messages": [{"role": "system", "content": "Olá"}],
+            "_ldMeta": {"enabled": True, "variationKey": "variation-a"},
+        }
+        span = FakeSpan()
+        set_ld_span_attributes(span, {**_vars(None), "__ldValue": raw})
+        # ldotel's TracingHook writes json.dumps(detail.value) with defaults.
+        assert _feature_flag(span)["feature_flag.result.value"] == json.dumps(raw)
+
+    def test_value_is_absent_without_an_evaluated_value(self) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(span, {"__ld": {**LD_FIXTURE, "variationKey": ""}})
+        assert "feature_flag.result.value" not in _feature_flag(span)
