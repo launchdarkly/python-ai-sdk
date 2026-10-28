@@ -1687,7 +1687,7 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
             "criterionType": "$ld:ai:judge:accuracy",
             "kind": "judge",
             "judgeKey": "$ld:ai:judge:accuracy",
-            "options": {"threshold": 0.5},
+            "options": {"threshold": 0.5, "passRateThreshold": 0.95},
         }
     ]
     assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
@@ -1929,7 +1929,7 @@ def test_scorer_lower_is_better_reaches_the_criteria_wire() -> None:
         "criterionType": "policy-violations",
         "kind": "scorer",
         "successDirection": "lower_is_better",
-        "options": {"threshold": 0.0},
+        "options": {"threshold": 0.0, "passRateThreshold": 0.95},
     }
 
 
@@ -1940,7 +1940,23 @@ def test_judge_threshold_defaults_so_a_criterion_is_always_rulable() -> None:
         "criterionType": "$ld:ai:judge:accuracy",
         "kind": "judge",
         "judgeKey": "$ld:ai:judge:accuracy",
-        "options": {"threshold": 0.5},
+        "options": {"threshold": 0.5, "passRateThreshold": 0.95},
+    }
+
+
+def test_explicit_none_pass_rate_threshold_falls_back_to_default() -> None:
+    """An explicit None must not drop passRateThreshold from the wire, or the
+    run would have no pass rate to gate on."""
+    judge = Judge(key="$ld:ai:judge:accuracy", pass_rate_threshold=None)
+    scorer = Scorer(name="exact", fn=lambda row, output: True, pass_rate_threshold=None)
+
+    assert judge.to_criteria_wire()["options"] == {
+        "threshold": 0.5,
+        "passRateThreshold": 0.95,
+    }
+    assert scorer.to_criteria_wire()["options"] == {
+        "threshold": 1.0,
+        "passRateThreshold": 0.95,
     }
 
 
@@ -2045,7 +2061,7 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
             "criterionType": "refund-exists",
             "kind": "scorer",
             "successDirection": "higher_is_better",
-            "options": {"threshold": 1.0},
+            "options": {"threshold": 1.0, "passRateThreshold": 0.95},
         }
     ]
     assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
