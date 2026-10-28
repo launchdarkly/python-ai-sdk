@@ -860,7 +860,9 @@ class TestRootSpanAttributes:
             "__ldValue": {"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}},
         }
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agents_handler()(CONFIG, "q", {}, vs)
+            await create_openai_agents_handler(capture_content=False)(
+                CONFIG, "q", {}, vs
+            )
         assert [event for event in rec.root.events if event[0] == "feature_flag"] == [
             (
                 "feature_flag",
