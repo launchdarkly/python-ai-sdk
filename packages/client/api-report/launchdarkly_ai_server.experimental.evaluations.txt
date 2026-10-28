@@ -81,3 +81,13 @@ Scorer  [class, @dataclass(frozen=True)]
   success_direction: SuccessDirection = 'higher_is_better'
   threshold: float | None = 1.0
   to_criteria_wire() -> dict[str, Any]
+ScorerContext  [class, @dataclass(frozen=True)]
+  __init__(tool_calls: tuple[ToolInvocation, ...] = (), tool_calls_omitted: int = 0)
+  tool_calls: tuple[ToolInvocation, ...] = ()
+  tool_calls_omitted: int = 0
+ToolInvocation  [class, @dataclass(frozen=True)]
+  __init__(name: str, arguments: Any = None, result: Any = None, error: str | None = None)
+  arguments: Any = None
+  error: str | None = None
+  name: str
+  result: Any = None

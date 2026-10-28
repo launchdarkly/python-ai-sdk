@@ -20,6 +20,8 @@ from launchdarkly_ai_server.experimental.evaluations import (
     EvaluationsError,
     Judge,
     Scorer,
+    ScorerContext,
+    ToolInvocation,
     init_evaluations,
 )
 
@@ -4895,3 +4897,172 @@ async def test_a_completion_or_list_tagged_handler_is_selected(
     )
 
     assert stub.await_count == 1
+
+
+def _scorer_runner() -> Any:
+    from launchdarkly_ai_server.evaluations.api import LDApiClient
+    from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner
+
+    return EvaluationsRunner(LDApiClient(api_key="token", transport=failing_transport))
+
+
+def _generated_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "row_index": 0,
+        "input": "Question",
+        "expected_output": None,
+        "variables": {},
+        "metadata": None,
+        "output": "answer",
+        "status": "COMPLETE",
+        "tool_calls": [
+            ToolInvocation(name="lookup_order", arguments='{"id":"A1"}', result="ok"),
+            ToolInvocation(name="refund", arguments='{"id":"A1"}', result="done"),
+        ],
+        "tool_calls_omitted": 3,
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_scorer_with_a_third_parameter_receives_the_tool_calls_in_order() -> None:
+    seen: list[ScorerContext] = []
+
+    def scorer_fn(row: DatasetRow, output: Any, context: ScorerContext) -> float:
+        seen.append(context)
+        names = [call.name for call in context.tool_calls]
+        return 1.0 if names == ["lookup_order", "refund"] else 0.0
+
+    result = await _scorer_runner()._run_scorer_for_result(
+        _generated_row(), Scorer(name="trajectory", fn=scorer_fn)
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["score"] == 1.0
+    assert seen[0].tool_calls_omitted == 3
+
+
+@pytest.mark.asyncio
+async def test_async_scorer_with_a_context_is_awaited() -> None:
+    async def scorer_fn(row: DatasetRow, output: Any, context: ScorerContext) -> float:
+        return 1.0 if len(context.tool_calls) == 2 else 0.0
+
+    result = await _scorer_runner()._run_scorer_for_result(
+        _generated_row(), Scorer(name="trajectory", fn=scorer_fn)
+    )
+
+    assert result["score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_scorer_context_is_empty_when_no_tool_was_called() -> None:
+    def scorer_fn(row: DatasetRow, output: Any, context: ScorerContext) -> float:
+        assert context.tool_calls == ()
+        assert context.tool_calls_omitted == 0
+        return 1.0
+
+    result = await _scorer_runner()._run_scorer_for_result(
+        _generated_row(tool_calls=[], tool_calls_omitted=0),
+        Scorer(name="trajectory", fn=scorer_fn),
+    )
+
+    assert result["status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_two_parameter_scorer_is_called_without_a_context() -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    def scorer_fn(*args: Any) -> float:
+        calls.append(args)
+        return 1.0
+
+    def two_parameter(row: DatasetRow, output: Any) -> float:
+        return scorer_fn(row, output)
+
+    await _scorer_runner()._run_scorer_for_result(
+        _generated_row(), Scorer(name="plain", fn=two_parameter)
+    )
+
+    assert len(calls[0]) == 2
+
+
+def test_scorer_detects_the_context_parameter_once_at_construction() -> None:
+    assert Scorer(name="a", fn=lambda row, output: 1.0)._accepts_context is False
+    assert Scorer(name="b", fn=lambda row, output, ctx: 1.0)._accepts_context is True
+    # Only required parameters count: a defaulted third one is called with two.
+    assert (
+        Scorer(name="c", fn=lambda row, output, ctx=None: 1.0)._accepts_context is False
+    )
+    assert Scorer(name="d", fn=lambda *args: 1.0)._accepts_context is False
+    assert (
+        Scorer(name="e", fn=lambda row, output, ctx, *, opt=1: 1.0)._accepts_context
+        is True
+    )
+
+
+def test_scorer_rejects_a_function_that_needs_more_than_three_arguments() -> None:
+    with pytest.raises(ValueError, match="at most"):
+        Scorer(name="too-many", fn=lambda a, b, c, d: 1.0)
+
+
+def test_scorer_rejects_a_required_keyword_only_argument() -> None:
+    # It would pass validation and then fail on every row.
+    with pytest.raises(ValueError, match="keyword-only"):
+        Scorer(name="kw", fn=lambda row, output, *, ctx: 1.0)
+
+
+@pytest.mark.asyncio
+async def test_run_calls_two_and_three_parameter_scorers(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200, dataset_page([{"rowIndex": 0, "input": "Ticket A"}], total=1)
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    seen: list[ScorerContext] = []
+
+    async def handler(*args: Any) -> dict[str, Any]:
+        return {"output": "refunded"}
+
+    def plain(row: DatasetRow, output: Any) -> float:
+        return 1.0 if output == "refunded" else 0.0
+
+    def with_context(row: DatasetRow, output: Any, context: ScorerContext) -> float:
+        seen.append(context)
+        return 1.0
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation=COMPLETION,
+        criteria=[
+            Scorer(name="plain", fn=plain),
+            Scorer(name="with-context", fn=with_context),
+        ],
+    )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scores = {e["criterionType"]: e for e in events if e.get("kind") == "scorer"}
+    assert scores["plain"]["status"] == "COMPLETE"
+    assert scores["plain"]["score"] == 1.0
+    assert scores["with-context"]["status"] == "COMPLETE"
+    assert seen == [ScorerContext()]
