@@ -1664,7 +1664,7 @@ class TestModelParametersForwarding:
     async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``ClaudeAgentOptions`` has no ``temperature``/``top_p``/``top_k``/``max_tokens``/
+        """``ClaudeAgentOptions`` has no ``temperature``/``top_p``/``top_k``/
         ``stop_sequences``/``tool_choice``/``metadata`` fields, all of which the LaunchDarkly UI's
         model parameters panel offers for other providers. Forwarding one unfiltered raises
         ``TypeError`` before any request is made; the filter must drop them instead.
@@ -1677,7 +1677,6 @@ class TestModelParametersForwarding:
                     "temperature": 0.2,
                     "top_p": 0.5,
                     "top_k": 10,
-                    "max_tokens": 256,
                     "stop_sequences": ["STOP"],
                     "tool_choice": "auto",
                     "metadata": {"user_id": "u1"},
@@ -1691,7 +1690,6 @@ class TestModelParametersForwarding:
             "temperature",
             "top_p",
             "top_k",
-            "max_tokens",
             "stop_sequences",
             "tool_choice",
             "metadata",
@@ -1730,6 +1728,96 @@ class TestModelParametersForwarding:
         }
         options = await self._run_and_capture_options(config, monkeypatch)
         assert options.max_turns == 5
+
+
+class TestOutputLimitAndThinkingDefault:
+    """The cross-SDK Claude Agents rule: ``max_tokens`` reaches the CLI as
+    ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``, and thinking is off unless the config asks for it. The CLI
+    would otherwise send its own defaults (``max_tokens`` 32000 and a 31,999-token thinking budget
+    on ``claude-haiku-4-5``)."""
+
+    @staticmethod
+    async def _options(
+        parameters: dict[str, Any], path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> Any:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            build_cli_command(kwargs["options"])
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        config = {
+            **BASE_CONFIG,
+            "model": {**BASE_CONFIG["model"], "parameters": parameters},
+        }
+        h = create_claude_agents_handler()
+        if path == "invoke":
+            await h(config, "q")
+        else:
+            await _collect(await h.stream(config, "q"))
+        return captured["options"]
+
+    @pytest.fixture(params=["invoke", "stream"])
+    def path(self, request: pytest.FixtureRequest) -> str:
+        return request.param
+
+    async def test_max_tokens_sets_the_cli_output_limit_and_thinking_is_disabled(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_tokens": 200}, path, monkeypatch)
+        # The SDK adds ``env`` to the inherited ``os.environ``, so only the one variable is set.
+        assert options.env == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "200"}
+        assert options.thinking == {"type": "disabled"}
+        assert "--thinking" in (command := build_cli_command(options))
+        assert command[command.index("--thinking") + 1] == "disabled"
+
+    async def test_an_integral_float_max_tokens_is_read_as_an_integer(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_tokens": 200.0}, path, monkeypatch)
+        assert options.env == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "200"}
+
+    async def test_no_env_without_max_tokens(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_turns": 2}, path, monkeypatch)
+        assert options.env == {}
+        assert options.thinking == {"type": "disabled"}
+
+    @pytest.mark.parametrize(
+        "max_tokens", [0, -5, 1.5, float("inf"), "200", True, None, {"value": 200}]
+    )
+    async def test_a_max_tokens_that_is_not_a_positive_integer_is_dropped(
+        self, path: str, max_tokens: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_tokens": max_tokens}, path, monkeypatch)
+        assert options.env == {}
+
+    async def test_a_configured_thinking_replaces_the_default(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options(
+            {
+                "max_tokens": 4096,
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            },
+            path,
+            monkeypatch,
+        )
+        assert options.thinking == {"type": "enabled", "budget_tokens": 2048}
+        assert options.env == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"}
+
+    async def test_max_thinking_tokens_alone_leaves_thinking_unset(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``thinking`` takes precedence over ``max_thinking_tokens`` in the SDK, so the default
+        must not be added or the config's budget would be ignored."""
+        options = await self._options({"max_thinking_tokens": 2048}, path, monkeypatch)
+        assert options.max_thinking_tokens == 2048
+        assert options.thinking is None
 
 
 class TestFinishReasonMapping:
@@ -2821,12 +2909,13 @@ class TestThinkingIsRebuilt:
 
     @pytest.mark.parametrize("value", [{"budget_tokens": 1024}, {"type": "enabled"}])
     def test_the_shapes_the_sdk_cannot_read_are_dropped(self, value: Any) -> None:
-        """Both raise ``KeyError`` in the SDK's command builder when passed through."""
+        """Both raise ``KeyError`` in the SDK's command builder when passed through. A dropped
+        thinking counts as not set, so the handler's disabled default applies."""
         from claude_agent_sdk import ClaudeAgentOptions
 
         with pytest.raises(KeyError):
             build_cli_command(ClaudeAgentOptions(thinking=value))
-        assert self._thinking(value) is None
+        assert self._thinking(value) == {"type": "disabled"}
 
     @pytest.mark.parametrize(
         "value",
@@ -2838,7 +2927,7 @@ class TestThinkingIsRebuilt:
         ],
     )
     def test_an_unknown_type_or_a_malformed_budget_is_dropped(self, value: Any) -> None:
-        assert self._thinking(value) is None
+        assert self._thinking(value) == {"type": "disabled"}
 
 
 class TestMalformedObjectValuesAreDropped:
@@ -2858,7 +2947,7 @@ class TestMalformedObjectValuesAreDropped:
                 }
             }
         )
-        assert params == {"max_turns": 3}
+        assert params == {"max_turns": 3, "thinking": {"type": "disabled"}}
 
 
 async def test_a_builtin_tool_result_is_not_marked_failed(

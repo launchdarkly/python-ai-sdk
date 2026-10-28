@@ -92,9 +92,11 @@ from .spans import (
 #: This is the cross-SDK list for Claude Agents (TESTING.md section 1.12), shared with the native
 #: graph through :func:`_options_parameters`.
 #:
-#: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
-#: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
-#: for other providers; they are dropped like any other key not listed here.
+#: The SDK offers no ``temperature``/``top_p``/``top_k``/``stop_sequences``/``tool_choice``/
+#: ``metadata``, all of which the LaunchDarkly UI's model parameters panel offers for other
+#: providers; they are dropped like any other key not listed here. It has no ``max_tokens`` field
+#: either, but ``max_tokens`` is not dropped: :func:`_options_parameters` sends it to the CLI as
+#: :data:`_MAX_OUTPUT_TOKENS_ENV`.
 _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
     {
         "betas",
@@ -600,6 +602,12 @@ def _raise_if_run_failed(message: Any) -> None:
     )
 
 
+#: The variable the CLI reads its output-token limit from. ``ClaudeAgentOptions`` has no
+#: output-token field, so the config's ``max_tokens`` reaches the CLI as this variable in its
+#: environment, the only value this package writes there. Without it the CLI sends its own default
+#: (32000 on ``claude-haiku-4-5``) whatever the config asks for.
+_MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+
 #: The ``thinking`` types ``claude_agent_sdk`` knows (``ThinkingConfig``). It reads
 #: ``thinking["type"]`` when it builds the CLI command, so a ``thinking`` without one raises.
 _THINKING_TYPES = frozenset({"adaptive", "enabled", "disabled"})
@@ -636,9 +644,16 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
     ``thinking`` rebuilt by :func:`_rebuild_thinking`. The handler and the native graph both call
     this, so they forward the same keys.
+
+    Two fields are set even though the config does not name them. ``thinking`` is
+    ``{"type": "disabled"}`` unless the config sets ``thinking`` or ``max_thinking_tokens``,
+    because the CLI otherwise picks thinking itself (a 31,999-token budget on
+    ``claude-haiku-4-5``). And a positive integer ``max_tokens`` becomes
+    ``env={_MAX_OUTPUT_TOKENS_ENV: ...}``, which the SDK adds to the inherited ``os.environ``.
     """
+    parameters = model_parameters(config)
     params = select_forwarded_parameters(
-        model_parameters(config),
+        parameters,
         _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
         mapping_keys=_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS,
     )
@@ -646,6 +661,18 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
         thinking = _rebuild_thinking(params.pop("thinking"))
         if thinking is not None:
             params["thinking"] = thinking
+    if "thinking" not in params and params.get("max_thinking_tokens") is None:
+        params["thinking"] = {"type": "disabled"}
+    max_tokens = parameters.get("max_tokens")
+    # JSON has one number type, so ``200.0`` is the same value the JS SDK reads as 200.
+    if isinstance(max_tokens, float) and max_tokens.is_integer():
+        max_tokens = int(max_tokens)
+    if (
+        isinstance(max_tokens, int)
+        and not isinstance(max_tokens, bool)
+        and max_tokens > 0
+    ):
+        params["env"] = {_MAX_OUTPUT_TOKENS_ENV: str(max_tokens)}
     return params
 
 
