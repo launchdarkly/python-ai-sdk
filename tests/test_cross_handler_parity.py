@@ -376,6 +376,10 @@ EXPECTED_VOCABULARY = {
     "feature_flag",
     "feature_flag.key",
     "feature_flag.provider.name",
+    # OTel feature-flag semconv: the served variation key, and the evaluated value (the raw
+    # variation with content capture on, else the JSON-encoded key).
+    "feature_flag.result.variant",
+    "feature_flag.result.value",
     "feature_flag.set.id",
     # AIC-3230: evaluation-context identity on the root feature_flag event / span.
     # `context.contextKeys` is the f-string prefix; the keys actually emitted are
