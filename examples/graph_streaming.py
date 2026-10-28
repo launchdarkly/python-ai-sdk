@@ -44,7 +44,7 @@ async def run(key: str, user_input: str) -> None:
         elif event["type"] == "node_done":
             # A node's own judge results, when one of its judges produced a score.
             judged = (
-                f" judgeResults={json.dumps(event['judgeResults'])}"
+                f" judgeResults={json.dumps(event['judgeResults'], default=str)}"
                 if event.get("judgeResults")
                 else ""
             )
