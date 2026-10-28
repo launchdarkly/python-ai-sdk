@@ -154,7 +154,7 @@ class TestFactoryAndTransport:
         handler = create_litellm_messages_handler(capture_content=True)
         assert handler.provides_for == ("*", "messages")
         assert handler.capture_content is True
-        assert create_litellm_messages_handler().capture_content is False
+        assert create_litellm_messages_handler().capture_content is True
 
     async def test_calls_in_process_litellm_acompletion(self) -> None:
         completion = AsyncMock(return_value=_response())
@@ -604,9 +604,9 @@ class TestTelemetryAndConvenience:
             "ldContext": {"kind": "user", "key": "ada"},
         }
         with patch.object(handler_mod, "trace", trace):
-            await create_litellm_messages_handler(completion=completion)(
-                CONFIG, "private prompt", {}, variables
-            )
+            await create_litellm_messages_handler(
+                completion=completion, capture_content=False
+            )(CONFIG, "private prompt", {}, variables)
         attributes = {
             call.args[0]: call.args[1] for call in span.set_attribute.call_args_list
         }
