@@ -853,6 +853,7 @@ pip install "launchdarkly-ai-python[otel]"
 **Other env vars / options read by `init_client()`:**
 - `LD_SERVICE_NAME` / `options["serviceName"]` — sets `service.name` resource attribute (default: `'python-sdk'`)
 - `LD_ENVIRONMENT` / `options["environment"]` — sets `deployment.environment` resource attribute
+- Not configurable: the `launchdarkly.project_id` resource attribute is always set to the resolved SDK key, not the project's ID. It replaced `highlight.project_id`, which is no longer sent
 
 **Graceful degradation:** if any OTel package is missing, telemetry is silently skipped and a `logger.warning` is emitted. The LD client still initializes and all AI API calls work normally.
 
