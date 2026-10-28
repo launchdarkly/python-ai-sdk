@@ -14,6 +14,7 @@ fail loudly here instead of silently.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1788,7 +1789,8 @@ class TestOutputLimitAndThinkingDefault:
         assert options.thinking == {"type": "disabled"}
 
     @pytest.mark.parametrize(
-        "max_tokens", [0, -5, 1.5, float("inf"), "200", True, None, {"value": 200}]
+        "max_tokens",
+        [0, -5, 1.5, 2**53, float("inf"), "200", True, None, {"value": 200}],
     )
     async def test_a_max_tokens_that_is_not_a_positive_integer_is_dropped(
         self, path: str, max_tokens: Any, monkeypatch: pytest.MonkeyPatch
@@ -1818,6 +1820,57 @@ class TestOutputLimitAndThinkingDefault:
         options = await self._options({"max_thinking_tokens": 2048}, path, monkeypatch)
         assert options.max_thinking_tokens == 2048
         assert options.thinking is None
+
+    async def test_thinking_and_max_thinking_tokens_together_pass_as_given(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options(
+            {
+                "max_thinking_tokens": 4096,
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            },
+            path,
+            monkeypatch,
+        )
+        assert options.max_thinking_tokens == 4096
+        assert options.thinking == {"type": "enabled", "budget_tokens": 2048}
+
+    async def test_effort_alone_does_not_turn_thinking_on(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"effort": "low"}, path, monkeypatch)
+        assert options.effort == "low"
+        assert options.thinking == {"type": "disabled"}
+
+    async def test_the_cli_process_keeps_the_inherited_environment(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``env`` holds only the one variable because the SDK adds it to ``os.environ``. Start
+        the SDK's own transport with the options and read the environment it gives the CLI, so a
+        change to that merge fails here."""
+        import dataclasses
+
+        import claude_agent_sdk._internal.transport.subprocess_cli as subprocess_cli
+        from claude_agent_sdk import CLIConnectionError
+
+        options = await self._options({"max_tokens": 200}, path, monkeypatch)
+        monkeypatch.setenv("LD_TEST_INHERITED", "kept")
+        monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+        spawned: dict[str, Any] = {}
+
+        async def _open_process(cmd: Any, **kwargs: Any) -> Any:
+            spawned["env"] = kwargs["env"]
+            raise RuntimeError("stop before spawning")
+
+        monkeypatch.setattr(subprocess_cli.anyio, "open_process", _open_process)
+        transport = subprocess_cli.SubprocessCLITransport(
+            prompt="q", options=dataclasses.replace(options, cli_path="/bin/echo")
+        )
+        with pytest.raises(CLIConnectionError):
+            await transport.connect()
+        assert spawned["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "200"
+        assert spawned["env"]["LD_TEST_INHERITED"] == "kept"
+        assert spawned["env"]["PATH"] == os.environ["PATH"]
 
 
 class TestFinishReasonMapping:

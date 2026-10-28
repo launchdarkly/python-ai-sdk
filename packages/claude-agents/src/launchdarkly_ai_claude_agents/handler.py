@@ -608,6 +608,10 @@ def _raise_if_run_failed(message: Any) -> None:
 #: (32000 on ``claude-haiku-4-5``) whatever the config asks for.
 _MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
 
+#: The largest ``max_tokens`` kept, ``Number.MAX_SAFE_INTEGER`` in JS: the JS SDK drops a larger
+#: value, so both SDKs send the same thing for the same config.
+_MAX_TOKENS_LIMIT = 2**53 - 1
+
 #: The ``thinking`` types ``claude_agent_sdk`` knows (``ThinkingConfig``). It reads
 #: ``thinking["type"]`` when it builds the CLI command, so a ``thinking`` without one raises.
 _THINKING_TYPES = frozenset({"adaptive", "enabled", "disabled"})
@@ -648,7 +652,8 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     Two fields are set even though the config does not name them. ``thinking`` is
     ``{"type": "disabled"}`` unless the config sets ``thinking`` or ``max_thinking_tokens``,
     because the CLI otherwise picks thinking itself (a 31,999-token budget on
-    ``claude-haiku-4-5``). And a positive integer ``max_tokens`` becomes
+    ``claude-haiku-4-5``). And a positive integer ``max_tokens`` up to
+    :data:`_MAX_TOKENS_LIMIT` becomes
     ``env={_MAX_OUTPUT_TOKENS_ENV: ...}``, which the SDK adds to the inherited ``os.environ``.
     """
     parameters = model_parameters(config)
@@ -670,7 +675,7 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     if (
         isinstance(max_tokens, int)
         and not isinstance(max_tokens, bool)
-        and max_tokens > 0
+        and 0 < max_tokens <= _MAX_TOKENS_LIMIT
     ):
         params["env"] = {_MAX_OUTPUT_TOKENS_ENV: str(max_tokens)}
     return params

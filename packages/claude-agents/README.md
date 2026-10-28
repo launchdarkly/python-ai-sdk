@@ -76,8 +76,8 @@ to_claude_agents(
 
 ### Output limit and thinking
 
-- `max_tokens` in the config's model parameters sets the output-token limit for each model request. The Agent SDK has no option for it, so the handler sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the environment of the Claude Code process. Without `max_tokens`, Claude Code uses its own default.
-- Thinking is off unless the config sets `thinking` or `max_thinking_tokens`. Claude Code lowers a thinking budget to one less than `max_tokens`, so when a config sets both, keep `max_tokens` above the budget.
+- `max_tokens` in the config's model parameters sets the output-token limit for each model request. The Agent SDK has no option for it, so the handler sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the environment of the Claude Code process. Without `max_tokens`, Claude Code uses its own default. A `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the `env` of a Claude Code settings file, including `~/.claude.json`, wins over `max_tokens`.
+- Thinking is off unless the config sets `thinking` or `max_thinking_tokens`. Models that reject disabled thinking, such as `claude-fable-5`, still use their own default. Claude Code lowers a thinking budget to one less than `max_tokens`, so when a config sets both, keep `max_tokens` above the budget.
 
 #### Migrating from a version that used Claude Code's thinking default
 

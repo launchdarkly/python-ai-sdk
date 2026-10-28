@@ -1407,6 +1407,19 @@ class TestNativeGraphModelParameters:
         limited = await node_options({"max_tokens": 200})
         assert limited["env"] == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "200"}
         assert limited["thinking"] == {"type": "disabled"}
+        # Built by the real SDK, so the node's CLI is started with thinking off.
+        command = _build_cli_command(limited)
+        assert command[command.index("--thinking") + 1] == "disabled"
+
+        invalid = await node_options({"max_tokens": 1.5})
+        assert "env" not in invalid
+        assert invalid["thinking"] == {"type": "disabled"}
+
+        budget_only = await node_options({"max_thinking_tokens": 2048})
+        assert budget_only["max_thinking_tokens"] == 2048
+        assert "thinking" not in budget_only
+        command = _build_cli_command(budget_only)
+        assert command[command.index("--max-thinking-tokens") + 1] == "2048"
 
         thinking = await node_options(
             {"thinking": {"type": "enabled", "budget_tokens": 2048}}
