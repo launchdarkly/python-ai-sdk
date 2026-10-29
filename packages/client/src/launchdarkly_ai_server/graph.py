@@ -6,7 +6,7 @@ import logging
 import re as _re
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from .agui import StableProjector
@@ -337,12 +337,15 @@ async def _build_graph(
                 def _fn(*a: Any, **kw: Any) -> str:
                     if not chosen:
                         chosen.append(t)
-                    # Selecting an edge does not end the turn; execution continues until the
-                    # model produces its final text. A "transferring now" reply reads as though
-                    # control has already left, and the model stops short of its own work.
+                    # Both routing strings are pinned byte for byte across SDKs, for two
+                    # reasons: "recorded" keeps a node with a real tool from skipping
+                    # it, and asking for no "final response" keeps a router from answering for
+                    # its target.
                     return (
                         f"Handoff to {t} recorded. "
-                        "Finish your own work and provide your final response."
+                        f"{t} takes over when your turn ends. "
+                        "Finish your own part, then end your turn. "
+                        f"Do not answer for {t}."
                     )
 
                 return _fn
@@ -355,8 +358,10 @@ async def _build_graph(
                 (node.config.get("instructions") or "")
                 + (
                     "\n\nComplete your task using your available tools first. "
-                    "Only once you have your final answer, call exactly one transfer "
-                    "tool to route to the next agent."
+                    "Only once your own part is done, call exactly one transfer "
+                    "tool to route to the next agent. "
+                    "Do not answer the parts of the request that belong to the agent "
+                    "you route to."
                 )
             ),
             "tools": {
@@ -572,12 +577,16 @@ async def _build_graph(
                     1,
                 )
 
-            yield {
+            # The node's own judges; omitted when none produced a result, as on done.
+            node_done: GraphStreamEvent = {
                 "type": "node_done",
                 "nodeKey": node.key,
                 "response": response,
                 "usage": usage,
             }
+            if judge_results:
+                node_done["judgeResults"] = judge_results
+            yield node_done
             if outcome is not None:
                 outcome.clear()
                 outcome.update(
@@ -716,12 +725,16 @@ async def _build_graph(
                     1,
                 )
 
-            yield {
+            # The node's own judges; omitted when none produced a result, as on done.
+            node_done: GraphStreamEvent = {
                 "type": "node_done",
                 "nodeKey": node.key,
                 "response": response,
                 "usage": usage,
             }
+            if judge_results:
+                node_done["judgeResults"] = judge_results
+            yield node_done
             if outcome is not None:
                 outcome.clear()
                 outcome.update(
@@ -832,7 +845,7 @@ async def resolve_graph(
     *,
     context: LDContext,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
 ) -> GraphDefinition:
     """
@@ -1340,7 +1353,7 @@ def graph(
     key: str,
     *,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     graph_judge: str | None = None,
 ) -> GraphInstance:
@@ -1362,7 +1375,7 @@ def _graph(
     key: str,
     *,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     graph_judge: str | None = None,
 ) -> GraphInstance:

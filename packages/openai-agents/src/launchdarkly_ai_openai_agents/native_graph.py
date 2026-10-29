@@ -9,13 +9,15 @@ import inspect
 import logging
 import re
 import time
-import types
 import uuid
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypedDict
 
 from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
+    LDContext,
+    NativeGraphRunner,
     NativeTool,
     compose_history,
     get_client,
@@ -63,7 +65,7 @@ def _build_instructions(node: GraphNode, variables: dict[str, Any]) -> str | Non
 
 def _build_node_tools(
     node: GraphNode,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     import importlib
 
@@ -96,10 +98,18 @@ def _build_node_tools(
     return result
 
 
+class OpenAINativeGraphOptions(TypedDict, total=False):
+    """Options for :func:`to_openai_agents`."""
+
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
+    context: LDContext
+    """LaunchDarkly context used for tracking events. Required for LD telemetry."""
+
+
 def to_openai_agents(
-    def_promise: Any,
-    opts: dict[str, Any] | None = None,
-) -> Any:
+    def_promise: Awaitable[GraphDefinition],
+    opts: OpenAINativeGraphOptions | None = None,
+) -> NativeGraphRunner:
     """
     Converts a resolved ``GraphDefinition`` into an OpenAI Agents SDK agent tree
     and returns a caller that runs the graph natively via ``Runner.run``.
@@ -139,7 +149,9 @@ def to_openai_agents(
         if not root:
             raise ValueError(f'Graph "{def_obj.key}" has no root node')
 
-        tool_handlers: dict[str, Any] = _opts.get("tool_handlers") or {}
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] = (
+            _opts.get("tool_handlers") or {}
+        )
         raw_ld_context = _opts.get("context")
         ld_context = (
             to_ld_context(get_client(), raw_ld_context)
@@ -279,7 +291,7 @@ def to_openai_agents(
             if history:
                 # config.instructions takes priority over config.messages, so skip
                 # config conversation turns when instructions are set (parity with the
-                # single-node handler and TESTING.md §1.11 composition order).
+                # single-node handler's history composition order).
                 config_messages = (
                     []
                     if root.config.get("instructions")
@@ -374,4 +386,10 @@ def to_openai_agents(
             if span:
                 span.end()
 
-    return types.SimpleNamespace(invoke=invoke)
+    # A class, not a SimpleNamespace, so mypy checks invoke against NativeGraphRunner.
+    _invoke = invoke
+
+    class _Runner:
+        invoke = staticmethod(_invoke)
+
+    return _Runner()

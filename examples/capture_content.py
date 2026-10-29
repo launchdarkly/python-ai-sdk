@@ -1,11 +1,13 @@
 """
-Example: enable conversation content for every handler at process startup.
+Example: pin conversation content on for every handler at process startup.
 
-The handlers in the global registry are built with no ``capture_content``
-argument. They read the process default when they run. ``configure`` is
-separate from ``init_client``: ``main.py`` initializes the client, and this
-example calls ``configure`` once before the first AI invocation. An explicit
-``True`` or ``False`` on a factory would override this default.
+The built-in default is already on. The handlers in the global registry are
+built with no ``capture_content`` argument and read that default when they
+run. ``configure`` is separate from ``init_client``: ``main.py`` initializes
+the client, and this example calls ``configure`` once before the first AI
+invocation so the choice is visible at startup. Pass
+``SDKOptions(capture_content=False)`` to opt out. An explicit ``False`` on a
+factory removes the transcript everywhere, including offline evaluation spans.
 
 Usage (via main.py):
     python main.py capture-content <flag-key> "<user input>"

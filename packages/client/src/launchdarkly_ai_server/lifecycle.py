@@ -10,7 +10,7 @@ from typing import Any
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
 from .shutdown_hooks import run_shutdown_hooks
-from .types import InitClientOptions, SDKOptions
+from .types import InitClientOptions, LDClientInterface, SDKOptions
 from .utils import model_stamps_from_meta
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
-_client: Any = None
+_client: LDClientInterface | None = None
 _tracer_provider: Any = None
 # True only when *this* SDK's call to trace.set_tracer_provider actually took
 # effect. "We built a provider" is not the same as "we own the global": the set
@@ -83,7 +83,8 @@ def effective_capture_content(override: bool | None) -> bool:
 
     An explicit ``True`` or ``False`` — from a convenience wrapper, then from
     the handler factory — wins. ``None`` reads the configured default, which
-    itself defaults to ``False``.
+    itself defaults to ``True``. An explicit ``False`` removes conversation
+    content everywhere, including on offline evaluation spans.
     """
     if override is not None:
         return override
@@ -96,7 +97,7 @@ def note_ai_invocation() -> None:
     _ai_invoked = True
 
 
-def get_client() -> Any:
+def get_client() -> LDClientInterface:
     """
     Returns the singleton LaunchDarkly client.
     Raises ``RuntimeError`` if ``init_client`` has not been called yet.
@@ -114,7 +115,7 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
     if OTel packages are not installed (graceful degradation).
 
     This function:
-    - Stamps ``service.name``, ``highlight.project_id``, and (when set)
+    - Stamps ``service.name``, ``launchdarkly.project_id``, and (when set)
       ``deployment.environment`` resource attributes, mirroring the TS SDK.
     - Registers W3C trace context and baggage propagators.
     - Configures GZIP compression on the OTLP exporter.
@@ -152,7 +153,7 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
         resource_attrs: dict[str, str] = {
             "service.name": opts.get("serviceName")
             or os.environ.get("LD_SERVICE_NAME", "python-sdk"),
-            "highlight.project_id": sdk_key,
+            "launchdarkly.project_id": sdk_key,
         }
         environment = opts.get("environment") or os.environ.get("LD_ENVIRONMENT")
         if environment:
@@ -208,8 +209,8 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
 
 async def init_client(
     options: InitClientOptions | None = None,
-    client: Any = None,
-) -> Any:
+    client: LDClientInterface | None = None,
+) -> LDClientInterface:
     """
     Initializes the singleton LaunchDarkly client.
 
@@ -278,7 +279,8 @@ async def init_client(
         except ImportError:
             raise RuntimeError(
                 "LaunchDarkly server SDK not installed. "
-                "Run `pip install launchdarkly-server-sdk` or pass a pre-initialized client."
+                'Run `pip install "launchdarkly-ai-server[ld]"` (installs launchdarkly-server-sdk) '
+                "or pass a pre-initialized client."
             ) from None
 
     # Initialize LD client — Config wraps the SDK key and URI overrides; LDClient takes a Config.
@@ -290,9 +292,9 @@ async def init_client(
         )
 
     config_kwargs: dict[str, str] = {}
-    base_uri = opts.get("baseUri") or os.environ.get("LD_BASE_URI")
-    stream_uri = opts.get("streamUri") or os.environ.get("LD_STREAM_URI")
-    events_uri = opts.get("eventsUri") or os.environ.get("LD_EVENTS_URI")
+    base_uri = opts.get("baseUri") or _env("LD_BASE_URI")
+    stream_uri = opts.get("streamUri") or _env("LD_STREAM_URI")
+    events_uri = opts.get("eventsUri") or _env("LD_EVENTS_URI")
     if base_uri:
         config_kwargs["base_uri"] = base_uri
     if stream_uri:
@@ -396,13 +398,53 @@ def _release_otel_globals() -> None:
         logger.debug("Could not release the global OTel tracer provider", exc_info=True)
 
 
+def _sdk_processor_is_active() -> bool:
+    """Whether the active tracer provider carries ``ConversationIdSpanProcessor``.
+
+    Only then does ``count_sdk_spans`` see a handler's spans. Under a foreign
+    provider the count stays 0 even when the handler traced itself, so a
+    caller that falls back to writing spans on a 0 count would write them twice.
+    """
+    if _owns_otel_globals:
+        return True
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return False
+    from .conversation import ConversationIdSpanProcessor
+
+    # ponytail: reads the SDK TracerProvider's private processor list; a provider
+    # without it (proxy, vendor wrapper) reads as foreign, which only skips the fallback.
+    multi = getattr(trace.get_tracer_provider(), "_active_span_processor", None)
+    processors = getattr(multi, "_span_processors", ())
+    return any(isinstance(p, ConversationIdSpanProcessor) for p in processors)
+
+
+def _flush_tracer_provider() -> None:
+    """Export spans queued on the provider ``init_client`` registered.
+
+    A provider without ``force_flush`` (the API proxy) is a no-op.
+    """
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return
+    flush = getattr(trace.get_tracer_provider(), "force_flush", None)
+    if flush is None:
+        return
+    try:
+        flush()
+    except Exception:
+        logger.debug("Could not flush OpenTelemetry spans", exc_info=True)
+
+
 async def shutdown() -> None:
     """
     Shuts down the singleton client. Idempotent — safe to call multiple times
     even if the client was never initialized or already shut down.
 
-    Also runs the registered shutdown hooks, which clear the state of any
-    experimental feature in use, and restores process-wide SDK defaults from
+    Also runs the registered shutdown hooks, which clear feature state such as
+    the configured skill store, and restores process-wide SDK defaults from
     ``configure``.
 
     When telemetry was running, this also releases the process-global tracer
@@ -574,7 +616,7 @@ async def extract_variation(
             f"Variation '{config_key}' returned None (flag may be disabled)."
         )
 
-    # Only an explicit ``_ldMeta.enabled`` counts as enabled (spec §3.10, as in JS and Go).
+    # Only an explicit ``_ldMeta.enabled`` counts as enabled (as in JS and Go).
     ld_meta = (raw.get("_ldMeta") or {}) if isinstance(raw, dict) else {}
     if not isinstance(ld_meta, dict) or not ld_meta.get("enabled"):
         raise RuntimeError(f"Variation '{config_key}' is disabled.")

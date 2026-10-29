@@ -5,7 +5,7 @@ Convenience barrel package for the LaunchDarkly AI Python SDK. Re-exports the co
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-python launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-python[ld]" launchdarkly-ai-openai-messages
 ```
 
 To enable trace export to the LaunchDarkly Observability dashboard, install the `otel` extras group:
@@ -52,18 +52,28 @@ if result["enabled"]:
 
 Never raises. Returns `{"enabled": bool, "config": dict | None, "meta": dict | None}`.
 
+## Agent Skills
+
+Agent Skills (`get_skill`, `write_skills`, `watch_skills` and the rest) are re-exported from this
+package's root. They need `launchdarkly-ai-server` 1.0.0 or later, the first release with Agent
+Skills in core. This package does not pin `launchdarkly-ai-server`, so upgrading it alone can leave
+an older one installed, and `from launchdarkly_ai_python import get_skill` then raises
+`ImportError`. Upgrade both:
+
+```bash
+pip install --upgrade launchdarkly-ai-python "launchdarkly-ai-server>=1.0.0"
+```
+
 ## Experimental features
 
 Experimental features are not re-exported from this package. They live in
 `launchdarkly-ai-server`, the package this one depends on, and need a `launchdarkly-ai-server`
 release that includes them. Import them from `launchdarkly_ai_server.experimental`; if that
 import fails, upgrade `launchdarkly-ai-server` itself, since upgrading this package alone can
-leave an older `launchdarkly-ai-server` in place. The experimental features are:
+leave an older `launchdarkly-ai-server` in place. No feature is experimental now.
 
-- **Agent Skills**, in `launchdarkly_ai_server.experimental.skills`; see the
-  [Agent Skills guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#agent-skills-experimental).
-- **Evaluations from Code**, in `launchdarkly_ai_server.experimental.evaluations`; see the
-  [evaluations guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#run-an-evaluation-from-code-experimental).
+Evaluations from Code is core, so this package re-exports it. See the
+[evaluations guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#run-an-evaluation-from-code).
 
 ---
 

@@ -65,6 +65,7 @@ async def session_events(
     model_id: str,
     agent: str | None,
     session_ids: list[str],
+    permission: list[dict[str, str]] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Open one session and yield its bus events.
 
@@ -75,6 +76,13 @@ async def session_events(
     The post runs concurrently with the read. This session's ``session.idle`` ends the
     turn. A failed message POST raises without waiting for another bus
     frame. Leaving early cancels the post and aborts the session.
+
+    *permission* is sent as the session's own ``permission`` ruleset
+    (``Session.CreateInput.permission``). ``Permission.merge`` appends it
+    after the agent's static config permission and ``Permission.disabled``
+    resolves the *last* matching rule, so this always wins over whatever the
+    opencode.json agent config says: the catalog this call is offering is
+    authoritative, not the host's static default.
     """
     http = httpx.AsyncClient(
         auth=(SERVER_USERNAME, password),
@@ -91,7 +99,12 @@ async def session_events(
             timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=None),
         ) as sse:
             sse.raise_for_status()
-            created = await http.post(f"{base}/session", timeout=HTTP_TIMEOUT_SECONDS)
+            session_body = {"permission": permission} if permission else None
+            created = await http.post(
+                f"{base}/session",
+                json=session_body,
+                timeout=HTTP_TIMEOUT_SECONDS,
+            )
             if created.status_code >= 400:
                 raise OpenCodeHTTPError(f"POST /session -> {created.status_code}")
             session_id = _session_id(created.json())
@@ -137,6 +150,68 @@ async def session_events(
             except Exception:
                 pass
         await http.aclose()
+
+
+async def register_mcp_bridge(
+    *, base_url: str, password: str, name: str, url: str, token: str, timeout_ms: int
+) -> None:
+    """``POST /mcp``: attaches a remote MCP server to the running instance.
+
+    Per-call, not per-session: the route adds the server to the instance
+    (``MCP.add``), so this must run before the session's message is posted,
+    not before the session itself — there is no per-session MCP attachment.
+    """
+    base = base_url.rstrip("/")
+    async with httpx.AsyncClient(
+        auth=(SERVER_USERNAME, password), timeout=HTTP_TIMEOUT_SECONDS
+    ) as http:
+        response = await http.post(
+            f"{base}/mcp",
+            json={
+                "name": name,
+                "config": {
+                    "type": "remote",
+                    "url": url,
+                    "headers": {"Authorization": f"Bearer {token}"},
+                    "oauth": False,
+                    "timeout": timeout_ms,
+                },
+            },
+        )
+        if response.status_code >= 400:
+            raise OpenCodeHTTPError(f"POST /mcp -> {response.status_code}")
+        # HTTP 200 is the status map MCP.add stored, not a connection. The
+        # route returns that map keyed by server name; a server whose status
+        # is anything but "connected" is not callable.
+        try:
+            reported = response.json()
+        except ValueError as exc:
+            raise OpenCodeHTTPError(
+                "POST /mcp returned a body that is not JSON"
+            ) from exc
+        entry = reported.get(name) if isinstance(reported, dict) else None
+        state = entry.get("status") if isinstance(entry, dict) else None
+        if state != "connected":
+            raise OpenCodeHTTPError(
+                f"POST /mcp registered {name!r} but its status is {state!r}"
+            )
+
+
+async def disconnect_mcp_bridge(*, base_url: str, password: str, name: str) -> None:
+    """``POST /mcp/{name}/disconnect``, best-effort.
+
+    Swallows every error: this runs from a ``finally``, after the turn is
+    already done, and the opencode process this call started (or shares) is
+    about to be told to stop regardless of whether this succeeds.
+    """
+    base = base_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(
+            auth=(SERVER_USERNAME, password), timeout=HTTP_TIMEOUT_SECONDS
+        ) as http:
+            await http.post(f"{base}/mcp/{name}/disconnect")
+    except httpx.HTTPError:
+        pass
 
 
 async def _read_until_done(

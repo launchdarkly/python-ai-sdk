@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     RunUsage,
     SpanMessage,
@@ -69,7 +70,7 @@ from .spans import (
 #: so ``reasoning`` is forwarded with its ``effort`` and ``summary`` (see :func:`_rebuild_reasoning`)
 #: and no top-level ``reasoning_effort`` is read.
 #:
-#: This is the cross-SDK list for OpenAI Messages (TESTING.md section 1.12). The same list serves
+#: This is the cross-SDK list for OpenAI Messages. The same list serves
 #: ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves the
 #: same whichever is called. ``max_tool_calls`` is marked not supported in TypeScript there: the JS
 #: ``openai`` SDK's ``responses.create`` has no such parameter, while this SDK's ``create`` and
@@ -386,9 +387,9 @@ def create_openai_messages_handler(
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. Conversation content is PII, so a run emits only metadata, meaning
-    models, token counts, timings and tool names, until capture is turned on.
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
+    meaning models, token counts, timings and tool names.
     """
     report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
     return _create_openai_messages_handler(capture_content=capture_content)
@@ -407,7 +408,7 @@ def _create_openai_messages_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -578,7 +579,7 @@ def _create_openai_messages_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -612,7 +613,7 @@ async def _stream_gen(
     client: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,

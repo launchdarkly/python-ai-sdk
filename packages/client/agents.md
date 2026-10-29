@@ -31,14 +31,15 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
 | `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, and store resolution. Imported by both `skills.py` and the materialization layer; imports neither |
-| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `FDv2SkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
-| `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
+| `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `LaunchDarklySkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
+| `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener, and for a `SkillSource` the base client's `flag_tracker` listener, to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
+| `src/launchdarkly_ai_server/skills_source.py` | Agent Skills, config-scoped requested set — `config_skills(key, context)`, which evaluates one AI Config per read and classifies every failure as a raised read, never `[]`. With `skills_watch`, the only skills module that imports `lifecycle`, and it takes only `get_client` |
 | `src/launchdarkly_ai_server/skills_fs.py` | Agent Skills, materialization half — `write_skills`, request resolution, the manifest format and on-disk filenames, per-skill reconcile, and pruning |
 | `src/launchdarkly_ai_server/safe_fs.py` | Descriptor-pinned filesystem primitives — `atomic_write`, `unlink_file`, `pinned_directory`, `open_directory_nofollow`, `open_or_create_directory`, `SymlinkRefused`, `DirectoryMissing`, and the `*at()` capability probe. Owns the descriptor-vs-path platform split; knows nothing about skills |
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
-| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and `EvaluationsModule.run()` orchestration. Experimental: public names are exported only from `experimental/evaluations.py`, never from the package root |
+| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and `EvaluationsModule.run()` orchestration. Public names are exported from the package root |
 | `src/launchdarkly_ai_server/__init__.py` | Public barrel — the only surface handler packages import from |
 
 ---
@@ -77,13 +78,19 @@ from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_t
 
 # Entry points
 from launchdarkly_ai_server import config, graph, resolve_graph
-from launchdarkly_ai_server.experimental.evaluations import init_evaluations
 
-# Agent Skills (experimental: none of these is exported from the package root)
-from launchdarkly_ai_server.experimental.skills import (
-    set_skill_store, SkillStore, InMemorySkillStore, FDv2SkillStore, StoreDiagnostics,
+# Evaluations from Code
+from launchdarkly_ai_server import (
+    init_evaluations, EvaluationsModule, AIConfig, GenerationConfig, GenerationMode,
+    GenerationOverrides, DatasetRow, EvalTool, Criterion, Judge, Scorer,
+    EvalRunResult, RunSummary, EvaluationsError,
+)
+
+# Agent Skills
+from launchdarkly_ai_server import (
+    set_skill_store, SkillStore, InMemorySkillStore, LaunchDarklySkillStore, StoreDiagnostics,
     skill_refs, get_skill, get_skill_result, get_skills, all_skills, write_skills,
-    watch_skills, SkillWatcher,
+    watch_skills, SkillWatcher, SkillSource, config_skills,
     Skill, SkillReference, SkillOutcome, ReconcileAction, ReconcileReport,
     SKILL_FILENAME, MANIFEST_FILENAME, MANIFEST_VERSION,
     ReconcileActionKind, OnUnavailable, SkillOutcomeReason,  # the three closed-set unions
@@ -91,11 +98,12 @@ from launchdarkly_ai_server.experimental.skills import (
 ```
 
 An experimental feature is exported only from its module under
-`launchdarkly_ai_server.experimental`, and its names may change in a minor release. No core
-public type, function or `init_client` option may name it. Core reaches it only through an
-internal hook (as `shutdown` clears the skill store), and an error there is logged, never
-raised into the core call. The experimental part is the SDK's API, not the LaunchDarkly data
-model: `AiConfigRep` still documents the `skills` references a config carries.
+`launchdarkly_ai_server.experimental`, and its names may change in a minor release. No feature
+is experimental now. No core public type, function or `init_client` option may name an
+experimental feature. Agent Skills and Evaluations from Code are core and are exported from
+the package root. `lifecycle` imports no Evaluations from Code module. For Agent Skills,
+`shutdown` still reaches its state only through an internal hook (it clears the skill store),
+and an error there is logged, never raised into `shutdown`.
 
 `MAX_SKILL_CONTENT_BYTES` and `SKILL_OBJECT_KIND` are deliberately **not** exported; both stay
 internal to `skills_core`:
@@ -106,7 +114,7 @@ internal to `skills_core`:
   would imply otherwise. An adapter that needs it imports it from
   `launchdarkly_ai_server.skills_core`.
 
-When adding a new core export, add it to `__init__.py`'s imports and `__all__`. An Agent Skills export goes in `experimental/skills.py` instead, and in `EXPERIMENTAL_SKILLS_SURFACE` in `tests/test_skills.py`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
+When adding a new core export, add it to `__init__.py`'s imports and `__all__`, and to `ROOT_SURFACE` in `tests/test_public_surface.py`. An Agent Skills export also goes in `SKILLS_SURFACE` in `tests/test_skills.py`. Handler packages must never import from sub-paths (e.g. `launchdarkly_ai_server.client`).
 
 ---
 
@@ -162,7 +170,7 @@ Handlers may return any of these — the client normalizes them before emitting 
 
 ## SDK-run evaluations
 
-Evaluations from Code is experimental. Its public names are exported from `launchdarkly_ai_server.experimental.evaluations` and pinned by `TestPackageExports` in `tests/test_evaluations.py`; none may be added to the package root. `init_evaluations` reports the helper `experimental.initEvaluations`.
+Evaluations from Code is core. Its public names are exported from the package root and pinned by `TestPackageExports` in `tests/test_evaluations.py` and by `tests/test_public_surface.py`. `init_evaluations` reports the helper `client.initEvaluations`.
 
 `init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host (`api_base_uri`, then `LD_API_BASE_URI`; a blank value at either level counts as unset). Do not reuse `LD_BASE_URI`, or name the option `base_uri`: that host configures SDK delivery and may point at a relay proxy. Evaluation-run links use the separate `ui_base_uri` option, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; do not derive their host from `LD_API_BASE_URI`. An event transport is resolved in `init_evaluations()`, which raises before any network I/O when it finds neither an SDK key (`sdk_key` or `LD_SDK_KEY`) nor an already-initialized event-capable client: generation events are the only ingest path for row results, so a run without a transport could never complete. The lifecycle module's bring-your-own-client path (`init_client(client=...)`) therefore satisfies the check on its own, and `run()` reuses that singleton through `_resolve_client`; `run()` raises if the client disappears before it emits. Both polling arguments reject NaN, which would otherwise never compare past a deadline and hang the run. The harness always queues one `$ld:ai:offline-evals:generation` custom event per row through the standard SDK event transport and flushes before returning. No feature flag gates event emission. The harness polls the run summary endpoint until a nonzero `total_rows` has `pending_rows == 0` and `passed + failed + error` rows accounting for the total, polling every `poll_interval_seconds` (default 2s) until `poll_timeout_seconds` (default 180s); both are `run()` arguments so large datasets can widen them. The summary endpoint does not return run state, so `RunSummary` exposes row counts only.
 
@@ -207,19 +215,30 @@ through an injectable store, and materialized onto disk for agent runtimes to di
 Three layers, in increasing order of blast radius:
 
 1. **Reference discovery** — `skill_refs(config)` projects the config's `skills` array into
-   typed `SkillReference` values. Pure: no network, no client, no store, no telemetry.
+   typed `SkillReference` values. Needs no client or store, and makes no network call. Its
+   only side effect is the one-time helper usage event (see the Telemetry seam); it records
+   no skills signal.
    It also validates the array, and **fails closed**: a present but malformed field
    (including `null`, or one bad entry) raises `ValueError` rather than returning a partial
    list that would authorize a prune. So does a config that is not a dict, including the
    `None` a failed `inspect_config` returns; only a dict with no `skills` key yields `[]`. `parse_ai_config` deliberately does not check `skills`,
-   so an experimental field cannot fail a core config call (TESTING.md §0.3).
+   so a malformed field cannot fail a config call that does not use skills.
 2. **Content accessors** — `get_skill`, `get_skill_result`, `get_skills`, `all_skills` read
    through the `SkillStore` seam. Configure a store with `set_skill_store(store)`; with
    none configured the accessors raise
    an actionable `RuntimeError`. A delivery transport can be added behind the seam
    without touching the public API.
 3. **Materialization** — `write_skills(skills, root)` writes `<root>/<key>/SKILL.md` and
-   reconciles against a manifest at `<root>/.launchdarkly-skills.json`.
+   reconciles against a manifest at `<root>/.launchdarkly-skills.json`. `skills` may be a
+   `SkillSource` (`types.py`), whose `refs` is read once per reconcile; `skills_fs`
+   recognizes it by type and never imports `skills_source`. A source that raises or answers
+   anything but a sequence of valid references and keys is a run-level unavailable
+   retrieval, never an empty set.
+
+`config_skills(key, context)` is the documented form for config-scoped materialization
+under `watch_skills`. Do not write examples that feed `skill_refs(inspect_config(...))` to
+`watch_skills`: that is a fixed list, so the watcher never follows the config. At boot,
+with `write_skills`, either form is safe.
 
 ### The store seam, and why version is part of the lookup
 
@@ -258,7 +277,7 @@ user's files.
 
 ### The delivery transport, and the one field that will bite you
 
-`FDv2SkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
+`LaunchDarklySkillStore` speaks LaunchDarkly's SDK-facing FDv2 channel (`GET /sdk/poll`,
 `GET /sdk/stream`, server-side SDK key in `Authorization`, `kinds` + `basis` params,
 `If-None-Match`/304). It sits below the store interface and produces raw objects in the
 shape `skills_core.SkillStore` documents; **nothing above that interface knows it exists**.
@@ -303,6 +322,14 @@ resumes in place once the cause is fixed, clearing the terminal reason through
   answer) surfaces as an `HTTPError` that `_classify_status` maps to a fatal, non-retried
   failure.
 
+**Polling and streaming have different default hosts.** `GET /sdk/poll` uses `DEFAULT_BASE_URI`
+(`sdk.launchdarkly.com`) and `GET /sdk/stream` uses `DEFAULT_STREAM_URI`
+(`stream.launchdarkly.com`). A lone `base_uri` applies to both. When neither option is given, the
+constructor reads `LD_BASE_URI` / `LD_STREAM_URI` (blank is unset) in their place and applies the
+same rule. An option given turns the environment off for both, and `_require_https_uri` names the
+variable when its value is refused. `test_skills_fdv2.py` clears both variables with an autouse
+fixture, so a developer shell cannot move the default-host assertions.
+
 **A known stream event whose data is not JSON drops the connection; it is never skipped.**
 `_iter_sse` logs a WARNING and raises `_RecoverableTransportError`, as the base SDK's FDv2
 stream interrupts on a `JSONDecodeError`, so the in-flight payload is abandoned and the
@@ -318,12 +345,12 @@ inside its known-event branches. Empty data on a known event is not JSON either,
 connection the same way: read as `None`, a `delete-object` would be ignored and a
 `payload-transferred` would commit with no selector.
 
-**A put or delete that is valid JSON but has no usable `key` is warned and ignored, for the
-experimental stage.** Its transfer still commits, so a keyless `delete-object` loses its
+**A put or delete that is valid JSON but has no usable `key` is warned and ignored, and
+delivery keeps going.** This is the accepted behaviour, not a provisional one. Its transfer still commits, so a keyless `delete-object` loses its
 revocation and a keyless `put-object` in an `xfer-full` revokes that skill by omission (and
 `write_skills("*")` prunes it). `ldclient` interrupts the stream instead. Interrupting is not
 strictly safer, because a server that keeps resending the object would then block every later
-change, so the choice is to be revisited before 1.0 (TESTING.md §3.25). Pinned by
+change. Pinned by
 `test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits` and
 `test_a_put_with_no_usable_key_in_an_xfer_full_revokes_by_omission`; changing the rule should fail
 them.
@@ -551,7 +578,7 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   directory skips its unlink, drops the manifest entry, and reports `removed` while the
   revoked skill stays on disk.
 - **Every numeric option rejects non-finite values, not just negative ones.**
-  `write_skills`'s `timeout`, `watch_skills`'s `debounce`, and `FDv2SkillStore`'s
+  `write_skills`'s `timeout`, `watch_skills`'s `debounce`, and `LaunchDarklySkillStore`'s
   `poll_interval` and `read_timeout` share one rule. `nan` and `inf` both pass a `< 0` check
   and then mean opposite things downstream: an unbounded vs. an already-expired deadline, a
   zero vs. a never-closing coalescing window, a poll loop that spins vs. one that stops while
@@ -587,8 +614,15 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
 Skills telemetry goes through a private emitter with one method, `record(signal,
 properties)`, whose default is a **no-op** — nothing leaves the process in this release. Do
 not use `client.track()`: it needs an LD context, spends the customer's event volume, lands
-in their data export, and is silenced by offline mode. No LD context is involved anywhere in
-this feature.
+in their data export, and is silenced by offline mode. No skills signal carries an LD context.
+
+**The one exception is the SDK-wide helper usage event.** Each public skills helper calls
+`report_usage("client.<helper>")` (`sdk_usage.py`), which sends `$ld:ai:sdk:usage` through
+`client.track()` with `SDK_INFO_CONTEXT`, once per helper per client, holding it until init
+when no client exists yet. The SDK's other public helpers (`config`, `graph`, judges, handler
+factories) report the same event, and it carries the helper's name and package, never a skill key, version, content or hash. It is
+not a skills signal: do not remove it as a violation of the rule above, and do not add skill
+data to it.
 
 Exactly three signals exist, and the list is an **allowlist, not a floor**:
 
@@ -625,8 +659,9 @@ Do not undo any of these as a simplification:
   store), and the stdlib's default formatter drops `extra`, so an `extra`-only record is
   invisible under a plain `logging.basicConfig()`.
 - **`ld.skills.integrity_failure` is documented for customers to match on.** Do not rename it
-  casually. The experimental stage allows a rename in a minor release, but only in every SDK
-  at once and with a changelog entry, because a rename silently breaks customers' alerts.
+  casually. Agent Skills is core, so a rename is a breaking change: it needs a `!` commit (a
+  minor bump while on 0.x, a major after 1.0) in every SDK at once and a changelog entry,
+  because a rename silently breaks customers' alerts.
 - **`sort_keys=True` makes the line byte-identical across SDKs** (modulo `language`), since
   the other implementations build the object in alphabetical key order.
 - **Optional fields are omitted, never nulled**, so a SIEM field-existence check means
@@ -689,10 +724,9 @@ the allowlist is enforced in one place.
 `_clear_state` delegate to `skills_core`. `set_skill_store` and tests use those; none
 should reach into `skills_core` directly.
 
-**Core never imports this feature.** `skills_core` registers `clear_state` with
-`shutdown_hooks.register_shutdown_hook` when it loads, and `shutdown()` runs the registered
-hooks. `lifecycle.py` imports no skills module (TESTING.md §0.3, pinned by
-`test_core_does_not_import_experimental_code`).
+**Lifecycle never imports this feature.** `skills_core` registers `clear_state` with
+`shutdown_hooks.register_shutdown_hook` when it loads (the package root imports it), and
+`shutdown()` runs the registered hooks. `lifecycle.py` imports no skills module.
 
 ### Descriptor-pinned filesystem access
 
@@ -792,7 +826,7 @@ create false confidence. The operator's verification steps are in the README.
 `timeout` is a monotonic deadline, checked before each retrieval, each write, and each prune;
 only the final manifest rewrite runs past it, so files already written are never orphaned.
 Bounded retries are **not** implemented at this layer; retry policy belongs to the delivery
-transport (`FDv2SkillStore`'s capped backoff). Why:
+transport (`LaunchDarklySkillStore`'s capped backoff). Why:
 
 1. **There is nothing transient to retry.** `SkillStore.get_object` is a synchronous
    in-process read of already-delivered data, modelled on the LaunchDarkly data-store API. A
@@ -826,6 +860,7 @@ pip install "launchdarkly-ai-python[otel]"
 **Other env vars / options read by `init_client()`:**
 - `LD_SERVICE_NAME` / `options["serviceName"]` — sets `service.name` resource attribute (default: `'python-sdk'`)
 - `LD_ENVIRONMENT` / `options["environment"]` — sets `deployment.environment` resource attribute
+- Not configurable: the `launchdarkly.project_id` resource attribute is always set to the resolved SDK key, not the project's ID
 
 **Graceful degradation:** if any OTel package is missing, telemetry is silently skipped and a `logger.warning` is emitted. The LD client still initializes and all AI API calls work normally.
 
@@ -875,7 +910,7 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 
 ## Lifecycle Invariants
 
-- **Process defaults.** `configure(options=SDKOptions(capture_content=True))` sets behavior defaults for the process. Call it once at startup, not from request data, and not via `init_client`. Handlers omit `capture_content` to follow it. `shutdown()` restores the built-in defaults.
+- **Process defaults.** The built-in `capture_content` default is on. `configure(options=SDKOptions(capture_content=False))` turns it off for the process. Call `configure` once at startup, not from request data, and not via `init_client`. Handlers omit `capture_content` to follow it. An explicit `False` strips content everywhere, including offline evaluation spans. `shutdown()` restores the built-in default, which is on.
 - **Lazy initialization.** Importing the package does not initialize the LD client. The first API call that needs LaunchDarkly calls `init_client()` internally when `LD_SDK_KEY` is set.
 - **Explicit initialization — SDK path.** `await init_client(options?)` dynamically imports `launchdarkly-server-sdk` at runtime (optional peer dep). If the package is not installed it raises with a clear message.
 - **Explicit initialization — BYOC path.** `await init_client(client)` accepts any pre-initialized object that satisfies `LDClientInterface` — this is the path for custom or edge environments whose SDK has different init semantics.
@@ -905,11 +940,13 @@ There is deliberately **no** `python-dotenv` here: `lifecycle.py` reads `os.envi
 
 Install with `pip install "launchdarkly-ai-server[otel]"`; see [OTel Setup](#otel-setup) for the endpoint variables.
 
-### Resolved dynamically, declared nowhere
+### Optional extra (`[project.optional-dependencies] ld`)
 
 | Package | Why |
 |---|---|
-| `launchdarkly-server-sdk` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. Undeclared because the BYOC path (`init_client(client=...)`) supplies its own client and should not have to install an unused SDK. Absent ⇒ a `RuntimeError` naming the `pip install`, only on the path that needs it. |
+| `launchdarkly-server-sdk>=9.18.3,<10` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. An extra, not a dependency, because the BYOC path (`init_client(client=...)`) supplies its own client and should not have to install an unused SDK. Declared at all so pip can resolve a compatible version: before the extra existed, nothing bounded it. Absent ⇒ a `RuntimeError` naming the `pip install`, only on the path that needs it. |
+
+Install with `pip install "launchdarkly-ai-server[ld]"`.
 
 ### Dev-only (workspace root `[dependency-groups] dev`) — the ones with a contract attached
 
@@ -955,16 +992,34 @@ true. Tampered content must never trigger deletion.
 
 ### 6. Expecting revocation to reach a boot-only `write_skills` deployment
 
-Even with `watch_skills`, only the `"*"` form removes a revoked skill from disk. With an
-explicit list such as `skill_refs(config)`, the list is fixed: a skill the store answers
-`absent` for is reported as an `error` and its files are kept, and the watcher listens only to
-the skill store, so unpinning a skill or moving it to a new version is not seen until the refs
-are read again.
+Even with `watch_skills`, a fixed list never follows its config. With an explicit list such
+as `skill_refs(config)`, a skill the store answers `absent` for is reported as an `error` and
+its files are kept, and unpinning a skill or moving it to a new version is not seen until the
+refs are read again. `"*"` prunes a skill deleted from the library; `config_skills(key,
+context)` is re-read on every reconcile and on every change to its config, so a version bump
+replaces the file and an unpinned skill is pruned.
 
 Without `watch_skills`, the revocation bound is process lifetime: a skill revoked after boot
 stays on disk until the process reconciles again, so a restart (or an explicit re-run of
 `write_skills`) is the incident-response action — and content an agent has already read into
 a conversation is out of reach at this layer either way.
+
+### 7. Reading a `SkillSource` inside the flag listener, or answering `[]` for "I could not tell"
+
+The base SDK calls `flag_tracker` listeners on the thread applying flag data, and under FDv2
+while holding the store lock every `variation()` takes. `SkillWatcher._on_flag_change` must
+only set the wake flag; the source is read on the watcher's worker. A source (hand-built or
+`config_skills`) that returns `[]` when evaluation fails tells the reconcile that every
+skill was revoked, so it prunes them all. Raise instead. For the same reason the
+`config_skills` `variation` default is `None`: any default that reads as a disabled variation
+would turn "client not ready" into "no skills".
+
+A client without a working change signal (no client, no `flag_tracker`, `is_offline()`) makes
+`watch_skills` raise for a source with `config_keys`. Do not turn that into a silent no-op: a
+watcher that never hears about config changes looks exactly like one whose config never
+changed. Daemon mode passes the probe and never fires; that gap is documented, not detected.
+Tests use a hand-built fake client, never a `MagicMock`, which passes the probe and never
+fires.
 
 ---
 
@@ -977,13 +1032,13 @@ a conversation is out of reach at this layer either way.
 ## Invariants to Preserve
 
 - Do not add dependencies on any `launchdarkly-ai-*` handler package. This package has no upward dependencies.
-- Do not add a hard dependency on `launchdarkly-server-sdk`. It must remain an optional peer, discovered via dynamic `importlib.import_module`.
+- Do not add a hard dependency on `launchdarkly-server-sdk`. It must remain optional (the `[ld]` extra), discovered via dynamic `importlib.import_module`.
 - Handler packages must import `LDContext` from `launchdarkly-ai-server` — not directly from any LD SDK.
 - Do not weaken the `parse_ai_config` validation — handler packages rely on `config` being valid when they receive it.
 - `parse_usage` must continue to accept `input_tokens/output_tokens`, `inputTokens/outputTokens`, and `input/output` as all existing handlers return one of these variants.
 - `Skill.content` is opaque `bytes`. Do not add anything that parses or interprets it — no YAML library in this package's dependencies at any tier, and no accessor that decodes content.
-- Do not route skills telemetry through `client.track()`, and do not introduce an LD context anywhere in the skills path. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions.
+- Do not route skills telemetry through `client.track()`, and do not give any skills signal an LD context. Signals go through the `skills_core.py` emitter seam, whose default is a no-op, and only via its `record_*` functions. The one `client.track()` path is the SDK-wide helper usage event (`report_usage`, see "Telemetry seam"); it carries no skill data and is not a skills signal.
 - Do not add a signal name outside the three in the Agent Skills table above — the list is an allowlist. `AgentControl Skill SDK Reference Returned` and `AgentControl Skill Content Retrieved` were considered and deliberately excluded from SDK emission.
-- Do not rename `ld.skills.integrity_failure` in one language only or without a changelog entry, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces, though the experimental stage lets either change in a minor release. See "The integrity-failure log record" above.
+- Do not rename `ld.skills.integrity_failure` in one language only or without a changelog entry, and do not add an eleventh `reason_code` in one language only — both are documented compatibility surfaces. See "The integrity-failure log record" above.
 - Do not relax any of the `write_skills` filesystem defenses (local key re-validation, symlink refusal, manifest-authorized destruction, corrupt-manifest fail-closed, atomic `0644` writes). Each is a deliberate security property with abuse-case tests attached.
 - Do not make `SkillStore` lookups key-only. Version is part of the lookup identity because a payload holds several versions of one key; a key-only seam cannot express a version-pinned reference.

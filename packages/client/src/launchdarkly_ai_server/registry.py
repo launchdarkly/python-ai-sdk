@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from .types import NativeTool, ProviderHandler
@@ -19,7 +19,7 @@ class Registry:
         self,
         *,
         handlers: list[ProviderHandler] | None = None,
-        tools: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tools: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     ) -> None:
         self._handlers: list[ProviderHandler] = list(handlers) if handlers else []
         self._tools: dict[str, Callable[..., Any] | NativeTool] = (
@@ -38,7 +38,7 @@ class Registry:
         self,
         *,
         handlers: list[ProviderHandler] | None = None,
-        tools: dict[str, Callable[..., Any] | NativeTool] | None = None,
+        tools: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     ) -> None:
         if handlers:
             for handler in handlers:
@@ -112,8 +112,8 @@ def resolve_handlers(
 
 def resolve_tools(
     registry: Registry | None,
-    local_tools: dict[str, Callable[..., Any] | NativeTool] | None,
-) -> dict[str, Callable[..., Any] | NativeTool] | None:
+    local_tools: Mapping[str, Callable[..., Any] | NativeTool] | None,
+) -> Mapping[str, Callable[..., Any] | NativeTool] | None:
     """
     Merges registry tools with locally-supplied tools. Local keys win.
     """

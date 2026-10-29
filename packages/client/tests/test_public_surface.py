@@ -1,8 +1,8 @@
 """
 The package root's public surface.
 
-``ROOT_SURFACE`` is the checked-in snapshot of ``launchdarkly_ai_server.__all__``
-(TESTING.md §0.3). It is spelled out so that any change to the root, including
+``ROOT_SURFACE`` is the checked-in snapshot of ``launchdarkly_ai_server.__all__``.
+It is spelled out so that any change to the root, including
 an experimental name leaking onto it, fails here and is seen in review. Update
 it deliberately, in the same change that adds or removes a root export.
 """
@@ -40,6 +40,7 @@ ROOT_SURFACE = frozenset(
         "ParseFailure",
         "ParseResult",
         "ParseSuccess",
+        "NativeGraphRunner",
         "ProviderGraphResponse",
         "ProviderHandler",
         "ProviderResponse",
@@ -116,6 +117,49 @@ ROOT_SURFACE = frozenset(
         "to_usage_dict",
         "tool_result_string",
         "wrap_tool_handlers",
+        # Agent Skills
+        "set_skill_store",
+        "SkillStore",
+        "InMemorySkillStore",
+        "LaunchDarklySkillStore",
+        "FDv2SkillStore",
+        "StoreDiagnostics",
+        "watch_skills",
+        "SkillWatcher",
+        "SkillSource",
+        "config_skills",
+        "skill_refs",
+        "get_skill",
+        "get_skill_result",
+        "get_skills",
+        "all_skills",
+        "write_skills",
+        "Skill",
+        "SkillReference",
+        "SkillOutcome",
+        "ReconcileAction",
+        "ReconcileReport",
+        "ReconcileActionKind",
+        "OnUnavailable",
+        "SkillOutcomeReason",
+        "SKILL_FILENAME",
+        "MANIFEST_FILENAME",
+        "MANIFEST_VERSION",
+        # Evaluations from Code
+        "init_evaluations",
+        "EvaluationsModule",
+        "AIConfig",
+        "GenerationConfig",
+        "GenerationMode",
+        "GenerationOverrides",
+        "DatasetRow",
+        "EvalTool",
+        "Criterion",
+        "Judge",
+        "Scorer",
+        "EvalRunResult",
+        "RunSummary",
+        "EvaluationsError",
     }
 )
 
@@ -127,3 +171,9 @@ def test_root_surface_is_exactly_the_snapshot() -> None:
     assert len(package.__all__) == len(ROOT_SURFACE), "duplicate name in __all__"
     for name in ROOT_SURFACE:
         assert hasattr(package, name), name
+
+
+def test_deprecated_fdv2_skill_store_name_is_the_same_class() -> None:
+    from launchdarkly_ai_server import FDv2SkillStore, LaunchDarklySkillStore
+
+    assert FDv2SkillStore is LaunchDarklySkillStore

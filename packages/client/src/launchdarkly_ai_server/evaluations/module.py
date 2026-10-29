@@ -10,13 +10,14 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast, overload
 
-from ..lifecycle import get_client, init_client
+from ..lifecycle import _flush_tracer_provider, get_client, init_client
 from ..utils import normalize_mode
 from .api import (
     DEFAULT_BASE_URI,
     EvaluationsError,
     LDApiClient,
     Transport,
+    check_string_keys,
     segment,
     urllib_transport,
 )
@@ -60,17 +61,6 @@ def _render_inline_row(row: DatasetRow) -> DatasetRow:
         variables_value=row.variables,
         metadata_value=row.metadata,
     )
-
-
-def _check_string_keys(value: Any) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"keys must be str, not {type(key).__name__}")
-            _check_string_keys(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _check_string_keys(item)
 
 
 def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]:
@@ -126,7 +116,7 @@ def _normalize_inline_rows(rows: Sequence[InlineDatasetRow]) -> list[DatasetRow]
             # references fail there instead of recursing in the key check.
             try:
                 json.dumps(value, allow_nan=False)
-                _check_string_keys(value)
+                check_string_keys(value)
             except (TypeError, ValueError) as error:
                 raise EvaluationsError(
                     f"Inline dataset row {position} {field_name} must be "
@@ -482,14 +472,17 @@ class EvaluationsModule:
                 )
                 raise
         config = self._runner._build_handler_config(run_generation, run_tools)
-        results = await self._runner._run_rows(
-            dataset_rows,
-            generation_handler,
-            config,
-            run_tool_handlers,
-            concurrency,
-        )
+        row_spans: dict[int, Any] = {}
         try:
+            results = await self._runner._run_rows(
+                dataset_rows,
+                generation_handler,
+                config,
+                run_tool_handlers,
+                concurrency,
+                evaluation_run_id=evaluation_run.id,
+                row_spans=row_spans,
+            )
             self._runner._emit_generation_events(
                 client,
                 project_key=self._project_key,
@@ -504,6 +497,8 @@ class EvaluationsModule:
                     run_criteria,
                     resolved_judges,
                     concurrency,
+                    evaluation_run_id=evaluation_run.id,
+                    row_spans=row_spans,
                 )
                 self._runner._emit_evaluation_events(
                     client,
@@ -515,10 +510,19 @@ class EvaluationsModule:
                 )
         finally:
             # Generation results already queued on the SDK event buffer must
-            # reach LaunchDarkly even when the criteria phase fails.
-            flush_result = client.flush()
-            if inspect.isawaitable(flush_result):
-                await flush_result
+            # reach LaunchDarkly even when the criteria phase fails. Spans
+            # follow on the provider init_client already registered. A span
+            # that fails to end must not skip the event flush.
+            try:
+                for row_span in row_spans.values():
+                    row_span.end()
+            finally:
+                try:
+                    flush_result = client.flush()
+                    if inspect.isawaitable(flush_result):
+                        await flush_result
+                finally:
+                    _flush_tracer_provider()
         summary = await self._poll_summary_until_terminal(
             evaluation.id,
             evaluation_run.id,
@@ -878,7 +882,7 @@ def init_evaluations(
     """
     from ..sdk_usage import report_usage
 
-    report_usage("experimental.initEvaluations")
+    report_usage("client.initEvaluations")
     resolved_project_key = (project_key or "").strip() or _env("LD_PROJECT_KEY")
     if not resolved_project_key:
         raise EvaluationsError(

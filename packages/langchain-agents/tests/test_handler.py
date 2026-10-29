@@ -1,7 +1,6 @@
 """
 Tests for launchdarkly-ai-langchain-agents handler.
-Covers §1.1–1.9 (generic) and §2.x.1 span name.
-Reference: TESTING.md §1, §2.x (LangChain)
+Covers the generic handler tests and the LangChain span name.
 """
 
 from __future__ import annotations
@@ -112,7 +111,7 @@ def _patch_lc(mocks: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.x.0 Agent creation API (Python: create_agent from langchain.agents)
+# Agent creation API (Python: create_agent from langchain.agents)
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +121,7 @@ class TestAgentCreationAPI:
     async def test_calls_create_agent_not_create_react_agent(
         self, streaming: bool
     ) -> None:
-        """§2.x.0 — both paths call create_agent from langchain.agents with system_prompt=,
+        """Both paths call create_agent from langchain.agents with system_prompt=,
         never LangGraph's deprecated create_react_agent."""
         mocks = _make_langchain_mock("answer")
         mocks["_agent"].astream = MagicMock(return_value=_empty_astream())
@@ -151,7 +150,7 @@ class TestAgentCreationAPI:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory
+# Factory
 # ---------------------------------------------------------------------------
 
 
@@ -188,7 +187,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -308,7 +307,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -385,7 +384,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -430,6 +429,18 @@ class TestToolExecutionLoop:
         if captured_fns:
             with pytest.raises(ValueError, match="No handler"):
                 await captured_fns[0](key="val")
+
+    @pytest.mark.asyncio
+    async def test_native_tool_is_not_called(self) -> None:
+        # Offline evaluations pass a NativeTool through unwrapped; it is not callable.
+        from launchdarkly_ai_server import NativeTool
+
+        run = _built_tool(
+            {"web-search": {"description": "d", "parameters": {}}},
+            {"web-search": NativeTool("WebSearch")},
+        )
+        with pytest.raises(ValueError, match="No handler"):
+            await run(query="q")
 
     @pytest.mark.asyncio
     async def test_tool_handler_throws_propagates(self) -> None:
@@ -499,8 +510,8 @@ class TestToolExecutionLoop:
             if not chosen:
                 chosen.append("billing")
             return (
-                "Handoff to billing recorded. "
-                "Finish your own work and provide your final response."
+                "Handoff to billing recorded. billing takes over when your turn ends. "
+                "Finish your own part, then end your turn. Do not answer for billing."
             )
 
         tool = _built_tool(
@@ -508,8 +519,8 @@ class TestToolExecutionLoop:
             {"__handoff_billing": handoff},
         )
         assert await tool() == (
-            "Handoff to billing recorded. "
-            "Finish your own work and provide your final response."
+            "Handoff to billing recorded. billing takes over when your turn ends. "
+            "Finish your own part, then end your turn. Do not answer for billing."
         )
         assert chosen == ["billing"]
 
@@ -605,7 +616,7 @@ class TestToolExecutionLoop:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Telemetry
+# Telemetry
 # ---------------------------------------------------------------------------
 
 
@@ -973,7 +984,9 @@ class TestRootSpanAttributes:
         assert attrs["launchdarkly.variation.key"] == "v"
         assert attrs["launchdarkly.run.id"] == "r"
         assert attrs["launchdarkly.graph.key"] == "g"
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
 
     @pytest.mark.asyncio
     async def test_child_spans_carry_no_launchdarkly_identity(self) -> None:
@@ -1113,11 +1126,24 @@ class TestContentCapture:
     """TELEMETRY-CONTRACT.md section 7."""
 
     @pytest.mark.asyncio
-    async def test_emits_no_content_at_all_by_default(self) -> None:
+    async def test_emits_content_by_default(self) -> None:
         ctx, rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("hi")])
         with ctx:
             await create_langchain_agents_handler(llm)(BASE_CONFIG, "q")
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(self) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            await create_langchain_agents_handler(llm, capture_content=False)(
+                BASE_CONFIG, "q"
+            )
         for span in rec.spans:
             content_keys = [
                 k
@@ -1289,7 +1315,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1350,7 +1376,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1547,7 +1573,7 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)
+# Streaming telemetry (do not patch _HAS_OTEL=False)
 # ---------------------------------------------------------------------------
 
 
@@ -1659,13 +1685,29 @@ class TestStreamingTelemetry:
         assert rec.root.ended == 1
 
     @pytest.mark.asyncio
-    async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
+    async def test_emits_content_by_default_on_the_streaming_path(self) -> None:
         ctx, rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("hi")])
         with ctx:
             async for _ in await create_langchain_agents_handler(llm).stream(
                 BASE_CONFIG, "q", {}, {}
             ):
+                pass
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("hi")])
+        with ctx:
+            async for _ in await create_langchain_agents_handler(
+                llm, capture_content=False
+            ).stream(BASE_CONFIG, "q", {}, {}):
                 pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
@@ -1692,7 +1734,7 @@ class TestStreamingTelemetry:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format
+# Output format
 # ---------------------------------------------------------------------------
 
 
@@ -1739,12 +1781,12 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not raise or produce None content
+# None user_input must not raise or produce None content
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: _build_initial_messages must not pass None to
+    """_build_initial_messages must not pass None to
     HumanMessage when user_input is None."""
 
     def test_none_user_input_no_none_human_message_content(self) -> None:
@@ -1775,7 +1817,7 @@ class TestNoneUserInput:
         for arg in captured_human_args:
             assert arg is not None, (
                 "HumanMessage was constructed with None content; "
-                "must use '' when user_input is None (TESTING.md §1.2 Path C)"
+                "must use '' when user_input is None"
             )
 
 
@@ -2663,7 +2705,7 @@ class TestModelSource:
         ):
             with pytest.raises(
                 ImportError,
-                match=r"pip install langchain-aws",
+                match=r"pip install \"launchdarkly-ai-langchain-agents\[aws\]\"",
             ):
                 handler_mod._make_default_chat_model(cfg)
 

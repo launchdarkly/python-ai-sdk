@@ -86,3 +86,21 @@ jobs:
             echo "Building $pkg..."
             (cd "$pkg" && uv build --out-dir dist)
           done
+
+  # ─── Packaging ──────────────────────────────────────────────────────────────
+  # Installs each wheel into an empty virtualenv with its documented install
+  # command, then imports its public modules and every module its source
+  # imports, lazy ones included. The workspace test run cannot catch an
+  # undeclared dependency, because it installs every package's at once.
+  packaging:
+    name: Packaging check
+    needs: [lint, typecheck, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv lock
+      - run: uv sync --all-packages
+      - run: make check-packaging

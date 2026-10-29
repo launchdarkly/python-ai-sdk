@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-opencode-agents-0.2.0...launchdarkly-ai-opencode-agents-0.3.0) (2026-10-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **opencode-agents:** honor AI Config tools ([#216](https://github.com/launchdarkly/python-ai-sdk/issues/216))
+* handlers now forward the AI Config's model parameters to the provider, limited to each handler's list in TESTING.md 1.12. Configs that set parameters which used to be ignored now take effect.
+
+### Experimental
+
+* **evaluations:** normalize text behaviors ([7cee8c8](https://github.com/launchdarkly/python-ai-sdk/commit/7cee8c8667ecfa2ec4b939accbcb1c633071e81a))
+
+
+### Features
+
+* **opencode-agents:** honor AI Config tools ([#216](https://github.com/launchdarkly/python-ai-sdk/issues/216)) ([b5a63ec](https://github.com/launchdarkly/python-ai-sdk/commit/b5a63ecc9fb45ae2c65e89bc3a57167bce2ce14c))
+
+
+### Bug Fixes
+
+* **client:** show a judge an output of 0 or false, and render non-string values as JSON ([7cee8c8](https://github.com/launchdarkly/python-ai-sdk/commit/7cee8c8667ecfa2ec4b939accbcb1c633071e81a))
+* pass AI Config model parameters through to every provider handler ([#107](https://github.com/launchdarkly/python-ai-sdk/issues/107)) ([e3afb3f](https://github.com/launchdarkly/python-ai-sdk/commit/e3afb3f2c19ebf7085f84e94cd5a53f2bbe929ae))
+
 ## [0.2.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-opencode-agents-0.1.0...launchdarkly-ai-opencode-agents-0.2.0) (2026-10-23)
 
 

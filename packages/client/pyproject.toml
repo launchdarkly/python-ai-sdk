@@ -1,6 +1,6 @@
 [project]
 name = "launchdarkly-ai-server"
-version = "0.4.0"
+version = "0.5.0"
 requires-python = ">=3.12"
 dependencies = ["opentelemetry-api>=1.25"]
 description = "LaunchDarkly AI SDK core client for Python"
@@ -9,7 +9,7 @@ license = "Apache-2.0"
 authors = [{name = "LaunchDarkly", email = "team@launchdarkly.com"}]
 keywords = ["launchdarkly", "ai", "feature-flags", "sdk", "opentelemetry"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
@@ -27,6 +27,8 @@ otel = [
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-otlp-proto-http>=1.25",
 ]
+# The base SDK init_client() discovers at runtime; optional so BYOC installs stay lean.
+ld = ["launchdarkly-server-sdk>=9.18.3,<10"]
 
 [build-system]
 requires = ["hatchling>=1.32,<2"]
