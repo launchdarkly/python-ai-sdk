@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeVar
 
 # ---------------------------------------------------------------------------
 # LDContext
@@ -19,24 +19,32 @@ At minimum carries ``kind`` and ``key``; additional attributes are allowed.
 # ---------------------------------------------------------------------------
 
 
-class LDClientInterface:
-    """Protocol-like base; pass any object that satisfies this surface."""
+class LDClientInterface(Protocol):
+    """
+    Structural type for any LaunchDarkly client; ``ldclient.LDClient`` satisfies it.
 
-    async def variation(
-        self, key: str, context: LDContext, default_value: Any
-    ) -> Any: ...
+    ``variation``, ``flush`` and ``close`` may be sync or async: the SDK awaits any
+    awaitable result. ``track`` must be synchronous: the SDK calls it from sync code and
+    drops the result, so an ``async def track`` would never send an event. ``context`` is
+    ``Any`` because ``ldclient`` takes an ``ldclient.Context``, which the SDK builds from
+    an ``LDContext`` before the call. Parameters are positional-only so implementations
+    may name them freely (``ldclient`` calls the third ``variation`` argument ``default``).
+    """
+
+    def variation(self, key: str, context: Any, default_value: Any, /) -> Any: ...
 
     def track(
         self,
         event_name: str,
-        context: LDContext,
+        context: Any,
         data: Any = None,
         metric_value: float | None = None,
+        /,
     ) -> None: ...
 
-    async def flush(self) -> None: ...
+    def flush(self) -> Any: ...
 
-    async def close(self) -> None: ...
+    def close(self) -> Any: ...
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +138,7 @@ _HandlerFn = Callable[
     [
         AiConfigRep,
         str | None,
-        dict[str, Any] | None,
+        Mapping[str, Callable[..., Any] | NativeTool] | None,
         dict[str, Any] | None,
         list[dict[str, Any]] | None,
     ],
@@ -140,7 +148,7 @@ _StreamFn = Callable[
     [
         AiConfigRep,
         str | None,
-        dict[str, Any] | None,
+        Mapping[str, Callable[..., Any] | NativeTool] | None,
         dict[str, Any] | None,
         list[dict[str, Any]] | None,
     ],
@@ -198,7 +206,7 @@ class ProviderHandler:
         self,
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> HandlerResult:
@@ -211,7 +219,7 @@ class ProviderHandler:
         self,
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -389,7 +397,7 @@ StreamEvent = dict[str, Any]  # StreamChunkEvent | StreamDoneEvent
 # Graph stream events (camelCase public fields, matching the TypeScript SDK)
 # node_start: {type, nodeKey}
 # chunk: {type, text, nodeKey}
-# node_done: {type, nodeKey, response, usage}
+# node_done: {type, nodeKey, response, usage, judgeResults?}  (the node's own judges)
 # handoff: {type, sourceKey, targetKey}
 # done: {type, response, usage, judgeResults?}
 GraphStreamEvent = dict[str, Any]
@@ -487,6 +495,21 @@ class ProviderGraphResponse:
     """Aggregate token counts across all nodes."""
     judge_results: dict[str, JudgeResult] | None = None
     """Results from a graph-level judge, if configured."""
+
+
+class NativeGraphRunner(Protocol):
+    """
+    What a native graph adapter (``to_lang_graph``, ``to_openai_agents``, …) returns.
+
+    ``invoke`` resolves to ``{"response": str, "usage": UsageDict}``.
+    """
+
+    def invoke(
+        self,
+        input_text: str = "",
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> Awaitable[dict[str, Any]]: ...
 
 
 # ---------------------------------------------------------------------------

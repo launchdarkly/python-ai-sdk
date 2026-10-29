@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from .conversation import with_judge_evaluation
@@ -92,7 +92,7 @@ async def run_judges(
     user_input: str | None,
     llm_response: str,
     base_track_data: TrackData,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     graph_key: str | None = None,
     trajectory: str = "",
 ) -> dict[str, JudgeResult]:

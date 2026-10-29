@@ -6,7 +6,7 @@ provides_for = ('*', 'agent')
 
 Each call starts `opencode serve`, speaks the stable HTTP API (`/session`, `/session/{id}/message`, `/event`, `/session/{id}/abort`), and stops the process when the stream finishes or the caller closes it. The package does not import or construct `anomalyco/opencode-sdk-python`.
 
-This package is Python-only. There is no JS counterpart in this slice. The spec section, API surface list, and `usage-ids.txt` row live in `launchdarkly/ai-sdks-monorepo`, which is not this repository. The usage helper ids are `opencode-agents.createOpenCodeHandler` and `opencode-agents.opencodeAgents`. The package is a normal pre-v1 package, same as the other handlers.
+This package is Python-only. There is no JS counterpart in this slice. The usage helper ids are `opencode-agents.createOpenCodeHandler` and `opencode-agents.opencodeAgents`. The package is a normal pre-v1 package, same as the other handlers.
 
 ## File map
 

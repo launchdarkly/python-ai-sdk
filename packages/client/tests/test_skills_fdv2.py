@@ -1678,7 +1678,7 @@ class TestPollingAgainstTheEndpoint:
         Releasing ``wait_for_skills`` on it would make ``is_initialized`` true
         over an empty committed set — the fact ``write_skills("*")`` prunes on —
         so a reconcile that raced delivery would delete every managed skill on
-        disk instead of reporting the retrieval unavailable (§3.21). Failing
+        disk instead of reporting the retrieval unavailable. Failing
         closed costs a boot that is genuinely waiting nothing it was not already
         waiting for.
         """

@@ -1,6 +1,5 @@
 """
-Tests for §3.9 init_client / get_client / shutdown.
-Reference: TESTING.md §3.9
+Tests for init_client / get_client / shutdown.
 """
 
 import ast
@@ -673,7 +672,7 @@ class TestShutdown:
     async def test_a_failure_clearing_experimental_state_is_logged_not_raised(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Experimental behaviour must not break a core call (TESTING.md §0.3)."""
+        """Experimental behaviour must not break a core call."""
         stub = _make_stub_client()
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=stub)
@@ -694,8 +693,8 @@ class TestShutdown:
         assert "Could not clear the Failing Feature state" in caplog.messages
         later.assert_called_once()  # one failing hook does not skip the rest
 
-    def test_lifecycle_imports_no_skills_module(self) -> None:
-        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
+    @staticmethod
+    def _lifecycle_imports() -> set[str]:
         tree = ast.parse(inspect.getsource(lifecycle_module))
         imported: set[str] = set()
         for node in ast.walk(tree):
@@ -705,10 +704,25 @@ class TestShutdown:
                 imported.add(node.module or "")
                 # `from . import skills_core` names the module in the alias, not in `module`.
                 imported.update(alias.name for alias in node.names)
+        return imported
+
+    def test_lifecycle_imports_no_skills_module(self) -> None:
+        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
         skills = sorted(
-            name for name in imported if name.rsplit(".", 1)[-1].startswith("skills")
+            name
+            for name in self._lifecycle_imports()
+            if name.rsplit(".", 1)[-1].startswith("skills")
         )
         assert skills == []
+
+    def test_lifecycle_imports_no_evaluations_module(self) -> None:
+        """Lifecycle imports no Evaluations from Code module."""
+        evaluations = sorted(
+            name
+            for name in self._lifecycle_imports()
+            if "evaluations" in name.split(".")
+        )
+        assert evaluations == []
 
     def test_core_does_not_import_experimental_code(self) -> None:
         """Importing and shutting down core loads no experimental module."""
@@ -716,9 +730,8 @@ class TestShutdown:
             "import asyncio, sys\n"
             "import launchdarkly_ai_server\n"
             "asyncio.run(launchdarkly_ai_server.shutdown())\n"
-            "loaded = sorted(m for m in sys.modules if m.startswith("
-            "('launchdarkly_ai_server.evaluations',"
-            " 'launchdarkly_ai_server.experimental')))\n"
+            "loaded = sorted(m for m in sys.modules"
+            " if m.startswith('launchdarkly_ai_server.experimental'))\n"
             "print(','.join(loaded))\n"
         )
         result = subprocess.run(
@@ -738,7 +751,7 @@ class TestShutdown:
 
 
 # ---------------------------------------------------------------------------
-# OTel setup details (§3.9)
+# OTel setup details
 # ---------------------------------------------------------------------------
 
 
@@ -1139,7 +1152,7 @@ class TestInspectConfig:
 
 
 class TestExtractVariationMissingEnabled:
-    # Spec §3.10: only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
+    # Only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
     @pytest.mark.parametrize("ld_meta", [None, {}], ids=["no_ldMeta", "empty_ldMeta"])
     async def test_raises_when_enabled_is_missing(
         self, ld_meta: dict[str, Any] | None

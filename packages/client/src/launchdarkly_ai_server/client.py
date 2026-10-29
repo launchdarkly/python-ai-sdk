@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
 from typing import Any
 
@@ -52,7 +52,7 @@ class ConfigInstance:
         self,
         key: str,
         handler: ProviderHandler | list[ProviderHandler] | None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
         registry: Any,  # Registry | None
         skip_judges: bool = False,
     ) -> None:
@@ -304,7 +304,7 @@ def config(
     *,
     key: str,
     handler: ProviderHandler | list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     skip_judges: bool = False,
 ) -> ConfigInstance:
@@ -333,7 +333,7 @@ def _config(
     *,
     key: str,
     handler: ProviderHandler | list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     skip_judges: bool = False,
 ) -> ConfigInstance:

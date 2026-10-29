@@ -8,7 +8,7 @@ Agents SDK's `LitellmModel`.
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-litellm-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-litellm-agents
 ```
 
 Python uses LiteLLM in-process; no proxy endpoint is required. Set the provider

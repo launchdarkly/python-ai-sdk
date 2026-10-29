@@ -8,13 +8,15 @@ from __future__ import annotations
 import inspect
 import re
 import time
-import types
 import uuid
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, TypedDict
 
 from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
+    LDContext,
+    NativeGraphRunner,
     NativeTool,
     compose_history,
     get_client,
@@ -69,7 +71,7 @@ def _build_system_prompt(node: GraphNode, variables: dict[str, Any]) -> str | No
 
 def _build_node_tools(
     node: GraphNode,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     import importlib
 
@@ -121,10 +123,20 @@ def _extract_usage(msg: Any) -> dict[str, int]:
     return {"input": input_t, "output": output_t, "total": input_t + output_t}
 
 
+class LangChainNativeGraphOptions(TypedDict, total=False):
+    """Options for :func:`to_lang_graph`."""
+
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
+    model_factory: Callable[[GraphNode], Any]
+    """Builds the chat model for a node. Defaults to ``ChatOpenAI``."""
+    context: LDContext
+    """LaunchDarkly context used for tracking events. Required for LD telemetry."""
+
+
 def to_lang_graph(
-    def_promise: Any,
-    opts: dict[str, Any] | None = None,
-) -> Any:
+    def_promise: Awaitable[GraphDefinition],
+    opts: LangChainNativeGraphOptions | None = None,
+) -> NativeGraphRunner:
     """
     Converts a resolved ``GraphDefinition`` into a compiled LangGraph
     ``StateGraph`` and returns a caller that runs it via ``compiled.invoke``.
@@ -171,7 +183,9 @@ def to_lang_graph(
         if not root:
             raise ValueError(f'Graph "{def_obj.key}" has no root node')
 
-        tool_handlers: dict[str, Any] = _opts.get("tool_handlers") or {}
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] = (
+            _opts.get("tool_handlers") or {}
+        )
         model_factory = _opts.get("model_factory")
         raw_ld_context = _opts.get("context")
         ld_context = (
@@ -464,4 +478,10 @@ def to_lang_graph(
             if span:
                 span.end()
 
-    return types.SimpleNamespace(invoke=invoke)
+    # A class, not a SimpleNamespace, so mypy checks invoke against NativeGraphRunner.
+    _invoke = invoke
+
+    class _Runner:
+        invoke = staticmethod(_invoke)
+
+    return _Runner()

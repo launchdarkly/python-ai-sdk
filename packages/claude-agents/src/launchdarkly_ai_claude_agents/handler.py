@@ -89,12 +89,14 @@ from .spans import (
 #: environment, working directory, file access, permissions, settings files, plugins, sandbox,
 #: session state) stays under the application's control, never a config's.
 #:
-#: This is the cross-SDK list for Claude Agents (TESTING.md section 1.12), shared with the native
+#: This is the cross-SDK list for Claude Agents, shared with the native
 #: graph through :func:`_options_parameters`.
 #:
-#: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
-#: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
-#: for other providers; they are dropped like any other key not listed here.
+#: The SDK offers no ``temperature``/``top_p``/``top_k``/``stop_sequences``/``tool_choice``/
+#: ``metadata``, all of which the LaunchDarkly UI's model parameters panel offers for other
+#: providers; they are dropped like any other key not listed here. It has no ``max_tokens`` field
+#: either, but ``max_tokens`` is not dropped: :func:`_options_parameters` sends it to the CLI as
+#: :data:`_MAX_OUTPUT_TOKENS_ENV`.
 _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
     {
         "betas",
@@ -176,7 +178,7 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
 
 async def _build_tool_mcp(
     config_tools: dict[str, Any],
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
 ) -> Any:
     """Build an in-process SDK MCP server from LD config tools + handler functions.
 
@@ -213,7 +215,7 @@ async def _build_tool_mcp(
 
 def _partition_tools(
     config_tools: dict[str, Any] | None,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """
     Returns (native_tool_map, user_config_tools, native_tool_names).
@@ -239,7 +241,9 @@ def _partition_tools(
     return native_tool_map, user_config_tools, list(native_tool_map.keys())
 
 
-def _native_tool_aliases(tool_handlers: dict[str, Any]) -> dict[str, str]:
+def _native_tool_aliases(
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
+) -> dict[str, str]:
     """AI Config key → provider tool name, for the config's native tools only.
 
     ``_partition_tools``'s ``native_tool_map`` is keyed the other way round, by provider name, which
@@ -600,6 +604,16 @@ def _raise_if_run_failed(message: Any) -> None:
     )
 
 
+#: The variable the CLI reads its output-token limit from. ``ClaudeAgentOptions`` has no
+#: output-token field, so the config's ``max_tokens`` reaches the CLI as this variable in its
+#: environment, the only value this package writes there. Without it the CLI sends its own default
+#: (32000 on ``claude-haiku-4-5``) whatever the config asks for.
+_MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+
+#: The largest ``max_tokens`` kept, ``Number.MAX_SAFE_INTEGER`` in JS: the JS SDK drops a larger
+#: value, so both SDKs send the same thing for the same config.
+_MAX_TOKENS_LIMIT = 2**53 - 1
+
 #: The ``thinking`` types ``claude_agent_sdk`` knows (``ThinkingConfig``). It reads
 #: ``thinking["type"]`` when it builds the CLI command, so a ``thinking`` without one raises.
 _THINKING_TYPES = frozenset({"adaptive", "enabled", "disabled"})
@@ -636,9 +650,17 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
     ``thinking`` rebuilt by :func:`_rebuild_thinking`. The handler and the native graph both call
     this, so they forward the same keys.
+
+    Two fields are set even though the config does not name them. ``thinking`` is
+    ``{"type": "disabled"}`` unless the config sets ``thinking`` or ``max_thinking_tokens``,
+    because the CLI otherwise picks thinking itself (a 31,999-token budget on
+    ``claude-haiku-4-5``). And a positive integer ``max_tokens`` up to
+    :data:`_MAX_TOKENS_LIMIT` becomes
+    ``env={_MAX_OUTPUT_TOKENS_ENV: ...}``, which the SDK adds to the inherited ``os.environ``.
     """
+    parameters = model_parameters(config)
     params = select_forwarded_parameters(
-        model_parameters(config),
+        parameters,
         _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
         mapping_keys=_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS,
     )
@@ -646,6 +668,18 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
         thinking = _rebuild_thinking(params.pop("thinking"))
         if thinking is not None:
             params["thinking"] = thinking
+    if "thinking" not in params and params.get("max_thinking_tokens") is None:
+        params["thinking"] = {"type": "disabled"}
+    max_tokens = parameters.get("max_tokens")
+    # JSON has one number type, so ``200.0`` is the same value the JS SDK reads as 200.
+    if isinstance(max_tokens, float) and max_tokens.is_integer():
+        max_tokens = int(max_tokens)
+    if (
+        isinstance(max_tokens, int)
+        and not isinstance(max_tokens, bool)
+        and 0 < max_tokens <= _MAX_TOKENS_LIMIT
+    ):
+        params["env"] = {_MAX_OUTPUT_TOKENS_ENV: str(max_tokens)}
     return params
 
 
@@ -778,7 +812,7 @@ def _create_claude_agents_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -964,7 +998,7 @@ def _create_claude_agents_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -1035,7 +1069,7 @@ def _map_claude_stream_event(
 async def _stream_gen(
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
