@@ -1,10 +1,15 @@
 """
-Tests for wrap_tool_handlers.
+Tests for wrap_tool_handlers and the handler variables execute_and_track builds.
 """
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server import NATIVE_TOOL_KEY, NativeTool, wrap_tool_handlers
+from launchdarkly_ai_server.tracking import execute_and_track
 
 
 def _make_mock_client() -> MagicMock:
@@ -85,3 +90,40 @@ class TestWrapToolHandlers:
     def test_undefined_tool_handlers(self) -> None:
         result = wrap_tool_handlers(None, CONTEXT, TRACK_DATA)
         assert result == {}
+
+
+class TestHandlerVariables:
+    @pytest.mark.parametrize(
+        ("evaluated", "expected"),
+        [(None, None), ({"raw": True}, {"raw": True})],
+    )
+    async def test_a_caller_supplied_ld_value_never_reaches_the_handler(
+        self, evaluated: Any, expected: Any
+    ) -> None:
+        seen: list[dict[str, Any]] = []
+
+        async def handler(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict[str, Any]:
+            seen.append(dict(variables or {}))
+            return {"output": "ok", "usage": {}}
+
+        lifecycle_module._set_client_for_testing(_make_mock_client())
+        try:
+            await execute_and_track(
+                config_key="c",
+                config={"model": {"name": "m"}, "provider": {"name": "P"}},
+                meta={"variationKey": "v", "version": 1},
+                user_context={"kind": "user", "key": "u1"},
+                handler=handler,  # type: ignore[arg-type]
+                variables={"__ldValue": "from-caller"},
+                evaluated_value=evaluated,
+            )
+        finally:
+            lifecycle_module._reset_for_testing()
+
+        assert seen[0].get("__ldValue") == expected

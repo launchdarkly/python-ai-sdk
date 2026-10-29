@@ -215,6 +215,9 @@ async def execute_and_track(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
+    # ``__ldValue`` is SDK-owned like ``__ld``: a caller-supplied one never
+    # reaches the handler.
+    merged_variables.pop("__ldValue", None)
     if evaluated_value is not None:
         merged_variables["__ldValue"] = evaluated_value
 
@@ -318,6 +321,9 @@ async def execute_and_stream(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
+    # ``__ldValue`` is SDK-owned like ``__ld``: a caller-supplied one never
+    # reaches the handler.
+    merged_variables.pop("__ldValue", None)
     if evaluated_value is not None:
         merged_variables["__ldValue"] = evaluated_value
 
