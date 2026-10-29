@@ -17,6 +17,7 @@ from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
 from launchdarkly_ai_langchain_agents.native_graph import (
     _build_node_tools,
     _extract_usage,
+    _to_neutral_history,
     to_lang_graph,
 )
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
@@ -1651,3 +1652,70 @@ class TestNativeHandoffRealStateGraph:
         assert second[2].tool_calls[0]["id"] == "call_x"
         assert second[2].content == [_REASONING]
         assert second[3].tool_call_id == "call_x"
+
+
+class TestToNeutralHistory:
+    """The rewrite rules in spec §2.x.3, on one input that hits each of them.
+    The TypeScript test uses the same input and expects the same output."""
+
+    def test_rewrites_every_case(self) -> None:
+        from langchain_core.messages import (
+            AIMessage,
+            AIMessageChunk,
+            HumanMessage,
+            SystemMessage,
+            ToolMessage,
+        )
+
+        image = [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:x"}},
+        ]
+        history = [
+            SystemMessage("sys"),
+            HumanMessage(image),
+            AIMessage(
+                content=[
+                    _REASONING,
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": None},
+                    {"type": "text", "text": "b"},
+                ],
+                tool_calls=[
+                    {
+                        "name": "first",
+                        "args": {"q": "café", "n": {"x": [1, 2]}},
+                        "id": "c1",
+                    },
+                    {"name": "second", "args": {}, "id": "c2"},
+                ],
+            ),
+            ToolMessage("orphan", tool_call_id="zz", name="lost"),
+            ToolMessage([{"type": "text", "text": "two"}], tool_call_id="c2"),
+            ToolMessage("one", tool_call_id="c1"),
+            AIMessage(content=[_REASONING]),
+            AIMessageChunk(
+                content="chunk", tool_calls=[{"name": "t", "args": {}, "id": "c3"}]
+            ),
+        ]
+
+        out = _to_neutral_history(history, AIMessage, HumanMessage)
+
+        assert [(m.type, m.content) for m in out] == [
+            ("system", "sys"),
+            ("human", image),
+            (
+                "ai",
+                "ab\n"
+                '[Tool call] first {"q":"café","n":{"x":[1,2]}}\n'
+                "[Tool call] second {}",
+            ),
+            (
+                "human",
+                "[Tool result] first: one\n"
+                "[Tool result] second: two\n"
+                "[Tool result] lost: orphan",
+            ),
+            ("ai", "chunk\n[Tool call] t {}"),
+        ]
+        assert all(not getattr(m, "tool_calls", None) for m in out)

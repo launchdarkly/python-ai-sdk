@@ -74,11 +74,16 @@ def _content_text(content: Any) -> str:
         return content
     if isinstance(content, list):
         return "".join(
-            part.get("text", "")
+            part.get("text") or ""
             for part in content
             if isinstance(part, dict) and part.get("type") == "text"
         )
     return ""
+
+
+# Message `type` values, chunks included (an AIMessageChunk's type is not "ai").
+_AI_TYPES = frozenset({"ai", "AIMessageChunk"})
+_TOOL_TYPES = frozenset({"tool", "ToolMessageChunk"})
 
 
 def _to_neutral_history(
@@ -104,11 +109,11 @@ def _to_neutral_history(
         results.clear()
 
     for m in messages:
-        if m.type == "tool":
+        if m.type in _TOOL_TYPES:
             results.append(m)
             continue
         _flush()
-        if m.type != "ai":
+        if m.type not in _AI_TYPES:
             out.append(m)
             continue
         calls = list(getattr(m, "tool_calls", None) or [])
@@ -411,7 +416,7 @@ def to_lang_graph(
                     # tool loop; anything else means the node was just entered.
                     if not (
                         last is not None
-                        and last.type == "tool"
+                        and last.type in _TOOL_TYPES
                         and last.tool_call_id in routing["call_ids"]
                     ):
                         routing["start"] = len(state_messages)
