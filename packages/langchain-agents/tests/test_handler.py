@@ -74,14 +74,14 @@ def _make_langchain_mock(response: str = "answer") -> Any:
     mock_agent = AsyncMock()
     mock_agent.ainvoke = AsyncMock(return_value={"messages": [ai_msg]})
 
-    mock_langgraph_prebuilt = MagicMock()
-    mock_langgraph_prebuilt.create_react_agent = MagicMock(return_value=mock_agent)
+    mock_langchain_agents = MagicMock()
+    mock_langchain_agents.create_agent = MagicMock(return_value=mock_agent)
 
     lc_tools = MagicMock()
     lc_tools.tool = MagicMock(side_effect=lambda name, fn=None, **kw: fn)
 
     return {
-        "langgraph.prebuilt": mock_langgraph_prebuilt,
+        "langchain.agents": mock_langchain_agents,
         "langchain_core.messages": lc_msgs,
         "langchain_core.tools": lc_tools,
         "langchain_openai": MagicMock(ChatOpenAI=MagicMock(return_value=mock_llm)),
@@ -111,63 +111,42 @@ def _patch_lc(mocks: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Agent creation API (Python: create_react_agent from langgraph.prebuilt)
+# Agent creation API (Python: create_agent from langchain.agents)
 # ---------------------------------------------------------------------------
 
 
 class TestAgentCreationAPI:
     @pytest.mark.asyncio
-    async def test_calls_create_react_agent_not_createAgent(self) -> None:
-        """Python handler must call create_react_agent from langgraph.prebuilt."""
-        captured: dict[str, Any] = {"called": False, "args": None, "kwargs": None}
-
-        mock_agent = AsyncMock()
-        ai_msg = _make_ai_msg("answer")
-        mock_agent.ainvoke = AsyncMock(return_value={"messages": [ai_msg]})
-
-        def _fake_create_react_agent(*args: Any, **kwargs: Any) -> Any:
-            captured["called"] = True
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            return mock_agent
-
-        mock_langgraph_prebuilt = MagicMock()
-        mock_langgraph_prebuilt.create_react_agent = _fake_create_react_agent
-
-        lc_msgs = MagicMock()
-        lc_msgs.HumanMessage = MagicMock(
-            side_effect=lambda c: MagicMock(content=c, type="human")
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_calls_create_agent_not_create_react_agent(
+        self, streaming: bool
+    ) -> None:
+        """Both paths call create_agent from langchain.agents with system_prompt=,
+        never LangGraph's deprecated create_react_agent."""
+        mocks = _make_langchain_mock("answer")
+        mocks["_agent"].astream = MagicMock(return_value=_empty_astream())
+        create_agent = mocks["langchain.agents"].create_agent
+        prebuilt = MagicMock()
+        prebuilt.create_react_agent = MagicMock(
+            side_effect=AssertionError("deprecated create_react_agent was called")
         )
-        lc_msgs.AIMessage = MagicMock()
-        lc_msgs.SystemMessage = MagicMock()
+        mocks["langgraph.prebuilt"] = prebuilt
 
-        def _import_side_effect(name: str) -> Any:
-            if name == "langgraph.prebuilt":
-                return mock_langgraph_prebuilt
-            if name == "langchain":
-                # Return a mock that does NOT have createAgent
-                # so the handler would fail if it tries to call langchain.createAgent
-                m = MagicMock(spec=[])  # empty spec means no attributes allowed
-                return m
-            if name == "langchain_core.messages":
-                return lc_msgs
-            if name == "langchain_core.tools":
-                tools_mod = MagicMock()
-                tools_mod.tool = MagicMock(side_effect=lambda name, fn=None, **kw: fn)
-                return tools_mod
-            if name == "langchain_openai":
-                return MagicMock()
-            return __import__(name)
-
-        with patch("importlib.import_module", side_effect=_import_side_effect):
-            with patch.object(spans_mod, "_HAS_OTEL", False):
-                h = create_langchain_agents_handler(llm=MagicMock())
+        with _patch_lc(mocks), patch.object(spans_mod, "_HAS_OTEL", False):
+            h = create_langchain_agents_handler(llm=MagicMock())
+            if streaming:
+                assert h.stream is not None
+                async for _ in await h.stream(
+                    _make_config(instructions="Be helpful."), "hi"
+                ):
+                    pass
+            else:
                 await h(_make_config(instructions="Be helpful."), "hi")
 
-        assert captured["called"], (
-            "create_react_agent from langgraph.prebuilt was not called. "
-            "Handler must use create_react_agent, not langchain.createAgent."
-        )
+        create_agent.assert_called_once()
+        assert create_agent.call_args.kwargs.get("system_prompt") == "Be helpful."
+        assert "prompt" not in create_agent.call_args.kwargs
+        prebuilt.create_react_agent.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +565,7 @@ class TestToolExecutionLoop:
                 built["tools"] = tools
                 return mocks["_agent"]
 
-            mocks["langgraph.prebuilt"].create_react_agent = MagicMock(
-                side_effect=_create
-            )
+            mocks["langchain.agents"].create_agent = MagicMock(side_effect=_create)
 
             async def _call_handoff() -> str:
                 assert built.get("tools"), "route did not receive built tools"
@@ -644,7 +621,7 @@ class TestToolExecutionLoop:
 
 
 class _FakeToolModel(BaseChatModel):
-    """A real ``BaseChatModel`` (so ``create_react_agent`` accepts it) that returns canned replies
+    """A real ``BaseChatModel`` (so ``create_agent`` accepts it) that returns canned replies
     in sequence and never touches the network. ``bind_tools`` is required by the agent graph and
     the base class raises ``NotImplementedError`` for it.
     """
@@ -1782,9 +1759,7 @@ class TestOutputFormat:
             captured_calls.append((args, kw))
             return mocks["_agent"]
 
-        mocks["langgraph.prebuilt"].create_react_agent = MagicMock(
-            side_effect=_capture_agent
-        )
+        mocks["langchain.agents"].create_agent = MagicMock(side_effect=_capture_agent)
 
         with _patch_lc(mocks):
             with patch.object(spans_mod, "_HAS_OTEL", False):
@@ -1799,13 +1774,10 @@ class TestOutputFormat:
                 )
                 await h(config, "hi")
 
-        if captured_calls:
-            # The system prompt is passed as the "prompt" keyword argument
-            kw = captured_calls[0][1]
-            system = kw.get("prompt", "")
-            assert (
-                "json" in (system or "").lower() or "schema" in (system or "").lower()
-            )
+        assert captured_calls, "create_agent was not called"
+        # The system prompt is passed as create_agent's "system_prompt" keyword argument
+        system = captured_calls[0][1].get("system_prompt", "")
+        assert "json" in (system or "").lower() or "schema" in (system or "").lower()
 
 
 # ---------------------------------------------------------------------------
