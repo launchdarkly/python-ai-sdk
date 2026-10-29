@@ -679,7 +679,7 @@ def _create_langchain_agents_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` below can tell an open root
         # from a closed one without asking the span. A mock span answers `is_recording()`
@@ -842,7 +842,7 @@ async def _stream_gen(
     """
     import importlib
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     system_prompt = _extract_system_prompt(config, variables)

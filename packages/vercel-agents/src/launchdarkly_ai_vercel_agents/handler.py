@@ -24,6 +24,7 @@ from launchdarkly_ai_server import (
     parse_template,
     report_usage,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
 
@@ -523,7 +524,9 @@ def _create_vercel_agents_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         vs = variables or {}
-        span = start_root_span(cfg, vs)
+        span = start_root_span(
+            cfg, vs, capture_content=effective_capture_content(capture_content)
+        )
         parent = parent_context_of(span)
         turns = _ChatTurns(cfg, parent)
         failed = False
@@ -576,7 +579,9 @@ def _create_vercel_agents_handler(
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         vs = variables or {}
-        span = start_root_span(cfg, vs)
+        span = start_root_span(
+            cfg, vs, capture_content=effective_capture_content(capture_content)
+        )
         parent = parent_context_of(span)
         turns = _ChatTurns(cfg, parent)
         completed = False

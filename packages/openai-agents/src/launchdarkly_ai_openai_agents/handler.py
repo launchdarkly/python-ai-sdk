@@ -685,7 +685,7 @@ def _create_openai_agents_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared once this path (success or failure) has ended the root, so the `finally` below can
         # tell an open root from a closed one without asking the span. A mock span answers
@@ -811,7 +811,7 @@ async def _stream_gen(
     agents_mod = importlib.import_module("agents")
     Runner = agents_mod.Runner
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     agent, prompt, instructions = _build_agent_and_prompt(

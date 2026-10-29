@@ -246,3 +246,30 @@ async def test_init_client_does_not_carry_behavior_defaults(
         await init_client({"capture_content": False}, stub)
     assert _handler().capture_content is True
     assert any("capture_content" in record.getMessage() for record in caplog.records)
+
+
+def test_rewrapping_keeps_an_explicit_override() -> None:
+    from launchdarkly_ai_server import create_handler
+
+    inner = create_handler(("A", "messages"), _fn, None, False)
+    outer = create_handler(("B", "messages"), inner)
+    assert outer.capture_content is False
+    assert create_handler(("B", "messages"), inner, None, True).capture_content is True
+
+
+def test_rewrapping_an_unset_handler_still_follows_configure() -> None:
+    from launchdarkly_ai_server import create_handler
+
+    outer = create_handler(("B", "messages"), create_handler(("A", "messages"), _fn))
+    configure(options=SDKOptions(capture_content=False))
+    assert outer.capture_content is False
+
+
+def test_rewrapping_keeps_the_stream() -> None:
+    from launchdarkly_ai_server import create_handler
+
+    async def stream(*_args: Any, **_kwargs: Any) -> Any:
+        yield {"type": "done", "output": "", "usage": {}}
+
+    inner = create_handler(("A", "messages"), _fn, stream)
+    assert create_handler(("B", "messages"), inner)._stream_fn is stream

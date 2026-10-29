@@ -417,7 +417,7 @@ def _create_openai_messages_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` can tell an open root from a
         # closed one without asking the span. A mock span answers `is_recording()` truthily, and
@@ -627,7 +627,7 @@ async def _stream_gen(
     the root span is never ended, so it is never exported, and the whole run disappears from AI
     Config Monitoring along with the ``feature_flag`` event it carries.
     """
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     ended: set[int] = set()

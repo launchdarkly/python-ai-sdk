@@ -5,6 +5,7 @@ Tests for ``graph().stream()``.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,7 +18,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import ProviderHandler, graph
+from launchdarkly_ai_server import ProviderHandler, SDKOptions, configure, graph
 from launchdarkly_ai_server.conversation import (
     GEN_AI_CONVERSATION_ID,
     ConversationIdSpanProcessor,
@@ -1090,6 +1091,50 @@ class TestGraphStreamOtel:
         flag_events = [e for e in graph_spans[0].events if e.name == "feature_flag"]
         assert len(flag_events) == 1
         assert (flag_events[0].attributes or {})["feature_flag.key"] == "graph-key"
+
+    @pytest.mark.parametrize("mode", ["invoke", "stream"])
+    @pytest.mark.parametrize("capture", [True, False])
+    async def test_graph_span_event_carries_the_graph_variation(
+        self, mode: str, capture: bool
+    ) -> None:
+        """With capture on the result value is the raw graph variation; off, the key."""
+        raw = {
+            "root": "root-node",
+            "edges": {"root-node": [{"key": "leaf-node"}]},
+            "_ldMeta": {"enabled": True, "variationKey": "graph-v1", "version": 3},
+        }
+        client = _make_client(raw)
+        lifecycle_module._set_client_for_testing(client)
+        configure(options=SDKOptions(capture_content=capture))
+        try:
+            g = graph("graph-key", handlers=[_make_streaming_handler(["ok"])])
+            if mode == "invoke":
+                await g.invoke("hi", CONTEXT)
+            else:
+                await _collect(g.stream("hi", CONTEXT))
+        finally:
+            lifecycle_module._reset_for_testing()
+
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
+        event = next(e for e in graph_spans[0].events if e.name == "feature_flag")
+        attrs = event.attributes or {}
+        assert attrs["feature_flag.result.variant"] == "graph-v1"
+        expected = json.dumps(raw) if capture else json.dumps("graph-v1")
+        assert attrs["feature_flag.result.value"] == expected
+
+    async def test_graph_span_without_a_variation_key_omits_the_result(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """With capture off and no variation key there is nothing to write."""
+        configure(options=SDKOptions(capture_content=False))
+        await graph("graph-key", handlers=[_make_streaming_handler(["ok"])]).invoke(
+            "hi", CONTEXT
+        )
+        graph_spans = [s for s in _finished() if s.name == "launchdarkly.graph"]
+        event = next(e for e in graph_spans[0].events if e.name == "feature_flag")
+        attrs = event.attributes or {}
+        assert "feature_flag.result.variant" not in attrs
+        assert "feature_flag.result.value" not in attrs
 
     async def test_graph_parent_captured_at_stream_call_time(
         self, mock_ld_client: MagicMock

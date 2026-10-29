@@ -109,6 +109,7 @@ class ConfigInstance:
             tool_handlers=resolved_tools,
             variables=variables,
             history=history,
+            evaluated_value=variation.get("value"),
         )
 
         raw_response = result["response"]
@@ -240,6 +241,7 @@ class ConfigInstance:
                 tool_handlers=resolved_tools,
                 variables=variables,
                 history=history,
+                evaluated_value=variation.get("value"),
             )
         ) as source:
             async for event in source:

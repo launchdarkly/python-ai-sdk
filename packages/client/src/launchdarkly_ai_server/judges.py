@@ -202,6 +202,7 @@ async def run_judges(
                         "response_to_evaluate": llm_response,
                         **({"input": user_input} if user_input else {}),
                     },
+                    evaluated_value=variation.get("value"),
                 )
 
                 usage = to_usage_dict(result["usage"])
@@ -386,6 +387,7 @@ async def _build_judge_tasks(
                     collapse_messages=collapse_messages,
                     parent_track_data=base_track_data,
                     evaluation_metric_key=evaluation_metric_key,
+                    judge_value=variation.get("value"),
                 )
             )
         except Exception as exc:
@@ -459,6 +461,7 @@ async def run_judge(
                 "response_to_evaluate": task.actual_output,
                 **({"input": task.user_input} if task.user_input else {}),
             },
+            evaluated_value=task.judge_value,
         )
 
         usage = to_usage_dict(result["usage"])
