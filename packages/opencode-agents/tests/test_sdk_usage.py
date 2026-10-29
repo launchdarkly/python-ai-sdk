@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.27 — opencode-agents."""
+"""Tests for SDK helper usage events — opencode-agents."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch

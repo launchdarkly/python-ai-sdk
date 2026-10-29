@@ -1,6 +1,5 @@
 """
-Tests for §3.12 resolve_graph() and graph().
-Reference: TESTING.md §3.12
+Tests for resolve_graph() and graph().
 """
 
 from typing import Any
@@ -327,7 +326,7 @@ class TestGraphInvoke:
     async def test_node_variations_resolved_on_every_call(
         self, mock_ld_client: MagicMock
     ) -> None:
-        """Each invoke() re-resolves the graph and node flags. See TESTING.md §3.11."""
+        """Each invoke() re-resolves the graph and node flags."""
         g = graph("graph-key", handlers=[_make_handler()])
         await g.invoke("hi", CONTEXT)
         after_first = mock_ld_client.variation.call_count
@@ -337,7 +336,7 @@ class TestGraphInvoke:
     async def test_flag_change_reaches_reused_graph(
         self, mock_ld_client: MagicMock
     ) -> None:
-        """A node flag change between calls is seen on the next call. See TESTING.md §3.11."""
+        """A node flag change between calls is seen on the next call."""
         state = {"instructions": "v1", "graph_enabled": True}
 
         async def variation(key: str, ctx: dict, default: Any) -> Any:
@@ -541,7 +540,7 @@ class TestGraphInvoke:
         self, mock_ld_client: MagicMock
     ) -> None:
         """Python GraphDefinition must expose 'reverse_traverse' (snake_case), not
-        'reverseTraverse' (camelCase). See TESTING.md Appendix A.2."""
+        'reverseTraverse' (camelCase)."""
         gd = await resolve_graph(
             "graph-key", context=CONTEXT, handlers=[_make_handler()]
         )
@@ -556,7 +555,7 @@ class TestGraphInvoke:
         self, mock_ld_client: MagicMock
     ) -> None:
         """Disabled GraphDefinition stub must also use 'reverse_traverse', not
-        'reverseTraverse'. See TESTING.md Appendix A.2."""
+        'reverseTraverse'."""
         mock_ld_client.variation = AsyncMock(return_value={"edges": {}})
         gd = await resolve_graph("graph-key", context=CONTEXT)
         assert hasattr(gd, "reverse_traverse")

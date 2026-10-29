@@ -9,7 +9,7 @@ license = "Apache-2.0"
 authors = [{name = "LaunchDarkly", email = "team@launchdarkly.com"}]
 keywords = ["launchdarkly", "ai", "feature-flags", "sdk"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
@@ -24,6 +24,7 @@ Repository = "https://github.com/launchdarkly/python-ai-sdk"
 
 [project.optional-dependencies]
 otel = ["launchdarkly-ai-server[otel]>=1.0.0,<2"]
+ld = ["launchdarkly-ai-server[ld]>=1.0.0,<2"]
 
 [build-system]
 requires = ["hatchling>=1.32,<2"]

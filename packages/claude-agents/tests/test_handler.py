@@ -14,6 +14,7 @@ fail loudly here instead of silently.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -416,7 +417,7 @@ class TestPartitionTools:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion — restored from the pre-rewrite file (not telemetry).
+# Tool conversion — restored from the pre-rewrite file (not telemetry).
 # ``_partition_tools`` kept its 3-tuple return, so these run byte-for-byte.
 # ---------------------------------------------------------------------------
 
@@ -444,7 +445,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (via _build_tool_mcp) — restored from the pre-rewrite
+# Tool execution loop (via _build_tool_mcp) — restored from the pre-rewrite
 # file. ``_build_tool_mcp`` kept its lazy ``importlib.import_module`` pattern
 # (native_graph.py depends on it), so the old SDK-mocking approach still works
 # unmodified for this one.
@@ -1686,7 +1687,7 @@ class TestModelParametersForwarding:
     async def test_ui_keys_the_sdk_rejects_are_dropped_without_raising(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``ClaudeAgentOptions`` has no ``temperature``/``top_p``/``top_k``/``max_tokens``/
+        """``ClaudeAgentOptions`` has no ``temperature``/``top_p``/``top_k``/
         ``stop_sequences``/``tool_choice``/``metadata`` fields, all of which the LaunchDarkly UI's
         model parameters panel offers for other providers. Forwarding one unfiltered raises
         ``TypeError`` before any request is made; the filter must drop them instead.
@@ -1699,7 +1700,6 @@ class TestModelParametersForwarding:
                     "temperature": 0.2,
                     "top_p": 0.5,
                     "top_k": 10,
-                    "max_tokens": 256,
                     "stop_sequences": ["STOP"],
                     "tool_choice": "auto",
                     "metadata": {"user_id": "u1"},
@@ -1713,7 +1713,6 @@ class TestModelParametersForwarding:
             "temperature",
             "top_p",
             "top_k",
-            "max_tokens",
             "stop_sequences",
             "tool_choice",
             "metadata",
@@ -1752,6 +1751,148 @@ class TestModelParametersForwarding:
         }
         options = await self._run_and_capture_options(config, monkeypatch)
         assert options.max_turns == 5
+
+
+class TestOutputLimitAndThinkingDefault:
+    """The cross-SDK Claude Agents rule: ``max_tokens`` reaches the CLI as
+    ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``, and thinking is off unless the config asks for it. The CLI
+    would otherwise send its own defaults (``max_tokens`` 32000 and a 31,999-token thinking budget
+    on ``claude-haiku-4-5``)."""
+
+    @staticmethod
+    async def _options(
+        parameters: dict[str, Any], path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> Any:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            build_cli_command(kwargs["options"])
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        config = {
+            **BASE_CONFIG,
+            "model": {**BASE_CONFIG["model"], "parameters": parameters},
+        }
+        h = create_claude_agents_handler()
+        if path == "invoke":
+            await h(config, "q")
+        else:
+            await _collect(await h.stream(config, "q"))
+        return captured["options"]
+
+    @pytest.fixture(params=["invoke", "stream"])
+    def path(self, request: pytest.FixtureRequest) -> str:
+        return request.param
+
+    async def test_max_tokens_sets_the_cli_output_limit_and_thinking_is_disabled(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_tokens": 200}, path, monkeypatch)
+        # The SDK adds ``env`` to the inherited ``os.environ``, so only the one variable is set.
+        assert options.env == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "200"}
+        assert options.thinking == {"type": "disabled"}
+        assert "--thinking" in (command := build_cli_command(options))
+        assert command[command.index("--thinking") + 1] == "disabled"
+
+    async def test_an_integral_float_max_tokens_is_read_as_an_integer(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_tokens": 200.0}, path, monkeypatch)
+        assert options.env == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "200"}
+
+    async def test_no_env_without_max_tokens(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_turns": 2}, path, monkeypatch)
+        assert options.env == {}
+        assert options.thinking == {"type": "disabled"}
+
+    @pytest.mark.parametrize(
+        "max_tokens",
+        [0, -5, 1.5, 2**53, float("inf"), "200", True, None, {"value": 200}],
+    )
+    async def test_a_max_tokens_that_is_not_a_positive_integer_is_dropped(
+        self, path: str, max_tokens: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"max_tokens": max_tokens}, path, monkeypatch)
+        assert options.env == {}
+
+    async def test_a_configured_thinking_replaces_the_default(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options(
+            {
+                "max_tokens": 4096,
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            },
+            path,
+            monkeypatch,
+        )
+        assert options.thinking == {"type": "enabled", "budget_tokens": 2048}
+        assert options.env == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"}
+
+    async def test_max_thinking_tokens_alone_leaves_thinking_unset(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``thinking`` takes precedence over ``max_thinking_tokens`` in the SDK, so the default
+        must not be added or the config's budget would be ignored."""
+        options = await self._options({"max_thinking_tokens": 2048}, path, monkeypatch)
+        assert options.max_thinking_tokens == 2048
+        assert options.thinking is None
+
+    async def test_thinking_and_max_thinking_tokens_together_pass_as_given(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options(
+            {
+                "max_thinking_tokens": 4096,
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            },
+            path,
+            monkeypatch,
+        )
+        assert options.max_thinking_tokens == 4096
+        assert options.thinking == {"type": "enabled", "budget_tokens": 2048}
+
+    async def test_effort_alone_does_not_turn_thinking_on(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = await self._options({"effort": "low"}, path, monkeypatch)
+        assert options.effort == "low"
+        assert options.thinking == {"type": "disabled"}
+
+    async def test_the_cli_process_keeps_the_inherited_environment(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``env`` holds only the one variable because the SDK adds it to ``os.environ``. Start
+        the SDK's own transport with the options and read the environment it gives the CLI, so a
+        change to that merge fails here."""
+        import dataclasses
+
+        import claude_agent_sdk._internal.transport.subprocess_cli as subprocess_cli
+        from claude_agent_sdk import CLIConnectionError
+
+        options = await self._options({"max_tokens": 200}, path, monkeypatch)
+        monkeypatch.setenv("LD_TEST_INHERITED", "kept")
+        monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+        spawned: dict[str, Any] = {}
+
+        async def _open_process(cmd: Any, **kwargs: Any) -> Any:
+            spawned["env"] = kwargs["env"]
+            raise RuntimeError("stop before spawning")
+
+        monkeypatch.setattr(subprocess_cli.anyio, "open_process", _open_process)
+        transport = subprocess_cli.SubprocessCLITransport(
+            prompt="q", options=dataclasses.replace(options, cli_path="/bin/echo")
+        )
+        with pytest.raises(CLIConnectionError):
+            await transport.connect()
+        assert spawned["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "200"
+        assert spawned["env"]["LD_TEST_INHERITED"] == "kept"
+        assert spawned["env"]["PATH"] == os.environ["PATH"]
 
 
 class TestFinishReasonMapping:
@@ -2028,7 +2169,7 @@ class TestConvenienceExportHostOptions:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None prompt.
+# None user_input must not produce None prompt.
 # Restored from the pre-rewrite file (not telemetry). Adapted from the old
 # ``_patch_query``/mocked-module approach to ``monkeypatch.setattr(handler_mod, "query", ...)``,
 # since ``query`` is now resolved once at import time rather than through
@@ -2037,7 +2178,7 @@ class TestConvenienceExportHostOptions:
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the prompt passed to
+    """When user_input is None, the prompt passed to
     the provider must be '' (empty string), not None."""
 
     async def test_none_user_input_instructions_path_prompt_is_empty_string(
@@ -2250,7 +2391,7 @@ async def _query_options(
 
 @pytest.mark.parametrize("path", _PATHS)
 class TestHostOptionsAndBuiltinToolSet:
-    """TESTING.md §2.x Claude Agents Handler — host options and built-in tool set.
+    """Claude Agents Handler — host options and built-in tool set.
 
     ``cwd`` and ``setting_sources`` configure the CLI process, so only the application sets them.
     ``setting_sources`` not given sends ``[]``: the Agent SDK's own ``None`` loads every settings
@@ -2843,12 +2984,13 @@ class TestThinkingIsRebuilt:
 
     @pytest.mark.parametrize("value", [{"budget_tokens": 1024}, {"type": "enabled"}])
     def test_the_shapes_the_sdk_cannot_read_are_dropped(self, value: Any) -> None:
-        """Both raise ``KeyError`` in the SDK's command builder when passed through."""
+        """Both raise ``KeyError`` in the SDK's command builder when passed through. A dropped
+        thinking counts as not set, so the handler's disabled default applies."""
         from claude_agent_sdk import ClaudeAgentOptions
 
         with pytest.raises(KeyError):
             build_cli_command(ClaudeAgentOptions(thinking=value))
-        assert self._thinking(value) is None
+        assert self._thinking(value) == {"type": "disabled"}
 
     @pytest.mark.parametrize(
         "value",
@@ -2860,7 +3002,7 @@ class TestThinkingIsRebuilt:
         ],
     )
     def test_an_unknown_type_or_a_malformed_budget_is_dropped(self, value: Any) -> None:
-        assert self._thinking(value) is None
+        assert self._thinking(value) == {"type": "disabled"}
 
 
 class TestMalformedObjectValuesAreDropped:
@@ -2880,7 +3022,7 @@ class TestMalformedObjectValuesAreDropped:
                 }
             }
         )
-        assert params == {"max_turns": 3}
+        assert params == {"max_turns": 3, "thinking": {"type": "disabled"}}
 
 
 async def test_a_builtin_tool_result_is_not_marked_failed(

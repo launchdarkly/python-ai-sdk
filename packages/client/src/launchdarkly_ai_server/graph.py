@@ -6,7 +6,7 @@ import logging
 import re as _re
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from .agui import StableProjector
@@ -337,8 +337,8 @@ async def _build_graph(
                 def _fn(*a: Any, **kw: Any) -> str:
                     if not chosen:
                         chosen.append(t)
-                    # Both routing strings are pinned byte for byte in TESTING.md §3.15a, which
-                    # gives the reasons: "recorded" keeps a node with a real tool from skipping
+                    # Both routing strings are pinned byte for byte across SDKs, for two
+                    # reasons: "recorded" keeps a node with a real tool from skipping
                     # it, and asking for no "final response" keeps a router from answering for
                     # its target.
                     return (
@@ -837,7 +837,7 @@ async def resolve_graph(
     *,
     context: LDContext,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
 ) -> GraphDefinition:
     """
@@ -1345,7 +1345,7 @@ def graph(
     key: str,
     *,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     graph_judge: str | None = None,
 ) -> GraphInstance:
@@ -1367,7 +1367,7 @@ def _graph(
     key: str,
     *,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     graph_judge: str | None = None,
 ) -> GraphInstance:

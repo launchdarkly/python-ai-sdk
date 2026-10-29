@@ -1,5 +1,5 @@
 """
-Tests for TESTING.md §2.x Claude Agents Skills Integration (A.18).
+Tests for the Claude Agents Skills integration.
 
 ``query()`` is replaced with a fake async generator that records the options it was given and can
 look at the filesystem while the run is in progress. The skill store is a real

@@ -55,7 +55,7 @@ def claude_graph(key: str, *, cwd=None, setting_sources=None, **options): ...
 
 # Native graph adapter — builds a Claude code-agents graph from a resolved GraphDefinition.
 # opts: context, tool_handlers, and the host options cwd and setting_sources
-def to_claude_agents(def_promise: Awaitable[dict], opts: dict | None = None): ...
+def to_claude_agents(def_promise: Awaitable[GraphDefinition], opts: ClaudeNativeGraphOptions | None = None) -> NativeGraphRunner: ...
 
 # NativeTool sentinels for Claude Code built-in capabilities
 ClaudeBash: NativeTool
@@ -141,7 +141,7 @@ The CLI also writes its own `AssistantMessage`, with `model` set to the literal 
 an API call fails and after a response stops at `max_output_tokens`. It is not a model response:
 it gets no `chat` span and never joins the conversation a later span reports.
 
-**Important:** a bare `return` inside `async for` abandons the generator. Python's asyncio finalizer will try to `aclose()` it later and may raise `RuntimeError: aclose(): asynchronous generator is already running` if the generator is still suspended inside a real SDK `await`. Always use `break` + explicit `aclose()`. See **Appendix A.4** in `TESTING.md`.
+**Important:** a bare `return` inside `async for` abandons the generator. Python's asyncio finalizer will try to `aclose()` it later and may raise `RuntimeError: aclose(): asynchronous generator is already running` if the generator is still suspended inside a real SDK `await`. Always use `break` + explicit `aclose()`.
 
 ### 4. Telemetry
 
@@ -236,6 +236,6 @@ Span names and attributes are described in [Implementation Details → Telemetry
 ## Common Pitfalls
 
 - **MCP tool name prefix**: tools registered in the MCP server are accessible as `mcp__tool-mcp__<name>`. The `allowed_tools` list must use this prefix; omitting it will cause the agent to not invoke any tools.
-- **Async generator teardown**: always use `break` inside `async for` (not `return`) and wrap the loop in `try/finally: await gen.aclose()`. See TESTING.md Appendix A.4.
+- **Async generator teardown**: always use `break` inside `async for` (not `return`) and wrap the loop in `try/finally: await gen.aclose()`.
 - **`message.usage` shape**: the raw usage dict from the `claude_agent_sdk` is passed through directly to `parse_usage`. It accepts `input_tokens`/`output_tokens` which the SDK provides.
 - **Native tools** (`ClaudeWebSearch`, etc.) are registered in `tool_handlers` as `NativeTool` sentinel instances (not callables). The handler's `_partition_tools` function separates them from user-defined tools — native tools go into `native_tool_names` for the agent's built-in access, user tools go through the MCP server.
