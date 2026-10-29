@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+import launchdarkly_ai_server.lifecycle as lifecycle_module
+from launchdarkly_ai_server import SDKOptions, configure
 from launchdarkly_ai_server.utils import set_ld_span_attributes
 
 LD_FIXTURE = {
@@ -236,8 +238,25 @@ class TestResultVariant:
 
     def test_capture_off_writes_the_variation_key_not_the_prompt(self) -> None:
         span = FakeSpan()
-        set_ld_span_attributes(span, {**_vars(None), "__ldValue": RAW_VARIATION})
+        set_ld_span_attributes(
+            span, {**_vars(None), "__ldValue": RAW_VARIATION}, capture_content=False
+        )
         assert _feature_flag(span)["feature_flag.result.value"] == '"variation-a"'
+
+    @pytest.mark.parametrize(("default", "raw"), [(True, True), (False, False)])
+    def test_an_unset_capture_follows_the_process_default(
+        self, default: bool, raw: bool
+    ) -> None:
+        """A custom handler that passes no capture_content gets what configure() says."""
+        lifecycle_module._reset_for_testing()
+        configure(options=SDKOptions(capture_content=default))
+        try:
+            span = FakeSpan()
+            set_ld_span_attributes(span, {**_vars(None), "__ldValue": RAW_VARIATION})
+        finally:
+            lifecycle_module._reset_for_testing()
+        expected = json.dumps(RAW_VARIATION) if raw else '"variation-a"'
+        assert _feature_flag(span)["feature_flag.result.value"] == expected
 
     def test_capture_on_without_a_raw_variation_falls_back_to_the_key(self) -> None:
         span = FakeSpan()
