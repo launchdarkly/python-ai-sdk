@@ -2,7 +2,7 @@
 
 > **Span shape.** This package emits `invoke_agent` → `chat {model}` → `execute_tool {name}`, with
 > tool spans as siblings of `chat`. Span construction lives in `spans.py` beside the handler.
-> Conversation content is off unless the caller passes `capture_content=True`, or the process sets it. See [Process-wide defaults](../client/README.md#process-wide-defaults).
+> Conversation content is on unless the caller passes `capture_content=False`, or the process turns it off. See [Process-wide defaults](../client/README.md#process-wide-defaults).
 > `TELEMETRY-CONTRACT.md` at the repo root is the authority; read it before changing span code.
 
 
@@ -39,16 +39,16 @@ That means the LaunchDarkly flag variation must have `provider.name == "OpenAI"`
 
 ```python
 # Factory — returns a ProviderHandler with provides_for attached
-def create_openai_agent_handler() -> ProviderHandler: ...
+def create_openai_agents_handler() -> ProviderHandler: ...
 
-# Convenience wrapper — equivalent to config(key=config_key, handler=create_openai_agent_handler()).invoke(user_input, context)
+# Convenience wrapper — equivalent to config(key=config_key, handler=create_openai_agents_handler()).invoke(user_input, context)
 def openai_agents(config_key: str, user_input: str, context: dict, **kwargs) -> ProviderResponse: ...
 
 # Graph convenience wrapper
 def openai_graph(key: str, options: dict | None = None): ...
 
 # Native graph adapter
-def to_openai_agents(def_promise: Awaitable[dict], opts: dict | None = None): ...
+def to_openai_agents(def_promise: Awaitable[GraphDefinition], opts: OpenAINativeGraphOptions | None = None) -> NativeGraphRunner: ...
 ```
 
 ---

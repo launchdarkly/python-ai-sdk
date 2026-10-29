@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_output_type(output_format: dict[str, Any] | None) -> dict[str, Any] | None:
+def _build_output_type(output_format: dict[str, Any] | None) -> dict[str, Any] | None:
     """
     Converts the ``outputFormat`` from an LD AI config into the schema envelope
     the OpenAI Agents SDK expects as ``output_type`` on an ``Agent``.

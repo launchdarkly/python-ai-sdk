@@ -1,6 +1,5 @@
 """
-Tests for §3.14 run_judges.
-Reference: TESTING.md §3.14
+Tests for run_judges.
 """
 
 import json
@@ -818,7 +817,7 @@ class TestRunJudgeScoreReporting:
 
 
 class TestRunJudgeTrackData:
-    """§3.13 run_judge result track_data carries the evaluated (parent) config identity."""
+    """run_judge result track_data carries the evaluated (parent) config identity."""
 
     PARENT: ClassVar[dict[str, Any]] = {
         "runId": "parent-run",
@@ -1360,6 +1359,56 @@ class TestJudgeOutputFormatStripped:
         # Must still survive a JSON round-trip (serialisable for a background thread).
         roundtripped = json.loads(json.dumps(asdict(task)))
         assert "outputFormat" not in roundtripped["judge_config"]
+
+    async def test_judge_task_carries_the_raw_judge_variation(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        """A deferred judge writes the same feature_flag.result.value as an inline one."""
+        judge_variation = _judge_variation_with_output_format()
+        mock_ld_client.variation = AsyncMock(return_value=judge_variation)
+        config = {
+            "model": {"name": "gpt-4"},
+            "provider": {"name": "TestProvider"},
+            "instructions": "hi",
+            "judgeConfiguration": {"judges": [{"key": "judge-1", "samplingRate": 1.0}]},
+        }
+
+        import random
+
+        with patch.object(random, "random", return_value=0.0):
+            tasks = await build_judge_tasks(
+                config=config,
+                user_context=CONTEXT,
+                handler=_make_handler(),
+                llm_response="response",
+                base_track_data={"runId": "x"},
+            )
+
+        assert tasks[0].judge_value == judge_variation
+        assert (
+            json.loads(json.dumps(asdict(tasks[0])))["judge_value"] == judge_variation
+        )
+
+        seen: list[dict[str, Any]] = []
+
+        async def recording_fn(
+            config, user_input, tool_handlers, variables, history=None
+        ) -> dict:  # type: ignore[override]
+            seen.append(dict(variables or {}))
+            return {
+                "output": '{"score": 0.6, "reasoning": "ok"}',
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        from launchdarkly_ai_server.types import ProviderHandler
+
+        judge_handler = ProviderHandler(
+            fn=recording_fn,  # type: ignore[arg-type]
+            provides_for=("TestProvider", tasks[0].judge_mode),
+        )
+        await run_judge(tasks[0], [judge_handler])
+
+        assert seen[0]["__ldValue"] == judge_variation
 
     async def test_run_judge_strips_defensively(
         self, mock_ld_client: MagicMock

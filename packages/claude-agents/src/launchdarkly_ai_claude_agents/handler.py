@@ -17,7 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from claude_agent_sdk import (
@@ -88,12 +89,14 @@ from .spans import (
 #: environment, working directory, file access, permissions, settings files, plugins, sandbox,
 #: session state) stays under the application's control, never a config's.
 #:
-#: This is the cross-SDK list for Claude Agents (TESTING.md section 1.12), shared with the native
+#: This is the cross-SDK list for Claude Agents, shared with the native
 #: graph through :func:`_options_parameters`.
 #:
-#: The SDK offers no ``temperature``/``top_p``/``top_k``/``max_tokens``/``stop_sequences``/
-#: ``tool_choice``/``metadata``, all of which the LaunchDarkly UI's model parameters panel offers
-#: for other providers; they are dropped like any other key not listed here.
+#: The SDK offers no ``temperature``/``top_p``/``top_k``/``stop_sequences``/``tool_choice``/
+#: ``metadata``, all of which the LaunchDarkly UI's model parameters panel offers for other
+#: providers; they are dropped like any other key not listed here. It has no ``max_tokens`` field
+#: either, but ``max_tokens`` is not dropped: :func:`_options_parameters` sends it to the CLI as
+#: :data:`_MAX_OUTPUT_TOKENS_ENV`.
 _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS = frozenset(
     {
         "betas",
@@ -173,9 +176,9 @@ _CLAUDE_AGENT_OPTIONS_EXCLUDED_KEYS = frozenset(
 # ---------------------------------------------------------------------------
 
 
-async def build_tool_mcp(
+async def _build_tool_mcp(
     config_tools: dict[str, Any],
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
 ) -> Any:
     """Build an in-process SDK MCP server from LD config tools + handler functions.
 
@@ -210,9 +213,9 @@ async def build_tool_mcp(
     return create_server(name=TOOL_MCP_NAME, version="1.0.0", tools=tool_objs)
 
 
-def partition_tools(
+def _partition_tools(
     config_tools: dict[str, Any] | None,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """
     Returns (native_tool_map, user_config_tools, native_tool_names).
@@ -238,10 +241,12 @@ def partition_tools(
     return native_tool_map, user_config_tools, list(native_tool_map.keys())
 
 
-def _native_tool_aliases(tool_handlers: dict[str, Any]) -> dict[str, str]:
+def _native_tool_aliases(
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
+) -> dict[str, str]:
     """AI Config key → provider tool name, for the config's native tools only.
 
-    ``partition_tools``'s ``native_tool_map`` is keyed the other way round, by provider name, which
+    ``_partition_tools``'s ``native_tool_map`` is keyed the other way round, by provider name, which
     loses the AI Config key, and the key is what a config's declared schema is filed under.
     :class:`~.spans.ToolCatalog` needs both ends to report one tool once, under the name the model
     saw, with the schema the config gave it.
@@ -437,7 +442,7 @@ def build_tool_hooks(
 # ---------------------------------------------------------------------------
 
 
-def build_prompt(
+def _build_prompt(
     config: AiConfigRep,
     user_input: str | None,
     variables: dict[str, Any],
@@ -599,6 +604,16 @@ def _raise_if_run_failed(message: Any) -> None:
     )
 
 
+#: The variable the CLI reads its output-token limit from. ``ClaudeAgentOptions`` has no
+#: output-token field, so the config's ``max_tokens`` reaches the CLI as this variable in its
+#: environment, the only value this package writes there. Without it the CLI sends its own default
+#: (32000 on ``claude-haiku-4-5``) whatever the config asks for.
+_MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+
+#: The largest ``max_tokens`` kept, ``Number.MAX_SAFE_INTEGER`` in JS: the JS SDK drops a larger
+#: value, so both SDKs send the same thing for the same config.
+_MAX_TOKENS_LIMIT = 2**53 - 1
+
 #: The ``thinking`` types ``claude_agent_sdk`` knows (``ThinkingConfig``). It reads
 #: ``thinking["type"]`` when it builds the CLI command, so a ``thinking`` without one raises.
 _THINKING_TYPES = frozenset({"adaptive", "enabled", "disabled"})
@@ -635,9 +650,17 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
     ``thinking`` rebuilt by :func:`_rebuild_thinking`. The handler and the native graph both call
     this, so they forward the same keys.
+
+    Two fields are set even though the config does not name them. ``thinking`` is
+    ``{"type": "disabled"}`` unless the config sets ``thinking`` or ``max_thinking_tokens``,
+    because the CLI otherwise picks thinking itself (a 31,999-token budget on
+    ``claude-haiku-4-5``). And a positive integer ``max_tokens`` up to
+    :data:`_MAX_TOKENS_LIMIT` becomes
+    ``env={_MAX_OUTPUT_TOKENS_ENV: ...}``, which the SDK adds to the inherited ``os.environ``.
     """
+    parameters = model_parameters(config)
     params = select_forwarded_parameters(
-        model_parameters(config),
+        parameters,
         _CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS,
         mapping_keys=_CLAUDE_AGENT_OPTIONS_MAPPING_KEYS,
     )
@@ -645,6 +668,18 @@ def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
         thinking = _rebuild_thinking(params.pop("thinking"))
         if thinking is not None:
             params["thinking"] = thinking
+    if "thinking" not in params and params.get("max_thinking_tokens") is None:
+        params["thinking"] = {"type": "disabled"}
+    max_tokens = parameters.get("max_tokens")
+    # JSON has one number type, so ``200.0`` is the same value the JS SDK reads as 200.
+    if isinstance(max_tokens, float) and max_tokens.is_integer():
+        max_tokens = int(max_tokens)
+    if (
+        isinstance(max_tokens, int)
+        and not isinstance(max_tokens, bool)
+        and 0 < max_tokens <= _MAX_TOKENS_LIMIT
+    ):
+        params["env"] = {_MAX_OUTPUT_TOKENS_ENV: str(max_tokens)}
     return params
 
 
@@ -655,8 +690,14 @@ def _build_query_options(
     mcp_allowed_tools: list[str],
     tool_mcp: Any,
     hooks: dict[str, list[HookMatcher]] | None,
+    extra_builtins: list[str] | None = None,
     **extra: Any,
 ) -> ClaudeAgentOptions:
+    """*extra_builtins* are built-ins the handler itself turns on, after the config's native tools,
+    because a per-invoke preparation asked for them (``Skill``, for example). They go in ``tools``
+    only, never ``allowed_tools``: a built-in the Agent SDK enables through its own option needs no
+    permission entry here.
+    """
     all_allowed = [*mcp_allowed_tools, *native_tool_names]
     params = _options_parameters(config)
     kwargs: dict[str, Any] = {
@@ -670,7 +711,7 @@ def _build_query_options(
         # the full built-in set, and its read-only tools need no permission. A config turns a
         # built-in on by attaching its sentinel. User-defined tools go through the MCP server and
         # are not governed by `tools`.
-        "tools": list(native_tool_names),
+        "tools": [*native_tool_names, *(extra_builtins or [])],
         **extra,
     }
     if system_prompt:
@@ -681,6 +722,27 @@ def _build_query_options(
 # ---------------------------------------------------------------------------
 # Handler factory
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class QueryPreparation:
+    """What a per-invoke preparation adds to one run.
+
+    Package-internal and generic: it names no feature, so code at a later stage can register
+    through it without this module importing or naming that code.
+    """
+
+    options: dict[str, Any]
+    """Extra ``query()`` options, set with the handler's own host options."""
+    extra_builtins: list[str]
+    """Built-in tool names appended to the config's native tools."""
+    cleanup: Callable[[], Awaitable[None]]
+    """Runs once when the run ends, however it ends. Must not raise."""
+
+
+PrepareQuery = Callable[[AiConfigRep], Awaitable[QueryPreparation | None]]
+"""Called at the start of every invoke and stream, inside the run's span, so a raise fails the run
+like any other error. ``None`` means nothing to add, and the run is exactly the core handler's."""
 
 
 def _host_query_options(
@@ -711,8 +773,8 @@ def create_claude_agents_handler(
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. See TELEMETRY-CONTRACT.md section 7.
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. An explicit ``False`` emits only metadata. See TELEMETRY-CONTRACT.md section 7.
 
     *cwd* and *setting_sources* configure the Claude Code process the Agent SDK starts, not the
     model, so they come from the application and never from a config. Each one given is passed to
@@ -736,8 +798,13 @@ def _create_claude_agents_handler(
     capture_content: bool | None = None,
     cwd: str | os.PathLike[str] | None = None,
     setting_sources: list[SettingSource] | None = None,
+    _prepare: PrepareQuery | None = None,
 ) -> ProviderHandler:
-    """Non-reporting :func:`create_claude_agents_handler`, used by this package's wrappers."""
+    """Non-reporting :func:`create_claude_agents_handler`, used by this package's wrappers.
+
+    *_prepare* is a package-internal hook, never an option of the public factory: see
+    :data:`PrepareQuery`.
+    """
     content_override = capture_content
     # Resolved once, so a caller mutating its list afterwards does not change later runs.
     host_options = _host_query_options(cwd, setting_sources)
@@ -745,7 +812,7 @@ def _create_claude_agents_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -754,14 +821,14 @@ def _create_claude_agents_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the finally below can tell an open root
         # from a closed one without asking the span. A mock span answers `is_recording()`
         # truthily, and this handler's own suite is built on mock spans in places.
         open_root_span: Any = span
 
-        prompt, system_prompt = build_prompt(config, user_input, vs, history)
+        prompt, system_prompt = _build_prompt(config, user_input, vs, history)
         query_prompt = build_query_prompt(config, user_input, vs, history, prompt)
         if config.get("outputFormat"):
             schema_instr = f"Respond with valid JSON matching this schema:\n{json.dumps(config['outputFormat'])}"
@@ -770,7 +837,7 @@ def _create_claude_agents_handler(
             )
         opening = _opening_of(prompt, system_prompt)
 
-        native_tool_map, user_config_tools, native_tool_names = partition_tools(
+        native_tool_map, user_config_tools, native_tool_names = _partition_tools(
             config.get("tools"), th
         )
         catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(th))
@@ -783,6 +850,7 @@ def _create_claude_agents_handler(
         # already reported an authoritative run-level total and must not overwrite it.
         root_usage_written = False
         gen: AsyncIterator[Any] | None = None
+        prepared: QueryPreparation | None = None
         try:
             # Inside the guard, because serialising the prompt raises on anything that is not
             # JSON-serialisable and a raise out here would leave the root open: never ended, never
@@ -794,14 +862,16 @@ def _create_claude_agents_handler(
                 messages=opening.messages,
                 tool_definitions=catalog.current,
             )
+            prepared = await _prepare(config) if _prepare is not None else None
+            extra_builtins = prepared.extra_builtins if prepared is not None else []
             tool_mcp = (
-                await build_tool_mcp(user_config_tools, th)
+                await _build_tool_mcp(user_config_tools, th)
                 if user_config_tools
                 else None
             )
             mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
             hooks = None
-            if native_tool_names or mcp_allowed_tools:
+            if native_tool_names or mcp_allowed_tools or extra_builtins:
                 # The blocking path cannot be abandoned, so it takes no abandon hook, but it can
                 # still be cancelled, so it keeps cancel_open_spans.
                 hooks, tool_telemetry, _, cancel_tool_spans = build_tool_hooks(
@@ -815,7 +885,13 @@ def _create_claude_agents_handler(
                 mcp_allowed_tools,
                 tool_mcp,
                 hooks,
-                **host_options,
+                extra_builtins,
+                # Merged first, so a preparation's key replaces a host option's rather than
+                # colliding with it.
+                **{
+                    **host_options,
+                    **(prepared.options if prepared is not None else {}),
+                },
             )
 
             output = ""
@@ -898,23 +974,31 @@ def _create_claude_agents_handler(
             # the root is the only span carrying the feature_flag event and the launchdarkly.*
             # attributes, so the whole run would vanish from AI Config Monitoring rather than show
             # as incomplete.
-            inference.finish()
-            if cancel_tool_spans is not None:
-                cancel_tool_spans()
-            if (
-                open_root_span is not None
-                and not root_usage_written
-                and inference.run_usage["reported"]
-            ):
-                # The turns that completed were billed, the same reason the failure path reports
-                # them.
-                finish_root_span(open_root_span, config, inference.run_usage["total"])
-            end_unfinished_spans(open_root_span)
+            try:
+                inference.finish()
+                if cancel_tool_spans is not None:
+                    cancel_tool_spans()
+                if (
+                    open_root_span is not None
+                    and not root_usage_written
+                    and inference.run_usage["reported"]
+                ):
+                    # The turns that completed were billed, the same reason the failure path
+                    # reports them.
+                    finish_root_span(
+                        open_root_span, config, inference.run_usage["total"]
+                    )
+                end_unfinished_spans(open_root_span)
+            finally:
+                # Last, after the span tree is closed, and in its own finally so a raise above
+                # still removes the preparation's temp dir.
+                if prepared is not None:
+                    await prepared.cleanup()
 
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -926,6 +1010,7 @@ def _create_claude_agents_handler(
             history,
             capture_content=effective_capture_content(content_override),
             host_options=host_options,
+            prepare=_prepare,
         )
 
     return _create_handler(
@@ -984,12 +1069,13 @@ def _map_claude_stream_event(
 async def _stream_gen(
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
     capture_content: bool = False,
     host_options: dict[str, Any] | None = None,
+    prepare: PrepareQuery | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Streams the run, emitting the same span tree as the blocking path.
 
@@ -1000,14 +1086,14 @@ async def _stream_gen(
     exit abandons it, and asyncio's finalizer later raises ``RuntimeError`` when it is suspended
     inside a real await in the SDK.
     """
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
-    prompt, system_prompt = build_prompt(config, user_input, variables, history)
+    prompt, system_prompt = _build_prompt(config, user_input, variables, history)
     query_prompt = build_query_prompt(config, user_input, variables, history, prompt)
     opening = _opening_of(prompt, system_prompt)
 
-    native_tool_map, user_config_tools, native_tool_names = partition_tools(
+    native_tool_map, user_config_tools, native_tool_names = _partition_tools(
         config.get("tools"), tool_handlers
     )
     catalog = ToolCatalog(config.get("tools"), _native_tool_aliases(tool_handlers))
@@ -1027,6 +1113,7 @@ async def _stream_gen(
     pending: list[dict[str, Any]] = []
     block_ids: dict[int, str] = {}
     saw_args: set[str] = set()
+    prepared: QueryPreparation | None = None
     try:
         # Inside the guard, because serialising the prompt raises on anything that is not
         # JSON-serialisable. A raise out here would leave the root open with the `finally` never
@@ -1038,14 +1125,16 @@ async def _stream_gen(
             messages=opening.messages,
             tool_definitions=catalog.current,
         )
+        prepared = await prepare(config) if prepare is not None else None
+        extra_builtins = prepared.extra_builtins if prepared is not None else []
         tool_mcp = (
-            await build_tool_mcp(user_config_tools, tool_handlers)
+            await _build_tool_mcp(user_config_tools, tool_handlers)
             if user_config_tools
             else None
         )
         mcp_allowed_tools = [MCP_TOOL_PREFIX + n for n in user_config_tools]
         hooks = None
-        if native_tool_names or mcp_allowed_tools:
+        if native_tool_names or mcp_allowed_tools or extra_builtins:
             hooks, tool_telemetry, abandon_tool_spans, _ = build_tool_hooks(
                 native_tool_map,
                 parent,
@@ -1061,7 +1150,11 @@ async def _stream_gen(
             mcp_allowed_tools,
             tool_mcp,
             hooks,
-            **(host_options or _host_query_options(None, None)),
+            extra_builtins,
+            **{
+                **(host_options or _host_query_options(None, None)),
+                **(prepared.options if prepared is not None else {}),
+            },
             include_partial_messages=True,
         )
 
@@ -1179,25 +1272,34 @@ async def _stream_gen(
             yield rich
         raise
     finally:
-        # A no-op on the success path, where the result message already closed the last response.
-        # On the error and abandonment paths this is the only thing that ends a chat span still
-        # open, and the exporter only receives ended spans.
-        inference.finish()
-        # A no-op on the success and failure paths; on abandonment it is the only chance to close
-        # the tree, including any tool span whose PostToolUse hook never fired, and the only chance
-        # to report what the responses that did arrive cost.
-        if id(span) not in ended:
-            # Abandonment, not failure: UNSET plus the abandoned marker, the same as the model
-            # span and the root get just below.
-            if abandon_tool_spans is not None:
-                abandon_tool_spans(ended, cancelled=cancelled)
-            if not root_usage_written and inference.run_usage["reported"]:
-                finish_root_span(span, config, inference.run_usage["total"])
-        end_span_once(span, ended, abandoned=True, cancelled=cancelled)
-        # Same reasoning as the blocking path: a bare exit through this generator's boundary
-        # abandons the vendor's own generator if it is not closed explicitly.
-        if gen is not None:
-            await gen.aclose()  # type: ignore[attr-defined]
+        try:
+            # A no-op on the success path, where the result message already closed the last
+            # response. On the error and abandonment paths this is the only thing that ends a chat
+            # span still open, and the exporter only receives ended spans.
+            inference.finish()
+            # A no-op on the success and failure paths; on abandonment it is the only chance to
+            # close the tree, including any tool span whose PostToolUse hook never fired, and the
+            # only chance to report what the responses that did arrive cost.
+            if id(span) not in ended:
+                # Abandonment, not failure: UNSET plus the abandoned marker, the same as the model
+                # span and the root get just below.
+                if abandon_tool_spans is not None:
+                    abandon_tool_spans(ended, cancelled=cancelled)
+                if not root_usage_written and inference.run_usage["reported"]:
+                    finish_root_span(span, config, inference.run_usage["total"])
+            end_span_once(span, ended, abandoned=True, cancelled=cancelled)
+        finally:
+            # In their own finally, so a raise closing the spans still closes the vendor's
+            # generator and removes the preparation's temp dir. Same reasoning as the blocking
+            # path: a bare exit through this generator's boundary abandons the vendor's own
+            # generator if it is not closed explicitly.
+            try:
+                if gen is not None:
+                    await gen.aclose()  # type: ignore[attr-defined]
+            finally:
+                # Last, after the span tree is closed: the run is over however it ended.
+                if prepared is not None:
+                    await prepared.cleanup()
 
 
 def claude_agents(

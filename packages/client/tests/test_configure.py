@@ -45,14 +45,15 @@ def _handler(capture_content: bool | None = None) -> ProviderHandler:
     return ProviderHandler(_fn, capture_content=capture_content)
 
 
-def test_builtin_default_is_off() -> None:
-    assert _handler().capture_content is False
+def test_builtin_default_is_on() -> None:
+    assert SDKOptions().capture_content is True
+    assert _handler().capture_content is True
 
 
 def test_configure_is_read_after_the_handler_is_built() -> None:
     handler = _handler()
-    configure(options=SDKOptions(capture_content=True))
-    assert handler.capture_content is True
+    configure(options=SDKOptions(capture_content=False))
+    assert handler.capture_content is False
 
 
 def test_configure_can_be_replaced_before_an_invocation() -> None:
@@ -101,7 +102,7 @@ def test_sdk_options_is_frozen() -> None:
 async def test_a_changed_configuration_is_rejected_after_invocation() -> None:
     await _handler()({})
     with pytest.raises(RuntimeError, match="cannot change"):
-        configure(options=SDKOptions(capture_content=True))
+        configure(options=SDKOptions(capture_content=False))
 
 
 async def test_an_identical_configuration_is_allowed_after_invocation() -> None:
@@ -119,26 +120,26 @@ async def test_streaming_latches_invocation_before_the_body_runs() -> None:
     gen = await handler.stream({})
     await gen.aclose()
     with pytest.raises(RuntimeError, match="cannot change"):
-        configure(options=SDKOptions(capture_content=True))
+        configure(options=SDKOptions(capture_content=False))
 
 
 async def test_a_missing_stream_does_not_latch() -> None:
     with pytest.raises(NotImplementedError):
         await _handler().stream({})
-    configure(options=SDKOptions(capture_content=True))
-    assert _handler().capture_content is True
+    configure(options=SDKOptions(capture_content=False))
+    assert _handler().capture_content is False
 
 
 async def test_shutdown_restores_the_builtin_default() -> None:
-    configure(options=SDKOptions(capture_content=True))
+    configure(options=SDKOptions(capture_content=False))
     await _handler()({})
     await shutdown()
-    assert _handler().capture_content is False
-    configure(options=SDKOptions(capture_content=True))
     assert _handler().capture_content is True
+    configure(options=SDKOptions(capture_content=False))
+    assert _handler().capture_content is False
 
 
-async def test_run_judges_writes_the_explanation_from_the_configured_default() -> None:
+async def test_run_judges_writes_the_explanation_from_the_builtin_default() -> None:
     """The judge explanation follows the handler's effective capture flag.
 
     Goes through ``run_judges``, not a copy of the ``if capture_content``
@@ -191,7 +192,6 @@ async def test_run_judges_writes_the_explanation_from_the_configured_default() -
         }
     )
     lifecycle_module._set_client_for_testing(client)
-    configure(options=SDKOptions(capture_content=True))
     parent = {
         "model": {"name": "gpt-4"},
         "provider": {"name": "TestProvider"},
@@ -243,6 +243,33 @@ async def test_init_client_does_not_carry_behavior_defaults(
         patch.object(lifecycle_module, "_setup_telemetry", return_value=None),
         caplog.at_level("WARNING", logger="launchdarkly_ai_server.lifecycle"),
     ):
-        await init_client({"capture_content": True}, stub)
-    assert _handler().capture_content is False
+        await init_client({"capture_content": False}, stub)
+    assert _handler().capture_content is True
     assert any("capture_content" in record.getMessage() for record in caplog.records)
+
+
+def test_rewrapping_keeps_an_explicit_override() -> None:
+    from launchdarkly_ai_server import create_handler
+
+    inner = create_handler(("A", "messages"), _fn, None, False)
+    outer = create_handler(("B", "messages"), inner)
+    assert outer.capture_content is False
+    assert create_handler(("B", "messages"), inner, None, True).capture_content is True
+
+
+def test_rewrapping_an_unset_handler_still_follows_configure() -> None:
+    from launchdarkly_ai_server import create_handler
+
+    outer = create_handler(("B", "messages"), create_handler(("A", "messages"), _fn))
+    configure(options=SDKOptions(capture_content=False))
+    assert outer.capture_content is False
+
+
+def test_rewrapping_keeps_the_stream() -> None:
+    from launchdarkly_ai_server import create_handler
+
+    async def stream(*_args: Any, **_kwargs: Any) -> Any:
+        yield {"type": "done", "output": "", "usage": {}}
+
+    inner = create_handler(("A", "messages"), _fn, stream)
+    assert create_handler(("B", "messages"), inner)._stream_fn is stream

@@ -9,10 +9,17 @@ Pass `providers=["Bedrock"]` to `create_langchain_agents_handler`, `langchain_ag
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-langchain-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-langchain-agents
 ```
 
 The default model is `ChatOpenAI`, so set `OPENAI_API_KEY` unless you pass a custom `BaseChatModel`.
+
+For AI configs whose provider is Anthropic or Bedrock, install the matching extra:
+
+```bash
+pip install "launchdarkly-ai-langchain-agents[anthropic]"  # langchain-anthropic
+pip install "launchdarkly-ai-langchain-agents[aws]"        # langchain-aws (Bedrock)
+```
 
 ## Usage
 

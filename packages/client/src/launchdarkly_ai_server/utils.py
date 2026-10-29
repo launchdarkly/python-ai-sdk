@@ -52,7 +52,18 @@ def _create_handler(
     *,
     providers: Sequence[str] | None = None,
 ) -> ProviderHandler:
-    """Non-reporting :func:`create_handler`, used by the package factories."""
+    """Non-reporting :func:`create_handler`, used by the package factories.
+
+    Wrapping a :class:`ProviderHandler` again keeps its streaming
+    implementation and its explicit ``capture_content`` override unless new
+    ones are passed, as of the moment it is wrapped. An unset inner handler
+    stays unset.
+    """
+    if isinstance(fn, ProviderHandler):
+        if stream_fn is None:
+            stream_fn = fn._stream_fn
+        if capture_content is None:
+            capture_content = fn._capture_content_override
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,
@@ -870,7 +881,9 @@ def _context_identity_from_ld_context(
         return None
 
 
-def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
+def set_ld_span_attributes(
+    span: Any, variables: dict[str, Any] | None, *, capture_content: bool | None = None
+) -> None:
     """
     Sets LaunchDarkly config-identifying attributes on an OTel span and emits
     the ``feature_flag`` span event required by the AI Config Monitoring Traces
@@ -892,10 +905,23 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
 
     Span event (required for AI Config Monitoring Traces tab correlation):
     ``name='feature_flag'`` with ``feature_flag.key``,
-    ``feature_flag.provider.name``, ``feature_flag.set.id`` (when
+    ``feature_flag.provider.name``, ``feature_flag.result.variant`` (the
+    served variation key, when non-empty), ``feature_flag.result.value``
+    (see below), ``feature_flag.set.id`` (when
     ``LD_ENVIRONMENT_ID`` is set or the TS SDK auto-resolved it),
     ``feature_flag.context.id``, and ``feature_flag.contextKeys`` (when
     ``ldContext`` has a usable identity).
+
+    ``feature_flag.result.value`` follows content capture. With
+    *capture_content* on and the raw variation in ``variables['__ldValue']``,
+    it is ``json.dumps`` of that variation, as the ``ldotel`` tracing hook
+    writes it with value inclusion on. Otherwise, when the variation key is
+    non-empty, it is ``json.dumps`` of the key, so a prompt never leaves the
+    process without consent. Otherwise it is omitted (native-graph spans).
+    *capture_content* left as ``None`` trusts the core: ``execute_and_track``
+    and ``execute_and_stream`` only pass ``__ldValue`` to a handler whose
+    effective setting is on, so the value is written whenever it is present.
+    Only an explicit ``False`` suppresses it.
     """
     span.set_attribute("launchdarkly.operation.type", "gen_ai")
     if not variables:
@@ -913,6 +939,15 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
         "feature_flag.key": ld.get("configKey", ""),
         "feature_flag.provider.name": "LaunchDarkly",
     }
+    variation_key = ld.get("variationKey")
+    if isinstance(variation_key, str) and variation_key:
+        feature_flag_attrs["feature_flag.result.variant"] = variation_key
+    if capture_content is not False and variables.get("__ldValue") is not None:
+        feature_flag_attrs["feature_flag.result.value"] = json.dumps(
+            variables["__ldValue"]
+        )
+    elif isinstance(variation_key, str) and variation_key:
+        feature_flag_attrs["feature_flag.result.value"] = json.dumps(variation_key)
     if ld.get("environmentId"):
         feature_flag_attrs["feature_flag.set.id"] = ld["environmentId"]
 

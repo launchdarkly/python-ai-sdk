@@ -1,11 +1,14 @@
-"""Context identity on the root feature_flag span. TESTING.md §3.18."""
+"""Context identity on the root feature_flag span."""
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
 
+import launchdarkly_ai_server.lifecycle as lifecycle_module
+from launchdarkly_ai_server import SDKOptions, configure
 from launchdarkly_ai_server.utils import set_ld_span_attributes
 
 LD_FIXTURE = {
@@ -15,6 +18,14 @@ LD_FIXTURE = {
     "version": 1,
     "modelName": "test-model",
     "providerName": "TestProvider",
+}
+
+
+RAW_VARIATION: dict[str, Any] = {
+    "model": {"name": "gpt-x", "parameters": {"temperature": 0.5}},
+    "provider": {"name": "openai"},
+    "messages": [{"role": "system", "content": "Olá"}],
+    "_ldMeta": {"enabled": True, "variationKey": "variation-a"},
 }
 
 
@@ -194,3 +205,69 @@ def test_malformed_ld_context_emits_none_of_the_three_and_does_not_throw(
     span = FakeSpan()
     set_ld_span_attributes(span, variables)
     _assert_no_context_identity(span)
+
+
+class TestResultVariant:
+    def test_variant_is_the_variation_key(self) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(span, _vars(None))
+        assert _feature_flag(span)["feature_flag.result.variant"] == "variation-a"
+
+    @pytest.mark.parametrize("variation_key", ["", None])
+    def test_empty_or_missing_variation_key_omits_the_variant(
+        self, variation_key: Any
+    ) -> None:
+        ld = {**LD_FIXTURE, "variationKey": variation_key}
+        if variation_key is None:
+            del ld["variationKey"]
+        span = FakeSpan()
+        set_ld_span_attributes(span, {"__ld": ld})
+        assert "feature_flag.result.variant" not in _feature_flag(span)
+
+    def test_capture_on_writes_the_raw_variation_like_the_tracing_hook(
+        self,
+    ) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(
+            span, {**_vars(None), "__ldValue": RAW_VARIATION}, capture_content=True
+        )
+        # ldotel's TracingHook writes json.dumps(detail.value) with defaults.
+        assert _feature_flag(span)["feature_flag.result.value"] == json.dumps(
+            RAW_VARIATION
+        )
+
+    def test_capture_off_writes_the_variation_key_not_the_prompt(self) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(
+            span, {**_vars(None), "__ldValue": RAW_VARIATION}, capture_content=False
+        )
+        assert _feature_flag(span)["feature_flag.result.value"] == '"variation-a"'
+
+    @pytest.mark.parametrize("default", [True, False])
+    def test_an_unset_capture_trusts_the_core(self, default: bool) -> None:
+        """The core only passes __ldValue to a capture-on handler, so None writes it."""
+        lifecycle_module._reset_for_testing()
+        configure(options=SDKOptions(capture_content=default))
+        try:
+            span = FakeSpan()
+            set_ld_span_attributes(span, {**_vars(None), "__ldValue": RAW_VARIATION})
+        finally:
+            lifecycle_module._reset_for_testing()
+        assert _feature_flag(span)["feature_flag.result.value"] == json.dumps(
+            RAW_VARIATION
+        )
+
+    def test_capture_on_without_a_raw_variation_falls_back_to_the_key(self) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(span, _vars(None), capture_content=True)
+        assert _feature_flag(span)["feature_flag.result.value"] == '"variation-a"'
+
+    @pytest.mark.parametrize("capture", [True, False])
+    def test_no_raw_variation_and_no_key_omits_the_value(self, capture: bool) -> None:
+        span = FakeSpan()
+        set_ld_span_attributes(
+            span,
+            {"__ld": {**LD_FIXTURE, "variationKey": ""}},
+            capture_content=capture,
+        )
+        assert "feature_flag.result.value" not in _feature_flag(span)

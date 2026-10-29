@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.27 — langchain-messages."""
+"""Tests for SDK helper usage events — langchain-messages."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch

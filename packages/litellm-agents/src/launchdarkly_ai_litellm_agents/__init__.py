@@ -5,9 +5,10 @@ from launchdarkly_ai_server import register_ai_sdk_package
 from ._version import PACKAGE_NAME, __version__
 from .graph import litellm_graph
 from .handler import create_litellm_agents_handler, litellm_agents
-from .native_graph import to_litellm_agents
+from .native_graph import LiteLLMNativeGraphOptions, to_litellm_agents
 
 __all__ = [
+    "LiteLLMNativeGraphOptions",
     "create_litellm_agents_handler",
     "litellm_agents",
     "litellm_graph",

@@ -1,7 +1,7 @@
 """
 Tests for launchdarkly-ai-openai-messages handler.
-Covers §1.1-1.9.
-Reference: TESTING.md §1, TELEMETRY-CONTRACT.md
+Covers the generic handler tests.
+Reference: TELEMETRY-CONTRACT.md
 """
 
 from __future__ import annotations
@@ -105,7 +105,7 @@ def mock_openai(mocker):
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory function and metadata
+# Factory function and metadata
 # ---------------------------------------------------------------------------
 
 
@@ -139,7 +139,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -276,7 +276,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -331,7 +331,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -439,7 +439,7 @@ class TestToolExecutionLoop:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Telemetry — span recording
+# Telemetry — span recording
 # ---------------------------------------------------------------------------
 
 
@@ -690,7 +690,9 @@ class TestRootSpanAttributes:
         assert attrs["launchdarkly.variation.key"] == "v"
         assert attrs["launchdarkly.run.id"] == "r"
         assert attrs["launchdarkly.graph.key"] == "g"
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
 
     async def test_child_spans_carry_no_launchdarkly_identity(
         self, mock_openai: MagicMock
@@ -873,14 +875,28 @@ class TestChatSpanAttributes:
 class TestContentCapture:
     """TELEMETRY-CONTRACT.md section 7."""
 
-    async def test_emits_no_content_at_all_by_default(
+    async def test_emits_content_by_default(self, mock_openai: MagicMock) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx:
+            await create_openai_messages_handler()(CONFIG, "q", {}, {})
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(
         self, mock_openai: MagicMock
     ) -> None:
         ctx, rec = _recording()
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         with ctx:
-            await create_openai_messages_handler()(CONFIG, "q", {}, {})
+            await create_openai_messages_handler(capture_content=False)(
+                CONFIG, "q", {}, {}
+            )
         for span in rec.spans:
             content_keys = [
                 k
@@ -1054,7 +1070,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling
+# Error handling
 # ---------------------------------------------------------------------------
 
 
@@ -1160,7 +1176,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Structured output (outputFormat)
+# Structured output (outputFormat)
 # ---------------------------------------------------------------------------
 
 
@@ -1516,7 +1532,7 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1564,7 +1580,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1973,7 +1989,7 @@ class TestStreaming:
     async def test_tools_forwarded_on_second_streaming_turn(
         self, mock_openai: MagicMock
     ) -> None:
-        """§1.8 - tools must appear in stream_params on every streaming turn.
+        """Tools must appear in stream_params on every streaming turn.
 
         This is a pre-existing Python-only behaviour that diverges from the TypeScript SDK (which
         does not resend tools after the first turn). It changes what the model is offered, not what
@@ -2066,12 +2082,12 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None content
+# None user_input must not produce None content
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the user-role message
+    """When user_input is None, the user-role message
     content sent to the provider must be '' not None."""
 
     async def test_none_user_input_instructions_path_no_none_content(
@@ -2100,12 +2116,12 @@ class TestNoneUserInput:
 
 
 # ---------------------------------------------------------------------------
-# §1.10 MAX_STEPS cap
+# MAX_STEPS cap
 # ---------------------------------------------------------------------------
 
 
 class TestMaxStepsCap:
-    """TESTING.md §1.10: The tool loop must break with an error after MAX_STEPS (5) iterations."""
+    """The tool loop must break with an error after MAX_STEPS (5) iterations."""
 
     def _tool_response(self) -> MagicMock:
         return _make_response(
@@ -2189,7 +2205,7 @@ class TestMaxStepsCap:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Streaming telemetry (do not patch _HAS_OTEL=False)
+# Streaming telemetry (do not patch _HAS_OTEL=False)
 # ---------------------------------------------------------------------------
 
 
@@ -2315,7 +2331,7 @@ class TestStreamingTelemetry:
         assert StatusCode.ERROR in rec.root.statuses
         assert rec.root.ended == 1
 
-    async def test_emits_no_content_by_default_on_the_streaming_path(
+    async def test_emits_content_by_default_on_the_streaming_path(
         self, mock_openai: MagicMock
     ) -> None:
         self._patch_stream(mock_openai, ["hi"])
@@ -2324,6 +2340,20 @@ class TestStreamingTelemetry:
 
         with ctx:
             async for _ in await create_openai_messages_handler().stream(CONFIG, "q"):
+                pass
+        assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self, mock_openai: MagicMock
+    ) -> None:
+        self._patch_stream(mock_openai, ["hi"])
+        ctx, rec = _recording()
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with ctx:
+            async for _ in await create_openai_messages_handler(
+                capture_content=False
+            ).stream(CONFIG, "q"):
                 pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []

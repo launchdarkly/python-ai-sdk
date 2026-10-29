@@ -1,11 +1,11 @@
 [project]
 name = "launchdarkly-ai-claude-messages"
-version = "0.2.5"
+version = "0.3.0"
 requires-python = ">=3.12"
 dependencies = [
-  "launchdarkly-ai-server>=0.4.1",
+  "launchdarkly-ai-server>=0.6,<2",
   "opentelemetry-api>=1.25",
-  "anthropic>=0.40",
+  "anthropic>=0.113",
 ]
 description = "Anthropic Claude messages handler for LaunchDarkly AI SDK"
 readme = "README.md"
@@ -13,7 +13,7 @@ license = "Apache-2.0"
 authors = [{name = "LaunchDarkly", email = "team@launchdarkly.com"}]
 keywords = ["launchdarkly", "ai", "anthropic", "claude"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",

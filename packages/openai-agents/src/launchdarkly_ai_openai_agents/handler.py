@@ -21,12 +21,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     RunUsage,
     SpanUsage,
@@ -86,7 +87,7 @@ except ImportError:  # pragma: no cover - `agents` is a hard dependency of this 
 #: ``TestModelSettingsAcceptsExactlyTheseFields`` in this package's tests asserts this
 #: classification stays exhaustive as the SDK's own dataclass changes.
 #:
-#: This is the cross-SDK list for OpenAI Agents (TESTING.md section 1.12), less the two keys that
+#: This is the cross-SDK list for OpenAI Agents, less the two keys that
 #: are not ``ModelSettings`` fields: ``max_turns`` goes to the run, and ``text`` is read only for
 #: ``text.verbosity``, which becomes ``verbosity`` (see :func:`_apply_text_verbosity`).
 _MODEL_SETTINGS_FORWARDED_KEYS = frozenset(
@@ -206,7 +207,7 @@ def _model_settings_parameters(config: AiConfigRep) -> dict[str, Any]:
 
 def _build_agent_tools(
     config_tools: dict[str, Any],
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK, which
     # excludes an unregistered tool from the catalog entirely. This difference predates the span
@@ -284,7 +285,7 @@ def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
 def _build_agent_and_prompt(
     config: AiConfigRep,
     user_input: str | None,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, str | list[dict[str, Any]], str | None]:
@@ -341,7 +342,7 @@ def _build_agent_and_prompt(
     # `outputFormat` is not wired into `Agent(output_type=...)` here, matching this handler's
     # pre-existing behaviour (and unlike the TypeScript handler, which does wire it): the Python
     # Agents SDK requires a concrete Python type for `output_type`, not a raw JSON Schema dict (see
-    # `utils.build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
+    # `utils._build_output_type`'s docstring). Fixing that gap is a "what is sent to the model"
     # change, not a telemetry one, so it is left alone. `_call_impl` still returns the parsed
     # `final_output` object as-is when `outputFormat` is configured, matching the pre-existing
     # return-shape contract.
@@ -646,31 +647,31 @@ def _usage_from_error(error: BaseException) -> SpanUsage | None:
     return to_span_usage(usage)
 
 
-def create_openai_agent_handler(
+def create_openai_agents_handler(
     *, capture_content: bool | None = None
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for OpenAI via the openai-agents SDK.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. Conversation content is PII, so a run emits only metadata, meaning
-    models, token counts, timings and tool names, until capture is turned on.
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
+    meaning models, token counts, timings and tool names.
     """
     report_usage("openai-agents.createOpenAIAgentHandler", PACKAGE_NAME, __version__)
-    return _create_openai_agent_handler(capture_content=capture_content)
+    return _create_openai_agents_handler(capture_content=capture_content)
 
 
-def _create_openai_agent_handler(
+def _create_openai_agents_handler(
     *, capture_content: bool | None = None
 ) -> ProviderHandler:
-    """Non-reporting :func:`create_openai_agent_handler`, used by this package's wrappers."""
+    """Non-reporting :func:`create_openai_agents_handler`, used by this package's wrappers."""
     content_override = capture_content
 
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -684,7 +685,7 @@ def _create_openai_agent_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared once this path (success or failure) has ended the root, so the `finally` below can
         # tell an open root from a closed one without asking the span. A mock span answers
@@ -753,7 +754,7 @@ def _create_openai_agent_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -788,7 +789,7 @@ def _stringify_output(value: Any) -> str:
 async def _stream_gen(
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
@@ -810,7 +811,7 @@ async def _stream_gen(
     agents_mod = importlib.import_module("agents")
     Runner = agents_mod.Runner
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     agent, prompt, instructions = _build_agent_and_prompt(
@@ -943,6 +944,6 @@ def openai_agents(
     capture_content = kwargs.pop("capture_content", None)
     return _config(
         key=config_key,
-        handler=_create_openai_agent_handler(capture_content=capture_content),
+        handler=_create_openai_agents_handler(capture_content=capture_content),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

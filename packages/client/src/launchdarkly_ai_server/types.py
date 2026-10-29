@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeVar
 
 # ---------------------------------------------------------------------------
 # LDContext
@@ -19,24 +19,32 @@ At minimum carries ``kind`` and ``key``; additional attributes are allowed.
 # ---------------------------------------------------------------------------
 
 
-class LDClientInterface:
-    """Protocol-like base; pass any object that satisfies this surface."""
+class LDClientInterface(Protocol):
+    """
+    Structural type for any LaunchDarkly client; ``ldclient.LDClient`` satisfies it.
 
-    async def variation(
-        self, key: str, context: LDContext, default_value: Any
-    ) -> Any: ...
+    ``variation``, ``flush`` and ``close`` may be sync or async: the SDK awaits any
+    awaitable result. ``track`` must be synchronous: the SDK calls it from sync code and
+    drops the result, so an ``async def track`` would never send an event. ``context`` is
+    ``Any`` because ``ldclient`` takes an ``ldclient.Context``, which the SDK builds from
+    an ``LDContext`` before the call. Parameters are positional-only so implementations
+    may name them freely (``ldclient`` calls the third ``variation`` argument ``default``).
+    """
+
+    def variation(self, key: str, context: Any, default_value: Any, /) -> Any: ...
 
     def track(
         self,
         event_name: str,
-        context: LDContext,
+        context: Any,
         data: Any = None,
         metric_value: float | None = None,
+        /,
     ) -> None: ...
 
-    async def flush(self) -> None: ...
+    def flush(self) -> Any: ...
 
-    async def close(self) -> None: ...
+    def close(self) -> Any: ...
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +103,7 @@ Raw AI config dict as returned by ``parse_ai_config``. Fields include
 ``model``, ``provider``, at least one of ``instructions``, ``messages``, or a
 non-empty ``classifiers`` list, and an optional ``skills`` array of
 ``{key, version}`` references. Parsing does not validate ``skills``; read it
-with ``launchdarkly_ai_server.experimental.skills.skill_refs``, which does.
+with ``launchdarkly_ai_server.skill_refs``, which does.
 """
 
 VariationMeta = dict[str, Any]
@@ -130,7 +138,7 @@ _HandlerFn = Callable[
     [
         AiConfigRep,
         str | None,
-        dict[str, Any] | None,
+        Mapping[str, Callable[..., Any] | NativeTool] | None,
         dict[str, Any] | None,
         list[dict[str, Any]] | None,
     ],
@@ -140,7 +148,7 @@ _StreamFn = Callable[
     [
         AiConfigRep,
         str | None,
-        dict[str, Any] | None,
+        Mapping[str, Callable[..., Any] | NativeTool] | None,
         dict[str, Any] | None,
         list[dict[str, Any]] | None,
     ],
@@ -228,7 +236,7 @@ class ProviderHandler:
         self,
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> HandlerResult:
@@ -241,7 +249,7 @@ class ProviderHandler:
         self,
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -377,6 +385,12 @@ class JudgeTask:
     must stay picklable.
     """
     """LD metric key to track the score against."""
+    judge_value: Any = None
+    """The judge variation exactly as the LD SDK returned it.
+
+    Written as the root span's ``feature_flag.result.value`` when the judge
+    handler captures content; otherwise the variation key is written.
+    """
 
 
 @dataclass
@@ -419,7 +433,7 @@ StreamEvent = dict[str, Any]  # StreamChunkEvent | StreamDoneEvent
 # Graph stream events (camelCase public fields, matching the TypeScript SDK)
 # node_start: {type, nodeKey}
 # chunk: {type, text, nodeKey}
-# node_done: {type, nodeKey, response, usage}
+# node_done: {type, nodeKey, response, usage, judgeResults?}  (the node's own judges)
 # handoff: {type, sourceKey, targetKey}
 # done: {type, response, usage, judgeResults?}
 GraphStreamEvent = dict[str, Any]
@@ -517,6 +531,21 @@ class ProviderGraphResponse:
     """Aggregate token counts across all nodes."""
     judge_results: dict[str, JudgeResult] | None = None
     """Results from a graph-level judge, if configured."""
+
+
+class NativeGraphRunner(Protocol):
+    """
+    What a native graph adapter (``to_lang_graph``, ``to_openai_agents``, …) returns.
+
+    ``invoke`` resolves to ``{"response": str, "usage": UsageDict}``.
+    """
+
+    def invoke(
+        self,
+        input_text: str = "",
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> Awaitable[dict[str, Any]]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +671,71 @@ class ReconcileReport:
         return [a for a in self.actions if a.action == "error"]
 
 
+@dataclass(frozen=True, init=False)
+class SkillSource:
+    """
+    A requested set of skills that is read when it is needed, not fixed when
+    the call is made. Immutable.
+
+    ``write_skills`` reads it once per call; ``watch_skills`` reads it on every
+    reconcile, and re-reconciles when one of the AI Configs named in
+    ``config_keys`` changes. ``config_skills(key, context)`` builds the common
+    case, one AI Config evaluated for one context.
+
+    ``refs`` raising, or answering anything other than a sequence of
+    ``SkillReference`` values and key strings, is a failed retrieval: nothing on
+    disk changes. Raise to say "I could not tell"; never return ``[]`` for it,
+    because ``[]`` prunes every skill the root manages.
+    """
+
+    refs: Callable[
+        [], Sequence[SkillReference | str] | Awaitable[Sequence[SkillReference | str]]
+    ]
+    """Zero-argument callable, sync or async, returning the current references."""
+    config_keys: tuple[str, ...]
+    """The AI Config keys whose changes should make a watcher read ``refs`` again."""
+
+    def __init__(
+        self,
+        refs: Callable[
+            [],
+            Sequence[SkillReference | str] | Awaitable[Sequence[SkillReference | str]],
+        ],
+        config_keys: Sequence[str] = (),
+    ) -> None:
+        """
+        Raises:
+            TypeError: If *refs* is not callable, or *config_keys* is a string
+                or holds anything but non-empty strings. A bare string would be
+                followed as one-character keys, none of which ever changes.
+        """
+        if not callable(refs):
+            raise TypeError(
+                f"SkillSource refs must be callable, got {type(refs).__name__}"
+            )
+        if isinstance(config_keys, (str, bytes)):
+            raise TypeError(
+                "SkillSource config_keys must be a sequence of config keys, not a "
+                f"single string; got {config_keys!r}. Pass ({config_keys!r},)."
+            )
+        if not isinstance(config_keys, Sequence):
+            raise TypeError(
+                "SkillSource config_keys must be a sequence of config keys, got "
+                f"{type(config_keys).__name__}"
+            )
+        keys = tuple(config_keys)
+        for key in keys:
+            if not isinstance(key, str):
+                raise TypeError(
+                    "SkillSource config_keys must hold only strings, got "
+                    f"{type(key).__name__}"
+                )
+            if not key:
+                raise TypeError("SkillSource config_keys must not hold an empty key")
+        object.__setattr__(self, "refs", refs)
+        object.__setattr__(self, "config_keys", keys)
+
+
 # ---------------------------------------------------------------------------
 # Model / graph options
 # ---------------------------------------------------------------------------
@@ -657,13 +751,15 @@ class SDKOptions:
     """Process-wide behavior defaults, applied by :func:`configure`.
 
     ``capture_content`` is the default for writing prompts, model output, tool
-    arguments, tool results, and judge explanations. It is a default, not a
-    ceiling: an explicit ``True`` or ``False`` on a handler factory or a
-    convenience wrapper overrides it. Further process-wide defaults are added
-    as fields on this object.
+    arguments, tool results, and judge explanations. The built-in value is
+    ``True``: a process that never calls ``configure`` sends that text. It is a
+    default, not a ceiling: an explicit ``True`` or ``False`` on a handler
+    factory or a convenience wrapper overrides it, and an explicit ``False``
+    removes the text everywhere, including on offline evaluation spans. Further
+    process-wide defaults are added as fields on this object.
     """
 
-    capture_content: bool = False
+    capture_content: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture_content, bool):

@@ -1,7 +1,6 @@
 """
 Tests for launchdarkly-ai-claude-messages handler.
-Covers §1.1–1.9 (generic handler tests).
-Reference: TESTING.md §1
+Covers the generic handler tests.
 """
 
 from __future__ import annotations
@@ -104,7 +103,7 @@ def mock_anthropic(mocker):
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory function and metadata
+# Factory function and metadata
 # ---------------------------------------------------------------------------
 
 
@@ -138,7 +137,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -294,7 +293,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -373,7 +372,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -740,7 +739,7 @@ class TestToolExecutionLoop:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Telemetry
+# Telemetry
 # ---------------------------------------------------------------------------
 # Span recording
 # ---------------------------------------------------------------------------
@@ -1007,7 +1006,9 @@ class TestRootSpanAttributes:
         assert attrs["launchdarkly.variation.key"] == "v"
         assert attrs["launchdarkly.run.id"] == "r"
         assert attrs["launchdarkly.graph.key"] == "g"
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
 
     async def test_child_spans_carry_no_launchdarkly_identity(
         self, mock_anthropic: MagicMock
@@ -1188,15 +1189,29 @@ class TestChatSpanAttributes:
 class TestContentCapture:
     """TELEMETRY-CONTRACT.md section 7."""
 
-    async def test_emits_no_content_at_all_by_default(
-        self, mock_anthropic: MagicMock
-    ) -> None:
-        # Conversation content is PII. This is the assertion worth pinning hardest.
+    async def test_emits_content_by_default(self, mock_anthropic: MagicMock) -> None:
         ctx, rec = _recording()
         from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
         with ctx:
             await create_claude_messages_handler()(CONFIG, "q", {}, {})
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        # An explicit false still strips conversation content. This is the opt-out.
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            await create_claude_messages_handler(capture_content=False)(
+                CONFIG, "q", {}, {}
+            )
         for span in rec.spans:
             content_keys = [
                 k
@@ -1292,7 +1307,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling
+# Error handling
 # ---------------------------------------------------------------------------
 
 
@@ -1406,7 +1421,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Structured output (outputFormat)
+# Structured output (outputFormat)
 # ---------------------------------------------------------------------------
 
 
@@ -1460,7 +1475,7 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1508,7 +1523,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1828,12 +1843,12 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None content
+# None user_input must not produce None content
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the user-role message
+    """When user_input is None, the user-role message
     content sent to the provider must be '' not None."""
 
     async def test_none_user_input_instructions_path_no_none_content(
@@ -1864,12 +1879,12 @@ class TestNoneUserInput:
 
 
 # ---------------------------------------------------------------------------
-# §1.10 MAX_STEPS cap
+# MAX_STEPS cap
 # ---------------------------------------------------------------------------
 
 
 class TestMaxStepsCap:
-    """TESTING.md §1.10: The tool loop must break with an error after MAX_STEPS (5) iterations."""
+    """The tool loop must break with an error after MAX_STEPS (5) iterations."""
 
     def _tool_use_response(self, id: str = "tu1") -> MagicMock:
         return _anthropic_response(
@@ -1957,7 +1972,7 @@ class TestMaxStepsCap:
 
 
 # ---------------------------------------------------------------------------
-# §1.5 Streaming telemetry (Appendix A.5 — do not patch _HAS_OTEL=False)
+# Streaming telemetry (do not patch _HAS_OTEL=False)
 # ---------------------------------------------------------------------------
 
 
@@ -2089,7 +2104,7 @@ class TestStreamingTelemetry:
         assert StatusCode.ERROR in rec.root.statuses
         assert rec.root.ended == 1
 
-    async def test_emits_no_content_by_default_on_the_streaming_path(
+    async def test_emits_content_by_default_on_the_streaming_path(
         self, mock_anthropic: MagicMock
     ) -> None:
         self._patch_stream(mock_anthropic, ["hi"])
@@ -2098,6 +2113,20 @@ class TestStreamingTelemetry:
 
         with ctx:
             async for _ in await create_claude_messages_handler().stream(CONFIG, "q"):
+                pass
+        assert any("gen_ai.input.messages" in span.attributes for span in rec.spans)
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self, mock_anthropic: MagicMock
+    ) -> None:
+        self._patch_stream(mock_anthropic, ["hi"])
+        ctx, rec = _recording()
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        with ctx:
+            async for _ in await create_claude_messages_handler(
+                capture_content=False
+            ).stream(CONFIG, "q"):
                 pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []

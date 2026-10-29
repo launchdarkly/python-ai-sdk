@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.4.0"  # x-release-please-version
+__version__ = "0.5.0"  # x-release-please-version
 
 from .client import ConfigInstance, config
 from .client import _config as _config
@@ -26,6 +26,22 @@ from .conversation import (
     ConversationIdSpanProcessor,
     conversation_id,
     set_conversation_id_if_absent,
+)
+from .evaluations import (
+    AIConfig,
+    Criterion,
+    DatasetRow,
+    EvalRunResult,
+    EvalTool,
+    EvaluationsError,
+    EvaluationsModule,
+    GenerationConfig,
+    GenerationMode,
+    GenerationOverrides,
+    Judge,
+    RunSummary,
+    Scorer,
+    init_evaluations,
 )
 from .graph import GraphInstance, graph, resolve_graph
 from .graph import _graph as _graph
@@ -55,6 +71,28 @@ from .registry import (
 )
 from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
 from .sdk_usage import report_usage
+from .skills import (
+    InMemorySkillStore,
+    all_skills,
+    get_skill,
+    get_skill_result,
+    get_skills,
+    set_skill_store,
+    skill_refs,
+)
+from .skills import _skill_refs as _skill_refs
+from .skills_core import SkillStore
+from .skills_fdv2 import LaunchDarklySkillStore, StoreDiagnostics
+from .skills_fs import (
+    MANIFEST_FILENAME,
+    MANIFEST_VERSION,
+    SKILL_FILENAME,
+    OnUnavailable,
+    write_skills,
+)
+from .skills_fs import _write_skills as _write_skills
+from .skills_source import config_skills
+from .skills_watch import SkillWatcher, watch_skills
 from .tracking import execute_and_stream, execute_and_track, wrap_tool_handlers
 from .types import (
     NATIVE_TOOL_KEY,
@@ -78,6 +116,7 @@ from .types import (
     LDClientInterface,
     LDContext,
     Message,
+    NativeGraphRunner,
     NativeTool,
     ParseFailure,
     ParseResult,
@@ -85,7 +124,15 @@ from .types import (
     ProviderGraphResponse,
     ProviderHandler,
     ProviderResponse,
+    ReconcileAction,
+    ReconcileActionKind,
+    ReconcileReport,
     SDKOptions,
+    Skill,
+    SkillOutcome,
+    SkillOutcomeReason,
+    SkillReference,
+    SkillSource,
     StreamChunkEvent,
     StreamDoneEvent,
     StreamEvent,
@@ -119,6 +166,9 @@ from .utils import (
 )
 from .utils import _create_handler as _create_handler
 
+# Deprecated: the 0.5.0 name. Removed in the next major release.
+FDv2SkillStore = LaunchDarklySkillStore
+
 __all__ = [  # noqa: RUF022
     # types
     "NATIVE_TOOL_KEY",
@@ -146,6 +196,7 @@ __all__ = [  # noqa: RUF022
     "ParseFailure",
     "ParseResult",
     "ParseSuccess",
+    "NativeGraphRunner",
     "ProviderGraphResponse",
     "ProviderHandler",
     "ProviderResponse",
@@ -236,6 +287,58 @@ __all__ = [  # noqa: RUF022
     "graph",
     "resolve_graph",
     "GraphInstance",
+    # Agent Skills: configuration
+    "set_skill_store",
+    "SkillStore",
+    "InMemorySkillStore",
+    # Agent Skills: LaunchDarkly delivery store and on-change re-reconcile
+    "LaunchDarklySkillStore",
+    "FDv2SkillStore",
+    "StoreDiagnostics",
+    "watch_skills",
+    "SkillWatcher",
+    # Agent Skills: a requested set read on every reconcile, following AI Config changes
+    "SkillSource",
+    "config_skills",
+    # Agent Skills: accessors
+    "skill_refs",
+    "get_skill",
+    "get_skill_result",
+    "get_skills",
+    "all_skills",
+    "write_skills",
+    # Agent Skills: value types
+    "Skill",
+    "SkillReference",
+    "SkillOutcome",
+    "ReconcileAction",
+    "ReconcileReport",
+    # Agent Skills: literal types for typed consumers
+    "ReconcileActionKind",
+    "OnUnavailable",
+    "SkillOutcomeReason",
+    # Agent Skills: on-disk filenames and manifest version
+    "SKILL_FILENAME",
+    "MANIFEST_FILENAME",
+    "MANIFEST_VERSION",
+    # Evaluations from Code: entry point
+    "init_evaluations",
+    "EvaluationsModule",
+    # Evaluations from Code: run() arguments
+    "AIConfig",
+    "GenerationConfig",
+    "GenerationMode",
+    "GenerationOverrides",
+    "DatasetRow",
+    "EvalTool",
+    # Evaluations from Code: criteria
+    "Criterion",
+    "Judge",
+    "Scorer",
+    # Evaluations from Code: results and errors
+    "EvalRunResult",
+    "RunSummary",
+    "EvaluationsError",
 ]
 
 register_ai_sdk_package("launchdarkly-ai-server", __version__)

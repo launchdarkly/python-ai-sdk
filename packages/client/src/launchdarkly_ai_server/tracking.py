@@ -4,7 +4,7 @@ import inspect
 import os
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -53,7 +53,7 @@ def _try_get_environment_id() -> str | None:
 
 
 def wrap_tool_handlers(
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
     user_context: LDContext,
     track_data: TrackData,
 ) -> dict[str, Callable[..., Any]]:
@@ -128,7 +128,7 @@ def wrap_tool_handlers(
 
 def _exposed_tool_keys(
     config: AiConfigRep,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
 ) -> list[str]:
     """The tool keys this config offered the model, in declaration order.
 
@@ -155,6 +155,21 @@ def _exposed_tool_keys(
     ]
 
 
+def _handler_captures_content(handler: Any) -> bool:
+    """Effective content capture for a call made through *handler*.
+
+    A :class:`ProviderHandler` answers with its own override, else the process
+    default. A plain function has no setting, so it follows the process
+    default. The raw variation only reaches a handler that captures content.
+    """
+    capture = getattr(handler, "capture_content", None)
+    if isinstance(capture, bool):
+        return capture
+    from .lifecycle import effective_capture_content
+
+    return effective_capture_content(None)
+
+
 async def execute_and_track(
     *,
     config_key: str,
@@ -163,14 +178,17 @@ async def execute_and_track(
     user_context: LDContext,
     handler: ProviderHandler,
     user_input: str | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
+    evaluated_value: Any = None,
 ) -> dict[str, Any]:
     """
     Calls *handler*, emits LD telemetry events, and returns
-    ``{usage, response, track_data}``.
+    ``{usage, response, track_data}``. *evaluated_value* is the variation as
+    the LD SDK returned it; with content capture on it becomes the root
+    span's ``feature_flag.result.value``.
     """
     from .lifecycle import get_client
 
@@ -212,6 +230,11 @@ async def execute_and_track(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
+    # ``__ldValue`` is SDK-owned like ``__ld``: a caller-supplied one never
+    # reaches the handler.
+    merged_variables.pop("__ldValue", None)
+    if evaluated_value is not None and _handler_captures_content(handler):
+        merged_variables["__ldValue"] = evaluated_value
 
     start_time = time.monotonic()
 
@@ -262,10 +285,11 @@ async def execute_and_stream(
     user_context: LDContext,
     handler: ProviderHandler,
     user_input: str | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
+    evaluated_value: Any = None,
 ) -> AsyncGenerator[ExecuteStreamEvent, None]:
     """
     Streaming counterpart to ``execute_and_track``. Yields ``chunk`` events,
@@ -312,6 +336,11 @@ async def execute_and_stream(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
+    # ``__ldValue`` is SDK-owned like ``__ld``: a caller-supplied one never
+    # reaches the handler.
+    merged_variables.pop("__ldValue", None)
+    if evaluated_value is not None and _handler_captures_content(handler):
+        merged_variables["__ldValue"] = evaluated_value
 
     start_time = time.monotonic()
     full_text = ""

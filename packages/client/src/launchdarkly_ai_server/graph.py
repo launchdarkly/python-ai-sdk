@@ -6,7 +6,7 @@ import logging
 import re as _re
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from .agui import StableProjector
@@ -107,16 +107,16 @@ async def _fetch_graph_variation(
     topology = variation if isinstance(variation, dict) else None
 
     if not topology or not topology.get("root"):
-        return {"enabled": False, "meta": meta}
+        return {"enabled": False, "meta": meta, "value": variation}
 
-    return {"enabled": True, "topology": topology, "meta": meta}
+    return {"enabled": True, "topology": topology, "meta": meta, "value": variation}
 
 
 async def _build_graph(
     key: str,
     context: LDContext,
     options: dict[str, Any],
-) -> tuple[GraphDefinition, TrackData, Callable[..., Any]]:
+) -> tuple[GraphDefinition, TrackData, Callable[..., Any], Any]:
     from .judges import run_judges
     from .lifecycle import extract_variation, get_client
     from .tracking import _try_get_environment_id, execute_and_track
@@ -127,6 +127,9 @@ async def _build_graph(
     enabled: bool = result["enabled"]
     topology: dict[str, Any] | None = result.get("topology")
     meta = result.get("meta", {})
+    # The graph variation as the LD SDK returned it, for the root span's
+    # feature_flag.result.value. Kept off GraphDefinition, which is public.
+    graph_value = result.get("value")
 
     graph_track_data: TrackData = {
         "runId": str(uuid.uuid4()),
@@ -147,6 +150,7 @@ async def _build_graph(
             _disabled_definition(key),
             graph_track_data,
             _disabled_stream_route(key),
+            graph_value,
         )
 
     raw_edges_map: dict[str, list[dict[str, Any]]] = topology.get("edges") or {}
@@ -171,11 +175,14 @@ async def _build_graph(
         return [e for e in edges if e.source_key == node_key]
 
     nodes: dict[str, GraphNode] = {}
+    # Raw variations, kept off the public GraphNode.
+    node_values: dict[str, Any] = {}
     try:
         for node_key in all_keys:
             variation = await extract_variation(node_key, context)
             node_config: AiConfigRep = variation["config"]
             node_meta: VariationMeta = variation["meta"]
+            node_values[node_key] = variation.get("value")
             node_edges = edges_from(node_key)
             nodes[node_key] = GraphNode(
                 key=node_key,
@@ -190,6 +197,7 @@ async def _build_graph(
             _disabled_definition(key),
             graph_track_data,
             _disabled_stream_route(key),
+            graph_value,
         )
 
     root_node = nodes.get(topology["root"])
@@ -238,6 +246,7 @@ async def _build_graph(
         try:
             result = await execute_and_track(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=node.config,
                 meta=node.meta,
                 user_context=context,
@@ -337,12 +346,15 @@ async def _build_graph(
                 def _fn(*a: Any, **kw: Any) -> str:
                     if not chosen:
                         chosen.append(t)
-                    # Selecting an edge does not end the turn; execution continues until the
-                    # model produces its final text. A "transferring now" reply reads as though
-                    # control has already left, and the model stops short of its own work.
+                    # Both routing strings are pinned byte for byte across SDKs, for two
+                    # reasons: "recorded" keeps a node with a real tool from skipping
+                    # it, and asking for no "final response" keeps a router from answering for
+                    # its target.
                     return (
                         f"Handoff to {t} recorded. "
-                        "Finish your own work and provide your final response."
+                        f"{t} takes over when your turn ends. "
+                        "Finish your own part, then end your turn. "
+                        f"Do not answer for {t}."
                     )
 
                 return _fn
@@ -355,8 +367,10 @@ async def _build_graph(
                 (node.config.get("instructions") or "")
                 + (
                     "\n\nComplete your task using your available tools first. "
-                    "Only once you have your final answer, call exactly one transfer "
-                    "tool to route to the next agent."
+                    "Only once your own part is done, call exactly one transfer "
+                    "tool to route to the next agent. "
+                    "Do not answer the parts of the request that belong to the agent "
+                    "you route to."
                 )
             ),
             "tools": {
@@ -410,6 +424,7 @@ async def _build_graph(
         try:
             result = await execute_and_track(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=routed_config,
                 meta=node.meta,
                 user_context=context,
@@ -525,6 +540,7 @@ async def _build_graph(
             projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=node.config,
                 meta=node.meta,
                 user_context=context,
@@ -572,12 +588,16 @@ async def _build_graph(
                     1,
                 )
 
-            yield {
+            # The node's own judges; omitted when none produced a result, as on done.
+            node_done: GraphStreamEvent = {
                 "type": "node_done",
                 "nodeKey": node.key,
                 "response": response,
                 "usage": usage,
             }
+            if judge_results:
+                node_done["judgeResults"] = judge_results
+            yield node_done
             if outcome is not None:
                 outcome.clear()
                 outcome.update(
@@ -665,6 +685,7 @@ async def _build_graph(
             projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=routed_config,
                 meta=node.meta,
                 user_context=context,
@@ -716,12 +737,16 @@ async def _build_graph(
                     1,
                 )
 
-            yield {
+            # The node's own judges; omitted when none produced a result, as on done.
+            node_done: GraphStreamEvent = {
                 "type": "node_done",
                 "nodeKey": node.key,
                 "response": response,
                 "usage": usage,
             }
+            if judge_results:
+                node_done["judgeResults"] = judge_results
+            yield node_done
             if outcome is not None:
                 outcome.clear()
                 outcome.update(
@@ -824,7 +849,7 @@ async def _build_graph(
         reverse_traverse=reverse_traverse,
     )
 
-    return graph_def, graph_track_data, stream_route
+    return graph_def, graph_track_data, stream_route, graph_value
 
 
 async def resolve_graph(
@@ -832,7 +857,7 @@ async def resolve_graph(
     *,
     context: LDContext,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
 ) -> GraphDefinition:
     """
@@ -852,7 +877,7 @@ async def resolve_graph(
         "tool_handlers": resolved_tools,
         "registry": registry,
     }
-    graph_def, _, _ = await _build_graph(key, context, options)
+    graph_def, _, _, _ = await _build_graph(key, context, options)
     return graph_def
 
 
@@ -890,7 +915,7 @@ class GraphInstance:
         from opentelemetry import trace
 
         from .judges import run_judges
-        from .lifecycle import get_client
+        from .lifecycle import effective_capture_content, get_client
 
         ld_ctx = to_ld_context(get_client(), context)
 
@@ -913,7 +938,7 @@ class GraphInstance:
             )
 
         built = await _build_graph(self._key, context, resolved_options)
-        graph_def, built_track_data, _ = built
+        graph_def, built_track_data, _, graph_value = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
@@ -923,7 +948,13 @@ class GraphInstance:
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
             set_ld_span_attributes(
-                span, {"__ld": graph_track_data, "ldContext": context}
+                span,
+                {
+                    "__ld": graph_track_data,
+                    "ldContext": context,
+                    "__ldValue": graph_value,
+                },
+                capture_content=effective_capture_content(None),
             )
 
             start_time = time.monotonic()
@@ -1115,7 +1146,7 @@ class GraphInstance:
         from opentelemetry.trace import Status, StatusCode, set_span_in_context
 
         from .judges import run_judges
-        from .lifecycle import get_client
+        from .lifecycle import effective_capture_content, get_client
 
         resolved_input = user_input or ""
         ld_ctx = to_ld_context(get_client(), context)
@@ -1139,7 +1170,7 @@ class GraphInstance:
             )
 
         built = await _build_graph(self._key, context, resolved_options)
-        graph_def, built_track_data, stream_route = built
+        graph_def, built_track_data, stream_route, graph_value = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
@@ -1148,7 +1179,11 @@ class GraphInstance:
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
-        set_ld_span_attributes(span, {"__ld": graph_track_data, "ldContext": context})
+        set_ld_span_attributes(
+            span,
+            {"__ld": graph_track_data, "ldContext": context, "__ldValue": graph_value},
+            capture_content=effective_capture_content(None),
+        )
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()
@@ -1340,7 +1375,7 @@ def graph(
     key: str,
     *,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     graph_judge: str | None = None,
 ) -> GraphInstance:
@@ -1362,7 +1397,7 @@ def _graph(
     key: str,
     *,
     handlers: list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     graph_judge: str | None = None,
 ) -> GraphInstance:

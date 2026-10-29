@@ -1,5 +1,5 @@
 """
-LangChain Agents handler — uses LangGraph's create_react_agent / StateGraph.
+LangChain Agents handler — uses LangChain's create_agent / LangGraph's StateGraph.
 Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 """
 
@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
@@ -85,7 +86,7 @@ _LANGCHAIN_RUNTIME_KEYS = frozenset(
 #: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
 #: stays exhaustive as the SDK's own pydantic model changes.
 #:
-#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatOpenAI.
 #: ``reasoning_effort`` and ``seed`` are marked not supported in TypeScript there: the JS
 #: ``ChatOpenAI`` takes them only as per-call options, while this handler sets them on the
 #: constructor, which has a field for each. ``reasoning_effort`` is the Chat Completions field and
@@ -131,7 +132,7 @@ _CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 #:   handler gets back. ``truncation``, ``context_management`` and ``use_previous_response_id``
 #:   also lean on server-side conversation state.
 #: * ``store``: data retention. It decides whether the request is kept on the server.
-#: * ``prompt_cache_key``: on the spec list, marked not supported in Python, because
+#: * ``prompt_cache_key``: on the cross-SDK list, marked not supported in Python, because
 #:   ``ChatOpenAI`` has no such constructor field (it takes it only per call). It is not in the set
 #:   below because ``ChatOpenAI`` does not accept it at all, which the drift test requires of every
 #:   listed key.
@@ -181,7 +182,7 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``TestChatAnthropicAcceptsExactlyTheseKeys`` in this
 #: package's tests asserts this classification stays exhaustive.
 #:
-#: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatAnthropic.
 #: ``max_tokens_to_sample`` is renamed to ``max_tokens`` before this list applies, and a
 #: ``max_tokens`` the config also set wins. ``stop`` is renamed to ``stop_sequences`` the same way, and
 #: a ``stop_sequences`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
@@ -304,7 +305,7 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: ``TestChatBedrockConverseAcceptsExactlyTheseKeys`` in this package's tests skips itself when it
 #: is not installed rather than asserting nothing.
 #:
-#: This is the cross-SDK list for LangChain ChatBedrockConverse (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatBedrockConverse.
 #: ``reasoning_effort``, ``stop`` and ``stop_sequences`` are marked not supported in TypeScript
 #: there: the JS ``ChatBedrockConverse`` takes stop sequences only as a per-call option and has no
 #: reasoning effort field, while this class has constructor fields for both. ``stop`` is renamed to
@@ -390,7 +391,7 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 
 def _build_agent_tools(
     config_tools: dict[str, Any],
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     import importlib
 
@@ -403,7 +404,8 @@ def _build_agent_tools(
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
             fn = tool_handlers.get(_name)
-            if not fn:
+            # A NativeTool reaches here unwrapped on the offline evaluations path.
+            if not callable(fn):
                 raise ValueError(f'No handler registered for tool "{_name}"')
             # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
             # routing records the selected edge on the call itself; awaiting a plain
@@ -556,7 +558,13 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
 
     provider = ((config.get("provider") or {}).get("name") or "openai").lower()
     if provider == "anthropic":
-        lc_anthropic = importlib.import_module("langchain_anthropic")
+        try:
+            lc_anthropic = importlib.import_module("langchain_anthropic")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Anthropic models requires langchain-anthropic. "
+                'Install it with: pip install "launchdarkly-ai-langchain-agents[anthropic]"'
+            ) from exc
         return lc_anthropic.ChatAnthropic(
             **_rebuild_anthropic_output_config(
                 _rebuild_anthropic_thinking(
@@ -576,7 +584,7 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
         except ImportError as exc:
             raise ImportError(
                 "Using Bedrock models requires langchain-aws. "
-                "Install it with: pip install langchain-aws"
+                'Install it with: pip install "launchdarkly-ai-langchain-agents[aws]"'
             ) from exc
         return lc_aws.ChatBedrockConverse(
             **_model_constructor_kwargs(
@@ -637,16 +645,16 @@ def create_langchain_agents_handler(
     providers: Sequence[str] | None = None,
     capture_content: bool | None = None,
 ) -> ProviderHandler:
-    """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
+    """Creates a ``ProviderHandler`` for LangChain via ``langchain.agents.create_agent``.
 
     Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
     called after flag evaluation so ``model.parameters`` can be applied unchanged.
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. Conversation content is PII, so a run emits only metadata, meaning
-    models, token counts, timings and tool names, until capture is turned on.
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
+    meaning models, token counts, timings and tool names.
 
     *providers* limits which ``config.provider.name`` values this wildcard accepts.
     Omit it to match every provider. Names must match the config exactly, for example
@@ -672,7 +680,7 @@ def _create_langchain_agents_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -683,7 +691,7 @@ def _create_langchain_agents_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` below can tell an open root
         # from a closed one without asking the span. A mock span answers `is_recording()`
@@ -719,13 +727,12 @@ def _create_langchain_agents_handler(
                 )
             base_model = await _resolve_base_model(config, llm)
 
-            langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
-            create_react_agent = langgraph_prebuilt.create_react_agent
+            create_agent = importlib.import_module("langchain.agents").create_agent
             tools = _build_agent_tools(config.get("tools") or {}, th)
-            agent = create_react_agent(
+            agent = create_agent(
                 base_model,
                 tools,
-                **({"prompt": system_prompt} if system_prompt else {}),
+                **({"system_prompt": system_prompt} if system_prompt else {}),
             )
             result = await agent.ainvoke(
                 {"messages": initial_messages},
@@ -803,7 +810,7 @@ def _create_langchain_agents_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -830,7 +837,7 @@ async def _stream_gen(
     llm: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
@@ -848,7 +855,7 @@ async def _stream_gen(
     """
     import importlib
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     system_prompt = _extract_system_prompt(config, variables)
@@ -877,13 +884,12 @@ async def _stream_gen(
             )
         base_model = await _resolve_base_model(config, llm)
 
-        langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
-        create_react_agent = langgraph_prebuilt.create_react_agent
+        create_agent = importlib.import_module("langchain.agents").create_agent
         tools = _build_agent_tools(config.get("tools") or {}, tool_handlers)
-        agent = create_react_agent(
+        agent = create_agent(
             base_model,
             tools,
-            **({"prompt": system_prompt} if system_prompt else {}),
+            **({"system_prompt": system_prompt} if system_prompt else {}),
         )
 
         run_usage = create_run_usage()

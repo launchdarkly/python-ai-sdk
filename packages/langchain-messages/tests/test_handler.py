@@ -1,6 +1,6 @@
 """
 Tests for launchdarkly-ai-langchain-messages handler.
-Covers §1.1-1.10 (generic handler tests) plus TELEMETRY-CONTRACT.md sections 1-9.
+Covers the generic handler tests plus TELEMETRY-CONTRACT.md sections 1-9.
 """
 
 from __future__ import annotations
@@ -174,7 +174,7 @@ def _make_tracer_patch(mock_span: MagicMock) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory function and metadata
+# Factory function and metadata
 # ---------------------------------------------------------------------------
 
 
@@ -227,7 +227,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -347,7 +347,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 Tool conversion
+# Tool conversion
 # ---------------------------------------------------------------------------
 
 
@@ -400,7 +400,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop
+# Tool execution loop
 # ---------------------------------------------------------------------------
 
 
@@ -695,7 +695,9 @@ class TestRootSpanAttributes:
         assert attrs["launchdarkly.variation.key"] == "v"
         assert attrs["launchdarkly.run.id"] == "r"
         assert attrs["launchdarkly.graph.key"] == "g"
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
 
     async def test_child_spans_carry_no_launchdarkly_identity(self) -> None:
         ctx, rec = _recording()
@@ -845,7 +847,7 @@ class TestChatSpanAttributes:
 
 
 class TestContentCapture:
-    async def test_emits_no_content_at_all_by_default(self) -> None:
+    async def test_emits_content_by_default(self) -> None:
         ctx, rec = _recording()
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 
@@ -853,6 +855,20 @@ class TestContentCapture:
             await create_langchain_messages_handler(llm=_make_llm())(
                 CONFIG, "q", {}, {}
             )
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(self) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        with ctx:
+            await create_langchain_messages_handler(
+                llm=_make_llm(), capture_content=False
+            )(CONFIG, "q", {}, {})
         for span in rec.spans:
             content_keys = [
                 k
@@ -1048,7 +1064,7 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Structured output — withStructuredOutput
+# Structured output — withStructuredOutput
 # ---------------------------------------------------------------------------
 
 
@@ -1129,7 +1145,7 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1194,7 +1210,7 @@ class TestConvenienceExport:
 
 
 # ---------------------------------------------------------------------------
-# §1.8 Streaming
+# Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -1640,7 +1656,7 @@ class TestStreamingTelemetry:
         assert StatusCode.ERROR in rec.root.statuses
         assert rec.root.ended == 1
 
-    async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
+    async def test_emits_content_by_default_on_the_streaming_path(self) -> None:
         ctx, rec = _recording()
         from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
 
@@ -1649,6 +1665,24 @@ class TestStreamingTelemetry:
             async for _ in await create_langchain_messages_handler(llm=llm).stream(
                 CONFIG, "q"
             ):
+                pass
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = self._make_streaming_llm(["hi"])
+        with ctx:
+            async for _ in await create_langchain_messages_handler(
+                llm=llm, capture_content=False
+            ).stream(CONFIG, "q"):
                 pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
@@ -1678,7 +1712,7 @@ class TestStreamingTelemetry:
 
 
 # ---------------------------------------------------------------------------
-# §1.10 MAX_STEPS cap
+# MAX_STEPS cap
 # ---------------------------------------------------------------------------
 
 
@@ -2239,9 +2273,9 @@ class TestNoContentWorkWhenCaptureIsOff:
 
         ctx, rec = _recording()
         with ctx:
-            result = await create_langchain_messages_handler(llm=llm)(
-                config, "q", {"myTool": AsyncMock(return_value="r")}, {}
-            )
+            result = await create_langchain_messages_handler(
+                llm=llm, capture_content=False
+            )(config, "q", {"myTool": AsyncMock(return_value="r")}, {})
         assert result["output"] is parsed
         assert "gen_ai.output.messages" not in rec.root.attributes
 
@@ -2268,9 +2302,9 @@ class TestNoContentWorkWhenCaptureIsOff:
 
         ctx, rec = _recording()
         with ctx:
-            result = await create_langchain_messages_handler(llm=llm)(
-                config, "q", {}, {}
-            )
+            result = await create_langchain_messages_handler(
+                llm=llm, capture_content=False
+            )(config, "q", {}, {})
         assert result["output"] is parsed
         assert result["usage"] == {"input_tokens": 8, "output_tokens": 2}
         assert "gen_ai.output.messages" not in rec.root.attributes
@@ -2595,7 +2629,9 @@ class TestStreamingRootOutputRespectsTheCaptureFlag:
 
         monkeypatch.setattr(handler_mod, "set_output_content_attributes", _counting)
 
-        h = create_langchain_messages_handler(llm=self._streaming_llm(["hi"]))
+        h = create_langchain_messages_handler(
+            llm=self._streaming_llm(["hi"]), capture_content=False
+        )
         async for _ in await h.stream(CONFIG, "q"):
             pass
 
@@ -2867,7 +2903,10 @@ class TestModelSource:
         imports.import_module.side_effect = ModuleNotFoundError(
             "No module named 'langchain_aws'"
         )
-        with pytest.raises(ImportError, match=r"pip install langchain-aws"):
+        with pytest.raises(
+            ImportError,
+            match=r"pip install \"launchdarkly-ai-langchain-messages\[aws\]\"",
+        ):
             handler_mod._make_default_chat_model(cfg, imports)
 
     @pytest.mark.asyncio

@@ -11,10 +11,10 @@ All handler packages (`launchdarkly-ai-*`) depend on this package.
 ### Without telemetry
 
 ```bash
-pip install launchdarkly-ai-server
+pip install "launchdarkly-ai-server[ld]"
 ```
 
-`launchdarkly-server-sdk` is an optional dependency — include it for standard usage, or pass a pre-initialized client to `init_client(client=...)` if you bring your own.
+`launchdarkly-server-sdk` is an optional dependency, installed by the `[ld]` extra — include it for standard usage, or pass a pre-initialized client to `init_client(client=...)` if you bring your own.
 
 The SDK works fully without the OpenTelemetry packages — feature flags evaluate, handlers run, and LaunchDarkly AI events are tracked. Spans are created as no-ops. If you call `init_client()` without the OTel packages installed, the SDK logs a single warning and continues normally.
 
@@ -23,7 +23,7 @@ The SDK works fully without the OpenTelemetry packages — feature flags evaluat
 To export traces to the LaunchDarkly Observability dashboard (or any OTLP-compatible backend), install the `otel` extras group:
 
 ```bash
-pip install "launchdarkly-ai-server[otel]"
+pip install "launchdarkly-ai-server[ld,otel]"
 ```
 
 No code changes are required — `init_client()` detects the packages at runtime and sets up the tracer provider automatically.
@@ -33,8 +33,8 @@ No code changes are required — `init_client()` detects the packages at runtime
 | Variable | Required | Description |
 |---|---|---|
 | `LD_SDK_KEY` | Yes | LaunchDarkly server-side SDK key |
-| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging) |
-| `LD_STREAM_URI` | No | Override the streaming URI |
+| `LD_BASE_URI` | No | Override the LaunchDarkly polling base URI (e.g. for staging). `LaunchDarklySkillStore` reads it too when given no URI option |
+| `LD_STREAM_URI` | No | Override the streaming URI. `LaunchDarklySkillStore` reads it too when given no URI option |
 | `LD_EVENTS_URI` | No | Override the events URI |
 | `LD_SERVICE_NAME` | No | OTel `service.name` resource attribute (default: `python-sdk`) |
 | `LD_ENVIRONMENT` | No | `deployment.environment` resource attribute attached to telemetry |
@@ -44,13 +44,18 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
 
-### Run an evaluation from code (experimental)
+`init_client()` also sets the `launchdarkly.project_id` resource attribute to the resolved SDK key, not the project's ID.
 
-> **Experimental.** Import Evaluations from Code from `launchdarkly_ai_server.experimental.evaluations`;
-> none of these names is exported from the package root. They may change in a minor release,
-> so review the changelog when you upgrade.
+### Run an evaluation from code
+
+> **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include
+> Evaluations from Code in core. If you install `launchdarkly-ai-python`, upgrade
+> `launchdarkly-ai-server` too, because upgrading `launchdarkly-ai-python` alone can leave an older
+> one in place: `pip install --upgrade "launchdarkly-ai-server>=1.0.0"`.
 
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
+
+Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span. The built-in default sends them. Setting capture to false removes them, including on these evaluation spans. The `$ld:ai:offline-evals:*` events still carry no transcript.
 
 Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts only. A run passes only when the completed summary has no failed, error, or pending rows. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
@@ -59,7 +64,7 @@ import asyncio
 import sys
 
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server.experimental.evaluations import init_evaluations
+from launchdarkly_ai_server import init_evaluations
 
 
 async def main() -> int:
@@ -120,7 +125,7 @@ Pass `criteria` to `run()` to score every generated row. A `Judge` references an
 ```python
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server.experimental.evaluations import (
+from launchdarkly_ai_server import (
     DatasetRow, Judge, Scorer, init_evaluations,
 )
 
@@ -194,7 +199,7 @@ A tool result is now judge-prompt input. It stays literal for the same reason th
 
 **Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`. Each judge selects its handler from `handler` or `handlers` by its provider and mode, with the same rule as generation. There is no mode fallback: a messages-mode judge never runs on an agent handler. A judge's prompt must also match its handler's mode. Judges get no tools: the harness passes an empty tool map and removes `tools` from the judge config. A wildcard's `providers` list, when set, accepts only those names: an exact provider match wins, then the shortest list that contains the name, then an unscoped `*`.
 
-Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge, a judge that no handler covers, or a judge whose prompt does not match its handler fails the run up front rather than after the generation spend. One error lists every judge with a problem. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
+Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge, a judge that no handler covers, or a judge whose prompt does not match its handler fails the run up front rather than after the generation spend. One error lists every judge with a problem. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, and a raising handler or scorer each become a per-criterion `ERROR` event carrying a top-level `errorMessage` that describes the failure. A row whose generation errored is not scored at all: no judge or scorer runs for it and no criterion event is sent, because its generation `ERROR` event already records the row as failed. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
 
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 
@@ -248,13 +253,14 @@ warning and ignored.
 
 ### Process-wide defaults
 
-`configure` sets behavior for the process. It does not initialize the LaunchDarkly client; call `init_client` for that. Handlers built without an explicit `capture_content` read this value when they run, so one startup call covers every handler. An explicit `True` or `False` on a handler factory or convenience wrapper overrides it. Call `configure` from process startup, not from request data. It can be replaced until the first AI invocation; after that only the same options are accepted. `shutdown()` restores the built-in default, which is off.
+`configure` sets behavior for the process. It does not initialize the LaunchDarkly client; call `init_client` for that. Handlers built without an explicit `capture_content` read this value when they run, so one startup call covers every handler. The built-in default is on: prompts, model output, tool payloads, and judge explanations are sent unless you turn capture off. An explicit `True` or `False` on a handler factory or convenience wrapper overrides it, and an explicit `False` removes that text everywhere, including on offline evaluation spans. Call `configure` from process startup, not from request data. It can be replaced until the first AI invocation; after that only the same options are accepted. `shutdown()` restores the built-in default, which is on.
 
 ```python
 from launchdarkly_ai_server import SDKOptions, configure, init_client, shutdown
 
 async def main():
-    configure(options=SDKOptions(capture_content=True))
+    # Capture is on unless you turn it off.
+    configure(options=SDKOptions(capture_content=False))
     await init_client({"sdkKey": "sdk-...", "serviceName": "my-service"})
     # create_*_handler() with no capture_content argument follows the default above.
     await shutdown()
@@ -267,7 +273,7 @@ async def main():
 Pass `tools` to `run()` as a list of `EvalTool`. Construct one to define a tool in code. Await `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
 
 ```python
-from launchdarkly_ai_server.experimental.evaluations import EvalTool, init_evaluations
+from launchdarkly_ai_server import EvalTool, init_evaluations
 
 
 def lookup_order(order_id: str) -> str:
@@ -312,7 +318,7 @@ The primary entry point for AI config invocations. Accepts either a single handl
 import asyncio
 from launchdarkly_ai_server import config, shutdown
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_openai_agents import create_openai_agent_handler
+from launchdarkly_ai_openai_agents import create_openai_agents_handler
 from launchdarkly_ai_claude_agents import create_claude_agents_handler
 
 # Single handler — must match the flag variation's provider+mode, or raises.
@@ -337,7 +343,7 @@ async def main():
         tool_handlers={"search": search_fn},
         handler=[
             create_openai_messages_handler(),  # provides_for: ["OpenAI", "messages"]
-            create_openai_agent_handler(),     # provides_for: ["OpenAI", "agent"]
+            create_openai_agents_handler(),    # provides_for: ["OpenAI", "agent"]
             create_claude_agents_handler(),    # provides_for: ["Anthropic", "agent"]
         ],
     )
@@ -471,11 +477,12 @@ asyncio.run(main())
 
 ---
 
-### Agent Skills (experimental)
+### Agent Skills
 
-> **Experimental.** Import Agent Skills from `launchdarkly_ai_server.experimental.skills`;
-> none of these names is exported from the package root. They may change in a minor release,
-> so review the changelog when you upgrade.
+> **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include Agent
+> Skills in core. If you install `launchdarkly-ai-python`, upgrade `launchdarkly-ai-server` too,
+> because upgrading `launchdarkly-ai-python` alone can leave an older one in place:
+> `pip install --upgrade "launchdarkly-ai-server>=1.0.0"`.
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
@@ -487,9 +494,9 @@ import asyncio
 import hashlib
 from pathlib import Path
 
-from launchdarkly_ai_server import init_client, inspect_config
-from launchdarkly_ai_server.experimental.skills import (
-    InMemorySkillStore, get_skill, set_skill_store, skill_refs, write_skills,
+from launchdarkly_ai_server import (
+    InMemorySkillStore, get_skill, init_client, inspect_config, set_skill_store,
+    skill_refs, write_skills,
 )
 
 SKILL_MD = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
@@ -532,6 +539,10 @@ async def main():
 
 asyncio.run(main())
 ```
+
+This reads the config once, which is right at boot. To keep a config's skills on disk as the
+config changes, pass `config_skills(key, context)` to `watch_skills` instead; see
+[Following an AI Config's changes](#following-an-ai-configs-changes).
 
 **Know what `"*"` asks for.** Passing `"*"` instead of a reference list writes the **whole
 project library**, which puts every skill's `description` into the agent's context, including
@@ -623,9 +634,8 @@ ERROR ld.skills.integrity_failure {"action":"withheld","event":"ld.skills.integr
 ```
 
 **Match on `ld.skills.integrity_failure`.** It is the name LaunchDarkly's AI SDKs share for this
-record. While Agent Skills is experimental, the event name, its fields, and its `reason_code`
-values may change in a minor release; any such change gets a changelog entry under
-**Experimental**, so review it before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
+record. A change to the event name, its fields, or its `reason_code` values gets a changelog
+entry, so review the changelog before upgrading. JSON keys are sorted, so the line is byte-identical across LaunchDarkly's
 AI SDKs for the same input.
 
 | Field | Description |
@@ -669,8 +679,8 @@ worth alerting on too.
 verification passes, and the usual cause is a bug in a custom `SkillStore` adapter (a stale
 cache entry, a colliding key, a wrong index lookup) rather than tampering, so neither inflates
 LaunchDarkly's integrity counter. Both still write this record, so a rule on
-`ld.skills.integrity_failure` catches them. If `FDv2SkillStore` is your only store, treat them
-like `hash_mismatch`; behind a custom adapter, suspect the adapter first.
+`ld.skills.integrity_failure` catches them. If `LaunchDarklySkillStore` is your only store,
+treat them like `hash_mismatch`; behind a custom adapter, suspect the adapter first.
 
 `get_skill` returns `None` for a `version_mismatch` like any other failure, so this record is
 the only place it is visible unless you use `get_skill_result`, which reports it as the
@@ -683,7 +693,7 @@ retrieval, verification, and telemetry as `get_skill`, but reports which of five
 happened instead of collapsing them all to `None`.
 
 ```python
-from launchdarkly_ai_server.experimental.skills import get_skill_result
+from launchdarkly_ai_server import get_skill_result
 
 outcome = await get_skill_result("pdf-extraction")
 
@@ -724,18 +734,16 @@ be resolved and log a count at WARN. Use `get_skill_result` per key when you nee
 #### Receiving skills from LaunchDarkly
 
 `InMemorySkillStore` is for tests and bring-your-own-content. In production, skill content
-arrives through `FDv2SkillStore`, which uses LaunchDarkly's SDK-facing FDv2 delivery channel
+arrives through `LaunchDarklySkillStore`, which uses LaunchDarkly's SDK-facing FDv2 delivery channel
 (the `GET /sdk/poll` and `GET /sdk/stream` endpoints the base SDK's FDv2 data source uses),
 authenticated with the environment's server-side SDK key.
 
 ```python
 import os
 
-from launchdarkly_ai_server.experimental.skills import (
-    FDv2SkillStore, set_skill_store, watch_skills,
-)
+from launchdarkly_ai_server import LaunchDarklySkillStore, set_skill_store, watch_skills
 
-store = FDv2SkillStore(os.environ["LD_SDK_KEY"]).start()
+store = LaunchDarklySkillStore(os.environ["LD_SDK_KEY"]).start()
 if not store.wait_for_skills(timeout=10):
     # No payload arrived. Reconciling now would find an empty store; see below.
     print(f"skill delivery has not answered yet: {store.failed or 'still waiting'}")
@@ -753,9 +761,9 @@ finally:
 **A reconcile that runs before delivery answers does not prune.** A store still waiting for its
 first payload looks the same as an environment with no skills, and `write_skills("*")` would
 otherwise treat that as every skill revoked and delete the files from a previous run.
-`FDv2SkillStore` reports readiness through the optional `is_initialized()`; until it is true, a
-reconcile reports the retrieval unavailable (`report.ok` is `False`, and the error says why)
-and leaves the disk alone.
+`LaunchDarklySkillStore` reports readiness through the optional `is_initialized()`; until it
+is true, a reconcile reports the retrieval unavailable (`report.ok` is `False`, and the error
+says why) and leaves the disk alone.
 
 **A 422 means this connection will never be assigned a skill payload, and delivery stops.**
 Every request declares the payload it wants (`kinds=agent-skill`), and LaunchDarkly answers
@@ -788,6 +796,11 @@ never followed, so a 3xx stops delivery instead of forwarding the key to the `Lo
 **Polling and streaming have separate hosts.** By default `/sdk/poll` goes to
 `https://sdk.launchdarkly.com` and `/sdk/stream` to `https://stream.launchdarkly.com`. Pass
 `base_uri` alone to use one host for both, or `stream_uri` as well to set them independently.
+With neither option, the store reads `LD_BASE_URI` and `LD_STREAM_URI` in their place, once, when
+it is constructed, the same variables `init_client()` reads. So a process pointed at a staging or
+private instance by its environment gets its skills from there too. `LD_BASE_URI` alone moves both
+endpoints, as `base_uri` alone does. That differs from `init_client()`, where flag streaming stays
+on its default host unless `LD_STREAM_URI` is set.
 
 **`close()` is final.** A closed store still answers from the content it received, but
 `start()` afterwards raises, so delivery is guaranteed stopped even if the join times out.
@@ -806,11 +819,70 @@ an outage the store keeps serving its last content and retries for as long as it
 `write_skills`' default `on_unavailable="keep"` leaves managed files alone, so an outage does
 not read as "everything was revoked".
 
-**With an explicit skill list, revocation does not reach the disk.** Given a list such as
-`skill_refs(config)`, a skill deleted in LaunchDarkly is reported as an `error` action under
-its key, and its `SKILL.md` is kept rather than pruned. The watcher also listens only to the
-skill store, not to flag changes, so unpinning a skill from a variation is not seen either. Use
-`"*"` when revocation must reach the disk.
+**What reaches the disk depends on what you pass as `skills`.** A fixed list, such as
+`skill_refs(config)`, is never re-read, so the watcher cannot see a config change:
+
+| Change in LaunchDarkly | `"*"` | Fixed list | `config_skills(key, context)` |
+|---|---|---|---|
+| A skill is deleted (possible only once no variation pins it) | Pruned | Stays on disk, reported `error` on every run | Already pruned, when the config stopped referencing it |
+| A config moves `pdf-extraction` from v2 to v3 | Unaffected: `"*"` already follows the newest version | v2 stays on disk, reported `error`; v3 is never written | v3 replaces v2 |
+| A config stops referencing a skill | Unaffected: `"*"` asks for the whole library | Stays on disk | Pruned |
+
+So a revoked skill leaves the disk under `"*"` and `config_skills`, never under a fixed list.
+Keep a fixed list for a set that genuinely does not change for the life of the process.
+
+#### Following an AI Config's changes
+
+`config_skills(key, context)` returns a `SkillSource`: a requested set that is read on every
+reconcile instead of being fixed when you call `watch_skills`. The watcher also re-reconciles
+when that AI Config changes in the base LaunchDarkly client, so a version bump or an unpinned
+skill reaches the disk once changes have been quiet for `debounce`.
+
+```python
+from launchdarkly_ai_server import config_skills, init_client, watch_skills
+
+await init_client()  # config_skills needs an initialized client; it never creates one
+report, watcher = await watch_skills(
+    config_skills("doc-agent", {"kind": "user", "key": "user-123"}),
+    ".claude/skills",
+)
+```
+
+- **A failed evaluation never reads as "no skills".** Each read evaluates the config with
+  `variation(key, context, None)`. Only a disabled variation, or a config with no `skills`
+  field, answers `[]`, and those are answers from LaunchDarkly, so their skills are pruned. No
+  initialized client, a `variation` that raises, the default (a missing flag or a client that
+  is not ready), or a malformed variation or `skills` field is a failed read: the reconcile
+  reports it as a run-level `error` (or raises, with `on_unavailable="raise"`) and changes
+  nothing on disk. There is no retry timer: the next store or config change is the retry,
+  and a client that finishes initializing reports a change for every flag.
+- **Each read is a real evaluation.** It records an evaluation event in the base SDK, as
+  `inspect_config` does: once per reconcile, which the debounce bounds. It sends no AI
+  telemetry.
+- **Following changes needs the base client's change signal.** The watcher registers one
+  `flag_tracker` listener and raises `RuntimeError` when no AI client is initialized, when the
+  client has no `flag_tracker` (a client brought to `init_client` that implements only
+  `variation`), or when the client is offline. The listener only wakes the watcher; the
+  config is read on the watcher's own thread, never on the base SDK's delivery thread.
+- **A dropped skill is pruned on the next reconcile whose retrieval is available.** A skill
+  the store answers `absent` for keeps its file under its own key, reported `error`, and does
+  not stop the dropped skill being pruned in the same run. A store that raises, has not
+  received its initial data, or runs out of `timeout` holds the prune until a later run.
+- **Daemon mode follows skill-store changes only.** With `use_ldd=True`, or
+  `ldclient.datasystem.daemon(...)`, the base client has no data source, so its `flag_tracker`
+  never fires and nothing reports it. Call `watcher.notify()` yourself if you learn of config
+  changes some other way.
+- **Several configs, or a custom resolution, take a hand-built source.**
+  `SkillSource(refs, config_keys=(...))` takes a zero-argument function, sync or async,
+  returning `SkillReference` values and key strings, plus the config keys whose changes should
+  re-read it. Raise from `refs` when you cannot tell; returning `[]` prunes every managed
+  skill. An answer that is not a sequence of references and keys, or holds one invalid entry,
+  is a failed read too. With `config_keys=()` the watcher subscribes to nothing; call
+  `watcher.notify()` from your own change listener. `config_keys` must be a sequence:
+  `config_keys="doc-agent"` raises `TypeError`.
+- **`timeout` covers the read, with one limit.** An async `refs` still pending at the deadline
+  is cancelled. A synchronous one cannot be interrupted, so a slow one uses up the time left
+  for the rest of the reconcile.
 
 **Without the watcher, the revocation bound is process lifetime.** If you call `write_skills`
 once at boot and never run `watch_skills`, a skill revoked after boot stays on disk, and in the
@@ -841,16 +913,18 @@ that skips verification.
 
 | Export | Description |
 |---|---|
+| `config_skills(key, context)` | A `SkillSource` that evaluates AI Config `key` for `context` on every read. Raises from the read, rather than answering `[]`, for anything but a disabled variation or a parsed config. Never initializes the client. See *Following an AI Config's changes* above. |
+| `SkillSource(refs, config_keys=())` | A requested set read when it is needed: `refs` is a zero-argument function, sync or async, returning `SkillReference` values and key strings; `config_keys` names the AI Configs whose changes make a watcher read it again. Frozen; `config_keys` is held as a tuple. A non-callable `refs`, a string `config_keys`, or an entry that is not a non-empty string raises `TypeError`. |
 | `skill_refs(config)` | Project a config's `skills` array into `list[SkillReference]`. Pure — no client, store, or network needed. Returns `[]` when the field is absent. Raises `ValueError` when the config is not a dict (including the `None` a failed `inspect_config` returns) or the field is present but malformed (including `null`), so neither reaches a pruning reconcile as "no skills". |
 | `get_skill(key, *, version=None)` | One verified skill, or `None`. `version=None` means newest available; a specific `version` matches exactly. Raises only when no store is configured. |
 | `get_skill_result(key, *, version=None)` | The same retrieval, reporting **why**: a frozen `SkillOutcome` with `.skill`, `.reason` (`ok` / `absent` / `integrity_failure` / `store_unavailable` / `wrong_version`), and `.detail`. See *Failing closed on tampering* above. Raises only when no store is configured. |
 | `get_skills(refs)` | Batch form. Accepts `SkillReference` values and bare key strings (string = latest). Results follow input order; missing or unverifiable entries are omitted. |
 | `all_skills()` | Every verified skill the store holds, one per key at its newest version. |
-| `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative or non-finite `timeout`, or an unrecognised `on_unavailable`. `timeout=0` is valid and makes every skill report an error. **Performs synchronous filesystem I/O — see the note below.** |
+| `write_skills(skills, root, *, prune=True, timeout=10.0, on_unavailable="keep")` | Materialize skills under `root`, returning a `ReconcileReport`. `skills` is a sequence of `Skill` / `SkillReference` / key strings, `"*"`, or a `SkillSource`, which is read once; a source that raises or answers anything malformed is an unavailable retrieval. `prune` removes formerly-managed skills no longer requested. `on_unavailable="raise"` raises instead of reporting when content cannot be retrieved. Raises `ValueError` for an unusable root, a negative or non-finite `timeout`, or an unrecognised `on_unavailable`. `timeout=0` is valid and makes every skill report an error. **Performs synchronous filesystem I/O — see the note below.** |
 | `SkillStore` | The structural interface content arrives through: `get_object(kind, key, version=None)`, `all_objects(kind)`, optional `is_initialized()`, `add_listener(kind, fn)` / `remove_listener(kind, fn)`. A store without `is_initialized()` is treated as initialized. Both shipped stores deliver only the skill kind, so `add_listener` on any other kind raises. |
 | `InMemorySkillStore(objects=None)` | A dict-backed store with `put(raw)`, for local development and testing. Holds several versions of a key. |
-| `FDv2SkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `close()` is **final** — `start()` afterwards raises. `poll_interval`, `read_timeout`, `initial_backoff` and `max_backoff` must be positive and finite, and `initial_backoff` may not exceed `max_backoff`. **Server-side only.** See *Receiving skills from LaunchDarkly* above. |
-| `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, so revocation takes effect within `debounce` rather than at the next restart. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
+| `LaunchDarklySkillStore(sdk_key, *, base_uri=…, stream_uri=…, mode="stream", …)` | The delivery transport: a store fed by LaunchDarkly over the SDK-facing FDv2 channel. `start()`, `wait_for_skills(timeout)`, `is_initialized()`, `close()`, `diagnostics`, `failed`; also a context manager. `close()` is **final** — `start()` afterwards raises. `poll_interval`, `read_timeout`, `initial_backoff` and `max_backoff` must be positive and finite, and `initial_backoff` may not exceed `max_backoff`. **Server-side only.** See *Receiving skills from LaunchDarkly* above. |
+| `watch_skills(skills, root, *, debounce=0.5, on_reconcile=None, …)` | `write_skills` plus a re-reconcile on every delivery change, and, for a `SkillSource`, on every change to one of its `config_keys`, so revocation takes effect once changes have been quiet for `debounce` rather than at the next restart. `watcher.notify()` schedules a reconcile through the same debounce. Returns `(initial report, SkillWatcher)`; close the watcher when done. `debounce` is in **seconds**, non-negative and finite. `on_reconcile` receives each *subsequent* report. One watcher per root. |
 | `StoreDiagnostics` | What the transport has seen: `payloads_transferred`, `skill_objects_received`, `objects_ignored`, `objects_revoked`, `payloads_ignored`, `hashless_objects`, `connection_failures`, `last_error`. |
 
 Configure the store with `set_skill_store(store)`. It applies on every call, before or after
@@ -874,7 +948,8 @@ and `MANIFEST_VERSION`. So are the closed-set types, for annotating your own hel
 `ok` / `store_unavailable` / `wrong_version`).
 
 **`write_skills` blocks.** It is `async` for parity with the other accessors, but awaits
-nothing: all file I/O runs inline and holds the event loop for the duration. Wrap it in
+nothing except an async `SkillSource`: all file I/O runs inline and holds the event loop for
+the duration. Wrap it in
 `asyncio.to_thread` if that matters; `timeout` is checked between steps, not mid-step. Do not
 run two reconciles against the same root concurrently — they race on the manifest.
 

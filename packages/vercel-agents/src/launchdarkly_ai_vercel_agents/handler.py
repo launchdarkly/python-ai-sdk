@@ -24,6 +24,7 @@ from launchdarkly_ai_server import (
     parse_template,
     report_usage,
 )
+from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
 from launchdarkly_ai_server.utils import model_parameters
 
@@ -48,7 +49,7 @@ ModelSource = Any | Callable[[AiConfigRep], Any]
 #: :func:`_renamed_parameters`. Every other key is dropped. The handler sets ``model``,
 #: ``messages``, ``tools`` and ``output_type`` itself, and runs the tool loop.
 #:
-#: This is the Vercel AI SDK list from TESTING.md section 1.12 as the Python ``ai`` library can
+#: This is the cross-SDK Vercel AI SDK list as the Python ``ai`` library can
 #: send it. ``stop_sequences`` is on the JS list but the Python library has no field for it.
 #: ``parallel_tool_calls``, ``max_tool_calls``, ``service_tier`` and ``prompt_cache_key`` are
 #: Python-only: the library takes them as typed request params, while the JS AI SDK can reach them
@@ -120,7 +121,7 @@ _TOOL_CHOICE_MODES = frozenset({"auto", "none", "required"})
 
 
 def _renamed_parameters(params: dict[str, Any]) -> dict[str, Any]:
-    """Applies the section 1.12 renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
+    """Applies the cross-SDK renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
     which wins over ``max_tokens``, and an explicit ``reasoning`` wins over ``reasoning_effort``."""
     for alias in ("max_completion_tokens", "max_tokens"):
         value = params.pop(alias, None)
@@ -283,7 +284,7 @@ async def _call_tool(handler: Callable[..., Any], kwargs: dict[str, Any]) -> Any
 
 def build_agent_tools(
     definitions: dict[str, Any] | None,
-    handlers: dict[str, Any] | None,
+    handlers: Mapping[str, Any] | None,
     runtime: Any = None,
     *,
     parent: Any = None,
@@ -518,12 +519,14 @@ def _create_vercel_agents_handler(
     async def run(
         cfg: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         vs = variables or {}
-        span = start_root_span(cfg, vs)
+        span = start_root_span(
+            cfg, vs, capture_content=effective_capture_content(capture_content)
+        )
         parent = parent_context_of(span)
         turns = _ChatTurns(cfg, parent)
         failed = False
@@ -571,12 +574,14 @@ def _create_vercel_agents_handler(
     async def stream(
         cfg: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         vs = variables or {}
-        span = start_root_span(cfg, vs)
+        span = start_root_span(
+            cfg, vs, capture_content=effective_capture_content(capture_content)
+        )
         parent = parent_context_of(span)
         turns = _ChatTurns(cfg, parent)
         completed = False
