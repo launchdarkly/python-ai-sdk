@@ -631,7 +631,9 @@ async def extract_variation(
         # The variation exactly as the LD SDK returned it, ``_ldMeta`` included.
         # Written to the root span's ``feature_flag`` event as
         # ``feature_flag.result.value``; never copied into tracking payloads.
-        "evaluatedValue": raw,
+        # Private: ``meta`` surfaces publicly as ``GraphNode.meta`` and
+        # ``JudgeTask.judge_meta``.
+        "_evaluatedValue": raw,
     }
 
     # Strip _ldMeta for config parsing

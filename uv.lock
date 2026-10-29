@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -1322,7 +1322,7 @@ wheels = [
 
 [[package]]
 name = "launchdarkly-ai-claude-agents"
-version = "0.2.6"
+version = "0.3.0"
 source = { editable = "packages/claude-agents" }
 dependencies = [
     { name = "anthropic" },
@@ -1341,7 +1341,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-claude-messages"
-version = "0.2.5"
+version = "0.3.0"
 source = { editable = "packages/claude-messages" }
 dependencies = [
     { name = "anthropic" },
@@ -1358,7 +1358,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-langchain-agents"
-version = "0.2.6"
+version = "0.3.0"
 source = { editable = "packages/langchain-agents" }
 dependencies = [
     { name = "langchain-core" },
@@ -1377,7 +1377,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-langchain-messages"
-version = "0.2.5"
+version = "0.3.0"
 source = { editable = "packages/langchain-messages" }
 dependencies = [
     { name = "langchain-core" },
@@ -1394,7 +1394,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-litellm-agents"
-version = "0.1.1"
+version = "0.2.0"
 source = { editable = "packages/litellm-agents" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -1411,7 +1411,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-litellm-messages"
-version = "0.1.1"
+version = "0.2.0"
 source = { editable = "packages/litellm-messages" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -1428,7 +1428,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-openai-agents"
-version = "0.2.6"
+version = "0.3.0"
 source = { editable = "packages/openai-agents" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -1447,7 +1447,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-openai-messages"
-version = "0.2.5"
+version = "0.3.0"
 source = { editable = "packages/openai-messages" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -1464,7 +1464,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-opencode-agents"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "packages/opencode-agents" }
 dependencies = [
     { name = "httpx" },
@@ -1481,7 +1481,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-python"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "packages/ai" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -1501,7 +1501,7 @@ provides-extras = ["otel"]
 
 [[package]]
 name = "launchdarkly-ai-server"
-version = "0.4.0"
+version = "0.5.0"
 source = { editable = "packages/client" }
 dependencies = [
     { name = "opentelemetry-api" },
@@ -1523,7 +1523,7 @@ provides-extras = ["otel"]
 
 [[package]]
 name = "launchdarkly-ai-typesafe"
-version = "0.1.1"
+version = "0.2.0"
 source = { editable = "packages/typesafe" }
 dependencies = [
     { name = "launchdarkly-ai-server" },
@@ -1540,7 +1540,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-vercel-agents"
-version = "0.1.1"
+version = "0.2.0"
 source = { editable = "packages/vercel-agents" }
 dependencies = [
     { name = "ai" },
@@ -1557,7 +1557,7 @@ requires-dist = [
 
 [[package]]
 name = "launchdarkly-ai-vercel-messages"
-version = "0.1.1"
+version = "0.2.0"
 source = { editable = "packages/vercel-messages" }
 dependencies = [
     { name = "ai" },
