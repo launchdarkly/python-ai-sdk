@@ -27,9 +27,9 @@ class TestReexports:
                 f"launchdarkly_ai_python.{name} is not the same object as launchdarkly_ai_server.{name}"
             )
 
-    def test_experimental_evaluations_are_not_reexported(self) -> None:
-        importlib.import_module("launchdarkly_ai_server.experimental.evaluations")
+    def test_evaluations_are_reexported(self) -> None:
+        server = importlib.import_module("launchdarkly_ai_server")
         barrel = importlib.import_module("launchdarkly_ai_python")
 
         for name in ("init_evaluations", "EvalTool", "Judge", "Scorer", "DatasetRow"):
-            assert not hasattr(barrel, name), name
+            assert getattr(barrel, name) is getattr(server, name), name

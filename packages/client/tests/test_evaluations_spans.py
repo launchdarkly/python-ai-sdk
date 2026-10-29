@@ -20,7 +20,14 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 from opentelemetry.util._once import Once
 
-from launchdarkly_ai_server import SDKOptions, configure, create_handler
+from launchdarkly_ai_server import (
+    EvalTool,
+    Judge,
+    SDKOptions,
+    configure,
+    create_handler,
+    init_evaluations,
+)
 from launchdarkly_ai_server.conversation import (
     GEN_AI_CONVERSATION_ID,
     ConversationIdSpanProcessor,
@@ -33,11 +40,6 @@ from launchdarkly_ai_server.evaluations.spans import (
     record_evaluation_result,
     record_tool_calls,
     start_row_span,
-)
-from launchdarkly_ai_server.experimental.evaluations import (
-    EvalTool,
-    Judge,
-    init_evaluations,
 )
 from launchdarkly_ai_server.lifecycle import (
     _reset_for_testing,

@@ -680,8 +680,8 @@ class TestShutdown:
         assert "Could not clear the Failing Feature state" in caplog.messages
         later.assert_called_once()  # one failing hook does not skip the rest
 
-    def test_lifecycle_imports_no_skills_module(self) -> None:
-        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
+    @staticmethod
+    def _lifecycle_imports() -> set[str]:
         tree = ast.parse(inspect.getsource(lifecycle_module))
         imported: set[str] = set()
         for node in ast.walk(tree):
@@ -691,10 +691,25 @@ class TestShutdown:
                 imported.add(node.module or "")
                 # `from . import skills_core` names the module in the alias, not in `module`.
                 imported.update(alias.name for alias in node.names)
+        return imported
+
+    def test_lifecycle_imports_no_skills_module(self) -> None:
+        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
         skills = sorted(
-            name for name in imported if name.rsplit(".", 1)[-1].startswith("skills")
+            name
+            for name in self._lifecycle_imports()
+            if name.rsplit(".", 1)[-1].startswith("skills")
         )
         assert skills == []
+
+    def test_lifecycle_imports_no_evaluations_module(self) -> None:
+        """Lifecycle imports no Evaluations from Code module."""
+        evaluations = sorted(
+            name
+            for name in self._lifecycle_imports()
+            if "evaluations" in name.split(".")
+        )
+        assert evaluations == []
 
     def test_core_does_not_import_experimental_code(self) -> None:
         """Importing and shutting down core loads no experimental module."""
@@ -702,9 +717,8 @@ class TestShutdown:
             "import asyncio, sys\n"
             "import launchdarkly_ai_server\n"
             "asyncio.run(launchdarkly_ai_server.shutdown())\n"
-            "loaded = sorted(m for m in sys.modules if m.startswith("
-            "('launchdarkly_ai_server.evaluations',"
-            " 'launchdarkly_ai_server.experimental')))\n"
+            "loaded = sorted(m for m in sys.modules"
+            " if m.startswith('launchdarkly_ai_server.experimental'))\n"
             "print(','.join(loaded))\n"
         )
         result = subprocess.run(

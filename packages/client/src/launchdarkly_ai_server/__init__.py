@@ -27,6 +27,22 @@ from .conversation import (
     conversation_id,
     set_conversation_id_if_absent,
 )
+from .evaluations import (
+    AIConfig,
+    Criterion,
+    DatasetRow,
+    EvalRunResult,
+    EvalTool,
+    EvaluationsError,
+    EvaluationsModule,
+    GenerationConfig,
+    GenerationMode,
+    GenerationOverrides,
+    Judge,
+    RunSummary,
+    Scorer,
+    init_evaluations,
+)
 from .graph import GraphInstance, graph, resolve_graph
 from .graph import _graph as _graph
 from .history import (
@@ -303,6 +319,24 @@ __all__ = [  # noqa: RUF022
     "SKILL_FILENAME",
     "MANIFEST_FILENAME",
     "MANIFEST_VERSION",
+    # Evaluations from Code: entry point
+    "init_evaluations",
+    "EvaluationsModule",
+    # Evaluations from Code: run() arguments
+    "AIConfig",
+    "GenerationConfig",
+    "GenerationMode",
+    "GenerationOverrides",
+    "DatasetRow",
+    "EvalTool",
+    # Evaluations from Code: criteria
+    "Criterion",
+    "Judge",
+    "Scorer",
+    # Evaluations from Code: results and errors
+    "EvalRunResult",
+    "RunSummary",
+    "EvaluationsError",
 ]
 
 register_ai_sdk_package("launchdarkly-ai-server", __version__)
