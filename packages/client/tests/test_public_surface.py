@@ -40,6 +40,7 @@ ROOT_SURFACE = frozenset(
         "ParseFailure",
         "ParseResult",
         "ParseSuccess",
+        "NativeGraphRunner",
         "ProviderGraphResponse",
         "ProviderHandler",
         "ProviderResponse",

@@ -24,7 +24,7 @@ from .handler import (
     claude_agents,
     create_claude_agents_handler,
 )
-from .native_graph import to_claude_agents
+from .native_graph import ClaudeNativeGraphOptions, to_claude_agents
 from .skills import create_claude_agents_skills_handler
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "ClaudeEdit",
     "ClaudeGlob",
     "ClaudeGrep",
+    "ClaudeNativeGraphOptions",
     "ClaudeNotebookEdit",
     "ClaudeRead",
     "ClaudeTodoWrite",

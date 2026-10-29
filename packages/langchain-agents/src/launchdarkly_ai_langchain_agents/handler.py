@@ -8,12 +8,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
@@ -390,7 +391,7 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 
 def _build_agent_tools(
     config_tools: dict[str, Any],
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
     import importlib
 
@@ -403,7 +404,8 @@ def _build_agent_tools(
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
             fn = tool_handlers.get(_name)
-            if not fn:
+            # A NativeTool reaches here unwrapped on the offline evaluations path.
+            if not callable(fn):
                 raise ValueError(f'No handler registered for tool "{_name}"')
             # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
             # routing records the selected edge on the call itself; awaiting a plain
@@ -556,7 +558,13 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
 
     provider = ((config.get("provider") or {}).get("name") or "openai").lower()
     if provider == "anthropic":
-        lc_anthropic = importlib.import_module("langchain_anthropic")
+        try:
+            lc_anthropic = importlib.import_module("langchain_anthropic")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Anthropic models requires langchain-anthropic. "
+                'Install it with: pip install "launchdarkly-ai-langchain-agents[anthropic]"'
+            ) from exc
         return lc_anthropic.ChatAnthropic(
             **_rebuild_anthropic_output_config(
                 _rebuild_anthropic_thinking(
@@ -576,7 +584,7 @@ def _make_default_chat_model(config: AiConfigRep) -> Any:
         except ImportError as exc:
             raise ImportError(
                 "Using Bedrock models requires langchain-aws. "
-                "Install it with: pip install langchain-aws"
+                'Install it with: pip install "launchdarkly-ai-langchain-agents[aws]"'
             ) from exc
         return lc_aws.ChatBedrockConverse(
             **_model_constructor_kwargs(
@@ -660,7 +668,7 @@ def _create_langchain_agents_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -791,7 +799,7 @@ def _create_langchain_agents_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -817,7 +825,7 @@ async def _stream_gen(
     llm: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,

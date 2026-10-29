@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from types import SimpleNamespace
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
@@ -619,7 +620,13 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
     if provider == "anthropic":
-        lc_anthropic = importlib.import_module("langchain_anthropic")
+        try:
+            lc_anthropic = importlib.import_module("langchain_anthropic")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Anthropic models requires langchain-anthropic. "
+                'Install it with: pip install "launchdarkly-ai-langchain-messages[anthropic]"'
+            ) from exc
         return lc_anthropic.ChatAnthropic(
             **_rebuild_anthropic_output_config(
                 _rebuild_anthropic_thinking(
@@ -639,7 +646,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
         except ImportError as exc:
             raise ImportError(
                 "Using Bedrock models requires langchain-aws. "
-                "Install it with: pip install langchain-aws"
+                'Install it with: pip install "launchdarkly-ai-langchain-messages[aws]"'
             ) from exc
         return lc_aws.ChatBedrockConverse(
             **_model_constructor_kwargs(
@@ -791,7 +798,7 @@ def _create_langchain_messages_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -1085,7 +1092,7 @@ def _create_langchain_messages_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -1111,7 +1118,7 @@ async def _stream_gen(
     llm: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
