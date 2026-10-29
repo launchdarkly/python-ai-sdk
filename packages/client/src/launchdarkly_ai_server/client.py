@@ -69,6 +69,9 @@ class ConfigInstance:
             return self._handler
         return [self._handler]
 
+    async def _evaluate(self, context: LDContext) -> dict[str, Any]:
+        return await extract_variation(self._key, context)
+
     async def invoke(
         self,
         user_input: str | None,
@@ -91,7 +94,7 @@ class ConfigInstance:
         )
         resolved_tools = resolve_tools(self._registry, self._tool_handlers)
 
-        variation = await extract_variation(self._key, context)
+        variation = await self._evaluate(context)
         config: AiConfigRep = variation["config"]
         meta: VariationMeta = variation["meta"]
 
@@ -210,7 +213,7 @@ class ConfigInstance:
         )
         resolved_tools = resolve_tools(self._registry, self._tool_handlers)
 
-        variation = await extract_variation(self._key, context)
+        variation = await self._evaluate(context)
         config: AiConfigRep = variation["config"]
         meta: VariationMeta = variation["meta"]
 

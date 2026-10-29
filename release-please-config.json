@@ -158,6 +158,9 @@
     }
   },
   "changelog-sections": [
+    { "type": "feat", "scope": "shadow-requests", "section": "Experimental" },
+    { "type": "fix", "scope": "shadow-requests", "section": "Experimental" },
+    { "type": "perf", "scope": "shadow-requests", "section": "Experimental" },
     { "type": "feat", "section": "Features" },
     { "type": "fix", "section": "Bug Fixes" },
     { "type": "perf", "section": "Performance Improvements" },

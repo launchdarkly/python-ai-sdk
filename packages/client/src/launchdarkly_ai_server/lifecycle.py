@@ -595,7 +595,6 @@ async def extract_variation(
     Lazily initializes the LD client when ``LD_SDK_KEY`` is set, matching
     the TypeScript SDK's behaviour where any AI call auto-initializes.
     """
-    from .types_validation import parse_ai_config
     from .utils import to_ld_context  # late import avoids circular dependency
 
     await init_client()
@@ -610,6 +609,11 @@ async def extract_variation(
         if inspect.isawaitable(variation_result)
         else variation_result
     )
+    return _parse_variation(config_key, raw)
+
+
+def _parse_variation(config_key: str, raw: Any) -> dict[str, Any]:
+    from .types_validation import parse_ai_config
 
     if raw is None:
         raise RuntimeError(

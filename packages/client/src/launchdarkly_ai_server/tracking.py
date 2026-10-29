@@ -20,7 +20,13 @@ from .types import (
     TrackData,
     VariationMeta,
 )
-from .utils import model_stamps_from_meta, parse_usage, to_ld_context
+from .utils import (
+    _SPAN_ATTRIBUTES_KEY,
+    _without_span_attributes,
+    model_stamps_from_meta,
+    parse_usage,
+    to_ld_context,
+)
 
 
 @asynccontextmanager
@@ -167,6 +173,9 @@ async def execute_and_track(
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
+    run_id: str | None = None,
+    extra_track_data: dict[str, Any] | None = None,
+    span_attributes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Calls *handler*, emits LD telemetry events, and returns
@@ -176,7 +185,7 @@ async def execute_and_track(
 
     environment_id = _try_get_environment_id()
     track_data: TrackData = {
-        "runId": str(uuid.uuid4()),
+        "runId": run_id or str(uuid.uuid4()),
         "configKey": config_key,
         "variationKey": meta.get("variationKey", "") if isinstance(meta, dict) else "",
         "version": meta.get("version", 1) if isinstance(meta, dict) else 1,
@@ -192,6 +201,8 @@ async def execute_and_track(
         track_data["graphKey"] = graph_key
     if environment_id:
         track_data["environmentId"] = environment_id
+    if extra_track_data:
+        track_data.update(extra_track_data)
 
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
@@ -208,10 +219,12 @@ async def execute_and_track(
         track_data,
     )
     merged_variables: dict[str, Any] = {
-        **(variables or {}),
+        **_without_span_attributes(variables),
         "ldContext": {**user_context},
         "__ld": track_data,
     }
+    if span_attributes:
+        merged_variables[_SPAN_ATTRIBUTES_KEY] = dict(span_attributes)
 
     start_time = time.monotonic()
 
@@ -308,7 +321,7 @@ async def execute_and_stream(
         track_data,
     )
     merged_variables: dict[str, Any] = {
-        **(variables or {}),
+        **_without_span_attributes(variables),
         "ldContext": {**user_context},
         "__ld": track_data,
     }
