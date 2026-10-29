@@ -6,6 +6,7 @@ mirroring the TypeScript toLangGraph implementation.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import time
 import uuid
@@ -65,6 +66,67 @@ class _HandoffArgs(BaseModel):
     the call id (a dict schema would skip the injection)."""
 
     tool_call_id: Annotated[str, InjectedToolCallId]
+
+
+def _content_text(content: Any) -> str:
+    """The text parts of a message's content, joined with no separator."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _to_neutral_history(
+    messages: list[Any], ai_message: Any, human_message: Any
+) -> list[Any]:
+    """Rewrite the history a node finds when it is entered as provider-neutral
+    text, so a target on another provider never sees the previous node's tool
+    or reasoning blocks (spec §2.x.3). Human and system messages pass through."""
+    out: list[Any] = []
+    calls: list[dict[str, Any]] = []
+    results: list[Any] = []
+
+    def _flush() -> None:
+        if not results:
+            return
+        order = {c.get("id"): i for i, c in enumerate(calls)}
+        lines = []
+        for r in sorted(results, key=lambda r: order.get(r.tool_call_id, len(calls))):
+            i = order.get(r.tool_call_id)
+            name = calls[i]["name"] if i is not None else getattr(r, "name", "") or ""
+            lines.append(f"[Tool result] {name}: {_content_text(r.content)}")
+        out.append(human_message("\n".join(lines)))
+        results.clear()
+
+    for m in messages:
+        if m.type == "tool":
+            results.append(m)
+            continue
+        _flush()
+        if m.type != "ai":
+            out.append(m)
+            continue
+        calls = list(getattr(m, "tool_calls", None) or [])
+        text = _content_text(m.content)
+        lines = [text] if text else []
+        lines += [
+            "[Tool call] {} {}".format(
+                c["name"],
+                json.dumps(
+                    c.get("args") or {}, separators=(",", ":"), ensure_ascii=False
+                ),
+            )
+            for c in calls
+        ]
+        if lines:
+            out.append(ai_message("\n".join(lines)))
+    _flush()
+    return out
 
 
 def _sanitize_name(key: str) -> str:
@@ -187,6 +249,7 @@ def to_lang_graph(
         HumanMessage = lc_msgs.HumanMessage
         SystemMessage = lc_msgs.SystemMessage
         ToolMessage = lc_msgs.ToolMessage
+        AIMessage = lc_msgs.AIMessage
 
         vs = variables or {}
         def_obj: GraphDefinition = await def_promise
@@ -272,8 +335,14 @@ def to_lang_graph(
                 Command = langgraph_types.Command
 
                 # The node's last model call sets "first" (its first hand-off call
-                # id); the tools step sets "handed_off" when that call routes.
-                routing: dict[str, Any] = {"first": None, "handed_off": False}
+                # id) and "call_ids"; the tools step sets "handed_off" when that
+                # call routes. "start" is where the node's current visit began.
+                routing: dict[str, Any] = {
+                    "first": None,
+                    "handed_off": False,
+                    "call_ids": set(),
+                    "start": 0,
+                }
 
                 handoff_tools = []
                 for edge in outgoing:
@@ -336,7 +405,22 @@ def to_lang_graph(
                     node_start = time.monotonic()
 
                     system_prompt = _build_system_prompt(_node, vs)
-                    conv_messages: list[Any] = state.get("messages", [])
+                    state_messages: list[Any] = state.get("messages", [])
+                    last = state_messages[-1] if state_messages else None
+                    # A tool result for this node's own last call continues its
+                    # tool loop; anything else means the node was just entered.
+                    if not (
+                        last is not None
+                        and last.type == "tool"
+                        and last.tool_call_id in routing["call_ids"]
+                    ):
+                        routing["start"] = len(state_messages)
+                    conv_messages = [
+                        *_to_neutral_history(
+                            state_messages[: routing["start"]], AIMessage, HumanMessage
+                        ),
+                        *state_messages[routing["start"] :],
+                    ]
                     full_messages = (
                         [SystemMessage(system_prompt), *conv_messages]
                         if system_prompt
@@ -359,6 +443,10 @@ def to_lang_graph(
                         None,
                     )
                     routing["handed_off"] = False
+                    routing["call_ids"] = {
+                        tc.get("id")
+                        for tc in getattr(result_msg, "tool_calls", None) or []
+                    }
                     usage = _extract_usage(result_msg)
                     total_usage["input"] += usage["input"]
                     total_usage["output"] += usage["output"]
@@ -466,18 +554,7 @@ def to_lang_graph(
             last_msg = result_messages[-1] if result_messages else None
 
             def _content_str(msg: Any) -> str:
-                if msg is None:
-                    return ""
-                c = msg.content
-                if isinstance(c, str):
-                    return c
-                if isinstance(c, list):
-                    return "".join(
-                        part.get("text", "") if isinstance(part, dict) else ""
-                        for part in c
-                        if isinstance(part, dict) and part.get("type") == "text"
-                    )
-                return ""
+                return "" if msg is None else _content_text(msg.content)
 
             final_output = _content_str(last_msg)
 

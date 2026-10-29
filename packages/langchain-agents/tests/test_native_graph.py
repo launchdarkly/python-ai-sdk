@@ -1401,13 +1401,20 @@ def _scripted_models(replies: dict[str, list[Any]]) -> tuple[Any, dict[str, Any]
     return (lambda node: models[node.key]), models
 
 
-def _tool_call_msg(*calls: tuple[str, str]) -> Any:
+def _tool_call_msg(*calls: tuple[Any, ...], content: Any = "") -> Any:
+    """An AI message with tool calls; each call is (name, id) or (name, id, args)."""
     from langchain_core.messages import AIMessage
 
     return AIMessage(
-        content="",
+        content=content,
         tool_calls=[
-            {"name": n, "args": {}, "id": i, "type": "tool_call"} for n, i in calls
+            {
+                "name": c[0],
+                "args": c[2] if len(c) > 2 else {},
+                "id": c[1],
+                "type": "tool_call",
+            }
+            for c in calls
         ],
     )
 
@@ -1440,9 +1447,20 @@ async def _run_handoff(
     return result, tracked
 
 
-def _tool_messages(model: Any) -> list[Any]:
-    sent = model.ainvoke.call_args.args[0]
-    return [m for m in sent if m.type == "tool"]
+def _sent(model: Any, call: int = 0) -> list[tuple[str, Any]]:
+    """(type, content) of each message a node's model received on one call."""
+    return [(m.type, m.content) for m in model.ainvoke.call_args_list[call].args[0]]
+
+
+def _assert_neutral(model: Any) -> None:
+    """No tool role, tool calls or non-text blocks reach a node that was handed to."""
+    for m in model.ainvoke.call_args.args[0]:
+        assert m.type != "tool"
+        assert not getattr(m, "tool_calls", None)
+        assert isinstance(m.content, str)
+
+
+_REASONING = {"type": "reasoning_content", "reasoning_content": {"text": "hmm"}}
 
 
 class TestNativeHandoffRealStateGraph:
@@ -1452,7 +1470,12 @@ class TestNativeHandoffRealStateGraph:
 
         factory, models = _scripted_models(
             {
-                "router": [_tool_call_msg(("transfer_to_manor_butler", "call_1"))],
+                "router": [
+                    _tool_call_msg(
+                        ("transfer_to_manor_butler", "call_1"),
+                        content=[_REASONING, {"type": "text", "text": "Routing."}],
+                    )
+                ],
                 "manor.butler": [AIMessage(content="the butler did it")],
                 "cook": [],
             }
@@ -1464,11 +1487,19 @@ class TestNativeHandoffRealStateGraph:
         assert result["response"] == "the butler did it"
         assert models["router"].ainvoke.call_count == 1  # not re-run after the hand-off
         assert models["cook"].ainvoke.call_count == 0
-        [answer] = _tool_messages(models["manor.butler"])
-        assert answer.tool_call_id == "call_1"
-        # The text uses the raw target key; the tool name uses the sanitized one.
-        assert answer.content == "Handed off to manor.butler."
-        assert answer.name == "transfer_to_manor_butler"
+        # A target with no tools gets the router's turn as plain text: reasoning
+        # dropped, the call and its result as lines. The result text uses the raw
+        # target key; the tool name uses the sanitized one.
+        assert _sent(models["manor.butler"]) == [
+            ("system", "you are manor.butler"),
+            ("human", "who did it?"),
+            ("ai", "Routing.\n[Tool call] transfer_to_manor_butler {}"),
+            (
+                "human",
+                "[Tool result] transfer_to_manor_butler: Handed off to manor.butler.",
+            ),
+        ]
+        _assert_neutral(models["manor.butler"])
         assert tracked.count("$ld:ai:graph:handoff_success") == 1
 
     @pytest.mark.asyncio
@@ -1496,7 +1527,8 @@ class TestNativeHandoffRealStateGraph:
             {
                 "router": [
                     _tool_call_msg(
-                        ("lookup", "call_a"), ("transfer_to_butler", "call_b")
+                        ("lookup", "call_a", {"room": "library"}),
+                        ("transfer_to_butler", "call_b"),
                     )
                 ],
                 "butler": [AIMessage(content="done")],
@@ -1506,17 +1538,36 @@ class TestNativeHandoffRealStateGraph:
         result, _ = await _run_handoff(
             _handoff_graph_def(
                 ["butler", "cook"],
-                root_tools={"lookup": {"description": "look up", "parameters": {}}},
+                root_tools={
+                    "lookup": {
+                        "description": "look up",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"room": {"type": "string"}},
+                        },
+                    }
+                },
             ),
             factory,
             tool_handlers={"lookup": lambda args: lookups.append(args) or "clue"},
         )
 
         assert result["response"] == "done"
-        assert len(lookups) == 1
+        assert lookups == [{"room": "library"}]
         assert models["router"].ainvoke.call_count == 1
-        answers = {m.tool_call_id: m.content for m in _tool_messages(models["butler"])}
-        assert answers == {"call_a": "clue", "call_b": "Handed off to butler."}
+        # Both results become one user message, in the call order.
+        assert _sent(models["butler"])[2:] == [
+            (
+                "ai",
+                '[Tool call] lookup {"room":"library"}\n[Tool call] transfer_to_butler {}',
+            ),
+            (
+                "human",
+                "[Tool result] lookup: clue\n"
+                "[Tool result] transfer_to_butler: Handed off to butler.",
+            ),
+        ]
+        _assert_neutral(models["butler"])
 
     @pytest.mark.asyncio
     async def test_first_handoff_wins(self) -> None:
@@ -1539,11 +1590,11 @@ class TestNativeHandoffRealStateGraph:
 
         assert result["response"] == "butler answer"
         assert models["cook"].ainvoke.call_count == 0
-        answers = {m.tool_call_id: m.content for m in _tool_messages(models["butler"])}
-        assert answers == {
-            "call_1": "Handed off to butler.",
-            "call_2": "Ignored: only the first transfer in a turn routes.",
-        }
+        assert _sent(models["butler"])[-1] == (
+            "human",
+            "[Tool result] transfer_to_butler: Handed off to butler.\n"
+            "[Tool result] transfer_to_cook: Ignored: only the first transfer in a turn routes.",
+        )
         assert tracked.count("$ld:ai:graph:handoff_success") == 1
 
     @pytest.mark.asyncio
@@ -1560,5 +1611,43 @@ class TestNativeHandoffRealStateGraph:
 
         assert result["response"] == "the butler did it"
         assert models["router"].ainvoke.call_count == 1
-        [answer] = _tool_messages(models["butler"])
-        assert answer.tool_call_id == "call_1"
+        assert _sent(models["butler"])[2:] == [
+            ("ai", "[Tool call] transfer_to_butler {}"),
+            ("human", "[Tool result] transfer_to_butler: Handed off to butler."),
+        ]
+        _assert_neutral(models["butler"])
+
+    @pytest.mark.asyncio
+    async def test_own_tool_loop_stays_native(self) -> None:
+        """Only the history from before a node was entered is rewritten: a node's
+        own tool call and its result reach its next model call unchanged."""
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [
+                    _tool_call_msg(("lookup", "call_x"), content=[_REASONING]),
+                    AIMessage(content="answer"),
+                ],
+            }
+        )
+        result, _ = await _run_handoff(
+            _handoff_graph_def(
+                [],
+                root_tools={
+                    "lookup": {
+                        "description": "look up",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                },
+            ),
+            factory,
+            tool_handlers={"lookup": lambda args: "clue"},
+        )
+
+        assert result["response"] == "answer"
+        second = models["router"].ainvoke.call_args_list[1].args[0]
+        assert [m.type for m in second] == ["system", "human", "ai", "tool"]
+        assert second[2].tool_calls[0]["id"] == "call_x"
+        assert second[2].content == [_REASONING]
+        assert second[3].tool_call_id == "call_x"
