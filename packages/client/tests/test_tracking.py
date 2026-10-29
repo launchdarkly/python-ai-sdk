@@ -130,10 +130,17 @@ class TestHandlerVariables:
 
 
 class TestCustomHandlerCapture:
-    async def test_an_explicit_false_custom_handler_never_gets_the_raw_variation(
-        self,
+    @pytest.mark.parametrize(
+        ("explicit", "default", "expected"),
+        [
+            (False, True, '"v1"'),
+            (True, False, '{"instructions": "secret prompt"}'),
+        ],
+    )
+    async def test_a_custom_handler_s_explicit_setting_beats_the_default(
+        self, explicit: bool, default: bool, expected: str
     ) -> None:
-        """A custom handler's function calls the helper without a flag; its own False wins."""
+        """A custom handler's function calls the helper without a flag; its own setting beats the process default."""
         from launchdarkly_ai_server import create_handler
         from launchdarkly_ai_server.utils import set_ld_span_attributes
 
@@ -156,8 +163,11 @@ class TestCustomHandlerCapture:
             set_ld_span_attributes(Span(), variables)
             return {"output": "ok", "usage": {}}
 
-        handler = create_handler(("Custom", "messages"), fn, None, False)
+        from launchdarkly_ai_server import SDKOptions, configure
+
+        handler = create_handler(("Custom", "messages"), fn, None, explicit)
         lifecycle_module._set_client_for_testing(_make_mock_client())
+        configure(options=SDKOptions(capture_content=default))
         try:
             await execute_and_track(
                 config_key="c",
@@ -170,4 +180,4 @@ class TestCustomHandlerCapture:
         finally:
             lifecycle_module._reset_for_testing()
 
-        assert events[0]["feature_flag.result.value"] == '"v1"'
+        assert events[0]["feature_flag.result.value"] == expected

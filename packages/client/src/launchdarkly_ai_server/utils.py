@@ -816,9 +816,10 @@ def set_ld_span_attributes(
     writes it with value inclusion on. Otherwise, when the variation key is
     non-empty, it is ``json.dumps`` of the key, so a prompt never leaves the
     process without consent. Otherwise it is omitted (native-graph spans).
-    *capture_content* left as ``None`` follows the process default from
-    ``configure()``, so a custom handler gets the same value a built-in one
-    does.
+    *capture_content* left as ``None`` trusts the core: ``execute_and_track``
+    and ``execute_and_stream`` only pass ``__ldValue`` to a handler whose
+    effective setting is on, so the value is written whenever it is present.
+    Only an explicit ``False`` suppresses it.
     """
     span.set_attribute("launchdarkly.operation.type", "gen_ai")
     if not variables:
@@ -839,11 +840,7 @@ def set_ld_span_attributes(
     variation_key = ld.get("variationKey")
     if isinstance(variation_key, str) and variation_key:
         feature_flag_attrs["feature_flag.result.variant"] = variation_key
-    if capture_content is None:
-        from .lifecycle import effective_capture_content
-
-        capture_content = effective_capture_content(None)
-    if capture_content and variables.get("__ldValue") is not None:
+    if capture_content is not False and variables.get("__ldValue") is not None:
         feature_flag_attrs["feature_flag.result.value"] = json.dumps(
             variables["__ldValue"]
         )

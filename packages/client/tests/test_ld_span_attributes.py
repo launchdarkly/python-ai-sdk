@@ -243,11 +243,9 @@ class TestResultVariant:
         )
         assert _feature_flag(span)["feature_flag.result.value"] == '"variation-a"'
 
-    @pytest.mark.parametrize(("default", "raw"), [(True, True), (False, False)])
-    def test_an_unset_capture_follows_the_process_default(
-        self, default: bool, raw: bool
-    ) -> None:
-        """A custom handler that passes no capture_content gets what configure() says."""
+    @pytest.mark.parametrize("default", [True, False])
+    def test_an_unset_capture_trusts_the_core(self, default: bool) -> None:
+        """The core only passes __ldValue to a capture-on handler, so None writes it."""
         lifecycle_module._reset_for_testing()
         configure(options=SDKOptions(capture_content=default))
         try:
@@ -255,8 +253,9 @@ class TestResultVariant:
             set_ld_span_attributes(span, {**_vars(None), "__ldValue": RAW_VARIATION})
         finally:
             lifecycle_module._reset_for_testing()
-        expected = json.dumps(RAW_VARIATION) if raw else '"variation-a"'
-        assert _feature_flag(span)["feature_flag.result.value"] == expected
+        assert _feature_flag(span)["feature_flag.result.value"] == json.dumps(
+            RAW_VARIATION
+        )
 
     def test_capture_on_without_a_raw_variation_falls_back_to_the_key(self) -> None:
         span = FakeSpan()
