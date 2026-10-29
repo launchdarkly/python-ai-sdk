@@ -672,6 +672,7 @@ CONTEXT = {"kind": "user", "key": "user-1"}
 async def ld_client() -> Any:
     await shutdown()
     client = MagicMock()
+    del client.variation_detail
     client.track = MagicMock()
     client.flush = MagicMock()
     client.close = MagicMock()

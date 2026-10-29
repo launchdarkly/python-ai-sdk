@@ -277,6 +277,7 @@ def _reset_sdk() -> Iterator[None]:
 @pytest.fixture
 def mock_ld_client() -> Iterator[MagicMock]:
     client = MagicMock()
+    del client.variation_detail
     client.track = MagicMock()
     client.flush = AsyncMock()
     client.close = AsyncMock()

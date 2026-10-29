@@ -586,11 +586,17 @@ async def inspect_config(
 async def extract_variation(
     config_key: str,
     context: dict[str, Any],
+    *,
+    with_reason: bool = False,
 ) -> dict[str, Any]:
     """
     Fetches an AI config variation from the LD client and parses it.
     Returns ``{"config": AiConfigRep, "meta": VariationMeta}``.
     Raises on disabled or invalid variations.
+
+    Also returns ``reason`` and ``shadow_configuration``, which ``config()``
+    uses to pick shadow requests. ``reason`` is ``None`` unless *with_reason* is
+    set and the client has ``variation_detail``.
 
     Lazily initializes the LD client when ``LD_SDK_KEY`` is set, matching
     the TypeScript SDK's behaviour where any AI call auto-initializes.
@@ -603,13 +609,25 @@ async def extract_variation(
     # The real ldclient.variation() expects an ldclient.Context, not a plain dict.
     # Convert when running against the real SDK; test mocks accept dicts directly.
     ld_context = to_ld_context(client, context)
-    # variation() is synchronous in the real Python LD SDK; AsyncMock in tests.
-    variation_result = client.variation(config_key, ld_context, None)
-    raw = (
-        await variation_result
-        if inspect.isawaitable(variation_result)
-        else variation_result
+    variation_detail = (
+        getattr(client, "variation_detail", None) if with_reason else None
     )
+    reason: Any = None
+    if variation_detail is not None:
+        detail_result = variation_detail(config_key, ld_context, None)
+        detail = (
+            await detail_result if inspect.isawaitable(detail_result) else detail_result
+        )
+        raw = detail.value
+        reason = detail.reason
+    else:
+        # variation() is synchronous in the real Python LD SDK; AsyncMock in tests.
+        variation_result = client.variation(config_key, ld_context, None)
+        raw = (
+            await variation_result
+            if inspect.isawaitable(variation_result)
+            else variation_result
+        )
 
     if raw is None:
         raise RuntimeError(
@@ -631,9 +649,8 @@ async def extract_variation(
         **model_stamps_from_meta(ld_meta),
     }
 
-    # Strip _ldMeta for config parsing
     config_raw = (
-        {k: v for k, v in raw.items() if k != "_ldMeta"}
+        {k: v for k, v in raw.items() if k not in ("_ldMeta", "shadowConfiguration")}
         if isinstance(raw, dict)
         else raw
     )
@@ -644,4 +661,9 @@ async def extract_variation(
             f"Invalid AI config variation for '{config_key}': {result.error['message']}"
         )
 
-    return {"config": result.data, "meta": meta}
+    return {
+        "config": result.data,
+        "meta": meta,
+        "reason": reason,
+        "shadow_configuration": raw.get("shadowConfiguration"),
+    }

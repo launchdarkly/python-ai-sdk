@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import uuid
 from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
 from typing import Any
@@ -11,6 +13,7 @@ from .judges import _build_judge_tasks, run_judges
 from .lifecycle import extract_variation
 from .registry import resolve_handlers, resolve_tools
 from .sdk_usage import report_usage
+from .shadows import build_shadow_tasks, start_shadows
 from .tracking import execute_and_stream, execute_and_track
 from .types import (
     AiConfigRep,
@@ -18,6 +21,7 @@ from .types import (
     NativeTool,
     ProviderHandler,
     ProviderResponse,
+    ShadowTask,
     StreamEvent,
     VariationMeta,
 )
@@ -55,12 +59,18 @@ class ConfigInstance:
         tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
         registry: Any,  # Registry | None
         skip_judges: bool = False,
+        skip_shadows: bool = False,
+        shadow_timeout_s: float = 30.0,
     ) -> None:
+        if not (math.isfinite(shadow_timeout_s) and shadow_timeout_s > 0):
+            raise ValueError("shadow_timeout_s must be a finite number greater than 0")
         self._key = key
         self._handler = handler
         self._tool_handlers = tool_handlers
         self._registry = registry
         self._skip_judges = skip_judges
+        self._skip_shadows = skip_shadows
+        self._shadow_timeout_s = shadow_timeout_s
 
     def _normalize_handlers(self) -> list[ProviderHandler] | None:
         if self._handler is None:
@@ -68,6 +78,33 @@ class ConfigInstance:
         if isinstance(self._handler, list):
             return self._handler
         return [self._handler]
+
+    def _shadows(
+        self,
+        variation: dict[str, Any],
+        context: LDContext,
+        user_input: str | None,
+        history: list[dict[str, Any]] | None,
+        variables: dict[str, Any] | None,
+        handlers: list[ProviderHandler],
+        run_id: str,
+    ) -> list[ShadowTask] | None:
+        """Starts the sampled shadows, or returns them when ``skip_shadows`` is set."""
+        tasks = build_shadow_tasks(
+            config_key=self._key,
+            variation=variation,
+            context=context,
+            user_input=user_input,
+            history=history,
+            variables=variables,
+            handlers=handlers,
+            run_id=run_id,
+            timeout_s=self._shadow_timeout_s,
+        )
+        if self._skip_shadows:
+            return tasks
+        start_shadows(tasks, handlers)
+        return None
 
     async def invoke(
         self,
@@ -91,13 +128,23 @@ class ConfigInstance:
         )
         resolved_tools = resolve_tools(self._registry, self._tool_handlers)
 
-        variation = await extract_variation(self._key, context)
+        variation = await extract_variation(self._key, context, with_reason=True)
         config: AiConfigRep = variation["config"]
         meta: VariationMeta = variation["meta"]
 
         if not resolved_handler_list:
             raise ValueError("No handlers provided to config()")
         handler = select_handler(config, meta, resolved_handler_list)
+        run_id = str(uuid.uuid4())
+        shadow_tasks = self._shadows(
+            variation,
+            context,
+            user_input,
+            history,
+            variables,
+            resolved_handler_list,
+            run_id,
+        )
 
         result = await execute_and_track(
             config_key=self._key,
@@ -109,6 +156,7 @@ class ConfigInstance:
             tool_handlers=resolved_tools,
             variables=variables,
             history=history,
+            run_id=run_id,
         )
 
         raw_response = result["response"]
@@ -140,6 +188,7 @@ class ConfigInstance:
                 response=parsed_response,
                 usage=usage_obj,
                 judge_tasks=judge_tasks,
+                shadow_tasks=shadow_tasks,
                 track_data=track_data,
             )
 
@@ -158,6 +207,7 @@ class ConfigInstance:
             response=parsed_response,
             usage=usage_obj,
             judge_results=judge_results if judge_results else None,
+            shadow_tasks=shadow_tasks,
             track_data=track_data,
         )
 
@@ -210,7 +260,7 @@ class ConfigInstance:
         )
         resolved_tools = resolve_tools(self._registry, self._tool_handlers)
 
-        variation = await extract_variation(self._key, context)
+        variation = await extract_variation(self._key, context, with_reason=True)
         config: AiConfigRep = variation["config"]
         meta: VariationMeta = variation["meta"]
 
@@ -228,6 +278,16 @@ class ConfigInstance:
         sink["tools"] = resolved_tools
         sink["provider"] = provider
         sink["model"] = model
+        run_id = str(uuid.uuid4())
+        sink["shadow_tasks"] = self._shadows(
+            variation,
+            context,
+            user_input,
+            history,
+            variables,
+            resolved_handler_list,
+            run_id,
+        )
 
         async with aclosing(
             execute_and_stream(
@@ -240,6 +300,7 @@ class ConfigInstance:
                 tool_handlers=resolved_tools,
                 variables=variables,
                 history=history,
+                run_id=run_id,
             )
         ) as source:
             async for event in source:
@@ -266,12 +327,15 @@ class ConfigInstance:
             judge_results = await judge_completed_stream(
                 self, sink, done_event, user_input, context
             )
-            yield {
+            done: StreamEvent = {
                 "type": "done",
                 "response": done_event.get("response", ""),
                 "usage": done_event.get("usage"),
                 "judge_results": judge_results if judge_results else None,
             }
+            if sink.get("shadow_tasks") is not None:
+                done["shadow_tasks"] = sink["shadow_tasks"]
+            yield done
 
 
 class _InternalConfigInstance(ConfigInstance):
@@ -307,6 +371,8 @@ def config(
     tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     skip_judges: bool = False,
+    skip_shadows: bool = False,
+    shadow_timeout_s: float = 30.0,
 ) -> ConfigInstance:
     """
     Creates a ``ConfigInstance`` bound to *key*. Accepts a single handler or a
@@ -319,6 +385,11 @@ def config(
     ``.invoke()`` / ``.stream()``. When set, ``invoke()`` returns
     ``judge_tasks: list[JudgeTask]`` — pre-packaged tasks ready for a background
     thread calling ``run_judge(task, handlers)``.
+
+    Shadow requests on the matched rule or fallthrough run in the background,
+    each limited to *shadow_timeout_s*. Pass ``skip_shadows=True`` to get them
+    back as ``shadow_tasks`` instead, and run each with
+    ``run_shadow(task, handlers)``.
     """
     return ConfigInstance(
         key=key,
@@ -326,6 +397,8 @@ def config(
         tool_handlers=tool_handlers,
         registry=registry,
         skip_judges=skip_judges,
+        skip_shadows=skip_shadows,
+        shadow_timeout_s=shadow_timeout_s,
     )
 
 
@@ -336,6 +409,8 @@ def _config(
     tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     skip_judges: bool = False,
+    skip_shadows: bool = False,
+    shadow_timeout_s: float = 30.0,
 ) -> ConfigInstance:
     """Non-reporting :func:`config` for SDK wrappers."""
     return _InternalConfigInstance(
@@ -344,4 +419,6 @@ def _config(
         tool_handlers=tool_handlers,
         registry=registry,
         skip_judges=skip_judges,
+        skip_shadows=skip_shadows,
+        shadow_timeout_s=shadow_timeout_s,
     )

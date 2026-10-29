@@ -34,6 +34,7 @@ def _generation_calls(client: MagicMock) -> list[Any]:
 
 def _make_client(response: Any = "Hello", usage: dict | None = None) -> MagicMock:
     c = MagicMock()
+    del c.variation_detail
     c.track = MagicMock()
     c.flush = AsyncMock()
     c.close = AsyncMock()

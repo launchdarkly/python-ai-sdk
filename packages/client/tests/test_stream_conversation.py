@@ -47,6 +47,7 @@ def _reset_exporter() -> Iterator[None]:
 @pytest.fixture
 def mock_ld_client() -> Iterator[MagicMock]:
     c = MagicMock()
+    del c.variation_detail
     c.track = MagicMock()
     c.flush = AsyncMock()
     c.close = AsyncMock()

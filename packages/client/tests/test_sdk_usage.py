@@ -43,6 +43,7 @@ HELPER = "client.buildJudgeTasks"
 
 def _client(variation: Any = None) -> MagicMock:
     client = MagicMock()
+    del client.variation_detail
     client.track = MagicMock()
     client.variation = AsyncMock(return_value=variation)
     client.flush = AsyncMock()

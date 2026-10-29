@@ -379,6 +379,29 @@ elif result and task.evaluation_metric_key:
     get_client().track(task.evaluation_metric_key, context, result.track_data, result.score)
 ```
 
+#### Shadow requests
+
+A shadow request runs another variation of an AI Config on the same input and reports it on the normal AI metrics with `isShadow: true`. You attach shadow requests to a targeting rule or the fallthrough in LaunchDarkly. The shadow's response is discarded, and your response, latency and events are unchanged. Shadow runs use your provider account, so they are billed like real calls.
+
+`config().invoke()` and `config().stream()` run them in the background, each with a 30 second timeout that you can change with `shadow_timeout_s`. A shadow makes no tool calls and runs no judges. Graphs and judges never run shadows.
+
+With `skip_shadows=True`, `invoke()` returns `shadow_tasks` instead of running them, and `stream()` puts them on the `done` event. A task can be pickled, so you can run it later on your own queue or worker with `run_shadow(task, handlers)`, the same way as `run_judge`:
+
+```python
+from launchdarkly_ai_server import config, run_shadow
+
+result = await config(key="my-ai-config", handler=handlers, skip_shadows=True).invoke(
+    user_input, context
+)
+for task in result.shadow_tasks or []:
+    queue.put_nowait(task)
+
+# in the worker
+outcome = await run_shadow(task, handlers)
+```
+
+`run_shadow` never raises. A failure or timeout is in `outcome.error`, and the shadow's events are already tracked.
+
 ### `graph(key, **options)`
 
 Runs a multi-agent workflow defined in a LaunchDarkly agent graph flag. The SDK uses a **model-driven router**: it starts at the root node, presents outgoing edges as handoff choices to the model, and follows whichever edge the model selects. The loop terminates when the model produces a final answer, a leaf is reached, a cycle is detected, or the step cap is hit.
@@ -1032,7 +1055,7 @@ All types are exported from this package. Handler packages import them from here
 | `AiConfigRep` | The AI configuration object fetched from a LaunchDarkly flag variation |
 | `Tool` | A tool definition (name, description, JSON Schema parameters) |
 | `ProviderHandler` | The callable type that all handler packages produce |
-| `ProviderResponse` | The value returned to callers: `response`, `usage`, `track_data`, `judge_results?`, `judge_tasks?`. `judge_results` is populated when `skip_judges=False`; `judge_tasks` (a `list[JudgeTask]`) is populated when `skip_judges=True`. |
+| `ProviderResponse` | The value returned to callers: `response`, `usage`, `track_data`, `judge_results?`, `judge_tasks?`, `shadow_tasks?`. `judge_results` is populated when `skip_judges=False`; `judge_tasks` (a `list[JudgeTask]`) is populated when `skip_judges=True`; `shadow_tasks` (a `list[ShadowTask]`) is populated when `skip_shadows=True`. |
 | `ConfigArgs` | Arguments accepted by `config()` (key, handler, tool_handlers, registry) |
 | `NativeTool` | Marker class for provider built-in tools |
 | `LDContext` | Standard LaunchDarkly context dict. Import from `launchdarkly_ai_server`. |

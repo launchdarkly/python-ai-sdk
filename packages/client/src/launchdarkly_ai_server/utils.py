@@ -768,6 +768,10 @@ def _context_identity_from_ld_context(
         return None
 
 
+SPAN_ATTRIBUTES_KEY = "__ld_span"
+"""Variables key for extra root-span attributes. Only the SDK sets it."""
+
+
 def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     """
     Sets LaunchDarkly config-identifying attributes on an OTel span and emits
@@ -806,6 +810,10 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
     span.set_attribute("launchdarkly.run.id", ld.get("runId", ""))
     if ld.get("graphKey"):
         span.set_attribute("launchdarkly.graph.key", ld["graphKey"])
+    extra = variables.get(SPAN_ATTRIBUTES_KEY)
+    if isinstance(extra, dict):
+        for name, value in extra.items():
+            span.set_attribute(name, value)
 
     feature_flag_attrs: dict[str, str] = {
         "feature_flag.key": ld.get("configKey", ""),
