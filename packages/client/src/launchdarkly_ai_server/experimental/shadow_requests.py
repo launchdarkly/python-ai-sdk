@@ -13,6 +13,7 @@ review the changelog when you upgrade.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import logging
@@ -372,7 +373,7 @@ def _select_tasks(
                 user_input=user_input,
                 history=list(history) if history else None,
                 variables=dict(variables) if variables else None,
-                user_context=dict(context),
+                user_context=copy.deepcopy(context),
                 timeout_s=timeout_s,
                 track_data={
                     "runId": primary_track_data.get("runId"),

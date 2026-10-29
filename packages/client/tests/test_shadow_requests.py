@@ -640,6 +640,28 @@ class TestDeferred:
         assert response.response == "real answer"
         assert any("on_task" in m for m in caplog.messages)
 
+    async def test_task_copies_the_context(self) -> None:
+        client = _make_client(_variation_a())
+        _use(client)
+        context: dict[str, Any] = {
+            "kind": "multi",
+            "user": {"key": "u1", "name": "Ann"},
+        }
+        tasks: list[ShadowTask] = []
+        await shadow_config(
+            key="flag",
+            handler=[
+                _Recorder("TestProvider", "a").handler,
+                _Recorder("ShadowProvider", "b").handler,
+            ],
+            on_task=tasks.append,
+        ).invoke("hi", context)
+        context["user"]["key"] = "someone-else"
+        assert tasks[0].user_context == {
+            "kind": "multi",
+            "user": {"key": "u1", "name": "Ann"},
+        }
+
     async def test_task_is_self_contained_and_survives_pickle(self) -> None:
         history = [{"role": "user", "content": "earlier"}]
         tasks: list[ShadowTask] = []
