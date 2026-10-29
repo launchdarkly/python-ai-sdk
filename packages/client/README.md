@@ -305,33 +305,28 @@ result = await evals.run(
 
 **The list is checked before any network I/O.** A blank key, an uppercase key, a `schema` that is not a JSON object, a schema that is not JSON-serializable (including a `NaN` or `Infinity` value), and a non-callable implementation each fail with zero requests issued. A repeated key fails too, and keys are compared without case. A `NativeTool` is valid only for a library tool, because the provider supplies its schema.
 
-### Shadow Requests (experimental)
+### Shadow requests
 
-A Shadow Request runs another variation of an AI Config in the background on the same input, and reports it on the normal AI metrics with `isShadow: true`. LaunchDarkly attaches shadow requests to a targeting rule or the fallthrough. The shadow's response is discarded, and your response, latency and events are unchanged. Shadow runs use your provider account, so they are billed like real calls.
+A shadow request runs another variation of an AI Config in the background on the same input, and reports it on the normal AI metrics with `isShadow: true`. You set shadow requests up on a targeting rule or the fallthrough in LaunchDarkly. The shadow's response is discarded, and your response, latency and events are unchanged. Shadow runs use your provider account, so they are billed like real calls.
 
-Nothing runs until you enable it:
+`config().invoke()` and `config().stream()` run them for you in the background, with a 30 second timeout. Shadows don't run for graphs or judges, and a shadow makes no tool calls and runs no judges.
 
 ```python
-from launchdarkly_ai_server.experimental.shadow_requests import enable_shadow_requests
-
-enable_shadow_requests()               # run sampled shadows in the background, 30 s timeout
-enable_shadow_requests(timeout_s=10)   # or pick the timeout
+caller = config(key="my-ai-config", handler=handlers, shadow_timeout_s=10)
 ```
 
-Shadows run for `config().invoke()` and `config().stream()`, not for graphs or judges. A shadow makes no tool calls and runs no judges. Call `disable_shadow_requests()` to turn them off.
-
-To run shadows on your own queue or worker instead, pass `on_task`. It receives a picklable `ShadowTask` before your handler runs and must only enqueue it. Run the task later with `run_shadow`:
+To run shadows on your own queue or worker instead, pass `skip_shadows=True`. Each response then carries `shadow_tasks`, which you can pickle and run later with `run_shadow`, the same way `skip_judges` and `run_judge` work:
 
 ```python
-from launchdarkly_ai_server.experimental.shadow_requests import enable_shadow_requests, run_shadow
+from launchdarkly_ai_server import config, run_shadow
 
-enable_shadow_requests(on_task=queue.put_nowait)
+result = await config(key="my-ai-config", handler=handlers, skip_shadows=True).invoke(...)
+for task in result.shadow_tasks or []:
+    queue.put_nowait(task)
 
 # in the worker
-result = await run_shadow(task, handlers=[create_openai_messages_handler()])
+outcome = await run_shadow(task, handlers)
 ```
-
-These names may change in a minor release.
 
 ### `config(**args)`
 

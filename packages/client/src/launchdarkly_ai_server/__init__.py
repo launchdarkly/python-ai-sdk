@@ -71,6 +71,7 @@ from .registry import (
 )
 from .sdk_info import SDK_INFO_CONTEXT, SDK_INFO_EVENT, register_ai_sdk_package
 from .sdk_usage import report_usage
+from .shadows import run_shadow
 from .skills import (
     InMemorySkillStore,
     all_skills,
@@ -128,6 +129,8 @@ from .types import (
     ReconcileActionKind,
     ReconcileReport,
     SDKOptions,
+    ShadowResult,
+    ShadowTask,
     Skill,
     SkillOutcome,
     SkillOutcomeReason,
@@ -200,6 +203,8 @@ __all__ = [  # noqa: RUF022
     "ProviderGraphResponse",
     "ProviderHandler",
     "ProviderResponse",
+    "ShadowResult",
+    "ShadowTask",
     "StreamChunkEvent",
     "StreamDoneEvent",
     "StreamEvent",
@@ -275,6 +280,7 @@ __all__ = [  # noqa: RUF022
     # judges
     "build_judge_tasks",
     "run_judge",
+    "run_shadow",
     "run_judges",
     # client
     "config",

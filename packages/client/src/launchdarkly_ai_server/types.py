@@ -288,6 +288,12 @@ class ProviderResponse(Generic[T]):
 
     ``None`` when ``skip_judges=False`` (judges ran inline).
     """
+    shadow_tasks: list[ShadowTask] | None = None
+    """
+    Shadow requests sampled for this call, produced when ``skip_shadows=True``.
+    Run each with ``run_shadow(task, handlers)``. ``None`` when shadows ran in
+    the background.
+    """
     track_data: TrackData | None = None
     """
     Tracking payload from this invocation. Carried inside each :class:`JudgeTask`
@@ -355,6 +361,39 @@ class JudgeTask:
     must stay picklable.
     """
     """LD metric key to track the score against."""
+
+
+@dataclass(frozen=True)
+class ShadowTask:
+    """
+    Everything needed to run one shadow request later, without evaluating the
+    flag again. Returned in ``ProviderResponse.shadow_tasks`` when
+    ``skip_shadows=True``. Plain data, so it can be pickled and queued. Run it
+    with ``run_shadow(task, handlers)``.
+    """
+
+    config_key: str
+    shadow_request_id: str
+    shadow_config: AiConfigRep
+    """The shadow variation, with tools, judges and shadow configuration removed."""
+    shadow_meta: VariationMeta
+    user_input: str | None
+    history: list[dict[str, Any]] | None
+    variables: dict[str, Any] | None
+    user_context: LDContext
+    timeout_s: float
+    track_data: TrackData
+    """Fields added to every event of the shadow run, including the real run's ``runId``."""
+    span_attributes: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ShadowResult:
+    """The outcome of one shadow run. The shadow's response is discarded."""
+
+    usage: dict[str, int]
+    track_data: TrackData
+    error: str | None = None
 
 
 @dataclass

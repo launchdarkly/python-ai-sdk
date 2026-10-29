@@ -32,6 +32,7 @@ CONTEXT = {"kind": "user", "key": "u1"}
 
 def _client() -> MagicMock:
     client = MagicMock()
+    del client.variation_detail
     client.track = MagicMock()
     client.flush = AsyncMock()
     client.close = AsyncMock()

@@ -586,6 +586,8 @@ async def inspect_config(
 async def extract_variation(
     config_key: str,
     context: dict[str, Any],
+    *,
+    with_reason: bool = False,
 ) -> dict[str, Any]:
     """
     Fetches an AI config variation from the LD client and parses it.
@@ -603,11 +605,12 @@ async def extract_variation(
     # The real ldclient.variation() expects an ldclient.Context, not a plain dict.
     # Convert when running against the real SDK; test mocks accept dicts directly.
     ld_context = to_ld_context(client, context)
-    from .invocation_hooks import has_invocation_hooks
-
+    # The evaluation reason picks the shadow requests for the matched rule.
     reason: Any = None
-    variation_detail = getattr(client, "variation_detail", None)
-    if has_invocation_hooks() and variation_detail is not None:
+    variation_detail = (
+        getattr(client, "variation_detail", None) if with_reason else None
+    )
+    if variation_detail is not None:
         detail_result = variation_detail(config_key, ld_context, None)
         detail = (
             await detail_result if inspect.isawaitable(detail_result) else detail_result

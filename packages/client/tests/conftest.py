@@ -14,6 +14,7 @@ from launchdarkly_ai_server import InMemorySkillStore
 def mock_ld_client() -> MagicMock:
     """Stub LaunchDarkly client with variation/track/flush/close."""
     client = MagicMock()
+    del client.variation_detail
     client.variation = AsyncMock(return_value=None)
     client.track = MagicMock()
     client.flush = AsyncMock()

@@ -10,10 +10,10 @@ any_multimodal(turns: list[dict[str, Any]]) -> bool
 build_judge_tasks(*, config: AiConfigRep, user_context: LDContext, handler: ProviderHandler, handlers: list[ProviderHandler] | None = None, llm_response: str, base_track_data: TrackData, user_input: str | None = None, trajectory: str = '') -> list[JudgeTask]  [async]
 compose(a: Registry, b: Registry) -> Registry
 compose_history(*, history: list[dict[str, Any]], user_input: str | None = None, config_messages: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]
-config(*, key: str, handler: ProviderHandler | list[ProviderHandler] | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, registry: Any = None, skip_judges: bool = False) -> ConfigInstance
+config(*, key: str, handler: ProviderHandler | list[ProviderHandler] | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, registry: Any = None, skip_judges: bool = False, skip_shadows: bool = False, shadow_timeout_s: float = DEFAULT_SHADOW_TIMEOUT_S) -> ConfigInstance
 config_skills(key: str, context: LDContext) -> SkillSource
 ConfigInstance  [class]
-  __init__(key: str, handler: ProviderHandler | list[ProviderHandler] | None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None, registry: Any, skip_judges: bool = False)
+  __init__(key: str, handler: ProviderHandler | list[ProviderHandler] | None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None, registry: Any, skip_judges: bool = False, skip_shadows: bool = False, shadow_timeout_s: float = DEFAULT_SHADOW_TIMEOUT_S)
   invoke(user_input: str | None, context: LDContext, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> ProviderResponse[Any]  [async]
   stream(user_input: str | None, context: LDContext, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[StreamEvent, None]
 configure(*, options: SDKOptions) -> None
@@ -65,7 +65,7 @@ execute_and_stream(*, config_key: str, config: AiConfigRep, meta: VariationMeta,
 execute_and_track(*, config_key: str, config: AiConfigRep, meta: VariationMeta, user_context: LDContext, handler: ProviderHandler, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, graph_key: str | None = None, history: list[dict[str, Any]] | None = None, run_id: str | None = None, extra_track_data: dict[str, Any] | None = None, span_attributes: dict[str, Any] | None = None) -> dict[str, Any]  [async]
 ExecuteStreamDoneEvent = dict[str, Any]
 ExecuteStreamEvent = dict[str, Any]
-extract_variation(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
+extract_variation(config_key: str, context: dict[str, Any], *, with_reason: bool = False) -> dict[str, Any]  [async]
 FDv2SkillStore = LaunchDarklySkillStore
 GenerationConfig(TypedDict, total=False)  [class]
   instructions: str
@@ -255,10 +255,11 @@ ProviderHandler  [class]
   provides_for: tuple[str, Literal['agent', 'messages']] | None = provides_for
   stream(config: AiConfigRep, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[dict[str, Any], None]  [async]
 ProviderResponse(Generic[T])  [class, @dataclass]
-  __init__(response: T, usage: UsageDict, judge_results: dict[str, JudgeResult] | None = None, judge_tasks: list[JudgeTask] | None = None, track_data: TrackData | None = None)
+  __init__(response: T, usage: UsageDict, judge_results: dict[str, JudgeResult] | None = None, judge_tasks: list[JudgeTask] | None = None, shadow_tasks: list[ShadowTask] | None = None, track_data: TrackData | None = None)
   judge_results: dict[str, JudgeResult] | None = None
   judge_tasks: list[JudgeTask] | None = None
   response: T
+  shadow_tasks: list[ShadowTask] | None = None
   track_data: TrackData | None = None
   usage: UsageDict
 ReconcileAction  [class, @dataclass(frozen=True)]
@@ -286,6 +287,7 @@ resolve_handlers(registry: Registry | None, local_handlers: list[ProviderHandler
 resolve_tools(registry: Registry | None, local_tools: Mapping[str, Callable[..., Any] | NativeTool] | None) -> Mapping[str, Callable[..., Any] | NativeTool] | None
 run_judge(task: JudgeTask, handlers: list[ProviderHandler]) -> JudgeRunResult | None  [async]
 run_judges(*, config: AiConfigRep, user_context: LDContext, handler: ProviderHandler, handlers: list[ProviderHandler] | None = None, user_input: str | None, llm_response: str, base_track_data: TrackData, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, graph_key: str | None = None, trajectory: str = '') -> dict[str, JudgeResult]  [async]
+run_shadow(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResult  [async]
 RunSummary  [class, @dataclass]
   __init__(total_rows: int = 0, passed_rows: int = 0, failed_rows: int = 0, error_rows: int = 0, pending_rows: int = 0)
   error_rows: int = 0
@@ -324,6 +326,24 @@ set_skill_store(store: SkillStore | None) -> None
 set_tool_call_content_attributes(span: Any, capture: bool, *, arguments: Any = None, result: Any = None) -> None
 set_tool_definition_attributes(span: Any, capture: bool, tools: list[ToolDefinitionInput]) -> None
 set_usage_span_attributes(span: Any, usage: SpanUsage) -> None
+ShadowResult  [class, @dataclass(frozen=True)]
+  __init__(usage: dict[str, int], track_data: TrackData, error: str | None = None)
+  error: str | None = None
+  track_data: TrackData
+  usage: dict[str, int]
+ShadowTask  [class, @dataclass(frozen=True)]
+  __init__(config_key: str, shadow_request_id: str, shadow_config: AiConfigRep, shadow_meta: VariationMeta, user_input: str | None, history: list[dict[str, Any]] | None, variables: dict[str, Any] | None, user_context: LDContext, timeout_s: float, track_data: TrackData, span_attributes: dict[str, Any] = dict())
+  config_key: str
+  history: list[dict[str, Any]] | None
+  shadow_config: AiConfigRep
+  shadow_meta: VariationMeta
+  shadow_request_id: str
+  span_attributes: dict[str, Any] = field(default_factory=dict)
+  timeout_s: float
+  track_data: TrackData
+  user_context: LDContext
+  user_input: str | None
+  variables: dict[str, Any] | None
 shutdown() -> None  [async]
 Skill  [class, @dataclass(frozen=True)]
   __init__(key: str, version: int, content: bytes, content_hash: str, name: str | None = None, description: str | None = None)
