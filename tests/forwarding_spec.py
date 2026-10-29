@@ -54,6 +54,7 @@ CLAUDE_AGENTS = frozenset(
         "fallback_model",
         "max_budget_usd",
         "max_thinking_tokens",
+        "max_tokens",
         "max_turns",
         "thinking",
     }
