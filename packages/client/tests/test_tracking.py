@@ -127,3 +127,47 @@ class TestHandlerVariables:
             lifecycle_module._reset_for_testing()
 
         assert seen[0].get("__ldValue") == expected
+
+
+class TestCustomHandlerCapture:
+    async def test_an_explicit_false_custom_handler_never_gets_the_raw_variation(
+        self,
+    ) -> None:
+        """A custom handler's function calls the helper without a flag; its own False wins."""
+        from launchdarkly_ai_server import create_handler
+        from launchdarkly_ai_server.utils import set_ld_span_attributes
+
+        events: list[dict[str, Any]] = []
+
+        class Span:
+            def set_attribute(self, *_a: Any) -> None:
+                pass
+
+            def add_event(self, name: str, attributes: dict[str, Any]) -> None:
+                events.append(attributes)
+
+        async def fn(
+            config: Any,
+            user_input: Any,
+            tool_handlers: Any,
+            variables: Any,
+            history: Any = None,
+        ) -> dict[str, Any]:
+            set_ld_span_attributes(Span(), variables)
+            return {"output": "ok", "usage": {}}
+
+        handler = create_handler(("Custom", "messages"), fn, None, False)
+        lifecycle_module._set_client_for_testing(_make_mock_client())
+        try:
+            await execute_and_track(
+                config_key="c",
+                config={"model": {"name": "m"}, "provider": {"name": "Custom"}},
+                meta={"variationKey": "v1", "version": 1},
+                user_context={"kind": "user", "key": "u1"},
+                handler=handler,
+                evaluated_value={"instructions": "secret prompt"},
+            )
+        finally:
+            lifecycle_module._reset_for_testing()
+
+        assert events[0]["feature_flag.result.value"] == '"v1"'

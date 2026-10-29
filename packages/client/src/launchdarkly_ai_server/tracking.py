@@ -155,6 +155,21 @@ def _exposed_tool_keys(
     ]
 
 
+def _handler_captures_content(handler: Any) -> bool:
+    """Effective content capture for a call made through *handler*.
+
+    A :class:`ProviderHandler` answers with its own override, else the process
+    default. A plain function has no setting, so it follows the process
+    default. The raw variation only reaches a handler that captures content.
+    """
+    capture = getattr(handler, "capture_content", None)
+    if isinstance(capture, bool):
+        return capture
+    from .lifecycle import effective_capture_content
+
+    return effective_capture_content(None)
+
+
 async def execute_and_track(
     *,
     config_key: str,
@@ -218,7 +233,7 @@ async def execute_and_track(
     # ``__ldValue`` is SDK-owned like ``__ld``: a caller-supplied one never
     # reaches the handler.
     merged_variables.pop("__ldValue", None)
-    if evaluated_value is not None:
+    if evaluated_value is not None and _handler_captures_content(handler):
         merged_variables["__ldValue"] = evaluated_value
 
     start_time = time.monotonic()
@@ -324,7 +339,7 @@ async def execute_and_stream(
     # ``__ldValue`` is SDK-owned like ``__ld``: a caller-supplied one never
     # reaches the handler.
     merged_variables.pop("__ldValue", None)
-    if evaluated_value is not None:
+    if evaluated_value is not None and _handler_captures_content(handler):
         merged_variables["__ldValue"] = evaluated_value
 
     start_time = time.monotonic()
