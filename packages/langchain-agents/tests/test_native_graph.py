@@ -1461,6 +1461,7 @@ def _assert_neutral(model: Any) -> None:
         assert isinstance(m.content, str)
 
 
+# Same literal as the TypeScript tests' REASONING, so the two rewrite tests share one input.
 _REASONING = {"type": "reasoning_content", "reasoning_content": {"text": "hmm"}}
 
 
@@ -1665,6 +1666,7 @@ class TestToNeutralHistory:
             HumanMessage,
             SystemMessage,
             ToolMessage,
+            ToolMessageChunk,
         )
 
         image = [
@@ -1697,6 +1699,7 @@ class TestToNeutralHistory:
             AIMessageChunk(
                 content="chunk", tool_calls=[{"name": "t", "args": {}, "id": "c3"}]
             ),
+            ToolMessageChunk(content="three", tool_call_id="c3"),
         ]
 
         out = _to_neutral_history(history, AIMessage, HumanMessage)
@@ -1717,5 +1720,6 @@ class TestToNeutralHistory:
                 "[Tool result] lost: orphan",
             ),
             ("ai", "chunk\n[Tool call] t {}"),
+            ("human", "[Tool result] t: three"),
         ]
         assert all(not getattr(m, "tool_calls", None) for m in out)
