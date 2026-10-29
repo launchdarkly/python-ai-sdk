@@ -41,8 +41,9 @@ def clear_endpoint_env(monkeypatch: pytest.MonkeyPatch) -> None:
     ``LD_EVENTS_URI`` to ``Config``, so tests asserting the exact ``Config``
     call fail when any is set. A developer shell can set them, and so can a
     ``.env`` file: importing ``litellm`` during collection runs
-    ``load_dotenv()``, which walks up from the working directory. All three
-    are cleared around each test, and restored after.
+    ``load_dotenv()``, which searches upward from litellm's own install
+    directory, so a ``.venv`` inside a checkout finds that checkout's
+    ``.env``. All three are cleared around each test, and restored after.
     """
     for name in ("LD_BASE_URI", "LD_STREAM_URI", "LD_EVENTS_URI"):
         monkeypatch.delenv(name, raising=False)
