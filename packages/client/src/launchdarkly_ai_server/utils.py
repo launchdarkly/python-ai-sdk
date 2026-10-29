@@ -55,15 +55,17 @@ def _create_handler(
     """Non-reporting :func:`create_handler`, used by the package factories.
 
     Wrapping a :class:`ProviderHandler` again keeps its streaming
-    implementation and its explicit ``capture_content`` override unless new
-    ones are passed, as of the moment it is wrapped. An unset inner handler
-    stays unset.
+    implementation, its explicit ``capture_content`` override, and its
+    ``providers`` allowlist unless new ones are passed, as of the moment it
+    is wrapped. An unset inner value stays unset.
     """
     if isinstance(fn, ProviderHandler):
         if stream_fn is None:
             stream_fn = fn._stream_fn
         if capture_content is None:
             capture_content = fn._capture_content_override
+        if providers is None:
+            providers = fn.providers
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,
