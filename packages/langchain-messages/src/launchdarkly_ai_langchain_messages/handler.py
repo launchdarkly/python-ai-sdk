@@ -785,7 +785,7 @@ def create_langchain_messages_handler(
     for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
     meaning models, token counts, timings and tool names.
     """
-    report_usage("langchain-messages.createLangChainHandler", PACKAGE_NAME, __version__)
+    report_usage("langchain-messages.createLangChainMessagesHandler", PACKAGE_NAME, __version__)
     return _create_langchain_messages_handler(llm, capture_content=capture_content)
 
 
