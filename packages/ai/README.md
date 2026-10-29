@@ -72,7 +72,8 @@ release that includes them. Import them from `launchdarkly_ai_server.experimenta
 import fails, upgrade `launchdarkly-ai-server` itself, since upgrading this package alone can
 leave an older `launchdarkly-ai-server` in place. No feature is experimental now.
 
-Evaluations from Code is core, so this package re-exports it. See the
+Evaluations from Code is core, so this package re-exports it. Like Agent Skills, it needs
+`launchdarkly-ai-server` 1.0.0 or later. See the
 [evaluations guide](https://github.com/launchdarkly/python-ai-sdk/blob/main/packages/client/README.md#run-an-evaluation-from-code).
 
 ---

@@ -48,6 +48,11 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 ### Run an evaluation from code
 
+> **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include
+> Evaluations from Code in core. If you install `launchdarkly-ai-python`, upgrade
+> `launchdarkly-ai-server` too, because upgrading `launchdarkly-ai-python` alone can leave an older
+> one in place: `pip install --upgrade "launchdarkly-ai-server>=1.0.0"`.
+
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
 Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span. The built-in default sends them. Setting capture to false removes them, including on these evaluation spans. The `$ld:ai:offline-evals:*` events still carry no transcript.
@@ -473,6 +478,11 @@ asyncio.run(main())
 ---
 
 ### Agent Skills
+
+> **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include Agent
+> Skills in core. If you install `launchdarkly-ai-python`, upgrade `launchdarkly-ai-server` too,
+> because upgrading `launchdarkly-ai-python` alone can leave an older one in place:
+> `pip install --upgrade "launchdarkly-ai-server>=1.0.0"`.
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their
