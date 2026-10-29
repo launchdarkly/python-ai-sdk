@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from collections.abc import Iterator
 from typing import Any
@@ -8,18 +9,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
+from launchdarkly_ai_server import (
+    EvalRunResult,
+    EvaluationsError,
+    RunSummary,
+    init_evaluations,
+)
 from launchdarkly_ai_server.evaluations import (
     DEFAULT_BASE_URI,
     LDApiError,
     Usage,
 )
 from launchdarkly_ai_server.evaluations.api import HttpResponse, LDApiClient
-from launchdarkly_ai_server.experimental.evaluations import (
-    EvalRunResult,
-    EvaluationsError,
-    RunSummary,
-    init_evaluations,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -595,7 +596,7 @@ def test_missing_project_key_raises_before_network_io(monkeypatch) -> None:
         init_evaluations(transport=failing_transport)
 
 
-EXPERIMENTAL_EVALUATIONS_SURFACE = frozenset(
+EVALUATIONS_SURFACE = frozenset(
     {
         "init_evaluations",
         "EvaluationsModule",
@@ -617,29 +618,22 @@ EXPERIMENTAL_EVALUATIONS_SURFACE = frozenset(
 
 class TestPackageExports:
     """
-    Evaluations from Code is experimental: every public name is
-    exported from ``launchdarkly_ai_server.experimental.evaluations`` and none
-    from the package root.
+    Evaluations from Code is core: every public name is exported from the
+    package root, and ``launchdarkly_ai_server.experimental.evaluations`` no
+    longer exists.
     """
 
-    def test_experimental_surface_is_exactly_the_documented_set(self) -> None:
-        from launchdarkly_ai_server.experimental import evaluations as experimental
-
-        assert set(experimental.__all__) == EXPERIMENTAL_EVALUATIONS_SURFACE
-        assert len(experimental.__all__) == len(EXPERIMENTAL_EVALUATIONS_SURFACE)
-        for name in EXPERIMENTAL_EVALUATIONS_SURFACE:
-            assert hasattr(experimental, name), name
-
-    def test_experimental_module_defines_no_other_public_name(self) -> None:
-        from launchdarkly_ai_server.experimental import evaluations as experimental
-
-        public = {name for name in dir(experimental) if not name.startswith("_")}
-        assert public == EXPERIMENTAL_EVALUATIONS_SURFACE
-
-    def test_no_evaluations_name_is_exported_from_the_package_root(self) -> None:
+    def test_every_evaluations_name_is_exported_from_the_package_root(self) -> None:
         import launchdarkly_ai_server as package
-        import launchdarkly_ai_server.experimental.evaluations
 
-        for name in EXPERIMENTAL_EVALUATIONS_SURFACE:
-            assert name not in package.__all__, name
-            assert not hasattr(package, name), name
+        assert EVALUATIONS_SURFACE <= set(package.__all__)
+        for name in EVALUATIONS_SURFACE:
+            assert hasattr(package, name), name
+
+    def test_the_experimental_evaluations_module_is_gone(self) -> None:
+        import launchdarkly_ai_server.experimental as experimental
+
+        with pytest.raises(ImportError):
+            importlib.import_module("launchdarkly_ai_server.experimental.evaluations")
+        for name in EVALUATIONS_SURFACE:
+            assert not hasattr(experimental, name), name
