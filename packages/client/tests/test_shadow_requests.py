@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import logging
 import pickle
+import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -661,6 +662,30 @@ class TestDeferred:
             "kind": "multi",
             "user": {"key": "u1", "name": "Ann"},
         }
+
+    async def test_served_response_survives_a_failure_building_shadows(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _make_client(_variation_a())
+        _use(client)
+        context: dict[str, Any] = {
+            "kind": "user",
+            "key": "u1",
+            "lock": threading.Lock(),
+        }
+        tasks: list[ShadowTask] = []
+        with caplog.at_level(logging.WARNING, logger=sr.logger.name):
+            response = await shadow_config(
+                key="flag",
+                handler=[
+                    _Recorder("TestProvider", "real answer").handler,
+                    _Recorder("ShadowProvider", "b").handler,
+                ],
+                on_task=tasks.append,
+            ).invoke("hi", context)
+        assert response.response == "real answer"
+        assert tasks == []
+        assert caplog.messages
 
     async def test_task_is_self_contained_and_survives_pickle(self) -> None:
         history = [{"role": "user", "content": "earlier"}]

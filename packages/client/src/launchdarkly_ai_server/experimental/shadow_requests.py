@@ -210,17 +210,24 @@ class _ShadowConfigInstance(_InternalConfigInstance):
         if not primary_track_data:
             return
         handlers = resolve_handlers(self._registry, self._normalize_handlers()) or []
-        for task in _select_tasks(
-            config_key=self._key,
-            evaluation=evaluation,
-            primary_track_data=primary_track_data,
-            handlers=handlers,
-            user_input=user_input,
-            context=context,
-            variables=variables,
-            history=history,
-            timeout_s=self._timeout_s,
-        ):
+        try:
+            tasks = _select_tasks(
+                config_key=self._key,
+                evaluation=evaluation,
+                primary_track_data=primary_track_data,
+                handlers=handlers,
+                user_input=user_input,
+                context=context,
+                variables=variables,
+                history=history,
+                timeout_s=self._timeout_s,
+            )
+        except Exception:
+            logger.warning(
+                "Skipping shadow requests: they could not be prepared", exc_info=True
+            )
+            return
+        for task in tasks:
             if self._on_task is not None:
                 try:
                     self._on_task(task)
