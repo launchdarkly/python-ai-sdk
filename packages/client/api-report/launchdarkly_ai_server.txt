@@ -255,7 +255,7 @@ ProviderHandler  [class]
   provides_for: tuple[str, Literal['agent', 'messages']] | None = provides_for
   stream(config: AiConfigRep, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[dict[str, Any], None]  [async]
 ProviderResponse(Generic[T])  [class, @dataclass]
-  __init__(response: T, usage: UsageDict, judge_results: dict[str, JudgeResult] | None = None, judge_tasks: list[JudgeTask] | None = None, shadow_tasks: list[ShadowTask] | None = None, track_data: TrackData | None = None)
+  __init__(response: T, usage: UsageDict, judge_results: dict[str, JudgeResult] | None = None, judge_tasks: list[JudgeTask] | None = None, track_data: TrackData | None = None, shadow_tasks: list[ShadowTask] | None = None)
   judge_results: dict[str, JudgeResult] | None = None
   judge_tasks: list[JudgeTask] | None = None
   response: T

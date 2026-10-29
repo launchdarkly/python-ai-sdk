@@ -288,16 +288,16 @@ class ProviderResponse(Generic[T]):
 
     ``None`` when ``skip_judges=False`` (judges ran inline).
     """
-    shadow_tasks: list[ShadowTask] | None = None
-    """
-    Sampled shadow requests, produced when ``skip_shadows=True``. Run each with
-    ``run_shadow(task, handlers)``. ``None`` when shadows ran in the background.
-    """
     track_data: TrackData | None = None
     """
     Tracking payload from this invocation. Carried inside each :class:`JudgeTask`
     so that background judge results are attributed to the originating request
     (run ID, config key, graph key, etc.).
+    """
+    shadow_tasks: list[ShadowTask] | None = None
+    """
+    Sampled shadow requests, produced when ``skip_shadows=True``. Run each with
+    ``run_shadow(task, handlers)``. ``None`` when shadows ran in the background.
     """
 
 
