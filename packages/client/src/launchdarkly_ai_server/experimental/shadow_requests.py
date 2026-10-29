@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import inspect
 import logging
 import math
 import time
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..client import ConfigInstance, _InternalConfigInstance
-from ..lifecycle import _parse_variation, get_client, init_client
+from ..lifecycle import _fetch_variation, _parse_variation
 from ..registry import resolve_handlers
 from ..sdk_usage import report_usage
 from ..shutdown_hooks import register_shutdown_hook
@@ -42,7 +41,6 @@ from ..utils import (
     _context_identity_from_ld_context,
     parse_usage,
     select_handler,
-    to_ld_context,
 )
 
 __all__ = ["ShadowResult", "ShadowTask", "run_shadow", "shadow_config"]
@@ -187,6 +185,7 @@ class _ShadowConfigInstance(_InternalConfigInstance):
             primary._execute_stream(user_input, context, variables, history, sink)
         ) as source:
             async for event in source:
+                # Before judges run, unlike invoke(); neither delays the caller.
                 if event.get("type") == "done":
                     self._start_shadows(
                         evaluation,
@@ -244,13 +243,11 @@ class _ShadowConfigInstance(_InternalConfigInstance):
 class _Evaluated(_InternalConfigInstance):
     """Runs ``config()``'s invoke and stream on a variation that is already evaluated."""
 
+    _FORWARDED = ("key", "handler", "tool_handlers", "registry", "skip_judges")
+
     def __init__(self, source: ConfigInstance, variation: dict[str, Any]) -> None:
         super().__init__(
-            key=source._key,
-            handler=source._handler,
-            tool_handlers=source._tool_handlers,
-            registry=source._registry,
-            skip_judges=source._skip_judges,
+            **{name: getattr(source, f"_{name}") for name in self._FORWARDED}
         )
         self._variation = variation
 
@@ -259,18 +256,7 @@ class _Evaluated(_InternalConfigInstance):
 
 
 async def _evaluate(config_key: str, context: LDContext) -> _Evaluation:
-    await init_client()
-    client = get_client()
-    ld_context = to_ld_context(client, context)
-    variation_detail = getattr(client, "variation_detail", None)
-    reason: Any = None
-    if variation_detail is None:
-        raw = client.variation(config_key, ld_context, None)
-    else:
-        detail = variation_detail(config_key, ld_context, None)
-        detail = await detail if inspect.isawaitable(detail) else detail
-        raw, reason = detail.value, detail.reason
-    raw = await raw if inspect.isawaitable(raw) else raw
+    raw, reason = await _fetch_variation(config_key, context, with_reason=True)
     shadow_configuration = None
     if isinstance(raw, dict):
         shadow_configuration = raw.get("shadowConfiguration")

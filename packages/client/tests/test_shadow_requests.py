@@ -262,6 +262,31 @@ class TestPlainConfig:
             assert not hasattr(launchdarkly_ai_server, name)
 
 
+class TestCoreSeams:
+    def test_forwards_every_config_instance_option(self) -> None:
+        import inspect
+
+        from launchdarkly_ai_server.client import ConfigInstance
+
+        options = set(inspect.signature(ConfigInstance.__init__).parameters) - {"self"}
+        assert set(sr._Evaluated._FORWARDED) == options
+
+    async def test_fetch_variation_reads_the_reason_only_when_asked(self) -> None:
+        detail = SimpleNamespace(value={"v": 1}, reason={"kind": "FALLTHROUGH"})
+        client = MagicMock()
+        client.variation.return_value = {"v": 0}
+        client.variation_detail.return_value = detail
+        _use(client)
+        assert await lifecycle_module._fetch_variation("flag", CONTEXT) == (
+            {"v": 0},
+            None,
+        )
+        assert await lifecycle_module._fetch_variation(
+            "flag", CONTEXT, with_reason=True
+        ) == ({"v": 1}, {"kind": "FALLTHROUGH"})
+        client.variation_detail.assert_called_once()
+
+
 class TestPrimary:
     async def test_primary_matches_plain_config(self) -> None:
         value = _variation_a(shadows={})
