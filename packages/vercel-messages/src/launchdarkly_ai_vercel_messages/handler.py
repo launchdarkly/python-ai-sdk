@@ -50,7 +50,7 @@ MAX_STEPS = 10
 #: :func:`_renamed_parameters`. Every other key is dropped. The handler sets ``model``,
 #: ``messages``, ``tools`` and ``output_type`` itself, and runs the tool loop.
 #:
-#: This is the Vercel AI SDK list from TESTING.md section 1.12 as the Python ``ai`` library can
+#: This is the cross-SDK Vercel AI SDK list as the Python ``ai`` library can
 #: send it. ``stop_sequences`` is on the JS list but the Python library has no field for it.
 #: ``parallel_tool_calls``, ``max_tool_calls``, ``service_tier`` and ``prompt_cache_key`` are
 #: Python-only: the library takes them as typed request params, while the JS AI SDK can reach them
@@ -122,7 +122,7 @@ _TOOL_CHOICE_MODES = frozenset({"auto", "none", "required"})
 
 
 def _renamed_parameters(params: dict[str, Any]) -> dict[str, Any]:
-    """Applies the section 1.12 renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
+    """Applies the cross-SDK renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
     which wins over ``max_tokens``, and an explicit ``reasoning`` wins over ``reasoning_effort``."""
     for alias in ("max_completion_tokens", "max_tokens"):
         value = params.pop(alias, None)

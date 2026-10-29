@@ -616,7 +616,7 @@ async def extract_variation(
             f"Variation '{config_key}' returned None (flag may be disabled)."
         )
 
-    # Only an explicit ``_ldMeta.enabled`` counts as enabled (spec §3.10, as in JS and Go).
+    # Only an explicit ``_ldMeta.enabled`` counts as enabled (as in JS and Go).
     ld_meta = (raw.get("_ldMeta") or {}) if isinstance(raw, dict) else {}
     if not isinstance(ld_meta, dict) or not ld_meta.get("enabled"):
         raise RuntimeError(f"Variation '{config_key}' is disabled.")

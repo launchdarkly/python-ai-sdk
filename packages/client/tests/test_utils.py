@@ -1,7 +1,6 @@
 """
 Tests for parse_template, parse_json_with_possible_fences,
 parse_usage, normalize_mode, create_handler.
-Reference: TESTING.md s3.1-3.4, s3.15
 """
 
 from typing import Any
@@ -271,7 +270,7 @@ class TestCreateHandler:
 
 
 class TestMakeTrackData:
-    """§3.10 model stamps — shared node-trackData builder for native graph adapters."""
+    """Model stamps — shared node-trackData builder for native graph adapters."""
 
     def _node(self, meta: dict) -> Any:
         from launchdarkly_ai_server.types import GraphNode
@@ -349,7 +348,7 @@ class TestMakeGraphTrackData:
 
 
 class TestModelStampsFromMeta:
-    """§3.10 model stamps — malformed ``modelVersion`` is omitted, never raises."""
+    """Model stamps — malformed ``modelVersion`` is omitted, never raises."""
 
     def test_copies_int_version_and_non_empty_key(self) -> None:
         assert model_stamps_from_meta({"modelKey": "m", "modelVersion": 3}) == {

@@ -70,7 +70,7 @@ from .spans import (
 #: so ``reasoning`` is forwarded with its ``effort`` and ``summary`` (see :func:`_rebuild_reasoning`)
 #: and no top-level ``reasoning_effort`` is read.
 #:
-#: This is the cross-SDK list for OpenAI Messages (TESTING.md section 1.12). The same list serves
+#: This is the cross-SDK list for OpenAI Messages. The same list serves
 #: ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves the
 #: same whichever is called. ``max_tool_calls`` is marked not supported in TypeScript there: the JS
 #: ``openai`` SDK's ``responses.create`` has no such parameter, while this SDK's ``create`` and

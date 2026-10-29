@@ -337,8 +337,8 @@ async def _build_graph(
                 def _fn(*a: Any, **kw: Any) -> str:
                     if not chosen:
                         chosen.append(t)
-                    # Both routing strings are pinned byte for byte in TESTING.md §3.15a, which
-                    # gives the reasons: "recorded" keeps a node with a real tool from skipping
+                    # Both routing strings are pinned byte for byte across SDKs, for two
+                    # reasons: "recorded" keeps a node with a real tool from skipping
                     # it, and asking for no "final response" keeps a router from answering for
                     # its target.
                     return (

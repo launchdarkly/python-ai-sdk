@@ -47,7 +47,7 @@ def _json_schema(output_format: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-#: The cross-SDK list for LiteLLM Messages (TESTING.md section 1.12): the ``model.parameters``
+#: The cross-SDK list for LiteLLM Messages: the ``model.parameters``
 #: keys forwarded to ``litellm.acompletion``. Every other key is dropped. The handler sets
 #: ``model``, ``messages``, ``stream``, ``stream_options``, ``tools`` and ``response_format`` itself,
 #: and ``api_key`` (with ``api_base``) comes from the handler's options, never from the config.
