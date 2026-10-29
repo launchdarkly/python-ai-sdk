@@ -12,6 +12,9 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, TypedDict
 
+from langchain_core.tools import InjectedToolCallId
+from pydantic import BaseModel
+
 from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
@@ -52,6 +55,16 @@ except ImportError:
     # inside invoke() will raise ImportError with a clear message.
     add_messages = None  # type: ignore[assignment]
     _HAS_LANGGRAPH = False
+
+
+_HANDOFF_IGNORED = "Ignored: only the first transfer in a turn routes."
+
+
+class _HandoffArgs(BaseModel):
+    """Hand-off tool schema: the model passes no arguments, and LangChain injects
+    the call id (a dict schema would skip the injection)."""
+
+    tool_call_id: Annotated[str, InjectedToolCallId]
 
 
 def _sanitize_name(key: str) -> str:
@@ -173,6 +186,7 @@ def to_lang_graph(
 
         HumanMessage = lc_msgs.HumanMessage
         SystemMessage = lc_msgs.SystemMessage
+        ToolMessage = lc_msgs.ToolMessage
 
         vs = variables or {}
         def_obj: GraphDefinition = await def_promise
@@ -257,26 +271,49 @@ def to_lang_graph(
                 langgraph_types = importlib.import_module("langgraph.types")
                 Command = langgraph_types.Command
 
+                # The node's last model call sets "first" (its first hand-off call
+                # id); the tools step sets "handed_off" when that call routes.
+                routing: dict[str, Any] = {"first": None, "handed_off": False}
+
                 handoff_tools = []
                 for edge in outgoing:
                     target_key = _sanitize_name(edge.target_key)
 
                     async def _handoff_exec(
+                        tool_call_id: Annotated[str, InjectedToolCallId],
                         _target: str = target_key,
+                        _target_raw: str = edge.target_key,
                         _node: GraphNode = node,
                     ) -> Any:
+                        # Only the first hand-off in a model message routes, as in graph().
+                        if tool_call_id != routing["first"]:
+                            return _HANDOFF_IGNORED
+                        routing["handed_off"] = True
                         if ld_context:
                             td = make_track_data(_node, def_obj.key, run_id)
                             get_client().track(
                                 "$ld:ai:graph:handoff_success", ld_context, td, 1
                             )
-                        return Command(goto=_target)
+                        # The ToolMessage answers the call, so the next model call
+                        # never sees an unanswered tool call.
+                        return Command(
+                            goto=_target,
+                            update={
+                                "messages": [
+                                    ToolMessage(
+                                        content=f"Handed off to {_target_raw}.",
+                                        tool_call_id=tool_call_id,
+                                        name=f"transfer_to_{_target}",
+                                    )
+                                ]
+                            },
+                        )
 
                     ht = tool_fn(
                         f"transfer_to_{_sanitize_name(edge.target_key)}",
                         _handoff_exec,
                         description=f"Transfer control to the {edge.target_key} agent",
-                        args_schema={},
+                        args_schema=_HandoffArgs,
                     )
                     handoff_tools.append(ht)
 
@@ -306,18 +343,22 @@ def to_lang_graph(
                         else list(conv_messages)
                     )
 
+                    # No parallel_tool_calls: Bedrock Converse rejects it. The
+                    # hand-off tools keep only the first hand-off instead.
                     bound = (
-                        chat_model.bind_tools(
-                            all_tools,
-                            **(
-                                {"parallel_tool_calls": False} if is_multi_child else {}
-                            ),
-                        )
-                        if all_tools
-                        else chat_model
+                        chat_model.bind_tools(all_tools) if all_tools else chat_model
                     )
 
                     result_msg = await bound.ainvoke(full_messages)
+                    routing["first"] = next(
+                        (
+                            tc.get("id")
+                            for tc in getattr(result_msg, "tool_calls", None) or []
+                            if tc.get("name", "").startswith("transfer_to_")
+                        ),
+                        None,
+                    )
+                    routing["handed_off"] = False
                     usage = _extract_usage(result_msg)
                     total_usage["input"] += usage["input"]
                     total_usage["output"] += usage["output"]
@@ -363,27 +404,28 @@ def to_lang_graph(
                         builder.add_edge(f"{node_key}_tools", node_key)
                     else:
                         builder.add_edge(node_key, END)
-                elif is_multi_child:
-                    if all_tools:
-                        builder.add_conditional_edges(
-                            node_key,
-                            tools_condition,
-                            {"tools": f"{node_key}_tools", "__end__": END},
-                        )
-                        builder.add_edge(f"{node_key}_tools", node_key)
-                    else:
-                        builder.add_edge(node_key, END)
                 else:
-                    child_key = _sanitize_name(outgoing[0].target_key)
-                    if all_tools:
-                        builder.add_conditional_edges(
-                            node_key,
-                            tools_condition,
-                            {"tools": f"{node_key}_tools", "__end__": child_key},
-                        )
-                        builder.add_edge(f"{node_key}_tools", node_key)
-                    else:
-                        builder.add_edge(node_key, child_key)
+                    # A non-terminal node always has hand-off tools. Ending the turn
+                    # without one ends the run (multi-child) or moves to the child.
+                    builder.add_conditional_edges(
+                        node_key,
+                        tools_condition,
+                        {
+                            "tools": f"{node_key}_tools",
+                            "__end__": END
+                            if is_multi_child
+                            else _sanitize_name(outgoing[0].target_key),
+                        },
+                    )
+                    # No static edge back to the node: after a hand-off the Command
+                    # routes to the target and the node must not run again.
+                    builder.add_conditional_edges(
+                        f"{node_key}_tools",
+                        lambda _s, _r=routing, _k=node_key: (
+                            END if _r["handed_off"] else _k
+                        ),
+                        [node_key, END],
+                    )
 
             # Pre-order traversal (root first, to mirror TS traverse)
             pre_visited: set[str] = set()

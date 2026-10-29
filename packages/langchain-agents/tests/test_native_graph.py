@@ -1353,3 +1353,211 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
         expected = LANGCHAIN_CHAT_OPENAI
         candidates = candidate_keys(_REAL_CHAT_OPENAI.model_fields, expected)
         assert await probe_forwarded_keys(candidates, call) == expected
+
+
+# ---------------------------------------------------------------------------
+# Hand-offs through a real StateGraph (AIC-3592)
+# ---------------------------------------------------------------------------
+
+
+def _handoff_graph_def(
+    children: list[str], root_tools: dict[str, Any] | None = None
+) -> GraphDefinition:
+    def _node(
+        key: str, edges: list[str], tools: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "model": {"name": "m"},
+            "instructions": f"you are {key}",
+        }
+        if tools:
+            config["tools"] = tools
+        return {
+            "key": key,
+            "config": config,
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [{"source_key": key, "target_key": c} for c in edges],
+            "is_terminal": not edges,
+        }
+
+    nodes = {"router": _node("router", children, root_tools)}
+    nodes.update({c: _node(c, []) for c in children})
+    return _make_graph_def(
+        nodes=nodes,
+        edges=[{"source_key": "router", "target_key": c} for c in children],
+        root_key="router",
+    )
+
+
+def _scripted_models(replies: dict[str, list[Any]]) -> tuple[Any, dict[str, Any]]:
+    """One mock chat model per node; each ainvoke pops that node's next reply.
+    bind_tools is a MagicMock, so a test can assert on its kwargs."""
+    models: dict[str, Any] = {}
+    for key, msgs in replies.items():
+        m = MagicMock()
+        m.ainvoke = AsyncMock(side_effect=list(msgs))
+        m.bind_tools = MagicMock(return_value=m)
+        models[key] = m
+    return (lambda node: models[node.key]), models
+
+
+def _tool_call_msg(*calls: tuple[str, str]) -> Any:
+    from langchain_core.messages import AIMessage
+
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {"name": n, "args": {}, "id": i, "type": "tool_call"} for n, i in calls
+        ],
+    )
+
+
+async def _run_handoff(
+    graph_def: GraphDefinition,
+    factory: Any,
+    tool_handlers: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    from langchain_core.messages import AIMessage  # noqa: F401
+
+    tracked: list[str] = []
+    client = MagicMock()
+    client.track = MagicMock(side_effect=lambda evt, *_a: tracked.append(evt))
+    with (
+        patch("launchdarkly_ai_langchain_agents.native_graph._HAS_OTEL", False),
+        patch(
+            "launchdarkly_ai_langchain_agents.native_graph.get_client",
+            return_value=client,
+        ),
+    ):
+        result = await to_lang_graph(
+            _make_def_promise(graph_def),
+            {
+                "model_factory": factory,
+                "tool_handlers": tool_handlers or {},
+                "context": {"kind": "user", "key": "u"},
+            },
+        ).invoke("who did it?")
+    return result, tracked
+
+
+def _tool_messages(model: Any) -> list[Any]:
+    sent = model.ainvoke.call_args.args[0]
+    return [m for m in sent if m.type == "tool"]
+
+
+class TestNativeHandoffRealStateGraph:
+    @pytest.mark.asyncio
+    async def test_multi_child_router_hands_off_once(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [_tool_call_msg(("transfer_to_butler", "call_1"))],
+                "butler": [AIMessage(content="the butler did it")],
+                "cook": [],
+            }
+        )
+        result, tracked = await _run_handoff(
+            _handoff_graph_def(["butler", "cook"]), factory
+        )
+
+        assert result["response"] == "the butler did it"
+        assert models["router"].ainvoke.call_count == 1  # not re-run after the hand-off
+        assert models["cook"].ainvoke.call_count == 0
+        [answer] = _tool_messages(models["butler"])
+        assert answer.tool_call_id == "call_1"
+        assert answer.content == "Handed off to butler."
+        assert tracked.count("$ld:ai:graph:handoff_success") == 1
+
+    @pytest.mark.asyncio
+    async def test_bind_tools_gets_no_parallel_tool_calls(self) -> None:
+        """Bedrock Converse rejects parallel_tool_calls, so it is never passed."""
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [_tool_call_msg(("transfer_to_butler", "call_1"))],
+                "butler": [AIMessage(content="done")],
+                "cook": [],
+            }
+        )
+        await _run_handoff(_handoff_graph_def(["butler", "cook"]), factory)
+
+        _args, kwargs = models["router"].bind_tools.call_args
+        assert "parallel_tool_calls" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_normal_tool_and_handoff_in_one_message_both_run(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        lookups: list[Any] = []
+        factory, models = _scripted_models(
+            {
+                "router": [
+                    _tool_call_msg(
+                        ("lookup", "call_a"), ("transfer_to_butler", "call_b")
+                    )
+                ],
+                "butler": [AIMessage(content="done")],
+                "cook": [],
+            }
+        )
+        result, _ = await _run_handoff(
+            _handoff_graph_def(
+                ["butler", "cook"],
+                root_tools={"lookup": {"description": "look up", "parameters": {}}},
+            ),
+            factory,
+            tool_handlers={"lookup": lambda args: lookups.append(args) or "clue"},
+        )
+
+        assert result["response"] == "done"
+        assert len(lookups) == 1
+        assert models["router"].ainvoke.call_count == 1
+        answers = {m.tool_call_id: m.content for m in _tool_messages(models["butler"])}
+        assert answers == {"call_a": "clue", "call_b": "Handed off to butler."}
+
+    @pytest.mark.asyncio
+    async def test_first_handoff_wins(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [
+                    _tool_call_msg(
+                        ("transfer_to_butler", "call_1"), ("transfer_to_cook", "call_2")
+                    )
+                ],
+                "butler": [AIMessage(content="butler answer")],
+                "cook": [],
+            }
+        )
+        result, tracked = await _run_handoff(
+            _handoff_graph_def(["butler", "cook"]), factory
+        )
+
+        assert result["response"] == "butler answer"
+        assert models["cook"].ainvoke.call_count == 0
+        answers = {m.tool_call_id: m.content for m in _tool_messages(models["butler"])}
+        assert answers == {
+            "call_1": "Handed off to butler.",
+            "call_2": "Ignored: only the first transfer in a turn routes.",
+        }
+        assert tracked.count("$ld:ai:graph:handoff_success") == 1
+
+    @pytest.mark.asyncio
+    async def test_single_child_hands_off_once(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [_tool_call_msg(("transfer_to_butler", "call_1"))],
+                "butler": [AIMessage(content="the butler did it")],
+            }
+        )
+        result, _ = await _run_handoff(_handoff_graph_def(["butler"]), factory)
+
+        assert result["response"] == "the butler did it"
+        assert models["router"].ainvoke.call_count == 1
+        [answer] = _tool_messages(models["butler"])
+        assert answer.tool_call_id == "call_1"
