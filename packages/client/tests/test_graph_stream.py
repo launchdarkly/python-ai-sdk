@@ -19,7 +19,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import ProviderHandler, graph
+from launchdarkly_ai_server import ProviderHandler, SDKOptions, configure, graph
 from launchdarkly_ai_server.conversation import (
     GEN_AI_CONVERSATION_ID,
     ConversationIdSpanProcessor,
@@ -990,18 +990,19 @@ class TestGraphStreamOtel:
         assert (flag_events[0].attributes or {})["feature_flag.key"] == "graph-key"
 
     @pytest.mark.parametrize("mode", ["invoke", "stream"])
+    @pytest.mark.parametrize("capture", [True, False])
     async def test_graph_span_event_carries_the_graph_variation(
-        self, mode: str
+        self, mode: str, capture: bool
     ) -> None:
-        """A graph root has no raw variation, so its result value is the JSON-encoded key."""
-        client = _make_client(
-            {
-                "root": "root-node",
-                "edges": {"root-node": [{"key": "leaf-node"}]},
-                "_ldMeta": {"enabled": True, "variationKey": "graph-v1", "version": 3},
-            }
-        )
+        """With capture on the result value is the raw graph variation; off, the key."""
+        raw = {
+            "root": "root-node",
+            "edges": {"root-node": [{"key": "leaf-node"}]},
+            "_ldMeta": {"enabled": True, "variationKey": "graph-v1", "version": 3},
+        }
+        client = _make_client(raw)
         lifecycle_module._set_client_for_testing(client)
+        configure(options=SDKOptions(capture_content=capture))
         try:
             g = graph("graph-key", handlers=[_make_streaming_handler(["ok"])])
             if mode == "invoke":
@@ -1015,11 +1016,14 @@ class TestGraphStreamOtel:
         event = next(e for e in graph_spans[0].events if e.name == "feature_flag")
         attrs = event.attributes or {}
         assert attrs["feature_flag.result.variant"] == "graph-v1"
-        assert attrs["feature_flag.result.value"] == json.dumps("graph-v1")
+        expected = json.dumps(raw) if capture else json.dumps("graph-v1")
+        assert attrs["feature_flag.result.value"] == expected
 
     async def test_graph_span_without_a_variation_key_omits_the_result(
         self, mock_ld_client: MagicMock
     ) -> None:
+        """With capture off and no variation key there is nothing to write."""
+        configure(options=SDKOptions(capture_content=False))
         await graph("graph-key", handlers=[_make_streaming_handler(["ok"])]).invoke(
             "hi", CONTEXT
         )

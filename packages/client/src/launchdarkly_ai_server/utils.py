@@ -825,7 +825,7 @@ def set_ld_span_attributes(
     variation_key = ld.get("variationKey")
     if isinstance(variation_key, str) and variation_key:
         feature_flag_attrs["feature_flag.result.variant"] = variation_key
-    if capture_content and "__ldValue" in variables:
+    if capture_content and variables.get("__ldValue") is not None:
         feature_flag_attrs["feature_flag.result.value"] = json.dumps(
             variables["__ldValue"]
         )

@@ -107,16 +107,16 @@ async def _fetch_graph_variation(
     topology = variation if isinstance(variation, dict) else None
 
     if not topology or not topology.get("root"):
-        return {"enabled": False, "meta": meta}
+        return {"enabled": False, "meta": meta, "value": variation}
 
-    return {"enabled": True, "topology": topology, "meta": meta}
+    return {"enabled": True, "topology": topology, "meta": meta, "value": variation}
 
 
 async def _build_graph(
     key: str,
     context: LDContext,
     options: dict[str, Any],
-) -> tuple[GraphDefinition, TrackData, Callable[..., Any]]:
+) -> tuple[GraphDefinition, TrackData, Callable[..., Any], Any]:
     from .judges import run_judges
     from .lifecycle import extract_variation, get_client
     from .tracking import _try_get_environment_id, execute_and_track
@@ -127,6 +127,9 @@ async def _build_graph(
     enabled: bool = result["enabled"]
     topology: dict[str, Any] | None = result.get("topology")
     meta = result.get("meta", {})
+    # The graph variation as the LD SDK returned it, for the root span's
+    # feature_flag.result.value. Kept off GraphDefinition, which is public.
+    graph_value = result.get("value")
 
     graph_track_data: TrackData = {
         "runId": str(uuid.uuid4()),
@@ -147,6 +150,7 @@ async def _build_graph(
             _disabled_definition(key),
             graph_track_data,
             _disabled_stream_route(key),
+            graph_value,
         )
 
     raw_edges_map: dict[str, list[dict[str, Any]]] = topology.get("edges") or {}
@@ -193,6 +197,7 @@ async def _build_graph(
             _disabled_definition(key),
             graph_track_data,
             _disabled_stream_route(key),
+            graph_value,
         )
 
     root_node = nodes.get(topology["root"])
@@ -836,7 +841,7 @@ async def _build_graph(
         reverse_traverse=reverse_traverse,
     )
 
-    return graph_def, graph_track_data, stream_route
+    return graph_def, graph_track_data, stream_route, graph_value
 
 
 async def resolve_graph(
@@ -864,7 +869,7 @@ async def resolve_graph(
         "tool_handlers": resolved_tools,
         "registry": registry,
     }
-    graph_def, _, _ = await _build_graph(key, context, options)
+    graph_def, _, _, _ = await _build_graph(key, context, options)
     return graph_def
 
 
@@ -902,7 +907,7 @@ class GraphInstance:
         from opentelemetry import trace
 
         from .judges import run_judges
-        from .lifecycle import get_client
+        from .lifecycle import effective_capture_content, get_client
 
         ld_ctx = to_ld_context(get_client(), context)
 
@@ -925,7 +930,7 @@ class GraphInstance:
             )
 
         built = await _build_graph(self._key, context, resolved_options)
-        graph_def, built_track_data, _ = built
+        graph_def, built_track_data, _, graph_value = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
@@ -935,7 +940,13 @@ class GraphInstance:
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         with tracer.start_as_current_span("launchdarkly.graph") as span:
             set_ld_span_attributes(
-                span, {"__ld": graph_track_data, "ldContext": context}
+                span,
+                {
+                    "__ld": graph_track_data,
+                    "ldContext": context,
+                    "__ldValue": graph_value,
+                },
+                capture_content=effective_capture_content(None),
             )
 
             start_time = time.monotonic()
@@ -1127,7 +1138,7 @@ class GraphInstance:
         from opentelemetry.trace import Status, StatusCode, set_span_in_context
 
         from .judges import run_judges
-        from .lifecycle import get_client
+        from .lifecycle import effective_capture_content, get_client
 
         resolved_input = user_input or ""
         ld_ctx = to_ld_context(get_client(), context)
@@ -1151,7 +1162,7 @@ class GraphInstance:
             )
 
         built = await _build_graph(self._key, context, resolved_options)
-        graph_def, built_track_data, stream_route = built
+        graph_def, built_track_data, stream_route, graph_value = built
 
         if not graph_def.enabled:
             raise ValueError(f'Agent graph "{self._key}" is disabled')
@@ -1160,7 +1171,11 @@ class GraphInstance:
 
         tracer = trace.get_tracer("@launchdarkly/ai-server")
         span = tracer.start_span("launchdarkly.graph", context=caller_context)
-        set_ld_span_attributes(span, {"__ld": graph_track_data, "ldContext": context})
+        set_ld_span_attributes(
+            span,
+            {"__ld": graph_track_data, "ldContext": context, "__ldValue": graph_value},
+            capture_content=effective_capture_content(None),
+        )
         span_context = set_span_in_context(span, caller_context)
         ended: set[int] = set()
         start_time = time.monotonic()
