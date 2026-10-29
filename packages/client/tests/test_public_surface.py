@@ -82,6 +82,7 @@ ROOT_SURFACE = frozenset(
         "init_client",
         "inspect_config",
         "is_content_blocks",
+        "is_function_tool",
         "lang_chain_content_text",
         "lang_chain_finish_reasons",
         "lang_chain_span_messages",

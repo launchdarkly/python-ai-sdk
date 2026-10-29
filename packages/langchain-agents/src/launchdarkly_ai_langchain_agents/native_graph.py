@@ -24,6 +24,7 @@ from launchdarkly_ai_server import (
     NativeTool,
     compose_history,
     get_client,
+    is_function_tool,
     make_track_data,
     parse_template,
     report_usage,
@@ -163,6 +164,8 @@ def _build_node_tools(
 
     result = []
     for name, tool_cfg in node.config["tools"].items():
+        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+            continue
         schema = tool_cfg.get("parameters") or {}
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:

@@ -21,6 +21,7 @@ from launchdarkly_ai_server import (
     _config,
     _create_handler,
     compose_history,
+    is_function_tool,
     parse_template,
     report_usage,
 )
@@ -293,7 +294,7 @@ def build_agent_tools(
     result: list[Any] = []
     for name, definition in (definitions or {}).items():
         handler = (handlers or {}).get(name)
-        if not callable(handler) or isinstance(handler, NativeTool):
+        if not is_function_tool(handler, name):
             continue
 
         async def execute(

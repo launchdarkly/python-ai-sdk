@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 from .sdk_usage import report_usage
 from .types import (
+    NATIVE_TOOL_KEY,
     AiConfigRep,
     GraphNode,
     InputTokenDetails,
+    NativeTool,
     ProviderHandler,
     UsageDict,
     VariationMeta,
     _HandlerFn,
     _StreamFn,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def create_handler(
@@ -896,3 +901,25 @@ def parse_json_with_possible_fences(raw_text: str) -> Any | None:
             pass
 
     return None
+
+
+_warned_native_tools: set[str] = set()
+
+
+def is_function_tool(handler: Any, name: str) -> TypeGuard[Callable[..., Any]]:
+    """
+    Whether a handler may send ``handler`` to the model as a function tool. A ``NativeTool``,
+    or the tracking stub ``wrap_tool_handlers`` makes from one, is a provider built-in, never a
+    function tool: a handler with no built-in for it skips it, warning once per tool key.
+    """
+    if isinstance(handler, NativeTool) or isinstance(
+        getattr(handler, NATIVE_TOOL_KEY, None), NativeTool
+    ):
+        if name not in _warned_native_tools:
+            _warned_native_tools.add(name)
+            logger.warning(
+                'Skipping native tool "%s": this handler has no built-in tool for it.',
+                name,
+            )
+        return False
+    return callable(handler)
