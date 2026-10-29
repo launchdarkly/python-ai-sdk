@@ -55,7 +55,7 @@ from .spans import (
 #: ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
 #: classification stays exhaustive as the SDK's own signatures change.
 #:
-#: This is the cross-SDK list for Claude Messages (TESTING.md section 1.12). A top-level
+#: This is the cross-SDK list for Claude Messages. A top-level
 #: ``effort`` is also accepted and moved into ``output_config.effort`` before this list applies
 #: (see :func:`_rename_effort_to_output_config`), ``output_config`` keeps only its ``effort`` (see
 #: :func:`_rebuild_output_config`), and ``max_tokens`` defaults to 1024. The same list

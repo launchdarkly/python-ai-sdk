@@ -85,7 +85,7 @@ _LANGCHAIN_RUNTIME_KEYS = frozenset(
 #: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
 #: stays exhaustive as the SDK's own pydantic model changes.
 #:
-#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatOpenAI.
 #: ``reasoning_effort`` and ``seed`` are marked not supported in TypeScript there: the JS
 #: ``ChatOpenAI`` takes them only as per-call options, while this handler sets them on the
 #: constructor, which has a field for each. ``reasoning_effort`` is the Chat Completions field and
@@ -131,7 +131,7 @@ _CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 #:   handler gets back. ``truncation``, ``context_management`` and ``use_previous_response_id``
 #:   also lean on server-side conversation state.
 #: * ``store``: data retention. It decides whether the request is kept on the server.
-#: * ``prompt_cache_key``: on the spec list, marked not supported in Python, because
+#: * ``prompt_cache_key``: on the cross-SDK list, marked not supported in Python, because
 #:   ``ChatOpenAI`` has no such constructor field (it takes it only per call). It is not in the set
 #:   below because ``ChatOpenAI`` does not accept it at all, which the drift test requires of every
 #:   listed key.
@@ -181,7 +181,7 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``TestChatAnthropicAcceptsExactlyTheseKeys`` in this
 #: package's tests asserts this classification stays exhaustive.
 #:
-#: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatAnthropic.
 #: ``max_tokens_to_sample`` is renamed to ``max_tokens`` before this list applies, and a
 #: ``max_tokens`` the config also set wins. ``stop`` is renamed to ``stop_sequences`` the same way, and
 #: a ``stop_sequences`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
@@ -304,7 +304,7 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: ``TestChatBedrockConverseAcceptsExactlyTheseKeys`` in this package's tests skips itself when it
 #: is not installed rather than asserting nothing.
 #:
-#: This is the cross-SDK list for LangChain ChatBedrockConverse (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatBedrockConverse.
 #: ``reasoning_effort``, ``stop`` and ``stop_sequences`` are marked not supported in TypeScript
 #: there: the JS ``ChatBedrockConverse`` takes stop sequences only as a per-call option and has no
 #: reasoning effort field, while this class has constructor fields for both. ``stop`` is renamed to

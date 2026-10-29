@@ -5,7 +5,7 @@ Shared filtering for ``model.parameters`` before it reaches a provider SDK call.
 sense across providers (``temperature``, ``top_p``, ``max_tokens``, ``tool_choice``, ...). No
 single provider SDK accepts all of them, and each handler package classifies every key its own
 provider entry point accepts into exactly one written-down list: forwarded (model and run settings
-only, the cross-SDK list for that handler in TESTING.md section 1.12), handler-owned (set by the
+only, the cross-SDK list for that handler), handler-owned (set by the
 call site itself), or excluded (accepted by the provider but never forwarded: credentials, endpoints
 and connection settings, raw request injection such as extra headers or ``model_kwargs``, remote
 tools, host-process settings, data location and retention, server-side state, identity and

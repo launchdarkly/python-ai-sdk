@@ -1,7 +1,4 @@
-"""Offline evaluation spans join the customer project on the existing exporter.
-
-Reference: TESTING.md §8.10.
-"""
+"""Offline evaluation spans join the customer project on the existing exporter."""
 
 from __future__ import annotations
 

@@ -15,5 +15,3 @@ This Tier 1 package provides the wildcard `("*", "messages")` handler.
   `ToolSpec.params`.
 - `ai.stream` must remain inside `async with`, including early consumer exit.
 - Do not add a provider-native client or enable duplicate runtime telemetry.
-
-`TESTING.md` §1.x and Appendix A.14 are authoritative.
