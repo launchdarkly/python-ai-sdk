@@ -50,7 +50,7 @@ MAX_STEPS = 10
 #: :func:`_renamed_parameters`. Every other key is dropped. The handler sets ``model``,
 #: ``messages``, ``tools`` and ``output_type`` itself, and runs the tool loop.
 #:
-#: This is the Vercel AI SDK list from TESTING.md section 1.12 as the Python ``ai`` library can
+#: This is the cross-SDK Vercel AI SDK list as the Python ``ai`` library can
 #: send it. ``stop_sequences`` is on the JS list but the Python library has no field for it.
 #: ``parallel_tool_calls``, ``max_tool_calls``, ``service_tier`` and ``prompt_cache_key`` are
 #: Python-only: the library takes them as typed request params, while the JS AI SDK can reach them
@@ -122,7 +122,7 @@ _TOOL_CHOICE_MODES = frozenset({"auto", "none", "required"})
 
 
 def _renamed_parameters(params: dict[str, Any]) -> dict[str, Any]:
-    """Applies the section 1.12 renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
+    """Applies the cross-SDK renames: ``max_output_tokens`` wins over ``max_completion_tokens``,
     which wins over ``max_tokens``, and an explicit ``reasoning`` wins over ``reasoning_effort``."""
     for alias in ("max_completion_tokens", "max_tokens"):
         value = params.pop(alias, None)
@@ -268,7 +268,7 @@ async def _call_tool(handler: Callable[..., Any], kwargs: dict[str, Any]) -> Any
 
 
 def _tool_executors(
-    cfg: AiConfigRep, handlers: dict[str, Any] | None
+    cfg: AiConfigRep, handlers: Mapping[str, Any] | None
 ) -> dict[str, Callable[..., Any]]:
     executors: dict[str, Callable[..., Any]] = {}
     for name in cfg.get("tools") or {}:
@@ -333,7 +333,7 @@ def _final_output(stream: Any) -> str:
     return json.dumps(output)
 
 
-def _tools(cfg: AiConfigRep, handlers: dict[str, Any] | None) -> list[Any]:
+def _tools(cfg: AiConfigRep, handlers: Mapping[str, Any] | None) -> list[Any]:
     result: list[Any] = []
     for name, definition in (cfg.get("tools") or {}).items():
         handler = (handlers or {}).get(name)
@@ -417,7 +417,7 @@ async def _run_conversation(
     user_input: str | None,
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None,
-    tool_handlers: dict[str, Any] | None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
     parent: Any,
     *,
     structured: bool,
@@ -541,7 +541,7 @@ def _create_vercel_messages_handler(
     async def invoke(
         cfg: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -594,7 +594,7 @@ def _create_vercel_messages_handler(
     async def stream(
         cfg: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:

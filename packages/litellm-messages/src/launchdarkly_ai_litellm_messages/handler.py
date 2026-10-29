@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from typing import Any
 
 from opentelemetry import trace
@@ -12,6 +12,7 @@ from opentelemetry.trace import StatusCode
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanUsage,
     _config,
@@ -46,7 +47,7 @@ def _json_schema(output_format: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-#: The cross-SDK list for LiteLLM Messages (TESTING.md section 1.12): the ``model.parameters``
+#: The cross-SDK list for LiteLLM Messages: the ``model.parameters``
 #: keys forwarded to ``litellm.acompletion``. Every other key is dropped. The handler sets
 #: ``model``, ``messages``, ``stream``, ``stream_options``, ``tools`` and ``response_format`` itself,
 #: and ``api_key`` (with ``api_base``) comes from the handler's options, never from the config.
@@ -205,7 +206,8 @@ def _build_messages(
 
 
 def _build_tools(
-    config_value: AiConfigRep, tool_handlers: dict[str, Any]
+    config_value: AiConfigRep,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -366,7 +368,7 @@ async def _invoke_tool(handler: Any, arguments: dict[str, Any]) -> Any:
 
 async def _execute_tools(
     calls: list[Any],
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
     parent: Any,
     ended: set[int],
     *,
@@ -455,7 +457,7 @@ def _create_litellm_messages_handler(
     async def call(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -567,7 +569,7 @@ def _create_litellm_messages_handler(
     def stream(
         config_value: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -595,7 +597,7 @@ async def _stream(
     completion: Completion,
     config_value: AiConfigRep,
     user_input: str | None,
-    handlers: dict[str, Any],
+    handlers: Mapping[str, Any],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None,
     *,

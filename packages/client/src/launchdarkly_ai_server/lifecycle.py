@@ -10,7 +10,7 @@ from typing import Any
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
 from .sdk_usage import flush_sdk_usage, report_usage, reset_sdk_usage
 from .shutdown_hooks import run_shutdown_hooks
-from .types import InitClientOptions, SDKOptions
+from .types import InitClientOptions, LDClientInterface, SDKOptions
 from .utils import model_stamps_from_meta
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
-_client: Any = None
+_client: LDClientInterface | None = None
 _tracer_provider: Any = None
 # True only when *this* SDK's call to trace.set_tracer_provider actually took
 # effect. "We built a provider" is not the same as "we own the global": the set
@@ -83,7 +83,8 @@ def effective_capture_content(override: bool | None) -> bool:
 
     An explicit ``True`` or ``False`` — from a convenience wrapper, then from
     the handler factory — wins. ``None`` reads the configured default, which
-    itself defaults to ``False``.
+    itself defaults to ``True``. An explicit ``False`` removes conversation
+    content everywhere, including on offline evaluation spans.
     """
     if override is not None:
         return override
@@ -96,7 +97,7 @@ def note_ai_invocation() -> None:
     _ai_invoked = True
 
 
-def get_client() -> Any:
+def get_client() -> LDClientInterface:
     """
     Returns the singleton LaunchDarkly client.
     Raises ``RuntimeError`` if ``init_client`` has not been called yet.
@@ -208,8 +209,8 @@ def _setup_telemetry(sdk_key: str, options: InitClientOptions | None = None) -> 
 
 async def init_client(
     options: InitClientOptions | None = None,
-    client: Any = None,
-) -> Any:
+    client: LDClientInterface | None = None,
+) -> LDClientInterface:
     """
     Initializes the singleton LaunchDarkly client.
 
@@ -278,7 +279,8 @@ async def init_client(
         except ImportError:
             raise RuntimeError(
                 "LaunchDarkly server SDK not installed. "
-                "Run `pip install launchdarkly-server-sdk` or pass a pre-initialized client."
+                'Run `pip install "launchdarkly-ai-server[ld]"` (installs launchdarkly-server-sdk) '
+                "or pass a pre-initialized client."
             ) from None
 
     # Initialize LD client — Config wraps the SDK key and URI overrides; LDClient takes a Config.
@@ -601,13 +603,12 @@ async def extract_variation(
     # The real ldclient.variation() expects an ldclient.Context, not a plain dict.
     # Convert when running against the real SDK; test mocks accept dicts directly.
     ld_context = to_ld_context(client, context)
-    # The reason is only read while an invocation hook is registered, so an app
-    # with none keeps calling variation() exactly as before (spec §9.6).
     from .invocation_hooks import has_invocation_hooks
 
     reason: Any = None
-    if has_invocation_hooks():
-        detail_result = client.variation_detail(config_key, ld_context, None)
+    variation_detail = getattr(client, "variation_detail", None)
+    if has_invocation_hooks() and variation_detail is not None:
+        detail_result = variation_detail(config_key, ld_context, None)
         detail = (
             await detail_result if inspect.isawaitable(detail_result) else detail_result
         )
@@ -627,7 +628,7 @@ async def extract_variation(
             f"Variation '{config_key}' returned None (flag may be disabled)."
         )
 
-    # Only an explicit ``_ldMeta.enabled`` counts as enabled (spec §3.10, as in JS and Go).
+    # Only an explicit ``_ldMeta.enabled`` counts as enabled (as in JS and Go).
     ld_meta = (raw.get("_ldMeta") or {}) if isinstance(raw, dict) else {}
     if not isinstance(ld_meta, dict) or not ld_meta.get("enabled"):
         raise RuntimeError(f"Variation '{config_key}' is disabled.")

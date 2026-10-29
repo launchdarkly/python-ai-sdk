@@ -11,10 +11,10 @@ All handler packages (`launchdarkly-ai-*`) depend on this package.
 ### Without telemetry
 
 ```bash
-pip install launchdarkly-ai-server
+pip install "launchdarkly-ai-server[ld]"
 ```
 
-`launchdarkly-server-sdk` is an optional dependency — include it for standard usage, or pass a pre-initialized client to `init_client(client=...)` if you bring your own.
+`launchdarkly-server-sdk` is an optional dependency, installed by the `[ld]` extra — include it for standard usage, or pass a pre-initialized client to `init_client(client=...)` if you bring your own.
 
 The SDK works fully without the OpenTelemetry packages — feature flags evaluate, handlers run, and LaunchDarkly AI events are tracked. Spans are created as no-ops. If you call `init_client()` without the OTel packages installed, the SDK logs a single warning and continues normally.
 
@@ -23,7 +23,7 @@ The SDK works fully without the OpenTelemetry packages — feature flags evaluat
 To export traces to the LaunchDarkly Observability dashboard (or any OTLP-compatible backend), install the `otel` extras group:
 
 ```bash
-pip install "launchdarkly-ai-server[otel]"
+pip install "launchdarkly-ai-server[ld,otel]"
 ```
 
 No code changes are required — `init_client()` detects the packages at runtime and sets up the tracer provider automatically.
@@ -46,15 +46,11 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 `init_client()` also sets the `launchdarkly.project_id` resource attribute to the resolved SDK key, not the project's ID.
 
-### Run an evaluation from code (experimental)
-
-> **Experimental.** Import Evaluations from Code from `launchdarkly_ai_server.experimental.evaluations`;
-> none of these names is exported from the package root. They may change in a minor release,
-> so review the changelog when you upgrade.
+### Run an evaluation from code
 
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
-Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span, so they are omitted unless capture is on.
+Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span. The built-in default sends them. Setting capture to false removes them, including on these evaluation spans. The `$ld:ai:offline-evals:*` events still carry no transcript.
 
 Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts only. A run passes only when the completed summary has no failed, error, or pending rows. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
@@ -63,7 +59,7 @@ import asyncio
 import sys
 
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server.experimental.evaluations import init_evaluations
+from launchdarkly_ai_server import init_evaluations
 
 
 async def main() -> int:
@@ -124,7 +120,7 @@ Pass `criteria` to `run()` to score every generated row. A `Judge` references an
 ```python
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server.experimental.evaluations import (
+from launchdarkly_ai_server import (
     DatasetRow, Judge, Scorer, init_evaluations,
 )
 
@@ -252,13 +248,14 @@ warning and ignored.
 
 ### Process-wide defaults
 
-`configure` sets behavior for the process. It does not initialize the LaunchDarkly client; call `init_client` for that. Handlers built without an explicit `capture_content` read this value when they run, so one startup call covers every handler. An explicit `True` or `False` on a handler factory or convenience wrapper overrides it. Call `configure` from process startup, not from request data. It can be replaced until the first AI invocation; after that only the same options are accepted. `shutdown()` restores the built-in default, which is off.
+`configure` sets behavior for the process. It does not initialize the LaunchDarkly client; call `init_client` for that. Handlers built without an explicit `capture_content` read this value when they run, so one startup call covers every handler. The built-in default is on: prompts, model output, tool payloads, and judge explanations are sent unless you turn capture off. An explicit `True` or `False` on a handler factory or convenience wrapper overrides it, and an explicit `False` removes that text everywhere, including on offline evaluation spans. Call `configure` from process startup, not from request data. It can be replaced until the first AI invocation; after that only the same options are accepted. `shutdown()` restores the built-in default, which is on.
 
 ```python
 from launchdarkly_ai_server import SDKOptions, configure, init_client, shutdown
 
 async def main():
-    configure(options=SDKOptions(capture_content=True))
+    # Capture is on unless you turn it off.
+    configure(options=SDKOptions(capture_content=False))
     await init_client({"sdkKey": "sdk-...", "serviceName": "my-service"})
     # create_*_handler() with no capture_content argument follows the default above.
     await shutdown()
@@ -271,7 +268,7 @@ async def main():
 Pass `tools` to `run()` as a list of `EvalTool`. Construct one to define a tool in code. Await `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
 
 ```python
-from launchdarkly_ai_server.experimental.evaluations import EvalTool, init_evaluations
+from launchdarkly_ai_server import EvalTool, init_evaluations
 
 
 def lookup_order(order_id: str) -> str:

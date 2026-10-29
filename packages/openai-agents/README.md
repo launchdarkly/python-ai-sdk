@@ -7,7 +7,7 @@ OpenAI handler for `launchdarkly-ai-server` using the **OpenAI Agents SDK** (`op
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-openai-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-openai-agents
 ```
 
 Set `OPENAI_API_KEY` in your environment (the OpenAI SDK reads it automatically).

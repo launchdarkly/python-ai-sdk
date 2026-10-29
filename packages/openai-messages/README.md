@@ -7,7 +7,7 @@ OpenAI handler for `launchdarkly-ai-server` using the **OpenAI Responses API** (
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-openai-messages
 ```
 
 Set `OPENAI_API_KEY` in your environment (the OpenAI SDK reads it automatically).

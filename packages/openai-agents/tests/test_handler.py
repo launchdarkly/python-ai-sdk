@@ -1,7 +1,7 @@
 """
 Tests for launchdarkly-ai-openai-agents handler.
 
-TELEMETRY-CONTRACT.md sections 1-9 for the span tree, and TESTING.md §1 for the generic handler
+TELEMETRY-CONTRACT.md sections 1-9 for the span tree, and the generic handler
 behaviours. Rewritten from the pre-span-work version: this handler drives the ``agents`` SDK's own
 ``Runner``, which owns the per-turn loop, so a test drives spans by calling the ``RunHooks``
 callbacks (``on_llm_start`` / ``on_llm_end`` / ``on_tool_start`` / ``on_tool_end``) the way the real
@@ -356,7 +356,7 @@ def _recording() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory
+# Factory
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +378,7 @@ class TestFactory:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -524,7 +524,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 / §1.4 Tool conversion and execution
+# Tool conversion and execution
 # ---------------------------------------------------------------------------
 
 
@@ -619,7 +619,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (pre-span-era; restored, not telemetry)
+# Tool execution loop (pre-span-era; restored, not telemetry)
 # ---------------------------------------------------------------------------
 
 
@@ -774,7 +774,9 @@ class TestSpanTree:
             )
         for span in rec.spans[1:]:
             assert [k for k in span.attributes if k.startswith("launchdarkly.")] == []
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
         assert all(
             "feature_flag" not in [n for n, _ in s.events] for s in rec.spans[1:]
         )
@@ -838,7 +840,7 @@ class TestRootSpanAttributes:
         }
         with ctx, _patched_agents(agents_mod):
             await create_openai_agents_handler()(CONFIG, "q", {}, vs)
-        assert rec.root.events == [
+        assert [event for event in rec.root.events if event[0] == "feature_flag"] == [
             (
                 "feature_flag",
                 {
@@ -991,13 +993,28 @@ class TestToolSpanAttributes:
 
 
 class TestContentCapture:
-    async def test_emits_no_content_at_all_by_default(self) -> None:
+    async def test_emits_content_by_default(self) -> None:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(
             run=_make_run([{"output": _text_output("answer")}])
         )
         with ctx, _patched_agents(agents_mod):
             await create_openai_agents_handler()(CONFIG, "my question", {}, {})
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(self) -> None:
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(
+            run=_make_run([{"output": _text_output("answer")}])
+        )
+        with ctx, _patched_agents(agents_mod):
+            await create_openai_agents_handler(capture_content=False)(
+                CONFIG, "my question", {}, {}
+            )
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [
@@ -1030,14 +1047,14 @@ class TestContentCapture:
             # Built before configure, with no capture flag. Vega's startup call
             # has to reach this handler when it later runs.
             handler = create_openai_agents_handler()
-            configure(options=SDKOptions(capture_content=True))
+            configure(options=SDKOptions(capture_content=False))
             ctx, rec = _recording()
             agents_mod = _fake_agents_module(
                 run=_make_run([{"output": _text_output("answer")}])
             )
             with ctx, _patched_agents(agents_mod):
                 await handler(CONFIG, "my question", {}, {})
-            assert "my question" in json.dumps(rec.root.attributes)
+            assert "my question" not in json.dumps(rec.root.attributes)
         finally:
             _reset_for_testing()
 
@@ -1184,7 +1201,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling (top-level, no partial usage)
+# Error handling (top-level, no partial usage)
 # ---------------------------------------------------------------------------
 
 
@@ -1287,7 +1304,7 @@ class TestCancellationEndsEverySpan:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1676,7 +1693,7 @@ class TestStreaming:
         assert len(ends) == 1
         assert ends[0]["messageId"] == starts[0]["messageId"]
 
-    async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
+    async def test_emits_content_by_default_on_the_streaming_path(self) -> None:
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "hi"))
@@ -1685,13 +1702,30 @@ class TestStreaming:
                 CONFIG, "q", {}, {}
             ):
                 pass
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self,
+    ) -> None:
+        turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "hi"))
+        with ctx, _patched_agents(agents_mod):
+            async for _ in await create_openai_agents_handler(
+                capture_content=False
+            ).stream(CONFIG, "q", {}, {}):
+                pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [n for n, _ in span.events if n.startswith("gen_ai.content")] == []
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format (_build_output_type)
+# Output format (_build_output_type)
 # ---------------------------------------------------------------------------
 
 
@@ -1878,12 +1912,12 @@ class TestOutputFormat:
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None prompt
+# None user_input must not produce None prompt
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the prompt passed to
+    """When user_input is None, the prompt passed to
     Runner.run must be '' (empty string), not None."""
 
     async def test_none_user_input_instructions_path_prompt_is_empty_string(

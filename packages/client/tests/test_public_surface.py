@@ -1,8 +1,8 @@
 """
 The package root's public surface.
 
-``ROOT_SURFACE`` is the checked-in snapshot of ``launchdarkly_ai_server.__all__``
-(TESTING.md §0.3). It is spelled out so that any change to the root, including
+``ROOT_SURFACE`` is the checked-in snapshot of ``launchdarkly_ai_server.__all__``.
+It is spelled out so that any change to the root, including
 an experimental name leaking onto it, fails here and is seen in review. Update
 it deliberately, in the same change that adds or removes a root export.
 """
@@ -40,6 +40,7 @@ ROOT_SURFACE = frozenset(
         "ParseFailure",
         "ParseResult",
         "ParseSuccess",
+        "NativeGraphRunner",
         "ProviderGraphResponse",
         "ProviderHandler",
         "ProviderResponse",
@@ -144,6 +145,21 @@ ROOT_SURFACE = frozenset(
         "SKILL_FILENAME",
         "MANIFEST_FILENAME",
         "MANIFEST_VERSION",
+        # Evaluations from Code
+        "init_evaluations",
+        "EvaluationsModule",
+        "AIConfig",
+        "GenerationConfig",
+        "GenerationMode",
+        "GenerationOverrides",
+        "DatasetRow",
+        "EvalTool",
+        "Criterion",
+        "Judge",
+        "Scorer",
+        "EvalRunResult",
+        "RunSummary",
+        "EvaluationsError",
     }
 )
 

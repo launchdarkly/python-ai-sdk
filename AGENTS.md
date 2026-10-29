@@ -86,13 +86,11 @@ Every public module has a committed API report at `packages/<package>/api-report
 
 PRs are squash-merged with the PR title as the commit message, and release-please builds each package's changelog from those messages.
 
-- **A change to an experimental feature uses that feature's scope:** `evaluations` (Evaluations from Code). `feat`, `fix` and `perf` commits with that scope are listed under **Experimental** (`changelog-sections` in `release-please-config.json`), for example `feat(evaluations): score rows in parallel`. Any other scope, such as `client` or `skills`, lists the change as a core feature or fix. Agent Skills is core, so `feat(skills):` lands under Features.
-- **Use exactly one scope.** `feat(evaluations,client):` matches no Experimental row, so it lands under Features.
+- **A change to an experimental feature uses that feature's scope.** `feat`, `fix` and `perf` commits with that scope are listed under **Experimental** (`changelog-sections` in `release-please-config.json`). No feature is experimental now. Any other scope, such as `client`, `skills` or `evaluations`, lists the change as a core feature or fix. Agent Skills and Evaluations from Code are core, so `feat(skills):` and `feat(evaluations):` land under Features.
+- **Use exactly one scope.** `feat(beta,client):` matches no Experimental row, so it lands under Features.
 - **A PR that changes both core and experimental behaviour** should be split. If it can't be, add a `BEGIN_COMMIT_OVERRIDE` block to its description with one conventional-commit line per change. An override also corrects a merged PR's title, as long as the release PR hasn't merged yet.
-- **A breaking experimental change** uses `!` while the package is 0.x: `feat(evaluations)!:` bumps the minor version, which is what an experimental break is allowed. After 1.0, `!` would force a major release. Use `feat(evaluations):` without `!` instead, and say the change is breaking in the title.
+- **A breaking experimental change** uses `!` while the package is 0.x: `feat(beta)!:` bumps the minor version, which is what an experimental break is allowed. After 1.0, `!` would force a major release. Use `feat(beta):` without `!` instead, and say the change is breaking in the title.
 - **When a feature is promoted to core,** remove its rows from `changelog-sections`.
-
-The rule is specified in `TESTING.md` §0.3 in `launchdarkly/ai-sdks-monorepo`.
 
 ## Package Hierarchy
 
@@ -156,7 +154,7 @@ The client manages a singleton connection to LaunchDarkly and the associated tel
 |---|---|
 | `init_client(options?)` | Auto-discovers and initializes `launchdarkly-server-sdk` (optional dep, loaded via `importlib`). Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Accepts optional overrides for SDK key, base URIs, service name, environment, and OTLP endpoint. Returns `Awaitable[LDClientInterface]`. On every successful path, including the already-initialized path, flushes `$ld:ai:sdk:info` for any LaunchDarkly AI packages that have not yet reported. Does not take behavior defaults. |
 | `init_client(client=...)` | **BYOC overload** — accepts a pre-initialized `LDClientInterface`. Stores it directly without calling the SDK. Flushes pending `$ld:ai:sdk:info` events. |
-| `configure(*, options)` | Sets process-wide behavior defaults on the lifecycle singleton. `options` is a frozen `SDKOptions` (`capture_content: bool = False`). Keyword-only. Handlers read it at invocation. An explicit factory or wrapper `capture_content` overrides it. Replaceable until the first AI invocation; an identical value is allowed after. Not read from request data. |
+| `configure(*, options)` | Sets process-wide behavior defaults on the lifecycle singleton. `options` is a frozen `SDKOptions` (`capture_content: bool = True`). Keyword-only. Handlers read it at invocation. An explicit factory or wrapper `capture_content` overrides it, and an explicit `False` strips content everywhere, including offline evaluation spans. Replaceable until the first AI invocation; an identical value is allowed after. Not read from request data. |
 | `get_client()` | Returns the initialized `LDClientInterface`. Throws if initialization has not completed. |
 | `shutdown()` | Flushes all pending events and telemetry, then closes the client. Must be awaited before the process exits. Clears sdk-info reporting so a later client reports again. Restores the built-in SDK defaults. |
 | `register_ai_sdk_package(name, version)` | Records a LaunchDarkly AI package identity. Handler and convenience packages call this at import time. |
@@ -571,14 +569,15 @@ beside the input count, so its handlers add it in. OpenAI and LangChain already 
 input, so theirs pass the figure through. Centralising that rule would double-count for two
 providers out of three. `SpanUsage` is the type that means the folding is already done.
 
-#### Content is off by default
+#### Content is on by default
 
 Every factory takes `capture_content: bool | None = None`. `None` reads `configure()` at
-invocation, which is off until a process sets `SDKOptions(capture_content=True)`. An explicit
-`True` or `False` overrides that default. Guard at the call site as well as inside the helper: the
-helper's guard makes a forgotten call site harmless, and the call site's guard avoids serialising
-JSON that would then be discarded, once per turn, in a loop. Resolve the bool when the handler
-runs, not when it is constructed.
+invocation. The built-in default is on until a process sets `SDKOptions(capture_content=False)`.
+An explicit `True` or `False` overrides that default, and an explicit `False` strips content
+everywhere, including offline evaluation spans. Guard at the call site as well as inside the
+helper: the helper's guard makes a forgotten call site harmless, and the call site's guard avoids
+serialising JSON that would then be discarded, once per turn, in a loop. Resolve the bool when the
+handler runs, not when it is constructed.
 
 #### Finish reasons have three mechanisms, not one
 

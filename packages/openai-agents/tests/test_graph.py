@@ -1,6 +1,5 @@
 """
-Tests for §2.1 graph convenience wrapper (openai_graph) and §2.x.4 full coverage.
-Reference: TESTING.md §2.1, §2.x.4
+Tests for the graph convenience wrapper (openai_graph), with full coverage.
 """
 
 from unittest.mock import MagicMock, patch

@@ -7,7 +7,7 @@ Anthropic Claude handler for `launchdarkly-ai-server` using the **Claude Agent S
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-claude-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-claude-agents
 ```
 
 Set `ANTHROPIC_API_KEY` in your environment (the Anthropic SDK reads it automatically).
@@ -40,7 +40,7 @@ asyncio.run(main())
 
 | Option | Default | Description |
 |---|---|---|
-| `capture_content` | `None` | Put prompts, model output, and tool arguments and results on the emitted spans. `None` follows `configure()`, which is off by default. |
+| `capture_content` | `None` | Put prompts, model output, and tool arguments and results on the emitted spans. `None` follows `configure()`, which is on by default. An explicit `False` leaves them off. |
 | `cwd` | the process's working directory | Working directory for the Claude Code process the Agent SDK starts. A `str` or path-like. |
 | `setting_sources` | `[]` (none) | Which Claude Code settings sources to load: `"user"` (`~/.claude/settings.json`), `"project"` (`.claude/settings.json`, and `CLAUDE.md`), `"local"` (`.claude/settings.local.json`). |
 
@@ -73,6 +73,15 @@ to_claude_agents(
     {"context": context, "setting_sources": ["user"]},
 )
 ```
+
+### Output limit and thinking
+
+- `max_tokens` in the config's model parameters sets the output-token limit for each model request. The Agent SDK has no option for it, so the handler sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the environment of the Claude Code process. Without `max_tokens`, Claude Code uses its own default. A `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in the `env` of a Claude Code settings file, including `~/.claude.json`, wins over `max_tokens`.
+- Thinking is off unless the config sets `thinking` or `max_thinking_tokens`. Models that reject disabled thinking, such as `claude-fable-5`, still use their own default. Claude Code lowers a thinking budget to one less than `max_tokens`, so when a config sets both, keep `max_tokens` above the budget.
+
+#### Migrating from a version that used Claude Code's thinking default
+
+Earlier versions passed no thinking setting when the config had none, so Claude Code chose one: adaptive thinking on models that support it, and a 31,999-token budget on others such as `claude-haiku-4-5`. A run now thinks only when its config asks. To keep thinking, set it in the config's model parameters, for example `{"thinking": {"type": "adaptive"}}`.
 
 ### Convenience wrapper
 

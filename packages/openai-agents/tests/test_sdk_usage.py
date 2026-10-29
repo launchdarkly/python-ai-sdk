@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.27 — openai-agents."""
+"""Tests for SDK helper usage events — openai-agents."""
 
 from types import SimpleNamespace
 from typing import Any

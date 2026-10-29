@@ -7,7 +7,7 @@ and model, while preserving already-qualified Gateway ids.
 ## Install
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-vercel-messages
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-vercel-messages
 ```
 
 Default routing is AI Gateway: for example, `xAI` + `grok-4.5` becomes
