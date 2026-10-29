@@ -52,7 +52,6 @@ EXTRA_IMPORTS = {
     ("launchdarkly-ai-python", "otel"): _OTEL,
     ("launchdarkly-ai-langchain-agents", "anthropic"): ["langchain_anthropic"],
     ("launchdarkly-ai-langchain-agents", "aws"): ["langchain_aws"],
-    ("launchdarkly-ai-langchain-messages", "openai"): ["langchain_openai"],
     ("launchdarkly-ai-langchain-messages", "anthropic"): ["langchain_anthropic"],
     ("launchdarkly-ai-langchain-messages", "aws"): ["langchain_aws"],
 }
@@ -79,13 +78,31 @@ for name in sys.argv[1:]:
 
 # Prints which installed distributions provide each module, so the caller can compare
 # them with what the package declares. ``null`` means the module is not installed.
+# A dotted name resolves to the distribution that owns its file, so a namespace package
+# (``opentelemetry.sdk``) maps to ``opentelemetry-sdk``, not to every ``opentelemetry-*``.
 PROVIDERS = """
 import importlib.metadata, importlib.util, json, sys
-dists = importlib.metadata.packages_distributions()
-print(json.dumps({
-    name: dists.get(name, []) if importlib.util.find_spec(name) else None
-    for name in sys.argv[1:]
-}))
+owners = {}
+for dist in importlib.metadata.distributions():
+    for file in dist.files or []:
+        owners[str(dist.locate_file(file).resolve())] = dist.metadata["Name"]
+top_level = importlib.metadata.packages_distributions()
+
+def providers(name):
+    try:
+        spec = importlib.util.find_spec(name)
+    except ImportError:
+        return None
+    if spec is None:
+        return None
+    if spec.origin and spec.has_location:
+        from pathlib import Path
+        owner = owners.get(str(Path(spec.origin).resolve()))
+        if owner:
+            return [owner]
+    return top_level.get(name.split(".")[0], [])
+
+print(json.dumps({name: providers(name) for name in sys.argv[1:]}))
 """
 
 
@@ -113,7 +130,7 @@ class Package:
     public: list[str]
     """Modules whose ``__all__`` is the public contract."""
     imports: list[str]
-    """Top-level modules the source imports unconditionally."""
+    """Modules, by full dotted name, that the source imports unconditionally."""
     dependencies: list[str] = field(default_factory=list)
     optional: dict[str, list[str]] = field(default_factory=dict)
     """``[project.optional-dependencies]``: extra name to its requirements."""
@@ -200,7 +217,7 @@ class _Imports(ast.NodeVisitor):
 
     def _add(self, module: str) -> None:
         if not self._optional:
-            self.found.add(module.split(".")[0])
+            self.found.add(module)
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -229,7 +246,8 @@ def source_imports(src: Path) -> list[str]:
     visitor = _Imports()
     for path in src.rglob("*.py"):
         visitor.visit(ast.parse(path.read_text(), str(path)))
-    return sorted(visitor.found - set(sys.stdlib_module_names) - {"__future__"})
+    skip = set(sys.stdlib_module_names) | {"__future__"}
+    return sorted(m for m in visitor.found if m.split(".")[0] not in skip)
 
 
 def packages() -> list[Package]:

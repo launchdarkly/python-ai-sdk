@@ -12,10 +12,9 @@ pip install launchdarkly-ai-server launchdarkly-ai-langchain-messages
 
 The default model is `ChatOpenAI`, so set `OPENAI_API_KEY` unless you pass a custom `BaseChatModel`.
 
-Install the extra for each provider your AI configs use:
+`langchain-openai` is a dependency, so the default model works with the install above. For AI configs whose provider is Anthropic or Bedrock, install the matching extra:
 
 ```bash
-pip install "launchdarkly-ai-langchain-messages[openai]"     # langchain-openai (the default model)
 pip install "launchdarkly-ai-langchain-messages[anthropic]"  # langchain-anthropic
 pip install "launchdarkly-ai-langchain-messages[aws]"        # langchain-aws (Bedrock)
 ```

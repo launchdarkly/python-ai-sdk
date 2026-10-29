@@ -1,4 +1,4 @@
-"""Tests the import scan in scripts/check_packaging.py (TESTING.md §5.3).
+"""Tests the import scan and run planning in scripts/check_packaging.py.
 
 The install half needs built wheels and PyPI, so CI runs it as ``make check-packaging``.
 """
@@ -27,7 +27,7 @@ def test_reads_module_level_and_lazy_imports(tmp_path: Path) -> None:
             import importlib
             return importlib.import_module("pkg_c.models")
     """
-    assert _scan(tmp_path, source) == ["pkg_a", "pkg_b", "pkg_c"]
+    assert _scan(tmp_path, source) == ["pkg_a", "pkg_b.sub", "pkg_c.models"]
 
 
 def test_an_import_guarded_by_import_error_is_optional(tmp_path: Path) -> None:
@@ -112,6 +112,18 @@ def test_an_undeclared_dynamic_import_fails(tmp_path: Path) -> None:
     providers = {"langchain_anthropic": ["langchain-anthropic"]}
     assert check_packaging.undeclared_imports(providers, package.declared()) == [
         "langchain_anthropic (from langchain-anthropic, not declared)"
+    ]
+
+
+def test_a_namespace_package_needs_its_own_distribution_declared() -> None:
+    # opentelemetry-api is declared; opentelemetry.sdk comes from opentelemetry-sdk.
+    declared = {"launchdarkly-ai-example", "opentelemetry-api"}
+    providers: dict[str, list[str] | None] = {
+        "opentelemetry.trace": ["opentelemetry-api"],
+        "opentelemetry.sdk.trace": ["opentelemetry-sdk"],
+    }
+    assert check_packaging.undeclared_imports(providers, declared) == [
+        "opentelemetry.sdk.trace (from opentelemetry-sdk, not declared)"
     ]
 
 

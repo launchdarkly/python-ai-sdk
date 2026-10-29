@@ -657,13 +657,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
                 renames=_CHAT_BEDROCK_CONVERSE_RENAMES,
             )
         )
-    try:
-        lc_openai = importlib.import_module("langchain_openai")
-    except ImportError as exc:
-        raise ImportError(
-            "Using OpenAI models requires langchain-openai. "
-            'Install it with: pip install "launchdarkly-ai-langchain-messages[openai]"'
-        ) from exc
+    lc_openai = importlib.import_module("langchain_openai")
     return lc_openai.ChatOpenAI(
         **_model_constructor_kwargs(
             config,
