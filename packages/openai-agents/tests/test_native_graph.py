@@ -1177,6 +1177,7 @@ class TestNativeGraphRunsANodeWithAToolOnTheRealSdk:
         from agents import FunctionTool, ModelResponse, Usage
         from agents.models.interface import Model
         from agents.models.multi_provider import MultiProvider
+        from agents.tracing import get_trace_provider
         from openai.types.responses import (
             ResponseFunctionToolCall,
             ResponseOutputMessage,
@@ -1254,7 +1255,13 @@ class TestNativeGraphRunsANodeWithAToolOnTheRealSdk:
                 "is_terminal": True,
             }
         }
-        with patch.object(MultiProvider, "get_model", return_value=_FakeModel()):
+        # Never export this run's trace to OpenAI, whatever OPENAI_API_KEY is set. The
+        # exporter sends in the background, so only stopping the trace itself is enough.
+        # `set_tracing_disabled` has no undo; patching its flag restores the exact prior state.
+        with (
+            patch.object(get_trace_provider(), "_manual_disabled", True),
+            patch.object(MultiProvider, "get_model", return_value=_FakeModel()),
+        ):
             result = await to_openai_agents(
                 _make_def_promise(_make_graph_def(nodes=nodes)),
                 {"tool_handlers": {"lookup": lookup}},
