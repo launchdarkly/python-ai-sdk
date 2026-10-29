@@ -23,7 +23,7 @@ The SDK works fully without the OpenTelemetry packages — feature flags evaluat
 To export traces to the LaunchDarkly Observability dashboard (or any OTLP-compatible backend), install the `otel` extras group:
 
 ```bash
-pip install "launchdarkly-ai-server[otel]"
+pip install "launchdarkly-ai-server[ld,otel]"
 ```
 
 No code changes are required — `init_client()` detects the packages at runtime and sets up the tracer provider automatically.

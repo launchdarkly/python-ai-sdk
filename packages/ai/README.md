@@ -5,7 +5,7 @@ Convenience barrel package for the LaunchDarkly AI Python SDK. Re-exports the co
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-python launchdarkly-ai-openai-messages
+pip install "launchdarkly-ai-python[ld]" launchdarkly-ai-openai-messages
 ```
 
 To enable trace export to the LaunchDarkly Observability dashboard, install the `otel` extras group:

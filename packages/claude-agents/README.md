@@ -7,7 +7,7 @@ Anthropic Claude handler for `launchdarkly-ai-server` using the **Claude Agent S
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-claude-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-claude-agents
 ```
 
 Set `ANTHROPIC_API_KEY` in your environment (the Anthropic SDK reads it automatically).

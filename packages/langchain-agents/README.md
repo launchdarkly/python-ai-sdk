@@ -7,7 +7,7 @@ LangChain handler for `launchdarkly-ai-server` using **LangGraph's `StateGraph`*
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-langchain-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-langchain-agents
 ```
 
 The default model is `ChatOpenAI`, so set `OPENAI_API_KEY` unless you pass a custom `BaseChatModel`.

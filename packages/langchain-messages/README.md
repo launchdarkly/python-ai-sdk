@@ -7,7 +7,7 @@ LangChain handler for `launchdarkly-ai-server` using **LangChain chat models** (
 ## Installation
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-ai-langchain-messages
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-langchain-messages
 ```
 
 The default model is `ChatOpenAI`, so set `OPENAI_API_KEY` unless you pass a custom `BaseChatModel`.
