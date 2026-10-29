@@ -1452,21 +1452,23 @@ class TestNativeHandoffRealStateGraph:
 
         factory, models = _scripted_models(
             {
-                "router": [_tool_call_msg(("transfer_to_butler", "call_1"))],
-                "butler": [AIMessage(content="the butler did it")],
+                "router": [_tool_call_msg(("transfer_to_manor_butler", "call_1"))],
+                "manor.butler": [AIMessage(content="the butler did it")],
                 "cook": [],
             }
         )
         result, tracked = await _run_handoff(
-            _handoff_graph_def(["butler", "cook"]), factory
+            _handoff_graph_def(["manor.butler", "cook"]), factory
         )
 
         assert result["response"] == "the butler did it"
         assert models["router"].ainvoke.call_count == 1  # not re-run after the hand-off
         assert models["cook"].ainvoke.call_count == 0
-        [answer] = _tool_messages(models["butler"])
+        [answer] = _tool_messages(models["manor.butler"])
         assert answer.tool_call_id == "call_1"
-        assert answer.content == "Handed off to butler."
+        # The text uses the raw target key; the tool name uses the sanitized one.
+        assert answer.content == "Handed off to manor.butler."
+        assert answer.name == "transfer_to_manor_butler"
         assert tracked.count("$ld:ai:graph:handoff_success") == 1
 
     @pytest.mark.asyncio
@@ -1483,8 +1485,7 @@ class TestNativeHandoffRealStateGraph:
         )
         await _run_handoff(_handoff_graph_def(["butler", "cook"]), factory)
 
-        _args, kwargs = models["router"].bind_tools.call_args
-        assert "parallel_tool_calls" not in kwargs
+        assert models["router"].bind_tools.call_args.kwargs == {}
 
     @pytest.mark.asyncio
     async def test_normal_tool_and_handoff_in_one_message_both_run(self) -> None:
