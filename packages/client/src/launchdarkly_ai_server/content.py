@@ -7,9 +7,9 @@ span-event recording API, and LaunchDarkly's ingest does not normalise content e
 canonical shape, so a ``gen_ai.content.prompt`` event, which is what these handlers emitted
 before, is read by nothing on the LaunchDarkly side.
 
-**Off by default.** Everything here is conversation content, which is PII. Handlers resolve
+**On by default.** Everything here is conversation content, which is PII. Handlers resolve
 ``capture_content`` to a bool before calling in: an explicit ``True`` or ``False``, otherwise the
-process default from ``configure``, otherwise off. Every function below takes that decision as its
+process default from ``configure``, which is on. Every function below takes that decision as its
 ``capture`` argument and returns without writing when it is false. Passing the flag rather than
 reading ambient state keeps the gate visible at each call site.
 

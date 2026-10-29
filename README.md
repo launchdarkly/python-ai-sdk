@@ -548,20 +548,23 @@ This matters most on Anthropic, which reports cache reads and writes beside the 
 than inside it. A turn that reads 19,971 tokens from cache and writes 3,580 more reports an input of
 3 from the provider; the span reports 23,554.
 
-### Conversation content is off by default
+### Conversation content is on by default
 
-Prompts, model output, tool arguments and tool results are personal data, so a span carries only
-metadata unless you ask for more: models, token counts, timings, tool names.
+Prompts, model output, tool arguments and tool results are personal data. The built-in default
+sends that text. A span carries only metadata — models, token counts, timings, tool names — when
+capture is turned off.
 
-Pass `capture_content=True` to a handler factory to include the conversation, or turn it on for every handler from process startup. See [Process-wide defaults](packages/client/README.md#process-wide-defaults).
+Pass `capture_content=False` to a handler factory to leave the conversation off that handler, or
+turn it off for every handler from process startup. An explicit `False` wins everywhere, including
+on offline evaluation spans. See [Process-wide defaults](packages/client/README.md#process-wide-defaults).
 
 ```python
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
-handler = create_claude_messages_handler(capture_content=True)
+handler = create_claude_messages_handler(capture_content=False)
 ```
 
-Turning this on sends the text of every request and response to whatever collector the SDK points
+Leaving this on sends the text of every request and response to whatever collector the SDK points
 at.
 
 ### Streaming

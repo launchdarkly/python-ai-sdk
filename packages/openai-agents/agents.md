@@ -2,7 +2,7 @@
 
 > **Span shape.** This package emits `invoke_agent` → `chat {model}` → `execute_tool {name}`, with
 > tool spans as siblings of `chat`. Span construction lives in `spans.py` beside the handler.
-> Conversation content is off unless the caller passes `capture_content=True`, or the process sets it. See [Process-wide defaults](../client/README.md#process-wide-defaults).
+> Conversation content is on unless the caller passes `capture_content=False`, or the process turns it off. See [Process-wide defaults](../client/README.md#process-wide-defaults).
 > `TELEMETRY-CONTRACT.md` at the repo root is the authority; read it before changing span code.
 
 

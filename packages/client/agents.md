@@ -39,7 +39,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/utils.py` | `parse_template`, `parse_json_with_possible_fences`, `create_handler`, `parse_usage`, `make_track_data`, `to_ld_context` |
 | `src/launchdarkly_ai_server/registry.py` | `Registry`, `global_registry`, `compose`, `resolve_handlers`, `resolve_tools` |
 | `src/launchdarkly_ai_server/judges.py` | `run_judges`, `build_judge_tasks`, `run_judge` |
-| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and `EvaluationsModule.run()` orchestration. Experimental: public names are exported only from `experimental/evaluations.py`, never from the package root |
+| `src/launchdarkly_ai_server/evaluations/` | `init_evaluations`, the private management API operations, and `EvaluationsModule.run()` orchestration. Public names are exported from the package root |
 | `src/launchdarkly_ai_server/__init__.py` | Public barrel — the only surface handler packages import from |
 
 ---
@@ -78,7 +78,13 @@ from launchdarkly_ai_server import execute_and_track, execute_and_stream, wrap_t
 
 # Entry points
 from launchdarkly_ai_server import config, graph, resolve_graph
-from launchdarkly_ai_server.experimental.evaluations import init_evaluations
+
+# Evaluations from Code
+from launchdarkly_ai_server import (
+    init_evaluations, EvaluationsModule, AIConfig, GenerationConfig, GenerationMode,
+    GenerationOverrides, DatasetRow, EvalTool, Criterion, Judge, Scorer,
+    EvalRunResult, RunSummary, EvaluationsError,
+)
 
 # Agent Skills
 from launchdarkly_ai_server import (
@@ -91,12 +97,13 @@ from launchdarkly_ai_server import (
 )
 ```
 
-An experimental feature (today only Evaluations from Code) is exported only from its module
-under `launchdarkly_ai_server.experimental`, and its names may change in a minor release. No
-core public type, function or `init_client` option may name it. Agent Skills is core and is
-exported from the package root; `shutdown` still reaches its state only through an internal
-hook (it clears the skill store), and an error there is logged, never raised into
-`shutdown`.
+An experimental feature is exported only from its module under
+`launchdarkly_ai_server.experimental`, and its names may change in a minor release. No feature
+is experimental now. No core public type, function or `init_client` option may name an
+experimental feature. Agent Skills and Evaluations from Code are core and are exported from
+the package root. `lifecycle` imports no Evaluations from Code module. For Agent Skills,
+`shutdown` still reaches its state only through an internal hook (it clears the skill store),
+and an error there is logged, never raised into `shutdown`.
 
 `MAX_SKILL_CONTENT_BYTES` and `SKILL_OBJECT_KIND` are deliberately **not** exported; both stay
 internal to `skills_core`:
@@ -163,7 +170,7 @@ Handlers may return any of these — the client normalizes them before emitting 
 
 ## SDK-run evaluations
 
-Evaluations from Code is experimental. Its public names are exported from `launchdarkly_ai_server.experimental.evaluations` and pinned by `TestPackageExports` in `tests/test_evaluations.py`; none may be added to the package root. `init_evaluations` reports the helper `experimental.initEvaluations`.
+Evaluations from Code is core. Its public names are exported from the package root and pinned by `TestPackageExports` in `tests/test_evaluations.py` and by `tests/test_public_surface.py`. `init_evaluations` reports the helper `client.initEvaluations`.
 
 `init_evaluations()` creates an evaluations harness using `LD_API_TOKEN` and the management API host (`api_base_uri`, then `LD_API_BASE_URI`; a blank value at either level counts as unset). Do not reuse `LD_BASE_URI`, or name the option `base_uri`: that host configures SDK delivery and may point at a relay proxy. Evaluation-run links use the separate `ui_base_uri` option, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; do not derive their host from `LD_API_BASE_URI`. An event transport is resolved in `init_evaluations()`, which raises before any network I/O when it finds neither an SDK key (`sdk_key` or `LD_SDK_KEY`) nor an already-initialized event-capable client: generation events are the only ingest path for row results, so a run without a transport could never complete. The lifecycle module's bring-your-own-client path (`init_client(client=...)`) therefore satisfies the check on its own, and `run()` reuses that singleton through `_resolve_client`; `run()` raises if the client disappears before it emits. Both polling arguments reject NaN, which would otherwise never compare past a deadline and hang the run. The harness always queues one `$ld:ai:offline-evals:generation` custom event per row through the standard SDK event transport and flushes before returning. No feature flag gates event emission. The harness polls the run summary endpoint until a nonzero `total_rows` has `pending_rows == 0` and `passed + failed + error` rows accounting for the total, polling every `poll_interval_seconds` (default 2s) until `poll_timeout_seconds` (default 180s); both are `run()` arguments so large datasets can widen them. The summary endpoint does not return run state, so `RunSummary` exposes row counts only.
 
@@ -853,6 +860,7 @@ pip install "launchdarkly-ai-python[otel]"
 **Other env vars / options read by `init_client()`:**
 - `LD_SERVICE_NAME` / `options["serviceName"]` — sets `service.name` resource attribute (default: `'python-sdk'`)
 - `LD_ENVIRONMENT` / `options["environment"]` — sets `deployment.environment` resource attribute
+- Not configurable: the `launchdarkly.project_id` resource attribute is always set to the resolved SDK key, not the project's ID
 
 **Graceful degradation:** if any OTel package is missing, telemetry is silently skipped and a `logger.warning` is emitted. The LD client still initializes and all AI API calls work normally.
 
@@ -902,7 +910,7 @@ When `enabled` is `False`, `config` is always `None`. When `enabled` is `True` b
 
 ## Lifecycle Invariants
 
-- **Process defaults.** `configure(options=SDKOptions(capture_content=True))` sets behavior defaults for the process. Call it once at startup, not from request data, and not via `init_client`. Handlers omit `capture_content` to follow it. `shutdown()` restores the built-in defaults.
+- **Process defaults.** The built-in `capture_content` default is on. `configure(options=SDKOptions(capture_content=False))` turns it off for the process. Call `configure` once at startup, not from request data, and not via `init_client`. Handlers omit `capture_content` to follow it. An explicit `False` strips content everywhere, including offline evaluation spans. `shutdown()` restores the built-in default, which is on.
 - **Lazy initialization.** Importing the package does not initialize the LD client. The first API call that needs LaunchDarkly calls `init_client()` internally when `LD_SDK_KEY` is set.
 - **Explicit initialization — SDK path.** `await init_client(options?)` dynamically imports `launchdarkly-server-sdk` at runtime (optional peer dep). If the package is not installed it raises with a clear message.
 - **Explicit initialization — BYOC path.** `await init_client(client)` accepts any pre-initialized object that satisfies `LDClientInterface` — this is the path for custom or edge environments whose SDK has different init semantics.

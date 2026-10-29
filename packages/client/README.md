@@ -44,15 +44,13 @@ No code changes are required — `init_client()` detects the packages at runtime
 | `LD_API_BASE_URI` | No | Evaluations management API host override; intentionally separate from `LD_BASE_URI` |
 | `LD_UI_BASE_URI` | No | LaunchDarkly application host for evaluation-run links (default: `https://app.launchdarkly.com`). Set it for a non-production project, or its runs still link to the production app |
 
-### Run an evaluation from code (experimental)
+`init_client()` also sets the `launchdarkly.project_id` resource attribute to the resolved SDK key, not the project's ID.
 
-> **Experimental.** Import Evaluations from Code from `launchdarkly_ai_server.experimental.evaluations`;
-> none of these names is exported from the package root. They may change in a minor release,
-> so review the changelog when you upgrade.
+### Run an evaluation from code
 
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
-Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span, so they are omitted unless capture is on.
+Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span. The built-in default sends them. Setting capture to false removes them, including on these evaluation spans. The `$ld:ai:offline-evals:*` events still carry no transcript.
 
 Management API requests go to the `api_base_uri` option, then `LD_API_BASE_URI`, then `https://app.launchdarkly.com`; `LD_BASE_URI` is never used, because it may point at a relay proxy. Result links use `ui_base_uri`, then `LD_UI_BASE_URI`, then `https://app.launchdarkly.com`; this is independent of `LD_API_BASE_URI`. At either level a blank value counts as unset, and a trailing `/` is stripped. After flushing generation events, the harness polls the run summary endpoint until passed + failed + error rows fully account for a nonzero total with no pending rows, polling every `poll_interval_seconds` (default 2s) up to `poll_timeout_seconds` (default 180s); pass either to `run()` to widen both for large datasets. The summary endpoint does not return run state, so `RunSummary` exposes row counts only. A run passes only when the completed summary has no failed, error, or pending rows. `failed_rows` counts rows whose criteria were scored and did not meet their threshold, so a gate that ignored it would exit 0 on a run where every row failed its judge. Evaluation keys must be unique because every call creates a new evaluation with `POST`.
 
@@ -61,7 +59,7 @@ import asyncio
 import sys
 
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server.experimental.evaluations import init_evaluations
+from launchdarkly_ai_server import init_evaluations
 
 
 async def main() -> int:
@@ -122,7 +120,7 @@ Pass `criteria` to `run()` to score every generated row. A `Judge` references an
 ```python
 from launchdarkly_ai_claude_messages import create_claude_messages_handler
 from launchdarkly_ai_openai_messages import create_openai_messages_handler
-from launchdarkly_ai_server.experimental.evaluations import (
+from launchdarkly_ai_server import (
     DatasetRow, Judge, Scorer, init_evaluations,
 )
 
@@ -196,7 +194,7 @@ A tool result is now judge-prompt input. It stays literal for the same reason th
 
 **Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`. Each judge selects its handler from `handler` or `handlers` by its provider and mode, with the same rule as generation. There is no mode fallback: a messages-mode judge never runs on an agent handler. A judge's prompt must also match its handler's mode. Judges get no tools: the harness passes an empty tool map and removes `tools` from the judge config.
 
-Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge, a judge that no handler covers, or a judge whose prompt does not match its handler fails the run up front rather than after the generation spend. One error lists every judge with a problem. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, a raising handler or scorer, and a row whose generation errored each become a per-criterion `ERROR` event with a cause code (`invalid_judge_output`, `invalid_score`, `handler_raised`, `scorer_raised`, `generation_incomplete`) and a top-level `errorMessage`. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
+Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge, a judge that no handler covers, or a judge whose prompt does not match its handler fails the run up front rather than after the generation spend. One error lists every judge with a problem. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, and a raising handler or scorer each become a per-criterion `ERROR` event carrying a top-level `errorMessage` that describes the failure. A row whose generation errored is not scored at all: no judge or scorer runs for it and no criterion event is sent, because its generation `ERROR` event already records the row as failed. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
 
 The client uses **lazy initialization**: importing the package does not connect to LaunchDarkly. The singleton is created automatically on the first API call that needs it (`config().invoke()`, `graph().invoke()`, `resolve_graph()`, etc.), as long as `LD_SDK_KEY` is set in the environment.
 
@@ -250,13 +248,14 @@ warning and ignored.
 
 ### Process-wide defaults
 
-`configure` sets behavior for the process. It does not initialize the LaunchDarkly client; call `init_client` for that. Handlers built without an explicit `capture_content` read this value when they run, so one startup call covers every handler. An explicit `True` or `False` on a handler factory or convenience wrapper overrides it. Call `configure` from process startup, not from request data. It can be replaced until the first AI invocation; after that only the same options are accepted. `shutdown()` restores the built-in default, which is off.
+`configure` sets behavior for the process. It does not initialize the LaunchDarkly client; call `init_client` for that. Handlers built without an explicit `capture_content` read this value when they run, so one startup call covers every handler. The built-in default is on: prompts, model output, tool payloads, and judge explanations are sent unless you turn capture off. An explicit `True` or `False` on a handler factory or convenience wrapper overrides it, and an explicit `False` removes that text everywhere, including on offline evaluation spans. Call `configure` from process startup, not from request data. It can be replaced until the first AI invocation; after that only the same options are accepted. `shutdown()` restores the built-in default, which is on.
 
 ```python
 from launchdarkly_ai_server import SDKOptions, configure, init_client, shutdown
 
 async def main():
-    configure(options=SDKOptions(capture_content=True))
+    # Capture is on unless you turn it off.
+    configure(options=SDKOptions(capture_content=False))
     await init_client({"sdkKey": "sdk-...", "serviceName": "my-service"})
     # create_*_handler() with no capture_content argument follows the default above.
     await shutdown()
@@ -269,7 +268,7 @@ async def main():
 Pass `tools` to `run()` as a list of `EvalTool`. Construct one to define a tool in code. Await `evals.tools.get()` to use a tool that already exists in your project's AI library, which reads the tool and pins its version at that point. One list can hold both kinds.
 
 ```python
-from launchdarkly_ai_server.experimental.evaluations import EvalTool, init_evaluations
+from launchdarkly_ai_server import EvalTool, init_evaluations
 
 
 def lookup_order(order_id: str) -> str:

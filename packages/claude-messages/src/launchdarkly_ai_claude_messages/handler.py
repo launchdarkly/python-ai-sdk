@@ -538,9 +538,9 @@ def create_claude_messages_handler(
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. Conversation content is PII, so a run emits only metadata, meaning
-    models, token counts, timings and tool names, until capture is turned on. Turning this
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
+    meaning models, token counts, timings and tool names. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
     report_usage(
