@@ -408,7 +408,7 @@ def _build_agent_tools(
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
             fn = tool_handlers.get(_name)
-            # A NativeTool reaches here unwrapped on the offline evaluations path.
+            # The builder skips a NativeTool, so this guards only a handler that is not callable.
             if not callable(fn):
                 raise ValueError(f'No handler registered for tool "{_name}"')
             # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
