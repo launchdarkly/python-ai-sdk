@@ -347,6 +347,12 @@ class JudgeTask:
     must stay picklable.
     """
     """LD metric key to track the score against."""
+    judge_value: Any = None
+    """The judge variation exactly as the LD SDK returned it.
+
+    Written as the root span's ``feature_flag.result.value`` when the judge
+    handler captures content; otherwise the variation key is written.
+    """
 
 
 @dataclass
