@@ -492,6 +492,82 @@ class TestGraphStream:
             )
         assert "judgeResults" not in events[-1]
 
+    async def test_node_done_carries_the_nodes_own_judge_results(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        leaf_judge = {
+            "leaf-judge": {
+                "usage": {"input": 1, "output": 1, "total": 2},
+                "response": "good",
+                "score": 0.9,
+            }
+        }
+
+        async def judges_for(**kwargs: Any) -> dict[str, Any]:
+            return leaf_judge if kwargs["config"]["instructions"] == "I am leaf" else {}
+
+        with patch(
+            "launchdarkly_ai_server.judges.run_judges",
+            new_callable=AsyncMock,
+            side_effect=judges_for,
+        ):
+            events = await _collect(
+                graph("graph-key", handlers=[_make_streaming_handler(["ok"])]).stream(
+                    "hi", CONTEXT
+                )
+            )
+        dones = [e for e in events if e["type"] == "node_done"]
+        assert [d["nodeKey"] for d in dones] == ["root-node", "leaf-node"]
+        assert "judgeResults" not in dones[0]
+        assert dones[1]["judgeResults"] == leaf_judge
+        # done holds only the graph-level judge; per-node results are not merged into it.
+        assert "judgeResults" not in events[-1]
+
+    async def test_node_judges_stay_on_node_done_when_a_graph_judge_runs(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        leaf_judge = {
+            "leaf-judge": {
+                "usage": {"input": 1, "output": 1, "total": 2},
+                "response": "good",
+                "score": 0.9,
+            }
+        }
+        graph_judge = {
+            "graph-judge": {
+                "usage": {"input": 1, "output": 1, "total": 2},
+                "response": "whole",
+                "score": 0.5,
+            }
+        }
+
+        async def judges_for(**kwargs: Any) -> dict[str, Any]:
+            config = kwargs["config"]
+            judges = (config.get("judgeConfiguration") or {}).get("judges") or []
+            if judges and judges[0]["key"] == "graph-judge":
+                return graph_judge
+            return leaf_judge if config.get("instructions") == "I am leaf" else {}
+
+        with patch(
+            "launchdarkly_ai_server.judges.run_judges",
+            new_callable=AsyncMock,
+            side_effect=judges_for,
+        ):
+            events = await _collect(
+                graph(
+                    "graph-key",
+                    handlers=[_make_streaming_handler(["ok"])],
+                    graph_judge="graph-judge",
+                ).stream("hi", CONTEXT)
+            )
+        leaf_done = next(
+            e
+            for e in events
+            if e["type"] == "node_done" and e["nodeKey"] == "leaf-node"
+        )
+        assert leaf_done["judgeResults"] == leaf_judge
+        assert events[-1]["judgeResults"] == graph_judge
+
     async def test_per_node_judge_receives_the_trajectory(
         self, mock_ld_client: MagicMock
     ) -> None:
@@ -650,6 +726,34 @@ class TestGraphStreamMultiEdge:
         judged = root_call.kwargs["config"]
         assert judged["instructions"] == "I am root"
         assert not any(k.startswith("__handoff_") for k in (judged.get("tools") or {}))
+
+    async def test_routing_node_judge_results_on_its_node_done(
+        self, mock_ld_client: MagicMock
+    ) -> None:
+        root_judge = {
+            "root-judge": {
+                "usage": {"input": 1, "output": 1, "total": 2},
+                "response": "routed",
+                "score": 1.0,
+            }
+        }
+
+        async def judges_for(**kwargs: Any) -> dict[str, Any]:
+            return root_judge if kwargs["config"]["instructions"] == "I am root" else {}
+
+        h = _make_branch_picking_stream_handler("agent-b")
+        with patch(
+            "launchdarkly_ai_server.judges.run_judges",
+            new_callable=AsyncMock,
+            side_effect=judges_for,
+        ):
+            events = await _collect(
+                graph("graph-key", handlers=[h]).stream("hi", CONTEXT)
+            )
+        dones = [e for e in events if e["type"] == "node_done"]
+        assert [d["nodeKey"] for d in dones] == ["root-node", "agent-b"]
+        assert dones[0]["judgeResults"] == root_judge
+        assert "judgeResults" not in dones[1]
 
     async def test_routed_judge_receives_the_trajectory(
         self, mock_ld_client: MagicMock
