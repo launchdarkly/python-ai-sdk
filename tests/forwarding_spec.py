@@ -1,8 +1,8 @@
-"""The cross-SDK forwarded-key lists (TESTING.md section 1.12), shared by every package's tests.
+"""The cross-SDK forwarded-key lists, shared by every package's tests.
 
 Each list names the ``model.parameters`` keys a handler forwards, in the config's own spelling, so
 a key the handler renames (``effort``, ``max_tokens``, ``text``) is listed under the name the config
-uses. A key the Python library cannot accept is marked not supported in Python in section 1.12 and
+uses. A key the Python library cannot accept is marked not supported in Python on the cross-SDK list and
 is absent here, and the JS SDK's lists differ the same way. Each package's tests probe its real call
 sites with :func:`probe_forwarded_keys` and assert the result equals its list here exactly.
 """

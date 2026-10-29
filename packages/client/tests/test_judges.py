@@ -1,6 +1,5 @@
 """
-Tests for §3.14 run_judges.
-Reference: TESTING.md §3.14
+Tests for run_judges.
 """
 
 import json
@@ -704,7 +703,7 @@ class TestRunJudgeScoreReporting:
 
 
 class TestRunJudgeTrackData:
-    """§3.13 run_judge result track_data carries the evaluated (parent) config identity."""
+    """run_judge result track_data carries the evaluated (parent) config identity."""
 
     PARENT: ClassVar[dict[str, Any]] = {
         "runId": "parent-run",

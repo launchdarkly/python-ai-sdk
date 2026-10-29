@@ -1,6 +1,5 @@
 """
-Tests for §2.1 graph convenience wrapper (langchain_graph) and §2.x.2 full coverage.
-Reference: TESTING.md §2.1, §2.x.2
+Tests for the graph convenience wrapper (langchain_graph), with full coverage.
 """
 
 from unittest.mock import MagicMock, patch

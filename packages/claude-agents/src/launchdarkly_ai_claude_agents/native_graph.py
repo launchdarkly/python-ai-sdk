@@ -6,16 +6,21 @@ query() calls, mirroring the TypeScript toClaudeAgents implementation.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
-import types
 import uuid
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypedDict
+
+from claude_agent_sdk import SettingSource
 
 from launchdarkly_ai_server import (
     NATIVE_TOOL_KEY,
     GraphDefinition,
     GraphNode,
+    LDContext,
+    NativeGraphRunner,
     NativeTool,
     get_client,
     make_track_data,
@@ -59,7 +64,7 @@ def _sanitize_name(key: str) -> str:
 
 
 def _wrap_native_tools(
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     ld_context: Any,
     track_data: dict[str, Any],
 ) -> dict[str, Any]:
@@ -110,7 +115,7 @@ async def _run_query(
     node: GraphNode,
     input_text: str,
     variables: dict[str, Any],
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     ld_context: Any,
     graph_key: str,
     run_id: str,
@@ -219,10 +224,20 @@ async def _run_query(
     }
 
 
+class ClaudeNativeGraphOptions(TypedDict, total=False):
+    """Options for :func:`to_claude_agents`."""
+
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
+    context: LDContext
+    """LaunchDarkly context used for tracking events. Required for LD telemetry."""
+    cwd: str | os.PathLike[str]
+    setting_sources: list[SettingSource]
+
+
 def to_claude_agents(
-    def_promise: Any,
-    opts: dict[str, Any] | None = None,
-) -> Any:
+    def_promise: Awaitable[GraphDefinition],
+    opts: ClaudeNativeGraphOptions | None = None,
+) -> NativeGraphRunner:
     """
     Converts a resolved ``GraphDefinition`` into a nested query() multi-agent
     execution where each child node becomes a sub-agent tool.
@@ -263,7 +278,7 @@ def to_claude_agents(
             if raw_ld_context is not None
             else None
         )
-        raw_handlers: dict[str, Any] = _opts.get("tool_handlers") or {}
+        raw_handlers: Mapping[str, Any] = _opts.get("tool_handlers") or {}
 
         start_time = time.monotonic()
         run_id = str(uuid.uuid4())
@@ -474,4 +489,10 @@ def to_claude_agents(
             if span:
                 span.end()
 
-    return types.SimpleNamespace(invoke=invoke)
+    # A class, not a SimpleNamespace, so mypy checks invoke against NativeGraphRunner.
+    _invoke = invoke
+
+    class _Runner:
+        invoke = staticmethod(_invoke)
+
+    return _Runner()

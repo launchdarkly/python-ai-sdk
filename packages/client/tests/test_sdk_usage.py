@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.27 helper usage events."""
+"""Tests for SDK helper usage events."""
 
 import time
 from pathlib import Path
@@ -516,7 +516,7 @@ async def test_package_name_without_version_reports_the_core(
 
 
 # ---------------------------------------------------------------------------
-# Agent Skills helpers (§3.27)
+# Agent Skills helpers
 # ---------------------------------------------------------------------------
 
 SKILL_KEY = "test-skill"

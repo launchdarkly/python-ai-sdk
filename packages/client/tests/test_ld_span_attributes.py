@@ -1,4 +1,4 @@
-"""Context identity on the root feature_flag span. TESTING.md §3.18."""
+"""Context identity on the root feature_flag span."""
 
 from __future__ import annotations
 

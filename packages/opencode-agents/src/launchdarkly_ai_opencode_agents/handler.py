@@ -19,6 +19,7 @@ from typing import Any
 from launchdarkly_ai_server import (
     NATIVE_TOOL_KEY,
     AiConfigRep,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanUsage,
@@ -745,7 +746,9 @@ class _ToolPlan:
         self.tool_display_names: dict[str, str] = {}
 
 
-def _plan_tools(config: AiConfigRep, tool_handlers: dict[str, Any] | None) -> _ToolPlan:
+def _plan_tools(
+    config: AiConfigRep, tool_handlers: Mapping[str, Any] | None
+) -> _ToolPlan:
     """Partitions the offered tools into native pass-throughs and bridged callables.
 
     "Offered" is the request-scoped authorization boundary: a config tool key
@@ -884,7 +887,7 @@ class OpenCodeHandler(ProviderHandler):
         self,
         config: AiConfigRep,
         user_input: str | None,
-        tool_handlers: dict[str, Any] | None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -1021,7 +1024,7 @@ class OpenCodeHandler(ProviderHandler):
         self,
         config: AiConfigRep,
         user_input: str | None,
-        tool_handlers: dict[str, Any] | None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
         variables: dict[str, Any] | None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:

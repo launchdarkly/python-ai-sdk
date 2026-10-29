@@ -1,4 +1,4 @@
-.PHONY: start test typecheck lint format format-check lint-fix build clean api-report api-report-check
+.PHONY: start test typecheck lint format format-check lint-fix build check-packaging clean api-report api-report-check
 
 # Run main.py (uv run python main.py)
 start:
@@ -48,6 +48,14 @@ build:
 		echo "Building $$pkg..."; \
 		(cd $$pkg && uv build --out-dir dist); \
 	done
+
+# Install each built wheel into an empty virtualenv and check its imports resolve there
+check-packaging:
+	rm -rf dist
+	@for pkg in packages/*/; do \
+		(cd $$pkg && uv build --quiet --wheel --out-dir ../../dist); \
+	done
+	uv run python scripts/check_packaging.py dist
 
 # Clean build artifacts
 clean:

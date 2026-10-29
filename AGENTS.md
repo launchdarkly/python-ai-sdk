@@ -92,8 +92,6 @@ PRs are squash-merged with the PR title as the commit message, and release-pleas
 - **A breaking experimental change** uses `!` while the package is 0.x: `feat(beta)!:` bumps the minor version, which is what an experimental break is allowed. After 1.0, `!` would force a major release. Use `feat(beta):` without `!` instead, and say the change is breaking in the title.
 - **When a feature is promoted to core,** remove its rows from `changelog-sections`.
 
-The rule is specified in `TESTING.md` §0.3 in `launchdarkly/ai-sdks-monorepo`.
-
 ## Package Hierarchy
 
 The monorepo is organized into three tiers plus a convenience barrel. Dependencies only flow **downward** — never sideways between packages in the same tier, and never upward.
