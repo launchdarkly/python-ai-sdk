@@ -138,7 +138,6 @@ def _make_agents_mock(run_result: Any) -> Any:
     mock.Agent = MagicMock(side_effect=_make_agent)
     mock.Runner.run = AsyncMock(return_value=run_result)
     mock.handoff = MagicMock(side_effect=lambda agent: agent)
-    mock.tool = MagicMock(side_effect=lambda **kw: lambda fn: fn)
 
     # RunHooks base class
     class _FakeRunHooks:
@@ -526,7 +525,6 @@ class TestToOpenAIAgentsOpenAISpecific:
         agents_mock.Agent = MagicMock(return_value=MagicMock(name="root"))
         agents_mock.Runner.run = AsyncMock(side_effect=RuntimeError("provider error"))
         agents_mock.handoff = MagicMock()
-        agents_mock.tool = MagicMock(side_effect=lambda **kw: lambda fn: fn)
 
         class _FakeRunHooks:
             async def on_agent_end(self, *a: Any) -> None:
@@ -605,7 +603,6 @@ class TestToOpenAIAgentsOpenAISpecific:
         agents_mock.Agent = MagicMock(return_value=MagicMock(name="root"))
         agents_mock.Runner.run = AsyncMock(side_effect=RuntimeError("fail"))
         agents_mock.handoff = MagicMock()
-        agents_mock.tool = MagicMock(side_effect=lambda **kw: lambda fn: fn)
 
         class _FakeRunHooks:
             async def on_agent_end(self, *a: Any) -> None:
@@ -1124,22 +1121,19 @@ class TestNativeGraphModelParameters:
 
 
 class TestBuildNodeToolsSyncHandlers:
-    """``_build_node_tools`` must accept sync handlers (native path skips wrap_tool_handlers)."""
+    """``_build_node_tools`` must accept sync handlers (native path skips wrap_tool_handlers).
 
-    @pytest.mark.asyncio
-    async def test_sync_handler_returns_string(self) -> None:
-        captured: list[Any] = []
+    Built with the real ``agents`` package: a mocked module accepted ``agents.tool(...)``, which is
+    a submodule in openai-agents, so the crash on every node with a tool went unseen (AIC-3716).
+    """
 
-        agents_mock = MagicMock()
-        agents_mock.tool = MagicMock(
-            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
-        )
-
-        node = _to_graph_node(
+    @staticmethod
+    def _node(tool_name: str) -> GraphNode:
+        return _to_graph_node(
             {
                 "key": "root",
                 "config": {
-                    "tools": {"weather": {"description": "d", "parameters": {}}},
+                    "tools": {tool_name: {"description": "d", "parameters": {}}},
                 },
                 "meta": {},
                 "edges": [],
@@ -1147,81 +1141,131 @@ class TestBuildNodeToolsSyncHandlers:
             }
         )
 
-        with patch(
-            "importlib.import_module",
-            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
-        ):
-            _build_node_tools(node, {"weather": lambda a: "sunny"})
+    async def test_sync_handler_returns_string(self) -> None:
+        from agents import FunctionTool
 
-        assert captured, "tool was not registered"
-        assert await captured[0]({"city": "Paris"}) == "sunny"
+        [t] = _build_node_tools(self._node("weather"), {"weather": lambda a: "sunny"})
 
-    @pytest.mark.asyncio
+        assert isinstance(t, FunctionTool)
+        assert t.name == "weather"
+        assert await t.on_invoke_tool(MagicMock(), '{"city": "Paris"}') == "sunny"
+
     async def test_async_handler_is_awaited(self) -> None:
-        captured: list[Any] = []
-
-        agents_mock = MagicMock()
-        agents_mock.tool = MagicMock(
-            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
-        )
-
         async def async_handler(args: Any) -> str:
             return f"async:{args.get('q')}"
 
-        node = _to_graph_node(
-            {
-                "key": "root",
-                "config": {
-                    "tools": {"lookup": {"description": "d", "parameters": {}}},
-                },
-                "meta": {},
-                "edges": [],
-                "is_terminal": True,
-            }
-        )
+        [t] = _build_node_tools(self._node("lookup"), {"lookup": async_handler})
 
-        with patch(
-            "importlib.import_module",
-            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
-        ):
-            _build_node_tools(node, {"lookup": async_handler})
+        assert await t.on_invoke_tool(MagicMock(), '{"q": "hi"}') == "async:hi"
 
-        assert await captured[0]({"q": "hi"}) == "async:hi"
-
-    @pytest.mark.asyncio
     async def test_sync_handler_returning_awaitable_is_awaited(self) -> None:
-        captured: list[Any] = []
-
-        agents_mock = MagicMock()
-        agents_mock.tool = MagicMock(
-            side_effect=lambda **kw: lambda fn: (captured.append(fn), fn)[1]
-        )
-
         async def _inner() -> str:
             return "done"
 
         def sync_wrapper(_args: Any) -> Any:
             return _inner()
 
-        node = _to_graph_node(
-            {
+        [t] = _build_node_tools(self._node("my-tool"), {"my-tool": sync_wrapper})
+
+        assert await t.on_invoke_tool(MagicMock(), "") == "done"
+
+
+class TestNativeGraphRunsANodeWithAToolOnTheRealSdk:
+    """The real ``agents`` package runs the graph; only the model is fake (AIC-3716)."""
+
+    async def test_tool_call_reaches_the_handler_and_the_run_completes(self) -> None:
+        from agents import FunctionTool, ModelResponse, Usage
+        from agents.models.interface import Model
+        from agents.models.multi_provider import MultiProvider
+        from openai.types.responses import (
+            ResponseFunctionToolCall,
+            ResponseOutputMessage,
+            ResponseOutputText,
+        )
+
+        # Not strict-mode shaped (`limit` optional, no additionalProperties), so a rewrite shows.
+        schema = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["q"],
+        }
+        seen_tools: list[list[Any]] = []
+
+        class _FakeModel(Model):
+            """Turn 1 calls the tool; turn 2 answers with the tool's result."""
+
+            async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+                seen_tools.append(list(kwargs["tools"]))
+                items = kwargs["input"]
+                outputs = [
+                    i["output"]
+                    for i in (items if isinstance(items, list) else [])
+                    if isinstance(i, dict) and i.get("type") == "function_call_output"
+                ]
+                if outputs:
+                    output: list[Any] = [
+                        ResponseOutputMessage(
+                            id="m1",
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[
+                                ResponseOutputText(
+                                    type="output_text",
+                                    text=f"answer: {outputs[-1]}",
+                                    annotations=[],
+                                )
+                            ],
+                        )
+                    ]
+                else:
+                    output = [
+                        ResponseFunctionToolCall(
+                            id="fc1",
+                            call_id="call1",
+                            type="function_call",
+                            name="lookup",
+                            arguments='{"q": "hi"}',
+                        )
+                    ]
+                return ModelResponse(output=output, usage=Usage(), response_id=None)
+
+            def stream_response(self, *args: Any, **kwargs: Any) -> Any:
+                raise NotImplementedError
+
+        calls: list[Any] = []
+
+        def lookup(args: Any) -> str:
+            calls.append(args)
+            return f"found {args['q']}"
+
+        nodes = {
+            "root": {
                 "key": "root",
                 "config": {
-                    "tools": {"my-tool": {"description": "d", "parameters": {}}},
+                    "model": {"name": "gpt-4o"},
+                    "instructions": "help",
+                    "tools": {
+                        "lookup": {"description": "Look up", "parameters": schema}
+                    },
                 },
-                "meta": {},
+                "meta": {"variationKey": "v1", "version": 1},
                 "edges": [],
                 "is_terminal": True,
             }
-        )
+        }
+        with patch.object(MultiProvider, "get_model", return_value=_FakeModel()):
+            result = await to_openai_agents(
+                _make_def_promise(_make_graph_def(nodes=nodes)),
+                {"tool_handlers": {"lookup": lookup}},
+            ).invoke("q")
 
-        with patch(
-            "importlib.import_module",
-            side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
-        ):
-            _build_node_tools(node, {"my-tool": sync_wrapper})
-
-        assert await captured[0]({}) == "done"
+        assert calls == [{"q": "hi"}]
+        assert result["response"] == "answer: found hi"
+        [tool] = seen_tools[0]
+        assert isinstance(tool, FunctionTool)
+        assert (tool.name, tool.description) == ("lookup", "Look up")
+        assert tool.params_json_schema == schema
 
 
 class TestNativeGraphForwardsExactlyTheCrossSdkList:
