@@ -202,6 +202,7 @@ async def run_judges(
                         "response_to_evaluate": llm_response,
                         **({"input": user_input} if user_input else {}),
                     },
+                    evaluated_value=variation.get("value"),
                 )
 
                 usage = to_usage_dict(result["usage"])

@@ -167,10 +167,13 @@ async def execute_and_track(
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
+    evaluated_value: Any = None,
 ) -> dict[str, Any]:
     """
     Calls *handler*, emits LD telemetry events, and returns
-    ``{usage, response, track_data}``.
+    ``{usage, response, track_data}``. *evaluated_value* is the variation as
+    the LD SDK returned it; with content capture on it becomes the root
+    span's ``feature_flag.result.value``.
     """
     from .lifecycle import get_client
 
@@ -212,8 +215,8 @@ async def execute_and_track(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
-    if isinstance(meta, dict) and "_evaluatedValue" in meta:
-        merged_variables["__ldValue"] = meta["_evaluatedValue"]
+    if evaluated_value is not None:
+        merged_variables["__ldValue"] = evaluated_value
 
     start_time = time.monotonic()
 
@@ -268,6 +271,7 @@ async def execute_and_stream(
     variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
     history: list[dict[str, Any]] | None = None,
+    evaluated_value: Any = None,
 ) -> AsyncGenerator[ExecuteStreamEvent, None]:
     """
     Streaming counterpart to ``execute_and_track``. Yields ``chunk`` events,
@@ -314,8 +318,8 @@ async def execute_and_stream(
         "ldContext": {**user_context},
         "__ld": track_data,
     }
-    if isinstance(meta, dict) and "_evaluatedValue" in meta:
-        merged_variables["__ldValue"] = meta["_evaluatedValue"]
+    if evaluated_value is not None:
+        merged_variables["__ldValue"] = evaluated_value
 
     start_time = time.monotonic()
     full_text = ""

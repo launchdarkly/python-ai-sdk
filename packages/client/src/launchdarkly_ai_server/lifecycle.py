@@ -588,7 +588,7 @@ async def extract_variation(
 ) -> dict[str, Any]:
     """
     Fetches an AI config variation from the LD client and parses it.
-    Returns ``{"config": AiConfigRep, "meta": VariationMeta}``.
+    Returns ``{"config": AiConfigRep, "meta": VariationMeta, "value": Any}``.
     Raises on disabled or invalid variations.
 
     Lazily initializes the LD client when ``LD_SDK_KEY`` is set, matching
@@ -628,12 +628,6 @@ async def extract_variation(
         # Pinned model-config identity; keys are omitted when absent so that
         # tracking payloads never carry ``None`` values.
         **model_stamps_from_meta(ld_meta),
-        # The variation exactly as the LD SDK returned it, ``_ldMeta`` included.
-        # Written to the root span's ``feature_flag`` event as
-        # ``feature_flag.result.value``; never copied into tracking payloads.
-        # Private: ``meta`` surfaces publicly as ``GraphNode.meta`` and
-        # ``JudgeTask.judge_meta``.
-        "_evaluatedValue": raw,
     }
 
     # Strip _ldMeta for config parsing
@@ -649,4 +643,7 @@ async def extract_variation(
             f"Invalid AI config variation for '{config_key}': {result.error['message']}"
         )
 
-    return {"config": result.data, "meta": meta}
+    # ``value`` is the variation exactly as the LD SDK returned it, ``_ldMeta``
+    # included. It stays off ``meta``, which surfaces publicly as
+    # ``GraphNode.meta`` and ``JudgeTask.judge_meta``.
+    return {"config": result.data, "meta": meta, "value": raw}

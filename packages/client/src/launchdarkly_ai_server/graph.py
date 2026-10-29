@@ -171,11 +171,14 @@ async def _build_graph(
         return [e for e in edges if e.source_key == node_key]
 
     nodes: dict[str, GraphNode] = {}
+    # Raw variations, kept off the public GraphNode.
+    node_values: dict[str, Any] = {}
     try:
         for node_key in all_keys:
             variation = await extract_variation(node_key, context)
             node_config: AiConfigRep = variation["config"]
             node_meta: VariationMeta = variation["meta"]
+            node_values[node_key] = variation.get("value")
             node_edges = edges_from(node_key)
             nodes[node_key] = GraphNode(
                 key=node_key,
@@ -238,6 +241,7 @@ async def _build_graph(
         try:
             result = await execute_and_track(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=node.config,
                 meta=node.meta,
                 user_context=context,
@@ -415,6 +419,7 @@ async def _build_graph(
         try:
             result = await execute_and_track(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=routed_config,
                 meta=node.meta,
                 user_context=context,
@@ -530,6 +535,7 @@ async def _build_graph(
             projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=node.config,
                 meta=node.meta,
                 user_context=context,
@@ -670,6 +676,7 @@ async def _build_graph(
             projector = StableProjector()
             async for event in execute_and_stream(
                 config_key=node.key,
+                evaluated_value=node_values.get(node.key),
                 config=routed_config,
                 meta=node.meta,
                 user_context=context,
