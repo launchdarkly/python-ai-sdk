@@ -16,6 +16,7 @@ from launchdarkly_ai_server import (
     parse_json_with_possible_fences,
     parse_template,
     parse_usage,
+    validate_max_retries,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data, model_parameters
 
@@ -434,3 +435,21 @@ class TestModelParameters:
         result = model_parameters(config)
         assert "secret" not in result
         assert "custom" not in result
+
+
+class TestValidateMaxRetries:
+    """TESTING.md A.22: a factory refuses a value that is not a non-negative int, naming the option."""
+
+    @pytest.mark.parametrize("value", [None, 0, 1, 7, 50])
+    def test_accepts_none_and_non_negative_ints(self, value: int | None) -> None:
+        assert validate_max_retries(value) == value
+
+    @pytest.mark.parametrize("value", [True, False, 2.0, "3", [3]])
+    def test_refuses_non_integers_with_type_error(self, value: Any) -> None:
+        with pytest.raises(TypeError, match="max_retries"):
+            validate_max_retries(value)
+
+    @pytest.mark.parametrize("value", [-1, -50])
+    def test_refuses_negatives_with_value_error(self, value: int) -> None:
+        with pytest.raises(ValueError, match="max_retries"):
+            validate_max_retries(value)

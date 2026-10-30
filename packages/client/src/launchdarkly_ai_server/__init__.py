@@ -163,6 +163,7 @@ from .utils import (
     set_usage_span_attributes,
     to_ld_context,
     to_usage_dict,
+    validate_max_retries,
 )
 from .utils import _create_handler as _create_handler
 
@@ -242,6 +243,7 @@ __all__ = [  # noqa: RUF022
     "parse_usage",
     "set_ld_span_attributes",
     "to_ld_context",
+    "validate_max_retries",
     # history
     "compose_history",
     "content_to_text",

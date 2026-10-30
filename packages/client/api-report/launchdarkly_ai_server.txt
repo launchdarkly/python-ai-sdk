@@ -413,6 +413,7 @@ UsageDict  [class, @dataclass]
   input_details: InputTokenDetails | None = None
   output: int = 0
   total: int = 0
+validate_max_retries(max_retries: int | None) -> int | None
 VariationMeta = dict[str, Any]
 watch_skills(skills: Sequence[Skill | SkillReference | str] | str | SkillSource, root: str | os.PathLike[str], *, prune: bool = True, timeout: float = 10.0, on_unavailable: OnUnavailable = 'keep', debounce: float = DEFAULT_DEBOUNCE_SECONDS, on_reconcile: Callable[[ReconcileReport], Any] | None = None) -> tuple[ReconcileReport, SkillWatcher]  [async]
 wrap_tool_handlers(tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None, user_context: LDContext, track_data: TrackData) -> dict[str, Callable[..., Any]]

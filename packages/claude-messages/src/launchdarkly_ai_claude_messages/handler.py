@@ -26,6 +26,7 @@ from launchdarkly_ai_server import (
     set_tool_call_content_attributes,
     to_semconv_finish_reason,
     tool_result_string,
+    validate_max_retries,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -530,7 +531,7 @@ _MAX_STEPS = 10
 
 
 def create_claude_messages_handler(
-    *, capture_content: bool | None = None
+    *, capture_content: bool | None = None, max_retries: int | None = None
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for Anthropic Claude (messages API).
 
@@ -542,22 +543,37 @@ def create_claude_messages_handler(
     for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
     meaning models, token counts, timings and tool names. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
+
+    Set *max_retries* to change how many times the ``AsyncAnthropic`` client retries a failed
+    request (a rate limit, an overload, a timeout, a 5xx) before the error reaches the handler.
+    ``None`` (the default) leaves the client's own default of 2 in place. Raise it when many calls
+    share one rate-limit window, as an evaluation run with many concurrent workers does: two
+    retries is thin when a whole batch hits the same window at once. The retries happen inside the
+    client, so a retried turn is still one ``chat`` span. Raises ``TypeError`` or ``ValueError``
+    when it is not a non-negative int.
     """
     report_usage(
         "claude-messages.createClaudeMessagesHandler", PACKAGE_NAME, __version__
     )
-    return _create_claude_messages_handler(capture_content=capture_content)
+    return _create_claude_messages_handler(
+        capture_content=capture_content, max_retries=max_retries
+    )
 
 
 def _create_claude_messages_handler(
-    *, capture_content: bool | None = None
+    *, capture_content: bool | None = None, max_retries: int | None = None
 ) -> ProviderHandler:
     """Non-reporting :func:`create_claude_messages_handler`, used by this package's wrappers."""
+    max_retries = validate_max_retries(max_retries)
     content_override = capture_content
     import importlib
 
     anthropic_mod = importlib.import_module("anthropic")
-    client = anthropic_mod.AsyncAnthropic()
+    # Passed only when set, so an omitted value keeps the vendor default rather than a copy of it.
+    client_options: dict[str, Any] = {}
+    if max_retries is not None:
+        client_options["max_retries"] = max_retries
+    client = anthropic_mod.AsyncAnthropic(**client_options)
 
     async def _call_impl(
         config: AiConfigRep,
@@ -951,14 +967,17 @@ def claude_messages(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
-    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
-    # asking for content on spans got a TypeError instead of content.
+    # All three are lifted out of kwargs: capture_content and max_retries configure the handler,
+    # variables belong to the invocation. Leaving any in would pass it to config(), which takes
+    # none of them, so a caller asking for content on spans got a TypeError instead of content.
     report_usage("claude-messages.claudeMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
+    max_retries = kwargs.pop("max_retries", None)
     return _config(
         key=config_key,
-        handler=_create_claude_messages_handler(capture_content=capture_content),
+        handler=_create_claude_messages_handler(
+            capture_content=capture_content, max_retries=max_retries
+        ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

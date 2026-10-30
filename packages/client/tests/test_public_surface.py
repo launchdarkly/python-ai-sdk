@@ -116,6 +116,7 @@ ROOT_SURFACE = frozenset(
         "to_semconv_finish_reason",
         "to_usage_dict",
         "tool_result_string",
+        "validate_max_retries",
         "wrap_tool_handlers",
         # Agent Skills
         "set_skill_store",
