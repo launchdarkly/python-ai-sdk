@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
 import inspect
 import logging
 import os
+import threading
 from typing import Any
 
 from .sdk_info import flush_ai_sdk_info, reset_ai_sdk_info
@@ -16,6 +18,9 @@ from .utils import model_stamps_from_meta
 logger = logging.getLogger(__name__)
 
 _LD_DEFAULT_OTLP_ENDPOINT = "https://otel.observability.app.launchdarkly.com"
+
+_START_WAIT_SECONDS = 10
+"""How long building the LaunchDarkly client may wait to connect; matches the TS SDK."""
 
 _INIT_CLIENT_OPTIONS = frozenset(
     {
@@ -37,7 +42,30 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
+class _InitAttempt:
+    """One build of the LaunchDarkly client, shared by every call that arrives while it runs.
+
+    ``result`` is a thread future, not an asyncio one, so callers on any event
+    loop or thread can wait on it. ``waiters`` counts the calls still waiting.
+    ``successor`` is the passed client that replaced this attempt, if one did;
+    an attempt replaced by ``shutdown()`` has none, so its calls fail.
+    """
+
+    def __init__(self) -> None:
+        self.result: concurrent.futures.Future[LDClientInterface] = (
+            concurrent.futures.Future()
+        )
+        self.waiters = 0
+        self.successor: LDClientInterface | None = None
+
+
+# Guards ``_client``, ``_attempt`` and the telemetry globals: the attempt thread
+# adopts its client, and callers may arrive from several threads.
+_state_lock = threading.Lock()
 _client: LDClientInterface | None = None
+# The in-flight attempt, cleared when it ends either way, so a failure is not
+# cached. ``shutdown()`` and a passed client clear it too, which abandons it.
+_attempt: _InitAttempt | None = None
 _tracer_provider: Any = None
 # True only when *this* SDK's call to trace.set_tracer_provider actually took
 # effect. "We built a provider" is not the same as "we own the global": the set
@@ -231,14 +259,16 @@ async def init_client(
       resource attribute.
 
     Idempotent: later calls return the existing client and ignore every option.
+    Calls made while the first one is still connecting wait for that same
+    attempt, from any event loop or thread, and ignore their own options.
     An option not listed above is logged as a warning and ignored.
 
     Returns the initialized ``LDClientInterface`` instance. Raises
     ``RuntimeError`` when the LaunchDarkly client it builds has not initialized
-    within 10 seconds or its SDK key was rejected; a later call retries. A
-    client passed as *client* is not checked.
+    within 10 seconds or its SDK key was rejected, in every call waiting on that
+    attempt; a later call retries. A client passed as *client* is not checked.
     """
-    global _client
+    global _client, _attempt
 
     opts = options or {}
     unknown = sorted(str(key) for key in opts if key not in _INIT_CLIENT_OPTIONS)
@@ -255,17 +285,56 @@ async def init_client(
 
     # BYOC path — pre-initialized client
     if client is not None:
-        # Adopted only after telemetry setup succeeds. ``_client`` is the
-        # idempotency guard above, so assigning it first meant a setup that
-        # raised (a malformed OTEL_EXPORTER_OTLP_TIMEOUT does) left it set: the
-        # next call returned it as a silent success with no telemetry, hiding
-        # the config error. The caller owns this client, so it is not closed.
-        _setup_telemetry(opts.get("sdkKey", "byoc"), opts)
-        _client = client
-        flush_ai_sdk_info(_client)
-        flush_sdk_usage(_client)
-        return _client
+        with _state_lock:
+            if _client is None:
+                # Adopted only after telemetry setup succeeds. ``_client`` is the
+                # idempotency guard above, so assigning it first meant a setup that
+                # raised (a malformed OTEL_EXPORTER_OTLP_TIMEOUT does) left it set:
+                # the next call returned it as a silent success with no telemetry,
+                # hiding the config error. The caller owns this client, so it is
+                # not closed.
+                _setup_telemetry(opts.get("sdkKey", "byoc"), opts)
+                _client = client
+                # An attempt still connecting is abandoned: it closes the client
+                # it builds, and the calls waiting on it get this one.
+                if _attempt is not None:
+                    _attempt.successor = client
+                _attempt = None
+            adopted = _client
+        flush_ai_sdk_info(adopted)
+        flush_sdk_usage(adopted)
+        return adopted
 
+    with _state_lock:
+        if _client is None and _attempt is None:
+            _attempt = _start_attempt(opts)
+        attempt = _attempt
+        if attempt is not None:
+            attempt.waiters += 1
+        existing = _client
+    if attempt is None:
+        # Adopted by another call between the check above and the lock.
+        assert existing is not None
+        flush_ai_sdk_info(existing)
+        flush_sdk_usage(existing)
+        return existing
+
+    try:
+        ld_client = await _wait_for_attempt(attempt.result)
+    finally:
+        with _state_lock:
+            attempt.waiters -= 1
+    flush_ai_sdk_info(ld_client)
+    flush_sdk_usage(ld_client)
+    return ld_client
+
+
+def _start_attempt(opts: InitClientOptions) -> _InitAttempt:
+    """Starts building the LaunchDarkly client. The caller holds ``_state_lock``.
+
+    Raises, with nothing started, when there is no SDK key or no SDK to build
+    the client with.
+    """
     # Resolve SDK key
     sdk_key: str | None = opts.get("sdkKey") or os.environ.get("LD_SDK_KEY")
     if not sdk_key:
@@ -306,57 +375,132 @@ async def init_client(
         config_kwargs["events_uri"] = events_uri
 
     ld_config = config_cls(sdk_key, **config_kwargs)
-    # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
-    # Built in a thread so that wait does not stall the caller's event loop.
-    build = asyncio.ensure_future(
-        asyncio.to_thread(client_cls, ld_config, start_wait=10)
-    )
+    attempt = _InitAttempt()
+    # Its own thread, not asyncio.to_thread: the build blocks for up to
+    # start_wait, and holding a default-executor thread per caller for that
+    # long starved every other to_thread user. Not tied to any event loop
+    # either, so the attempt outlives the loop of the call that started it.
+    threading.Thread(
+        target=_run_attempt,
+        args=(attempt, client_cls, ld_config, sdk_key, opts),
+        name="launchdarkly-ai-init-client",
+        daemon=True,
+    ).start()
+    return attempt
+
+
+def _run_attempt(
+    attempt: _InitAttempt,
+    client_cls: Any,
+    ld_config: Any,
+    sdk_key: str,
+    opts: InitClientOptions,
+) -> None:
+    """Builds and adopts the client on the attempt's thread, then settles ``result``."""
+    global _attempt
+
+    ld_client: Any = None
     try:
-        ld_client = await asyncio.shield(build)
-    except asyncio.CancelledError:
-        # The thread can't be stopped: close the client it finishes building, or its
-        # streaming connection outlives this cancelled call.
-        build.add_done_callback(_close_abandoned_client)
-        raise
+        ld_client = client_cls(ld_config, start_wait=_START_WAIT_SECONDS)
+        adopted = _adopt(attempt, ld_client, sdk_key, opts)
+    except BaseException as exc:
+        # A failed attempt is not cached: drop it before any caller sees the
+        # failure, so one that retries at once starts afresh. Close the client
+        # too, or each retry leaves a streaming connection open.
+        with _state_lock:
+            if _attempt is attempt:
+                _attempt = None
+        if ld_client is not None:
+            _close_unadopted(ld_client)
+        attempt.result.set_exception(exc)
+        return
+    if adopted is not ld_client:
+        _close_unadopted(ld_client)
+    attempt.result.set_result(adopted)
 
-    # A concurrent first call may have won while this one was connecting: keep
-    # its client and close ours, so only one streaming connection survives.
-    if _client is not None:
-        await _close_quietly(ld_client)
-        flush_ai_sdk_info(_client)
-        flush_sdk_usage(_client)
-        return _client
 
-    # The constructor returns normally both when start_wait runs out and when
-    # the service rejects the SDK key; it only logs. Adopting that client would
-    # serve every AI Config disabled with no error, so fail here. Close it too:
-    # a failed call is not cached, and each retry would otherwise leave a
-    # streaming connection open.
-    if not ld_client.is_initialized():
-        await _close_quietly(ld_client)
-        raise RuntimeError(
-            "LaunchDarkly client failed to initialize: it did not connect within "
-            "10 seconds, or the SDK key was rejected. Check LD_SDK_KEY (or the "
-            "sdkKey option) and that LaunchDarkly is reachable; the LaunchDarkly "
-            "SDK's log has the cause."
-        )
+def _adopt(
+    attempt: _InitAttempt,
+    ld_client: Any,
+    sdk_key: str,
+    opts: InitClientOptions,
+) -> LDClientInterface:
+    """Makes the attempt's client the singleton, or says what to return instead."""
+    global _client, _attempt
 
-    # As on the BYOC path: only a fully set-up client becomes the singleton. We
-    # built this one, so close it on failure — it holds a streaming connection
-    # that would otherwise outlive the attempt.
-    try:
+    with _state_lock:
+        # Whether the attempt was replaced comes first: once it has been, what
+        # its own client did no longer decides what its calls get.
+        if _attempt is not attempt or attempt.waiters == 0:
+            # shutdown() or a passed client replaced this attempt, or every call
+            # waiting on it was cancelled. Adopting the client would clobber
+            # what came after, or keep a connection open that nobody asked for.
+            # ``_client`` is no answer here: after shutdown() it may be a later
+            # attempt's client, which these calls must not get.
+            if _attempt is attempt:
+                _attempt = None
+            if attempt.successor is not None:
+                return attempt.successor
+            raise RuntimeError(
+                "init_client was abandoned: shutdown() ran, or every call "
+                "waiting on it was cancelled, before the client connected."
+            )
+        # The constructor returns normally both when start_wait runs out and
+        # when the service rejects the SDK key; it only logs. Adopting that
+        # client would serve every AI Config disabled with no error, so fail here.
+        if not ld_client.is_initialized():
+            raise RuntimeError(
+                "LaunchDarkly client failed to initialize: it did not connect "
+                f"within {_START_WAIT_SECONDS} seconds, or the SDK key was "
+                "rejected. Check LD_SDK_KEY (or the sdkKey option) and that "
+                "LaunchDarkly is reachable; the LaunchDarkly SDK's log has the cause."
+            )
+        # As on the BYOC path: only a fully set-up client becomes the singleton.
+        # The check above commits this attempt to adopting. A cancel or a
+        # shutdown() that blocks on the lock meanwhile lands after a successful
+        # init, as one a moment after it returned would. The lock spans the setup
+        # so shutdown() cannot run between setup and adoption: it would read the
+        # telemetry globals before the setup wrote them, and leak the provider.
         _setup_telemetry(sdk_key, opts)
-    except Exception:
-        await _close_quietly(ld_client)
-        raise
-    _client = ld_client
-    flush_ai_sdk_info(_client)
-    flush_sdk_usage(_client)
-    return _client
+        adopted: LDClientInterface = ld_client
+        _client = adopted
+        _attempt = None
+        return adopted
 
 
-async def _close_quietly(ld_client: Any) -> None:
-    """Closes a client ``init_client`` built and will not adopt.
+async def _wait_for_attempt(
+    result: concurrent.futures.Future[LDClientInterface],
+) -> LDClientInterface:
+    """Waits on the caller's event loop for an attempt other loops may share.
+
+    The outcome is copied into a future of this loop alone, so cancelling this
+    wait leaves the attempt running for the other callers.
+    ``asyncio.wrap_future`` would cancel the shared future instead.
+    """
+    loop = asyncio.get_running_loop()
+    waiter: asyncio.Future[LDClientInterface] = loop.create_future()
+
+    def copy() -> None:
+        if waiter.done():  # this wait was cancelled
+            return
+        exc = result.exception()
+        if exc is not None:
+            waiter.set_exception(exc)
+        else:
+            waiter.set_result(result.result())
+
+    def wake(_: concurrent.futures.Future[LDClientInterface]) -> None:
+        try:
+            loop.call_soon_threadsafe(copy)
+        except RuntimeError:
+            pass  # this caller's loop has closed, so nothing waits on it
+
+    result.add_done_callback(wake)
+    return await waiter
+
+
+def _close_unadopted(ld_client: Any) -> None:
+    """Closes, on the attempt thread, a client ``init_client`` built and will not adopt.
 
     An error from ``close`` is swallowed so it cannot replace the reason the
     client is being discarded.
@@ -364,27 +508,13 @@ async def _close_quietly(ld_client: Any) -> None:
     try:
         close_result = ld_client.close()
         if inspect.isawaitable(close_result):
-            await close_result
+            asyncio.run(_await(close_result))
     except Exception:
         pass
 
 
-def _close_abandoned_client(build: asyncio.Future[Any]) -> None:
-    """Closes a client whose ``init_client`` call was cancelled while it was being built."""
-    if build.cancelled() or build.exception() is not None:
-        return
-    try:
-        close_result = build.result().close()
-        if inspect.isawaitable(close_result):
-            # The loop keeps only a weak reference to the task; hold it until it is done.
-            task = asyncio.ensure_future(close_result)
-            _closing_tasks.add(task)
-            task.add_done_callback(_closing_tasks.discard)
-    except Exception:
-        pass
-
-
-_closing_tasks: set[asyncio.Future[Any]] = set()
+async def _await(awaitable: Any) -> None:
+    await awaitable
 
 
 def _release_otel_globals() -> None:
@@ -472,20 +602,24 @@ async def shutdown() -> None:
     provider so a later ``init_client`` can install its own — see
     ``_release_otel_globals``.
     """
-    global _client, _tracer_provider, _owns_otel_globals, _sdk_options, _ai_invoked
-
-    local_client = _client
-    local_provider = _tracer_provider
-    owned_globals = _owns_otel_globals
+    global _client, _attempt, _tracer_provider, _owns_otel_globals
+    global _sdk_options, _ai_invoked
 
     run_shutdown_hooks()
 
     # Null the singleton before any awaits so a second call is a no-op.
+    # Dropping the attempt abandons one still connecting: it closes the client
+    # it builds instead of adopting it after this shutdown.
     # Options reset even when no client was initialized: configure() does not
     # require one, and shutdown is what puts the process back to built-in defaults.
-    _client = None
-    _tracer_provider = None
-    _owns_otel_globals = False
+    with _state_lock:
+        local_client = _client
+        local_provider = _tracer_provider
+        owned_globals = _owns_otel_globals
+        _client = None
+        _attempt = None
+        _tracer_provider = None
+        _owns_otel_globals = False
     _sdk_options = SDKOptions()
     _ai_invoked = False
     reset_ai_sdk_info()
@@ -525,11 +659,14 @@ def _set_client_for_testing(c: Any) -> None:
 
 def _reset_for_testing() -> None:
     """Test helper — clear all singleton state."""
-    global _client, _tracer_provider, _owns_otel_globals, _sdk_options, _ai_invoked
-    owned_globals = _owns_otel_globals
-    _client = None
-    _tracer_provider = None
-    _owns_otel_globals = False
+    global _client, _attempt, _tracer_provider, _owns_otel_globals
+    global _sdk_options, _ai_invoked
+    with _state_lock:
+        owned_globals = _owns_otel_globals
+        _client = None
+        _attempt = None
+        _tracer_provider = None
+        _owns_otel_globals = False
     _sdk_options = SDKOptions()
     _ai_invoked = False
     # A failed reset should fail the test rather than leak state into the next one.
