@@ -206,7 +206,9 @@ The client uses **lazy initialization**: importing the package does not connect 
 Call `init_client()` explicitly when you want to:
 - Pass SDK or telemetry options programmatically (overriding env vars)
 - Initialize at startup before the first AI call (e.g. to avoid latency on the first request)
-- Fail fast at boot if `LD_SDK_KEY` is missing
+- Fail fast at boot if `LD_SDK_KEY` is missing, rejected, or LaunchDarkly is unreachable
+
+A failed initialization is not cached, so the process recovers without a restart once LaunchDarkly is reachable again. The cost is that while it is not, every call that initializes lazily, `inspect_config()` included, waits up to 10 seconds for a new LaunchDarkly client before it fails, and concurrent calls each build their own in a worker thread. To keep an outage from adding that wait to every request, call `init_client()` at startup and handle its error there.
 
 ```python
 import asyncio
@@ -231,8 +233,8 @@ asyncio.run(main())
 | Export | Description |
 |---|---|
 | `configure(options=...)` | Set process-wide behavior defaults. Keyword-only. Separate from `init_client`. |
-| `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. |
-| `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery. |
+| `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. Raises `RuntimeError` when the client has not initialized within 10 seconds or its SDK key was rejected; a later call retries. |
+| `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery and does not check whether that client has initialized. |
 | `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
 | `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. Restores the built-in SDK defaults. |
 | `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
