@@ -70,6 +70,7 @@ def _make_stub_client() -> MagicMock:
     stub.flush = AsyncMock()
     stub.close = AsyncMock()
     stub.wait_for_initialization = AsyncMock()
+    stub.is_initialized = MagicMock(return_value=True)
     return stub
 
 
@@ -209,6 +210,16 @@ class TestInitClientBYOC:
             stub.track.call_args.args[2]["aiSdkName"] == "launchdarkly-ai-openai-agents"
         )
 
+    async def test_does_not_check_whether_a_passed_client_initialized(
+        self,
+    ) -> None:
+        # The caller built a passed client and owns its readiness.
+        stub = _make_stub_client()
+        stub.is_initialized = MagicMock(return_value=False)
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            assert await init_client(client=stub) is stub
+        stub.is_initialized.assert_not_called()
+
     async def test_does_not_call_node_sdk(self) -> None:
         stub = _make_stub_client()
         mock_import = MagicMock()
@@ -329,6 +340,47 @@ class TestInitClientSDKKeyPath:
                     lifecycle_module, "_setup_telemetry", return_value=None
                 ):
                     assert await init_client() is healthy
+
+    async def test_an_sdk_client_that_did_not_initialize_fails_the_call(
+        self,
+    ) -> None:
+        # The SDK constructor returns normally when start_wait runs out or the
+        # key is rejected. Adopting that client served every AI Config
+        # disabled, with no error at startup.
+        failed = _make_stub_client()
+        failed.is_initialized = MagicMock(return_value=False)
+        healthy = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(side_effect=[failed, healthy])
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="failed to initialize"):
+                        await init_client()
+                    failed.close.assert_awaited_once()
+                    with pytest.raises(RuntimeError, match="init_client"):
+                        get_client()
+
+                    assert await init_client() is healthy
+        assert mock_ld.LDClient.call_count == 2
+        assert get_client() is healthy
+
+    async def test_a_close_error_does_not_replace_the_initialization_error(
+        self,
+    ) -> None:
+        failed = _make_stub_client()
+        failed.is_initialized = MagicMock(return_value=False)
+        failed.close = AsyncMock(side_effect=OSError("close failed"))
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=failed)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="failed to initialize"):
+                        await init_client()
+        assert lifecycle_module._client is None
 
     async def test_retries_after_a_failed_init_instead_of_replaying_it(self) -> None:
         # A failure must not be cached: an app whose first call ran before its

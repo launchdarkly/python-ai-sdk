@@ -233,7 +233,10 @@ async def init_client(
     Idempotent: later calls return the existing client and ignore every option.
     An option not listed above is logged as a warning and ignored.
 
-    Returns the initialized ``LDClientInterface`` instance.
+    Returns the initialized ``LDClientInterface`` instance. Raises
+    ``RuntimeError`` when the LaunchDarkly client it builds has not initialized
+    within 10 seconds or its SDK key was rejected; a later call retries. A
+    client passed as *client* is not checked.
     """
     global _client
 
@@ -319,15 +322,24 @@ async def init_client(
     # A concurrent first call may have won while this one was connecting: keep
     # its client and close ours, so only one streaming connection survives.
     if _client is not None:
-        try:
-            close_result = ld_client.close()
-            if inspect.isawaitable(close_result):
-                await close_result
-        except Exception:
-            pass
+        await _close_quietly(ld_client)
         flush_ai_sdk_info(_client)
         flush_sdk_usage(_client)
         return _client
+
+    # The constructor returns normally both when start_wait runs out and when
+    # the service rejects the SDK key; it only logs. Adopting that client would
+    # serve every AI Config disabled with no error, so fail here. Close it too:
+    # a failed call is not cached, and each retry would otherwise leave a
+    # streaming connection open.
+    if not ld_client.is_initialized():
+        await _close_quietly(ld_client)
+        raise RuntimeError(
+            "LaunchDarkly client failed to initialize: it did not connect within "
+            "10 seconds, or the SDK key was rejected. Check LD_SDK_KEY (or the "
+            "sdkKey option) and that LaunchDarkly is reachable; the LaunchDarkly "
+            "SDK's log has the cause."
+        )
 
     # As on the BYOC path: only a fully set-up client becomes the singleton. We
     # built this one, so close it on failure — it holds a streaming connection
@@ -335,17 +347,26 @@ async def init_client(
     try:
         _setup_telemetry(sdk_key, opts)
     except Exception:
-        try:
-            close_result = ld_client.close()
-            if inspect.isawaitable(close_result):
-                await close_result
-        except Exception:
-            pass
+        await _close_quietly(ld_client)
         raise
     _client = ld_client
     flush_ai_sdk_info(_client)
     flush_sdk_usage(_client)
     return _client
+
+
+async def _close_quietly(ld_client: Any) -> None:
+    """Closes a client ``init_client`` built and will not adopt.
+
+    An error from ``close`` is swallowed so it cannot replace the reason the
+    client is being discarded.
+    """
+    try:
+        close_result = ld_client.close()
+        if inspect.isawaitable(close_result):
+            await close_result
+    except Exception:
+        pass
 
 
 def _close_abandoned_client(build: asyncio.Future[Any]) -> None:
