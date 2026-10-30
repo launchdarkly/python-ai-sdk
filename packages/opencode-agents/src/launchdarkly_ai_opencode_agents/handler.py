@@ -892,7 +892,7 @@ class OpenCodeHandler(ProviderHandler):
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         capture = effective_capture_content(self._capture_content_override)
-        span = start_root_span(config, variables or {})
+        span = start_root_span(config, variables or {}, capture_content=capture)
         parent = parent_context_of(span)
         ended: set[int] = set()
         open_tool_spans: dict[str, Any] = {}

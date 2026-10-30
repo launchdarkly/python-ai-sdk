@@ -20,6 +20,7 @@ from launchdarkly_ai_server import (
     content_to_text,
     end_span_once,
     image_block_to_url,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -219,7 +220,7 @@ def _build_tools(
             },
         }
         for name, tool in (config_value.get("tools") or {}).items()
-        if callable(tool_handlers.get(name))
+        if is_function_tool(tool_handlers.get(name), name)
     ]
 
 
@@ -279,7 +280,12 @@ def _request(
     return parameters
 
 
-def _root_span(config_value: AiConfigRep, variables: dict[str, Any]) -> Any:
+def _root_span(
+    config_value: AiConfigRep,
+    variables: dict[str, Any],
+    *,
+    capture_content: bool = False,
+) -> Any:
     span = trace.get_tracer("@launchdarkly/ai-litellm-messages").start_span(
         "invoke_agent"
     )
@@ -287,7 +293,7 @@ def _root_span(config_value: AiConfigRep, variables: dict[str, Any]) -> Any:
     set_model_identity_attributes(
         span, _provider_name(config_value), _model_name(config_value), "litellm"
     )
-    set_ld_span_attributes(span, variables)
+    set_ld_span_attributes(span, variables, capture_content=capture_content)
     return span
 
 
@@ -466,7 +472,7 @@ def _create_litellm_messages_handler(
         values = variables or {}
         messages = _build_messages(config_value, user_input, values, history)
         tools = _build_tools(config_value, handlers)
-        root = _root_span(config_value, values)
+        root = _root_span(config_value, values, capture_content=capture_content)
         parent = _parent_context(root)
         total = SpanUsage()
         usage_reported = False
@@ -607,7 +613,7 @@ async def _stream(
 ) -> AsyncGenerator[dict[str, Any], None]:
     messages = _build_messages(config_value, user_input, variables, history)
     tools = _build_tools(config_value, handlers)
-    root = _root_span(config_value, variables)
+    root = _root_span(config_value, variables, capture_content=capture_content)
     parent = _parent_context(root)
     total = SpanUsage()
     usage_reported = False

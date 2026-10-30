@@ -1,5 +1,5 @@
 """
-LangChain Agents handler — uses LangGraph's create_react_agent / StateGraph.
+LangChain Agents handler — uses LangChain's create_agent / LangGraph's StateGraph.
 Mirrors the TypeScript @launchdarkly/ai-langchain-agents handler.
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -24,6 +24,7 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    is_function_tool,
     lang_chain_content_text,
     lang_chain_span_messages,
     lang_chain_span_usage,
@@ -400,11 +401,14 @@ def _build_agent_tools(
 
     result = []
     for name, tool_cfg in config_tools.items():
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+            continue
         schema = tool_cfg.get("parameters") or {}
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
             fn = tool_handlers.get(_name)
-            # A NativeTool reaches here unwrapped on the offline evaluations path.
+            # The builder skips a NativeTool, so this guards only a handler that is not callable.
             if not callable(fn):
                 raise ValueError(f'No handler registered for tool "{_name}"')
             # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
@@ -640,9 +644,12 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 
 
 def create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool | None = None
+    llm: Any = None,
+    *,
+    providers: Sequence[str] | None = None,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
-    """Creates a ``ProviderHandler`` for LangChain via ``create_react_agent``.
+    """Creates a ``ProviderHandler`` for LangChain via ``langchain.agents.create_agent``.
 
     Pass *llm* as a chat model instance, or as a function ``(config) -> model`` that is
     called after flag evaluation so ``model.parameters`` can be applied unchanged.
@@ -652,15 +659,24 @@ def create_langchain_agents_handler(
     which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
     for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
     meaning models, token counts, timings and tool names.
+
+    *providers* limits which ``config.provider.name`` values this wildcard accepts.
+    Omit it to match every provider. Names must match the config exactly, for example
+    ``["Bedrock"]``.
     """
     report_usage(
         "langchain-agents.createLangChainAgentsHandler", PACKAGE_NAME, __version__
     )
-    return _create_langchain_agents_handler(llm, capture_content=capture_content)
+    return _create_langchain_agents_handler(
+        llm, providers=providers, capture_content=capture_content
+    )
 
 
 def _create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool | None = None
+    llm: Any = None,
+    *,
+    providers: Sequence[str] | None = None,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_langchain_agents_handler`, used by this package's wrappers."""
     content_override = capture_content
@@ -679,7 +695,7 @@ def _create_langchain_agents_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` below can tell an open root
         # from a closed one without asking the span. A mock span answers `is_recording()`
@@ -715,13 +731,12 @@ def _create_langchain_agents_handler(
                 )
             base_model = await _resolve_base_model(config, llm)
 
-            langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
-            create_react_agent = langgraph_prebuilt.create_react_agent
+            create_agent = importlib.import_module("langchain.agents").create_agent
             tools = _build_agent_tools(config.get("tools") or {}, th)
-            agent = create_react_agent(
+            agent = create_agent(
                 base_model,
                 tools,
-                **({"prompt": system_prompt} if system_prompt else {}),
+                **({"system_prompt": system_prompt} if system_prompt else {}),
             )
             result = await agent.ainvoke(
                 {"messages": initial_messages},
@@ -818,6 +833,7 @@ def _create_langchain_agents_handler(
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
         capture_content=content_override,
+        providers=providers,
     )
 
 
@@ -843,7 +859,7 @@ async def _stream_gen(
     """
     import importlib
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     system_prompt = _extract_system_prompt(config, variables)
@@ -872,13 +888,12 @@ async def _stream_gen(
             )
         base_model = await _resolve_base_model(config, llm)
 
-        langgraph_prebuilt = importlib.import_module("langgraph.prebuilt")
-        create_react_agent = langgraph_prebuilt.create_react_agent
+        create_agent = importlib.import_module("langchain.agents").create_agent
         tools = _build_agent_tools(config.get("tools") or {}, tool_handlers)
-        agent = create_react_agent(
+        agent = create_agent(
             base_model,
             tools,
-            **({"prompt": system_prompt} if system_prompt else {}),
+            **({"system_prompt": system_prompt} if system_prompt else {}),
         )
 
         run_usage = create_run_usage()
@@ -999,14 +1014,17 @@ def langchain_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
-    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
-    # asking for content on spans got a TypeError instead of content.
+    # Lifted out of kwargs: capture_content and providers configure the handler, variables belong
+    # to the invocation. Leaving them in would pass them to config(), which takes none of them, so a
+    # caller asking for content on spans got a TypeError instead of content.
     report_usage("langchain-agents.langchainAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
+    providers = kwargs.pop("providers", None)
     return _config(
         key=config_key,
-        handler=_create_langchain_agents_handler(capture_content=capture_content),
+        handler=_create_langchain_agents_handler(
+            providers=providers, capture_content=capture_content
+        ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

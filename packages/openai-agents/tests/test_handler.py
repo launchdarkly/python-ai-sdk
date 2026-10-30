@@ -825,6 +825,26 @@ class TestRootSpanAttributes:
         assert attrs["gen_ai.usage.output_tokens"] == 5
         assert attrs["gen_ai.usage.total_tokens"] == 15
 
+    async def test_capture_on_writes_the_raw_variation_as_the_result_value(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(
+            run=_make_run([{"output": _text_output("hi")}])
+        )
+        raw = {"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}}
+        vs = {
+            "__ld": {"configKey": "my-config", "variationKey": "v1", "runId": "r"},
+            "__ldValue": raw,
+        }
+        with ctx, _patched_agents(agents_mod):
+            await create_openai_agents_handler(capture_content=True)(
+                CONFIG, "q", {}, vs
+            )
+        (name, attrs), *_ = rec.root.events
+        assert name == "feature_flag"
+        assert attrs["feature_flag.result.value"] == json.dumps(raw)
+
     async def test_feature_flag_event_on_root_only(self) -> None:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(
@@ -836,16 +856,22 @@ class TestRootSpanAttributes:
                 "variationKey": "v1",
                 "runId": "run-abc",
                 "environmentId": "env-1",
-            }
+            },
+            "__ldValue": {"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}},
         }
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agents_handler()(CONFIG, "q", {}, vs)
+            await create_openai_agents_handler(capture_content=False)(
+                CONFIG, "q", {}, vs
+            )
         assert [event for event in rec.root.events if event[0] == "feature_flag"] == [
             (
                 "feature_flag",
                 {
                     "feature_flag.key": "my-config",
                     "feature_flag.provider.name": "LaunchDarkly",
+                    "feature_flag.result.variant": "v1",
+                    # Content capture is off, so the key stands in for the variation.
+                    "feature_flag.result.value": '"v1"',
                     "feature_flag.set.id": "env-1",
                 },
             )

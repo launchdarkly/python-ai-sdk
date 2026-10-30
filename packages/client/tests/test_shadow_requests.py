@@ -327,6 +327,22 @@ class TestPrimary:
         assert "shadowConfiguration" not in a.calls[0]["config"]
         assert "shadowConfiguration" not in b.calls[0]["config"]
 
+    async def test_captured_variation_value_has_no_shadow_configuration(self) -> None:
+        _use(_make_client(_variation_a()))
+        a = _Recorder("TestProvider", "real answer")
+        capturing = ProviderHandler(
+            fn=a._fn,  # type: ignore[arg-type]
+            provides_for=("TestProvider", "messages"),
+            capture_content=True,
+        )
+        await shadow_config(
+            key="flag", handler=[capturing, _Recorder("ShadowProvider").handler]
+        ).invoke("hi", CONTEXT)
+        await sr._wait_for_shadows_for_testing()
+        captured = a.calls[0]["variables"]["__ldValue"]
+        assert captured["_ldMeta"]["variationKey"] == "a"
+        assert "shadowConfiguration" not in captured
+
     async def test_primary_failure_starts_no_shadows(self) -> None:
         client = _use(_make_client(_variation_a()))
         a = _Recorder("TestProvider", error=RuntimeError("primary failed"))

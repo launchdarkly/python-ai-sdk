@@ -6,11 +6,15 @@ mirroring the TypeScript toLangGraph implementation.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, TypedDict
+
+from langchain_core.tools import InjectedToolCallId
+from pydantic import BaseModel
 
 from launchdarkly_ai_server import (
     GraphDefinition,
@@ -20,6 +24,7 @@ from launchdarkly_ai_server import (
     NativeTool,
     compose_history,
     get_client,
+    is_function_tool,
     make_track_data,
     parse_template,
     report_usage,
@@ -54,6 +59,82 @@ except ImportError:
     _HAS_LANGGRAPH = False
 
 
+_HANDOFF_IGNORED = "Ignored: only the first transfer in a turn routes."
+
+
+class _HandoffArgs(BaseModel):
+    """Hand-off tool schema: the model passes no arguments, and LangChain injects
+    the call id (a dict schema would skip the injection)."""
+
+    tool_call_id: Annotated[str, InjectedToolCallId]
+
+
+def _content_text(content: Any) -> str:
+    """The text parts of a message's content, joined with no separator."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text") or ""
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+# Message `type` values, chunks included (an AIMessageChunk's type is not "ai").
+_AI_TYPES = frozenset({"ai", "AIMessageChunk"})
+_TOOL_TYPES = frozenset({"tool", "ToolMessageChunk"})
+
+
+def _to_neutral_history(
+    messages: list[Any], ai_message: Any, human_message: Any
+) -> list[Any]:
+    """Rewrite the history a node finds when it is entered as provider-neutral
+    text, so a target on another provider never sees the previous node's tool
+    or reasoning blocks (spec §2.x.3). Human and system messages pass through."""
+    out: list[Any] = []
+    calls: list[dict[str, Any]] = []
+    results: list[Any] = []
+
+    def _flush() -> None:
+        if not results:
+            return
+        order = {c.get("id"): i for i, c in enumerate(calls)}
+        lines = []
+        for r in sorted(results, key=lambda r: order.get(r.tool_call_id, len(calls))):
+            i = order.get(r.tool_call_id)
+            name = calls[i]["name"] if i is not None else getattr(r, "name", "") or ""
+            lines.append(f"[Tool result] {name}: {_content_text(r.content)}")
+        out.append(human_message("\n".join(lines)))
+        results.clear()
+
+    for m in messages:
+        if m.type in _TOOL_TYPES:
+            results.append(m)
+            continue
+        _flush()
+        if m.type not in _AI_TYPES:
+            out.append(m)
+            continue
+        calls = list(getattr(m, "tool_calls", None) or [])
+        text = _content_text(m.content)
+        lines = [text] if text else []
+        lines += [
+            "[Tool call] {} {}".format(
+                c["name"],
+                json.dumps(
+                    c.get("args") or {}, separators=(",", ":"), ensure_ascii=False
+                ),
+            )
+            for c in calls
+        ]
+        if lines:
+            out.append(ai_message("\n".join(lines)))
+    _flush()
+    return out
+
+
 def _sanitize_name(key: str) -> str:
     return re.sub(r"[^a-z0-9_-]", "_", key, flags=re.IGNORECASE)
 
@@ -83,6 +164,8 @@ def _build_node_tools(
 
     result = []
     for name, tool_cfg in node.config["tools"].items():
+        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+            continue
         schema = tool_cfg.get("parameters") or {}
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
@@ -173,6 +256,8 @@ def to_lang_graph(
 
         HumanMessage = lc_msgs.HumanMessage
         SystemMessage = lc_msgs.SystemMessage
+        ToolMessage = lc_msgs.ToolMessage
+        AIMessage = lc_msgs.AIMessage
 
         vs = variables or {}
         def_obj: GraphDefinition = await def_promise
@@ -257,26 +342,55 @@ def to_lang_graph(
                 langgraph_types = importlib.import_module("langgraph.types")
                 Command = langgraph_types.Command
 
+                # The node's last model call sets "first" (its first hand-off call
+                # id) and "call_ids"; the tools step sets "handed_off" when that
+                # call routes. "start" is where the node's current visit began.
+                routing: dict[str, Any] = {
+                    "first": None,
+                    "handed_off": False,
+                    "call_ids": set(),
+                    "start": 0,
+                }
+
                 handoff_tools = []
                 for edge in outgoing:
                     target_key = _sanitize_name(edge.target_key)
 
                     async def _handoff_exec(
+                        tool_call_id: Annotated[str, InjectedToolCallId],
                         _target: str = target_key,
+                        _target_raw: str = edge.target_key,
                         _node: GraphNode = node,
                     ) -> Any:
+                        # Only the first hand-off in a model message routes, as in graph().
+                        if tool_call_id != routing["first"]:
+                            return _HANDOFF_IGNORED
+                        routing["handed_off"] = True
                         if ld_context:
                             td = make_track_data(_node, def_obj.key, run_id)
                             get_client().track(
                                 "$ld:ai:graph:handoff_success", ld_context, td, 1
                             )
-                        return Command(goto=_target)
+                        # The ToolMessage answers the call, so the next model call
+                        # never sees an unanswered tool call.
+                        return Command(
+                            goto=_target,
+                            update={
+                                "messages": [
+                                    ToolMessage(
+                                        content=f"Handed off to {_target_raw}.",
+                                        tool_call_id=tool_call_id,
+                                        name=f"transfer_to_{_target}",
+                                    )
+                                ]
+                            },
+                        )
 
                     ht = tool_fn(
                         f"transfer_to_{_sanitize_name(edge.target_key)}",
                         _handoff_exec,
                         description=f"Transfer control to the {edge.target_key} agent",
-                        args_schema={},
+                        args_schema=_HandoffArgs,
                     )
                     handoff_tools.append(ht)
 
@@ -299,25 +413,48 @@ def to_lang_graph(
                     node_start = time.monotonic()
 
                     system_prompt = _build_system_prompt(_node, vs)
-                    conv_messages: list[Any] = state.get("messages", [])
+                    state_messages: list[Any] = state.get("messages", [])
+                    last = state_messages[-1] if state_messages else None
+                    # A tool result for this node's own last call continues its
+                    # tool loop; anything else means the node was just entered.
+                    if not (
+                        last is not None
+                        and last.type in _TOOL_TYPES
+                        and last.tool_call_id in routing["call_ids"]
+                    ):
+                        routing["start"] = len(state_messages)
+                    conv_messages = [
+                        *_to_neutral_history(
+                            state_messages[: routing["start"]], AIMessage, HumanMessage
+                        ),
+                        *state_messages[routing["start"] :],
+                    ]
                     full_messages = (
                         [SystemMessage(system_prompt), *conv_messages]
                         if system_prompt
                         else list(conv_messages)
                     )
 
+                    # No parallel_tool_calls: Bedrock Converse rejects it. The
+                    # hand-off tools keep only the first hand-off instead.
                     bound = (
-                        chat_model.bind_tools(
-                            all_tools,
-                            **(
-                                {"parallel_tool_calls": False} if is_multi_child else {}
-                            ),
-                        )
-                        if all_tools
-                        else chat_model
+                        chat_model.bind_tools(all_tools) if all_tools else chat_model
                     )
 
                     result_msg = await bound.ainvoke(full_messages)
+                    routing["first"] = next(
+                        (
+                            tc.get("id")
+                            for tc in getattr(result_msg, "tool_calls", None) or []
+                            if tc.get("name", "").startswith("transfer_to_")
+                        ),
+                        None,
+                    )
+                    routing["handed_off"] = False
+                    routing["call_ids"] = {
+                        tc.get("id")
+                        for tc in getattr(result_msg, "tool_calls", None) or []
+                    }
                     usage = _extract_usage(result_msg)
                     total_usage["input"] += usage["input"]
                     total_usage["output"] += usage["output"]
@@ -363,27 +500,28 @@ def to_lang_graph(
                         builder.add_edge(f"{node_key}_tools", node_key)
                     else:
                         builder.add_edge(node_key, END)
-                elif is_multi_child:
-                    if all_tools:
-                        builder.add_conditional_edges(
-                            node_key,
-                            tools_condition,
-                            {"tools": f"{node_key}_tools", "__end__": END},
-                        )
-                        builder.add_edge(f"{node_key}_tools", node_key)
-                    else:
-                        builder.add_edge(node_key, END)
                 else:
-                    child_key = _sanitize_name(outgoing[0].target_key)
-                    if all_tools:
-                        builder.add_conditional_edges(
-                            node_key,
-                            tools_condition,
-                            {"tools": f"{node_key}_tools", "__end__": child_key},
-                        )
-                        builder.add_edge(f"{node_key}_tools", node_key)
-                    else:
-                        builder.add_edge(node_key, child_key)
+                    # A non-terminal node always has hand-off tools. Ending the turn
+                    # without one ends the run (multi-child) or moves to the child.
+                    builder.add_conditional_edges(
+                        node_key,
+                        tools_condition,
+                        {
+                            "tools": f"{node_key}_tools",
+                            "__end__": END
+                            if is_multi_child
+                            else _sanitize_name(outgoing[0].target_key),
+                        },
+                    )
+                    # No static edge back to the node: after a hand-off the Command
+                    # routes to the target and the node must not run again.
+                    builder.add_conditional_edges(
+                        f"{node_key}_tools",
+                        lambda _s, _r=routing, _k=node_key: (
+                            END if _r["handed_off"] else _k
+                        ),
+                        [node_key, END],
+                    )
 
             # Pre-order traversal (root first, to mirror TS traverse)
             pre_visited: set[str] = set()
@@ -424,18 +562,7 @@ def to_lang_graph(
             last_msg = result_messages[-1] if result_messages else None
 
             def _content_str(msg: Any) -> str:
-                if msg is None:
-                    return ""
-                c = msg.content
-                if isinstance(c, str):
-                    return c
-                if isinstance(c, list):
-                    return "".join(
-                        part.get("text", "") if isinstance(part, dict) else ""
-                        for part in c
-                        if isinstance(part, dict) and part.get("type") == "text"
-                    )
-                return ""
+                return "" if msg is None else _content_text(msg.content)
 
             final_output = _content_str(last_msg)
 

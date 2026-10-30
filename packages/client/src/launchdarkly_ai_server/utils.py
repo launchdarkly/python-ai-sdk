@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard, cast
 
 from .sdk_usage import report_usage
 from .types import (
+    NATIVE_TOOL_KEY,
     AiConfigRep,
     GraphNode,
     InputTokenDetails,
+    NativeTool,
     ProviderHandler,
     UsageDict,
     VariationMeta,
@@ -18,12 +21,16 @@ from .types import (
     _StreamFn,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def create_handler(
     provides_for: tuple[str, Literal["agent", "messages"]],
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
     capture_content: bool | None = None,
+    *,
+    providers: Sequence[str] | None = None,
 ) -> ProviderHandler:
     """
     Wraps a plain async callable in a :class:`ProviderHandler` with the given
@@ -32,9 +39,14 @@ def create_handler(
     ``capture_content`` is this handler's override. ``None`` reads the process
     default from :func:`configure` when the value is used. ``True`` or ``False``
     overrides that default.
+
+    ``providers`` is consulted only when ``provides_for`` starts with ``"*"``.
+    It limits which ``config.provider.name`` values that wildcard accepts.
     """
     report_usage("client.createHandler")
-    return _create_handler(provides_for, fn, stream_fn, capture_content)
+    return _create_handler(
+        provides_for, fn, stream_fn, capture_content, providers=providers
+    )
 
 
 def _create_handler(
@@ -42,13 +54,29 @@ def _create_handler(
     fn: _HandlerFn,
     stream_fn: _StreamFn | None = None,
     capture_content: bool | None = None,
+    *,
+    providers: Sequence[str] | None = None,
 ) -> ProviderHandler:
-    """Non-reporting :func:`create_handler`, used by the package factories."""
+    """Non-reporting :func:`create_handler`, used by the package factories.
+
+    Wrapping a :class:`ProviderHandler` again keeps its streaming
+    implementation, its explicit ``capture_content`` override, and its
+    ``providers`` allowlist unless new ones are passed, as of the moment it
+    is wrapped. An unset inner value stays unset.
+    """
+    if isinstance(fn, ProviderHandler):
+        if stream_fn is None:
+            stream_fn = fn._stream_fn
+        if capture_content is None:
+            capture_content = fn._capture_content_override
+        if providers is None:
+            providers = fn.providers
     return ProviderHandler(
         fn=fn,
         provides_for=provides_for,
         stream_fn=stream_fn,
         capture_content=capture_content,
+        providers=providers,
     )
 
 
@@ -70,6 +98,77 @@ def model_parameters(config: AiConfigRep) -> dict[str, Any]:
     model = config.get("model") if isinstance(config, dict) else None
     parameters = model.get("parameters") if isinstance(model, dict) else None
     return dict(parameters) if isinstance(parameters, dict) else {}
+
+
+def wildcard_covers(handler: Any, provider: str | None) -> bool:
+    """Whether a ``"*"`` handler accepts *provider*. An allowlist is a filter; an absent one accepts every name."""
+    key = handler_key(handler)
+    if key is None or key[0] != "*":
+        return False
+    allow = getattr(handler, "providers", None)
+    if allow is None:
+        return True
+    return provider is not None and provider in tuple(allow)
+
+
+def best_wildcard(handlers: list[Any], provider: str | None, mode: str) -> Any | None:
+    """
+    The ``"*"`` handler of *mode* that accepts *provider*.
+
+    A scoped list beats an unscoped wildcard. Among scoped lists that contain
+    the name, the shorter list wins, and equal lengths keep the earlier
+    registration.
+    """
+    scoped: list[tuple[int, int, Any]] = []
+    unscoped: Any | None = None
+    for index, handler in enumerate(handlers):
+        key = handler_key(handler)
+        if key is None or key[1] != mode:
+            continue
+        if not wildcard_covers(handler, provider):
+            continue
+        allow = getattr(handler, "providers", None)
+        if allow is None:
+            if unscoped is None:
+                unscoped = handler
+            continue
+        scoped.append((len(tuple(allow)), index, handler))
+    if scoped:
+        scoped.sort(key=lambda item: (item[0], item[1]))
+        return scoped[0][2]
+    return unscoped
+
+
+def select_mode_handler(
+    handlers: list[Any], provider: str | None, mode: str
+) -> Any | None:
+    """Exact ``(provider, mode)`` first, then the best wildcard of that mode.
+
+    *mode* is compared after :func:`normalize_mode`, through :func:`handler_key`.
+    """
+    mode = normalize_mode(mode)
+    if provider:
+        exact = next(
+            (
+                handler
+                for handler in handlers
+                if handler_key(handler) == (provider, mode)
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact
+    return best_wildcard(handlers, provider, mode)
+
+
+def covers_provider_name(handler: Any, provider: str | None) -> bool:
+    """True when the handler names *provider* or its wildcard allowlist contains it, in any mode."""
+    key = handler_key(handler)
+    if key is None or provider is None:
+        return False
+    if key[0] == provider:
+        return True
+    return wildcard_covers(handler, provider)
 
 
 def collapse_messages_to_instructions(config: AiConfigRep) -> AiConfigRep:
@@ -114,6 +213,26 @@ def handler_key(
     ):
         return (provides_for[0], normalize_mode(provides_for[1]))
     return None
+
+
+def registration_key(
+    handler: Any,
+) -> tuple[tuple[str, str], tuple[str, ...] | None] | None:
+    """
+    Handler identity for :class:`Registry` and the evaluations duplicate check.
+
+    :func:`handler_key` (provider plus normalized mode, so ``completion`` and
+    ``messages`` collide), plus the allowlist as a set on a ``"*"`` handler.
+    Order and repeated names do not make a new identity. Routing ignores the
+    list on an exact handler, so it is not part of that handler's identity.
+    """
+    key = handler_key(handler)
+    if key is None:
+        return None
+    providers = getattr(handler, "providers", None)
+    if key[0] != "*" or providers is None:
+        return (key, None)
+    return (key, tuple(sorted(set(providers))))
 
 
 def number_or_zero(value: Any) -> int:
@@ -540,15 +659,18 @@ def select_handler(
     Selects a handler from *handlers* based on the provider and mode in *config*/*meta*.
 
     Resolution order:
-    1. Exact ``(provider, mode)`` match.
-    2. Wildcard ``("*", mode)`` match — for multi-provider adapters like LangChain.
-    3. (Non-strict only) Provider-only match, then single-handler fallback.
+    1. Exact ``(provider, mode)`` match. A ``providers`` list on an exact handler is ignored.
+    2. Wildcard ``("*", mode)`` whose ``providers`` list contains the name. The
+       shortest list wins; equal lengths keep the earlier registration.
+    3. Unscoped wildcard ``("*", mode)`` (``providers`` is ``None``).
+    4. (Non-strict only) Provider-only match, then single-handler fallback.
+       A sole handler whose allowlist omits the name is not used.
 
-    When *strict* is ``True`` (default, used by ``config()``), steps 1–2 are tried
-    and a descriptive error is raised if neither matches.
+    When *strict* is ``True`` (default, used by ``config()``), steps 1–3 are tried
+    and a descriptive error is raised if none match.
 
     When *strict* is ``False`` (used by ``graph()``), resolution falls back
-    progressively: exact match → wildcard match → provider-only match → single-handler fallback.
+    progressively through the provider-only match and the single-handler fallback.
     """
     provider = (
         (config.get("provider") or {}).get("name") if isinstance(config, dict) else None
@@ -558,19 +680,13 @@ def select_handler(
 
     mode = normalize_mode(meta.get("mode") if isinstance(meta, dict) else None)
 
-    exact = next((h for h in handlers if handler_key(h) == (provider, mode)), None)
-    if exact:
-        return exact
-
-    wildcard = next((h for h in handlers if handler_key(h) == ("*", mode)), None)
-    if wildcard:
-        return wildcard
+    chosen = select_mode_handler(handlers, provider, mode)
+    if chosen is not None:
+        return cast(ProviderHandler, chosen)
 
     if strict:
         has_coverage = any(
-            (key := handler_key(h)) is not None
-            and (key[0] == provider or key[0] == "*")
-            for h in handlers
+            covers_provider_name(handler, provider) for handler in handlers
         )
         if not has_coverage:
             raise ValueError(f"Handler for provider {provider} not found")
@@ -588,7 +704,11 @@ def select_handler(
         return by_provider
 
     if len(handlers) == 1:
-        return handlers[0]
+        only = handlers[0]
+        allow = getattr(only, "providers", None)
+        if allow is not None and provider not in tuple(allow):
+            raise ValueError(f"Handler for provider {provider} not found")
+        return only
 
     raise ValueError(f"Handler for provider {provider} not found")
 
@@ -780,7 +900,9 @@ def _without_span_attributes(variables: dict[str, Any] | None) -> dict[str, Any]
     }
 
 
-def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
+def set_ld_span_attributes(
+    span: Any, variables: dict[str, Any] | None, *, capture_content: bool | None = None
+) -> None:
     """
     Sets LaunchDarkly config-identifying attributes on an OTel span and emits
     the ``feature_flag`` span event required by the AI Config Monitoring Traces
@@ -802,10 +924,23 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
 
     Span event (required for AI Config Monitoring Traces tab correlation):
     ``name='feature_flag'`` with ``feature_flag.key``,
-    ``feature_flag.provider.name``, ``feature_flag.set.id`` (when
+    ``feature_flag.provider.name``, ``feature_flag.result.variant`` (the
+    served variation key, when non-empty), ``feature_flag.result.value``
+    (see below), ``feature_flag.set.id`` (when
     ``LD_ENVIRONMENT_ID`` is set or the TS SDK auto-resolved it),
     ``feature_flag.context.id``, and ``feature_flag.contextKeys`` (when
     ``ldContext`` has a usable identity).
+
+    ``feature_flag.result.value`` follows content capture. With
+    *capture_content* on and the raw variation in ``variables['__ldValue']``,
+    it is ``json.dumps`` of that variation, as the ``ldotel`` tracing hook
+    writes it with value inclusion on. Otherwise, when the variation key is
+    non-empty, it is ``json.dumps`` of the key, so a prompt never leaves the
+    process without consent. Otherwise it is omitted (native-graph spans).
+    *capture_content* left as ``None`` trusts the core: ``execute_and_track``
+    and ``execute_and_stream`` only pass ``__ldValue`` to a handler whose
+    effective setting is on, so the value is written whenever it is present.
+    Only an explicit ``False`` suppresses it.
     """
     span.set_attribute("launchdarkly.operation.type", "gen_ai")
     if not variables:
@@ -827,6 +962,15 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
         "feature_flag.key": ld.get("configKey", ""),
         "feature_flag.provider.name": "LaunchDarkly",
     }
+    variation_key = ld.get("variationKey")
+    if isinstance(variation_key, str) and variation_key:
+        feature_flag_attrs["feature_flag.result.variant"] = variation_key
+    if capture_content is not False and variables.get("__ldValue") is not None:
+        feature_flag_attrs["feature_flag.result.value"] = json.dumps(
+            variables["__ldValue"]
+        )
+    elif isinstance(variation_key, str) and variation_key:
+        feature_flag_attrs["feature_flag.result.value"] = json.dumps(variation_key)
     if ld.get("environmentId"):
         feature_flag_attrs["feature_flag.set.id"] = ld["environmentId"]
 
@@ -878,3 +1022,25 @@ def parse_json_with_possible_fences(raw_text: str) -> Any | None:
             pass
 
     return None
+
+
+_warned_native_tools: set[str] = set()
+
+
+def is_function_tool(handler: Any, name: str) -> TypeGuard[Callable[..., Any]]:
+    """
+    Whether a handler may send ``handler`` to the model as a function tool. A ``NativeTool``,
+    or the tracking stub ``wrap_tool_handlers`` makes from one, is a provider built-in, never a
+    function tool: a handler with no built-in for it skips it, warning once per tool key.
+    """
+    if isinstance(handler, NativeTool) or isinstance(
+        getattr(handler, NATIVE_TOOL_KEY, None), NativeTool
+    ):
+        if name not in _warned_native_tools:
+            _warned_native_tools.add(name)
+            logger.warning(
+                'Skipping native tool "%s": this handler has no built-in tool for it.',
+                name,
+            )
+        return False
+    return callable(handler)

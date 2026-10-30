@@ -106,6 +106,8 @@ The root also carries one span event, `feature_flag`, with these event attribute
 |---|---|
 | `feature_flag.key` | config key |
 | `feature_flag.provider.name` | `LaunchDarkly` |
+| `feature_flag.result.variant` | variation key, only when non-empty (graph spans may have none) |
+| `feature_flag.result.value` | with content capture on (the existing `capture_content` setting, including the `configure()` default) and a raw variation present: `json.dumps` of the variation as the LaunchDarkly SDK returned it (`_ldMeta` included), the same serialization as the `ldotel` tracing hook with value inclusion on. Otherwise, when the variation key is non-empty: `json.dumps` of the key (for example `"\"v1\""`), which also covers `graph()` roots. Otherwise absent (native-graph spans) |
 | `feature_flag.set.id` | environment id, only when present |
 | `feature_flag.context.id` | canonical context key, only when `variables.ldContext` has a usable identity |
 | `feature_flag.contextKeys` | compact JSON of per-kind keys, only when identity is present |
@@ -239,6 +241,26 @@ model-generated prose about the user's conversation, so it follows the judge han
 `capture_content` decision. It is written by default, and an explicit `False` on the judge's
 handler or the process default withholds it. The reasoning is always returned to the caller in
 `judgeResults` / `judge_results`; only the telemetry copy is gated.
+
+### Judge spans point at the run they graded
+
+A judge runs after the graded handler has ended its span, so its spans start a trace of their own,
+with their own `launchdarkly.run.id`. To tie them back, `run_judges` (inline) and `run_judge`
+(deferred) wrap each judge's run in `stamp_span_attributes`, so every SDK span of that run carries
+the graded run's identity, write-if-absent:
+
+| Span attribute | Value |
+|---|---|
+| `launchdarkly.judge.target.run.id` | graded run's `TrackData.runId` |
+| `launchdarkly.judge.target.config.key` | graded run's `TrackData.configKey` |
+| `launchdarkly.judge.target.variation.key` | graded run's `TrackData.variationKey` |
+
+The constants are `LD_JUDGE_TARGET_*` in `launchdarkly_ai_server/judges.py`. Inline judges read
+`base_track_data`; deferred judges read `JudgeTask.parent_track_data`. Each key is written only when
+its value is a non-empty string. They are identifiers, not content, so capture settings do not gate
+them. The judge's metric event already carries the graded `runId` in its `TrackData`; these
+attributes put the same link on the trace. Offline evaluations stamp `launchdarkly.evaluation_run.id`
+on every span of a row the same way.
 
 ---
 

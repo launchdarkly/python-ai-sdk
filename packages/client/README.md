@@ -48,6 +48,11 @@ No code changes are required — `init_client()` detects the packages at runtime
 
 ### Run an evaluation from code
 
+> **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include
+> Evaluations from Code in core. If you install `launchdarkly-ai-python`, upgrade
+> `launchdarkly-ai-server` too, because upgrading `launchdarkly-ai-python` alone can leave an older
+> one in place: `pip install --upgrade "launchdarkly-ai-server>=1.0.0"`.
+
 The evaluations harness reads an LD-hosted dataset, creates a new evaluation and API-source run, and invokes your handler once per row. Rows can then be scored by LaunchDarkly judges and local scorer functions; see [Score rows with judges and scorers](#score-rows-with-judges-and-scorers). Each success or error queues a `$ld:ai:offline-evals:generation` custom event containing the evaluation, run, dataset, and row identifiers plus output or error (`errorMessage` is included for `ERROR` rows), nested `usage.inputTokens`/`usage.outputTokens`, timing, and stable hashes. Dataset-owned input, expected output, metadata, and variables are not duplicated in the event. Each queued event is logged at `INFO` on the `launchdarkly_ai_server.evaluations.runner` logger with its RFC3339 UTC `emittedAt` timestamp and stable `eventId`, making it possible to compare SDK emission time with ClickHouse arrival time once that logger is enabled. The same `emittedAt` value is included in the event payload. Events are flushed before the summary is fetched and the call returns; handlers are never rerun to retry event delivery. Pass/fail is derived from LaunchDarkly's run summary.
 
 Each row is also exported as one trace on the tracer provider `init_client` registered: a `launchdarkly.dataset_row` root with the generation, its tool calls, and each criterion's `evaluate` span beneath it, all sharing the row's `gen_ai.conversation.id`. A provider handler traces its own call; for a plain function the runner writes the `chat` and `execute_tool` spans. Prompts, output, tool payloads, and judge explanations follow the same [`capture_content`](#process-wide-defaults) gate as every other span. The built-in default sends them. Setting capture to false removes them, including on these evaluation spans. The `$ld:ai:offline-evals:*` events still carry no transcript.
@@ -125,8 +130,8 @@ from launchdarkly_ai_server import (
 )
 
 
-def mentions_policy(row: DatasetRow, output: str | None) -> bool:
-    return "refund policy" in (output or "").lower()
+def mentions_policy(row: DatasetRow, output: str | None) -> float:
+    return 1.0 if "refund policy" in (output or "").lower() else 0.0
 
 
 result = await init_evaluations(project_key="my-project").run(
@@ -143,7 +148,7 @@ result = await init_evaluations(project_key="my-project").run(
 )
 ```
 
-`Scorer.fn` receives the `DatasetRow` the output was generated from plus the generated output, may be sync or async, and must return a bool or a number from 0 to 1; booleans become 1.0 or 0.0. `Judge.threshold` defaults to 0.5 and `Scorer.threshold` to 1.0 — a perfect score, which is what a boolean scorer wants — and both accept an optional `pass_rate_threshold`. Judge keys and scorer names share one `criterionType` namespace and must be unique within a run, case-insensitively, because that name is part of each result's deterministic event identity. `Judge.ground_truth_context` overrides what the judge is graded against when the dataset row's expected output is not it.
+`Scorer.fn` receives the `DatasetRow` the output was generated from plus the generated output, may be sync or async, and must return a **finite number from 0 to 1** — that is the whole contract, and nothing is coerced on your behalf. A scorer answering a yes/no question returns `1.0` or `0.0` itself; a `bool`, a `NaN`, or an out-of-range number is an `invalid_score` result. Returning one score type keeps a threshold comparison meaning the same thing for binary and graded scorers, and keeps a scorer that accidentally returns a non-score from passing silently — every non-empty value is truthy, so `return "high"` would otherwise score 1.0. `Judge.threshold` defaults to 0.5 and `Scorer.threshold` to 1.0 — a perfect score, which is what a yes/no scorer wants — and both accept an optional `pass_rate_threshold`. Judge keys and scorer names share one `criterionType` namespace and must be unique within a run, case-insensitively, because that name is part of each result's deterministic event identity. `Judge.ground_truth_context` overrides what the judge is graded against when the dataset row's expected output is not it.
 
 **The SDK reports scores and never rules on them.** LaunchDarkly derives each row's verdict at ingest by comparing the score against the criterion's stored threshold and success direction, so pass/fail policy is one server-side implementation that applies to every SDK version and to runs already recorded. A judge's direction lives on its AI Config and is injected server-side, keeping the one input a verdict turns on server-attested; a `Scorer` has no LaunchDarkly-side config to read, so it declares its own `success_direction` (default `"higher_is_better"` — set `"lower_is_better"` for a scorer that counts something unwanted, like a regex hit count).
 
@@ -192,7 +197,7 @@ Two limits keep a trajectory from spending the judge's context window: at most 5
 
 A tool result is now judge-prompt input. It stays literal for the same reason the generated output does: the judge config is handed to the handler unrendered and the handler makes exactly one template pass, so a `{{...}}` sequence coming back from a tool is never expanded into the judge prompt.
 
-**Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`. Each judge selects its handler from `handler` or `handlers` by its provider and mode, with the same rule as generation. There is no mode fallback: a messages-mode judge never runs on an agent handler. A judge's prompt must also match its handler's mode. Judges get no tools: the harness passes an empty tool map and removes `tools` from the judge config.
+**Judges are independent AI Configs, so handlers are routed per judge.** A judge may resolve to a different provider or mode than `generation`. Each judge selects its handler from `handler` or `handlers` by its provider and mode, with the same rule as generation. There is no mode fallback: a messages-mode judge never runs on an agent handler. A judge's prompt must also match its handler's mode. Judges get no tools: the harness passes an empty tool map and removes `tools` from the judge config. A wildcard's `providers` list, when set, accepts only those names: an exact provider match wins, then the shortest list that contains the name, then an unscoped `*`.
 
 Judges are resolved through flag delivery, and handlers are matched to them, **before** any evaluation records are created — a missing judge, a judge that no handler covers, or a judge whose prompt does not match its handler fails the run up front rather than after the generation spend. One error lists every judge with a problem. After that point a criterion failure never aborts the run: an unparseable judge response, an out-of-range score, and a raising handler or scorer each become a per-criterion `ERROR` event carrying a top-level `errorMessage` that describes the failure. A row whose generation errored is not scored at all: no judge or scorer runs for it and no criterion event is sent, because its generation `ERROR` event already records the row as failed. Event *delivery* is different: the backend needs one result per `(row, criterion)` to finish row accounting, so if tracking a criterion event fails, every remaining result is still attempted and flushed and then `run()` raises — rather than polling to its timeout with the cause hidden.
 
@@ -201,7 +206,9 @@ The client uses **lazy initialization**: importing the package does not connect 
 Call `init_client()` explicitly when you want to:
 - Pass SDK or telemetry options programmatically (overriding env vars)
 - Initialize at startup before the first AI call (e.g. to avoid latency on the first request)
-- Fail fast at boot if `LD_SDK_KEY` is missing
+- Fail fast at boot if `LD_SDK_KEY` is missing, rejected, or LaunchDarkly is unreachable
+
+A failed initialization is not cached, so the process recovers without a restart once LaunchDarkly is reachable again. The cost is that while it is not, every call that initializes lazily, `inspect_config()` included, waits up to 10 seconds for a new LaunchDarkly client before it fails, and concurrent calls each build their own in a worker thread. To keep an outage from adding that wait to every request, call `init_client()` at startup and handle its error there.
 
 ```python
 import asyncio
@@ -226,8 +233,8 @@ asyncio.run(main())
 | Export | Description |
 |---|---|
 | `configure(options=...)` | Set process-wide behavior defaults. Keyword-only. Separate from `init_client`. |
-| `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. |
-| `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery. |
+| `init_client(options?)` | Auto-discover and initialize `launchdarkly-server-sdk`. Optional — the first AI API call triggers lazy init when `LD_SDK_KEY` is set. Returns `Awaitable[LDClientInterface]`. Raises `RuntimeError` when the client has not initialized within 10 seconds or its SDK key was rejected; a later call retries. |
+| `init_client(client=...)` | **BYOC overload** — accept a pre-initialized `LDClientInterface`. Skips SDK auto-discovery and does not check whether that client has initialized. |
 | `get_client()` | Return the initialized `LDClientInterface`. Raises if `init_client` has not completed. |
 | `shutdown()` | Flush all events and telemetry, then close the client. Await before process exit. Restores the built-in SDK defaults. |
 | `inspect_config(key, context)` | Read an AI Config variation without invoking the model. Never raises. Returns `{"enabled", "config", "meta"}`. |
@@ -495,6 +502,11 @@ asyncio.run(main())
 ---
 
 ### Agent Skills
+
+> **Requires `launchdarkly-ai-server` 1.0.0 or later.** Earlier versions do not include Agent
+> Skills in core. If you install `launchdarkly-ai-python`, upgrade `launchdarkly-ai-server` too,
+> because upgrading `launchdarkly-ai-python` alone can leave an older one in place:
+> `pip install --upgrade "launchdarkly-ai-server>=1.0.0"`.
 
 Skills are versioned `SKILL.md` documents managed in LaunchDarkly and attached to AI Config
 variations by reference. The SDK tells you which skills a config references, retrieves their

@@ -24,7 +24,7 @@ ConversationIdSpanProcessor(_SpanProcessorBase)  [class]
   on_end(span: Any) -> None
   on_start(span: Span, parent_context: otel_context.Context | None = None) -> None
   shutdown() -> None
-create_handler(provides_for: tuple[str, Literal['agent', 'messages']], fn: _HandlerFn, stream_fn: _StreamFn | None = None, capture_content: bool | None = None) -> ProviderHandler
+create_handler(provides_for: tuple[str, Literal['agent', 'messages']], fn: _HandlerFn, stream_fn: _StreamFn | None = None, capture_content: bool | None = None, *, providers: Sequence[str] | None = None) -> ProviderHandler
 create_run_usage() -> RunUsage
 Criterion = Judge | Scorer  [type]
 DatasetRow  [class, @dataclass]
@@ -61,8 +61,8 @@ EvaluationsModule  [class]
   sdk_key: str | None  [property]
   tools: ToolsClient  [property]
   ui_base_uri: str  [property]
-execute_and_stream(*, config_key: str, config: AiConfigRep, meta: VariationMeta, user_context: LDContext, handler: ProviderHandler, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, graph_key: str | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[ExecuteStreamEvent, None]  [async]
-execute_and_track(*, config_key: str, config: AiConfigRep, meta: VariationMeta, user_context: LDContext, handler: ProviderHandler, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, graph_key: str | None = None, history: list[dict[str, Any]] | None = None, run_id: str | None = None, extra_track_data: dict[str, Any] | None = None, span_attributes: dict[str, Any] | None = None, feature_flag_event: bool = True) -> dict[str, Any]  [async]
+execute_and_stream(*, config_key: str, config: AiConfigRep, meta: VariationMeta, user_context: LDContext, handler: ProviderHandler, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, graph_key: str | None = None, history: list[dict[str, Any]] | None = None, evaluated_value: Any = None) -> AsyncGenerator[ExecuteStreamEvent, None]  [async]
+execute_and_track(*, config_key: str, config: AiConfigRep, meta: VariationMeta, user_context: LDContext, handler: ProviderHandler, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, graph_key: str | None = None, history: list[dict[str, Any]] | None = None, run_id: str | None = None, extra_track_data: dict[str, Any] | None = None, span_attributes: dict[str, Any] | None = None, feature_flag_event: bool = True, evaluated_value: Any = None) -> dict[str, Any]  [async]
 ExecuteStreamDoneEvent = dict[str, Any]
 ExecuteStreamEvent = dict[str, Any]
 extract_variation(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
@@ -148,6 +148,7 @@ InputTokenDetails  [class, @dataclass]
   uncached: int = 0
 inspect_config(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
 is_content_blocks(content: MessageContent) -> bool
+is_function_tool(handler: Any, name: str) -> TypeGuard[Callable[..., Any]]
 Judge  [class, @dataclass(frozen=True)]
   __init__(key: str, threshold: float | None = DEFAULT_JUDGE_THRESHOLD, pass_rate_threshold: float | None = None, ground_truth_context: str | None = None)
   __post_init__() -> None
@@ -173,7 +174,7 @@ JudgeRunResult  [class, @dataclass]
   track_data: TrackData
   usage: UsageDict
 JudgeTask  [class, @dataclass]
-  __init__(config_key: str, judge_config: AiConfigRep, judge_meta: VariationMeta, actual_output: str, user_context: LDContext, judge_provider: str | None, judge_mode: str, collapse_messages: bool, parent_track_data: TrackData, variables: dict[str, Any] | None = None, evaluation_metric_key: str | None = None, user_input: str | None = None, trajectory: str = '')
+  __init__(config_key: str, judge_config: AiConfigRep, judge_meta: VariationMeta, actual_output: str, user_context: LDContext, judge_provider: str | None, judge_mode: str, collapse_messages: bool, parent_track_data: TrackData, variables: dict[str, Any] | None = None, evaluation_metric_key: str | None = None, user_input: str | None = None, trajectory: str = '', judge_value: Any = None)
   actual_output: str
   collapse_messages: bool
   config_key: str
@@ -182,6 +183,7 @@ JudgeTask  [class, @dataclass]
   judge_meta: VariationMeta
   judge_mode: str
   judge_provider: str | None
+  judge_value: Any = None
   parent_track_data: TrackData
   trajectory: str = ''
   user_context: LDContext
@@ -248,10 +250,11 @@ ProviderGraphResponse  [class, @dataclass]
   response: str
   usage: UsageDict
 ProviderHandler  [class]
-  __init__(fn: _HandlerFn, provides_for: tuple[str, Literal['agent', 'messages']] | None = None, stream_fn: _StreamFn | None = None, capture_content: bool | None = None)
+  __init__(fn: _HandlerFn, provides_for: tuple[str, Literal['agent', 'messages']] | None = None, stream_fn: _StreamFn | None = None, capture_content: bool | None = None, *, providers: Sequence[str] | None = None)
   __call__(config: AiConfigRep, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> HandlerResult  [async]
   capture_content: bool  [property]
   has_stream: bool  [property]
+  providers: tuple[str, ...] | None = normalize_providers(providers)
   provides_for: tuple[str, Literal['agent', 'messages']] | None = provides_for
   stream(config: AiConfigRep, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, history: list[dict[str, Any]] | None = None) -> AsyncGenerator[dict[str, Any], None]  [async]
 ProviderResponse(Generic[T])  [class, @dataclass]
@@ -317,7 +320,7 @@ SDKOptions  [class, @dataclass(frozen=True)]
   capture_content: bool = True
 set_conversation_id_if_absent(span: Any, conversation: str) -> None
 set_input_content_attributes(span: Any, capture: bool, *, system_instructions: str | None = None, messages: list[SpanMessage] | None = None, tool_definitions: list[ToolDefinitionInput] | None = None) -> None
-set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None
+set_ld_span_attributes(span: Any, variables: dict[str, Any] | None, *, capture_content: bool | None = None) -> None
 set_model_identity_attributes(span: Any, provider_name: str, request_model: str, legacy_system: str | None = None) -> None
 set_output_content_attributes(span: Any, capture: bool, messages: list[SpanMessage]) -> None
 set_skill_store(store: SkillStore | None) -> None

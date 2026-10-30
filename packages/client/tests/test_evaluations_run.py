@@ -23,7 +23,7 @@ from launchdarkly_ai_server import (
     init_evaluations,
 )
 from launchdarkly_ai_server.evaluations.api import HttpResponse
-from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner
+from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner, _describe_value
 from launchdarkly_ai_server.evaluations.tools import (
     create_wire_tools,
     handler_config_tools,
@@ -2046,7 +2046,7 @@ def test_pass_rate_threshold_is_only_sent_when_set() -> None:
     """Pass rate has no client default yet, since LaunchDarkly does not act on
     it; an unset one stays off the wire rather than claiming a gate."""
     judge = Judge(key="$ld:ai:judge:accuracy")
-    scorer = Scorer(name="exact", fn=lambda row, output: True, pass_rate_threshold=0.8)
+    scorer = Scorer(name="exact", fn=lambda row, output: 1.0, pass_rate_threshold=0.8)
 
     assert judge.to_criteria_wire()["options"] == {"threshold": 0.5}
     assert scorer.to_criteria_wire()["options"] == {
@@ -2134,11 +2134,12 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
             "usage": {"input_tokens": 10, "output_tokens": 4},
         }
 
-    def check_refund(row: DatasetRow, output: Any) -> bool:
+    def check_refund(row: DatasetRow, output: Any) -> float:
         assert row.row_index == 42
         assert row.input == "Ticket A"
         assert output == "refund exists"
-        return "refund" in str(output)
+        # A yes/no scorer returns the score itself. The SDK coerces nothing.
+        return 1.0 if "refund" in str(output) else 0.0
 
     result = await evals.run(
         key="support-qa",
@@ -2346,7 +2347,7 @@ async def test_bad_judge_output_emits_error_event_instead_of_crashing(
         (
             lambda row, output: 3,
             "invalid_score",
-            "scorer fn score must be between 0 and 1, got 3",
+            "scorer fn must return a finite number between 0 and 1, got 3",
         ),
     ],
 )
@@ -2580,7 +2581,7 @@ async def test_duplicate_criteria_rejected_before_any_request() -> None:
             generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[
                 Judge(key="accuracy"),
-                Scorer(name="accuracy", fn=lambda row, output: True),
+                Scorer(name="accuracy", fn=lambda row, output: 1.0),
             ],
         )
 
@@ -2609,7 +2610,7 @@ async def test_duplicate_criteria_rejected_case_insensitively() -> None:
             generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[
                 Judge(key="Accuracy"),
-                Scorer(name="accuracy", fn=lambda row, output: True),
+                Scorer(name="accuracy", fn=lambda row, output: 1.0),
             ],
         )
 
@@ -2752,7 +2753,7 @@ async def test_failed_evaluation_event_tracking_raises_after_attempting_every_re
             generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
             criteria=[
                 Judge(key="$ld:ai:judge:accuracy"),
-                Scorer(name="nonempty", fn=lambda row, output: bool(output)),
+                Scorer(name="nonempty", fn=lambda row, output: 1.0 if output else 0.0),
             ],
         )
 
@@ -2777,7 +2778,7 @@ def test_criteria_reject_thresholds_outside_zero_to_one(
     with pytest.raises(ValueError, match=f"{field} must be a number between 0 and 1"):
         Judge(key="$ld:ai:judge:accuracy", **{field: value})
     with pytest.raises(ValueError, match=f"{field} must be a number between 0 and 1"):
-        Scorer(name="nonempty", fn=lambda row, output: True, **{field: value})
+        Scorer(name="nonempty", fn=lambda row, output: 1.0, **{field: value})
 
 
 def judge_variation(
@@ -2987,6 +2988,144 @@ async def test_wildcard_judge_handler_runs_a_judge_no_handler_names(
 
     assert result.passed is True
     assert [config["provider"]["name"] for config in judged] == ["Anthropic"]
+
+
+@pytest.mark.asyncio
+async def test_scoped_wildcard_does_not_run_a_judge_outside_its_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def bedrock_judge(
+        config: dict[str, Any],
+        user_input: str | None = None,
+        tool_handlers: dict[str, Callable[..., Any]] | None = None,
+        variables: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+    scoped = create_handler(("*", "messages"), bedrock_judge, providers=["Bedrock"])
+
+    with pytest.raises(EvaluationsError, match="Anthropic"):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+            criteria=[Judge(key="$ld:ai:judge:accuracy")],
+            handlers=[create_handler(("OpenAI", "messages"), _generation_only), scoped],
+        )
+
+
+@pytest.mark.asyncio
+async def test_two_scoped_judge_handlers_divide_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    chosen: list[str] = []
+
+    def judge_handler(name: str) -> Any:
+        async def run(
+            config: dict[str, Any],
+            user_input: str | None = None,
+            tool_handlers: dict[str, Callable[..., Any]] | None = None,
+            variables: dict[str, Any] | None = None,
+            history: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+            chosen.append(name)
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+        return run
+
+    bedrock = create_handler(
+        ("*", "messages"), judge_handler("bedrock"), providers=["Bedrock"]
+    )
+    anthropic = create_handler(
+        ("*", "messages"), judge_handler("anthropic"), providers=["Anthropic"]
+    )
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        handlers=[
+            create_handler(("OpenAI", "messages"), _generation_only),
+            bedrock,
+            anthropic,
+        ],
+    )
+
+    assert result.passed is True
+    assert chosen == ["anthropic"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("listed", "expected"),
+    [
+        (["unscoped", "wide", "narrow"], "narrow"),
+        (["unscoped", "other"], "unscoped"),
+    ],
+)
+async def test_judge_handler_prefers_shortest_allowlist_then_unscoped(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_sdk_client: MagicMock,
+    listed: list[str],
+    expected: str,
+) -> None:
+    transport = judge_run_transport()
+    judge_variation(monkeypatch, provider="Anthropic")
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    chosen: list[str] = []
+
+    def judge_handler(name: str) -> Any:
+        async def run(
+            config: dict[str, Any],
+            user_input: str | None = None,
+            tool_handlers: dict[str, Callable[..., Any]] | None = None,
+            variables: dict[str, Any] | None = None,
+            history: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+            chosen.append(name)
+            return {"output": '{"score": 1, "reasoning": "ok"}'}
+
+        return run
+
+    allowlists: dict[str, list[str] | None] = {
+        "unscoped": None,
+        "wide": ["Bedrock", "Anthropic", "Gemini"],
+        "narrow": ["Anthropic", "Bedrock"],
+        "other": ["Bedrock"],
+    }
+    handlers = [
+        create_handler(
+            ("*", "messages"), judge_handler(name), providers=allowlists[name]
+        )
+        for name in listed
+    ]
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+        criteria=[Judge(key="$ld:ai:judge:accuracy")],
+        handlers=[create_handler(("OpenAI", "messages"), _generation_only), *handlers],
+    )
+
+    assert result.passed is True
+    assert chosen == [expected]
 
 
 @pytest.mark.asyncio
@@ -4534,7 +4673,9 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
         dataset=[{"input": "hello"}],
         handler=tagged(echo_handler),
         generation=INLINE_GENERATION,
-        criteria=[Scorer(name="non-empty", fn=lambda row, output: bool(output))],
+        criteria=[
+            Scorer(name="non-empty", fn=lambda row, output: 1.0 if output else 0.0)
+        ],
     )
 
     criterion_events = [
@@ -4866,6 +5007,20 @@ async def _echo(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 ]
             },
             "both provide for",
+        ),
+        (
+            # The same provider set in another order is the same identity.
+            {
+                "handlers": [
+                    create_handler(
+                        ("*", "messages"), _echo, providers=["Bedrock", "Gemini"]
+                    ),
+                    create_handler(
+                        ("*", "messages"), _echo, providers=["Gemini", "Bedrock"]
+                    ),
+                ]
+            },
+            r"handlers\[0\] and handlers\[1\] both provide for",
         ),
     ],
 )
@@ -5237,3 +5392,171 @@ async def test_a_completion_or_list_tagged_handler_is_selected(
     )
 
     assert stub.await_count == 1
+
+
+def scorer_run_transport() -> SequencedTransport:
+    """Transport for a one-row scorer-only run."""
+    return SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page([{"rowIndex": 7, "input": "Question"}], total=1),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {"statusCounts": {"total": 1, "passed": 1, "error": 0, "pending": 0}},
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(3, id="above-range"),
+        pytest.param(-1, id="below-range"),
+        pytest.param("high", id="string"),
+        pytest.param(None, id="none"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_scorer_must_return_a_finite_number_in_range(
+    stub_sdk_client: MagicMock,
+    returned: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A scorer that returns a bool or a non-score value gets an invalid score."""
+    transport = scorer_run_transport()
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with caplog.at_level("WARNING"):
+        result = await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation=COMPLETION,
+            criteria=[Scorer(name="binary", fn=lambda row, output: returned)],
+        )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert scorer_event["status"] == "ERROR"
+    assert "error" not in scorer_event
+    # The message names the value that the scorer returned.
+    shown = _describe_value(returned)
+    assert shown in scorer_event["errorMessage"]
+    assert "score" not in scorer_event
+    # The log names the scorer and the value, once for each scorer.
+    warnings = [r for r in caplog.records if "invalid score" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "'binary'" in warnings[0].getMessage()
+    assert shown in warnings[0].getMessage()
+    # An invalid score is a per-criterion ERROR. The run does not raise.
+    assert result.run_id == "run-id"
+    stub_sdk_client.flush.assert_awaited()
+
+
+@pytest.mark.parametrize(
+    ("returned", "expected"),
+    [(1.0, 1.0), (0.0, 0.0), (0, 0.0), (1, 1.0), (0.25, 0.25)],
+)
+@pytest.mark.asyncio
+async def test_scorer_accepts_the_range_boundaries_and_integers(
+    stub_sdk_client: MagicMock,
+    returned: Any,
+    expected: float,
+) -> None:
+    """0 and 1 are valid scores, also as ints. Only a bool is invalid."""
+    transport = scorer_run_transport()
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation=COMPLETION,
+        criteria=[Scorer(name="graded", fn=lambda row, output: returned)],
+    )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert scorer_event["status"] == "COMPLETE"
+    assert scorer_event["score"] == expected
+
+
+@pytest.mark.asyncio
+async def test_async_scorer_score_is_awaited_before_validation(
+    stub_sdk_client: MagicMock,
+) -> None:
+    transport = scorer_run_transport()
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    async def graded(row: DatasetRow, output: Any) -> float:
+        return 0.5
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation=COMPLETION,
+        criteria=[Scorer(name="graded", fn=graded)],
+    )
+
+    events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
+    scorer_event = next(event for event in events if event.get("kind") == "scorer")
+    assert scorer_event["status"] == "COMPLETE"
+    assert scorer_event["score"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_invalid_score_warning_repeats_on_each_run(
+    stub_sdk_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One module logs a warning in each run for a scorer that returns an invalid score."""
+    transport = scorer_run_transport()
+    transport.responses = transport.responses * 2
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            await evals.run(
+                key="support-qa",
+                dataset="golden",
+                handler=tagged(handler),
+                generation=COMPLETION,
+                criteria=[Scorer(name="quality", fn=lambda row, output: "high")],
+            )
+
+    warnings = [r for r in caplog.records if "invalid score" in r.getMessage()]
+    assert len(warnings) == 2
