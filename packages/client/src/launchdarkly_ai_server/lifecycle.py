@@ -616,7 +616,15 @@ async def extract_variation(
     Lazily initializes the LD client when ``LD_SDK_KEY`` is set, matching
     the TypeScript SDK's behaviour where any AI call auto-initializes.
     """
-    from .types_validation import parse_ai_config
+    raw, _ = await _fetch_variation(config_key, context)
+    return _parse_variation(config_key, raw)
+
+
+async def _fetch_variation(
+    config_key: str, context: dict[str, Any], *, with_reason: bool = False
+) -> tuple[Any, Any]:
+    """The raw variation value, and its evaluation reason when ``with_reason`` is set
+    and the client has ``variation_detail``. Otherwise the reason is ``None``."""
     from .utils import to_ld_context  # late import avoids circular dependency
 
     await init_client()
@@ -624,6 +632,13 @@ async def extract_variation(
     # The real ldclient.variation() expects an ldclient.Context, not a plain dict.
     # Convert when running against the real SDK; test mocks accept dicts directly.
     ld_context = to_ld_context(client, context)
+    variation_detail = (
+        getattr(client, "variation_detail", None) if with_reason else None
+    )
+    if variation_detail is not None:
+        detail = variation_detail(config_key, ld_context, None)
+        detail = await detail if inspect.isawaitable(detail) else detail
+        return detail.value, detail.reason
     # variation() is synchronous in the real Python LD SDK; AsyncMock in tests.
     variation_result = client.variation(config_key, ld_context, None)
     raw = (
@@ -631,6 +646,11 @@ async def extract_variation(
         if inspect.isawaitable(variation_result)
         else variation_result
     )
+    return raw, None
+
+
+def _parse_variation(config_key: str, raw: Any) -> dict[str, Any]:
+    from .types_validation import parse_ai_config
 
     if raw is None:
         raise RuntimeError(
