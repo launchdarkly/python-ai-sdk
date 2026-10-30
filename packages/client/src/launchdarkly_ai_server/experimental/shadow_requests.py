@@ -18,15 +18,15 @@ import hashlib
 import logging
 import math
 import time
-from collections.abc import AsyncGenerator, Callable, Mapping
-from contextlib import aclosing
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
+from contextlib import aclosing, contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from opentelemetry import context as otel_context
 
 from ..client import ConfigInstance, _InternalConfigInstance
-from ..conversation import _conversation_id_from, conversation_id
+from ..conversation import _CONV_KEY, _conversation_id_from
 from ..lifecycle import _fetch_variation, _parse_variation
 from ..registry import resolve_handlers
 from ..sdk_usage import report_usage
@@ -412,7 +412,7 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
     extra = {k: v for k, v in task.track_data.items() if k != "runId"}
     try:
         handler = select_handler(task.shadow_config, task.shadow_meta, handlers)
-        with conversation_id(task.conversation_id):
+        with _bound_conversation(task.conversation_id):
             result = await execute_and_track(
                 config_key=task.config_key,
                 config=task.shadow_config,
@@ -433,6 +433,15 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
     except Exception as err:
         return _failed(task, str(err))
     return ShadowResult(usage=result["usage"], track_data=result["track_data"])
+
+
+@contextmanager
+def _bound_conversation(conversation: str | None) -> Iterator[None]:
+    token = otel_context.attach(otel_context.set_value(_CONV_KEY, conversation))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 def _failed(task: ShadowTask, error: str) -> ShadowResult:

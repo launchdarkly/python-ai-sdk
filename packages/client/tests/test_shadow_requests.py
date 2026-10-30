@@ -868,6 +868,22 @@ class TestDeferred:
         await run_shadow(task, [b.handler])
         assert b.calls[0]["conversation_id"] is None
 
+    async def test_task_without_an_id_ignores_the_workers_conversation(self) -> None:
+        task = await _deferred_task(_make_client(_variation_a()))
+        b = _Recorder("ShadowProvider")
+        with conversation_id("worker-conversation"):
+            await run_shadow(task, [b.handler])
+        assert b.calls[0]["conversation_id"] is None
+
+    async def test_task_id_replaces_the_workers_conversation(self) -> None:
+        client = _make_client(_variation_a())
+        with conversation_id("conv-1"):
+            task = await _deferred_task(client)
+        b = _Recorder("ShadowProvider")
+        with conversation_id("worker-conversation"):
+            await run_shadow(task, [b.handler])
+        assert b.calls[0]["conversation_id"] == "conv-1"
+
     async def test_run_shadow_reports_usage(self) -> None:
         client = _make_client(_variation_a())
         task = await _deferred_task(client)
