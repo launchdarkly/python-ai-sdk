@@ -148,6 +148,7 @@ InputTokenDetails  [class, @dataclass]
   uncached: int = 0
 inspect_config(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [async]
 is_content_blocks(content: MessageContent) -> bool
+is_function_tool(handler: Any, name: str) -> TypeGuard[Callable[..., Any]]
 Judge  [class, @dataclass(frozen=True)]
   __init__(key: str, threshold: float | None = DEFAULT_JUDGE_THRESHOLD, pass_rate_threshold: float | None = None, ground_truth_context: str | None = None)
   __post_init__() -> None

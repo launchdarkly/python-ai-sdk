@@ -26,6 +26,7 @@ from launchdarkly_ai_server import (
     content_to_text,
     end_span_once,
     image_block_to_url,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -273,7 +274,7 @@ def _tools(config_value: AiConfigRep, handlers: Mapping[str, Any]) -> list[Any]:
     tools: list[Any] = []
     for name, definition in (config_value.get("tools") or {}).items():
         handler = handlers.get(name)
-        if not callable(handler):
+        if not is_function_tool(handler, name):
             continue
 
         async def invoke(_context: Any, args: str, _handler: Any = handler) -> Any:

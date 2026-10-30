@@ -22,6 +22,7 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -215,7 +216,9 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     )
 
 
-def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_tools(
+    config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded on the span is the catalog actually sent.
@@ -228,6 +231,8 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
             "strict": False,
         }
         for name, tool in config_tools.items()
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
     ]
 
 
@@ -391,7 +396,9 @@ def create_openai_messages_handler(
     for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
     meaning models, token counts, timings and tool names.
     """
-    report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
+    report_usage(
+        "openai-messages.createOpenAIMessagesHandler", PACKAGE_NAME, __version__
+    )
     return _create_openai_messages_handler(capture_content=capture_content)
 
 
@@ -432,7 +439,7 @@ def _create_openai_messages_handler(
         run_usage = create_run_usage()
 
         try:
-            tools = _build_tools(config.get("tools") or {})
+            tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
             input_messages = _build_input_messages(config, user_input, vs, history)
             tool_definitions = to_tool_definitions(tools)
 
@@ -646,7 +653,7 @@ async def _stream_gen(
     cancelled = False
     emitter = TurnEmitter(capture_content=capture_content)
     try:
-        tools = _build_tools(config.get("tools") or {})
+        tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
         input_messages = _build_input_messages(config, user_input, variables, history)
         tool_definitions = to_tool_definitions(tools)
 

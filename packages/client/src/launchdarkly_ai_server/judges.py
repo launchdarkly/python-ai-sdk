@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
-from .conversation import with_judge_evaluation
+from .conversation import stamp_span_attributes, with_judge_evaluation
 from .judge_scoring import (
     build_message_history,
     numeric_score,
@@ -58,6 +59,35 @@ def _mode_matches(handler: ProviderHandler, mode: str) -> bool:
 
 
 logger = logging.getLogger(__name__)
+
+#: The run id of the config a judge graded, on every span of that judge's run.
+LD_JUDGE_TARGET_RUN_ID = "launchdarkly.judge.target.run.id"
+#: The key of the config a judge graded.
+LD_JUDGE_TARGET_CONFIG_KEY = "launchdarkly.judge.target.config.key"
+#: The variation key of the config a judge graded.
+LD_JUDGE_TARGET_VARIATION_KEY = "launchdarkly.judge.target.variation.key"
+
+
+@contextmanager
+def _judge_target(target: TrackData | None) -> Iterator[None]:
+    """Point a judge's spans at the run it graded.
+
+    A judge runs after the graded handler has ended its span, so its spans start
+    a trace of their own. Without these, the only tie back to the graded run is
+    the judge's metric event. Each key is written only when its value is a
+    non-empty string.
+    """
+    attributes: dict[str, str | int] = {}
+    for attribute, field in (
+        (LD_JUDGE_TARGET_RUN_ID, "runId"),
+        (LD_JUDGE_TARGET_CONFIG_KEY, "configKey"),
+        (LD_JUDGE_TARGET_VARIATION_KEY, "variationKey"),
+    ):
+        value = (target or {}).get(field)
+        if isinstance(value, str) and value:
+            attributes[attribute] = value
+    with stamp_span_attributes(attributes):
+        yield
 
 
 async def run_judges(
@@ -166,78 +196,79 @@ async def run_judges(
                 output=llm_response,
             )
 
-            async with with_judge_evaluation(judge_key) as record_evaluation:
-                result = await execute_and_track(
-                    config_key=judge_key,
-                    config=effective_judge_config,
-                    meta=judge_meta,
-                    user_context=user_context,
-                    handler=judge_handler,
-                    user_input=llm_response,
-                    tool_handlers=None,
-                    graph_key=graph_key,
-                    variables={
-                        "message_history": message_history,
-                        "response_to_evaluate": llm_response,
-                        **({"input": user_input} if user_input else {}),
-                    },
-                    evaluated_value=variation.get("value"),
-                )
+            with _judge_target(base_track_data):
+                async with with_judge_evaluation(judge_key) as record_evaluation:
+                    result = await execute_and_track(
+                        config_key=judge_key,
+                        config=effective_judge_config,
+                        meta=judge_meta,
+                        user_context=user_context,
+                        handler=judge_handler,
+                        user_input=llm_response,
+                        tool_handlers=None,
+                        graph_key=graph_key,
+                        variables={
+                            "message_history": message_history,
+                            "response_to_evaluate": llm_response,
+                            **({"input": user_input} if user_input else {}),
+                        },
+                        evaluated_value=variation.get("value"),
+                    )
 
-                usage = to_usage_dict(result["usage"])
-                entries = typesafe_judge_entries(result["response"])
-                if entries is not None:
-                    # One Jev call. Every label is returned with that call's
-                    # full usage, and each label is tracked under its eventKey.
-                    from .lifecycle import get_client
+                    usage = to_usage_dict(result["usage"])
+                    entries = typesafe_judge_entries(result["response"])
+                    if entries is not None:
+                        # One Jev call. Every label is returned with that call's
+                        # full usage, and each label is tracked under its eventKey.
+                        from .lifecycle import get_client
 
-                    client = get_client()
-                    for entry in entries:
-                        result_key = f"{judge_key}.{entry['key']}"
-                        score = entry["score"]
-                        judge_results[result_key] = JudgeResult(
-                            usage=usage,
-                            response=entry["reason"],
-                            score=score,
-                            event_key=entry["eventKey"],
+                        client = get_client()
+                        for entry in entries:
+                            result_key = f"{judge_key}.{entry['key']}"
+                            score = entry["score"]
+                            judge_results[result_key] = JudgeResult(
+                                usage=usage,
+                                response=entry["reason"],
+                                score=score,
+                                event_key=entry["eventKey"],
+                            )
+                            record_evaluation(score, None, result_key)
+                            client.track(
+                                entry["eventKey"],
+                                to_ld_context(client, user_context),
+                                {**base_track_data, "judgeConfigKey": result_key},
+                                score,
+                            )
+                        continue
+
+                    score, reasoning = parse_judge_response(result["response"])
+                    judge_results[judge_key] = JudgeResult(
+                        usage=usage,
+                        response=reasoning,
+                        score=score,
+                    )
+                    metric_score = numeric_score(score)
+                    if metric_score is not None:
+                        record_evaluation(
+                            metric_score,
+                            reasoning if judge_handler.capture_content else None,
                         )
-                        record_evaluation(score, None, result_key)
+
+                    evaluation_metric_key = (
+                        judge_ai_config.get("evaluationMetricKey")
+                        if isinstance(judge_ai_config, dict)
+                        else None
+                    )
+                    if evaluation_metric_key and score is not None:
+                        from .lifecycle import get_client
+
+                        client = get_client()
                         client.track(
-                            entry["eventKey"],
+                            evaluation_metric_key,
                             to_ld_context(client, user_context),
-                            {**base_track_data, "judgeConfigKey": result_key},
+                            {**base_track_data, "judgeConfigKey": judge_key},
                             score,
                         )
-                    continue
-
-                score, reasoning = parse_judge_response(result["response"])
-                judge_results[judge_key] = JudgeResult(
-                    usage=usage,
-                    response=reasoning,
-                    score=score,
-                )
-                metric_score = numeric_score(score)
-                if metric_score is not None:
-                    record_evaluation(
-                        metric_score,
-                        reasoning if judge_handler.capture_content else None,
-                    )
-
-                evaluation_metric_key = (
-                    judge_ai_config.get("evaluationMetricKey")
-                    if isinstance(judge_ai_config, dict)
-                    else None
-                )
-                if evaluation_metric_key and score is not None:
-                    from .lifecycle import get_client
-
-                    client = get_client()
-                    client.track(
-                        evaluation_metric_key,
-                        to_ld_context(client, user_context),
-                        {**base_track_data, "judgeConfigKey": judge_key},
-                        score,
-                    )
 
         except Exception as exc:
             logger.error("Judge '%s' failed: %s", judge_key, exc)
@@ -435,90 +466,94 @@ async def run_judge(
         output=task.actual_output,
     )
 
-    async with with_judge_evaluation(task.config_key) as record_evaluation:
-        result = await execute_and_track(
-            config_key=task.config_key,
-            config=effective_config,
-            meta=task.judge_meta,
-            user_context=task.user_context,
-            handler=judge_handler,
-            user_input=task.actual_output,
-            tool_handlers=None,
-            variables={
-                **(task.variables or {}),
-                "message_history": message_history,
-                "response_to_evaluate": task.actual_output,
-                **({"input": task.user_input} if task.user_input else {}),
-            },
-            evaluated_value=task.judge_value,
-        )
+    with _judge_target(task.parent_track_data):
+        async with with_judge_evaluation(task.config_key) as record_evaluation:
+            result = await execute_and_track(
+                config_key=task.config_key,
+                config=effective_config,
+                meta=task.judge_meta,
+                user_context=task.user_context,
+                handler=judge_handler,
+                user_input=task.actual_output,
+                tool_handlers=None,
+                variables={
+                    **(task.variables or {}),
+                    "message_history": message_history,
+                    "response_to_evaluate": task.actual_output,
+                    **({"input": task.user_input} if task.user_input else {}),
+                },
+                evaluated_value=task.judge_value,
+            )
 
-        usage = to_usage_dict(result["usage"])
-        try:
-            entries = typesafe_judge_entries(result["response"])
-        except ValueError:
-            return None
-        if entries is not None:
-            first = entries[0]
-            result_key = f"{task.config_key}.{first['key']}"
-            expanded = {
-                f"{task.config_key}.{entry['key']}": JudgeResult(
-                    usage=usage,
-                    response=entry["reason"],
-                    score=entry["score"],
-                    event_key=entry["eventKey"],
-                )
-                for entry in entries
-            }
-            metrics = [
-                {
-                    "eventKey": entry["eventKey"],
-                    "score": entry["score"],
-                    "judgeConfigKey": f"{task.config_key}.{entry['key']}",
+            usage = to_usage_dict(result["usage"])
+            try:
+                entries = typesafe_judge_entries(result["response"])
+            except ValueError:
+                return None
+            if entries is not None:
+                first = entries[0]
+                result_key = f"{task.config_key}.{first['key']}"
+                expanded = {
+                    f"{task.config_key}.{entry['key']}": JudgeResult(
+                        usage=usage,
+                        response=entry["reason"],
+                        score=entry["score"],
+                        event_key=entry["eventKey"],
+                    )
+                    for entry in entries
                 }
-                for entry in entries
-            ]
-            for entry in entries:
-                record_evaluation(
-                    entry["score"], None, f"{task.config_key}.{entry['key']}"
+                metrics = [
+                    {
+                        "eventKey": entry["eventKey"],
+                        "score": entry["score"],
+                        "judgeConfigKey": f"{task.config_key}.{entry['key']}",
+                    }
+                    for entry in entries
+                ]
+                for entry in entries:
+                    record_evaluation(
+                        entry["score"], None, f"{task.config_key}.{entry['key']}"
+                    )
+                # The score belongs to the evaluated config. Each metric carries its own judgeConfigKey.
+                typesafe_track_data: TrackData = {
+                    **task.parent_track_data,
+                    "judgeConfigKey": result_key,
+                }
+                return JudgeRunResult(
+                    score=first["score"],
+                    response=first["reason"],
+                    usage=usage,
+                    track_data=typesafe_track_data,
+                    results=expanded,
+                    metrics=metrics,
+                    event_key=first["eventKey"],
                 )
-            # The score belongs to the evaluated config. Each metric carries its own judgeConfigKey.
-            typesafe_track_data: TrackData = {
+
+            try:
+                score, reasoning = parse_judge_response(result["response"])
+            except ValueError:
+                return None
+
+            # The score is reported as the judge gave it. A missing or null score
+            # is not a zero: coercing it would record a gen_ai.evaluation of 0 --
+            # indistinguishable from a judge that scored the output a hard fail --
+            # where every other non-numeric judge output skips the metric instead.
+            metric_score = numeric_score(score)
+            if metric_score is not None:
+                record_evaluation(
+                    metric_score,
+                    reasoning if judge_handler.capture_content else None,
+                )
+            # The score belongs to the evaluated (parent) config, exactly as in
+            # the inline run_judges path.
+            merged_track_data: TrackData = {
                 **task.parent_track_data,
-                "judgeConfigKey": result_key,
+                "judgeConfigKey": task.config_key,
             }
+
             return JudgeRunResult(
-                score=first["score"],
-                response=first["reason"],
+                score=score,
+                response=reasoning,
                 usage=usage,
-                track_data=typesafe_track_data,
-                results=expanded,
-                metrics=metrics,
-                event_key=first["eventKey"],
+                track_data=merged_track_data,
             )
-
-        try:
-            score, reasoning = parse_judge_response(result["response"])
-        except ValueError:
-            return None
-
-        # The score is reported as the judge gave it. A missing or null score
-        # is not a zero: coercing it would record a gen_ai.evaluation of 0 --
-        # indistinguishable from a judge that scored the output a hard fail --
-        # where every other non-numeric judge output skips the metric instead.
-        metric_score = numeric_score(score)
-        if metric_score is not None:
-            record_evaluation(
-                metric_score,
-                reasoning if judge_handler.capture_content else None,
-            )
-        # The score belongs to the evaluated (parent) config, exactly as in
-        # the inline run_judges path.
-        merged_track_data: TrackData = {
-            **task.parent_track_data,
-            "judgeConfigKey": task.config_key,
-        }
-
-        return JudgeRunResult(
-            score=score, response=reasoning, usage=usage, track_data=merged_track_data
-        )
