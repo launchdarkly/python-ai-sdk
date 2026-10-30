@@ -446,6 +446,11 @@ def _adopt(
                 "waiting on it was cancelled, before the client connected."
             )
         # As on the BYOC path: only a fully set-up client becomes the singleton.
+        # The check above commits this attempt to adopting. A cancel or a
+        # shutdown() that blocks on the lock meanwhile lands after a successful
+        # init, as one a moment after it returned would. The lock spans the setup
+        # so shutdown() cannot run between setup and adoption: it would read the
+        # telemetry globals before the setup wrote them, and leak the provider.
         _setup_telemetry(sdk_key, opts)
         adopted: LDClientInterface = ld_client
         _client = adopted
