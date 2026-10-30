@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -436,22 +437,151 @@ class TestInitClientSDKKeyPath:
         ticker.cancel()
         assert ticks >= 5
 
-    async def test_concurrent_first_calls_end_with_one_client(self) -> None:
-        first, second = _make_stub_client(), _make_stub_client()
-        built = iter([first, second])
+    @staticmethod
+    def _gated_sdk(*clients: Any) -> tuple[MagicMock, threading.Event]:
+        """An LD SDK whose LDClient blocks until the returned event is set."""
+        release = threading.Event()
+        built = iter(clients)
         mock_ld = MagicMock()
         mock_ld.Config = MagicMock(return_value=MagicMock())
         mock_ld.LDClient = MagicMock(
-            side_effect=lambda *_a, **_k: (time.sleep(0.05), next(built))[1]
+            side_effect=lambda *_a, **_k: (release.wait(5), next(built))[1]
         )
+        return mock_ld, release
+
+    @staticmethod
+    async def _until(condition: Any) -> None:
+        for _ in range(500):
+            if condition():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("condition not met")
+
+    @classmethod
+    async def _waiters(cls, n: int) -> None:
+        await cls._until(
+            lambda: (
+                lifecycle_module._attempt is not None
+                and lifecycle_module._attempt.waiters == n
+            )
+        )
+
+    async def test_concurrent_first_calls_share_one_attempt(self) -> None:
+        stub = _make_stub_client()
+        mock_ld, release = self._gated_sdk(stub)
         with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
             with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
                 with patch("importlib.import_module", return_value=mock_ld):
-                    a, b = await asyncio.gather(init_client(), init_client())
-        assert a is b is get_client()
-        extra = second if a is first else first
-        extra.close.assert_awaited_once()
-        a.close.assert_not_called()
+                    calls = asyncio.gather(*(init_client() for _ in range(5)))
+                    await self._waiters(5)
+                    release.set()
+                    results = await calls
+        assert all(r is stub for r in results)
+        assert get_client() is stub
+        assert mock_ld.LDClient.call_count == 1
+        stub.close.assert_not_called()
+
+    async def test_concurrent_calls_during_a_failing_init_build_one_client(
+        self,
+    ) -> None:
+        # During an outage each call used to build its own client and hold a
+        # worker thread for the whole start_wait.
+        failed = _make_stub_client()
+        failed.is_initialized = MagicMock(return_value=False)
+        healthy = _make_stub_client()
+        mock_ld, release = self._gated_sdk(failed, healthy)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    calls = asyncio.gather(
+                        *(init_client() for _ in range(5)), return_exceptions=True
+                    )
+                    await self._waiters(5)
+                    release.set()
+                    results = await calls
+                    assert mock_ld.LDClient.call_count == 1
+                    assert all(isinstance(r, RuntimeError) for r in results)
+                    assert all("failed to initialize" in str(r) for r in results)
+                    failed.close.assert_awaited_once()
+                    assert lifecycle_module._attempt is None
+
+                    # The failure is not cached: the next call builds afresh.
+                    assert await init_client() is healthy
+        assert mock_ld.LDClient.call_count == 2
+        assert get_client() is healthy
+
+    async def test_a_cancelled_waiter_does_not_cancel_the_shared_attempt(
+        self,
+    ) -> None:
+        stub = _make_stub_client()
+        mock_ld, release = self._gated_sdk(stub)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    cancelled = asyncio.create_task(init_client())
+                    kept = asyncio.create_task(init_client())
+                    await self._waiters(2)
+                    cancelled.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await cancelled
+                    release.set()
+                    assert await kept is stub
+        assert get_client() is stub
+        assert mock_ld.LDClient.call_count == 1
+        stub.close.assert_not_called()
+
+    async def test_a_call_on_another_event_loop_joins_the_attempt(self) -> None:
+        # Callers can come from other threads, each with its own loop (a skills
+        # watcher runs asyncio.run on its thread), so the attempt is tied to none.
+        stub = _make_stub_client()
+        mock_ld, release = self._gated_sdk(stub)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    here = asyncio.create_task(init_client())
+                    await self._waiters(1)
+                    other = asyncio.create_task(
+                        asyncio.to_thread(lambda: asyncio.run(init_client()))
+                    )
+                    await self._waiters(2)
+                    release.set()
+                    assert await here is stub
+                    assert await other is stub
+        assert mock_ld.LDClient.call_count == 1
+
+    async def test_shutdown_abandons_an_attempt_in_flight(self) -> None:
+        # Adopting after shutdown() would bring back the client it just cleared.
+        stale, fresh = _make_stub_client(), _make_stub_client()
+        mock_ld, release = self._gated_sdk(stale, fresh)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    task = asyncio.create_task(init_client())
+                    await self._waiters(1)
+                    await shutdown()
+                    release.set()
+                    with pytest.raises(RuntimeError, match="abandoned"):
+                        await task
+                    stale.close.assert_awaited_once()
+                    assert lifecycle_module._client is None
+
+                    assert await init_client() is fresh
+        assert get_client() is fresh
+
+    async def test_a_passed_client_replaces_an_attempt_in_flight(self) -> None:
+        built, passed = _make_stub_client(), _make_stub_client()
+        mock_ld, release = self._gated_sdk(built)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    task = asyncio.create_task(init_client())
+                    await self._waiters(1)
+                    assert await init_client(client=passed) is passed
+                    release.set()
+                    assert await task is passed
+        built.close.assert_awaited_once()
+        passed.close.assert_not_called()
+        assert get_client() is passed
 
     async def test_cancelled_call_closes_the_client_still_being_built(self) -> None:
         # The thread can't be stopped, so the client it finishes building after the
