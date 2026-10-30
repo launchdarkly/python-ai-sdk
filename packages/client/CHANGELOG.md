@@ -1,5 +1,55 @@
 # Changelog
 
+## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.5.0...launchdarkly-ai-server-1.0.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **client:** init_client raises when the LaunchDarkly client did not initialize ([#254](https://github.com/launchdarkly/python-ai-sdk/issues/254))
+* **evaluations:** route generation and judges to a scoped wildcard handler only for its named providers, and accept two scoped wildcards of one mode when their lists differ
+* **AIC-3439:** let wildcard handlers accept only named providers
+* **AIC-3598:** make Python packaging and public types GA-ready ([#218](https://github.com/launchdarkly/python-ai-sdk/issues/218))
+* **AIC-3568:** give the barrel core's __all__, and drop private-spec references ([#234](https://github.com/launchdarkly/python-ai-sdk/issues/234))
+* **evaluations:** promote Evaluations from Code to core ([#235](https://github.com/launchdarkly/python-ai-sdk/issues/235))
+* **client:** capture conversation content by default ([#213](https://github.com/launchdarkly/python-ai-sdk/issues/213))
+* **evaluations:** remove default pass rate threshold ([#238](https://github.com/launchdarkly/python-ai-sdk/issues/238))
+* **evaluations:** set default pass rate threshold ([#226](https://github.com/launchdarkly/python-ai-sdk/issues/226))
+* **client:** spans carry launchdarkly.project_id instead of highlight.project_id
+* **AIC-3687:** rename create_openai_agent_handler to create_openai_agents_handler ([#225](https://github.com/launchdarkly/python-ai-sdk/issues/225))
+* **skills:** rename FDv2SkillStore to LaunchDarklySkillStore ([#223](https://github.com/launchdarkly/python-ai-sdk/issues/223))
+
+### Features
+
+* **AIC-3439:** let wildcard handlers accept only named providers ([454a4de](https://github.com/launchdarkly/python-ai-sdk/commit/454a4debec8e8d9b3d71f6affe070a7a8e446ddc))
+* **AIC-3687:** rename create_openai_agent_handler to create_openai_agents_handler ([#225](https://github.com/launchdarkly/python-ai-sdk/issues/225)) ([a7cdbc0](https://github.com/launchdarkly/python-ai-sdk/commit/a7cdbc03eaf21fd632583ff80ffe2009d2c2845d))
+* **client:** add result variant and value to the feature_flag span event ([#240](https://github.com/launchdarkly/python-ai-sdk/issues/240)) ([040d487](https://github.com/launchdarkly/python-ai-sdk/commit/040d487b49f159ddf3ab1a7dcc44d2b74baa7197))
+* **client:** capture conversation content by default ([#213](https://github.com/launchdarkly/python-ai-sdk/issues/213)) ([77a7cf5](https://github.com/launchdarkly/python-ai-sdk/commit/77a7cf5a88be6dbfff66ea94e0e99780b2cd03df))
+* **client:** point judge spans at the run they graded ([#253](https://github.com/launchdarkly/python-ai-sdk/issues/253)) ([863d423](https://github.com/launchdarkly/python-ai-sdk/commit/863d42352f5eea640a449e7d7f7f5f1582fae662))
+* **evaluations:** promote Evaluations from Code to core ([#235](https://github.com/launchdarkly/python-ai-sdk/issues/235)) ([0bc43a5](https://github.com/launchdarkly/python-ai-sdk/commit/0bc43a5e4ff890e2450a040f9e4481087a49a42c))
+* **evaluations:** remove default pass rate threshold ([#238](https://github.com/launchdarkly/python-ai-sdk/issues/238)) ([882d099](https://github.com/launchdarkly/python-ai-sdk/commit/882d099e307c7d95358717395e4f4384f0d00642))
+* **evaluations:** route generation and judges to a scoped wildcard handler only for its named providers, and accept two scoped wildcards of one mode when their lists differ ([454a4de](https://github.com/launchdarkly/python-ai-sdk/commit/454a4debec8e8d9b3d71f6affe070a7a8e446ddc))
+* **evaluations:** set default pass rate threshold ([#226](https://github.com/launchdarkly/python-ai-sdk/issues/226)) ([7ee368c](https://github.com/launchdarkly/python-ai-sdk/commit/7ee368c24d71a40c2be71c9e24f6ce31623f1696))
+* **skills:** rename FDv2SkillStore to LaunchDarklySkillStore ([#223](https://github.com/launchdarkly/python-ai-sdk/issues/223)) ([11f2c0b](https://github.com/launchdarkly/python-ai-sdk/commit/11f2c0bbb21934bdc79db64e9bb6409870bf2ba4))
+
+
+### Bug Fixes
+
+* **AIC-3568:** give the barrel core's __all__, and drop private-spec references ([#234](https://github.com/launchdarkly/python-ai-sdk/issues/234)) ([88e57e6](https://github.com/launchdarkly/python-ai-sdk/commit/88e57e627d0b01b6fe89961e75d9efe08a3d9fdb))
+* **AIC-3573:** never send a NativeTool to the model as a function tool ([#248](https://github.com/launchdarkly/python-ai-sdk/issues/248)) ([73caeae](https://github.com/launchdarkly/python-ai-sdk/commit/73caeae69c1eda516e3ae3e144878f2b517e5f61))
+* **AIC-3598:** make Python packaging and public types GA-ready ([#218](https://github.com/launchdarkly/python-ai-sdk/issues/218)) ([5860b40](https://github.com/launchdarkly/python-ai-sdk/commit/5860b40078f69febc522680ec76519c25274a606))
+* **AIC-3601:** stop graph routing text inviting a router to answer for its target ([#230](https://github.com/launchdarkly/python-ai-sdk/issues/230)) ([27b8d09](https://github.com/launchdarkly/python-ai-sdk/commit/27b8d0971e6e99484c278412fb3dcc2922fcb1a5))
+* **client:** init_client raises when the LaunchDarkly client did not initialize ([#254](https://github.com/launchdarkly/python-ai-sdk/issues/254)) ([6e66c00](https://github.com/launchdarkly/python-ai-sdk/commit/6e66c00feca982fb23661a04eb4783d7eebbbc67))
+* **client:** stamp launchdarkly.project_id on the telemetry resource ([#229](https://github.com/launchdarkly/python-ai-sdk/issues/229)) ([5347558](https://github.com/launchdarkly/python-ai-sdk/commit/5347558ce16f534311f1bbdc4ffdff67d47707cf))
+* **evaluations:** copy inline tool schemas and name both sources on a key collision ([#227](https://github.com/launchdarkly/python-ai-sdk/issues/227)) ([bfbdd4c](https://github.com/launchdarkly/python-ai-sdk/commit/bfbdd4c29c454927789bc7f0182edf38980d753b))
+* **evaluations:** send criterion errors as errorMessage and skip criteria for rows that did not generate ([#228](https://github.com/launchdarkly/python-ai-sdk/issues/228)) ([8b05b56](https://github.com/launchdarkly/python-ai-sdk/commit/8b05b56e7ce049b4fe1e6b7b3e84861f66c97b11))
+* **graph:** report a node's own judge scores on its node_done stream event ([#236](https://github.com/launchdarkly/python-ai-sdk/issues/236)) ([2f3f9ee](https://github.com/launchdarkly/python-ai-sdk/commit/2f3f9eef019ad8984861154b4a68d7e301399a9a))
+
+
+### Documentation
+
+* **AIC-3692:** say which project id attribute the telemetry resource carries ([#239](https://github.com/launchdarkly/python-ai-sdk/issues/239)) ([64eff43](https://github.com/launchdarkly/python-ai-sdk/commit/64eff43b65f9090838499c364c3f1b282f08454d))
+* state that Agent Skills and Evaluations from Code need 1.0.0 ([#191](https://github.com/launchdarkly/python-ai-sdk/issues/191)) ([fe3ef08](https://github.com/launchdarkly/python-ai-sdk/commit/fe3ef0886b231bd7aa06e3c274174ec84a5f29f4))
+
 ## [0.5.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.4.0...launchdarkly-ai-server-0.5.0) (2026-10-27)
 
 

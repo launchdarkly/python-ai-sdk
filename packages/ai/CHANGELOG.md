@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.4.0...launchdarkly-ai-python-1.0.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **AIC-3598:** make Python packaging and public types GA-ready ([#218](https://github.com/launchdarkly/python-ai-sdk/issues/218))
+* **AIC-3568:** give the barrel core's __all__, and drop private-spec references ([#234](https://github.com/launchdarkly/python-ai-sdk/issues/234))
+* **evaluations:** promote Evaluations from Code to core ([#235](https://github.com/launchdarkly/python-ai-sdk/issues/235))
+
+### Features
+
+* **evaluations:** promote Evaluations from Code to core ([#235](https://github.com/launchdarkly/python-ai-sdk/issues/235)) ([0bc43a5](https://github.com/launchdarkly/python-ai-sdk/commit/0bc43a5e4ff890e2450a040f9e4481087a49a42c))
+
+
+### Bug Fixes
+
+* **AIC-3568:** give the barrel core's __all__, and drop private-spec references ([#234](https://github.com/launchdarkly/python-ai-sdk/issues/234)) ([88e57e6](https://github.com/launchdarkly/python-ai-sdk/commit/88e57e627d0b01b6fe89961e75d9efe08a3d9fdb))
+* **AIC-3598:** make Python packaging and public types GA-ready ([#218](https://github.com/launchdarkly/python-ai-sdk/issues/218)) ([5860b40](https://github.com/launchdarkly/python-ai-sdk/commit/5860b40078f69febc522680ec76519c25274a606))
+
+
+### Documentation
+
+* state that Agent Skills and Evaluations from Code need 1.0.0 ([#191](https://github.com/launchdarkly/python-ai-sdk/issues/191)) ([fe3ef08](https://github.com/launchdarkly/python-ai-sdk/commit/fe3ef0886b231bd7aa06e3c274174ec84a5f29f4))
+
 ## [0.4.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.3.0...launchdarkly-ai-python-0.4.0) (2026-10-27)
 
 
