@@ -31,15 +31,21 @@ from .utils import (
 from .utils import (
     handler_key,
     normalize_mode,
+    select_mode_handler,
     to_ld_context,
     to_usage_dict,
+    wildcard_covers,
 )
 
 
 def _provider_matches(handler: ProviderHandler, provider: str | None) -> bool:
-    """Returns True when the handler covers the given provider or is a wildcard."""
+    """True when the handler names the provider or its wildcard allowlist contains it."""
     key = handler_key(handler)
-    return key is not None and (key[0] == provider or key[0] == "*")
+    if key is None:
+        return False
+    if provider is not None and key[0] == provider:
+        return True
+    return wildcard_covers(handler, provider)
 
 
 def _mode_matches(handler: ProviderHandler, mode: str) -> bool:
@@ -50,35 +56,6 @@ def _mode_matches(handler: ProviderHandler, mode: str) -> bool:
     """
     key = handler_key(handler)
     return key is not None and key[1] == mode
-
-
-def _handler_for(
-    handlers: list[ProviderHandler], provider: str | None, mode: str
-) -> ProviderHandler | None:
-    """Exact ``(provider, mode)`` match, then a same-mode wildcard.
-
-    Modes are compared after normalization, so a ``completion`` tag matches
-    a ``messages`` judge. A wildcard such as LangChain's ``('*', 'messages')``
-    does not hide a handler registered for the judge's own provider.
-    """
-    exact = next(
-        (
-            handler
-            for handler in handlers
-            if (key := handler_key(handler)) is not None and key == (provider, mode)
-        ),
-        None,
-    )
-    if exact is not None:
-        return exact
-    return next(
-        (
-            handler
-            for handler in handlers
-            if (key := handler_key(handler)) is not None and key == ("*", mode)
-        ),
-        None,
-    )
 
 
 logger = logging.getLogger(__name__)
@@ -179,11 +156,11 @@ async def run_judges(
             # config, collapse messages into a single instructions block.
             judge_handler: ProviderHandler = handler
             collapse_messages = False
-            if handlers:
-                exact = _handler_for(handlers, judge_provider, judge_mode)
+            if handlers is not None:
+                exact = select_mode_handler(handlers, judge_provider, judge_mode)
                 agent_fallback = (
-                    _handler_for(handlers, judge_provider, "agent")
-                    if not exact and judge_mode == "messages"
+                    select_mode_handler(handlers, judge_provider, "agent")
+                    if exact is None and judge_mode == "messages"
                     else None
                 )
                 if exact:
@@ -197,8 +174,10 @@ async def run_judges(
                         handler, "agent"
                     )
                 else:
+                    # No compatible handler — skip rather than calling a provider
+                    # whose allowlist does not include this judge.
                     logger.warning(
-                        "Judge '%s' skipped: no handler provides for provider %r",
+                        "Judge %r skipped: no handler covers provider %r",
                         judge_key,
                         judge_provider,
                     )
@@ -379,11 +358,11 @@ async def _build_judge_tasks(
             )
 
             collapse_messages = False
-            if handlers:
-                exact = _handler_for(handlers, judge_provider, judge_mode)
+            if handlers is not None:
+                exact = select_mode_handler(handlers, judge_provider, judge_mode)
                 agent_fallback = (
-                    _handler_for(handlers, judge_provider, "agent")
-                    if not exact and judge_mode == "messages"
+                    select_mode_handler(handlers, judge_provider, "agent")
+                    if exact is None and judge_mode == "messages"
                     else None
                 )
                 if exact:
@@ -396,6 +375,11 @@ async def _build_judge_tasks(
                     )
                 else:
                     # No compatible handler — skip, same as run_judges.
+                    logger.warning(
+                        "Judge %r skipped: no handler covers provider %r",
+                        judge_key,
+                        judge_provider,
+                    )
                     continue
 
             evaluation_metric_key = (
@@ -448,15 +432,20 @@ async def run_judge(
     report_usage("client.runJudge")
     from .tracking import execute_and_track
 
-    exact = _handler_for(handlers, task.judge_provider, task.judge_mode)
+    exact = select_mode_handler(handlers, task.judge_provider, task.judge_mode)
     agent_fallback = (
-        _handler_for(handlers, task.judge_provider, "agent")
-        if task.judge_mode == "messages" and not exact
+        select_mode_handler(handlers, task.judge_provider, "agent")
+        if task.judge_mode == "messages" and exact is None
         else None
     )
 
     judge_handler = exact or agent_fallback
     if judge_handler is None:
+        logger.warning(
+            "Judge %r skipped: no handler covers provider %r",
+            task.config_key,
+            task.judge_provider,
+        )
         return None
 
     # Defensive: a task serialized before outputFormat was stripped at build time

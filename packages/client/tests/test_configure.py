@@ -273,3 +273,15 @@ def test_rewrapping_keeps_the_stream() -> None:
 
     inner = create_handler(("A", "messages"), _fn, stream)
     assert create_handler(("B", "messages"), inner)._stream_fn is stream
+
+
+def test_rewrapping_keeps_the_providers_allowlist() -> None:
+    """Re-wrapping a scoped wildcard handler without passing ``providers``
+    must keep the inner allowlist, not silently become unscoped."""
+    from launchdarkly_ai_server import create_handler
+
+    inner = create_handler(("*", "messages"), _fn, providers=["Bedrock"])
+    outer = create_handler(("*", "messages"), inner)
+    assert outer.providers == ("Bedrock",)
+    overridden = create_handler(("*", "messages"), inner, providers=["Gemini"])
+    assert overridden.providers == ("Gemini",)

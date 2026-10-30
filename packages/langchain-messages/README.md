@@ -4,6 +4,8 @@ LangChain handler for `launchdarkly-ai-server` using **LangChain chat models** (
 
 **`provides_for`:** `['*', 'messages']` — matches any flag variation where `meta.mode` is `"messages"` and no more-specific handler is registered. LangChain is a framework adapter, not a provider: it routes through `langchain-anthropic`, `langchain-openai`, and others at runtime based on `config.provider.name`. Use `'*'` so that flags configured with `provider.name = "Anthropic"` or `"OpenAI"` are automatically handled without requiring a separate native handler.
 
+Pass `providers=["Bedrock"]` to `create_langchain_messages_handler` (and to `langchain_messages`) to accept only those `config.provider.name` values. Names must match the config exactly. Several scoped handlers can be registered together; the shortest list that contains the name wins. Omit `providers` to keep matching every provider.
+
 ## Installation
 
 ```bash

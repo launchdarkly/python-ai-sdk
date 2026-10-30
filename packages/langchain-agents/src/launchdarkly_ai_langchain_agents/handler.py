@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from typing import Any
 
 from launchdarkly_ai_server import (
@@ -644,7 +644,10 @@ def _run_usage_from_messages(messages: list[Any]) -> Any:
 
 
 def create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool | None = None
+    llm: Any = None,
+    *,
+    providers: Sequence[str] | None = None,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Creates a ``ProviderHandler`` for LangChain via ``langchain.agents.create_agent``.
 
@@ -656,15 +659,24 @@ def create_langchain_agents_handler(
     which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
     for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
     meaning models, token counts, timings and tool names.
+
+    *providers* limits which ``config.provider.name`` values this wildcard accepts.
+    Omit it to match every provider. Names must match the config exactly, for example
+    ``["Bedrock"]``.
     """
     report_usage(
         "langchain-agents.createLangChainAgentsHandler", PACKAGE_NAME, __version__
     )
-    return _create_langchain_agents_handler(llm, capture_content=capture_content)
+    return _create_langchain_agents_handler(
+        llm, providers=providers, capture_content=capture_content
+    )
 
 
 def _create_langchain_agents_handler(
-    llm: Any = None, *, capture_content: bool | None = None
+    llm: Any = None,
+    *,
+    providers: Sequence[str] | None = None,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_langchain_agents_handler`, used by this package's wrappers."""
     content_override = capture_content
@@ -821,6 +833,7 @@ def _create_langchain_agents_handler(
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
         capture_content=content_override,
+        providers=providers,
     )
 
 
@@ -1001,14 +1014,17 @@ def langchain_agents(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
-    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
-    # asking for content on spans got a TypeError instead of content.
+    # Lifted out of kwargs: capture_content and providers configure the handler, variables belong
+    # to the invocation. Leaving them in would pass them to config(), which takes none of them, so a
+    # caller asking for content on spans got a TypeError instead of content.
     report_usage("langchain-agents.langchainAgents", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
+    providers = kwargs.pop("providers", None)
     return _config(
         key=config_key,
-        handler=_create_langchain_agents_handler(capture_content=capture_content),
+        handler=_create_langchain_agents_handler(
+            providers=providers, capture_content=capture_content
+        ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)
