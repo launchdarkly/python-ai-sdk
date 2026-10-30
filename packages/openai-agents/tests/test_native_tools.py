@@ -56,19 +56,9 @@ def test_handler_never_sends_a_native_tool(caplog: pytest.LogCaptureFixture) -> 
 
 
 def test_native_graph_never_sends_a_native_tool(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    import agents
-
     from launchdarkly_ai_openai_agents.native_graph import _build_node_tools
-
-    # The adapter calls ``agents.tool(...)`` as a decorator factory; stub it as the other tests do.
-    monkeypatch.setattr(
-        agents,
-        "tool",
-        lambda **kw: lambda fn: SimpleNamespace(name=kw["name"]),
-        raising=False,
-    )
 
     _assert_skipped(
         PREFIX + "native_graph",
