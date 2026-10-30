@@ -2,7 +2,7 @@
 name = "launchdarkly-ai-python"
 version = "0.4.0"
 requires-python = ">=3.12"
-dependencies = ["launchdarkly-ai-server>=0.6,<2"]
+dependencies = ["launchdarkly-ai-server>=1.0.0,<2"]
 description = "LaunchDarkly AI SDK for Python — convenience barrel re-export"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,8 +23,8 @@ Repository = "https://github.com/launchdarkly/python-ai-sdk"
 "Bug Tracker" = "https://github.com/launchdarkly/python-ai-sdk/issues"
 
 [project.optional-dependencies]
-otel = ["launchdarkly-ai-server[otel]>=0.6,<2"]
-ld = ["launchdarkly-ai-server[ld]>=0.6,<2"]
+otel = ["launchdarkly-ai-server[otel]>=1.0.0,<2"]
+ld = ["launchdarkly-ai-server[ld]>=1.0.0,<2"]
 
 [build-system]
 requires = ["hatchling>=1.32,<2"]
