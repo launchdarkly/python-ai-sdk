@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from .types import NativeTool, ProviderHandler
-from .utils import handler_key
+from .utils import registration_key
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +42,15 @@ class Registry:
     ) -> None:
         if handlers:
             for handler in handlers:
-                key = handler_key(handler)
+                key = registration_key(handler)
                 if key is not None:
-                    # Same identity as select_handler / evaluations: provider plus
-                    # normalized mode (completion and messages collide).
+                    # Identity is provides_for plus the provider set. Two scoped
+                    # wildcards of the same mode stay registered when their lists differ.
                     existing_idx = next(
                         (
                             i
                             for i, h in enumerate(self._handlers)
-                            if handler_key(h) == key
+                            if registration_key(h) == key
                         ),
                         None,
                     )
