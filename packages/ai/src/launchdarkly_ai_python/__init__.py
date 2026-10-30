@@ -3,7 +3,7 @@
 See https://launchdarkly.com/docs for usage.
 """
 
-__version__ = "0.4.0"  # x-release-please-version
+__version__ = "1.0.0"  # x-release-please-version
 
 from launchdarkly_ai_server import *  # noqa: F403
 from launchdarkly_ai_server import __all__ as __all__
