@@ -17,6 +17,7 @@ from langchain_openai import ChatOpenAI as _REAL_CHAT_OPENAI
 from launchdarkly_ai_langchain_agents.native_graph import (
     _build_node_tools,
     _extract_usage,
+    _to_neutral_history,
     to_lang_graph,
 )
 from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
@@ -1353,3 +1354,372 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
         expected = LANGCHAIN_CHAT_OPENAI
         candidates = candidate_keys(_REAL_CHAT_OPENAI.model_fields, expected)
         assert await probe_forwarded_keys(candidates, call) == expected
+
+
+# ---------------------------------------------------------------------------
+# Hand-offs through a real StateGraph (AIC-3592)
+# ---------------------------------------------------------------------------
+
+
+def _handoff_graph_def(
+    children: list[str], root_tools: dict[str, Any] | None = None
+) -> GraphDefinition:
+    def _node(
+        key: str, edges: list[str], tools: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "model": {"name": "m"},
+            "instructions": f"you are {key}",
+        }
+        if tools:
+            config["tools"] = tools
+        return {
+            "key": key,
+            "config": config,
+            "meta": {"variationKey": "v1", "version": 1},
+            "edges": [{"source_key": key, "target_key": c} for c in edges],
+            "is_terminal": not edges,
+        }
+
+    nodes = {"router": _node("router", children, root_tools)}
+    nodes.update({c: _node(c, []) for c in children})
+    return _make_graph_def(
+        nodes=nodes,
+        edges=[{"source_key": "router", "target_key": c} for c in children],
+        root_key="router",
+    )
+
+
+def _scripted_models(replies: dict[str, list[Any]]) -> tuple[Any, dict[str, Any]]:
+    """One mock chat model per node; each ainvoke pops that node's next reply.
+    bind_tools is a MagicMock, so a test can assert on its kwargs."""
+    models: dict[str, Any] = {}
+    for key, msgs in replies.items():
+        m = MagicMock()
+        m.ainvoke = AsyncMock(side_effect=list(msgs))
+        m.bind_tools = MagicMock(return_value=m)
+        models[key] = m
+    return (lambda node: models[node.key]), models
+
+
+def _tool_call_msg(*calls: tuple[Any, ...], content: Any = "") -> Any:
+    """An AI message with tool calls; each call is (name, id) or (name, id, args)."""
+    from langchain_core.messages import AIMessage
+
+    return AIMessage(
+        content=content,
+        tool_calls=[
+            {
+                "name": c[0],
+                "args": c[2] if len(c) > 2 else {},
+                "id": c[1],
+                "type": "tool_call",
+            }
+            for c in calls
+        ],
+    )
+
+
+async def _run_handoff(
+    graph_def: GraphDefinition,
+    factory: Any,
+    tool_handlers: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    from langchain_core.messages import AIMessage  # noqa: F401
+
+    tracked: list[str] = []
+    client = MagicMock()
+    client.track = MagicMock(side_effect=lambda evt, *_a: tracked.append(evt))
+    with (
+        patch("launchdarkly_ai_langchain_agents.native_graph._HAS_OTEL", False),
+        patch(
+            "launchdarkly_ai_langchain_agents.native_graph.get_client",
+            return_value=client,
+        ),
+    ):
+        result = await to_lang_graph(
+            _make_def_promise(graph_def),
+            {
+                "model_factory": factory,
+                "tool_handlers": tool_handlers or {},
+                "context": {"kind": "user", "key": "u"},
+            },
+        ).invoke("who did it?")
+    return result, tracked
+
+
+def _sent(model: Any, call: int = 0) -> list[tuple[str, Any]]:
+    """(type, content) of each message a node's model received on one call."""
+    return [(m.type, m.content) for m in model.ainvoke.call_args_list[call].args[0]]
+
+
+def _assert_neutral(model: Any) -> None:
+    """No tool role, tool calls or non-text blocks reach a node that was handed to."""
+    for m in model.ainvoke.call_args.args[0]:
+        assert m.type != "tool"
+        assert not getattr(m, "tool_calls", None)
+        assert isinstance(m.content, str)
+
+
+# Same literal as the TypeScript tests' REASONING, so the two rewrite tests share one input.
+_REASONING = {"type": "reasoning_content", "reasoning_content": {"text": "hmm"}}
+
+
+class TestNativeHandoffRealStateGraph:
+    @pytest.mark.asyncio
+    async def test_multi_child_router_hands_off_once(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [
+                    _tool_call_msg(
+                        ("transfer_to_manor_butler", "call_1"),
+                        content=[_REASONING, {"type": "text", "text": "Routing."}],
+                    )
+                ],
+                "manor.butler": [AIMessage(content="the butler did it")],
+                "cook": [],
+            }
+        )
+        result, tracked = await _run_handoff(
+            _handoff_graph_def(["manor.butler", "cook"]), factory
+        )
+
+        assert result["response"] == "the butler did it"
+        assert models["router"].ainvoke.call_count == 1  # not re-run after the hand-off
+        assert models["cook"].ainvoke.call_count == 0
+        # A target with no tools gets the router's turn as plain text: reasoning
+        # dropped, the call and its result as lines. The result text uses the raw
+        # target key; the tool name uses the sanitized one.
+        assert _sent(models["manor.butler"]) == [
+            ("system", "you are manor.butler"),
+            ("human", "who did it?"),
+            ("ai", "Routing.\n[Tool call] transfer_to_manor_butler {}"),
+            (
+                "human",
+                "[Tool result] transfer_to_manor_butler: Handed off to manor.butler.",
+            ),
+        ]
+        _assert_neutral(models["manor.butler"])
+        assert tracked.count("$ld:ai:graph:handoff_success") == 1
+
+    @pytest.mark.asyncio
+    async def test_bind_tools_gets_no_parallel_tool_calls(self) -> None:
+        """Bedrock Converse rejects parallel_tool_calls, so it is never passed."""
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [_tool_call_msg(("transfer_to_butler", "call_1"))],
+                "butler": [AIMessage(content="done")],
+                "cook": [],
+            }
+        )
+        await _run_handoff(_handoff_graph_def(["butler", "cook"]), factory)
+
+        assert models["router"].bind_tools.call_args.kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_normal_tool_and_handoff_in_one_message_both_run(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        lookups: list[Any] = []
+        factory, models = _scripted_models(
+            {
+                "router": [
+                    _tool_call_msg(
+                        ("lookup", "call_a", {"room": "library"}),
+                        ("transfer_to_butler", "call_b"),
+                    )
+                ],
+                "butler": [AIMessage(content="done")],
+                "cook": [],
+            }
+        )
+        result, _ = await _run_handoff(
+            _handoff_graph_def(
+                ["butler", "cook"],
+                root_tools={
+                    "lookup": {
+                        "description": "look up",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"room": {"type": "string"}},
+                        },
+                    }
+                },
+            ),
+            factory,
+            tool_handlers={"lookup": lambda args: lookups.append(args) or "clue"},
+        )
+
+        assert result["response"] == "done"
+        assert lookups == [{"room": "library"}]
+        assert models["router"].ainvoke.call_count == 1
+        # Both results become one user message, in the call order.
+        assert _sent(models["butler"])[2:] == [
+            (
+                "ai",
+                '[Tool call] lookup {"room":"library"}\n[Tool call] transfer_to_butler {}',
+            ),
+            (
+                "human",
+                "[Tool result] lookup: clue\n"
+                "[Tool result] transfer_to_butler: Handed off to butler.",
+            ),
+        ]
+        _assert_neutral(models["butler"])
+
+    @pytest.mark.asyncio
+    async def test_first_handoff_wins(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [
+                    _tool_call_msg(
+                        ("transfer_to_butler", "call_1"), ("transfer_to_cook", "call_2")
+                    )
+                ],
+                "butler": [AIMessage(content="butler answer")],
+                "cook": [],
+            }
+        )
+        result, tracked = await _run_handoff(
+            _handoff_graph_def(["butler", "cook"]), factory
+        )
+
+        assert result["response"] == "butler answer"
+        assert models["cook"].ainvoke.call_count == 0
+        assert _sent(models["butler"])[-1] == (
+            "human",
+            "[Tool result] transfer_to_butler: Handed off to butler.\n"
+            "[Tool result] transfer_to_cook: Ignored: only the first transfer in a turn routes.",
+        )
+        assert tracked.count("$ld:ai:graph:handoff_success") == 1
+
+    @pytest.mark.asyncio
+    async def test_single_child_hands_off_once(self) -> None:
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [_tool_call_msg(("transfer_to_butler", "call_1"))],
+                "butler": [AIMessage(content="the butler did it")],
+            }
+        )
+        result, _ = await _run_handoff(_handoff_graph_def(["butler"]), factory)
+
+        assert result["response"] == "the butler did it"
+        assert models["router"].ainvoke.call_count == 1
+        assert _sent(models["butler"])[2:] == [
+            ("ai", "[Tool call] transfer_to_butler {}"),
+            ("human", "[Tool result] transfer_to_butler: Handed off to butler."),
+        ]
+        _assert_neutral(models["butler"])
+
+    @pytest.mark.asyncio
+    async def test_own_tool_loop_stays_native(self) -> None:
+        """Only the history from before a node was entered is rewritten: a node's
+        own tool call and its result reach its next model call unchanged."""
+        from langchain_core.messages import AIMessage
+
+        factory, models = _scripted_models(
+            {
+                "router": [
+                    _tool_call_msg(("lookup", "call_x"), content=[_REASONING]),
+                    AIMessage(content="answer"),
+                ],
+            }
+        )
+        result, _ = await _run_handoff(
+            _handoff_graph_def(
+                [],
+                root_tools={
+                    "lookup": {
+                        "description": "look up",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                },
+            ),
+            factory,
+            tool_handlers={"lookup": lambda args: "clue"},
+        )
+
+        assert result["response"] == "answer"
+        second = models["router"].ainvoke.call_args_list[1].args[0]
+        assert [m.type for m in second] == ["system", "human", "ai", "tool"]
+        assert second[2].tool_calls[0]["id"] == "call_x"
+        assert second[2].content == [_REASONING]
+        assert second[3].tool_call_id == "call_x"
+
+
+class TestToNeutralHistory:
+    """The rewrite rules in spec §2.x.3, on one input that hits each of them.
+    The TypeScript test uses the same input and expects the same output."""
+
+    def test_rewrites_every_case(self) -> None:
+        from langchain_core.messages import (
+            AIMessage,
+            AIMessageChunk,
+            HumanMessage,
+            SystemMessage,
+            ToolMessage,
+            ToolMessageChunk,
+        )
+
+        image = [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:x"}},
+        ]
+        history = [
+            SystemMessage("sys"),
+            HumanMessage(image),
+            AIMessage(
+                content=[
+                    _REASONING,
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": None},
+                    {"type": "text", "text": "b"},
+                ],
+                tool_calls=[
+                    {
+                        "name": "first",
+                        "args": {"q": "café", "n": {"x": [1, 2]}},
+                        "id": "c1",
+                    },
+                    {"name": "second", "args": {}, "id": "c2"},
+                ],
+            ),
+            ToolMessage("orphan", tool_call_id="zz", name="lost"),
+            ToolMessage([{"type": "text", "text": "two"}], tool_call_id="c2"),
+            ToolMessage("one", tool_call_id="c1"),
+            AIMessage(content=[_REASONING]),
+            AIMessageChunk(
+                content="chunk", tool_calls=[{"name": "t", "args": {}, "id": "c3"}]
+            ),
+            ToolMessageChunk(content="three", tool_call_id="c3"),
+        ]
+
+        out = _to_neutral_history(history, AIMessage, HumanMessage)
+
+        assert [(m.type, m.content) for m in out] == [
+            ("system", "sys"),
+            ("human", image),
+            (
+                "ai",
+                "ab\n"
+                '[Tool call] first {"q":"café","n":{"x":[1,2]}}\n'
+                "[Tool call] second {}",
+            ),
+            (
+                "human",
+                "[Tool result] first: one\n"
+                "[Tool result] second: two\n"
+                "[Tool result] lost: orphan",
+            ),
+            ("ai", "chunk\n[Tool call] t {}"),
+            ("human", "[Tool result] t: three"),
+        ]
+        assert all(not getattr(m, "tool_calls", None) for m in out)

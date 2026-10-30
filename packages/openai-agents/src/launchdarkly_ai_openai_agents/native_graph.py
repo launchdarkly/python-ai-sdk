@@ -6,6 +6,7 @@ tree and runs it via Runner.run, mirroring the TypeScript toOpenAIAgents.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
 import time
@@ -21,6 +22,7 @@ from launchdarkly_ai_server import (
     NativeTool,
     compose_history,
     get_client,
+    is_function_tool,
     make_track_data,
     parse_template,
     report_usage,
@@ -70,18 +72,26 @@ def _build_node_tools(
     import importlib
 
     agents_mod = importlib.import_module("agents")
-    tool_fn = agents_mod.tool
+    # Not `agents.tool`, which is a submodule. Same class as handler._build_agent_tools.
+    FunctionTool = agents_mod.FunctionTool
 
     if not node.config.get("tools"):
         return []
 
     result = []
     for name, tool_cfg in node.config["tools"].items():
+        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+            continue
 
-        async def _execute(args: Any, _name: str = name) -> str:
+        # on_invoke_tool receives (ToolContext, json_args_str); decode and dispatch.
+        async def _execute(_ctx: Any, args_str: str, _name: str = name) -> str:
             handler = tool_handlers.get(_name)
             if not handler or isinstance(handler, NativeTool):
                 return ""
+            try:
+                args = json.loads(args_str) if args_str else {}
+            except (json.JSONDecodeError, ValueError):
+                args = {}
             # Handlers may be sync or async. Same rule as handler._build_agent_tools
             # and tracking.wrap_tool_handlers — awaiting a plain return raises.
             result = handler(args)
@@ -89,11 +99,16 @@ def _build_node_tools(
                 result = await result
             return tool_result_string(result)
 
-        t = tool_fn(
+        t = FunctionTool(
             name=name,
-            description=tool_cfg.get("description", ""),
-            params_json_schema=tool_cfg.get("parameters") or {},
-        )(_execute)
+            description=tool_cfg.get("description", "") or "",
+            params_json_schema=tool_cfg.get("parameters")
+            or {"type": "object", "properties": {}},
+            on_invoke_tool=_execute,
+            # Send the config's schema as given, like the TypeScript graph's `strict: false`.
+            # Strict mode would make every property required and reject additionalProperties.
+            strict_json_schema=False,
+        )
         result.append(t)
     return result
 

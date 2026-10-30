@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from launchdarkly_ai_server import (
+    ProviderHandler,
     create_handler,
     make_track_data,
     model_stamps_from_meta,
@@ -194,6 +195,103 @@ class TestCreateHandler:
 
         h = create_handler(("MyProvider", "messages"), fn)
         assert h.provides_for == ("MyProvider", "messages")
+
+    def test_providers_defaults_to_none(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        h = create_handler(("*", "messages"), fn)
+        assert h.providers is None
+
+    def test_attaches_providers(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        h = create_handler(("*", "messages"), fn, providers=["Bedrock", "Anthropic"])
+        assert h.provides_for == ("*", "messages")
+        assert h.providers == ("Bedrock", "Anthropic")
+
+    def test_rejects_an_empty_provider_list(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers=[])
+
+    def test_rejects_a_blank_provider_name(self) -> None:
+        async def fn(
+            config: object,
+            user_input: object,
+            tool_handlers: object,
+            variables: object,
+            history: object = None,
+        ) -> dict:  # type: ignore[override]
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers=["Bedrock", ""])
+
+    @pytest.mark.parametrize("name", [" Bedrock", "Bedrock ", "\tBedrock"])
+    def test_rejects_a_provider_name_with_surrounding_whitespace(
+        self, name: str
+    ) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers=[name])
+
+    def test_rejects_a_bare_string(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            create_handler(("*", "messages"), fn, providers="Bedrock")
+
+    def test_drops_repeated_names_keeping_first_seen_order(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        h = create_handler(
+            ("*", "messages"), fn, providers=["Bedrock", "Anthropic", "Bedrock"]
+        )
+        assert h.providers == ("Bedrock", "Anthropic")
+
+    def test_provider_handler_validates_and_copies_providers(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(ValueError, match="providers"):
+            ProviderHandler(fn, ("*", "messages"), providers=[])
+        names = ["Bedrock"]
+        h = ProviderHandler(fn, ("*", "messages"), providers=names)
+        names.append("OpenAI")
+        assert h.providers == ("Bedrock",)
+
+    def test_provider_handler_takes_providers_by_keyword_only(self) -> None:
+        async def fn(*args: object, **kwargs: object) -> dict:
+            return {"output": "ok"}
+
+        with pytest.raises(TypeError):
+            ProviderHandler(fn, ("*", "messages"), None, None, ["Bedrock"])  # type: ignore[misc]
 
     def test_returns_callable(self) -> None:
         async def fn(
@@ -434,3 +532,35 @@ class TestModelParameters:
         result = model_parameters(config)
         assert "secret" not in result
         assert "custom" not in result
+
+
+# ---------------------------------------------------------------------------
+# is_function_tool
+# ---------------------------------------------------------------------------
+
+
+def test_is_function_tool_accepts_a_callable_and_rejects_a_missing_handler() -> None:
+    from launchdarkly_ai_server import is_function_tool
+
+    assert is_function_tool(lambda: 1, "fn") is True
+    assert is_function_tool(None, "missing") is False
+
+
+def test_is_function_tool_rejects_a_native_tool_and_its_stub_warning_once_per_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from launchdarkly_ai_server import NativeTool, is_function_tool, wrap_tool_handlers
+
+    native = NativeTool("WebSearch")
+    stub = wrap_tool_handlers({"utils-web": native}, {"kind": "user", "key": "u"}, {})[
+        "utils-web"
+    ]
+    assert callable(stub)
+    with caplog.at_level("WARNING"):
+        assert is_function_tool(stub, "utils-web") is False
+        assert is_function_tool(native, "utils-web") is False
+        assert is_function_tool(native, "utils-other") is False
+    assert [r.getMessage() for r in caplog.records] == [
+        'Skipping native tool "utils-web": this handler has no built-in tool for it.',
+        'Skipping native tool "utils-other": this handler has no built-in tool for it.',
+    ]

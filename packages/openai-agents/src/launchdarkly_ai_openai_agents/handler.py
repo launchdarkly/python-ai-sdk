@@ -39,6 +39,7 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     image_block_to_url,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -220,6 +221,10 @@ def _build_agent_tools(
 
     result = []
     for name, tool_cfg in config_tools.items():
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+            continue
+
         # on_invoke_tool receives (ToolContext, json_args_str); decode and dispatch.
         async def _execute(_ctx: Any, args_str: str, _name: str = name) -> str:
             handler = tool_handlers.get(_name)
@@ -658,7 +663,7 @@ def create_openai_agents_handler(
     for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
     meaning models, token counts, timings and tool names.
     """
-    report_usage("openai-agents.createOpenAIAgentHandler", PACKAGE_NAME, __version__)
+    report_usage("openai-agents.createOpenAIAgentsHandler", PACKAGE_NAME, __version__)
     return _create_openai_agents_handler(capture_content=capture_content)
 
 
@@ -685,7 +690,7 @@ def _create_openai_agents_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared once this path (success or failure) has ended the root, so the `finally` below can
         # tell an open root from a closed one without asking the span. A mock span answers
@@ -811,7 +816,7 @@ async def _stream_gen(
     agents_mod = importlib.import_module("agents")
     Runner = agents_mod.Runner
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     agent, prompt, instructions = _build_agent_and_prompt(

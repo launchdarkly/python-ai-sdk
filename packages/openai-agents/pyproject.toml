@@ -7,7 +7,7 @@ dependencies = [
   "opentelemetry-api>=1.25",
   "pydantic>=2.13",
   "openai>=2.44",
-  "openai-agents>=0.17",
+  "openai-agents>=0.17,<0.25",
 ]
 description = "OpenAI agent handler for LaunchDarkly AI SDK"
 readme = "README.md"

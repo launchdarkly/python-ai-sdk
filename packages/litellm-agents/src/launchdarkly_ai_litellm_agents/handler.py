@@ -26,6 +26,7 @@ from launchdarkly_ai_server import (
     content_to_text,
     end_span_once,
     image_block_to_url,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -273,7 +274,7 @@ def _tools(config_value: AiConfigRep, handlers: Mapping[str, Any]) -> list[Any]:
     tools: list[Any] = []
     for name, definition in (config_value.get("tools") or {}).items():
         handler = handlers.get(name)
-        if not callable(handler):
+        if not is_function_tool(handler, name):
             continue
 
         async def invoke(_context: Any, args: str, _handler: Any = handler) -> Any:
@@ -310,7 +311,12 @@ def _direct_usage(raw: Any) -> SpanUsage:
     )
 
 
-def _root_span(config_value: AiConfigRep, variables: dict[str, Any]) -> Any:
+def _root_span(
+    config_value: AiConfigRep,
+    variables: dict[str, Any],
+    *,
+    capture_content: bool = False,
+) -> Any:
     model_name = _model_config(config_value)[0]
     provider = str(
         (config_value.get("provider") or {}).get("name") or "litellm"
@@ -320,7 +326,7 @@ def _root_span(config_value: AiConfigRep, variables: dict[str, Any]) -> Any:
     )
     span.set_attribute("gen_ai.operation.name", "invoke_agent")
     set_model_identity_attributes(span, provider, model_name, "litellm")
-    set_ld_span_attributes(span, variables)
+    set_ld_span_attributes(span, variables, capture_content=capture_content)
     return span
 
 
@@ -589,7 +595,7 @@ def _create_litellm_agents_handler(
             history,
             factory,
         )
-        span = _root_span(config_value, values)
+        span = _root_span(config_value, values, capture_content=capture_content)
         parent = _parent_context(span)
         model_name = _model_config(config_value)[0]
         ended: set[int] = set()
@@ -676,7 +682,7 @@ async def _stream(
     agent, prompt, instructions, max_turns = _agent_and_prompt(
         config_value, user_input, handlers, variables, history, model_factory
     )
-    span = _root_span(config_value, variables)
+    span = _root_span(config_value, variables, capture_content=capture_content)
     parent = _parent_context(span)
     streamed: Any = None
     completed = False

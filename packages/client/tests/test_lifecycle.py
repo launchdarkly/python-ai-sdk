@@ -5,6 +5,7 @@ Tests for init_client / get_client / shutdown.
 import ast
 import asyncio
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -1029,6 +1030,28 @@ class TestInspectConfig:
         assert result["meta"]["modelVersion"] == 3  # type: ignore[index]
         assert extracted["meta"]["modelKey"] == "my-model"
         assert extracted["meta"]["modelVersion"] == 3
+
+    async def test_returns_the_raw_variation_beside_meta_not_on_it(self) -> None:
+        raw = {
+            "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+            "model": {"name": "claude-3-5"},
+            "provider": {"name": "Anthropic"},
+            "instructions": "You are helpful.",
+        }
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(return_value=raw)
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            extracted = await lifecycle_module.extract_variation("my-flag", ctx)
+
+        assert extracted["value"] == raw
+        assert raw not in extracted["meta"].values()
+        assert "instructions" not in json.dumps(extracted["meta"])
 
     async def test_returns_enabled_false_and_null_config_when_disabled(self) -> None:
         stub = _make_stub_client()

@@ -52,7 +52,7 @@ async def client() -> Any:
     ("helper", "call"),
     [
         ("openai-agents.openaiAgents", lambda: openai_agents("k", "q", CONTEXT)),
-        ("openai-agents.createOpenAIAgentHandler", create_openai_agents_handler),
+        ("openai-agents.createOpenAIAgentsHandler", create_openai_agents_handler),
         ("openai-agents.openaiGraph", lambda: openai_graph("k")),
         ("openai-agents.toOpenAIAgents", lambda: to_openai_agents(None)),
     ],
@@ -141,7 +141,7 @@ async def test_held_helper_flushes_with_its_package() -> None:
             "aiSdkName": "launchdarkly-ai-server",
             "aiSdkVersion": __version__,
             "aiSdkLanguage": "python",
-            "helper": "openai-agents.createOpenAIAgentHandler",
+            "helper": "openai-agents.createOpenAIAgentsHandler",
             "helperPackageName": PACKAGE_NAME,
             "helperPackageVersion": PACKAGE_VERSION,
         }
