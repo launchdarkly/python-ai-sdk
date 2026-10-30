@@ -391,7 +391,9 @@ def create_openai_messages_handler(
     for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
     meaning models, token counts, timings and tool names.
     """
-    report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
+    report_usage(
+        "openai-messages.createOpenAIMessagesHandler", PACKAGE_NAME, __version__
+    )
     return _create_openai_messages_handler(capture_content=capture_content)
 
 

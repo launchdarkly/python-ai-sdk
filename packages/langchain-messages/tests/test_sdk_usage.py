@@ -53,7 +53,7 @@ async def client() -> Any:
             lambda: langchain_messages("k", "q", CONTEXT),
         ),
         (
-            "langchain-messages.createLangChainHandler",
+            "langchain-messages.createLangChainMessagesHandler",
             create_langchain_messages_handler,
         ),
     ],
@@ -104,7 +104,7 @@ async def test_held_helper_flushes_with_its_package() -> None:
             "aiSdkName": "launchdarkly-ai-server",
             "aiSdkVersion": __version__,
             "aiSdkLanguage": "python",
-            "helper": "langchain-messages.createLangChainHandler",
+            "helper": "langchain-messages.createLangChainMessagesHandler",
             "helperPackageName": PACKAGE_NAME,
             "helperPackageVersion": PACKAGE_VERSION,
         }
