@@ -242,6 +242,26 @@ model-generated prose about the user's conversation, so it follows the judge han
 handler or the process default withholds it. The reasoning is always returned to the caller in
 `judgeResults` / `judge_results`; only the telemetry copy is gated.
 
+### Judge spans point at the run they graded
+
+A judge runs after the graded handler has ended its span, so its spans start a trace of their own,
+with their own `launchdarkly.run.id`. To tie them back, `run_judges` (inline) and `run_judge`
+(deferred) wrap each judge's run in `stamp_span_attributes`, so every SDK span of that run carries
+the graded run's identity, write-if-absent:
+
+| Span attribute | Value |
+|---|---|
+| `launchdarkly.judge.target.run.id` | graded run's `TrackData.runId` |
+| `launchdarkly.judge.target.config.key` | graded run's `TrackData.configKey` |
+| `launchdarkly.judge.target.variation.key` | graded run's `TrackData.variationKey` |
+
+The constants are `LD_JUDGE_TARGET_*` in `launchdarkly_ai_server/judges.py`. Inline judges read
+`base_track_data`; deferred judges read `JudgeTask.parent_track_data`. Each key is written only when
+its value is a non-empty string. They are identifiers, not content, so capture settings do not gate
+them. The judge's metric event already carries the graded `runId` in its `TrackData`; these
+attributes put the same link on the trace. Offline evaluations stamp `launchdarkly.evaluation_run.id`
+on every span of a row the same way.
+
 ---
 
 ## 5. Finish reasons
