@@ -1365,7 +1365,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.113" },
+    { name = "anthropic", specifier = ">=0.113,<2" },
     { name = "launchdarkly-ai-server", editable = "packages/client" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
 ]

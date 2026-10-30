@@ -70,7 +70,10 @@ jobs:
 
   # The lock pins the lowest anthropic the Claude packages allow, so `test` never sees a newer
   # one. anthropic 1.0 removed keyword arguments the handler used to pass (AIC-3735); this runs
-  # the Claude Messages suite, whose drift tests read the SDK's own signatures, on the newest.
+  # the full suite, whose Claude Messages drift tests read the SDK's own signatures, on the
+  # newest anthropic claude-messages allows. `uv pip install anthropic` alone ignores that
+  # package's cap, so the requirement is read from its pyproject.toml, and --upgrade-package
+  # upgrades anthropic only, not its dependencies.
   test-latest-anthropic:
     name: Tests (newest anthropic)
     needs: setup
@@ -82,9 +85,9 @@ jobs:
           python-version: "3.12"
       - run: uv lock
       - run: uv sync --all-packages
-      - run: uv pip install --upgrade anthropic
+      - run: uv pip install --upgrade-package anthropic -r packages/claude-messages/pyproject.toml
       - run: uv run --no-sync python -c "import anthropic; print('anthropic', anthropic.__version__)"
-      - run: uv run --no-sync pytest packages/claude-messages
+      - run: uv run --no-sync pytest
 
   # ─── Build ────────────────────────────────────────────────────────────────
   build:
