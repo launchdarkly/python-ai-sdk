@@ -14,11 +14,14 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 
+import pytest
 from anthropic.resources.messages import AsyncMessages
 
 from launchdarkly_ai_claude_messages.handler import (
     _MESSAGES_EXCLUDED_KEYS,
     _MESSAGES_FORWARDED_KEYS,
+    _MESSAGES_SAMPLING_KEYS,
+    _forwarded_parameters,
 )
 
 #: Handler-owned: set by each call site itself, never taken from the config.
@@ -36,6 +39,10 @@ def _signature_keys(fn: Callable[..., object]) -> frozenset[str]:
         keys.add(name)
     return frozenset(keys)
 
+
+#: Excluded keys that only newer ``anthropic`` releases accept (``pyproject.toml`` allows back to
+#: 0.113), so a missing one is not stale.
+_EXCLUDED_ADDED_LATER = frozenset({"diagnostics", "speed", "workspace_id"})
 
 _CREATE_KEYS = _signature_keys(AsyncMessages.create)
 _STREAM_KEYS = _signature_keys(AsyncMessages.stream)
@@ -59,7 +66,9 @@ class TestMessagesCreateAcceptsExactlyTheseKeys:
         assert not overlap, f"keys classified more than once: {sorted(overlap)}"
 
     def test_every_forwarded_or_owned_key_is_a_real_parameter(self) -> None:
-        stale = (_MESSAGES_FORWARDED_KEYS | _OWNED_KEYS) - _CREATE_KEYS
+        stale = (
+            (_MESSAGES_FORWARDED_KEYS - _MESSAGES_SAMPLING_KEYS) | _OWNED_KEYS
+        ) - _CREATE_KEYS
         assert not stale, (
             f"{sorted(stale)} forwarded or handler-owned in claude-messages handler.py but "
             "AsyncMessages.create does not accept them"
@@ -77,7 +86,9 @@ class TestMessagesStreamAcceptsExactlyTheseKeys:
         )
 
     def test_every_forwarded_or_owned_key_is_a_real_parameter(self) -> None:
-        stale = (_MESSAGES_FORWARDED_KEYS | _OWNED_KEYS) - _STREAM_KEYS
+        stale = (
+            (_MESSAGES_FORWARDED_KEYS - _MESSAGES_SAMPLING_KEYS) | _OWNED_KEYS
+        ) - _STREAM_KEYS
         assert not stale, (
             f"{sorted(stale)} forwarded or handler-owned in claude-messages handler.py but "
             "AsyncMessages.stream does not accept them"
@@ -85,8 +96,34 @@ class TestMessagesStreamAcceptsExactlyTheseKeys:
 
 
 def test_every_excluded_key_is_a_real_parameter() -> None:
-    stale = _MESSAGES_EXCLUDED_KEYS - (_CREATE_KEYS | _STREAM_KEYS)
+    stale = (_MESSAGES_EXCLUDED_KEYS - _EXCLUDED_ADDED_LATER) - (
+        _CREATE_KEYS | _STREAM_KEYS
+    )
     assert not stale, (
         f"{sorted(stale)} excluded in claude-messages handler.py but neither "
         "AsyncMessages.create nor .stream accepts them"
     )
+
+
+@pytest.mark.parametrize("call", [AsyncMessages.create, AsyncMessages.stream])
+def test_forwarded_parameters_bind_to_the_installed_sdk(
+    call: Callable[..., object],
+) -> None:
+    """``anthropic`` 1.0 dropped ``temperature``/``top_p``/``top_k`` from both calls, so passing
+    them as keyword arguments is a ``TypeError`` ("unexpected keyword argument"). Binds what the
+    handler would pass against the installed SDK's real signature, which fails on any release
+    that rejects a forwarded key and passes on the ones that take it."""
+    params = _forwarded_parameters(
+        {
+            "model": {
+                "parameters": {
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "top_k": 40,
+                    "stop_sequences": ["END"],
+                }
+            }
+        }
+    )
+    assert params["extra_body"] == {"temperature": 0.2, "top_p": 0.9, "top_k": 40}
+    inspect.signature(call).bind(None, model="m", max_tokens=1, messages=[], **params)

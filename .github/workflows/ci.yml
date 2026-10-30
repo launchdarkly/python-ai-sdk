@@ -68,6 +68,24 @@ jobs:
       # holds the invariants no single package can own. `make test` runs this same bare command.
       - run: uv run pytest
 
+  # The lock pins the lowest anthropic the Claude packages allow, so `test` never sees a newer
+  # one. anthropic 1.0 removed keyword arguments the handler used to pass (AIC-3735); this runs
+  # the Claude Messages suite, whose drift tests read the SDK's own signatures, on the newest.
+  test-latest-anthropic:
+    name: Tests (newest anthropic)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv lock
+      - run: uv sync --all-packages
+      - run: uv pip install --upgrade anthropic
+      - run: uv run --no-sync python -c "import anthropic; print('anthropic', anthropic.__version__)"
+      - run: uv run --no-sync pytest packages/claude-messages
+
   # ─── Build ────────────────────────────────────────────────────────────────
   build:
     name: Build all packages
