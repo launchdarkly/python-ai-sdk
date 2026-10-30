@@ -21,6 +21,7 @@ from .types import (
     VariationMeta,
 )
 from .utils import (
+    _NO_FEATURE_FLAG_EVENT_KEY,
     _SPAN_ATTRIBUTES_KEY,
     _without_span_attributes,
     model_stamps_from_meta,
@@ -161,29 +162,16 @@ def _exposed_tool_keys(
     ]
 
 
-async def execute_and_track(
+def make_track_data(
     *,
     config_key: str,
     config: AiConfigRep,
     meta: VariationMeta,
-    user_context: LDContext,
-    handler: ProviderHandler,
-    user_input: str | None = None,
-    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
-    variables: dict[str, Any] | None = None,
     graph_key: str | None = None,
-    history: list[dict[str, Any]] | None = None,
     run_id: str | None = None,
     extra_track_data: dict[str, Any] | None = None,
-    span_attributes: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Calls *handler*, emits LD telemetry events, and returns
-    ``{usage, response, track_data}``.
-    """
-    from .lifecycle import get_client
-
-    environment_id = _try_get_environment_id()
+) -> TrackData:
+    """The ``TrackData`` every event of one run of *config* carries."""
     track_data: TrackData = {
         "runId": run_id or str(uuid.uuid4()),
         "configKey": config_key,
@@ -199,10 +187,46 @@ async def execute_and_track(
     }
     if graph_key:
         track_data["graphKey"] = graph_key
+    environment_id = _try_get_environment_id()
     if environment_id:
         track_data["environmentId"] = environment_id
     if extra_track_data:
         track_data.update(extra_track_data)
+    return track_data
+
+
+async def execute_and_track(
+    *,
+    config_key: str,
+    config: AiConfigRep,
+    meta: VariationMeta,
+    user_context: LDContext,
+    handler: ProviderHandler,
+    user_input: str | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
+    variables: dict[str, Any] | None = None,
+    graph_key: str | None = None,
+    history: list[dict[str, Any]] | None = None,
+    run_id: str | None = None,
+    extra_track_data: dict[str, Any] | None = None,
+    span_attributes: dict[str, Any] | None = None,
+    feature_flag_event: bool = True,
+) -> dict[str, Any]:
+    """
+    Calls *handler*, emits LD telemetry events, and returns
+    ``{usage, response, track_data}``. ``feature_flag_event=False`` keeps the
+    ``feature_flag`` event off the handler's root span.
+    """
+    from .lifecycle import get_client
+
+    track_data = make_track_data(
+        config_key=config_key,
+        config=config,
+        meta=meta,
+        graph_key=graph_key,
+        run_id=run_id,
+        extra_track_data=extra_track_data,
+    )
 
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
@@ -225,6 +249,8 @@ async def execute_and_track(
     }
     if span_attributes:
         merged_variables[_SPAN_ATTRIBUTES_KEY] = dict(span_attributes)
+    if not feature_flag_event:
+        merged_variables[_NO_FEATURE_FLAG_EVENT_KEY] = True
 
     start_time = time.monotonic()
 
@@ -291,24 +317,9 @@ async def execute_and_stream(
     """
     from .lifecycle import get_client
 
-    environment_id = _try_get_environment_id()
-    track_data: TrackData = {
-        "runId": str(uuid.uuid4()),
-        "configKey": config_key,
-        "variationKey": meta.get("variationKey", "") if isinstance(meta, dict) else "",
-        "version": meta.get("version", 1) if isinstance(meta, dict) else 1,
-        "modelName": config.get("model", {}).get("name", "")
-        if isinstance(config, dict)
-        else "",
-        "providerName": config.get("provider", {}).get("name", "")
-        if isinstance(config, dict)
-        else "",
-        **model_stamps_from_meta(meta),
-    }
-    if graph_key:
-        track_data["graphKey"] = graph_key
-    if environment_id:
-        track_data["environmentId"] = environment_id
+    track_data = make_track_data(
+        config_key=config_key, config=config, meta=meta, graph_key=graph_key
+    )
 
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)

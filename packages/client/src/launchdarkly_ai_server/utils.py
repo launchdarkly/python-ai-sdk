@@ -769,10 +769,15 @@ def _context_identity_from_ld_context(
 
 
 _SPAN_ATTRIBUTES_KEY = "__ld_span"
+_NO_FEATURE_FLAG_EVENT_KEY = "__ld_no_feature_flag_event"
 
 
 def _without_span_attributes(variables: dict[str, Any] | None) -> dict[str, Any]:
-    return {k: v for k, v in (variables or {}).items() if k != _SPAN_ATTRIBUTES_KEY}
+    return {
+        k: v
+        for k, v in (variables or {}).items()
+        if k not in (_SPAN_ATTRIBUTES_KEY, _NO_FEATURE_FLAG_EVENT_KEY)
+    }
 
 
 def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
@@ -835,7 +840,8 @@ def set_ld_span_attributes(span: Any, variables: dict[str, Any] | None) -> None:
         for kind, key in keys.items():
             span.set_attribute(f"context.contextKeys.{kind}", key)
 
-    span.add_event("feature_flag", feature_flag_attrs)
+    if not variables.get(_NO_FEATURE_FLAG_EVENT_KEY):
+        span.add_event("feature_flag", feature_flag_attrs)
 
 
 def parse_json_with_possible_fences(raw_text: str) -> Any | None:

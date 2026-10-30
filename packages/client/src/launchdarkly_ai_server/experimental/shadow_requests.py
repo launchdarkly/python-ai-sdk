@@ -23,12 +23,15 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
 
+from opentelemetry import context as otel_context
+
 from ..client import ConfigInstance, _InternalConfigInstance
+from ..conversation import _conversation_id_from, conversation_id
 from ..lifecycle import _fetch_variation, _parse_variation
 from ..registry import resolve_handlers
 from ..sdk_usage import report_usage
 from ..shutdown_hooks import register_shutdown_hook
-from ..tracking import execute_and_track
+from ..tracking import execute_and_track, make_track_data
 from ..types import (
     AiConfigRep,
     LDContext,
@@ -48,6 +51,7 @@ __all__ = ["ShadowResult", "ShadowTask", "run_shadow", "shadow_config"]
 logger = logging.getLogger("launchdarkly_ai_server.experimental.shadow_requests")
 
 _FALLTHROUGH = "fallthrough"
+_PENDING_SHADOWS = "__ld_pending_shadows"
 _SHADOW_ONLY_KEYS = ("tools", "judgeConfiguration", "shadowConfiguration")
 _BUCKET_SCALE = float(0xFFFFFFFFFFFFFFF)
 
@@ -70,6 +74,7 @@ class ShadowTask:
     timeout_s: float
     track_data: dict[str, Any]
     span_attributes: dict[str, Any] = field(default_factory=dict)
+    conversation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -185,17 +190,31 @@ class _ShadowConfigInstance(_InternalConfigInstance):
             primary._execute_stream(user_input, context, variables, history, sink)
         ) as source:
             async for event in source:
-                # Before judges run, unlike invoke(); neither delays the caller.
                 if event.get("type") == "done":
-                    self._start_shadows(
+                    sink[_PENDING_SHADOWS] = (
                         evaluation,
                         event.get("track_data"),
                         user_input,
-                        context,
                         variables,
                         history,
                     )
                 yield event
+
+    async def _judge_stream(
+        self,
+        sink: dict[str, Any],
+        done: dict[str, Any],
+        user_input: str | None,
+        context: LDContext,
+    ) -> dict[str, Any]:
+        judge_results = await super()._judge_stream(sink, done, user_input, context)
+        pending = sink.pop(_PENDING_SHADOWS, None)
+        if pending is not None:
+            evaluation, track_data, user_input, variables, history = pending
+            self._start_shadows(
+                evaluation, track_data, user_input, context, variables, history
+            )
+        return judge_results
 
     def _start_shadows(
         self,
@@ -341,6 +360,7 @@ def _select_tasks(
         return []
 
     primary_variation_key = primary_track_data.get("variationKey", "")
+    conversation = _conversation_id_from(otel_context.get_current())
     now_ms = time.time() * 1000
     tasks: list[ShadowTask] = []
     for entry in entries:
@@ -381,6 +401,7 @@ def _select_tasks(
                     "launchdarkly.shadow.request.id": entry["id"],
                     "launchdarkly.shadow.primary.variation.key": primary_variation_key,
                 },
+                conversation_id=conversation,
             )
         )
     return tasks
@@ -391,29 +412,38 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
     extra = {k: v for k, v in task.track_data.items() if k != "runId"}
     try:
         handler = select_handler(task.shadow_config, task.shadow_meta, handlers)
-        result = await execute_and_track(
-            config_key=task.config_key,
-            config=task.shadow_config,
-            meta=task.shadow_meta,
-            user_context=task.user_context,
-            handler=_with_deadline(handler, task.timeout_s),
-            user_input=task.user_input,
-            tool_handlers=None,
-            variables=task.variables,
-            history=list(task.history) if task.history else None,
-            run_id=run_id,
-            extra_track_data=extra,
-            span_attributes=task.span_attributes,
-        )
+        with conversation_id(task.conversation_id):
+            result = await execute_and_track(
+                config_key=task.config_key,
+                config=task.shadow_config,
+                meta=task.shadow_meta,
+                user_context=task.user_context,
+                handler=_with_deadline(handler, task.timeout_s),
+                user_input=task.user_input,
+                tool_handlers=None,
+                variables=task.variables,
+                history=list(task.history) if task.history else None,
+                run_id=run_id,
+                extra_track_data=extra,
+                span_attributes=task.span_attributes,
+                feature_flag_event=False,
+            )
     except _ShadowTimeout:
-        return ShadowResult(
-            usage=parse_usage({}), track_data=task.track_data, error="timeout"
-        )
+        return _failed(task, "timeout")
     except Exception as err:
-        return ShadowResult(
-            usage=parse_usage({}), track_data=task.track_data, error=str(err)
-        )
+        return _failed(task, str(err))
     return ShadowResult(usage=result["usage"], track_data=result["track_data"])
+
+
+def _failed(task: ShadowTask, error: str) -> ShadowResult:
+    track_data = make_track_data(
+        config_key=task.config_key,
+        config=task.shadow_config,
+        meta=task.shadow_meta,
+        run_id=task.track_data.get("runId"),
+        extra_track_data=task.track_data,
+    )
+    return ShadowResult(usage=parse_usage({}), track_data=dict(track_data), error=error)
 
 
 class _ShadowTimeout(Exception):

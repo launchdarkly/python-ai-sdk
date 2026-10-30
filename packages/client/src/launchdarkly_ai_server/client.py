@@ -248,6 +248,16 @@ class ConfigInstance:
             async for event in source:
                 yield event
 
+    async def _judge_stream(
+        self,
+        sink: dict[str, Any],
+        done: dict[str, Any],
+        user_input: str | None,
+        context: LDContext,
+    ) -> dict[str, Any]:
+        """Run a finished stream's judges. Every stream reader calls this."""
+        return await judge_completed_stream(self, sink, done, user_input, context)
+
     async def _stream_events(
         self,
         user_input: str | None,
@@ -266,8 +276,8 @@ class ConfigInstance:
         done_event = projector.done
 
         if done_event:
-            judge_results = await judge_completed_stream(
-                self, sink, done_event, user_input, context
+            judge_results = await self._judge_stream(
+                sink, done_event, user_input, context
             )
             yield {
                 "type": "done",

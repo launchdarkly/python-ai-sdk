@@ -12,10 +12,19 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from opentelemetry import context as otel_context
 
 import launchdarkly_ai_server
+import launchdarkly_ai_server.client as client_module
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import ProviderHandler, agui, config, shutdown
+from launchdarkly_ai_server import (
+    ProviderHandler,
+    agui,
+    config,
+    conversation_id,
+    shutdown,
+)
+from launchdarkly_ai_server.conversation import _conversation_id_from
 from launchdarkly_ai_server.experimental import shadow_requests as sr
 from launchdarkly_ai_server.experimental.shadow_requests import (
     ShadowResult,
@@ -143,6 +152,7 @@ class _Recorder:
                 "tools": tool_handlers,
                 "variables": variables,
                 "history": history,
+                "conversation_id": _conversation_id_from(otel_context.get_current()),
             }
         )
         if self._sleep_s:
@@ -156,7 +166,13 @@ class _Recorder:
 
     async def _stream(self, cfg: Any, *args: Any) -> Any:
         self.streamed += 1
-        self.calls.append({"config": cfg, "streamed": True})
+        self.calls.append(
+            {
+                "config": cfg,
+                "streamed": True,
+                "conversation_id": _conversation_id_from(otel_context.get_current()),
+            }
+        )
         yield {"type": "chunk", "text": self._output}
         yield {"type": "done", "usage": {"input_tokens": 3, "output_tokens": 2}}
 
@@ -526,6 +542,69 @@ class TestStream:
         primary_run_ids = {d["runId"] for _, d in _real_events(client)}
         assert tasks[0].track_data["runId"] in primary_run_ids
 
+    async def test_stream_starts_shadows_after_judges(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _use(_make_client(_variation_a()))
+        tasks: list[ShadowTask] = []
+        tasks_when_judged: list[int] = []
+
+        async def judge(*args: Any) -> list[Any]:
+            tasks_when_judged.append(len(tasks))
+            return []
+
+        monkeypatch.setattr(client_module, "judge_completed_stream", judge)
+        async for _ in shadow_config(
+            key="flag",
+            handler=[
+                _Recorder("TestProvider", "real answer").handler,
+                _Recorder("ShadowProvider").handler,
+            ],
+            on_task=tasks.append,
+        ).stream("hi", CONTEXT):
+            pass
+        assert tasks_when_judged == [0]
+        assert len(tasks) == 1
+
+    async def test_agui_stream_starts_shadows_after_judges(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _use(_make_client(_variation_a()))
+        tasks: list[ShadowTask] = []
+        tasks_when_judged: list[int] = []
+
+        async def judge(*args: Any) -> list[Any]:
+            tasks_when_judged.append(len(tasks))
+            return []
+
+        monkeypatch.setattr(client_module, "judge_completed_stream", judge)
+        instance = shadow_config(
+            key="flag",
+            handler=[
+                _Recorder("TestProvider", "real answer").handler,
+                _Recorder("ShadowProvider").handler,
+            ],
+            on_task=tasks.append,
+        )
+        async for _ in agui.stream(instance, "hi", CONTEXT):
+            pass
+        assert tasks_when_judged == [0]
+        assert len(tasks) == 1
+
+    async def test_stream_binds_the_conversation_id_at_call_time(self) -> None:
+        _use(_make_client(_variation_a()))
+        a = _Recorder("TestProvider", "real answer")
+        b = _Recorder("ShadowProvider")
+        with conversation_id("conv-1"):
+            stream = shadow_config(key="flag", handler=[a.handler, b.handler]).stream(
+                "hi", CONTEXT
+            )
+        async for _ in stream:
+            pass
+        await sr._wait_for_shadows_for_testing()
+        assert a.calls[0]["conversation_id"] == "conv-1"
+        assert b.calls[0]["conversation_id"] == "conv-1"
+
     async def test_agui_stream_runs_shadows(self) -> None:
         _use(_make_client(_variation_a()))
         a = _Recorder("TestProvider", "real answer")
@@ -603,6 +682,8 @@ class TestRunning:
         )
         names = [e[0] for e in _shadow_events(client)]
         assert result.error == "timeout"
+        assert result.track_data["configKey"] == "flag"
+        assert result.track_data["variationKey"] == "b"
         assert names.count("$ld:ai:generation:error") == 1
         assert names.count("$ld:ai:duration:total") == 1
         assert "$ld:ai:generation:success" not in names
@@ -763,7 +844,29 @@ class TestDeferred:
         unrouted = await run_shadow(task, [])
         assert failed.error == "boom"
         assert unrouted.error
-        assert unrouted.track_data["isShadow"] is True
+        for result in (failed, unrouted):
+            assert result.track_data["configKey"] == "flag"
+            assert result.track_data["variationKey"] == "b"
+            assert result.track_data["providerName"] == "ShadowProvider"
+            assert SHADOW_FIELDS <= set(result.track_data)
+            assert result.track_data["runId"] == task.track_data["runId"]
+
+    async def test_task_carries_the_conversation_id(self) -> None:
+        client = _make_client(_variation_a())
+        with conversation_id("conv-1"):
+            task = await _deferred_task(client)
+        assert task.conversation_id == "conv-1"
+        assert pickle.loads(pickle.dumps(task)).conversation_id == "conv-1"
+        b = _Recorder("ShadowProvider")
+        await run_shadow(task, [b.handler])
+        assert b.calls[0]["conversation_id"] == "conv-1"
+
+    async def test_task_without_a_bound_conversation_id(self) -> None:
+        task = await _deferred_task(_make_client(_variation_a()))
+        assert task.conversation_id is None
+        b = _Recorder("ShadowProvider")
+        await run_shadow(task, [b.handler])
+        assert b.calls[0]["conversation_id"] is None
 
     async def test_run_shadow_reports_usage(self) -> None:
         client = _make_client(_variation_a())
@@ -817,6 +920,16 @@ class TestEvents:
             "launchdarkly.shadow.primary.variation.key", "a"
         )
 
+    async def test_shadow_root_span_has_no_feature_flag_event(self) -> None:
+        _, a, b = await _invoke(_make_client(_variation_a()))
+        primary_span, shadow_span = MagicMock(), MagicMock()
+        set_ld_span_attributes(primary_span, a.calls[0]["variables"])
+        set_ld_span_attributes(shadow_span, b.calls[0]["variables"])
+        assert "feature_flag" in [
+            c[0][0] for c in primary_span.add_event.call_args_list
+        ]
+        shadow_span.add_event.assert_not_called()
+
     async def test_template_variables_cannot_set_span_attributes(
         self, mock_span: MagicMock
     ) -> None:
@@ -828,3 +941,14 @@ class TestEvents:
         set_ld_span_attributes(mock_span, a.calls[0]["variables"])
         names = [c[0][0] for c in mock_span.set_attribute.call_args_list]
         assert "launchdarkly.is_shadow" not in names
+
+    async def test_template_variables_cannot_skip_the_feature_flag_event(
+        self, mock_span: MagicMock
+    ) -> None:
+        _use(_make_client(_variation_a(shadows={})))
+        a = _Recorder("TestProvider", "real answer")
+        await config(key="flag", handler=a.handler).invoke(
+            "hi", CONTEXT, {"__ld_no_feature_flag_event": True}
+        )
+        set_ld_span_attributes(mock_span, a.calls[0]["variables"])
+        assert "feature_flag" in [c[0][0] for c in mock_span.add_event.call_args_list]
