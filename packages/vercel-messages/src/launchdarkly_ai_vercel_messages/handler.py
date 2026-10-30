@@ -21,6 +21,7 @@ from launchdarkly_ai_server import (
     _config,
     _create_handler,
     compose_history,
+    is_function_tool,
     parse_template,
     report_usage,
 )
@@ -274,7 +275,7 @@ def _tool_executors(
     executors: dict[str, Callable[..., Any]] = {}
     for name in cfg.get("tools") or {}:
         handler = (handlers or {}).get(name)
-        if callable(handler) and not isinstance(handler, NativeTool):
+        if is_function_tool(handler, name):
             executors[name] = handler
     return executors
 
@@ -338,7 +339,7 @@ def _tools(cfg: AiConfigRep, handlers: Mapping[str, Any] | None) -> list[Any]:
     result: list[Any] = []
     for name, definition in (cfg.get("tools") or {}).items():
         handler = (handlers or {}).get(name)
-        if not callable(handler) or isinstance(handler, NativeTool):
+        if not is_function_tool(handler, name):
             continue
 
         async def execute(_handler: Callable[..., Any] = handler, **kwargs: Any) -> Any:

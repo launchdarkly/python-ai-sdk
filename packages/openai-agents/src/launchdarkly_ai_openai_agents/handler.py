@@ -39,6 +39,7 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     image_block_to_url,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -220,6 +221,10 @@ def _build_agent_tools(
 
     result = []
     for name, tool_cfg in config_tools.items():
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+            continue
+
         # on_invoke_tool receives (ToolContext, json_args_str); decode and dispatch.
         async def _execute(_ctx: Any, args_str: str, _name: str = name) -> str:
             handler = tool_handlers.get(_name)

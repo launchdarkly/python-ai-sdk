@@ -20,6 +20,7 @@ from launchdarkly_ai_server import (
     content_to_text,
     end_span_once,
     image_block_to_url,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -219,7 +220,7 @@ def _build_tools(
             },
         }
         for name, tool in (config_value.get("tools") or {}).items()
-        if callable(tool_handlers.get(name))
+        if is_function_tool(tool_handlers.get(name), name)
     ]
 
 

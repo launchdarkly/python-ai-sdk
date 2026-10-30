@@ -434,3 +434,35 @@ class TestModelParameters:
         result = model_parameters(config)
         assert "secret" not in result
         assert "custom" not in result
+
+
+# ---------------------------------------------------------------------------
+# is_function_tool
+# ---------------------------------------------------------------------------
+
+
+def test_is_function_tool_accepts_a_callable_and_rejects_a_missing_handler() -> None:
+    from launchdarkly_ai_server import is_function_tool
+
+    assert is_function_tool(lambda: 1, "fn") is True
+    assert is_function_tool(None, "missing") is False
+
+
+def test_is_function_tool_rejects_a_native_tool_and_its_stub_warning_once_per_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from launchdarkly_ai_server import NativeTool, is_function_tool, wrap_tool_handlers
+
+    native = NativeTool("WebSearch")
+    stub = wrap_tool_handlers({"utils-web": native}, {"kind": "user", "key": "u"}, {})[
+        "utils-web"
+    ]
+    assert callable(stub)
+    with caplog.at_level("WARNING"):
+        assert is_function_tool(stub, "utils-web") is False
+        assert is_function_tool(native, "utils-web") is False
+        assert is_function_tool(native, "utils-other") is False
+    assert [r.getMessage() for r in caplog.records] == [
+        'Skipping native tool "utils-web": this handler has no built-in tool for it.',
+        'Skipping native tool "utils-other": this handler has no built-in tool for it.',
+    ]

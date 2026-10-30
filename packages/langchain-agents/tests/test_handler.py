@@ -431,16 +431,21 @@ class TestToolExecutionLoop:
                 await captured_fns[0](key="val")
 
     @pytest.mark.asyncio
-    async def test_native_tool_is_not_called(self) -> None:
-        # Offline evaluations pass a NativeTool through unwrapped; it is not callable.
+    async def test_native_tool_is_not_registered(self) -> None:
+        # Offline evaluations pass a NativeTool through unwrapped; it is never a function tool.
         from launchdarkly_ai_server import NativeTool
 
-        run = _built_tool(
-            {"web-search": {"description": "d", "parameters": {}}},
-            {"web-search": NativeTool("WebSearch")},
-        )
-        with pytest.raises(ValueError, match="No handler"):
-            await run(query="q")
+        mocks = _make_langchain_mock()
+        mocks["langchain_core.tools"].tool = MagicMock()
+        with _patch_lc(mocks):
+            from launchdarkly_ai_langchain_agents.handler import _build_agent_tools
+
+            tools = _build_agent_tools(
+                {"web-search": {"description": "d", "parameters": {}}},
+                {"web-search": NativeTool("WebSearch")},
+            )
+        assert tools == []
+        mocks["langchain_core.tools"].tool.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_tool_handler_throws_propagates(self) -> None:

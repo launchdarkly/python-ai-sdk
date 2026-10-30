@@ -19,6 +19,7 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -230,7 +231,9 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     )
 
 
-def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_tools(
+    config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     return [
         {
             "name": name,
@@ -238,6 +241,8 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
             "input_schema": tool.get("parameters", {}),
         }
         for name, tool in config_tools.items()
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
     ]
 
 
@@ -380,7 +385,7 @@ async def _run_tool_loop(
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
-    tools = _build_tools(config.get("tools") or {})
+    tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
     extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
@@ -720,7 +725,7 @@ async def _stream_gen(
         config, user_input, variables, include_output_format=False, history=history
     )
 
-    tools = _build_tools(config.get("tools") or {})
+    tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
     tool_definitions = to_tool_definitions(tools)
     extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)

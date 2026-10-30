@@ -24,6 +24,7 @@ from launchdarkly_ai_server import (
     create_run_usage,
     end_span_once,
     end_unfinished_spans,
+    is_function_tool,
     lang_chain_content_text,
     lang_chain_span_messages,
     lang_chain_span_usage,
@@ -400,11 +401,14 @@ def _build_agent_tools(
 
     result = []
     for name, tool_cfg in config_tools.items():
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+            continue
         schema = tool_cfg.get("parameters") or {}
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
             fn = tool_handlers.get(_name)
-            # A NativeTool reaches here unwrapped on the offline evaluations path.
+            # The builder skips a NativeTool, so this guards only a handler that is not callable.
             if not callable(fn):
                 raise ValueError(f'No handler registered for tool "{_name}"')
             # Handlers may be sync or async. Graph ``__handoff_*`` tools stay sync so
