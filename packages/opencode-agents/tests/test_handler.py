@@ -1645,11 +1645,13 @@ class TestProcess:
                 text_delta("m1", "p1", "Hi"),
                 assistant_completed("m1"),
             ],
-            delay_ready=0.6,
+            delay_ready=2.0,
         )
         handler = create_opencode_handler(**script.handler_args())
         async with handler:
-            async with asyncio.timeout(0.2):
+            # The boot is twice the timeout, so the test fails if boot moves inside it. The
+            # 1 s timeout leaves the stream itself room on a slow runner.
+            async with asyncio.timeout(1.0):
                 seen = [
                     event
                     async for event in await handler.stream(
