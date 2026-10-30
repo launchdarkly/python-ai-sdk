@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 _LD_DEFAULT_OTLP_ENDPOINT = "https://otel.observability.app.launchdarkly.com"
 
+_START_WAIT_SECONDS = 10
+"""How long building the LaunchDarkly client may wait to connect; matches the TS SDK."""
+
 _INIT_CLIENT_OPTIONS = frozenset(
     {
         "sdkKey",
@@ -44,6 +47,8 @@ class _InitAttempt:
 
     ``result`` is a thread future, not an asyncio one, so callers on any event
     loop or thread can wait on it. ``waiters`` counts the calls still waiting.
+    ``successor`` is the passed client that replaced this attempt, if one did;
+    an attempt replaced by ``shutdown()`` has none, so its calls fail.
     """
 
     def __init__(self) -> None:
@@ -51,6 +56,7 @@ class _InitAttempt:
             concurrent.futures.Future()
         )
         self.waiters = 0
+        self.successor: LDClientInterface | None = None
 
 
 # Guards ``_client``, ``_attempt`` and the telemetry globals: the attempt thread
@@ -291,6 +297,8 @@ async def init_client(
                 _client = client
                 # An attempt still connecting is abandoned: it closes the client
                 # it builds, and the calls waiting on it get this one.
+                if _attempt is not None:
+                    _attempt.successor = client
                 _attempt = None
             adopted = _client
         flush_ai_sdk_info(adopted)
@@ -393,8 +401,7 @@ def _run_attempt(
 
     ld_client: Any = None
     try:
-        # start_wait caps the blocking init time; matches the TS SDK's 10 s timeout.
-        ld_client = client_cls(ld_config, start_wait=10)
+        ld_client = client_cls(ld_config, start_wait=_START_WAIT_SECONDS)
         adopted = _adopt(attempt, ld_client, sdk_key, opts)
     except BaseException as exc:
         # A failed attempt is not cached: drop it before any caller sees the
@@ -421,29 +428,32 @@ def _adopt(
     """Makes the attempt's client the singleton, or says what to return instead."""
     global _client, _attempt
 
-    # The constructor returns normally both when start_wait runs out and when
-    # the service rejects the SDK key; it only logs. Adopting that client would
-    # serve every AI Config disabled with no error, so fail here.
-    if not ld_client.is_initialized():
-        raise RuntimeError(
-            "LaunchDarkly client failed to initialize: it did not connect within "
-            "10 seconds, or the SDK key was rejected. Check LD_SDK_KEY (or the "
-            "sdkKey option) and that LaunchDarkly is reachable; the LaunchDarkly "
-            "SDK's log has the cause."
-        )
-
     with _state_lock:
+        # Whether the attempt was replaced comes first: once it has been, what
+        # its own client did no longer decides what its calls get.
         if _attempt is not attempt or attempt.waiters == 0:
             # shutdown() or a passed client replaced this attempt, or every call
             # waiting on it was cancelled. Adopting the client would clobber
             # what came after, or keep a connection open that nobody asked for.
+            # ``_client`` is no answer here: after shutdown() it may be a later
+            # attempt's client, which these calls must not get.
             if _attempt is attempt:
                 _attempt = None
-            if _client is not None:
-                return _client
+            if attempt.successor is not None:
+                return attempt.successor
             raise RuntimeError(
                 "init_client was abandoned: shutdown() ran, or every call "
                 "waiting on it was cancelled, before the client connected."
+            )
+        # The constructor returns normally both when start_wait runs out and
+        # when the service rejects the SDK key; it only logs. Adopting that
+        # client would serve every AI Config disabled with no error, so fail here.
+        if not ld_client.is_initialized():
+            raise RuntimeError(
+                "LaunchDarkly client failed to initialize: it did not connect "
+                f"within {_START_WAIT_SECONDS} seconds, or the SDK key was "
+                "rejected. Check LD_SDK_KEY (or the sdkKey option) and that "
+                "LaunchDarkly is reachable; the LaunchDarkly SDK's log has the cause."
             )
         # As on the BYOC path: only a fully set-up client becomes the singleton.
         # The check above commits this attempt to adopting. A cancel or a
