@@ -3,6 +3,9 @@ updates:
   - package-ecosystem: 'uv'
     # uv workspace root: one uv.lock covers every packages/* member.
     directory: '/'
+    # These are published libraries: keep each package's minimum version and
+    # only widen a range when a new release falls outside it.
+    versioning-strategy: 'increase-if-necessary'
     schedule:
       interval: 'daily'
     cooldown:
