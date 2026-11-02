@@ -106,7 +106,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/client/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -137,7 +137,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/ai/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -168,7 +168,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/claude-agents/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -199,7 +199,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/claude-messages/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -230,7 +230,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/openai-agents/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -261,7 +261,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/litellm-agents/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -292,7 +292,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/openai-messages/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -323,7 +323,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/litellm-messages/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -354,7 +354,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/langchain-agents/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -385,7 +385,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/langchain-messages/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -416,7 +416,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/opencode-agents/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -447,7 +447,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/typesafe/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -478,7 +478,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/vercel-agents/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -509,7 +509,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: 'packages/vercel-messages/dist/*'
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         name: 'Get PyPI token'
         with:
           aws_assume_role: ${{ vars.AWS_ROLE_ARN }}
@@ -536,7 +536,7 @@ jobs:
       - uses: ./.github/actions/build
         with:
           workspace_path: ${{ inputs.workspace_path }}
-      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.0
+      - uses: launchdarkly/gh-actions/actions/release-secrets@release-secrets-v1.2.1
         if: ${{ format('{0}', inputs.dry_run) != 'true' }}
         name: 'Get PyPI token'
         with:
