@@ -95,7 +95,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-client-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/client
@@ -126,7 +126,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-ai-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/ai
@@ -157,7 +157,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-claude-agents-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/claude-agents
@@ -188,7 +188,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-claude-messages-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/claude-messages
@@ -219,7 +219,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-openai-agents-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/openai-agents
@@ -250,7 +250,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-litellm-agents-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/litellm-agents
@@ -281,7 +281,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-openai-messages-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/openai-messages
@@ -312,7 +312,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-litellm-messages-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/litellm-messages
@@ -343,7 +343,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-langchain-agents-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/langchain-agents
@@ -374,7 +374,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-langchain-messages-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/langchain-messages
@@ -405,7 +405,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-opencode-agents-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/opencode-agents
@@ -436,7 +436,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-typesafe-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/typesafe
@@ -467,7 +467,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-vercel-agents-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/vercel-agents
@@ -498,7 +498,7 @@ jobs:
       attestations: write
     if: ${{ needs.release-please.outputs.package-vercel-messages-released == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: packages/vercel-messages
@@ -529,7 +529,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci
         with:
           workspace_path: ${{ inputs.workspace_path }}
