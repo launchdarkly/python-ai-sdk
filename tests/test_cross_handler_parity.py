@@ -376,6 +376,10 @@ EXPECTED_VOCABULARY = {
     "feature_flag",
     "feature_flag.key",
     "feature_flag.provider.name",
+    # OTel feature-flag semconv: the served variation key, and the evaluated value (the raw
+    # variation with content capture on, else the JSON-encoded key).
+    "feature_flag.result.variant",
+    "feature_flag.result.value",
     "feature_flag.set.id",
     # AIC-3230: evaluation-context identity on the root feature_flag event / span.
     # `context.contextKeys` is the f-string prefix; the keys actually emitted are
@@ -495,6 +499,11 @@ HOOK_BASED_TOOL_HANDLERS: dict[str, str] = {
     "claude-agents": "launchdarkly_ai_claude_agents.handler",
     "openai-agents": "launchdarkly_ai_openai_agents.handler",
     "langchain-agents": "launchdarkly_ai_langchain_agents.handler",
+    # Not hook-based in the vendor-SDK sense -- there is no vendor SDK here,
+    # only OpenCode's own bus. The reducer plays the same role: it is the one
+    # object whose tool-part transitions open and close `execute_tool` spans,
+    # so it needs the same abandon/close split as a hook object does.
+    "opencode-agents": "launchdarkly_ai_opencode_agents.handler",
 }
 
 
@@ -671,4 +680,55 @@ class TestStreamingTeardownClosesToolSpans:
             assert "fail_span" in body or "close_open_spans(" in body, (
                 f"{name} has a close_open_spans that neither records the failure nor hands off to "
                 "one that does, so it closes nothing."
+            )
+
+
+# ---------------------------------------------------------------------------
+# The root span's feature_flag value follows the handler's content capture
+# ---------------------------------------------------------------------------
+
+#: Every handler module that opens a run's root span. The root's feature_flag event writes the raw
+#: variation as `feature_flag.result.value` only when capture is on, so each must pass its resolved
+#: setting. Left off, the keyword defaults to False and capture-on runs silently lose the value.
+ROOT_SPAN_HANDLERS: dict[str, str] = {
+    "claude-agents": "launchdarkly_ai_claude_agents.handler",
+    "claude-messages": "launchdarkly_ai_claude_messages.handler",
+    "langchain-agents": "launchdarkly_ai_langchain_agents.handler",
+    "langchain-messages": "launchdarkly_ai_langchain_messages.handler",
+    "litellm-agents": "launchdarkly_ai_litellm_agents.handler",
+    "litellm-messages": "launchdarkly_ai_litellm_messages.handler",
+    "openai-agents": "launchdarkly_ai_openai_agents.handler",
+    "openai-messages": "launchdarkly_ai_openai_messages.handler",
+    "opencode-agents": "launchdarkly_ai_opencode_agents.handler",
+    "typesafe": "launchdarkly_ai_typesafe.handler",
+    "vercel-agents": "launchdarkly_ai_vercel_agents.handler",
+    "vercel-messages": "launchdarkly_ai_vercel_messages.handler",
+}
+
+_ROOT_SPAN_CALLS = {"start_root_span", "_root_span", "set_ld_span_attributes"}
+
+
+def _root_span_calls(source: str) -> list[ast.Call]:
+    calls: list[ast.Call] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = (
+                func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            )
+            if name in _ROOT_SPAN_CALLS:
+                calls.append(node)
+    return calls
+
+
+class TestRootSpanCaptureContent:
+    @pytest.mark.parametrize("name", sorted(ROOT_SPAN_HANDLERS))
+    def test_every_root_span_call_passes_capture_content(self, name: str) -> None:
+        source = _handler_source(ROOT_SPAN_HANDLERS[name])
+        calls = _root_span_calls(source)
+        assert calls, f"{name} opens no root span this check can see."
+        for call in calls:
+            assert any(kw.arg == "capture_content" for kw in call.keywords), (
+                f"{name} opens a root span without capture_content= at line "
+                f"{call.lineno}, so feature_flag.result.value ignores content capture."
             )

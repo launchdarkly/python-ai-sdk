@@ -24,11 +24,13 @@ def serving_provider(config: AiConfigRep) -> str:
     return str(config.get("provider", {}).get("name") or "vercel").lower()
 
 
-def start_root_span(config: AiConfigRep, variables: dict[str, Any]) -> Any:
+def start_root_span(
+    config: AiConfigRep, variables: dict[str, Any], *, capture_content: bool = False
+) -> Any:
     span = trace.get_tracer(TRACER_NAME).start_span("invoke_agent")
     span.set_attribute("gen_ai.operation.name", "invoke_agent")
     set_model_identity_attributes(span, serving_provider(config), model_name(config))
-    set_ld_span_attributes(span, variables)
+    set_ld_span_attributes(span, variables, capture_content=capture_content)
     return span
 
 

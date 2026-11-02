@@ -63,7 +63,9 @@ def serving_provider(config: AiConfigRep) -> str:
 # ─── Span starts ─────────────────────────────────────────────────────────────
 
 
-def start_root_span(config: AiConfigRep, variables: dict[str, Any]) -> Any:
+def start_root_span(
+    config: AiConfigRep, variables: dict[str, Any], *, capture_content: bool = False
+) -> Any:
     """Opens the ``invoke_agent`` root and returns it, or ``None`` when OTel is absent.
 
     The root is the only span carrying ``launchdarkly.*`` and the ``feature_flag`` event, so it is
@@ -76,7 +78,7 @@ def start_root_span(config: AiConfigRep, variables: dict[str, Any]) -> Any:
     set_model_identity_attributes(
         span, serving_provider(config), model_name(config), LEGACY_SYSTEM
     )
-    set_ld_span_attributes(span, variables)
+    set_ld_span_attributes(span, variables, capture_content=capture_content)
     return span
 
 

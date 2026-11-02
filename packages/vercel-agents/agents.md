@@ -14,5 +14,3 @@ This Tier 1 package provides the wildcard `("*", "agent")` handler.
 - Native graph spans end in `finally`, including `CancelledError`.
 - Runtime calls are always async context-managed and never enable duplicate
   runtime telemetry.
-
-`TESTING.md` §2.x and Appendix A.14 are authoritative.

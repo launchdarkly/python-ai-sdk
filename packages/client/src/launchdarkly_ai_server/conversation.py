@@ -6,7 +6,13 @@ provider HTTP calls. A multi-tenant process binds a different id per request.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Iterator,
+    Mapping,
+)
 from contextlib import aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from time import time_ns
@@ -28,6 +34,8 @@ GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
 
 _CONV_KEY = otel_context.create_key("launchdarkly.gen_ai.conversation.id")
 _EVAL_KEY = otel_context.create_key("launchdarkly.judge.evaluation")
+_STAMP_KEY = otel_context.create_key("launchdarkly.span.stamped_attributes")
+_COUNTER_KEY = otel_context.create_key("launchdarkly.span.counter")
 
 
 @dataclass
@@ -80,6 +88,53 @@ def _conversation_id_from(ctx: otel_context.Context | None) -> str | None:
         return None
     value = otel_context.get_value(_CONV_KEY, ctx)
     return value if isinstance(value, str) and value else None
+
+
+def _stamped_attributes_from(ctx: otel_context.Context | None) -> Mapping[str, Any]:
+    value = otel_context.get_value(_STAMP_KEY, ctx) if ctx is not None else None
+    if value is None:
+        value = otel_context.get_value(_STAMP_KEY)
+    return value if isinstance(value, Mapping) else {}
+
+
+@contextmanager
+def stamp_span_attributes(attributes: Mapping[str, str | int]) -> Iterator[None]:
+    """Write ``attributes`` onto every SDK span started in this block.
+
+    Each key is written only when the span does not already carry it, and only
+    onto spans from this SDK's tracers. Values must be strings or integers;
+    anything else is skipped. A nested block adds to the outer set, and its own
+    values win on a shared key. Relies on :class:`ConversationIdSpanProcessor`,
+    which ``init_client`` registers.
+    """
+    merged = {**_stamped_attributes_from(otel_context.get_current()), **attributes}
+    token = otel_context.attach(otel_context.set_value(_STAMP_KEY, merged))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+@dataclass
+class SpanCounter:
+    """Number of SDK spans started while :func:`count_sdk_spans` is bound."""
+
+    count: int = 0
+
+
+@contextmanager
+def count_sdk_spans() -> Iterator[SpanCounter]:
+    """Count the spans this SDK's tracers start inside this block.
+
+    Only the innermost block counts a span. Relies on
+    :class:`ConversationIdSpanProcessor`, which ``init_client`` registers.
+    """
+    counter = SpanCounter()
+    token = otel_context.attach(otel_context.set_value(_COUNTER_KEY, counter))
+    try:
+        yield counter
+    finally:
+        otel_context.detach(token)
 
 
 def _record_evaluation(
@@ -275,7 +330,7 @@ async def with_judge_evaluation(name: str) -> AsyncIterator[RecordEvaluation]:
 
 
 class ConversationIdSpanProcessor(_SpanProcessorBase):
-    """Stamps ``gen_ai.conversation.id`` write-if-absent; delays judge ``invoke_agent`` end.
+    """Stamps the conversation id and bound attributes, counts SDK spans, delays judge ``invoke_agent`` end.
 
     Structurally a ``SpanProcessor``; the base is only real to a type checker so that an
     api-only install (no ``[otel]`` extra) still imports this module.
@@ -293,6 +348,20 @@ class ConversationIdSpanProcessor(_SpanProcessorBase):
         )
         if conv and _is_launchdarkly_span(span):
             set_conversation_id_if_absent(span, conv)
+
+        counter = otel_context.get_value(_COUNTER_KEY, ctx)
+        if isinstance(counter, SpanCounter) and _is_launchdarkly_span(span):
+            counter.count += 1
+
+        stamped = _stamped_attributes_from(ctx)
+        if stamped and _is_launchdarkly_span(span):
+            for key, value in stamped.items():
+                if not isinstance(key, str) or _read_attribute(span, key) is not None:
+                    continue
+                if isinstance(value, str):
+                    span.set_attribute(key, value)
+                elif isinstance(value, int) and not isinstance(value, bool):
+                    span.set_attribute(key, value)
 
         capture = otel_context.get_value(_EVAL_KEY, ctx)
         if capture is None:

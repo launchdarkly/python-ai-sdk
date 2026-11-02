@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from math import isfinite
 from typing import Any
 
-from .content import tool_result_string
+from .canonical_json import canonical_json
 from .utils import parse_json_with_possible_fences
 
 logger = logging.getLogger(__name__)
@@ -42,23 +42,50 @@ def build_message_history(
     """The conversation a judge is shown, as its ``message_history`` variable.
 
     Ordered as it happened: what was asked, what the agent did, what it
-    answered, then how to format the verdict. Empty parts are skipped, so a
-    run with no tools yields the history it did before trajectories existed.
+    answered, then how to format the verdict. An empty part (see
+    :func:`_is_empty_part`) is skipped, so a run with no tools yields the
+    history it did before trajectories existed.
 
     The formatting block is appended here, not by callers: judges built from
     the AI Library's default templates read the JSON shape from
     ``{{message_history}}``, and one that stopped being told it would return
     prose and fail every result as invalid output.
 
-    A non-string output is shown as JSON, by the rule tool results follow, so a
-    rubric reads the same text in every SDK.
+    Every other part is rendered by the rule tool results follow, so a
+    non-string output is shown as JSON and a rubric reads the same text in
+    every SDK. An output of ``0`` or ``False`` is an answer, and is shown.
     """
-    output_text = tool_result_string(output) if output else None
     return "\n\n".join(
-        str(part)
-        for part in (user_input, trajectory, output_text, FORMATTING_INSTRUCTIONS)
-        if part
+        judge_text(part)
+        for part in (user_input, trajectory, output, FORMATTING_INSTRUCTIONS)
+        if not _is_empty_part(part)
     )
+
+
+def judge_text(value: Any) -> str:
+    """A value as a judge is shown it: a string as it is, ``None`` as ``""``, anything else as JSON.
+
+    The JSON is ``JSON.stringify``'s spelling (no whitespace, keys in insertion
+    order, ``1`` for ``1.0``), not ``json.dumps``'s, so a rubric reads the same
+    text in every SDK.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return canonical_json(value, sort_keys=False)
+
+
+def _is_empty_part(value: Any) -> bool:
+    """``None``, ``""``, an empty list or an empty mapping, tested before rendering.
+
+    An empty container is skipped, as it was before structured outputs were
+    rendered as JSON. Python truthiness is not the test: it would also drop
+    ``0`` and ``False``, which are answers.
+    """
+    if value is None or value == "":
+        return True
+    return isinstance(value, (list, tuple, Mapping)) and not value
 
 
 def numeric_score(score: Any) -> float | None:
@@ -129,6 +156,10 @@ def parse_judge_response(raw: Any) -> tuple[Any, str]:
     already-decoded mapping. The score is returned untouched — callers apply
     their own policy to non-numeric values via :func:`numeric_score`.
 
+    The reasoning is the first of ``reasoning`` and ``reason`` that is not an
+    empty part (:func:`_is_empty_part`), rendered by the tool-result rule: a
+    string as it is, anything else as JSON, never as a Python repr.
+
     Raises ``ValueError`` when the response is not a non-empty JSON object.
     """
     parsed: Any
@@ -140,8 +171,15 @@ def parse_judge_response(raw: Any) -> tuple[Any, str]:
         parsed = None
     if not isinstance(parsed, Mapping) or not parsed:
         raise ValueError("Invalid JSON from judge")
-    reasoning = parsed.get("reasoning") or parsed.get("reason") or ""
-    return parsed.get("score"), str(reasoning)
+    reasoning = next(
+        (
+            judge_text(value)
+            for value in (parsed.get("reasoning"), parsed.get("reason"))
+            if not _is_empty_part(value)
+        ),
+        "",
+    )
+    return parsed.get("score"), reasoning
 
 
 def without_output_format(config: Any, judge_key: str) -> Any:

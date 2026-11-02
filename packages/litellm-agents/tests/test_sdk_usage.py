@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.27 — litellm-agents."""
+"""Tests for SDK helper usage events — litellm-agents."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch

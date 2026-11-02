@@ -148,7 +148,7 @@ class TestFactoryAndModelBinding:
         handler = create_litellm_agents_handler(capture_content=True)
         assert handler.provides_for == ("*", "agent")
         assert handler.capture_content is True
-        assert create_litellm_agents_handler().capture_content is False
+        assert create_litellm_agents_handler().capture_content is True
 
     async def test_evaluated_model_constructs_agents_sdk_litellm_model(self) -> None:
         agents = _agents_module()
@@ -493,9 +493,9 @@ class TestLifecycleAndTelemetry:
             "name": "Ada",
         }
         with _patch_agents(agents), patch.object(handler_mod, "trace", trace):
-            await create_litellm_agents_handler(model_factory=lambda *_: object())(
-                CONFIG, "private", {}, variables
-            )
+            await create_litellm_agents_handler(
+                model_factory=lambda *_: object(), capture_content=False
+            )(CONFIG, "private", {}, variables)
         attributes = {
             call.args[0]: call.args[1] for call in span.set_attribute.call_args_list
         }

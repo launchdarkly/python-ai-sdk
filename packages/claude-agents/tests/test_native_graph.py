@@ -1,6 +1,5 @@
 """
-Tests for §2.2 native graph adapter (to_claude_agents) plus Anthropic-specific specs.
-Reference: TESTING.md §2.2, §2.x (Anthropic)
+Tests for the native graph adapter (to_claude_agents) plus Anthropic-specific specs.
 """
 
 from __future__ import annotations
@@ -147,7 +146,7 @@ def _make_sdk_mock(result_text: str = "done") -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §2.2 Generic topology
+# Generic topology
 # ---------------------------------------------------------------------------
 
 
@@ -445,7 +444,7 @@ class TestToClaudeAgentsTopology:
                 opts={"tool_handlers": {"my-tool": _my_handler}},
             ).invoke("input")
 
-        # create_sdk_mcp_server is called from build_tool_mcp for user config tools
+        # create_sdk_mcp_server is called from _build_tool_mcp for user config tools
         assert mock_sdk.create_sdk_mcp_server.called
 
     @pytest.mark.asyncio
@@ -1247,7 +1246,7 @@ class TestToClaudeAgentsAnthropicSpecific:
 
     @pytest.mark.asyncio
     async def test_build_tool_mcp_throws_when_tool_not_in_handlers(self) -> None:
-        from launchdarkly_ai_claude_agents.handler import build_tool_mcp
+        from launchdarkly_ai_claude_agents.handler import _build_tool_mcp
 
         mock_sdk = MagicMock()
         mock_sdk.tool = MagicMock(side_effect=lambda name, desc, schema: lambda fn: fn)
@@ -1261,7 +1260,7 @@ class TestToClaudeAgentsAnthropicSpecific:
         ):
             config_tools = {"missing-tool": {"description": "d", "parameters": {}}}
             handlers: dict[str, Any] = {}
-            await build_tool_mcp(config_tools, handlers)
+            await _build_tool_mcp(config_tools, handlers)
             # The actual error is raised when the fn is *called*, not when mcp is built
 
 
@@ -1366,6 +1365,73 @@ class TestNativeGraphModelParameters:
         for opts in captured_options:
             assert opts["max_turns"] == 7
             assert not find_leaks(opts)
+
+    @pytest.mark.asyncio
+    async def test_node_max_tokens_sets_the_cli_output_limit_and_thinking_is_disabled(
+        self,
+    ) -> None:
+        """A node's ``max_tokens`` reaches its CLI as
+        ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``, and thinking is off unless the node's config asks."""
+
+        async def node_options(parameters: dict[str, Any]) -> dict[str, Any]:
+            mock_sdk = _make_sdk_mock("done")
+            nodes = {
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": "claude-3", "parameters": parameters},
+                        "instructions": "be helpful",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+            captured: list[dict[str, Any]] = []
+            mock_sdk.ClaudeAgentOptions = MagicMock(
+                side_effect=lambda **kw: (captured.append(kw), kw)[1]
+            )
+            with patch(
+                "importlib.import_module",
+                side_effect=lambda n: (
+                    mock_sdk if n == "claude_agent_sdk" else __import__(n)
+                ),
+            ):
+                await to_claude_agents(
+                    _make_def_promise(_make_graph_def(nodes=nodes))
+                ).invoke("hi")
+            assert len(captured) == 1
+            return captured[0]
+
+        limited = await node_options({"max_tokens": 200})
+        assert limited["env"] == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "200"}
+        assert limited["thinking"] == {"type": "disabled"}
+        # Built by the real SDK, so the node's CLI is started with thinking off.
+        command = _build_cli_command(limited)
+        assert command[command.index("--thinking") + 1] == "disabled"
+
+        invalid = await node_options({"max_tokens": 1.5})
+        assert "env" not in invalid
+        assert invalid["thinking"] == {"type": "disabled"}
+
+        malformed = await node_options({"thinking": {"type": "enabled"}})
+        assert malformed["thinking"] == {"type": "disabled"}
+
+        effort_only = await node_options({"effort": "low"})
+        assert effort_only["effort"] == "low"
+        assert effort_only["thinking"] == {"type": "disabled"}
+
+        budget_only = await node_options({"max_thinking_tokens": 2048})
+        assert budget_only["max_thinking_tokens"] == 2048
+        assert "thinking" not in budget_only
+        command = _build_cli_command(budget_only)
+        assert command[command.index("--max-thinking-tokens") + 1] == "2048"
+
+        thinking = await node_options(
+            {"thinking": {"type": "enabled", "budget_tokens": 2048}}
+        )
+        assert "env" not in thinking
+        assert thinking["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
 
 def _build_cli_command(options_kwargs: dict[str, Any]) -> list[str]:

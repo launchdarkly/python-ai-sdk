@@ -14,7 +14,9 @@ from launchdarkly_ai_server.conversation import (
     GEN_AI_CONVERSATION_ID,
     ConversationIdSpanProcessor,
     conversation_id,
+    count_sdk_spans,
     set_conversation_id_if_absent,
+    stamp_span_attributes,
     with_judge_evaluation,
 )
 
@@ -249,3 +251,72 @@ class TestJudgeExplanationGating:
         assert not any("explanation" in k for k in span.attributes)
         event = next(e for e in span.events if e.name == "gen_ai.evaluation.result")
         assert not any("explanation" in k for k in (event.attributes or {}))
+
+
+class TestStampSpanAttributes:
+    """The core primitive names no attribute of its own; callers supply the set."""
+
+    def test_stamps_supplied_attributes_onto_sdk_spans(self) -> None:
+        with stamp_span_attributes({"example.key": "value", "example.count": 7}):
+            span = _tracer.start_span("invoke_agent")
+            span.end()
+        attributes = finished()[0].attributes or {}
+        assert attributes["example.key"] == "value"
+        assert attributes["example.count"] == 7
+
+    def test_write_if_absent(self) -> None:
+        with stamp_span_attributes({"example.key": "bound"}):
+            span = _tracer.start_span("chat", attributes={"example.key": "own"})
+            span.end()
+        assert (finished()[0].attributes or {})["example.key"] == "own"
+
+    def test_does_not_stamp_third_party_spans(self) -> None:
+        foreign = _provider.get_tracer("opentelemetry.instrumentation.httpx")
+        with stamp_span_attributes({"example.key": "value"}):
+            span = foreign.start_span("POST")
+            span.end()
+        assert "example.key" not in (finished()[0].attributes or {})
+
+    def test_nested_block_adds_to_and_overrides_the_outer_set(self) -> None:
+        with stamp_span_attributes({"example.a": "outer", "example.b": "outer"}):
+            with stamp_span_attributes({"example.b": "inner"}):
+                span = _tracer.start_span("chat")
+                span.end()
+        attributes = finished()[0].attributes or {}
+        assert attributes["example.a"] == "outer"
+        assert attributes["example.b"] == "inner"
+
+    def test_skips_values_that_are_not_str_or_int(self) -> None:
+        bad: dict[str, object] = {"example.flag": True, "example.ratio": 0.5}
+        with stamp_span_attributes(bad):  # type: ignore[arg-type]
+            span = _tracer.start_span("chat")
+            span.end()
+        attributes = finished()[0].attributes or {}
+        assert "example.flag" not in attributes
+        assert "example.ratio" not in attributes
+
+    def test_nothing_is_stamped_outside_the_block(self) -> None:
+        with stamp_span_attributes({"example.key": "value"}):
+            pass
+        span = _tracer.start_span("chat")
+        span.end()
+        assert "example.key" not in (finished()[0].attributes or {})
+
+
+class TestCountSdkSpans:
+    def test_counts_only_sdk_spans_started_in_the_block(self) -> None:
+        foreign = _provider.get_tracer("opentelemetry.instrumentation.httpx")
+        with count_sdk_spans() as counter:
+            _tracer.start_span("invoke_agent").end()
+            _tracer.start_span("chat").end()
+            foreign.start_span("POST").end()
+        _tracer.start_span("after").end()
+        assert counter.count == 2
+
+    def test_inner_block_counts_its_own_spans(self) -> None:
+        with count_sdk_spans() as outer:
+            with count_sdk_spans() as inner:
+                _tracer.start_span("chat").end()
+            _tracer.start_span("chat").end()
+        assert inner.count == 1
+        assert outer.count == 1

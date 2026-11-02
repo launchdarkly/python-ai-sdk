@@ -1,6 +1,5 @@
 """
-Tests for §2.1 graph convenience wrapper (langchain_graph) and §2.x.2 full coverage.
-Reference: TESTING.md §2.1, §2.x.2
+Tests for the graph convenience wrapper (langchain_graph), with full coverage.
 """
 
 from unittest.mock import MagicMock, patch
@@ -39,6 +38,15 @@ class TestLangChainGraph:
             kw = mock_graph.call_args[1]
             assert "handlers" in kw
             assert len(kw["handlers"]) == 1
+
+    def test_providers_forwarded_to_the_handler(self) -> None:
+        with patch("launchdarkly_ai_langchain_agents.graph._graph") as mock_graph:
+            mock_graph.return_value = MagicMock()
+            langchain_graph("key", providers=["Bedrock"])
+            kw = mock_graph.call_args[1]
+            assert "providers" not in kw
+            assert kw["handlers"][0].providers == ("Bedrock",)
+            assert kw["handlers"][0].provides_for == ("*", "agent")
 
     def test_llm_option_forwarded(self) -> None:
         mock_llm = MagicMock()

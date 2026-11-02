@@ -34,11 +34,14 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from launchdarkly_ai_server import skills as skills_module
-from launchdarkly_ai_server import skills_core, skills_fdv2
-from launchdarkly_ai_server.experimental.skills import (
-    FDv2SkillStore,
+import launchdarkly_ai_server.skills as skills_module
+
+# Internal submodules, kept out of the public-name import below so they don't read as root exports.
+import launchdarkly_ai_server.skills_core as skills_core
+import launchdarkly_ai_server.skills_fdv2 as skills_fdv2
+from launchdarkly_ai_server import (
     InMemorySkillStore,
+    LaunchDarklySkillStore,
     all_skills,
     get_skill,
     get_skill_result,
@@ -74,7 +77,19 @@ from launchdarkly_ai_server.skills_fdv2 import (
     _tombstone_from_delete,
 )
 
-pytestmark = pytest.mark.usefixtures("reset_skill_state")
+pytestmark = pytest.mark.usefixtures("reset_skill_state", "clear_endpoint_env")
+
+
+@pytest.fixture
+def clear_endpoint_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A store given no URI option reads ``LD_BASE_URI`` and ``LD_STREAM_URI``, so
+    a developer shell with either set would move every default this module
+    asserts. Both are cleared around each test, and restored after.
+    """
+    monkeypatch.delenv("LD_BASE_URI", raising=False)
+    monkeypatch.delenv("LD_STREAM_URI", raising=False)
+
 
 SDK_KEY = "sdk-00000000-0000-4000-8000-000000000000"
 SKILL_BODY = "---\nname: PDF Extraction\n---\nExtract text from PDFs.\n"
@@ -383,8 +398,8 @@ def endpoint() -> Any:
     server.close()
 
 
-def poll_store(endpoint: Any, **kwargs: Any) -> FDv2SkillStore:
-    return FDv2SkillStore(
+def poll_store(endpoint: Any, **kwargs: Any) -> LaunchDarklySkillStore:
+    return LaunchDarklySkillStore(
         SDK_KEY,
         base_uri=endpoint.base_uri,
         mode="poll",
@@ -913,11 +928,12 @@ class TestProtocolReader:
     def test_a_delete_with_no_usable_key_is_ignored_and_its_transfer_commits(
         self,
     ) -> None:
-        """Pins TESTING.md §3.25's experimental-stage rule: ignored, not fatal.
+        """Pins the keyless-object rule: ignored, not fatal, and delivery keeps
+        going.
 
         The revocation it carried is lost, so ``revoked`` stays served. Base
-        ``ldclient`` interrupts the stream instead; the choice is to be
-        revisited before 1.0, and changing it should fail this test.
+        ``ldclient`` interrupts the stream instead; this SDK's choice is the
+        accepted behaviour, and changing it should fail this test.
         """
         held = _SkillObjectSet()
         reader = _ProtocolReader(held)
@@ -1662,7 +1678,7 @@ class TestPollingAgainstTheEndpoint:
         Releasing ``wait_for_skills`` on it would make ``is_initialized`` true
         over an empty committed set — the fact ``write_skills("*")`` prunes on —
         so a reconcile that raced delivery would delete every managed skill on
-        disk instead of reporting the retrieval unavailable (§3.21). Failing
+        disk instead of reporting the retrieval unavailable. Failing
         closed costs a boot that is genuinely waiting nothing it was not already
         waiting for.
         """
@@ -1757,7 +1773,7 @@ class TestStreamingAgainstTheEndpoint:
     def test_a_streamed_payload_lands(self, endpoint: Any) -> None:
         endpoint.hold_stream_open = True
         endpoint.queue_stream(full_payload(("put-object", put_skill())))
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY, base_uri=endpoint.base_uri, mode="stream", initial_backoff=0.01
         )
         try:
@@ -1770,7 +1786,9 @@ class TestStreamingAgainstTheEndpoint:
     def test_the_stream_request_advertises_event_stream(self, endpoint: Any) -> None:
         endpoint.hold_stream_open = True
         endpoint.queue_stream(full_payload(("put-object", put_skill())))
-        store = FDv2SkillStore(SDK_KEY, base_uri=endpoint.base_uri, mode="stream")
+        store = LaunchDarklySkillStore(
+            SDK_KEY, base_uri=endpoint.base_uri, mode="stream"
+        )
         try:
             store.start()
             store.wait_for_skills(timeout=5)
@@ -1784,7 +1802,9 @@ class TestStreamingAgainstTheEndpoint:
         against different origins."""
         endpoint.hold_stream_open = True
         endpoint.queue_stream(full_payload(("put-object", put_skill())))
-        store = FDv2SkillStore(SDK_KEY, base_uri=endpoint.base_uri, mode="stream")
+        store = LaunchDarklySkillStore(
+            SDK_KEY, base_uri=endpoint.base_uri, mode="stream"
+        )
         try:
             store.start()
             store.wait_for_skills(timeout=5)
@@ -1807,7 +1827,7 @@ class TestStreamingAgainstTheEndpoint:
                 ("payload-transferred", transferred("basis-2")),
             )
         )
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             base_uri=endpoint.base_uri,
             mode="stream",
@@ -1841,7 +1861,9 @@ class TestStreamingAgainstTheEndpoint:
                 ("payload-transferred", transferred("basis-2")),
             )
         )
-        store = FDv2SkillStore(SDK_KEY, base_uri=endpoint.base_uri, mode="stream")
+        store = LaunchDarklySkillStore(
+            SDK_KEY, base_uri=endpoint.base_uri, mode="stream"
+        )
         try:
             store.start()
             assert wait_until(
@@ -1860,7 +1882,7 @@ class TestStreamingAgainstTheEndpoint:
             full_payload(("put-object", put_skill()), state="basis-1")
         )
         endpoint.queue_stream(events(("heart-beat", None)))
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             base_uri=endpoint.base_uri,
             mode="stream",
@@ -1882,7 +1904,9 @@ class TestStreamingAgainstTheEndpoint:
         """
         endpoint.hold_stream_open = True
         endpoint.queue_stream(full_payload(("put-object", put_skill())))
-        store = FDv2SkillStore(SDK_KEY, base_uri=endpoint.base_uri, mode="stream")
+        store = LaunchDarklySkillStore(
+            SDK_KEY, base_uri=endpoint.base_uri, mode="stream"
+        )
         store.start()
         assert store.wait_for_skills(timeout=5) is True
         started = time.monotonic()
@@ -1894,7 +1918,9 @@ class TestStreamingAgainstTheEndpoint:
     ) -> None:
         endpoint.hold_stream_open = True
         endpoint.queue_stream(full_payload(("put-object", put_skill())))
-        store = FDv2SkillStore(SDK_KEY, base_uri=endpoint.base_uri, mode="stream")
+        store = LaunchDarklySkillStore(
+            SDK_KEY, base_uri=endpoint.base_uri, mode="stream"
+        )
         store.start()
         store.wait_for_skills(timeout=5)
         store.close()
@@ -1903,7 +1929,7 @@ class TestStreamingAgainstTheEndpoint:
     def test_content_survives_a_reconnect(self, endpoint: Any) -> None:
         endpoint.queue_stream(full_payload(("put-object", put_skill())))
         endpoint.queue_stream(events(("heart-beat", None)))
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY, base_uri=endpoint.base_uri, mode="stream", initial_backoff=0.01
         )
         try:
@@ -2117,8 +2143,8 @@ def _record_backoff_attempts(monkeypatch: Any) -> list[int]:
     return attempts
 
 
-def stream_store(**kwargs: Any) -> FDv2SkillStore:
-    return FDv2SkillStore(
+def stream_store(**kwargs: Any) -> LaunchDarklySkillStore:
+    return LaunchDarklySkillStore(
         SDK_KEY,
         mode="stream",
         initial_backoff=kwargs.pop("initial_backoff", 0.001),
@@ -2236,7 +2262,7 @@ class TestFailureHandling:
             _RecoverableTransportError("x"),
             _FatalTransportError("401"),
         )
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             mode="poll",
             initial_backoff=0.001,
@@ -2282,7 +2308,7 @@ class TestFailureHandling:
             _RecoverableTransportError("x"),
             _FatalTransportError("401"),
         )
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             mode="poll",
             initial_backoff=0.001,
@@ -2618,10 +2644,10 @@ class TestFailureHandling:
         """
         assert (
             "max_consecutive_failures"
-            not in inspect.signature(FDv2SkillStore.__init__).parameters
+            not in inspect.signature(LaunchDarklySkillStore.__init__).parameters
         )
         with pytest.raises(TypeError):
-            FDv2SkillStore(SDK_KEY, max_consecutive_failures=3)  # type: ignore[call-arg]
+            LaunchDarklySkillStore(SDK_KEY, max_consecutive_failures=3)  # type: ignore[call-arg]
 
     @pytest.mark.parametrize("option", ["initial_backoff", "max_backoff"])
     @pytest.mark.parametrize("value", [0, 0.0, -5, math.nan, math.inf])
@@ -2632,13 +2658,13 @@ class TestFailureHandling:
         retry loop: zero or less reconnects as fast as the network allows."""
         kwargs = {"initial_backoff": 1.0, "max_backoff": 30.0, option: value}
         with pytest.raises(ValueError, match=option):
-            FDv2SkillStore(SDK_KEY, **kwargs)
+            LaunchDarklySkillStore(SDK_KEY, **kwargs)
 
     def test_the_initial_backoff_may_not_exceed_the_cap(self) -> None:
         with pytest.raises(ValueError, match="must not exceed"):
-            FDv2SkillStore(SDK_KEY, initial_backoff=5.0, max_backoff=1.0)
+            LaunchDarklySkillStore(SDK_KEY, initial_backoff=5.0, max_backoff=1.0)
         # Equal is a fixed delay, and fine.
-        FDv2SkillStore(SDK_KEY, initial_backoff=2.0, max_backoff=2.0)
+        LaunchDarklySkillStore(SDK_KEY, initial_backoff=2.0, max_backoff=2.0)
 
     def test_wait_for_skills_runs_to_its_timeout_during_an_outage(self) -> None:
         """Recoverable failures no longer end delivery, so the store does not
@@ -2692,7 +2718,7 @@ class TestFailureHandling:
     def test_recoverable_failures_are_retried_indefinitely(self) -> None:
         """Well past ten in a row, the bound this replaces, and still retrying."""
         requester = _ScriptedRequester()
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             mode="poll",
             poll_interval=0.01,
@@ -2929,7 +2955,7 @@ class TestFailureHandling:
             def __init__(self) -> None:
                 self.bases: list[str | None] = []
                 self.held_at_reconnect: dict[str, bool] = {}
-                self.store: FDv2SkillStore | None = None
+                self.store: LaunchDarklySkillStore | None = None
 
             def stream(self, basis: str | None) -> Any:
                 self.bases.append(basis)
@@ -3139,7 +3165,7 @@ class TestFailureHandling:
         requester = _ScriptedRequester(
             _RecoverableTransportError("slow down", retry_after=0.5),
         )
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             mode="poll",
             poll_interval=10.0,
@@ -3172,7 +3198,7 @@ class TestFailureHandling:
         requester = _ScriptedRequester(
             _RecoverableTransportError("slow down", retry_after=0.0),
         )
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             mode="poll",
             poll_interval=10.0,
@@ -3270,7 +3296,7 @@ class TestFailureHandling:
     def test_a_malformed_polling_envelope_is_recoverable_not_fatal(
         self, endpoint: Any
     ) -> None:
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             mode="poll",
             poll_interval=0.01,
@@ -3425,7 +3451,7 @@ class TestTransportMemoryBound:
                 ("payload-transferred", transferred("basis-2")),
             )
         )
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             base_uri=endpoint.base_uri,
             mode="stream",
@@ -3597,7 +3623,7 @@ class TestRedirectsAreRefused:
         self, endpoint: Any, second_endpoint: Any
     ) -> None:
         endpoint.redirect_stream_to = second_endpoint.base_uri + "/sdk/stream"
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY, base_uri=endpoint.base_uri, mode="stream", initial_backoff=0.01
         )
         with store:
@@ -3894,30 +3920,30 @@ class TestMissingContentHash:
 class TestServerSideOnly:
     def test_a_mobile_key_is_refused(self) -> None:
         with pytest.raises(ValueError, match="mobile key"):
-            FDv2SkillStore("mob-00000000-0000-4000-8000-000000000000")
+            LaunchDarklySkillStore("mob-00000000-0000-4000-8000-000000000000")
 
     def test_a_client_side_environment_id_is_refused(self) -> None:
         with pytest.raises(ValueError, match="client-side"):
-            FDv2SkillStore("0123456789abcdef01234567")
+            LaunchDarklySkillStore("0123456789abcdef01234567")
 
     def test_an_empty_credential_is_refused(self) -> None:
         with pytest.raises(ValueError, match="server-side SDK key"):
-            FDv2SkillStore("   ")
+            LaunchDarklySkillStore("   ")
 
     def test_a_server_side_key_is_accepted(self) -> None:
-        assert FDv2SkillStore(SDK_KEY) is not None
+        assert LaunchDarklySkillStore(SDK_KEY) is not None
 
     def test_an_unrecognised_credential_shape_warns_but_is_allowed(
         self, caplog: Any
     ) -> None:
         """Private instances and test doubles issue keys without the public prefix."""
         with caplog.at_level("WARNING"):
-            FDv2SkillStore("my-private-instance-credential")
+            LaunchDarklySkillStore("my-private-instance-credential")
         assert any("server-side SDK key" in r.message for r in caplog.records)
 
     def test_an_unknown_mode_is_refused(self) -> None:
         with pytest.raises(ValueError, match="stream"):
-            FDv2SkillStore(SDK_KEY, mode="mobile")  # type: ignore[arg-type]
+            LaunchDarklySkillStore(SDK_KEY, mode="mobile")  # type: ignore[arg-type]
 
 
 class TestBaseUriScheme:
@@ -3930,7 +3956,7 @@ class TestBaseUriScheme:
 
     def test_a_plain_http_base_uri_is_refused(self) -> None:
         with pytest.raises(ValueError, match="cleartext") as excinfo:
-            FDv2SkillStore(SDK_KEY, base_uri="http://sdk.launchdarkly.com")
+            LaunchDarklySkillStore(SDK_KEY, base_uri="http://sdk.launchdarkly.com")
         assert "https://" in str(excinfo.value)
 
     def test_a_plain_http_base_uri_is_refused_even_with_a_requester_injected(
@@ -3938,7 +3964,7 @@ class TestBaseUriScheme:
     ) -> None:
         """The check is on the store, not on the socket it happens to open."""
         with pytest.raises(ValueError, match="cleartext"):
-            FDv2SkillStore(
+            LaunchDarklySkillStore(
                 SDK_KEY,
                 base_uri="http://relay.internal:8030",
                 _requester=_FakeRequester(),
@@ -3954,12 +3980,12 @@ class TestBaseUriScheme:
         ],
     )
     def test_plain_http_to_a_loopback_host_is_allowed(self, base_uri: str) -> None:
-        assert FDv2SkillStore(SDK_KEY, base_uri=base_uri) is not None
+        assert LaunchDarklySkillStore(SDK_KEY, base_uri=base_uri) is not None
 
     def test_a_private_address_is_not_loopback(self) -> None:
         """Only the machine itself is exempt; the LAN is not."""
         with pytest.raises(ValueError, match="cleartext"):
-            FDv2SkillStore(SDK_KEY, base_uri="http://10.0.0.5:8030")
+            LaunchDarklySkillStore(SDK_KEY, base_uri="http://10.0.0.5:8030")
 
     @pytest.mark.parametrize(
         "base_uri",
@@ -3969,16 +3995,19 @@ class TestBaseUriScheme:
         self, base_uri: str
     ) -> None:
         with pytest.raises(ValueError, match="https://"):
-            FDv2SkillStore(SDK_KEY, base_uri=base_uri)
+            LaunchDarklySkillStore(SDK_KEY, base_uri=base_uri)
 
     def test_https_is_accepted(self) -> None:
-        assert FDv2SkillStore(SDK_KEY, base_uri="https://sdk.example.com/") is not None
-        assert FDv2SkillStore(SDK_KEY) is not None
+        assert (
+            LaunchDarklySkillStore(SDK_KEY, base_uri="https://sdk.example.com/")
+            is not None
+        )
+        assert LaunchDarklySkillStore(SDK_KEY) is not None
 
     def test_a_plain_http_stream_uri_is_refused_by_name(self) -> None:
         """The streaming host is checked too, and the message names it."""
         with pytest.raises(ValueError, match="cleartext") as excinfo:
-            FDv2SkillStore(
+            LaunchDarklySkillStore(
                 SDK_KEY,
                 base_uri="https://sdk.example.com",
                 stream_uri="http://stream.example.com",
@@ -3997,14 +4026,14 @@ class TestStreamHostDefaults:
     """
 
     @staticmethod
-    def _origins(store: FDv2SkillStore) -> tuple[str, str]:
+    def _origins(store: LaunchDarklySkillStore) -> tuple[str, str]:
         requester = store._requester
         return requester._base_uri, requester._stream_uri
 
     def test_the_two_defaults_are_different_hosts(self) -> None:
         assert DEFAULT_BASE_URI == "https://sdk.launchdarkly.com"
         assert DEFAULT_STREAM_URI == "https://stream.launchdarkly.com"
-        assert self._origins(FDv2SkillStore(SDK_KEY)) == (
+        assert self._origins(LaunchDarklySkillStore(SDK_KEY)) == (
             DEFAULT_BASE_URI,
             DEFAULT_STREAM_URI,
         )
@@ -4013,12 +4042,12 @@ class TestStreamHostDefaults:
         # A relay or a private instance serving both from one host needs one
         # option, not two.
         assert self._origins(
-            FDv2SkillStore(SDK_KEY, base_uri="https://relay.example.com")
+            LaunchDarklySkillStore(SDK_KEY, base_uri="https://relay.example.com")
         ) == ("https://relay.example.com", "https://relay.example.com")
 
     def test_naming_both_overrides_them_independently(self) -> None:
         assert self._origins(
-            FDv2SkillStore(
+            LaunchDarklySkillStore(
                 SDK_KEY,
                 base_uri="https://sdk.example.com/",
                 stream_uri="https://stream.example.com/",
@@ -4027,7 +4056,7 @@ class TestStreamHostDefaults:
 
     def test_a_stream_uri_alone_leaves_polling_on_its_default(self) -> None:
         assert self._origins(
-            FDv2SkillStore(SDK_KEY, stream_uri="https://stream.example.com")
+            LaunchDarklySkillStore(SDK_KEY, stream_uri="https://stream.example.com")
         ) == (DEFAULT_BASE_URI, "https://stream.example.com")
 
     def test_the_stream_request_goes_to_the_stream_host(
@@ -4050,6 +4079,110 @@ class TestStreamHostDefaults:
         assert endpoint.requests == []
 
 
+class TestEndpointsFromTheEnvironment:
+    """
+    ``init_client`` reads ``LD_BASE_URI`` and ``LD_STREAM_URI`` for the base
+    SDK. A store that ignored them resolved flags against the instance the
+    environment named and sent skill delivery to production, with that
+    instance's SDK key: a fatal 401 in ``failed``, not a configuration error.
+    With no URI option, the store reads them as if they were the options.
+    """
+
+    @staticmethod
+    def _origins(store: LaunchDarklySkillStore) -> tuple[str, str]:
+        requester = store._requester
+        return requester._base_uri, requester._stream_uri
+
+    def test_ld_base_uri_alone_moves_both_endpoints(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The store's own rule for a lone base URI, not ``init_client``'s,
+        # which leaves flag streaming on its default host.
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        assert self._origins(LaunchDarklySkillStore(SDK_KEY)) == (
+            "https://sdk.catfood.example.com",
+            "https://sdk.catfood.example.com",
+        )
+
+    def test_both_variables_set_each_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.catfood.example.com/")
+        assert self._origins(LaunchDarklySkillStore(SDK_KEY)) == (
+            "https://sdk.catfood.example.com",
+            "https://stream.catfood.example.com",
+        )
+
+    def test_ld_stream_uri_alone_leaves_polling_on_its_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.catfood.example.com")
+        assert self._origins(LaunchDarklySkillStore(SDK_KEY)) == (
+            DEFAULT_BASE_URI,
+            "https://stream.catfood.example.com",
+        )
+
+    def test_either_option_turns_both_variables_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Options win as a set: an explicit host is never mixed with one read
+        from the environment."""
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.catfood.example.com")
+        assert self._origins(
+            LaunchDarklySkillStore(SDK_KEY, base_uri="https://relay.example.com")
+        ) == ("https://relay.example.com", "https://relay.example.com")
+        assert self._origins(
+            LaunchDarklySkillStore(SDK_KEY, stream_uri="https://stream.example.com")
+        ) == (DEFAULT_BASE_URI, "https://stream.example.com")
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_a_blank_value_is_unset(
+        self, monkeypatch: pytest.MonkeyPatch, blank: str
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", blank)
+        monkeypatch.setenv("LD_STREAM_URI", blank)
+        assert self._origins(LaunchDarklySkillStore(SDK_KEY)) == (
+            DEFAULT_BASE_URI,
+            DEFAULT_STREAM_URI,
+        )
+
+    @pytest.mark.parametrize("name", ["LD_BASE_URI", "LD_STREAM_URI"])
+    def test_a_plain_http_value_is_refused_by_the_variable_name(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """The message names the variable, not an option the caller never
+        passed."""
+        monkeypatch.setenv(name, "http://sdk.catfood.example.com")
+        with pytest.raises(ValueError, match="cleartext") as excinfo:
+            LaunchDarklySkillStore(SDK_KEY)
+        message = str(excinfo.value)
+        assert name in message
+        assert "base_uri" not in message
+        assert "stream_uri" not in message
+
+    def test_the_variables_are_read_once_at_construction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        store = LaunchDarklySkillStore(SDK_KEY)
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.elsewhere.example.com")
+        monkeypatch.setenv("LD_STREAM_URI", "https://stream.elsewhere.example.com")
+        assert self._origins(store) == (
+            "https://sdk.catfood.example.com",
+            "https://sdk.catfood.example.com",
+        )
+
+    def test_the_module_defaults_keep_the_production_hosts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LD_BASE_URI", "https://sdk.catfood.example.com")
+        LaunchDarklySkillStore(SDK_KEY)
+        assert DEFAULT_BASE_URI == "https://sdk.launchdarkly.com"
+        assert DEFAULT_STREAM_URI == "https://stream.launchdarkly.com"
+
+
 # ---------------------------------------------------------------------------
 # The eager re-reconcile, end to end over the transport
 # ---------------------------------------------------------------------------
@@ -4057,7 +4190,7 @@ class TestStreamHostDefaults:
 
 class TestWatchSkillsOverTheTransport:
     """
-    ``watch_skills`` against a live ``FDv2SkillStore``. The watcher's own
+    ``watch_skills`` against a live ``LaunchDarklySkillStore``. The watcher's own
     behaviour — debounce, refusal of a store without ``add_listener``, detaching
     on close — is covered in ``test_skills_watch.py`` against the in-memory
     store; these are the cases that only mean something with a transport
@@ -4244,7 +4377,7 @@ class TestLifecycle:
         with pytest.raises(RuntimeError, match="close\\(\\) is final") as excinfo:
             store.start()
         # The remedy is in the message, not only in the docs.
-        assert "Construct a new FDv2SkillStore" in str(excinfo.value)
+        assert "Construct a new LaunchDarklySkillStore" in str(excinfo.value)
 
     def test_a_store_closed_before_it_started_also_refuses_to_start(
         self, endpoint: Any
@@ -4292,7 +4425,7 @@ class TestLifecycle:
         assert store.get_object(SKILL_OBJECT_KIND, "pdf-extraction") is not None
 
     def test_wait_for_skills_times_out_rather_than_hanging(self) -> None:
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY, mode="poll", poll_interval=60, _requester=_ScriptedRequester()
         )
         try:
@@ -4301,7 +4434,7 @@ class TestLifecycle:
             store.close()
 
     def test_the_store_satisfies_the_interface_before_it_starts(self) -> None:
-        store = FDv2SkillStore(SDK_KEY)
+        store = LaunchDarklySkillStore(SDK_KEY)
         assert store.get_object(SKILL_OBJECT_KIND, "anything") is None
         assert store.all_objects(SKILL_OBJECT_KIND) == {}
 
@@ -4350,6 +4483,7 @@ class TestTransportLayering:
             "json",
             "logging",
             "math",
+            "os",
             "random",
             "re",
             "socket",
@@ -4363,11 +4497,11 @@ class TestTransportLayering:
         assert _module_imports(skills_fdv2) == stdlib | within_the_feature
 
     def test_nothing_in_the_feature_imports_it(self) -> None:
-        """Only the experimental entry point names it, to re-export
-        ``FDv2SkillStore`` and ``StoreDiagnostics``.
+        """Only the package root names it, to re-export
+        ``LaunchDarklySkillStore`` and ``StoreDiagnostics``.
 
         That re-export is the published surface rather than a dependency: it is
-        what makes ``FDv2SkillStore`` reachable without importing the
+        what makes ``LaunchDarklySkillStore`` reachable without importing the
         implementation module. A *feature* module importing the transport would
         be the layering inverting, and the accessors would start being able to
         tell which store answered them.
@@ -4377,6 +4511,7 @@ class TestTransportLayering:
             "skills_core.py",
             "skills_fs.py",
             "skills_watch.py",
+            "skills_source.py",
             "safe_fs.py",
             "types.py",
             "types_validation.py",
@@ -4390,9 +4525,9 @@ class TestTransportLayering:
         ]
 
         assert importers == []
-        # The positive control: the entry point does name it, so an empty result
+        # The positive control: the package root does name it, so an empty result
         # above cannot be a misspelt filename list finding nothing anywhere.
-        entry_point = source_dir / "experimental" / "skills.py"
+        entry_point = source_dir / "__init__.py"
         assert "skills_fdv2" in entry_point.read_text(encoding="utf-8")
 
 
@@ -4596,7 +4731,7 @@ class TestTimeouts:
     def test_the_store_reports_the_timeout_and_keeps_going(
         self, black_hole: Any
     ) -> None:
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             base_uri=black_hole.base_uri,
             mode="poll",
@@ -4616,20 +4751,20 @@ class TestTimeouts:
     def test_the_default_bound_depends_on_the_mode(self) -> None:
         assert DEFAULT_POLL_TIMEOUT == 10.0
         assert DEFAULT_STREAM_READ_TIMEOUT == 300.0
-        polling = FDv2SkillStore(SDK_KEY, mode="poll")
-        streaming = FDv2SkillStore(SDK_KEY, mode="stream")
+        polling = LaunchDarklySkillStore(SDK_KEY, mode="poll")
+        streaming = LaunchDarklySkillStore(SDK_KEY, mode="stream")
         assert polling._requester._read_timeout == DEFAULT_POLL_TIMEOUT
         assert streaming._requester._read_timeout == DEFAULT_STREAM_READ_TIMEOUT
 
     @pytest.mark.parametrize("mode", ["poll", "stream"])
     def test_an_explicit_read_timeout_overrides_the_default(self, mode: Any) -> None:
-        store = FDv2SkillStore(SDK_KEY, mode=mode, read_timeout=42.0)
+        store = LaunchDarklySkillStore(SDK_KEY, mode=mode, read_timeout=42.0)
         assert store._requester._read_timeout == 42.0
 
     @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
     def test_a_non_positive_read_timeout_is_rejected(self, value: float) -> None:
         with pytest.raises(ValueError, match="read_timeout"):
-            FDv2SkillStore(SDK_KEY, read_timeout=value)
+            LaunchDarklySkillStore(SDK_KEY, read_timeout=value)
 
     @pytest.mark.parametrize(
         "value",
@@ -4647,18 +4782,18 @@ class TestTimeouts:
         never again while reporting itself healthy.
         """
         with pytest.raises(ValueError, match="poll_interval"):
-            FDv2SkillStore(SDK_KEY, mode="poll", poll_interval=value)
+            LaunchDarklySkillStore(SDK_KEY, mode="poll", poll_interval=value)
 
     def test_a_finite_positive_poll_interval_is_accepted(self) -> None:
         """Positive control, so the guard above cannot reject every value."""
-        store = FDv2SkillStore(SDK_KEY, mode="poll", poll_interval=0.5)
+        store = LaunchDarklySkillStore(SDK_KEY, mode="poll", poll_interval=0.5)
         assert store.failed is None
 
     def test_there_is_no_separate_connect_timeout(self) -> None:
         # ``urllib`` cannot bound the connect separately from the reads, so the
         # constructor does not offer a parameter that would only pretend to.
         with pytest.raises(TypeError):
-            FDv2SkillStore(SDK_KEY, connect_timeout=2.0)  # type: ignore[call-arg]
+            LaunchDarklySkillStore(SDK_KEY, connect_timeout=2.0)  # type: ignore[call-arg]
 
 
 class TestWaitingForSkills:
@@ -4798,7 +4933,7 @@ class TestPollShutdown:
     def test_close_during_a_stalled_poll_returns_promptly(
         self, stalled_body: Any
     ) -> None:
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             base_uri=stalled_body.base_uri,
             mode="poll",
@@ -4819,7 +4954,7 @@ class TestPollShutdown:
         # Our own shutdown is not an outage: counting it would spend a retry
         # from the bounded budget and leave a misleading ``last_error`` behind
         # on a store whose content is still perfectly good.
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY,
             base_uri=stalled_body.base_uri,
             mode="poll",
@@ -4841,7 +4976,7 @@ class TestPollShutdown:
         # and a ``start`` that adopted the dying thread would leave a store
         # reporting itself started and never delivering. Raising says so.
         requester = _SlowPollRequester()
-        store = FDv2SkillStore(
+        store = LaunchDarklySkillStore(
             SDK_KEY, mode="poll", poll_interval=0.01, _requester=requester
         )
         try:

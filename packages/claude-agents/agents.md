@@ -2,7 +2,7 @@
 
 > **Span shape.** This package emits `invoke_agent` → `chat {model}` → `execute_tool {name}`, with
 > tool spans as siblings of `chat`. Span construction lives in `spans.py` beside the handler.
-> Conversation content is off unless the caller passes `capture_content=True`, or the process sets it. See [Process-wide defaults](../client/README.md#process-wide-defaults).
+> Conversation content is on unless the caller passes `capture_content=False`, or the process turns it off. See [Process-wide defaults](../client/README.md#process-wide-defaults).
 > `TELEMETRY-CONTRACT.md` at the repo root is the authority; read it before changing span code.
 
 
@@ -30,6 +30,7 @@ That means the LaunchDarkly flag variation must have `provider.name == "Anthropi
 | `src/launchdarkly_ai_claude_agents/graph.py` | `claude_graph()` convenience wrapper around `graph()` |
 | `src/launchdarkly_ai_claude_agents/native_graph.py` | `to_claude_agents()` native graph adapter |
 | `src/launchdarkly_ai_claude_agents/builtins.py` | Pre-constructed `NativeTool` sentinels for Claude built-in tools |
+| `src/launchdarkly_ai_claude_agents/skills.py` | `create_claude_agents_skills_handler()`, exported from the package root |
 | `src/launchdarkly_ai_claude_agents/__init__.py` | Package exports |
 | `src/launchdarkly_ai_claude_agents/_version.py` | `PACKAGE_NAME` and `__version__`, sent with `$ld:ai:sdk:info` and `$ld:ai:sdk:usage` |
 
@@ -54,7 +55,7 @@ def claude_graph(key: str, *, cwd=None, setting_sources=None, **options): ...
 
 # Native graph adapter — builds a Claude code-agents graph from a resolved GraphDefinition.
 # opts: context, tool_handlers, and the host options cwd and setting_sources
-def to_claude_agents(def_promise: Awaitable[dict], opts: dict | None = None): ...
+def to_claude_agents(def_promise: Awaitable[GraphDefinition], opts: ClaudeNativeGraphOptions | None = None) -> NativeGraphRunner: ...
 
 # NativeTool sentinels for Claude Code built-in capabilities
 ClaudeBash: NativeTool
@@ -73,7 +74,7 @@ ClaudeNotebookEdit: NativeTool
 
 ## Implementation Details
 
-### 1. Prompt Construction (`build_prompt`)
+### 1. Prompt Construction (`_build_prompt`)
 
 The handler uses a flat `prompt` + optional `system_prompt` shape that the `claude_agent_sdk.query()` call accepts:
 
@@ -93,7 +94,7 @@ neither?
 
 Note: the `messages` path collapses conversation history into a single flat string — roles are not individually structured. This is a limitation of the agent SDK's `query()` interface.
 
-### 2. Tool Wiring (`build_tool_mcp`)
+### 2. Tool Wiring (`_build_tool_mcp`)
 
 Tools are delivered via an in-process MCP server, not as raw JSON schema defs. The pipeline:
 
@@ -140,7 +141,7 @@ The CLI also writes its own `AssistantMessage`, with `model` set to the literal 
 an API call fails and after a response stops at `max_output_tokens`. It is not a model response:
 it gets no `chat` span and never joins the conversation a later span reports.
 
-**Important:** a bare `return` inside `async for` abandons the generator. Python's asyncio finalizer will try to `aclose()` it later and may raise `RuntimeError: aclose(): asynchronous generator is already running` if the generator is still suspended inside a real SDK `await`. Always use `break` + explicit `aclose()`. See **Appendix A.4** in `TESTING.md`.
+**Important:** a bare `return` inside `async for` abandons the generator. Python's asyncio finalizer will try to `aclose()` it later and may raise `RuntimeError: aclose(): asynchronous generator is already running` if the generator is still suspended inside a real SDK `await`. Always use `break` + explicit `aclose()`.
 
 ### 4. Telemetry
 
@@ -167,6 +168,20 @@ On error: `span.record_exception(exc)`, status set to ERROR, span ended, error r
 `session_id` from the `init` message when the caller supplied none. Write-if-absent: the caller
 id wins. An app that opens a fresh CLI session per turn and re-feeds history must pass its own
 conversation id, or each turn becomes its own conversation.
+
+### 5. Agent Skills (`skills.py`)
+
+`create_claude_agents_skills_handler(...)` is exported from the package root. It reports `claude-agents.createClaudeAgentsSkillsHandler` and builds the handler through `_create_claude_agents_handler(..., _prepare=...)`.
+
+`_prepare` is a package-internal hook, a private keyword argument of the internal factory only, so `create_claude_agents_handler`'s signature stays unchanged. It runs at the start of every invoke and stream, inside the `invoke_agent` span, and returns `None` (the run is exactly the core handler's) or a `QueryPreparation`. That holds extra `query()` options, extra built-ins appended to `tools` (never to `allowed_tools`), and a `cleanup` that both paths await last in their `finally`.
+
+For a variation with skills, `_prepare_skills`:
+
+1. `tempfile.mkdtemp(prefix="ld-skills-", dir=skills_temp_dir)`, then `os.path.realpath`, then `os.mkdir(<dir>/launchdarkly)`.
+2. `write_skills(skill_refs(config), <dir>/launchdarkly/skills, prune=False)`. A report that is not `ok` raises, naming each failed key, and `query()` is never called.
+3. Returns `plugins=[{"type": "local", "path": <dir>/launchdarkly}]`, `skills=["launchdarkly:<key>", ...]` and `extra_builtins=["Skill"]`.
+
+The plugin's name comes from its directory's base name, so no manifest is written. The skill names are qualified because a bare name would also match a host plugin's skill. `claude-agent-sdk`'s `SdkPluginConfig` has no `skipMcpDiscovery` key, so unlike TypeScript the plugin entry carries only `type` and `path`. The directory holds no `.mcp.json`, so there is nothing to discover. `setting_sources` is never `None` here, because the core handler always sends it. With `skills` set and `setting_sources=None`, `claude-agent-sdk` sends `--setting-sources=user,project`. The tool hooks are installed whenever `Skill` is in `tools`, so a `Skill` call gets an `execute_tool Skill` span. The directory is removed with a synchronous `shutil.rmtree`, so a cancellation during teardown cannot interrupt it. There's no shared root, no watcher and no prune: every run writes exactly its own variation's references, which is also how detaching a skill takes effect.
 
 ---
 
@@ -221,6 +236,6 @@ Span names and attributes are described in [Implementation Details → Telemetry
 ## Common Pitfalls
 
 - **MCP tool name prefix**: tools registered in the MCP server are accessible as `mcp__tool-mcp__<name>`. The `allowed_tools` list must use this prefix; omitting it will cause the agent to not invoke any tools.
-- **Async generator teardown**: always use `break` inside `async for` (not `return`) and wrap the loop in `try/finally: await gen.aclose()`. See TESTING.md Appendix A.4.
+- **Async generator teardown**: always use `break` inside `async for` (not `return`) and wrap the loop in `try/finally: await gen.aclose()`.
 - **`message.usage` shape**: the raw usage dict from the `claude_agent_sdk` is passed through directly to `parse_usage`. It accepts `input_tokens`/`output_tokens` which the SDK provides.
-- **Native tools** (`ClaudeWebSearch`, etc.) are registered in `tool_handlers` as `NativeTool` sentinel instances (not callables). The handler's `partition_tools` function separates them from user-defined tools — native tools go into `native_tool_names` for the agent's built-in access, user tools go through the MCP server.
+- **Native tools** (`ClaudeWebSearch`, etc.) are registered in `tool_handlers` as `NativeTool` sentinel instances (not callables). The handler's `_partition_tools` function separates them from user-defined tools — native tools go into `native_tool_names` for the agent's built-in access, user tools go through the MCP server.

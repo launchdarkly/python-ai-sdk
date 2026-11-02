@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from launchdarkly_ai_server.experimental.skills import (
+from launchdarkly_ai_server import (
     InMemorySkillStore,
     set_skill_store,
     watch_skills,
@@ -67,15 +67,15 @@ class TestWatchSkills:
     async def test_a_burst_of_changes_coalesces_into_a_debounce_window(
         self, tmp_path: Any, make_raw_skill: Any
     ) -> None:
-        """Six notifications spread across one window produce two reconciles.
+        """Six notifications spread across one window produce one reconcile.
 
         To discriminate rather than pass vacuously, the puts happen after the
         listener is attached, the counter is asserted against an exact figure,
         and each put lands in its own scheduler pass (a back-to-back burst would
         collapse to one reconcile with or without a debounce).
 
-        Two, not one: the wake flag is cleared before the window, so a change
-        arriving inside it schedules one further pass.
+        The debounce trails: each change restarts the window, so the reconcile
+        runs once delivery goes quiet and sees every skill in the burst.
         """
         store = InMemorySkillStore()
         set_skill_store(store)
@@ -85,10 +85,48 @@ class TestWatchSkills:
             for i in range(6):
                 store.put(make_raw_skill(key=f"skill-{i}"))
                 time.sleep(0.1)
-            assert wait_until(lambda: watcher.reconciles >= 2, timeout=10)
-            # Settle well past two windows, so a third would have landed by now.
+            assert wait_until(lambda: watcher.reconciles >= 1, timeout=10)
+            # Settle well past two windows, so a second would have landed by now.
             time.sleep(1.5)
+            assert watcher.reconciles == 1
+            for i in range(6):
+                assert (tmp_path / "s" / f"skill-{i}" / "SKILL.md").exists()
+        finally:
+            watcher.close()
+
+    async def test_a_change_during_a_reconcile_schedules_one_more(
+        self, tmp_path: Any, make_raw_skill: Any
+    ) -> None:
+        """The wait for quiet ends before the reconcile starts, so a change
+        landing while it runs is not swallowed by it: exactly one more pass
+        follows, and that pass writes the late skill."""
+
+        class ChangesDuringSnapshot(InMemorySkillStore):
+            """Delivers a new skill the moment an armed reconcile has taken its
+            snapshot, so the snapshot cannot include it."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.armed = False
+
+            def all_objects(self, kind: str) -> dict[str, dict[str, Any]]:
+                objects = super().all_objects(kind)
+                if self.armed:
+                    self.armed = False
+                    self.put(make_raw_skill(key="late"))
+                return objects
+
+        store = ChangesDuringSnapshot()
+        set_skill_store(store)
+        _report, watcher = await watch_skills("*", tmp_path / "s", debounce=0.05)
+        try:
+            store.armed = True
+            store.put(make_raw_skill(key="early"))
+            assert wait_until(lambda: watcher.reconciles >= 2, timeout=10)
+            # Settle well past the window, so a third would have landed by now.
+            time.sleep(0.5)
             assert watcher.reconciles == 2
+            assert (tmp_path / "s" / "late" / "SKILL.md").exists()
         finally:
             watcher.close()
 

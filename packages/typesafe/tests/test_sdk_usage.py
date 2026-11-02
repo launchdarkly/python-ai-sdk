@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.27 — typesafe."""
+"""Tests for SDK helper usage events — typesafe."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch

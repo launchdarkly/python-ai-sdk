@@ -213,6 +213,20 @@ def require_mapping(value: Any, *, description: str) -> Mapping[str, Any]:
     return value
 
 
+def check_string_keys(value: Any) -> None:
+    """Raise ``TypeError`` on a mapping key that is not a ``str``, recursively."""
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"keys must be str, not {type(key).__name__} (got {key!r})"
+                )
+            check_string_keys(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            check_string_keys(item)
+
+
 def require_string(data: Mapping[str, Any], key: str, description: str) -> str:
     """Return the non-empty string at ``key``. Raises ``EvaluationsError``."""
     value = data.get(key)

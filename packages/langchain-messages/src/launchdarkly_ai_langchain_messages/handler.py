@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
@@ -21,6 +22,7 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
+    is_function_tool,
     lang_chain_content_text,
     lang_chain_finish_reasons,
     lang_chain_span_messages,
@@ -87,7 +89,7 @@ _LANGCHAIN_RUNTIME_KEYS = frozenset(
 #: ``TestChatOpenAIAcceptsExactlyTheseKeys`` in this package's tests asserts this classification
 #: stays exhaustive as the SDK's own pydantic model changes.
 #:
-#: This is the cross-SDK list for LangChain ChatOpenAI (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatOpenAI.
 #: ``reasoning_effort`` and ``seed`` are marked not supported in TypeScript there: the JS
 #: ``ChatOpenAI`` takes them only as per-call options, while this handler sets them on the
 #: constructor, which has a field for each. ``reasoning_effort`` is the Chat Completions field and
@@ -133,7 +135,7 @@ _CHAT_OPENAI_MAPPING_KEYS = frozenset({"logit_bias"})
 #:   handler gets back. ``truncation``, ``context_management`` and ``use_previous_response_id``
 #:   also lean on server-side conversation state.
 #: * ``store``: data retention. It decides whether the request is kept on the server.
-#: * ``prompt_cache_key``: on the spec list, marked not supported in Python, because
+#: * ``prompt_cache_key``: on the cross-SDK list, marked not supported in Python, because
 #:   ``ChatOpenAI`` has no such constructor field (it takes it only per call). It is not in the set
 #:   below because ``ChatOpenAI`` does not accept it at all, which the drift test requires of every
 #:   listed key.
@@ -183,7 +185,7 @@ _CHAT_OPENAI_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: as :data:`_CHAT_OPENAI_FORWARDED_KEYS`. ``TestChatAnthropicAcceptsExactlyTheseKeys`` in this
 #: package's tests asserts this classification stays exhaustive.
 #:
-#: This is the cross-SDK list for LangChain ChatAnthropic (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatAnthropic.
 #: ``max_tokens_to_sample`` is renamed to ``max_tokens`` before this list applies, and a
 #: ``max_tokens`` the config also set wins. ``stop`` is renamed to ``stop_sequences`` the same way, and
 #: a ``stop_sequences`` the config also set wins (see :data:`_CHAT_ANTHROPIC_RENAMES`).
@@ -306,7 +308,7 @@ _CHAT_ANTHROPIC_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 #: ``TestChatBedrockConverseAcceptsExactlyTheseKeys`` in this package's tests skips itself when it
 #: is not installed rather than asserting nothing.
 #:
-#: This is the cross-SDK list for LangChain ChatBedrockConverse (TESTING.md section 1.12).
+#: This is the cross-SDK list for LangChain ChatBedrockConverse.
 #: ``reasoning_effort``, ``stop`` and ``stop_sequences`` are marked not supported in TypeScript
 #: there: the JS ``ChatBedrockConverse`` takes stop sequences only as a per-call option and has no
 #: reasoning effort field, while this class has constructor fields for both. ``stop`` is renamed to
@@ -390,7 +392,9 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 }
 
 
-def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_tools(
+    config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK's
     # `buildTools`. That difference predates this span work and changes what the model is offered,
     # not what the span reports, so it stays as it is: the catalog recorded below (via
@@ -405,6 +409,8 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
             },
         }
         for name, tool in config_tools.items()
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
     ]
 
 
@@ -619,7 +625,13 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
     if provider == "anthropic":
-        lc_anthropic = importlib.import_module("langchain_anthropic")
+        try:
+            lc_anthropic = importlib.import_module("langchain_anthropic")
+        except ImportError as exc:
+            raise ImportError(
+                "Using Anthropic models requires langchain-anthropic. "
+                'Install it with: pip install "launchdarkly-ai-langchain-messages[anthropic]"'
+            ) from exc
         return lc_anthropic.ChatAnthropic(
             **_rebuild_anthropic_output_config(
                 _rebuild_anthropic_thinking(
@@ -639,7 +651,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
         except ImportError as exc:
             raise ImportError(
                 "Using Bedrock models requires langchain-aws. "
-                "Install it with: pip install langchain-aws"
+                'Install it with: pip install "launchdarkly-ai-langchain-messages[aws]"'
             ) from exc
         return lc_aws.ChatBedrockConverse(
             **_model_constructor_kwargs(
@@ -762,7 +774,10 @@ async def _run_structured_turn(
 
 
 def create_langchain_messages_handler(
-    llm: Any = None, *, capture_content: bool | None = None
+    llm: Any = None,
+    *,
+    providers: Sequence[str] | None = None,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
@@ -774,16 +789,27 @@ def create_langchain_messages_handler(
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. Conversation content is PII, so a run emits only metadata, meaning
-    models, token counts, timings and tool names, until capture is turned on.
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
+    meaning models, token counts, timings and tool names.
+
+    *providers* limits which ``config.provider.name`` values this wildcard accepts.
+    Omit it to match every provider. Names must match the config exactly, for example
+    ``["Bedrock"]``.
     """
-    report_usage("langchain-messages.createLangChainHandler", PACKAGE_NAME, __version__)
-    return _create_langchain_messages_handler(llm, capture_content=capture_content)
+    report_usage(
+        "langchain-messages.createLangChainMessagesHandler", PACKAGE_NAME, __version__
+    )
+    return _create_langchain_messages_handler(
+        llm, providers=providers, capture_content=capture_content
+    )
 
 
 def _create_langchain_messages_handler(
-    llm: Any = None, *, capture_content: bool | None = None
+    llm: Any = None,
+    *,
+    providers: Sequence[str] | None = None,
+    capture_content: bool | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_langchain_messages_handler`, used by this package's wrappers."""
     content_override = capture_content
@@ -791,7 +817,7 @@ def _create_langchain_messages_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -802,7 +828,7 @@ def _create_langchain_messages_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` can tell an open root from a
         # closed one without asking the span. A mock span answers `is_recording()` truthily, and the
@@ -828,7 +854,7 @@ def _create_langchain_messages_handler(
                 )
             base_model = await _resolve_base_model(config, llm, importlib)
 
-            tool_defs = _build_tools(config.get("tools") or {})
+            tool_defs = _build_tools(config.get("tools") or {}, tool_handlers or {})
             output_format = config.get("outputFormat")
 
             # CASE 1: outputFormat only, no tools -> withStructuredOutput (all providers).
@@ -1085,7 +1111,7 @@ def _create_langchain_messages_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -1104,6 +1130,7 @@ def _create_langchain_messages_handler(
         _call_impl,  # type: ignore[arg-type]
         _stream_impl,  # type: ignore[arg-type]
         capture_content=content_override,
+        providers=providers,
     )
 
 
@@ -1111,7 +1138,7 @@ async def _stream_gen(
     llm: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
@@ -1140,12 +1167,12 @@ async def _stream_gen(
 
     base_model = await _resolve_base_model(config, llm, importlib)
 
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     initial_messages = _build_messages(config, user_input, variables, history)
 
-    tool_defs = _build_tools(config.get("tools") or {})
+    tool_defs = _build_tools(config.get("tools") or {}, tool_handlers or {})
     tool_model = base_model.bind_tools(tool_defs) if tool_defs else base_model
     tool_definitions = to_tool_definitions(tool_defs)
     conversation_messages = list(initial_messages)
@@ -1501,16 +1528,17 @@ def langchain_messages(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    # Both are lifted out of kwargs: capture_content configures the handler, variables belong to
-    # the invocation. Leaving either in would pass it to config(), which takes neither, so a caller
-    # asking for content on spans got a TypeError instead of content.
+    # Lifted out of kwargs: capture_content and providers configure the handler, variables belong
+    # to the invocation. Leaving them in would pass them to config(), which takes none of them, so a
+    # caller asking for content on spans got a TypeError instead of content.
     report_usage("langchain-messages.langchainMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
+    providers = kwargs.pop("providers", None)
     return _config(
         key=config_key,
         handler=_create_langchain_messages_handler(
-            llm, capture_content=capture_content
+            llm, providers=providers, capture_content=capture_content
         ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

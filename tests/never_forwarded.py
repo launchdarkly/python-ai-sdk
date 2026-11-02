@@ -10,7 +10,7 @@ forwarded lists against it, and each package's own tests check their real call s
 from __future__ import annotations
 
 #: Credentials, endpoints and connection settings, raw request injection, remote tools, the Claude
-#: Agents host-process settings, and the categories no cross-SDK allowlist (TESTING.md section 1.12)
+#: Agents host-process settings, and the categories no cross-SDK allowlist
 #: may hold: data location and retention, server-side state, identity and attribution, runtime wiring and
 #: API-shape switches, prompt content beyond the instructions, and safety configuration.
 NEVER_FORWARDED_KEYS = frozenset(

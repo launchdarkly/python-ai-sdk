@@ -67,8 +67,8 @@ def skills_field_rejection_reason(raw: Any) -> str | None:
     """
     Why a present ``skills`` field is malformed, or ``None`` when it is valid.
 
-    Used by ``skill_refs``, not by ``parse_ai_config``: Agent Skills is
-    experimental, and a malformed field must not fail a core config call.
+    Used by ``skill_refs``, not by ``parse_ai_config``: a malformed field must
+    not fail a config call that does not use skills.
     One malformed reference rejects the whole field, never a partial list.
     """
     if not isinstance(raw, list):
@@ -151,8 +151,8 @@ def parse_ai_config(raw: Any) -> ParseResult:
             error={"message": "outputFormat must be an object (JSON Schema)"},
         )
 
-    # ``skills`` is passed through unvalidated. Agent Skills is experimental, so
-    # a malformed field must not fail a core config call (TESTING.md §0.3);
-    # ``skill_refs`` rejects it where the references are used.
+    # ``skills`` is passed through unvalidated, so a malformed field does not fail
+    # a config call that does not use skills; ``skill_refs`` rejects it where the
+    # references are used.
 
     return ParseSuccess(success=True, data=raw)

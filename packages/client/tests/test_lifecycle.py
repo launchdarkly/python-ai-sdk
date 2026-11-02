@@ -1,9 +1,11 @@
 """
-Tests for §3.9 init_client / get_client / shutdown.
-Reference: TESTING.md §3.9
+Tests for init_client / get_client / shutdown.
 """
 
+import ast
 import asyncio
+import inspect
+import json
 import os
 import subprocess
 import sys
@@ -68,6 +70,7 @@ def _make_stub_client() -> MagicMock:
     stub.flush = AsyncMock()
     stub.close = AsyncMock()
     stub.wait_for_initialization = AsyncMock()
+    stub.is_initialized = MagicMock(return_value=True)
     return stub
 
 
@@ -207,6 +210,16 @@ class TestInitClientBYOC:
             stub.track.call_args.args[2]["aiSdkName"] == "launchdarkly-ai-openai-agents"
         )
 
+    async def test_does_not_check_whether_a_passed_client_initialized(
+        self,
+    ) -> None:
+        # The caller built a passed client and owns its readiness.
+        stub = _make_stub_client()
+        stub.is_initialized = MagicMock(return_value=False)
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            assert await init_client(client=stub) is stub
+        stub.is_initialized.assert_not_called()
+
     async def test_does_not_call_node_sdk(self) -> None:
         stub = _make_stub_client()
         mock_import = MagicMock()
@@ -240,6 +253,35 @@ class TestInitClientSDKKeyPath:
         with patch.dict(os.environ, env, clear=True):
             with pytest.raises(RuntimeError, match="SDK key"):
                 await init_client()
+
+    def test_never_loads_a_dotenv_file(self, tmp_path: Any) -> None:
+        """A library must not load the app's .env: importing and init read os.environ only."""
+        (tmp_path / ".env").write_text(
+            "LD_SDK_KEY=from-dotenv\nAIC_DOTENV_SENTINEL=1\n"
+        )
+        script = (
+            "import asyncio, os\n"
+            "import launchdarkly_ai_server\n"
+            "import launchdarkly_ai_server.experimental\n"
+            "try:\n"
+            "    asyncio.run(launchdarkly_ai_server.init_client())\n"
+            "except RuntimeError as err:\n"
+            "    print('init:', err)\n"
+            "print('sentinel:', os.environ.get('AIC_DOTENV_SENTINEL'))\n"
+            "print('key:', os.environ.get('LD_SDK_KEY'))\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k != "LD_SDK_KEY"}
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "SDK key" in result.stdout
+        assert "sentinel: None" in result.stdout
+        assert "key: None" in result.stdout
 
     async def test_uses_options_sdk_key_over_env_var(self) -> None:
         stub_client = _make_stub_client()
@@ -305,6 +347,47 @@ class TestInitClientSDKKeyPath:
                     lifecycle_module, "_setup_telemetry", return_value=None
                 ):
                     assert await init_client() is healthy
+
+    async def test_an_sdk_client_that_did_not_initialize_fails_the_call(
+        self,
+    ) -> None:
+        # The SDK constructor returns normally when start_wait runs out or the
+        # key is rejected. Adopting that client served every AI Config
+        # disabled, with no error at startup.
+        failed = _make_stub_client()
+        failed.is_initialized = MagicMock(return_value=False)
+        healthy = _make_stub_client()
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(side_effect=[failed, healthy])
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="failed to initialize"):
+                        await init_client()
+                    failed.close.assert_awaited_once()
+                    with pytest.raises(RuntimeError, match="init_client"):
+                        get_client()
+
+                    assert await init_client() is healthy
+        assert mock_ld.LDClient.call_count == 2
+        assert get_client() is healthy
+
+    async def test_a_close_error_does_not_replace_the_initialization_error(
+        self,
+    ) -> None:
+        failed = _make_stub_client()
+        failed.is_initialized = MagicMock(return_value=False)
+        failed.close = AsyncMock(side_effect=OSError("close failed"))
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=failed)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    with pytest.raises(RuntimeError, match="failed to initialize"):
+                        await init_client()
+        assert lifecycle_module._client is None
 
     async def test_retries_after_a_failed_init_instead_of_replaying_it(self) -> None:
         # A failure must not be cached: an app whose first call ran before its
@@ -397,6 +480,42 @@ class TestInitClientSDKKeyPath:
                     await asyncio.sleep(0.4)
         stub.close.assert_awaited_once()
         assert lifecycle_module._client is None
+
+    @staticmethod
+    async def _config_kwargs(env: dict[str, str]) -> dict[str, Any]:
+        mock_ld = MagicMock()
+        mock_ld.Config = MagicMock(return_value=MagicMock())
+        mock_ld.LDClient = MagicMock(return_value=_make_stub_client())
+        names = ("LD_BASE_URI", "LD_STREAM_URI", "LD_EVENTS_URI")
+        base = {k: v for k, v in os.environ.items() if k not in names}
+        with patch.dict(
+            os.environ, {**base, "LD_SDK_KEY": "test-key", **env}, clear=True
+        ):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    await init_client()
+        return dict(mock_ld.Config.call_args.kwargs)
+
+    async def test_strips_whitespace_from_the_uri_variables(self) -> None:
+        kwargs = await self._config_kwargs(
+            {
+                "LD_BASE_URI": "  https://sdk.example.com\n",
+                "LD_STREAM_URI": "\thttps://stream.example.com ",
+                "LD_EVENTS_URI": " https://events.example.com ",
+            }
+        )
+        assert kwargs == {
+            "base_uri": "https://sdk.example.com",
+            "stream_uri": "https://stream.example.com",
+            "events_uri": "https://events.example.com",
+        }
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    async def test_a_blank_uri_variable_is_unset(self, blank: str) -> None:
+        kwargs = await self._config_kwargs(
+            {"LD_BASE_URI": blank, "LD_STREAM_URI": blank, "LD_EVENTS_URI": blank}
+        )
+        assert kwargs == {}
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +718,7 @@ class TestShutdown:
     async def test_a_failure_clearing_experimental_state_is_logged_not_raised(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Experimental behaviour must not break a core call (TESTING.md §0.3)."""
+        """Experimental behaviour must not break a core call."""
         stub = _make_stub_client()
         with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
             await init_client(client=stub)
@@ -620,15 +739,45 @@ class TestShutdown:
         assert "Could not clear the Failing Feature state" in caplog.messages
         later.assert_called_once()  # one failing hook does not skip the rest
 
+    @staticmethod
+    def _lifecycle_imports() -> set[str]:
+        tree = ast.parse(inspect.getsource(lifecycle_module))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+                # `from . import skills_core` names the module in the alias, not in `module`.
+                imported.update(alias.name for alias in node.names)
+        return imported
+
+    def test_lifecycle_imports_no_skills_module(self) -> None:
+        """agents.md: lifecycle reaches Agent Skills only through the shutdown hooks."""
+        skills = sorted(
+            name
+            for name in self._lifecycle_imports()
+            if name.rsplit(".", 1)[-1].startswith("skills")
+        )
+        assert skills == []
+
+    def test_lifecycle_imports_no_evaluations_module(self) -> None:
+        """Lifecycle imports no Evaluations from Code module."""
+        evaluations = sorted(
+            name
+            for name in self._lifecycle_imports()
+            if "evaluations" in name.split(".")
+        )
+        assert evaluations == []
+
     def test_core_does_not_import_experimental_code(self) -> None:
-        """Core never hooks into experimental code (TESTING.md §0.3)."""
+        """Importing and shutting down core loads no experimental module."""
         script = (
             "import asyncio, sys\n"
             "import launchdarkly_ai_server\n"
             "asyncio.run(launchdarkly_ai_server.shutdown())\n"
-            "loaded = sorted(m for m in sys.modules if m.startswith("
-            "('launchdarkly_ai_server.skills', 'launchdarkly_ai_server.evaluations',"
-            " 'launchdarkly_ai_server.experimental')))\n"
+            "loaded = sorted(m for m in sys.modules"
+            " if m.startswith('launchdarkly_ai_server.experimental'))\n"
             "print(','.join(loaded))\n"
         )
         result = subprocess.run(
@@ -648,7 +797,7 @@ class TestShutdown:
 
 
 # ---------------------------------------------------------------------------
-# OTel setup details (§3.9)
+# OTel setup details
 # ---------------------------------------------------------------------------
 
 
@@ -692,12 +841,18 @@ class TestOtelSetup:
 
         return created_resources, mock_exporter_cls
 
-    def test_stamps_highlight_project_id(self) -> None:
-        """highlight.project_id resource attribute must equal the resolved SDK key."""
+    def test_stamps_launchdarkly_project_id(self) -> None:
+        """launchdarkly.project_id resource attribute must equal the resolved SDK key."""
         created_resources, _ = self._setup_with_mock_exporter("my-sdk-key")
         assert any(
-            r.get("highlight.project_id") == "my-sdk-key" for r in created_resources
+            r.get("launchdarkly.project_id") == "my-sdk-key" for r in created_resources
         )
+
+    def test_stamps_no_highlight_project_id(self) -> None:
+        """launchdarkly.project_id is the only project id the resource carries."""
+        created_resources, _ = self._setup_with_mock_exporter("my-sdk-key")
+        assert created_resources
+        assert all("highlight.project_id" not in r for r in created_resources)
 
     def test_registers_w3c_propagators(self) -> None:
         """init_client must register a CompositePropagator with W3C trace context and baggage propagators."""
@@ -877,8 +1032,8 @@ class TestInspectConfig:
         assert result["meta"] is not None
 
     async def test_a_malformed_skills_field_does_not_fail_core_calls(self) -> None:
-        """Agent Skills is experimental, so its field cannot break a core call
-        (TESTING.md §0.3). ``skill_refs`` rejects it instead."""
+        """A malformed ``skills`` field cannot break a config call that does
+        not use skills. ``skill_refs`` rejects it instead."""
         stub = _make_stub_client()
         stub.variation = AsyncMock(
             return_value={
@@ -934,6 +1089,28 @@ class TestInspectConfig:
         assert result["meta"]["modelVersion"] == 3  # type: ignore[index]
         assert extracted["meta"]["modelKey"] == "my-model"
         assert extracted["meta"]["modelVersion"] == 3
+
+    async def test_returns_the_raw_variation_beside_meta_not_on_it(self) -> None:
+        raw = {
+            "_ldMeta": {"enabled": True, "variationKey": "v1", "version": 1},
+            "model": {"name": "claude-3-5"},
+            "provider": {"name": "Anthropic"},
+            "instructions": "You are helpful.",
+        }
+        stub = _make_stub_client()
+        stub.variation = AsyncMock(return_value=raw)
+        with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+            await init_client(client=stub)
+        ctx = {"kind": "user", "key": "user-1"}
+        with patch(
+            "launchdarkly_ai_server.utils.to_ld_context",
+            side_effect=lambda _c, ctx: ctx,
+        ):
+            extracted = await lifecycle_module.extract_variation("my-flag", ctx)
+
+        assert extracted["value"] == raw
+        assert raw not in extracted["meta"].values()
+        assert "instructions" not in json.dumps(extracted["meta"])
 
     async def test_returns_enabled_false_and_null_config_when_disabled(self) -> None:
         stub = _make_stub_client()
@@ -1043,7 +1220,7 @@ class TestInspectConfig:
 
 
 class TestExtractVariationMissingEnabled:
-    # Spec §3.10: only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
+    # Only ``_ldMeta.enabled: true`` is enabled, as in JS and Go.
     @pytest.mark.parametrize("ld_meta", [None, {}], ids=["no_ldMeta", "empty_ldMeta"])
     async def test_raises_when_enabled_is_missing(
         self, ld_meta: dict[str, Any] | None

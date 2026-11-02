@@ -46,7 +46,9 @@ def model_name(config: AiConfigRep) -> str:
 # ─── Span starts ─────────────────────────────────────────────────────────────
 
 
-def start_root_span(config: AiConfigRep, variables: dict[str, Any]) -> Any:
+def start_root_span(
+    config: AiConfigRep, variables: dict[str, Any], *, capture_content: bool = False
+) -> Any:
     """Opens the ``invoke_agent`` root and returns it, or ``None`` when OTel is absent.
 
     The root is the only span carrying ``launchdarkly.*`` and the ``feature_flag`` event, so it is
@@ -57,7 +59,7 @@ def start_root_span(config: AiConfigRep, variables: dict[str, Any]) -> Any:
     span = trace.get_tracer(TRACER_NAME).start_span("invoke_agent")
     span.set_attribute("gen_ai.operation.name", "invoke_agent")
     set_model_identity_attributes(span, PROVIDER, model_name(config))
-    set_ld_span_attributes(span, variables)
+    set_ld_span_attributes(span, variables, capture_content=capture_content)
     return span
 
 

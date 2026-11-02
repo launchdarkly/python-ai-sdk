@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
 from typing import Any
 
 from .agui import StableProjector, judge_completed_stream
 from .conversation import bind_conversation_id
+from .judge_scoring import judge_text
 from .judges import _build_judge_tasks, run_judges
 from .lifecycle import extract_variation
 from .registry import resolve_handlers, resolve_tools
@@ -52,7 +52,7 @@ class ConfigInstance:
         self,
         key: str,
         handler: ProviderHandler | list[ProviderHandler] | None,
-        tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
         registry: Any,  # Registry | None
         skip_judges: bool = False,
     ) -> None:
@@ -109,6 +109,7 @@ class ConfigInstance:
             tool_handlers=resolved_tools,
             variables=variables,
             history=history,
+            evaluated_value=variation.get("value"),
         )
 
         raw_response = result["response"]
@@ -120,11 +121,8 @@ class ConfigInstance:
             config.get("outputFormat") if isinstance(config, dict) else None,
         )
 
-        llm_str = (
-            parsed_response
-            if isinstance(parsed_response, str)
-            else json.dumps(parsed_response)
-        )
+        # The same text an offline judge reads, so a rubric sees one spelling.
+        llm_str = judge_text(parsed_response)
 
         usage_obj = to_usage_dict(usage)
 
@@ -243,6 +241,7 @@ class ConfigInstance:
                 tool_handlers=resolved_tools,
                 variables=variables,
                 history=history,
+                evaluated_value=variation.get("value"),
             )
         ) as source:
             async for event in source:
@@ -307,7 +306,7 @@ def config(
     *,
     key: str,
     handler: ProviderHandler | list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     skip_judges: bool = False,
 ) -> ConfigInstance:
@@ -336,7 +335,7 @@ def _config(
     *,
     key: str,
     handler: ProviderHandler | list[ProviderHandler] | None = None,
-    tool_handlers: dict[str, Callable[..., Any] | NativeTool] | None = None,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
     registry: Any = None,
     skip_judges: bool = False,
 ) -> ConfigInstance:

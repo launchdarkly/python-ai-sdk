@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from types import SimpleNamespace
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypedDict
 
 import ai
 from ai.types.tools import ToolSpec
@@ -13,6 +13,9 @@ from opentelemetry.trace import StatusCode
 from launchdarkly_ai_server import (
     GraphDefinition,
     GraphNode,
+    LDContext,
+    NativeGraphRunner,
+    NativeTool,
     get_client,
     make_track_data,
     report_usage,
@@ -80,10 +83,22 @@ def _track(
     client.track(name, to_ld_context(client, context), data, value)
 
 
+class VercelNativeGraphOptions(TypedDict, total=False):
+    """Options for :func:`to_vercel_agents`."""
+
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool]
+    context: LDContext
+    """LaunchDarkly context used for tracking events. Required for LD telemetry."""
+    model: ModelSource
+    """A model, or a factory building one from a node's config."""
+    model_factory: ModelSource
+    """Read when ``model`` is absent."""
+
+
 def to_vercel_agents(
-    definition_promise: Any,
-    opts: dict[str, Any] | None = None,
-) -> Any:
+    definition_promise: Awaitable[GraphDefinition],
+    opts: VercelNativeGraphOptions | None = None,
+) -> NativeGraphRunner:
     report_usage("vercel-agents.toVercelAgents", PACKAGE_NAME, __version__)
     options = opts or {}
 
@@ -273,4 +288,10 @@ def to_vercel_agents(
         finally:
             span.end()
 
-    return SimpleNamespace(invoke=invoke)
+    # A class, not a SimpleNamespace, so mypy checks invoke against NativeGraphRunner.
+    _invoke = invoke
+
+    class _Runner:
+        invoke = staticmethod(_invoke)
+
+    return _Runner()

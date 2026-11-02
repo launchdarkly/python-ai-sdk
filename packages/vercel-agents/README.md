@@ -6,7 +6,7 @@ runtime for Python.
 ## Install
 
 ```bash
-pip install launchdarkly-ai-server launchdarkly-server-sdk launchdarkly-ai-vercel-agents
+pip install "launchdarkly-ai-server[ld]" launchdarkly-ai-vercel-agents
 ```
 
 Default routing is AI Gateway via a mapped `creator/model` id (for example,

@@ -2,11 +2,14 @@
 Agent Skills — keep skills on disk in sync as delivery changes.
 
 ``write_skills`` is a one-shot reconcile of what the store holds now.
-``watch_skills`` re-runs it whenever the store reports a change. With ``"*"``,
-a skill revoked in LaunchDarkly is removed from disk within a debounce interval
-rather than at the next restart. An explicit list is fixed: a skill the store
-answers ``absent`` for keeps its files and reports an error, and a config change
-that unpins a skill or moves it to a new version is not seen.
+``watch_skills`` re-runs it whenever the store reports a change and, for a
+``SkillSource``, whenever one of its AI Configs changes. With ``"*"``, a skill
+revoked in LaunchDarkly is removed from disk once changes have been quiet for a
+debounce interval, rather than at the next restart. With ``config_skills(key,
+context)``, a config moving a skill to a new version replaces the file, and a
+skill it stops referencing is pruned. An explicit list is fixed: a skill the
+store answers ``absent`` for keeps its files and reports an error, and a config
+change that unpins a skill or moves it to a new version is not seen.
 
 ``on_unavailable="keep"`` remains the default, so an outage never deletes the
 application's skill files.
@@ -22,16 +25,19 @@ import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from .lifecycle import get_client
+from .sdk_usage import report_usage
 from .skills_core import SKILL_OBJECT_KIND, get_store
-from .skills_fs import OnUnavailable, write_skills
-from .types import ReconcileReport, Skill, SkillReference
+from .skills_fs import OnUnavailable, _write_skills
+from .types import ReconcileReport, Skill, SkillReference, SkillSource
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DEBOUNCE_SECONDS = 0.5
 """
-Default debounce, in seconds: how long to wait after a change before
-reconciling, so a payload of many skills triggers one reconcile, not one each.
+Default debounce, in seconds: how long delivery must stay quiet after a change
+before reconciling, so a payload of many skills triggers one reconcile, not one
+each.
 """
 
 
@@ -47,7 +53,7 @@ class SkillWatcher:
 
     def __init__(
         self,
-        request: Sequence[Skill | SkillReference | str] | str,
+        request: Sequence[Skill | SkillReference | str] | str | SkillSource,
         root: str | os.PathLike[str],
         store: Any,
         *,
@@ -81,6 +87,16 @@ class SkillWatcher:
         store.add_listener(SKILL_OBJECT_KIND, self.notify)
         self._registered = True
 
+        # Set by ``_follow_configs``; detached by ``close``.
+        self._config_keys: frozenset[str] = frozenset()
+        self._flag_tracker: Any = None
+
+    def _follow_configs(self, flag_tracker: Any, config_keys: Sequence[str]) -> None:
+        """Subscribes to the base client's flag changes, filtered to *config_keys*."""
+        self._config_keys = frozenset(config_keys)
+        flag_tracker.add_listener(self._on_flag_change)
+        self._flag_tracker = flag_tracker
+
     def _start(self) -> None:
         """Starts the worker. Called once by ``watch_skills`` after the initial reconcile."""
         self._thread.start()
@@ -89,12 +105,26 @@ class SkillWatcher:
 
     def notify(self, _raw: Any = None) -> None:
         """
-        The store's change listener. Records that something changed; runs nothing.
+        Schedules a reconcile, through the same debounce as a delivery change.
 
-        Called on the delivery thread, so it must not block on filesystem work.
-        The argument is ignored: any change triggers a full reconcile.
+        Also the store's change listener. Call it yourself from your own
+        change listener when the watched ``SkillSource`` has no
+        ``config_keys``, or when the client cannot report config changes. Runs
+        nothing itself, so it is safe to call from any thread. The argument is
+        ignored: any change triggers a full reconcile.
         """
         self._wake.set()
+
+    def _on_flag_change(self, change: Any) -> None:
+        """
+        The base client's flag-change listener.
+
+        Only signals. The base SDK calls it on the thread applying flag data,
+        while holding the store lock every evaluation takes, so reading the
+        source here would stall flag delivery and every ``variation`` call.
+        """
+        if getattr(change, "key", None) in self._config_keys:
+            self._wake.set()
 
     # -- the worker --------------------------------------------------------
 
@@ -104,17 +134,24 @@ class SkillWatcher:
                 continue
             if self._stop.is_set():
                 return
-            # Clear before the debounce so a change arriving mid-debounce
-            # triggers another pass instead of being swallowed by this one.
-            self._wake.clear()
-            if self._stop.wait(self._debounce):
-                return
+            # A trailing debounce: wait until a whole window passes with no new
+            # change, so a burst spread across the window reconciles once. The
+            # reconcile reads the store after the last window, so it sees every
+            # change in the burst. Clearing before each window, not after the
+            # reconcile, means a change arriving during the reconcile itself
+            # still schedules one more pass instead of being swallowed by it.
+            while True:
+                self._wake.clear()
+                if self._stop.wait(self._debounce):
+                    return
+                if not self._wake.is_set():
+                    break
             self._reconcile_once()
 
     def _reconcile_once(self) -> None:
         try:
             report = asyncio.run(
-                write_skills(
+                _write_skills(
                     self._request,
                     self._root,
                     prune=self._prune,
@@ -174,9 +211,13 @@ class SkillWatcher:
             if not self._registered:
                 return
             self._registered = False
+            flag_tracker, self._flag_tracker = self._flag_tracker, None
         remove_listener = getattr(self._store, "remove_listener", None)
         if callable(remove_listener):
             remove_listener(SKILL_OBJECT_KIND, self.notify)
+        remove_flag_listener = getattr(flag_tracker, "remove_listener", None)
+        if callable(remove_flag_listener):
+            remove_flag_listener(self._on_flag_change)
 
     def __enter__(self) -> SkillWatcher:
         return self
@@ -186,7 +227,7 @@ class SkillWatcher:
 
 
 async def watch_skills(
-    skills: Sequence[Skill | SkillReference | str] | str,
+    skills: Sequence[Skill | SkillReference | str] | str | SkillSource,
     root: str | os.PathLike[str],
     *,
     prune: bool = True,
@@ -204,9 +245,32 @@ async def watch_skills(
     ``remove_listener``, a closed watcher stays registered with the store for
     the store's lifetime.
 
+    What reaches disk depends on the form of *skills*:
+
+    - ``"*"`` follows the whole library: a deleted skill is pruned and a new
+      version is written.
+    - A fixed list never re-reads a config. A version it pins that leaves the
+      store stays on disk, reported ``error``, and the newer one is never
+      written.
+    - A ``SkillSource``, such as ``config_skills(key, context)``, is read again
+      on every reconcile, and the watcher also reconciles when one of its
+      ``config_keys`` changes in the base client. A version bump replaces the
+      file, and a skill the config stops referencing is pruned on the next
+      reconcile whose retrieval is available. A skill the store answers
+      ``absent`` for beside it keeps its own file and does not hold that prune;
+      a store that raises, has no initial data, or runs out of time does.
+
+    Following config changes needs the initialized base LaunchDarkly client's
+    ``flag_tracker``; it is never read for a fixed list or ``"*"``. Under daemon
+    mode (``use_ldd`` or ``ldclient.datasystem.daemon``) the base client has no
+    data source, so its ``flag_tracker`` never fires: the watcher follows
+    skill-store changes only. Call ``watcher.notify()`` yourself if you can
+    detect config changes another way.
+
     Args:
-        debounce: Seconds to wait after a change before reconciling. Must be a
-            non-negative finite number.
+        debounce: Seconds delivery must stay quiet after a change before
+            reconciling; each further change restarts the wait, so a burst
+            reconciles once. Must be a non-negative finite number.
         on_reconcile: Called with each re-reconcile's report (not the initial
             one). Exceptions it raises are logged and do not stop the watcher.
 
@@ -222,13 +286,17 @@ async def watch_skills(
     Raises:
         RuntimeError: If no store is configured, or the store has no
             ``add_listener`` (use ``write_skills`` for a one-shot reconcile).
+            For a ``SkillSource`` with ``config_keys``, also if no AI client is
+            initialized, the client has no ``flag_tracker``, or the client is
+            offline: such a watcher would never hear about a config change.
         ValueError: If *debounce* is negative, ``NaN``, or infinite.
     """
+    report_usage("client.watchSkills")
     store = get_store()
     if store is None:
         raise RuntimeError(
             "watch_skills needs a configured skill store. Configure one with "
-            "set_skill_store(store) from launchdarkly_ai_server.experimental.skills."
+            "set_skill_store(store) from launchdarkly_ai_server."
         )
     add_listener = getattr(store, "add_listener", None)
     if not callable(add_listener):
@@ -236,7 +304,7 @@ async def watch_skills(
             "watch_skills needs a skill store that implements add_listener(kind, "
             "fn); the configured store does not, so delivery changes cannot be "
             "observed. Use write_skills for a one-shot reconcile, or configure a "
-            "store with a delivery transport (FDv2SkillStore)."
+            "store with a delivery transport (LaunchDarklySkillStore)."
         )
     # A bare ``< 0`` check misses both non-finite values: ``Event.wait(nan)``
     # returns immediately (no debouncing) and ``Event.wait(inf)`` never returns.
@@ -259,8 +327,12 @@ async def watch_skills(
         on_reconcile=on_reconcile,
     )
     try:
+        # Subscribed before the initial reconcile, like the store listener, so
+        # a config change landing during it is followed by one more.
+        if isinstance(skills, SkillSource) and skills.config_keys:
+            watcher._follow_configs(_config_flag_tracker(), skills.config_keys)
         # Run on the caller's task, so a bad root raises to the caller.
-        report = await write_skills(
+        report = await _write_skills(
             skills, root, prune=prune, timeout=timeout, on_unavailable=on_unavailable
         )
     except BaseException:
@@ -271,3 +343,48 @@ async def watch_skills(
     # Any change seen during the initial reconcile is already pending.
     watcher._start()
     return report, watcher
+
+
+_NO_CONFIG_SIGNAL_REMEDY = (
+    "Initialize the AI client with a base LaunchDarkly client "
+    "(init_client() with an SDK key, or init_client(client=LDClient(...))), or "
+    "build the SkillSource with config_keys=() and call watcher.notify() from "
+    "your own change listener."
+)
+
+
+def _config_flag_tracker() -> Any:
+    """
+    The base client's ``flag_tracker``, or raises naming the remedy.
+
+    A watcher that never hears about config changes looks exactly like one
+    whose config never changed, so a missing signal is an error, not a no-op.
+    """
+    try:
+        client = get_client()
+    except RuntimeError:
+        raise RuntimeError(
+            "watch_skills cannot follow config changes for this SkillSource: no "
+            "AI client is initialized. " + _NO_CONFIG_SIGNAL_REMEDY
+        ) from None
+    flag_tracker = getattr(client, "flag_tracker", None)
+    if not callable(getattr(flag_tracker, "add_listener", None)):
+        raise RuntimeError(
+            "watch_skills cannot follow config changes for this SkillSource: "
+            "the AI client has no flag_tracker.add_listener, so it cannot report "
+            "flag changes. " + _NO_CONFIG_SIGNAL_REMEDY
+        )
+    # An offline client still has a flag_tracker, but no data source to fire it.
+    # One that raises is treated as offline, so the caller still gets the remedy.
+    is_offline = getattr(client, "is_offline", None)
+    try:
+        offline = callable(is_offline) and is_offline() is True
+    except Exception:
+        offline = True
+    if offline:
+        raise RuntimeError(
+            "watch_skills cannot follow config changes for this SkillSource: "
+            "the AI client is offline, so it never reports flag changes. "
+            + _NO_CONFIG_SIGNAL_REMEDY
+        )
+    return flag_tracker

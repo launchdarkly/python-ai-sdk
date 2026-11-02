@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     RunUsage,
     SpanMessage,
@@ -21,6 +22,7 @@ from launchdarkly_ai_server import (
     end_unfinished_spans,
     image_block_to_url,
     is_content_blocks,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -69,7 +71,7 @@ from .spans import (
 #: so ``reasoning`` is forwarded with its ``effort`` and ``summary`` (see :func:`_rebuild_reasoning`)
 #: and no top-level ``reasoning_effort`` is read.
 #:
-#: This is the cross-SDK list for OpenAI Messages (TESTING.md section 1.12). The same list serves
+#: This is the cross-SDK list for OpenAI Messages. The same list serves
 #: ``invoke`` and ``stream`` (both read :func:`_forwarded_parameters`), so one config behaves the
 #: same whichever is called. ``max_tool_calls`` is marked not supported in TypeScript there: the JS
 #: ``openai`` SDK's ``responses.create`` has no such parameter, while this SDK's ``create`` and
@@ -214,7 +216,9 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     )
 
 
-def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_tools(
+    config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded on the span is the catalog actually sent.
@@ -227,6 +231,8 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
             "strict": False,
         }
         for name, tool in config_tools.items()
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
     ]
 
 
@@ -386,11 +392,13 @@ def create_openai_messages_handler(
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. Conversation content is PII, so a run emits only metadata, meaning
-    models, token counts, timings and tool names, until capture is turned on.
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
+    meaning models, token counts, timings and tool names.
     """
-    report_usage("openai-messages.createOpenAIHandler", PACKAGE_NAME, __version__)
+    report_usage(
+        "openai-messages.createOpenAIMessagesHandler", PACKAGE_NAME, __version__
+    )
     return _create_openai_messages_handler(capture_content=capture_content)
 
 
@@ -407,7 +415,7 @@ def _create_openai_messages_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -416,7 +424,7 @@ def _create_openai_messages_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` can tell an open root from a
         # closed one without asking the span. A mock span answers `is_recording()` truthily, and
@@ -431,7 +439,7 @@ def _create_openai_messages_handler(
         run_usage = create_run_usage()
 
         try:
-            tools = _build_tools(config.get("tools") or {})
+            tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
             input_messages = _build_input_messages(config, user_input, vs, history)
             tool_definitions = to_tool_definitions(tools)
 
@@ -578,7 +586,7 @@ def _create_openai_messages_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -612,7 +620,7 @@ async def _stream_gen(
     client: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
@@ -626,7 +634,7 @@ async def _stream_gen(
     the root span is never ended, so it is never exported, and the whole run disappears from AI
     Config Monitoring along with the ``feature_flag`` event it carries.
     """
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     ended: set[int] = set()
@@ -645,7 +653,7 @@ async def _stream_gen(
     cancelled = False
     emitter = TurnEmitter(capture_content=capture_content)
     try:
-        tools = _build_tools(config.get("tools") or {})
+        tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
         input_messages = _build_input_messages(config, user_input, variables, history)
         tool_definitions = to_tool_definitions(tools)
 

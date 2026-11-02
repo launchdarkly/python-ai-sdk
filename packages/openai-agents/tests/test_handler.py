@@ -1,7 +1,7 @@
 """
 Tests for launchdarkly-ai-openai-agents handler.
 
-TELEMETRY-CONTRACT.md sections 1-9 for the span tree, and TESTING.md §1 for the generic handler
+TELEMETRY-CONTRACT.md sections 1-9 for the span tree, and the generic handler
 behaviours. Rewritten from the pre-span-work version: this handler drives the ``agents`` SDK's own
 ``Runner``, which owns the per-turn loop, so a test drives spans by calling the ``RunHooks``
 callbacks (``on_llm_start`` / ``on_llm_end`` / ``on_tool_start`` / ``on_tool_end``) the way the real
@@ -23,10 +23,10 @@ import launchdarkly_ai_openai_agents.spans as spans_mod
 from launchdarkly_ai_openai_agents.handler import (
     _build_agent_and_prompt,
     _build_agent_tools,
-    create_openai_agent_handler,
+    create_openai_agents_handler,
     openai_agents,
 )
-from launchdarkly_ai_openai_agents.utils import build_output_type
+from launchdarkly_ai_openai_agents.utils import _build_output_type
 from tests.forwarding_spec import (
     OPENAI_AGENTS,
     candidate_keys,
@@ -356,29 +356,29 @@ def _recording() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# §1.1 Factory
+# Factory
 # ---------------------------------------------------------------------------
 
 
 class TestFactory:
     def test_returns_callable(self) -> None:
-        assert callable(create_openai_agent_handler())
+        assert callable(create_openai_agents_handler())
 
     def test_attaches_provides_for(self) -> None:
-        h = create_openai_agent_handler()
+        h = create_openai_agents_handler()
         assert h.provides_for == ("OpenAI", "agent")
 
     def test_multiple_calls_return_independent_instances(self) -> None:
-        assert create_openai_agent_handler() is not create_openai_agent_handler()
+        assert create_openai_agents_handler() is not create_openai_agents_handler()
 
     def test_provides_for_values_are_correct(self) -> None:
-        h = create_openai_agent_handler()
+        h = create_openai_agents_handler()
         pf = h.provides_for
         assert "OpenAI" in pf or "openai" in str(pf).lower()
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Prompt construction
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
@@ -524,7 +524,7 @@ class TestPromptConstruction:
 
 
 # ---------------------------------------------------------------------------
-# §1.3 / §1.4 Tool conversion and execution
+# Tool conversion and execution
 # ---------------------------------------------------------------------------
 
 
@@ -565,7 +565,7 @@ class TestToolConversion:
             "importlib.import_module",
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
-            h = create_openai_agent_handler()
+            h = create_openai_agents_handler()
             await h(_make_config(), "hi")
 
         if captured:
@@ -619,7 +619,7 @@ class TestToolConversion:
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Tool execution loop (pre-span-era; restored, not telemetry)
+# Tool execution loop (pre-span-era; restored, not telemetry)
 # ---------------------------------------------------------------------------
 
 
@@ -653,7 +653,7 @@ class TestToolExecutionLoop:
             "importlib.import_module",
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
-            h = create_openai_agent_handler()
+            h = create_openai_agents_handler()
             await h(_make_config(), "hi")
 
         assert len(tool_calls) == 0
@@ -671,7 +671,7 @@ class TestSpanTree:
             run=_make_run([{"output": _text_output("hi")}])
         )
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         assert rec.root.name == "invoke_agent"
         assert rec.root.attributes["gen_ai.operation.name"] == "invoke_agent"
 
@@ -681,7 +681,7 @@ class TestSpanTree:
             run=_make_run([{"output": _text_output("hi")}])
         )
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         chats = rec.named("chat ")
         assert len(chats) == 1
         assert chats[0].name == "chat gpt-4o"
@@ -699,7 +699,7 @@ class TestSpanTree:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         assert len(rec.named("chat ")) == 2
@@ -715,7 +715,7 @@ class TestSpanTree:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         tools = rec.named("execute_tool ")
@@ -736,7 +736,7 @@ class TestSpanTree:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         assert rec.named("execute_tool ")[0].context == ("context-of", rec.root)
@@ -752,7 +752,7 @@ class TestSpanTree:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
@@ -769,12 +769,14 @@ class TestSpanTree:
         agents_mod = _fake_agents_module(run=_make_run(turns))
         vs = {"__ld": {"configKey": "c", "variationKey": "v", "runId": "r"}}
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, vs
             )
         for span in rec.spans[1:]:
             assert [k for k in span.attributes if k.startswith("launchdarkly.")] == []
-        assert [n for n, _ in rec.root.events] == ["feature_flag"]
+        assert [
+            name for name, _ in rec.root.events if not name.startswith("gen_ai.content")
+        ] == ["feature_flag"]
         assert all(
             "feature_flag" not in [n for n, _ in s.events] for s in rec.spans[1:]
         )
@@ -792,7 +794,7 @@ class TestRootSpanAttributes:
             run=_make_run([{"output": _text_output("hi")}])
         )
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         attrs = rec.root.attributes
         assert attrs["gen_ai.system"] == "openai"
         assert attrs["gen_ai.provider.name"] == "openai"
@@ -807,7 +809,7 @@ class TestRootSpanAttributes:
             run=_make_run([{"output": _text_output("hi")}])
         )
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         assert rec.root.attributes["gen_ai.response.model"] == "gpt-4o"
 
     async def test_run_totals_on_the_root(self) -> None:
@@ -817,11 +819,31 @@ class TestRootSpanAttributes:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         attrs = rec.root.attributes
         assert attrs["gen_ai.usage.input_tokens"] == 10
         assert attrs["gen_ai.usage.output_tokens"] == 5
         assert attrs["gen_ai.usage.total_tokens"] == 15
+
+    async def test_capture_on_writes_the_raw_variation_as_the_result_value(
+        self,
+    ) -> None:
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(
+            run=_make_run([{"output": _text_output("hi")}])
+        )
+        raw = {"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}}
+        vs = {
+            "__ld": {"configKey": "my-config", "variationKey": "v1", "runId": "r"},
+            "__ldValue": raw,
+        }
+        with ctx, _patched_agents(agents_mod):
+            await create_openai_agents_handler(capture_content=True)(
+                CONFIG, "q", {}, vs
+            )
+        (name, attrs), *_ = rec.root.events
+        assert name == "feature_flag"
+        assert attrs["feature_flag.result.value"] == json.dumps(raw)
 
     async def test_feature_flag_event_on_root_only(self) -> None:
         ctx, rec = _recording()
@@ -834,16 +856,22 @@ class TestRootSpanAttributes:
                 "variationKey": "v1",
                 "runId": "run-abc",
                 "environmentId": "env-1",
-            }
+            },
+            "__ldValue": {"model": {"name": "m"}, "_ldMeta": {"variationKey": "v1"}},
         }
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, vs)
-        assert rec.root.events == [
+            await create_openai_agents_handler(capture_content=False)(
+                CONFIG, "q", {}, vs
+            )
+        assert [event for event in rec.root.events if event[0] == "feature_flag"] == [
             (
                 "feature_flag",
                 {
                     "feature_flag.key": "my-config",
                     "feature_flag.provider.name": "LaunchDarkly",
+                    "feature_flag.result.variant": "v1",
+                    # Content capture is off, so the key stands in for the variation.
+                    "feature_flag.result.value": '"v1"',
                     "feature_flag.set.id": "env-1",
                 },
             )
@@ -865,7 +893,7 @@ class TestChatSpanAttributes:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         chat = rec.named("chat ")[0]
         assert chat.attributes["gen_ai.usage.input_tokens"] == 50
         assert chat.attributes["gen_ai.usage.output_tokens"] == 5
@@ -880,7 +908,7 @@ class TestChatSpanAttributes:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         chat = rec.named("chat ")[0]
         assert chat.attributes["gen_ai.usage.total_tokens"] == 15
 
@@ -897,7 +925,7 @@ class TestChatSpanAttributes:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         chats = rec.named("chat ")
@@ -909,7 +937,7 @@ class TestChatSpanAttributes:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         chat = rec.named("chat ")[0]
         assert "gen_ai.response.finish_reasons" not in chat.attributes
 
@@ -923,7 +951,7 @@ class TestChatSpanAttributes:
             _patched_agents(agents_mod),
             pytest.raises(RuntimeError, match="model down"),
         ):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         chat = rec.named("chat ")[0]
         assert chat.exceptions == [err]
         from opentelemetry.trace import StatusCode
@@ -949,7 +977,7 @@ class TestChatSpanAttributes:
             _patched_agents(agents_mod),
             pytest.raises(RuntimeError, match="second turn failed"),
         ):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 10
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 5
         from opentelemetry.trace import StatusCode
@@ -975,7 +1003,7 @@ class TestToolSpanAttributes:
             _patched_agents(agents_mod),
             pytest.raises(RuntimeError, match="run boom"),
         ):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         tool_span = rec.named("execute_tool ")[0]
@@ -991,13 +1019,28 @@ class TestToolSpanAttributes:
 
 
 class TestContentCapture:
-    async def test_emits_no_content_at_all_by_default(self) -> None:
+    async def test_emits_content_by_default(self) -> None:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(
             run=_make_run([{"output": _text_output("answer")}])
         )
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "my question", {}, {})
+            await create_openai_agents_handler()(CONFIG, "my question", {}, {})
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_content_is_false(self) -> None:
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(
+            run=_make_run([{"output": _text_output("answer")}])
+        )
+        with ctx, _patched_agents(agents_mod):
+            await create_openai_agents_handler(capture_content=False)(
+                CONFIG, "my question", {}, {}
+            )
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
             assert [
@@ -1013,7 +1056,7 @@ class TestContentCapture:
             run=_make_run([{"output": _text_output("answer")}])
         )
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler(capture_content=True)(
+            await create_openai_agents_handler(capture_content=True)(
                 CONFIG, "my question", {}, {}
             )
         assert "gen_ai.input.messages" in rec.root.attributes
@@ -1029,15 +1072,15 @@ class TestContentCapture:
         try:
             # Built before configure, with no capture flag. Vega's startup call
             # has to reach this handler when it later runs.
-            handler = create_openai_agent_handler()
-            configure(options=SDKOptions(capture_content=True))
+            handler = create_openai_agents_handler()
+            configure(options=SDKOptions(capture_content=False))
             ctx, rec = _recording()
             agents_mod = _fake_agents_module(
                 run=_make_run([{"output": _text_output("answer")}])
             )
             with ctx, _patched_agents(agents_mod):
                 await handler(CONFIG, "my question", {}, {})
-            assert "my question" in json.dumps(rec.root.attributes)
+            assert "my question" not in json.dumps(rec.root.attributes)
         finally:
             _reset_for_testing()
 
@@ -1053,7 +1096,7 @@ class TestContentCapture:
                 run=_make_run([{"output": _text_output("answer")}])
             )
             with ctx, _patched_agents(agents_mod):
-                await create_openai_agent_handler(capture_content=False)(
+                await create_openai_agents_handler(capture_content=False)(
                     CONFIG, "my question", {}, {}
                 )
             for span in rec.spans:
@@ -1075,7 +1118,7 @@ class TestContentCapture:
                 run_streamed=_make_run_streamed(turns, "hi")
             )
             with ctx, _patched_agents(agents_mod):
-                async for _ in await create_openai_agent_handler().stream(
+                async for _ in await create_openai_agents_handler().stream(
                     CONFIG, "stream question", {}, {}
                 ):
                     pass
@@ -1101,7 +1144,7 @@ class TestContentCapture:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler(capture_content=True)(
+            await create_openai_agents_handler(capture_content=True)(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         tool_span = rec.named("execute_tool ")[0]
@@ -1116,7 +1159,7 @@ class TestContentCapture:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler()(
+            await create_openai_agents_handler()(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         from opentelemetry.trace import StatusCode
@@ -1140,7 +1183,7 @@ class TestContentCapture:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler(capture_content=True)(
+            await create_openai_agents_handler(capture_content=True)(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         chat = next(
@@ -1171,7 +1214,7 @@ class TestContentCapture:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            await create_openai_agent_handler(capture_content=True)(
+            await create_openai_agents_handler(capture_content=True)(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
         chat = next(
@@ -1184,7 +1227,7 @@ class TestContentCapture:
 
 
 # ---------------------------------------------------------------------------
-# §1.6 Error handling (top-level, no partial usage)
+# Error handling (top-level, no partial usage)
 # ---------------------------------------------------------------------------
 
 
@@ -1202,7 +1245,7 @@ class TestErrorHandling:
             _patched_agents(agents_mod),
             pytest.raises(RuntimeError, match="provider error"),
         ):
-            await create_openai_agent_handler()(CONFIG, "hi", {}, {})
+            await create_openai_agents_handler()(CONFIG, "hi", {}, {})
         assert rec.root.exceptions == [err]
         from opentelemetry.trace import StatusCode
 
@@ -1223,7 +1266,7 @@ class TestErrorHandling:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=run)
         with ctx, _patched_agents(agents_mod), pytest.raises(RuntimeError):
-            await create_openai_agent_handler()(CONFIG, "hi", {}, {})
+            await create_openai_agents_handler()(CONFIG, "hi", {}, {})
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 100
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 20
 
@@ -1248,7 +1291,7 @@ class TestCancellationEndsEverySpan:
         agents_mod = _fake_agents_module(run=never_returns)
         with ctx, _patched_agents(agents_mod):
             task = asyncio.create_task(
-                create_openai_agent_handler()(CONFIG, "q", {}, {})
+                create_openai_agents_handler()(CONFIG, "q", {}, {})
             )
             await asyncio.sleep(0.05)
             task.cancel()
@@ -1274,7 +1317,7 @@ class TestCancellationEndsEverySpan:
         agents_mod = _fake_agents_module(run=never_returns)
         with ctx, _patched_agents(agents_mod):
             task = asyncio.create_task(
-                create_openai_agent_handler()(CONFIG, "q", {}, {})
+                create_openai_agents_handler()(CONFIG, "q", {}, {})
             )
             await asyncio.sleep(0.05)
             task.cancel()
@@ -1287,7 +1330,7 @@ class TestCancellationEndsEverySpan:
 
 
 # ---------------------------------------------------------------------------
-# §1.7 Convenience export
+# Convenience export
 # ---------------------------------------------------------------------------
 
 
@@ -1344,7 +1387,7 @@ class TestConvenienceExport:
 
 class TestStreaming:
     async def test_stream_is_defined(self) -> None:
-        assert hasattr(create_openai_agent_handler(), "stream")
+        assert hasattr(create_openai_agents_handler(), "stream")
 
     async def test_stream_returns_async_generator(self) -> None:
         import inspect
@@ -1368,7 +1411,7 @@ class TestStreaming:
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
             with patch.object(spans_mod, "_HAS_OTEL", False):
-                h = create_openai_agent_handler()
+                h = create_openai_agents_handler()
                 gen = await h.stream(_make_config(), "hi")
                 assert inspect.isasyncgen(gen) or hasattr(gen, "__aiter__")
 
@@ -1392,7 +1435,7 @@ class TestStreaming:
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
             with patch.object(spans_mod, "_HAS_OTEL", False):
-                h = create_openai_agent_handler()
+                h = create_openai_agents_handler()
                 events = [e async for e in await h.stream(_make_config(), "hi")]
 
         done_events = [e for e in events if e.get("type") == "done"]
@@ -1406,7 +1449,7 @@ class TestStreaming:
         with _patched_agents(agents_mod):
             events = [
                 e
-                async for e in await create_openai_agent_handler().stream(
+                async for e in await create_openai_agents_handler().stream(
                     CONFIG, "q", {}, {}
                 )
             ]
@@ -1441,7 +1484,7 @@ class TestStreaming:
             with _patched_agents(agents_mod):
                 return [
                     event
-                    async for event in await create_openai_agent_handler(
+                    async for event in await create_openai_agents_handler(
                         capture_content=capture
                     ).stream(CONFIG, "q", {}, {})
                 ]
@@ -1482,7 +1525,7 @@ class TestStreaming:
         with _patched_agents(agents_mod):
             events = [
                 event
-                async for event in await create_openai_agent_handler(
+                async for event in await create_openai_agents_handler(
                     capture_content=True
                 ).stream(CONFIG, "q", {}, {})
             ]
@@ -1590,7 +1633,7 @@ class TestStreaming:
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
         agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "hi"))
         with ctx, _patched_agents(agents_mod):
-            async for _ in await create_openai_agent_handler().stream(
+            async for _ in await create_openai_agents_handler().stream(
                 CONFIG, "q", {}, {}
             ):
                 pass
@@ -1602,7 +1645,7 @@ class TestStreaming:
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
         agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "hi"))
         with ctx, _patched_agents(agents_mod):
-            async for _ in await create_openai_agent_handler().stream(
+            async for _ in await create_openai_agents_handler().stream(
                 CONFIG, "q", {}, {}
             ):
                 pass
@@ -1622,7 +1665,7 @@ class TestStreaming:
 
         agents_mod = _fake_agents_module(run_streamed=run_streamed)
         with ctx, _patched_agents(agents_mod):
-            gen = await create_openai_agent_handler().stream(CONFIG, "q", {}, {})
+            gen = await create_openai_agents_handler().stream(CONFIG, "q", {}, {})
             async for _ in gen:
                 break
             await gen.aclose()
@@ -1650,7 +1693,7 @@ class TestStreaming:
             _patched_agents(agents_mod),
             pytest.raises(RuntimeError, match="stream died"),
         ):
-            async for _ in await create_openai_agent_handler().stream(
+            async for _ in await create_openai_agents_handler().stream(
                 CONFIG, "q", {}, {}
             ):
                 pass
@@ -1666,7 +1709,7 @@ class TestStreaming:
             _patched_agents(agents_mod),
             pytest.raises(RuntimeError, match="next turn failed"),
         ):
-            async for event in await create_openai_agent_handler().stream(
+            async for event in await create_openai_agents_handler().stream(
                 CONFIG, "q", {}, {}
             ):
                 seen.append(event)
@@ -1676,14 +1719,31 @@ class TestStreaming:
         assert len(ends) == 1
         assert ends[0]["messageId"] == starts[0]["messageId"]
 
-    async def test_emits_no_content_by_default_on_the_streaming_path(self) -> None:
+    async def test_emits_content_by_default_on_the_streaming_path(self) -> None:
         turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "hi"))
         with ctx, _patched_agents(agents_mod):
-            async for _ in await create_openai_agent_handler().stream(
+            async for _ in await create_openai_agents_handler().stream(
                 CONFIG, "q", {}, {}
             ):
+                pass
+        assert any(
+            "gen_ai.input.messages" in span.attributes
+            or any(key.startswith("gen_ai.prompt") for key in span.attributes)
+            for span in rec.spans
+        )
+
+    async def test_emits_no_content_when_capture_is_false_on_the_streaming_path(
+        self,
+    ) -> None:
+        turns = [{"deltas": ["hi"], "output": _text_output("hi")}]
+        ctx, rec = _recording()
+        agents_mod = _fake_agents_module(run_streamed=_make_run_streamed(turns, "hi"))
+        with ctx, _patched_agents(agents_mod):
+            async for _ in await create_openai_agents_handler(
+                capture_content=False
+            ).stream(CONFIG, "q", {}, {}):
                 pass
         for span in rec.spans:
             assert [k for k in span.attributes if k.startswith("gen_ai.prompt")] == []
@@ -1691,7 +1751,7 @@ class TestStreaming:
 
 
 # ---------------------------------------------------------------------------
-# §1.9 Output format (build_output_type)
+# Output format (_build_output_type)
 # ---------------------------------------------------------------------------
 
 
@@ -1710,7 +1770,7 @@ class TestModelParametersForwarding:
             model={"name": "gpt-4o", "parameters": {"top_p": 0.5}},
         )
         with _patched_agents(agents_mod):
-            await create_openai_agent_handler()(config, "q", {}, {})
+            await create_openai_agents_handler()(config, "q", {}, {})
         model_settings = run_kwargs["agent"].kwargs["model_settings"]
         assert model_settings.kwargs["top_p"] == 0.5
 
@@ -1728,7 +1788,7 @@ class TestModelParametersForwarding:
             model={"name": "gpt-4o", "parameters": {"max_turns": 3}},
         )
         with _patched_agents(agents_mod):
-            await create_openai_agent_handler()(config, "q", {}, {})
+            await create_openai_agents_handler()(config, "q", {}, {})
         assert captured["max_turns"] == 3
 
     async def test_max_turns_from_config_reaches_runner_run_streamed(self) -> None:
@@ -1747,7 +1807,7 @@ class TestModelParametersForwarding:
         )
         with _patched_agents(agents_mod):
             events = []
-            gen = await create_openai_agent_handler().stream(config, "q", {}, {})
+            gen = await create_openai_agents_handler().stream(config, "q", {}, {})
             async for event in gen:
                 events.append(event)
         assert captured["max_turns"] == 4
@@ -1766,7 +1826,7 @@ class TestModelParametersForwarding:
             model={"name": "gpt-4o", "parameters": {"max_turns": 3}},
         )
         with _patched_agents(agents_mod):
-            await create_openai_agent_handler()(config, "q", {}, {})
+            await create_openai_agents_handler()(config, "q", {}, {})
         model_settings = run_kwargs["agent"].kwargs.get("model_settings")
         assert model_settings is None or "max_turns" not in model_settings.kwargs
 
@@ -1781,7 +1841,7 @@ class TestModelParametersForwarding:
 
         agents_mod = _fake_agents_module(run=run)
         with _patched_agents(agents_mod):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         assert "model_settings" not in run_kwargs["agent"].kwargs
         assert run_kwargs["kw"].get("max_turns") is None
 
@@ -1808,7 +1868,7 @@ class TestModelParametersForwarding:
             },
         )
         with _patched_agents(agents_mod):
-            await create_openai_agent_handler()(config, "q", {}, {})
+            await create_openai_agents_handler()(config, "q", {}, {})
         model_settings = run_kwargs["agent"].kwargs["model_settings"]
         assert model_settings.kwargs["top_p"] == 0.5
         assert "stop_sequences" not in model_settings.kwargs
@@ -1831,7 +1891,7 @@ class TestModelParametersForwarding:
             },
         )
         with _patched_agents(agents_mod):
-            await create_openai_agent_handler()(config, "q", {}, {})
+            await create_openai_agents_handler()(config, "q", {}, {})
         model_settings = run_kwargs["agent"].kwargs["model_settings"]
         assert model_settings.kwargs["top_p"] == 0.5
         assert "extra_body" not in model_settings.kwargs
@@ -1839,22 +1899,22 @@ class TestModelParametersForwarding:
 
 class TestOutputFormat:
     def test_absent_output_format_no_change(self) -> None:
-        assert build_output_type(None) is None
+        assert _build_output_type(None) is None
 
     def test_output_format_sets_output_type_on_agent(self) -> None:
         schema = {"type": "object", "properties": {"name": {"type": "string"}}}
-        result = build_output_type(schema)
+        result = _build_output_type(schema)
         assert result is not None
         assert result["type"] == "json_schema"
         assert "schema" in result
 
     def test_absent_output_format_returns_plain_string(self) -> None:
-        result = build_output_type({})
+        result = _build_output_type({})
         assert result is None
 
     def test_output_format_returns_parsed_object(self) -> None:
         schema = {"type": "object", "properties": {"count": {"type": "integer"}}}
-        result = build_output_type(schema)
+        result = _build_output_type(schema)
         assert result is not None
         assert result["schema"]["properties"]["count"]["type"] == "integer"
 
@@ -1871,19 +1931,19 @@ class TestOutputFormat:
 
         agents_mod.Runner.run = staticmethod(run)
         with _patched_agents(agents_mod):
-            result = await create_openai_agent_handler()(
+            result = await create_openai_agents_handler()(
                 _make_config(instructions="x", outputFormat={"type": "object"}), "hello"
             )
         assert result["output"] == {"score": 9}
 
 
 # ---------------------------------------------------------------------------
-# §1.2 Path C — None user_input must not produce None prompt
+# None user_input must not produce None prompt
 # ---------------------------------------------------------------------------
 
 
 class TestNoneUserInput:
-    """TESTING.md §1.2 Path C: When user_input is None, the prompt passed to
+    """When user_input is None, the prompt passed to
     Runner.run must be '' (empty string), not None."""
 
     async def test_none_user_input_instructions_path_prompt_is_empty_string(
@@ -1910,7 +1970,7 @@ class TestNoneUserInput:
             side_effect=lambda n: agents_mock if n == "agents" else __import__(n),
         ):
             with patch.object(spans_mod, "_HAS_OTEL", False):
-                h = create_openai_agent_handler()
+                h = create_openai_agents_handler()
                 await h(_make_config(instructions="Be helpful."), None)
 
         assert captured_prompts, "Runner.run was not called"
@@ -2045,7 +2105,7 @@ class TestFailedRunUsage:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=run)
         with ctx, _patched_agents(agents_mod), pytest.raises(_AgentsError):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
 
         # 70 and 12 are the aggregate. 140 and 24 would be the aggregate counted twice.
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 70
@@ -2070,7 +2130,7 @@ class TestFailedRunUsage:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=run)
         with ctx, _patched_agents(agents_mod), pytest.raises(RuntimeError):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
 
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 30
 
@@ -2082,7 +2142,7 @@ class TestFailedRunUsage:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=run)
         with ctx, _patched_agents(agents_mod), pytest.raises(RuntimeError):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
 
         assert "gen_ai.usage.input_tokens" not in rec.root.attributes
 
@@ -2106,7 +2166,7 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "_create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "_create_openai_agents_handler", _factory),
             patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.openai_agents("k", "q", {}, capture_content=True)
@@ -2127,7 +2187,7 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "_create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "_create_openai_agents_handler", _factory),
             patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.openai_agents("k", "q", {})
@@ -2146,7 +2206,7 @@ class TestConvenienceWrapperForwardsCaptureContent:
         fake_config = MagicMock()
         fake_config.return_value.invoke = MagicMock(return_value="ok")
         with (
-            patch.object(handler_mod, "_create_openai_agent_handler", _factory),
+            patch.object(handler_mod, "_create_openai_agents_handler", _factory),
             patch.object(handler_mod, "_config", fake_config),
         ):
             handler_mod.openai_agents("k", "q", {}, capture_content=False)
@@ -2172,7 +2232,7 @@ class TestUsageIsNotCoupledToSpans:
         ]
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with patch.object(spans_mod, "_HAS_OTEL", False), _patched_agents(agents_mod):
-            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            result = await create_openai_agents_handler()(CONFIG, "q", {}, {})
         assert result["usage"] == {"input_tokens": 17, "output_tokens": 7}
 
     async def test_the_usage_bag_agrees_with_the_root_span_when_telemetry_is_on(
@@ -2186,7 +2246,7 @@ class TestUsageIsNotCoupledToSpans:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            result = await create_openai_agents_handler()(CONFIG, "q", {}, {})
         assert result["usage"]["input_tokens"] == 17
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 17
 
@@ -2219,7 +2279,7 @@ class TestAFailedRunDoesNotClaimItCostNothing:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_raising_run)
         with ctx, _patched_agents(agents_mod), pytest.raises(_Boom):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
 
         attrs = rec.root.attributes
         assert "gen_ai.usage.input_tokens" not in attrs
@@ -2246,7 +2306,7 @@ class TestAFailedRunDoesNotClaimItCostNothing:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_raising_run)
         with ctx, _patched_agents(agents_mod), pytest.raises(_Boom):
-            await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            await create_openai_agents_handler()(CONFIG, "q", {}, {})
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 12
 
 
@@ -2276,7 +2336,7 @@ class TestCancellationDoesNotDependOnTelemetry:
 
         agents_mod = _fake_agents_module(run_streamed=run_streamed)
         with patch.object(spans_mod, "_HAS_OTEL", False), _patched_agents(agents_mod):
-            gen = await create_openai_agent_handler().stream(CONFIG, "q", {}, {})
+            gen = await create_openai_agents_handler().stream(CONFIG, "q", {}, {})
             async for _ in gen:
                 break
             await gen.aclose()
@@ -2295,7 +2355,7 @@ class TestCancellationDoesNotDependOnTelemetry:
 
         agents_mod = _fake_agents_module(run_streamed=run_streamed)
         with _patched_agents(agents_mod):
-            async for _ in await create_openai_agent_handler().stream(
+            async for _ in await create_openai_agents_handler().stream(
                 CONFIG, "q", {}, {}
             ):
                 pass
@@ -2330,7 +2390,9 @@ class TestInputWritesNeverLeakASpan:
             ),
             pytest.raises(TypeError),
         ):
-            await create_openai_agent_handler(capture_content=True)(CONFIG, "q", {}, {})
+            await create_openai_agents_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
 
         assert rec.root.ended == 1, "the root span leaked"
         assert StatusCode.ERROR in rec.root.statuses
@@ -2351,7 +2413,7 @@ class TestInputWritesNeverLeakASpan:
             ),
             pytest.raises(TypeError),
         ):
-            async for _ in await create_openai_agent_handler(
+            async for _ in await create_openai_agents_handler(
                 capture_content=True
             ).stream(CONFIG, "q", {}, {}):
                 pass
@@ -2386,7 +2448,9 @@ class TestChatSpanIsNeverStranded:
             ),
             pytest.raises(TypeError),
         ):
-            await create_openai_agent_handler(capture_content=True)(CONFIG, "q", {}, {})
+            await create_openai_agents_handler(capture_content=True)(
+                CONFIG, "q", {}, {}
+            )
 
         chat = rec.named("chat ")
         assert len(chat) == 1
@@ -2417,7 +2481,7 @@ class TestUsageComesFromTheRunnersOwnAggregate:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_run_without_hooks)
         with ctx, _patched_agents(agents_mod):
-            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            result = await create_openai_agents_handler()(CONFIG, "q", {}, {})
 
         assert result["usage"] == {"input_tokens": 88, "output_tokens": 21}
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 88
@@ -2441,7 +2505,7 @@ class TestUsageComesFromTheRunnersOwnAggregate:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_run)
         with ctx, _patched_agents(agents_mod):
-            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            result = await create_openai_agents_handler()(CONFIG, "q", {}, {})
 
         assert result["usage"] == {"input_tokens": 10, "output_tokens": 5}
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 10
@@ -2454,7 +2518,7 @@ class TestUsageComesFromTheRunnersOwnAggregate:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod):
-            result = await create_openai_agent_handler()(CONFIG, "q", {}, {})
+            result = await create_openai_agents_handler()(CONFIG, "q", {}, {})
 
         assert result["usage"] == {"input_tokens": 7, "output_tokens": 3}
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 7
@@ -2490,7 +2554,7 @@ class TestToolSpanSurvivesAContentFailure:
         ctx, rec = _recording()
         agents_mod = _fake_agents_module(run=_make_run(turns))
         with ctx, _patched_agents(agents_mod), pytest.raises(TypeError):
-            await create_openai_agent_handler(capture_content=True)(
+            await create_openai_agents_handler(capture_content=True)(
                 CONFIG, "q", {"search": AsyncMock()}, {}
             )
 
@@ -2528,7 +2592,7 @@ class TestCancelledStreamSaysCancelled:
 
         async def _drain() -> None:
             with ctx, _patched_agents(agents_mod):
-                gen = await create_openai_agent_handler().stream(CONFIG, "q", {}, {})
+                gen = await create_openai_agents_handler().stream(CONFIG, "q", {}, {})
                 async for _ in gen:
                     pass
 
@@ -2564,7 +2628,7 @@ class TestNeverForwardedParameters:
             },
         )
         with _patched_agents(agents_mod):
-            await create_openai_agent_handler()(config, "q", {}, {})
+            await create_openai_agents_handler()(config, "q", {}, {})
         model_settings = captured["agent"].kwargs["model_settings"]
         assert model_settings.kwargs == {"temperature": 0.1}
         assert not find_leaks(captured["run_kwargs"])
@@ -2588,7 +2652,7 @@ class TestNeverForwardedParameters:
             },
         )
         with _patched_agents(agents_mod):
-            gen = await create_openai_agent_handler().stream(config, "q", {}, {})
+            gen = await create_openai_agents_handler().stream(config, "q", {}, {})
             async for _event in gen:
                 pass
         model_settings = captured["agent"].kwargs["model_settings"]
@@ -2645,7 +2709,7 @@ class TestForwardsExactlyTheCrossSdkList:
 
         async def call(parameters: dict[str, Any]) -> object:
             with _patched_agents(_fake_agents_module(run=run)):
-                await create_openai_agent_handler()(
+                await create_openai_agents_handler()(
                     self._config(parameters), "q", {}, {}
                 )
             return _settings_and_run(captured)
@@ -2669,7 +2733,7 @@ class TestForwardsExactlyTheCrossSdkList:
 
         async def call(parameters: dict[str, Any]) -> object:
             with _patched_agents(_fake_agents_module(run_streamed=run_streamed)):
-                gen = await create_openai_agent_handler().stream(
+                gen = await create_openai_agents_handler().stream(
                     self._config(parameters), "q", {}, {}
                 )
                 async for _event in gen:

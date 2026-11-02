@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from opentelemetry import trace
@@ -12,6 +12,7 @@ from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 
 from launchdarkly_ai_server import (
     AiConfigRep,
+    NativeTool,
     ProviderHandler,
     _create_handler,
     report_usage,
@@ -98,7 +99,7 @@ def create_typesafe_handler(*, capture_content: bool | None = None) -> ProviderH
     async def _call(
         config: AiConfigRep,
         user_input: str | None = None,
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -115,7 +116,9 @@ def create_typesafe_handler(*, capture_content: bool | None = None) -> ProviderH
         chat = _TRACER.start_span(
             f"chat {span_model}", context=trace.set_span_in_context(root)
         )
-        set_ld_span_attributes(root, dict(variables) if variables else None)
+        set_ld_span_attributes(
+            root, dict(variables) if variables else None, capture_content=capture
+        )
         set_model_identity_attributes(root, "typesafe", span_model)
         set_model_identity_attributes(chat, "typesafe", span_model)
         if capture:

@@ -41,7 +41,7 @@ def _client(response: object) -> MagicMock:
 async def test_provides_for_typesafe_messages() -> None:
     handler = create_typesafe_handler()
     assert handler.provides_for == ("TypeSafe", "messages")
-    assert handler.capture_content is False
+    assert handler.capture_content is True
 
 
 @pytest.mark.asyncio

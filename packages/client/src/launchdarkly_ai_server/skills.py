@@ -16,6 +16,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from . import skills_core
+from .sdk_usage import report_usage
 from .skills_core import (
     SKILL_OBJECT_KIND,
     SkillStore,
@@ -57,7 +58,7 @@ def set_skill_store(store: SkillStore | None) -> None:
     replacement.
 
     Args:
-        store: ``FDv2SkillStore`` to receive skills from LaunchDarkly, or
+        store: ``LaunchDarklySkillStore`` to receive skills from LaunchDarkly, or
             ``InMemorySkillStore`` for local development and tests.
 
     Raises:
@@ -203,7 +204,8 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
     """
     Returns the skill references attached to a resolved AI Config.
 
-    Pure: no network, store, or telemetry. Returns ``[]`` when the config has no
+    Pure apart from the one-time helper usage event (``$ld:ai:sdk:usage``): no
+    network, store, or skills telemetry. Returns ``[]`` when the config has no
     ``skills`` field. Typical use: ``await get_skills(skill_refs(config))``.
 
     The config parser does not validate ``skills``, so a malformed field does
@@ -220,6 +222,15 @@ def skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
             objects with a valid key and an integer version >= 1. This
             includes ``skills: null``.
     """
+    report_usage("client.skillRefs")
+    return _skill_refs(config)
+
+
+def _skill_refs(config: AiConfigRep | None) -> list[SkillReference]:
+    """``skill_refs`` without the usage report, for SDK code that reads a variation's skills
+    on the customer's behalf (the Claude Agents skills handler, and the source ``config_skills``
+    builds): the customer never called ``skill_refs``, so no ``client.skillRefs`` event may be
+    sent for them."""
     if not isinstance(config, dict):
         raise ValueError(
             f"skill_refs was given {type(config).__name__}, not an AI Config. "
@@ -261,6 +272,7 @@ async def get_skill(key: str, *, version: int | None = None) -> Skill | None:
     Raises:
         RuntimeError: If no skill store is configured.
     """
+    report_usage("client.getSkill")
     return resolve_from_store(require_store(), key, version).skill
 
 
@@ -287,6 +299,7 @@ async def get_skill_result(key: str, *, version: int | None = None) -> SkillOutc
     Raises:
         RuntimeError: If no skill store is configured.
     """
+    report_usage("client.getSkillResult")
     resolved = resolve_from_store(require_store(), key, version)
     return SkillOutcome(
         skill=resolved.skill, reason=resolved.reason, detail=resolved.error
@@ -310,6 +323,7 @@ async def get_skills(refs: Sequence[SkillReference | str]) -> list[Skill]:
         TypeError: If *refs* is a single string; pass ``[key]`` instead.
         RuntimeError: If no skill store is configured.
     """
+    report_usage("client.getSkills")
     if isinstance(refs, str):
         # A str type-checks as Sequence[str] but would be iterated per character.
         raise TypeError(
@@ -344,6 +358,7 @@ async def all_skills() -> list[Skill]:
     Raises:
         RuntimeError: If no skill store is configured.
     """
+    report_usage("client.allSkills")
     objects, error = list_raw_objects(require_store())
     if error is not None:
         return []

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 
 from launchdarkly_ai_server import (
     AiConfigRep,
     LDContext,
+    NativeTool,
     ProviderHandler,
     SpanMessage,
     SpanMessagePart,
@@ -18,6 +19,7 @@ from launchdarkly_ai_server import (
     end_span_once,
     end_unfinished_spans,
     is_content_blocks,
+    is_function_tool,
     parse_template,
     report_usage,
     set_input_content_attributes,
@@ -55,7 +57,7 @@ from .spans import (
 #: ``TestMessagesStreamAcceptsExactlyTheseKeys`` in this package's tests assert this
 #: classification stays exhaustive as the SDK's own signatures change.
 #:
-#: This is the cross-SDK list for Claude Messages (TESTING.md section 1.12). A top-level
+#: This is the cross-SDK list for Claude Messages. A top-level
 #: ``effort`` is also accepted and moved into ``output_config.effort`` before this list applies
 #: (see :func:`_rename_effort_to_output_config`), ``output_config`` keeps only its ``effort`` (see
 #: :func:`_rebuild_output_config`), and ``max_tokens`` defaults to 1024. The same list
@@ -75,6 +77,12 @@ _MESSAGES_FORWARDED_KEYS = frozenset(
         "top_p",
     }
 )
+
+#: Forwarded keys that ``anthropic`` 1.0 removed from ``messages.create``/``.stream`` (a ``TypeError``
+#: if passed as keyword arguments). The API still honours them for models that predate the change,
+#: and ``extra_body`` is merged into the request JSON as-is on every ``anthropic`` release, so
+#: :func:`_forwarded_parameters` sends them there rather than branching on the installed version.
+_MESSAGES_SAMPLING_KEYS = frozenset({"temperature", "top_k", "top_p"})
 
 #: Forwarded keys whose value must be an object. A config value of any other type is malformed
 #: and dropped rather than passed to the API.
@@ -168,6 +176,12 @@ _MESSAGES_EXCLUDED_KEYS = frozenset(
         "extra_headers",
         "extra_query",
         "extra_body",
+        # Added after anthropic 0.113: a per-request diagnostics opt-in, a header that picks the
+        # workspace for a credential, and an inference speed (price/latency) mode. None of them
+        # shapes what the model generates.
+        "diagnostics",
+        "speed",
+        "workspace_id",
     }
 )
 
@@ -216,9 +230,10 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     moved into ``output_config``, then only :data:`_MESSAGES_FORWARDED_KEYS`, with malformed
     object values dropped, typed objects rebuilt (see :data:`_TYPED_OBJECT_SHAPES`), and
     ``output_config`` narrowed to ``effort`` (see :func:`_rebuild_output_config`). ``invoke`` and
-    ``stream`` both call this, so they forward the same keys.
+    ``stream`` both call this, so they forward the same keys. The sampling keys
+    (:data:`_MESSAGES_SAMPLING_KEYS`) come back inside ``extra_body``, not as top-level keys.
     """
-    return _rebuild_output_config(
+    params = _rebuild_output_config(
         _rebuild_typed_objects(
             select_forwarded_parameters(
                 _rename_effort_to_output_config(model_parameters(config)),
@@ -227,9 +242,15 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
             )
         )
     )
+    sampling = {k: params.pop(k) for k in _MESSAGES_SAMPLING_KEYS & params.keys()}
+    if sampling:
+        params["extra_body"] = sampling
+    return params
 
 
-def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_tools(
+    config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     return [
         {
             "name": name,
@@ -237,6 +258,8 @@ def _build_tools(config_tools: dict[str, Any]) -> list[dict[str, Any]]:
             "input_schema": tool.get("parameters", {}),
         }
         for name, tool in config_tools.items()
+        # A missing handler still reaches the model; a NativeTool never does.
+        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
     ]
 
 
@@ -361,7 +384,7 @@ async def _run_tool_loop(
     config: AiConfigRep,
     messages: list[dict[str, Any]],
     system: str | None,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     *,
     capture_content: bool = False,
     parent: Any = None,
@@ -379,7 +402,7 @@ async def _run_tool_loop(
     # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
     # difference predates this span work and changes what the model is offered, not what the span
     # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
-    tools = _build_tools(config.get("tools") or {})
+    tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
     extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
@@ -537,9 +560,9 @@ def create_claude_messages_handler(
 
     Set *capture_content* to put prompts, model output, tool arguments and tool results on the
     emitted spans. ``None`` (the default) reads the process-wide default at invocation,
-    which is off until ``configure`` sets it. ``True`` or ``False`` overrides that default
-    for this handler. Conversation content is PII, so a run emits only metadata, meaning
-    models, token counts, timings and tool names, until capture is turned on. Turning this
+    which is on until ``configure`` turns it off. ``True`` or ``False`` overrides that default
+    for this handler. Conversation content is PII. An explicit ``False`` emits only metadata,
+    meaning models, token counts, timings and tool names. Turning this
     on sends the text of every request and response to whatever collector the SDK is pointed at.
     """
     report_usage(
@@ -561,7 +584,7 @@ def _create_claude_messages_handler(
     async def _call_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -570,7 +593,7 @@ def _create_claude_messages_handler(
         th = tool_handlers or {}
         vs = variables or {}
 
-        span = start_root_span(config, vs)
+        span = start_root_span(config, vs, capture_content=capture_content)
         parent = parent_context_of(span)
         # Cleared by whichever path ends the root, so the `finally` can tell an open root from a
         # closed one without asking the span. A mock span answers `is_recording()` truthily, and the
@@ -639,7 +662,7 @@ def _create_claude_messages_handler(
     def _stream_impl(
         config: AiConfigRep,
         user_input: str = "",
-        tool_handlers: dict[str, Any] | None = None,
+        tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None,
         variables: dict[str, Any] | None = None,
         history: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -696,7 +719,7 @@ async def _stream_gen(
     client: Any,
     config: AiConfigRep,
     user_input: str,
-    tool_handlers: dict[str, Any],
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
     variables: dict[str, Any],
     history: list[dict[str, Any]] | None = None,
     *,
@@ -712,14 +735,14 @@ async def _stream_gen(
 
     ``ended`` stops the success, failure and abandonment paths from ending the same span twice.
     """
-    span = start_root_span(config, variables)
+    span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
 
     messages, system = _build_messages(
         config, user_input, variables, include_output_format=False, history=history
     )
 
-    tools = _build_tools(config.get("tools") or {})
+    tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
     tool_definitions = to_tool_definitions(tools)
     extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)

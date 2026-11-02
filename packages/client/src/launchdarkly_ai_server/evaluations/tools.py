@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from .api import (
     EvaluationsError,
     LDApiClient,
     LDApiError,
+    check_string_keys,
     require_mapping,
     segment,
 )
@@ -38,6 +40,9 @@ class EvalTool:
     a library tool, because the provider supplies its schema.
     ``dataclasses.replace`` on a library tool returns an inline tool that
     keeps the library schema.
+
+    The tool holds a deep copy of ``schema``, so changing the caller's dict
+    afterwards changes neither what is validated nor what is sent.
     """
 
     key: str
@@ -47,6 +52,16 @@ class EvalTool:
     source: Literal["library", "inline"] = field(default="inline", init=False)
     version: int | None = field(default=None, init=False)
     project_key: str | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        # A schema that is not a mapping, or cannot be copied, is left as it
+        # is for validate_tools to reject with the tool key.
+        if isinstance(self.schema, Mapping):
+            try:
+                schema = copy.deepcopy(dict(self.schema))
+            except (TypeError, copy.Error):
+                return
+            object.__setattr__(self, "schema", schema)
 
     @classmethod
     def _library(
@@ -76,7 +91,9 @@ class EvalTool:
         if self.source == "inline":
             return {
                 "key": self.key,
-                "schema": self.schema,
+                # A copy, so a handler that changes its config cannot change
+                # the body.
+                "schema": copy.deepcopy(self.schema),
                 "description": self.description,
                 "source": "inline",
             }
@@ -120,7 +137,11 @@ def _validate_inline_tool(tool: EvalTool) -> None:
         )
     try:
         # allow_nan=False rejects NaN and Infinity, which are not valid JSON.
+        # Non-str keys are rejected rather than coerced; json.dumps runs first
+        # so circular references fail there instead of recursing in the key
+        # check.
         json.dumps(dict(tool.schema), allow_nan=False)
+        check_string_keys(tool.schema)
     except (TypeError, ValueError) as error:
         raise EvaluationsError(
             f"Inline tool {key!r} schema must be JSON-serializable: {error}"
@@ -133,7 +154,7 @@ def validate_tools(tools: Sequence[EvalTool], project_key: str) -> None:
     Checks that each library tool has a project and that it matches
     ``project_key``. Issues no requests.
     """
-    keys_by_identity: dict[str, str] = {}
+    tools_by_identity: dict[str, EvalTool] = {}
     for tool in tools:
         if not isinstance(tool, EvalTool):
             raise EvaluationsError(
@@ -161,17 +182,18 @@ def validate_tools(tools: Sequence[EvalTool], project_key: str) -> None:
                 f"cannot run in project {project_key!r}. Read it from "
                 f"{project_key!r} instead."
             )
-        # One key names one tool. Keys are compared case-insensitively.
-        identity = key.strip().lower()
-        collision = keys_by_identity.get(identity)
+        # One key names one tool. Never pick one entry silently: the run record
+        # would then misdescribe where the model's tool came from. casefold,
+        # unlike lower, also matches keys such as "straße" and "strasse".
+        identity = key.strip().casefold()
+        collision = tools_by_identity.get(identity)
         if collision is not None:
-            if collision == key:
-                raise EvaluationsError(f"Tool {key!r} appears more than once in tools.")
             raise EvaluationsError(
-                f"Tool {key!r} collides with {collision!r}. Two tools in one "
-                "run must not have keys that differ only by case."
+                f"Tool {key!r} ({tool.source}) collides with {collision.key!r} "
+                f"({collision.source}). A key may appear once in tools, compared "
+                "without case."
             )
-        keys_by_identity[identity] = key
+        tools_by_identity[identity] = tool
 
 
 def tool_handlers(tools: Sequence[EvalTool]) -> dict[str, ToolImplementation]:
@@ -182,7 +204,11 @@ def tool_handlers(tools: Sequence[EvalTool]) -> dict[str, ToolImplementation]:
 def handler_config_tools(tools: Sequence[EvalTool]) -> dict[str, dict[str, Any]]:
     """Return the ``tools`` entry of a handler config."""
     return {
-        tool.key: {"description": tool.description, "parameters": tool.schema}
+        # A copy, so a handler that changes its config cannot change the body.
+        tool.key: {
+            "description": tool.description,
+            "parameters": copy.deepcopy(tool.schema),
+        }
         for tool in tools
     }
 

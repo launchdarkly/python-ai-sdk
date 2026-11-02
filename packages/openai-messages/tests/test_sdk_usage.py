@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.27 — openai-messages."""
+"""Tests for SDK helper usage events — openai-messages."""
 
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -50,7 +50,7 @@ async def client() -> Any:
     ("helper", "call"),
     [
         ("openai-messages.openaiMessages", lambda: openai_messages("k", "q", CONTEXT)),
-        ("openai-messages.createOpenAIHandler", create_openai_messages_handler),
+        ("openai-messages.createOpenAIMessagesHandler", create_openai_messages_handler),
     ],
 )
 async def test_helper_sends_one_usage_event(
@@ -99,7 +99,7 @@ async def test_held_helper_flushes_with_its_package() -> None:
             "aiSdkName": "launchdarkly-ai-server",
             "aiSdkVersion": __version__,
             "aiSdkLanguage": "python",
-            "helper": "openai-messages.createOpenAIHandler",
+            "helper": "openai-messages.createOpenAIMessagesHandler",
             "helperPackageName": PACKAGE_NAME,
             "helperPackageVersion": PACKAGE_VERSION,
         }

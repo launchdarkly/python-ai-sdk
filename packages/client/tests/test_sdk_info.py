@@ -1,4 +1,4 @@
-"""Tests for TESTING.md §3.9 AI SDK package information events."""
+"""Tests for AI SDK package information events."""
 
 from unittest.mock import MagicMock
 
