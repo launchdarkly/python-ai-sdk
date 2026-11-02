@@ -4,8 +4,8 @@ updates:
     # uv workspace root: one uv.lock covers every packages/* member.
     directory: '/'
     # These are published libraries: keep each package's minimum version and
-    # only widen a range when a new release falls outside it.
-    versioning-strategy: 'increase-if-necessary'
+    # widen the range to take a new release instead of raising the floor.
+    versioning-strategy: 'widen'
     schedule:
       interval: 'daily'
     cooldown:
