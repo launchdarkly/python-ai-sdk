@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.3.0...launchdarkly-ai-langchain-agents-1.0.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **evaluations:** route generation and judges to a scoped wildcard handler only for its named providers, and accept two scoped wildcards of one mode when their lists differ
+* **AIC-3439:** let wildcard handlers accept only named providers
+* **AIC-3598:** make Python packaging and public types GA-ready ([#218](https://github.com/launchdarkly/python-ai-sdk/issues/218))
+* **AIC-3568:** give the barrel core's __all__, and drop private-spec references ([#234](https://github.com/launchdarkly/python-ai-sdk/issues/234))
+* **client:** capture conversation content by default ([#213](https://github.com/launchdarkly/python-ai-sdk/issues/213))
+
+### Features
+
+* **AIC-3439:** let wildcard handlers accept only named providers ([454a4de](https://github.com/launchdarkly/python-ai-sdk/commit/454a4debec8e8d9b3d71f6affe070a7a8e446ddc))
+* **client:** add result variant and value to the feature_flag span event ([#240](https://github.com/launchdarkly/python-ai-sdk/issues/240)) ([040d487](https://github.com/launchdarkly/python-ai-sdk/commit/040d487b49f159ddf3ab1a7dcc44d2b74baa7197))
+* **client:** capture conversation content by default ([#213](https://github.com/launchdarkly/python-ai-sdk/issues/213)) ([77a7cf5](https://github.com/launchdarkly/python-ai-sdk/commit/77a7cf5a88be6dbfff66ea94e0e99780b2cd03df))
+* **evaluations:** route generation and judges to a scoped wildcard handler only for its named providers, and accept two scoped wildcards of one mode when their lists differ ([454a4de](https://github.com/launchdarkly/python-ai-sdk/commit/454a4debec8e8d9b3d71f6affe070a7a8e446ddc))
+
+
+### Bug Fixes
+
+* **AIC-3568:** give the barrel core's __all__, and drop private-spec references ([#234](https://github.com/launchdarkly/python-ai-sdk/issues/234)) ([88e57e6](https://github.com/launchdarkly/python-ai-sdk/commit/88e57e627d0b01b6fe89961e75d9efe08a3d9fdb))
+* **AIC-3573:** never send a NativeTool to the model as a function tool ([#248](https://github.com/launchdarkly/python-ai-sdk/issues/248)) ([73caeae](https://github.com/launchdarkly/python-ai-sdk/commit/73caeae69c1eda516e3ae3e144878f2b517e5f61))
+* **AIC-3590:** build Python langchain-agents with langchain.agents.create_agent ([#175](https://github.com/launchdarkly/python-ai-sdk/issues/175)) ([8218626](https://github.com/launchdarkly/python-ai-sdk/commit/82186262e24ef39af5c8a5b7fcf0cb5dcf9188f2))
+* **AIC-3592:** make native LangGraph hand-offs complete ([#246](https://github.com/launchdarkly/python-ai-sdk/issues/246)) ([bfb738f](https://github.com/launchdarkly/python-ai-sdk/commit/bfb738f01f8e32852d0836db7edc486af1f1498b))
+* **AIC-3598:** make Python packaging and public types GA-ready ([#218](https://github.com/launchdarkly/python-ai-sdk/issues/218)) ([5860b40](https://github.com/launchdarkly/python-ai-sdk/commit/5860b40078f69febc522680ec76519c25274a606))
+
 ## [0.3.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.2.6...launchdarkly-ai-langchain-agents-0.3.0) (2026-10-27)
 
 

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import anthropic._base_client as _anthropic_base_client
 import pytest
 
 from tests.forwarding_spec import (
@@ -25,6 +25,10 @@ from tests.never_forwarded import (
     NEVER_FORWARDED_KEYS,
     find_leaks,
 )
+
+# anthropic>=1 builds its client on httpx2 and rejects an httpx client; use whichever it imports.
+httpx = getattr(_anthropic_base_client, "httpx2", None) or _anthropic_base_client.httpx
+
 
 # ---------------------------------------------------------------------------
 # Fake anthropic response helpers
@@ -389,7 +393,7 @@ class TestModelParametersForwarding:
         h = create_claude_messages_handler()
         await h(config, "q", {}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
-        assert call_kwargs["top_p"] == 0.5
+        assert call_kwargs["extra_body"]["top_p"] == 0.5
 
     async def test_max_tokens_default_preserved_without_parameters(
         self, mock_anthropic: MagicMock
@@ -469,7 +473,7 @@ class TestModelParametersForwarding:
         async for _event in gen:
             pass
         call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
-        assert call_kwargs["top_p"] == 0.3
+        assert call_kwargs["extra_body"]["top_p"] == 0.3
 
     async def test_top_p_and_max_tokens_reach_the_wire(self) -> None:
         """Intercepts the real outgoing HTTP request with an httpx MockTransport, rather than
@@ -506,13 +510,15 @@ class TestModelParametersForwarding:
             **CONFIG,
             "model": {
                 **CONFIG["model"],
-                "parameters": {"top_p": 0.4, "max_tokens": 256},
+                "parameters": {"temperature": 0.2, "top_p": 0.4, "max_tokens": 256},
             },
         }
         with patch("anthropic.AsyncAnthropic", return_value=real_client):
             h = create_claude_messages_handler()
         await h(config, "q", {}, {})
 
+        # anthropic>=1 rejects these as keyword arguments; they still reach the wire via extra_body.
+        assert captured["body"]["temperature"] == 0.2
         assert captured["body"]["top_p"] == 0.4
         assert captured["body"]["max_tokens"] == 256
 
@@ -549,8 +555,7 @@ class TestModelParametersForwarding:
         h = create_claude_messages_handler()
         await h(config, "q", {}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
-        assert call_kwargs["top_p"] == 0.5
-        assert "extra_body" not in call_kwargs
+        assert call_kwargs["extra_body"] == {"top_p": 0.5}
 
     async def test_stream_key_is_never_forwarded(
         self, mock_anthropic: MagicMock
@@ -2860,7 +2865,7 @@ class TestInvokeAndStreamForwardTheSameKeys:
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         assert "output_format" not in call_kwargs
         assert call_kwargs["output_config"] == {"effort": "low"}
-        assert call_kwargs["top_p"] == 0.4
+        assert call_kwargs["extra_body"]["top_p"] == 0.4
 
     async def test_stream(self, mock_anthropic: MagicMock) -> None:
         import launchdarkly_ai_claude_messages.spans as spans_mod
@@ -2876,7 +2881,7 @@ class TestInvokeAndStreamForwardTheSameKeys:
         call_kwargs = mock_anthropic.messages.stream.call_args.kwargs
         assert "output_format" not in call_kwargs
         assert call_kwargs["output_config"] == {"effort": "low"}
-        assert call_kwargs["top_p"] == 0.4
+        assert call_kwargs["extra_body"]["top_p"] == 0.4
 
 
 class TestOutputConfigKeepsOnlyEffort:
@@ -3027,7 +3032,9 @@ class TestTypedObjectsAreRebuilt:
     def test_a_missing_or_unknown_type_or_required_sub_key_is_dropped(
         self, parameters: dict[str, Any]
     ) -> None:
-        assert self._forwarded({**parameters, "top_p": 0.4}) == {"top_p": 0.4}
+        assert self._forwarded({**parameters, "top_p": 0.4}) == {
+            "extra_body": {"top_p": 0.4}
+        }
 
     @pytest.mark.parametrize(
         ("key", "value", "expected"),
@@ -3079,6 +3086,11 @@ class TestTypedObjectsAreRebuilt:
 
         from launchdarkly_ai_claude_messages.handler import _TYPED_OBJECT_SHAPES
 
+        # Thinking variants newer anthropic releases declare that the handler does not forward yet
+        # (the API takes them; a config that sets one is dropped, not an error). Add one to
+        # ``_TYPED_OBJECT_SHAPES`` and remove it here to forward it.
+        not_forwarded_thinking = {"between_tools"}
+
         def shapes(*variants: Any) -> dict[str, tuple[frozenset[str], frozenset[str]]]:
             # The SDK's TypedDicts are total=False with ``Required[...]`` under postponed
             # annotations, so ``__required_keys__`` is empty; read ``Required`` from the hints.
@@ -3096,8 +3108,11 @@ class TestTypedObjectsAreRebuilt:
                 )
             return out
 
+        sdk_thinking = shapes(*typing.get_args(ThinkingConfigParam))
+        for kind in not_forwarded_thinking:
+            sdk_thinking.pop(kind, None)
         assert _TYPED_OBJECT_SHAPES == {
-            "thinking": shapes(*typing.get_args(ThinkingConfigParam)),
+            "thinking": sdk_thinking,
             "tool_choice": shapes(*typing.get_args(ToolChoiceParam)),
             "cache_control": shapes(CacheControlEphemeralParam),
         }
@@ -3121,7 +3136,7 @@ class TestMalformedObjectValuesAreDropped:
         assert not {"thinking", "cache_control", "output_config", "tool_choice"} & set(
             kwargs
         )
-        assert kwargs["top_p"] == 0.4
+        assert kwargs["extra_body"]["top_p"] == 0.4
 
     async def test_invoke(self, mock_anthropic: MagicMock) -> None:
         from launchdarkly_ai_claude_messages import create_claude_messages_handler

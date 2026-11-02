@@ -78,6 +78,12 @@ _MESSAGES_FORWARDED_KEYS = frozenset(
     }
 )
 
+#: Forwarded keys that ``anthropic`` 1.0 removed from ``messages.create``/``.stream`` (a ``TypeError``
+#: if passed as keyword arguments). The API still honours them for models that predate the change,
+#: and ``extra_body`` is merged into the request JSON as-is on every ``anthropic`` release, so
+#: :func:`_forwarded_parameters` sends them there rather than branching on the installed version.
+_MESSAGES_SAMPLING_KEYS = frozenset({"temperature", "top_k", "top_p"})
+
 #: Forwarded keys whose value must be an object. A config value of any other type is malformed
 #: and dropped rather than passed to the API.
 _MESSAGES_MAPPING_KEYS = frozenset(
@@ -170,6 +176,12 @@ _MESSAGES_EXCLUDED_KEYS = frozenset(
         "extra_headers",
         "extra_query",
         "extra_body",
+        # Added after anthropic 0.113: a per-request diagnostics opt-in, a header that picks the
+        # workspace for a credential, and an inference speed (price/latency) mode. None of them
+        # shapes what the model generates.
+        "diagnostics",
+        "speed",
+        "workspace_id",
     }
 )
 
@@ -218,9 +230,10 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
     moved into ``output_config``, then only :data:`_MESSAGES_FORWARDED_KEYS`, with malformed
     object values dropped, typed objects rebuilt (see :data:`_TYPED_OBJECT_SHAPES`), and
     ``output_config`` narrowed to ``effort`` (see :func:`_rebuild_output_config`). ``invoke`` and
-    ``stream`` both call this, so they forward the same keys.
+    ``stream`` both call this, so they forward the same keys. The sampling keys
+    (:data:`_MESSAGES_SAMPLING_KEYS`) come back inside ``extra_body``, not as top-level keys.
     """
-    return _rebuild_output_config(
+    params = _rebuild_output_config(
         _rebuild_typed_objects(
             select_forwarded_parameters(
                 _rename_effort_to_output_config(model_parameters(config)),
@@ -229,6 +242,10 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
             )
         )
     )
+    sampling = {k: params.pop(k) for k in _MESSAGES_SAMPLING_KEYS & params.keys()}
+    if sampling:
+        params["extra_body"] = sampling
+    return params
 
 
 def _build_tools(
