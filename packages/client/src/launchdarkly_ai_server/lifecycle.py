@@ -258,7 +258,8 @@ async def init_client(
         # Adopted only after telemetry setup succeeds. ``_client`` is the
         # idempotency guard above, so assigning it first meant a setup that
         # raised left it set: the next call returned it as a silent success
-        # with no telemetry, hiding the config error. The caller owns this client, so it is not closed.
+        # with no telemetry, hiding the config error. The caller owns this
+        # client, so it is not closed.
         _setup_telemetry(opts.get("sdkKey", "byoc"), opts)
         _client = client
         flush_ai_sdk_info(_client)
