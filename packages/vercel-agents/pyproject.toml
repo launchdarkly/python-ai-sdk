@@ -6,7 +6,7 @@ dependencies = [
   "launchdarkly-ai-server>=1.0.0,<2",
   "opentelemetry-api>=1.25",
   "pydantic>=2.13",
-  "ai>=0.7,<0.8",
+  "ai>=0.8.0,<0.9",
 ]
 description = "Vercel AI SDK agent handler for LaunchDarkly AI SDK"
 readme = "README.md"
