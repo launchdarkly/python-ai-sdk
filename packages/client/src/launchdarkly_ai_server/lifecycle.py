@@ -47,8 +47,9 @@ class _InitAttempt:
 
     ``result`` is a thread future, not an asyncio one, so callers on any event
     loop or thread can wait on it. ``waiters`` counts the calls still waiting.
-    ``successor`` is the passed client that replaced this attempt, if one did;
-    an attempt replaced by ``shutdown()`` has none, so its calls fail.
+    ``successor`` is the passed client that replaced this attempt, if one did.
+    ``generation`` is the ``shutdown()`` count when it started: once that has
+    moved on, its calls fail whatever replaced it in between.
     """
 
     def __init__(self) -> None:
@@ -57,6 +58,7 @@ class _InitAttempt:
         )
         self.waiters = 0
         self.successor: LDClientInterface | None = None
+        self.generation = _generation
 
 
 # Guards ``_client``, ``_attempt`` and the telemetry globals: the attempt thread
@@ -66,6 +68,9 @@ _client: LDClientInterface | None = None
 # The in-flight attempt, cleared when it ends either way, so a failure is not
 # cached. ``shutdown()`` and a passed client clear it too, which abandons it.
 _attempt: _InitAttempt | None = None
+# Bumped by every ``shutdown()``. A passed client clears ``_attempt`` first, so
+# ``shutdown()`` can no longer reach the attempt it replaced; this still can.
+_generation = 0
 _tracer_provider: Any = None
 # True only when *this* SDK's call to trace.set_tracer_provider actually took
 # effect. "We built a provider" is not the same as "we own the global": the set
@@ -435,10 +440,11 @@ def _adopt(
             # waiting on it was cancelled. Adopting the client would clobber
             # what came after, or keep a connection open that nobody asked for.
             # ``_client`` is no answer here: after shutdown() it may be a later
-            # attempt's client, which these calls must not get.
+            # attempt's client, which these calls must not get. Nor is the
+            # successor once shutdown() has run since: it closed that client.
             if _attempt is attempt:
                 _attempt = None
-            if attempt.successor is not None:
+            if attempt.successor is not None and attempt.generation == _generation:
                 return attempt.successor
             raise RuntimeError(
                 "init_client was abandoned: shutdown() ran, or every call "
@@ -601,7 +607,7 @@ async def shutdown() -> None:
     provider so a later ``init_client`` can install its own — see
     ``_release_otel_globals``.
     """
-    global _client, _attempt, _tracer_provider, _owns_otel_globals
+    global _client, _attempt, _generation, _tracer_provider, _owns_otel_globals
     global _sdk_options, _ai_invoked
 
     run_shutdown_hooks()
@@ -617,6 +623,7 @@ async def shutdown() -> None:
         owned_globals = _owns_otel_globals
         _client = None
         _attempt = None
+        _generation += 1
         _tracer_provider = None
         _owns_otel_globals = False
     _sdk_options = SDKOptions()
@@ -658,12 +665,13 @@ def _set_client_for_testing(c: Any) -> None:
 
 def _reset_for_testing() -> None:
     """Test helper — clear all singleton state."""
-    global _client, _attempt, _tracer_provider, _owns_otel_globals
+    global _client, _attempt, _generation, _tracer_provider, _owns_otel_globals
     global _sdk_options, _ai_invoked
     with _state_lock:
         owned_globals = _owns_otel_globals
         _client = None
         _attempt = None
+        _generation += 1
         _tracer_provider = None
         _owns_otel_globals = False
     _sdk_options = SDKOptions()

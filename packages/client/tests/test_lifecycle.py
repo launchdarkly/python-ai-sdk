@@ -659,6 +659,26 @@ class TestInitClientSDKKeyPath:
         passed.close.assert_not_called()
         assert get_client() is passed
 
+    async def test_shutdown_after_a_passed_client_fails_the_replaced_attempt(
+        self,
+    ) -> None:
+        # The passed client already cleared the attempt, so shutdown() could not
+        # reach it; handing its calls the client shutdown() closed would be wrong.
+        built, passed = _make_stub_client(), _make_stub_client()
+        mock_ld, release = self._gated_sdk(built)
+        with patch.dict(os.environ, {"LD_SDK_KEY": "test-key"}):
+            with patch.object(lifecycle_module, "_setup_telemetry", return_value=None):
+                with patch("importlib.import_module", return_value=mock_ld):
+                    task = asyncio.create_task(init_client())
+                    await self._waiters(1)
+                    assert await init_client(client=passed) is passed
+                    await shutdown()
+                    release.set()
+                    with pytest.raises(RuntimeError, match="abandoned"):
+                        await task
+        built.close.assert_awaited_once()
+        assert lifecycle_module._client is None
+
     async def test_a_passed_client_replaces_an_attempt_in_flight(self) -> None:
         built, passed = _make_stub_client(), _make_stub_client()
         mock_ld, release = self._gated_sdk(built)
