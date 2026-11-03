@@ -38,7 +38,7 @@ dev = [
     { name = "langchain-anthropic", specifier = ">=1.4.8" },
     { name = "langchain-aws", specifier = ">=1" },
     { name = "langchain-openai", specifier = ">=0.3" },
-    { name = "launchdarkly-server-sdk", specifier = ">=9.18.3" },
+    { name = "launchdarkly-server-sdk", specifier = ">=9.18.4" },
     { name = "mypy", specifier = ">=2.4.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.43.0" },
     { name = "opentelemetry-sdk", specifier = ">=1.25" },
@@ -1599,7 +1599,7 @@ otel = [
 
 [package.metadata]
 requires-dist = [
-    { name = "launchdarkly-server-sdk", marker = "extra == 'ld'", specifier = ">=9.18.3,<10" },
+    { name = "launchdarkly-server-sdk", marker = "extra == 'ld'", specifier = ">=9.18.4,<10" },
     { name = "opentelemetry-api", specifier = ">=1.25" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.25" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.25" },
@@ -1675,7 +1675,7 @@ wheels = [
 
 [[package]]
 name = "launchdarkly-server-sdk"
-version = "9.18.3"
+version = "9.18.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
@@ -1685,9 +1685,9 @@ dependencies = [
     { name = "semver" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/75/6f/a70c4b673eb3c093094292efdacc1017d1f1bec74b9ec4586322e86e5186/launchdarkly_server_sdk-9.18.3.tar.gz", hash = "sha256:e785b6a1ce1fabccbf380ec9f8e3604758a70f90e1cb272a1dcaa54df47a295b", size = 414832, upload-time = "2026-10-20T21:19:28.17Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/75/e3608fd0298afc683ae4daf0b9daae3bfae7b30458d57c601a67c0e45aaa/launchdarkly_server_sdk-9.18.4.tar.gz", hash = "sha256:b5ecb89c84e99133a420a29015dbb705c760cc3493478307577993bc53ae6195", size = 416483, upload-time = "2026-10-26T15:43:22.621Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/81/1c/cde2fee5941c5310fc20a3c843e234ae4e5b91a9a96475470529bfd74fb4/launchdarkly_server_sdk-9.18.3-py3-none-any.whl", hash = "sha256:e21d951a465c62f387c7b19b105351f463f45cf51ace93e293041f5452eaef94", size = 283624, upload-time = "2026-10-20T21:19:26.352Z" },
+    { url = "https://files.pythonhosted.org/packages/91/a2/9f85e09af114f2b16c92c1baf5270a08d7e05335c6329b200237fae9cf2f/launchdarkly_server_sdk-9.18.4-py3-none-any.whl", hash = "sha256:e27a90f1be84dee0d1fc2db5f7887e50f9b0f78889f7f63a73a5e1f095534a37", size = 283758, upload-time = "2026-10-26T15:43:21.324Z" },
 ]
 
 [[package]]
