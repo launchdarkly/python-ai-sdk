@@ -315,6 +315,8 @@ def _in_sample(shadow_id: str, context: LDContext, sampling_rate: float) -> bool
     identity = _context_identity_from_ld_context(context)
     if identity is None:
         return False
+    if sampling_rate >= 1:
+        return True
     canonical, _ = identity
     digest = hashlib.sha1(f"{shadow_id}.{canonical}".encode(), usedforsecurity=False)
     bucket = int(digest.hexdigest()[:15], 16) / _BUCKET_SCALE
@@ -431,7 +433,7 @@ async def _run(task: ShadowTask, handlers: list[ProviderHandler]) -> ShadowResul
     except _ShadowTimeout:
         return _failed(task, "timeout")
     except Exception as err:
-        return _failed(task, str(err))
+        return _failed(task, str(err) or type(err).__name__)
     return ShadowResult(usage=result["usage"], track_data=result["track_data"])
 
 
@@ -464,11 +466,14 @@ def _with_deadline(handler: ProviderHandler, timeout_s: float) -> ProviderHandle
         deadline = asyncio.timeout(timeout_s)
         try:
             async with deadline:
-                return await handler(*args)
+                result = await handler(*args)
         except TimeoutError:
             if deadline.expired():
                 raise _ShadowTimeout("timeout") from None
             raise
+        if deadline.expired():
+            raise _ShadowTimeout("timeout")
+        return result
 
     return ProviderHandler(
         fn=timed,

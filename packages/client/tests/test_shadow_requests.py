@@ -984,3 +984,42 @@ class TestEvents:
         )
         set_ld_span_attributes(mock_span, a.calls[0]["variables"])
         assert "feature_flag" in [c[0][0] for c in mock_span.add_event.call_args_list]
+
+
+class TestFailureEdges:
+    async def test_handler_that_swallows_cancellation_is_still_a_timeout(self) -> None:
+        client = _make_client(_variation_a())
+        task = await _deferred_task(client)
+        task = dataclasses.replace(task, timeout_s=0.05)
+
+        async def swallows(*args: Any) -> dict[str, Any]:
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass
+            return {"output": "late", "usage": {}}
+
+        handler = ProviderHandler(
+            fn=swallows, provides_for=("ShadowProvider", "messages")
+        )  # type: ignore[arg-type]
+        result = await run_shadow(task, [handler])
+        names = [e[0] for e in _shadow_events(client)]
+        assert result.error == "timeout"
+        assert "$ld:ai:generation:success" not in names
+        assert names.count("$ld:ai:generation:error") == 1
+
+    async def test_error_without_a_message_uses_the_type_name(self) -> None:
+        task = await _deferred_task(_make_client(_variation_a()))
+        result = await run_shadow(
+            task, [_Recorder("ShadowProvider", error=TimeoutError()).handler]
+        )
+        assert result.error == "TimeoutError"
+
+    def test_rate_above_one_is_treated_as_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        top = SimpleNamespace(hexdigest=lambda: "f" * 40)
+        monkeypatch.setattr(sr.hashlib, "sha1", lambda *a, **k: top)
+        assert sr._in_sample("shadow-1", CONTEXT, 1.0)
+        assert sr._in_sample("shadow-1", CONTEXT, 1.5)
+        assert not sr._in_sample("shadow-1", CONTEXT, 0.999)
