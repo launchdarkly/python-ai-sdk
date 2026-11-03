@@ -144,12 +144,16 @@ def _record_evaluation(
     explanation: str | None = None,
     *,
     mirror_attributes: bool = True,
+    score_range: tuple[float, float] | None = None,
 ) -> None:
     """Write the judge score as a ``gen_ai.evaluation.result`` event plus mirrored attributes.
 
     ``explanation`` is passed only when the judge's own handler captures content — it is model
     prose about the user's conversation, so it follows the same gate as every other content
     attribute. The reasoning always reaches the caller in ``judge_results``.
+
+    ``score_range`` adds ``launchdarkly.evaluation.score.min`` and ``.max``, so a reader can show
+    the score as a fraction of its range rather than a bare number.
     """
     if span is None or not span.is_recording():
         return
@@ -157,6 +161,9 @@ def _record_evaluation(
         "gen_ai.evaluation.name": name,
         "gen_ai.evaluation.score.value": score,
     }
+    if score_range is not None:
+        attrs["launchdarkly.evaluation.score.min"] = score_range[0]
+        attrs["launchdarkly.evaluation.score.max"] = score_range[1]
     if explanation:
         attrs["gen_ai.evaluation.explanation"] = explanation
     span.add_event("gen_ai.evaluation.result", attrs)

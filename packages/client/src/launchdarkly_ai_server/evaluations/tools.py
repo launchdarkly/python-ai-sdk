@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -35,7 +36,12 @@ class EvalTool:
     tool from the LaunchDarkly tool library. That returns a tool with
     ``source`` ``"library"`` and the version it pinned.
 
-    ``implementation`` is the function the handler calls. A key must be
+    ``implementation`` is the function the handler calls, sync or async. It
+    receives one argument: a ``dict`` of the arguments the model sent, keyed
+    as in ``schema``. Write ``def get_weather(args: dict) -> ...``, not
+    ``def get_weather(city: str)``. What it returns goes back to the model as
+    the tool result. If it raises, the model receives ``"Error: <type>:
+    <message>"`` as the result and the row continues. A key must be
     lowercase. A :class:`~launchdarkly_ai_server.NativeTool` is valid only for
     a library tool, because the provider supplies its schema.
     ``dataclasses.replace`` on a library tool returns an inline tool that
@@ -199,6 +205,62 @@ def validate_tools(tools: Sequence[EvalTool], project_key: str) -> None:
 def tool_handlers(tools: Sequence[EvalTool]) -> dict[str, ToolImplementation]:
     """Return the tools list as ``{key: executable}``."""
     return {tool.key: tool.implementation for tool in tools}
+
+
+def tool_error_result(error: Exception) -> str:
+    """The tool result a model receives when its tool call raised."""
+    return f"Error: {type(error).__name__}: {error}"
+
+
+def return_tool_errors(
+    handlers: Mapping[str, ToolImplementation],
+) -> dict[str, ToolImplementation]:
+    """Return ``handlers`` with each raising call answered by an error result.
+
+    An evaluation measures how an agent copes with a failing tool, so the
+    exception goes back to the model as the tool's result instead of failing
+    the row. Wrap outside the trajectory recorder: it still records the call
+    as an error, for the judge and the ``execute_tool`` span.
+    """
+    wrapped: dict[str, ToolImplementation] = {}
+    for name, implementation in handlers.items():
+        if isinstance(implementation, NativeTool) or not callable(implementation):
+            wrapped[name] = implementation
+            continue
+        wrapped[name] = _answer_errors(implementation)
+    return wrapped
+
+
+def _answer_errors(original: Callable[..., Any]) -> Callable[..., Any]:
+    # A sync tool stays sync, as in TrajectoryRecorder: a handler may call it
+    # directly and use the value.
+    if asyncio.iscoroutinefunction(original):
+
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await original(*args, **kwargs)
+            except Exception as error:
+                return tool_error_result(error)
+
+        return async_wrapper
+
+    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = original(*args, **kwargs)
+        except Exception as error:
+            return tool_error_result(error)
+        if inspect.isawaitable(result):
+            return _await_answering_errors(result)
+        return result
+
+    return sync_wrapper
+
+
+async def _await_answering_errors(awaitable: Any) -> Any:
+    try:
+        return await awaitable
+    except Exception as error:
+        return tool_error_result(error)
 
 
 def handler_config_tools(tools: Sequence[EvalTool]) -> dict[str, dict[str, Any]]:
