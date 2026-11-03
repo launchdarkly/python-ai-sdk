@@ -7,6 +7,7 @@ import pickle
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import aclosing
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -1023,3 +1024,52 @@ class TestFailureEdges:
         assert sr._in_sample("shadow-1", CONTEXT, 1.0)
         assert sr._in_sample("shadow-1", CONTEXT, 1.5)
         assert not sr._in_sample("shadow-1", CONTEXT, 0.999)
+
+    async def test_failed_served_call_hands_over_no_task(self) -> None:
+        _use(_make_client(_variation_a()))
+        tasks: list[ShadowTask] = []
+        failing = _Recorder("TestProvider", error=RuntimeError("primary failed"))
+        with pytest.raises(RuntimeError):
+            await shadow_config(
+                key="flag",
+                handler=[failing.handler, _Recorder("ShadowProvider").handler],
+                on_task=tasks.append,
+            ).invoke("hi", CONTEXT)
+        assert tasks == []
+
+    async def test_abandoned_stream_starts_no_shadow(self) -> None:
+        client = _use(_make_client(_variation_a()))
+        tasks: list[ShadowTask] = []
+        b = _Recorder("ShadowProvider")
+        for on_task in (None, tasks.append):
+            stream = shadow_config(
+                key="flag",
+                handler=[_Recorder("TestProvider", "real answer").handler, b.handler],
+                on_task=on_task,
+            ).stream("hi", CONTEXT)
+            async with aclosing(stream):
+                async for _ in stream:
+                    break
+        await sr._wait_for_shadows_for_testing()
+        assert tasks == []
+        assert b.calls == []
+        assert _shadow_events(client) == []
+
+    async def test_failing_shadow_leaves_served_events_unchanged(self) -> None:
+        with_shadow = _make_client(_variation_a())
+        await _invoke(
+            with_shadow, b=_Recorder("ShadowProvider", error=RuntimeError("boom"))
+        )
+        lifecycle_module._reset_for_testing()
+        without_shadow = _make_client(_variation_a(shadows={}))
+        await _invoke(without_shadow)
+        assert _without_run_id(_real_events(with_shadow)) == _without_run_id(
+            _events(without_shadow)
+        )
+
+    async def test_shadow_with_malformed_tools_still_runs(self) -> None:
+        variation = _variation_b()
+        variation["tools"] = "not-a-tools-map"
+        _, _, b = await _invoke(_make_client(_variation_a(variations={"b": variation})))
+        assert len(b.calls) == 1
+        assert "tools" not in b.calls[0]["config"]
