@@ -568,7 +568,7 @@ def test_is_function_tool_rejects_a_native_tool_and_its_stub_warning_once_per_ke
 
 
 class TestValidateMaxRetries:
-    """TESTING.md A.25: a factory refuses a value that is not a non-negative int, naming the option."""
+    """A factory refuses a value that is not a non-negative int, naming the option."""
 
     @pytest.mark.parametrize("value", [None, 0, 1, 7, 50])
     def test_accepts_none_and_non_negative_ints(self, value: int | None) -> None:

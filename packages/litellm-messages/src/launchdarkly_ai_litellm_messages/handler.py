@@ -139,7 +139,7 @@ def _model_name(config_value: AiConfigRep) -> str:
 
 
 #: LiteLLM routes that build an OpenAI SDK client, the only code in LiteLLM that reads
-#: ``max_retries`` (TESTING.md A.25, checked against litellm 1.106.2). Every other route ignores it
+#: ``max_retries`` (checked against litellm 1.106.2). Every other route ignores it
 #: and gets ``num_retries`` instead. Adding a provider here is a spec change.
 _OPENAI_CLIENT_PROVIDERS = frozenset({"openai", "azure"})
 

@@ -747,7 +747,7 @@ class TestForwardsExactlyTheCrossSdkList:
 class TestMaxRetries:
     """`max_retries` reaches every `acompletion` call under the keyword the model's route reads.
 
-    TESTING.md A.25: ``max_retries`` on LiteLLM's OpenAI-client routes (``openai``, ``azure``),
+    ``max_retries`` on LiteLLM's OpenAI-client routes (``openai``, ``azure``),
     ``num_retries`` on every other route, never both, and neither when the option is omitted.
     """
 
