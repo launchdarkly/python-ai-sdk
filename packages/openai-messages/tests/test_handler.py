@@ -3059,3 +3059,124 @@ class TestMalformedObjectValuesAreDropped:
         kwargs = mock_openai.responses.stream.call_args.kwargs
         assert "reasoning" not in kwargs
         assert kwargs["top_p"] == 0.4
+
+
+class TestMaxRetries:
+    """`max_retries` reaches the `AsyncOpenAI` client the factory builds, and only when set.
+
+    The client's own retries are the right layer for rate limits, so an omitted value must leave the
+    vendor default in place rather than replace it, and nothing may ever turn retries off.
+    """
+
+    def _build(
+        self, monkeypatch: pytest.MonkeyPatch, **kwargs: Any
+    ) -> tuple[Any, Any, MagicMock]:
+        import openai
+
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        real_client = openai.AsyncOpenAI
+        built: list[Any] = []
+
+        def _construct(**options: Any) -> Any:
+            built.append(real_client(**options))
+            return built[-1]
+
+        with patch("openai.AsyncOpenAI", side_effect=_construct) as ctor:
+            handler = create_openai_messages_handler(**kwargs)
+        return handler, built[0], ctor
+
+    def test_value_reaches_the_constructed_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _handler, client, _ctor = self._build(monkeypatch, max_retries=7)
+        assert client.max_retries == 7
+
+    def test_omitted_value_keeps_the_vendor_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import openai
+
+        _handler, client, ctor = self._build(monkeypatch)
+        assert "max_retries" not in ctor.call_args.kwargs
+        assert client.max_retries == openai.DEFAULT_MAX_RETRIES
+
+    def test_explicit_zero_is_the_callers_choice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _handler, client, _ctor = self._build(monkeypatch, max_retries=0)
+        assert client.max_retries == 0
+
+    @pytest.mark.parametrize("value", [True, 2.5, "3"])
+    def test_non_integer_is_refused_at_construction(self, value: Any) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with patch("openai.AsyncOpenAI") as ctor:
+            with pytest.raises(TypeError, match="max_retries"):
+                create_openai_messages_handler(max_retries=value)
+        ctor.assert_not_called()
+
+    def test_negative_is_refused_at_construction(self) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        with patch("openai.AsyncOpenAI") as ctor:
+            with pytest.raises(ValueError, match="max_retries"):
+                create_openai_messages_handler(max_retries=-1)
+        ctor.assert_not_called()
+
+    async def test_config_cannot_set_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+
+        handler, client, _ctor = self._build(monkeypatch, max_retries=3)
+        config = {
+            **CONFIG,
+            "model": {**CONFIG["model"], "parameters": {"max_retries": 50}},
+        }
+        create = AsyncMock(return_value=_make_response())
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            patch.object(client.responses, "create", create),
+        ):
+            await handler(config, "q", {}, {})
+        assert client.max_retries == 3
+        # A per-request max_retries would override the client's, so it must not be forwarded.
+        assert "max_retries" not in create.call_args.kwargs
+
+    async def test_invoke_and_stream_share_the_configured_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import launchdarkly_ai_openai_messages.spans as spans_mod
+
+        handler, client, ctor = self._build(monkeypatch, max_retries=7)
+        create = AsyncMock(return_value=_make_response())
+        stream = MagicMock(return_value=_make_openai_stream_context(["hi"]))
+        with (
+            patch.object(spans_mod, "_HAS_OTEL", False),
+            patch.object(client.responses, "create", create),
+            patch.object(client.responses, "stream", stream),
+        ):
+            await handler(CONFIG, "q", {}, {})
+            async for _event in await handler.stream(CONFIG, "q"):
+                pass
+        create.assert_awaited_once()
+        assert "max_retries" not in create.call_args.kwargs
+        stream.assert_called_once()
+        assert "max_retries" not in stream.call_args.kwargs
+        # One client, built once, serves both paths, so both get its retry count.
+        assert ctor.call_count == 1
+        assert client.max_retries == 7
+
+    def test_convenience_wrapper_forwards_it_to_the_factory(self) -> None:
+        import launchdarkly_ai_openai_messages.handler as handler_mod
+
+        factory = MagicMock()
+        fake_config = MagicMock()
+        with (
+            patch.object(handler_mod, "_create_openai_messages_handler", factory),
+            patch.object(handler_mod, "_config", fake_config),
+        ):
+            handler_mod.openai_messages("k", "q", {}, max_retries=6)
+        assert factory.call_args.kwargs["max_retries"] == 6
+        # config() takes no such argument, so leaving it in kwargs would raise TypeError.
+        assert "max_retries" not in fake_config.call_args.kwargs

@@ -34,6 +34,7 @@ from launchdarkly_ai_server import (
     set_output_content_attributes,
     set_tool_call_content_attributes,
     tool_result_string,
+    validate_max_retries,
 )
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
@@ -597,6 +598,7 @@ def _model_constructor_kwargs(
     *,
     mapping_keys: frozenset[str] = frozenset(),
     renames: Mapping[str, str] | None = None,
+    max_retries: int | None = None,
 ) -> dict[str, Any]:
     params = model_parameters(config)
     for alias, name in (renames or {}).items():
@@ -607,6 +609,10 @@ def _model_constructor_kwargs(
         params, forwarded_keys, mapping_keys=mapping_keys
     )
     parameters["model"] = _resolved_model_name(config, fallback_name)
+    # From the handler's options, never from model.parameters, which excludes it above. Set only
+    # when given, so an omitted value keeps each chat model's own default.
+    if max_retries is not None:
+        parameters["max_retries"] = max_retries
     return parameters
 
 
@@ -615,13 +621,16 @@ def _is_model_factory(llm: Any) -> bool:
     return callable(llm) and not hasattr(llm, "invoke") and not hasattr(llm, "ainvoke")
 
 
-def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
+def _make_default_chat_model(
+    config: AiConfigRep, importlib: Any, max_retries: int | None = None
+) -> Any:
     """
     Instantiate the appropriate LangChain chat model based on ``config.provider.name``.
     Falls back to ``ChatOpenAI`` when the provider is not recognised.
     Requires the matching ``langchain-<provider>`` integration package to be installed.
     ``model.parameters`` are filtered to that class's forwarded list first. ``tools`` is never on
-    that list, since tools are bound separately from ``config["tools"]``.
+    that list, since tools are bound separately from ``config["tools"]``. *max_retries*, when set,
+    is passed to whichever class is built.
     """
     provider = config.get("provider", {}).get("name", "openai").lower()
     if provider == "anthropic":
@@ -641,6 +650,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
                         _CHAT_ANTHROPIC_FORWARDED_KEYS,
                         mapping_keys=_CHAT_ANTHROPIC_MAPPING_KEYS,
                         renames=_CHAT_ANTHROPIC_RENAMES,
+                        max_retries=max_retries,
                     )
                 )
             )
@@ -660,6 +670,7 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
                 _CHAT_BEDROCK_CONVERSE_FORWARDED_KEYS,
                 mapping_keys=_CHAT_BEDROCK_CONVERSE_MAPPING_KEYS,
                 renames=_CHAT_BEDROCK_CONVERSE_RENAMES,
+                max_retries=max_retries,
             )
         )
     lc_openai = importlib.import_module("langchain_openai")
@@ -669,14 +680,17 @@ def _make_default_chat_model(config: AiConfigRep, importlib: Any) -> Any:
             "gpt-4o",
             _CHAT_OPENAI_FORWARDED_KEYS,
             mapping_keys=_CHAT_OPENAI_MAPPING_KEYS,
+            max_retries=max_retries,
         )
     )
 
 
-async def _resolve_base_model(config: AiConfigRep, llm: Any, importlib: Any) -> Any:
+async def _resolve_base_model(
+    config: AiConfigRep, llm: Any, importlib: Any, max_retries: int | None = None
+) -> Any:
     invocation = _config_for_model_call(config)
     if llm is None:
-        return _make_default_chat_model(invocation, importlib)
+        return _make_default_chat_model(invocation, importlib, max_retries)
     if _is_model_factory(llm):
         model = llm(invocation)
         if asyncio.iscoroutine(model):
@@ -778,6 +792,7 @@ def create_langchain_messages_handler(
     *,
     providers: Sequence[str] | None = None,
     capture_content: bool | None = None,
+    max_retries: int | None = None,
 ) -> ProviderHandler:
     """
     Creates a ``ProviderHandler`` for LangChain (chat models).
@@ -796,12 +811,24 @@ def create_langchain_messages_handler(
     *providers* limits which ``config.provider.name`` values this wildcard accepts.
     Omit it to match every provider. Names must match the config exactly, for example
     ``["Bedrock"]``.
+
+    Set *max_retries* to change how many times the default chat model retries a failed request (a
+        rate limit, a timeout, a 5xx) before the error reaches the handler. It is passed to the
+        ``ChatOpenAI``, ``ChatAnthropic`` or ``ChatBedrockConverse`` the handler builds. ``None`` (the
+        default) leaves that class's own default in place, which is 2 for OpenAI and Anthropic. Raise
+        it when many calls share one rate-limit window, as an evaluation run with many concurrent
+        workers does: two retries is thin when a whole batch hits the same window at once. It cannot
+        be combined with *llm*, because the handler does not build that model: set ``max_retries`` on
+        the model instead. Raises ``TypeError`` or ``ValueError`` when it is not a non-negative int.
     """
     report_usage(
         "langchain-messages.createLangChainMessagesHandler", PACKAGE_NAME, __version__
     )
     return _create_langchain_messages_handler(
-        llm, providers=providers, capture_content=capture_content
+        llm,
+        providers=providers,
+        capture_content=capture_content,
+        max_retries=max_retries,
     )
 
 
@@ -810,8 +837,17 @@ def _create_langchain_messages_handler(
     *,
     providers: Sequence[str] | None = None,
     capture_content: bool | None = None,
+    max_retries: int | None = None,
 ) -> ProviderHandler:
     """Non-reporting :func:`create_langchain_messages_handler`, used by this package's wrappers."""
+    max_retries = validate_max_retries(max_retries)
+    # Refused rather than ignored: the handler never constructs a model it is given, so the value
+    # would go nowhere and the caller would believe their retries had been raised.
+    if llm is not None and max_retries is not None:
+        raise ValueError(
+            "max_retries applies only to the default chat model. Set max_retries on the model "
+            "passed as llm instead."
+        )
     content_override = capture_content
 
     async def _call_impl(
@@ -852,7 +888,7 @@ def _create_langchain_messages_handler(
                     system_instructions=system_instructions,
                     messages=span_messages,
                 )
-            base_model = await _resolve_base_model(config, llm, importlib)
+            base_model = await _resolve_base_model(config, llm, importlib, max_retries)
 
             tool_defs = _build_tools(config.get("tools") or {}, tool_handlers or {})
             output_format = config.get("outputFormat")
@@ -1123,6 +1159,7 @@ def _create_langchain_messages_handler(
             variables or {},
             history,
             capture_content=effective_capture_content(content_override),
+            max_retries=max_retries,
         )
 
     return _create_handler(
@@ -1143,6 +1180,7 @@ async def _stream_gen(
     history: list[dict[str, Any]] | None = None,
     *,
     capture_content: bool = False,
+    max_retries: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Streams the run, emitting the same span tree as the blocking path.
 
@@ -1165,7 +1203,7 @@ async def _stream_gen(
     """
     import importlib
 
-    base_model = await _resolve_base_model(config, llm, importlib)
+    base_model = await _resolve_base_model(config, llm, importlib, max_retries)
 
     span = start_root_span(config, variables, capture_content=capture_content)
     parent = parent_context_of(span)
@@ -1528,17 +1566,21 @@ def langchain_messages(
     **kwargs: Any,
 ) -> Any:
     """Convenience wrapper: creates a handler and calls config(...).invoke()."""
-    # Lifted out of kwargs: capture_content and providers configure the handler, variables belong
+    # Lifted out of kwargs: capture_content, providers, and max_retries configure the handler, variables belong
     # to the invocation. Leaving them in would pass them to config(), which takes none of them, so a
     # caller asking for content on spans got a TypeError instead of content.
     report_usage("langchain-messages.langchainMessages", PACKAGE_NAME, __version__)
     variables = kwargs.pop("variables", None)
     capture_content = kwargs.pop("capture_content", None)
     providers = kwargs.pop("providers", None)
+    max_retries = kwargs.pop("max_retries", None)
     return _config(
         key=config_key,
         handler=_create_langchain_messages_handler(
-            llm, providers=providers, capture_content=capture_content
+            llm,
+            providers=providers,
+            capture_content=capture_content,
+            max_retries=max_retries,
         ),
         **kwargs,
     ).invoke(user_input, context, variables=variables)

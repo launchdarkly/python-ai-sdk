@@ -17,6 +17,7 @@ from launchdarkly_ai_server import (
     parse_json_with_possible_fences,
     parse_template,
     parse_usage,
+    validate_max_retries,
 )
 from launchdarkly_ai_server.utils import make_graph_track_data, model_parameters
 
@@ -564,3 +565,21 @@ def test_is_function_tool_rejects_a_native_tool_and_its_stub_warning_once_per_ke
         'Skipping native tool "utils-web": this handler has no built-in tool for it.',
         'Skipping native tool "utils-other": this handler has no built-in tool for it.',
     ]
+
+
+class TestValidateMaxRetries:
+    """A factory refuses a value that is not a non-negative int, naming the option."""
+
+    @pytest.mark.parametrize("value", [None, 0, 1, 7, 50])
+    def test_accepts_none_and_non_negative_ints(self, value: int | None) -> None:
+        assert validate_max_retries(value) == value
+
+    @pytest.mark.parametrize("value", [True, False, 2.0, "3", [3]])
+    def test_refuses_non_integers_with_type_error(self, value: Any) -> None:
+        with pytest.raises(TypeError, match="max_retries"):
+            validate_max_retries(value)
+
+    @pytest.mark.parametrize("value", [-1, -50])
+    def test_refuses_negatives_with_value_error(self, value: int) -> None:
+        with pytest.raises(ValueError, match="max_retries"):
+            validate_max_retries(value)
