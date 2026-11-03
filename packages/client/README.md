@@ -386,6 +386,28 @@ elif result and task.evaluation_metric_key:
     get_client().track(task.evaluation_metric_key, context, result.track_data, result.score)
 ```
 
+### Shadow requests (experimental)
+
+> **Experimental.** Import shadow requests from `launchdarkly_ai_server.experimental.shadow_requests`.
+> These names may change in a minor release, so review the changelog when you upgrade.
+
+A shadow request runs a candidate variation on real traffic without serving it. Use `shadow_config()` in place of `config()` at the call sites you want to shadow. It takes the same arguments, and `invoke()` and `stream()` return exactly what `config()` returns. When the context matches a targeting rule or the fallthrough that has shadows attached, each sampled shadow runs the same input on its own variation once the served variation succeeds. Its response is discarded. Its events are the normal `$ld:ai:*` events for that variation, with the served variation's `runId` and `isShadow: true`, so you can compare the two on the usual AI metrics. A shadow never delays or changes the served response, and its failures are only tracked.
+
+Shadows run in the background by default, each with a 30 second limit (`shadow_timeout_s`). `shutdown()` cancels any that are still running. Pass `on_task` to run them yourself instead: it receives a picklable `ShadowTask` for each sampled shadow, and `run_shadow(task, handlers)` runs it later and never raises.
+
+```python
+from launchdarkly_ai_server.experimental.shadow_requests import run_shadow, shadow_config
+
+caller = shadow_config(key="my-ai-config", handler=[openai_handler, anthropic_handler])
+result = await caller.invoke("Summarize this document", {"kind": "user", "key": "user-123"})
+
+# Or hand each shadow to your own queue, and run it from a worker.
+caller = shadow_config(key="my-ai-config", handler=handlers, on_task=queue.put_nowait)
+shadow = await run_shadow(await queue.get(), handlers)
+```
+
+A shadow runs as a plain `invoke()`, even when the served call streamed, with no tools and no judges. Pass handlers for every provider your shadow variations use, since a shadow with no matching handler is skipped. Plain `config()` never runs shadows.
+
 ### `graph(key, **options)`
 
 Runs a multi-agent workflow defined in a LaunchDarkly agent graph flag. The SDK uses a **model-driven router**: it starts at the root node, presents outgoing edges as handoff choices to the model, and follows whichever edge the model selects. The loop terminates when the model produces a final answer, a leaf is reached, a cycle is detected, or the step cap is hit.

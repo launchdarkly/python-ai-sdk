@@ -644,9 +644,7 @@ async def _stream_events(
         yield reader.start()
     if done is None:
         done = {"response": "", "usage": {}, "_had_usage": False}
-    judge_results = await judge_completed_stream(
-        instance, sink, done, user_input, context
-    )
+    judge_results = await instance._judge_stream(sink, done, user_input, context)
     for item in reader.finish(
         done,
         judge_results,

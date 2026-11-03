@@ -70,7 +70,8 @@ Experimental features are not re-exported from this package. They live in
 `launchdarkly-ai-server`, the package this one depends on, and need a `launchdarkly-ai-server`
 release that includes them. Import them from `launchdarkly_ai_server.experimental`; if that
 import fails, upgrade `launchdarkly-ai-server` itself, since upgrading this package alone can
-leave an older `launchdarkly-ai-server` in place. No feature is experimental now.
+leave an older `launchdarkly-ai-server` in place. Shadow requests is experimental, in
+`launchdarkly_ai_server.experimental.shadow_requests`.
 
 Evaluations from Code is core, so this package re-exports it. Like Agent Skills, it needs
 `launchdarkly-ai-server` 1.0.0 or later. See the
