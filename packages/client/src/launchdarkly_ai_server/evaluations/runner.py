@@ -576,19 +576,27 @@ class EvaluationsRunner:
             )
         return rows
 
-    def _create_evaluation(
+    def _evaluation_config_body(
         self,
-        project_key: str,
         key: str,
         generation: GenerationConfig,
         tools: Sequence[EvalTool],
         criteria: list[Criterion] | None = None,
-    ) -> EvaluationRef:
+        *,
+        include_key: bool,
+    ) -> dict[str, Any]:
+        """Build the offline-evaluation create/patch body for ``key``.
+
+        Create requires ``key`` + ``name``; PATCH is by path key and takes the
+        same mutable config fields as a full snapshot (no ``key`` in the body).
+        """
         body: dict[str, Any] = {
             "name": key,
             "generationProvider": generation["provider"],
             "generationModel": generation["model"],
         }
+        if include_key:
+            body["key"] = key
         if "parameters" in generation:
             body["parameters"] = generation["parameters"]
         if "instructions" in generation:
@@ -605,17 +613,105 @@ class EvaluationsRunner:
             body["tools"] = create_wire_tools(tools)
         if criteria:
             body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
+        return body
 
-        path = f"projects/{segment(project_key)}/evaluations"
-        raw = require_mapping(self._api.post(path, body=body), description="evaluation")
+    @staticmethod
+    def _evaluation_config_matches(
+        current: Mapping[str, Any], desired: Mapping[str, Any]
+    ) -> bool:
+        """Return whether ``current`` already matches the desired config snapshot.
+
+        Compares only the mutable fields the harness sends. Fields omitted from
+        ``desired`` because they are empty (``tools``, ``criteria``, optional
+        ``parameters`` / ``promptSnippets``) must also be empty or absent on
+        ``current``, so a no-op skip does not leave stale config in place.
+        """
+        for field, desired_val in desired.items():
+            current_val = current.get(field)
+            if field in ("tools", "criteria") and current_val is None:
+                current_val = []
+            if current_val != desired_val:
+                return False
+        for field in ("tools", "criteria"):
+            if field not in desired and current.get(field) not in (None, []):
+                return False
+        for field in ("parameters", "promptSnippets"):
+            if field not in desired and current.get(field) not in (None, {}):
+                return False
+        return True
+
+    def _parse_evaluation_ref(self, raw: Mapping[str, Any], key: str) -> EvaluationRef:
         evaluation_id = require_string(raw, "id", "evaluation")
-        response_key = raw.get("name", raw.get("label", key))
+        response_key = raw.get("key", raw.get("name", raw.get("label", key)))
         version = raw.get("version")
         return EvaluationRef(
             id=evaluation_id,
             key=str(response_key),
             version=version if isinstance(version, int) else None,
         )
+
+    def _get_offline_evaluation(
+        self, project_key: str, key: str
+    ) -> Mapping[str, Any] | None:
+        path = f"projects/{segment(project_key)}/offline-evaluations/{segment(key)}"
+        try:
+            return require_mapping(
+                self._api.get(path), description="offline evaluation"
+            )
+        except LDApiError as error:
+            if error.status == 404:
+                return None
+            raise
+
+    def _ensure_evaluation(
+        self,
+        project_key: str,
+        key: str,
+        generation: GenerationConfig,
+        tools: Sequence[EvalTool],
+        criteria: list[Criterion] | None = None,
+    ) -> EvaluationRef:
+        """Reconcile a keyed offline evaluation via GET → POST|PATCH.
+
+        First CI mint: GET 404 → POST ``…/offline-evaluations`` with ``key`` +
+        ``name`` (create-only). Steady state: GET 200 → PATCH only when the
+        desired config differs. A POST 409 race re-GETs and continues as the
+        update path. Runs still use legacy ``…/evaluations/{id}/runs``.
+        """
+        collection = f"projects/{segment(project_key)}/offline-evaluations"
+        create_body = self._evaluation_config_body(
+            key, generation, tools, criteria, include_key=True
+        )
+        patch_body = self._evaluation_config_body(
+            key, generation, tools, criteria, include_key=False
+        )
+
+        current = self._get_offline_evaluation(project_key, key)
+        if current is None:
+            try:
+                raw = require_mapping(
+                    self._api.post(collection, body=create_body),
+                    description="offline evaluation",
+                )
+                return self._parse_evaluation_ref(raw, key)
+            except LDApiError as error:
+                if error.status != 409:
+                    raise
+                current = self._get_offline_evaluation(project_key, key)
+                if current is None:
+                    raise EvaluationsError(
+                        f"LaunchDarkly offline evaluation {key!r} reported a "
+                        "key conflict but could not be re-fetched"
+                    ) from error
+
+        if not self._evaluation_config_matches(current, patch_body):
+            path = f"{collection}/{segment(key)}"
+            raw = require_mapping(
+                self._api.patch(path, body=patch_body),
+                description="offline evaluation",
+            )
+            return self._parse_evaluation_ref(raw, key)
+        return self._parse_evaluation_ref(current, key)
 
     def _create_evaluation_run(
         self,

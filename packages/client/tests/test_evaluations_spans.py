@@ -171,6 +171,7 @@ def one_row_transport() -> SequencedTransport:
                     "_links": {"self": {"href": "https://api.test/current"}},
                 },
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,

@@ -327,6 +327,30 @@ def test_requests_carry_token_auth_and_json_body() -> None:
     assert request["body"] == {"key": "support-qa"}
 
 
+def test_patch_sends_json_body() -> None:
+    transport = RecordingTransport(
+        [HttpResponse(status=200, body='{"id": "eval-1", "version": 2}')]
+    )
+    client = LDApiClient(api_key="api-token", transport=transport)
+
+    result = client.patch(
+        "projects/proj/offline-evaluations/support-qa",
+        body={"name": "support-qa", "generationProvider": "OpenAI"},
+    )
+
+    assert result == {"id": "eval-1", "version": 2}
+    request = transport.requests[0]
+    assert request["method"] == "PATCH"
+    assert request["url"] == (
+        f"{DEFAULT_BASE_URI}/api/v2/projects/proj/offline-evaluations/support-qa"
+    )
+    assert request["headers"]["Content-Type"] == "application/json"
+    assert request["body"] == {
+        "name": "support-qa",
+        "generationProvider": "OpenAI",
+    }
+
+
 def test_get_encodes_query_params_and_omits_none() -> None:
     transport = RecordingTransport([HttpResponse(status=200, body='{"items": []}')])
     client = LDApiClient(
