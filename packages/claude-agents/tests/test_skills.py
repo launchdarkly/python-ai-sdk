@@ -593,8 +593,6 @@ class TestQueryOptions:
         assert fake.options.tools == ["Skill"]
         assert "Skill" not in fake.options.allowed_tools
 
-        # A registered Read sentinel is not a variation tool, so it stays off.
-        # Skill is still on: the variation named a skill.
         unlisted = _FakeQuery()
         monkeypatch.setattr(handler_mod, "query", unlisted)
         await _run(handler, path, _config(("a", 1)), {"read": _read_stub()})

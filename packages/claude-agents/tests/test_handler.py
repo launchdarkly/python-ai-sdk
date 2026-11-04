@@ -2507,7 +2507,6 @@ class TestHostOptionsAndBuiltinToolSet:
         from launchdarkly_ai_server import NATIVE_TOOL_KEY
 
         # The client hands the handler a tracking stub with the sentinel stashed on it.
-        # The variation still has to name the key; registration alone does not enable it.
         read, bash = MagicMock(), MagicMock()
         setattr(read, NATIVE_TOOL_KEY, ClaudeRead)
         setattr(bash, NATIVE_TOOL_KEY, ClaudeBash)
