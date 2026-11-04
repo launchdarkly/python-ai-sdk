@@ -240,10 +240,17 @@ def _partition_tools(
     user_config_tools: dict[str, Any] = {}
 
     for ld_name, stub in tool_handlers.items():
+        # The variation's tool keys are the allowlist. ``tool_handlers`` is the
+        # application's whole registry, including this package's built-in
+        # sentinels, so a key the variation does not declare is not offered.
+        # Missing and ``{}`` both enable nothing. Same rule as OpenCode's
+        # ``_plan_tools`` and the JS handler's ``partitionTools``.
+        if not config_tools or ld_name not in config_tools:
+            continue
         native = getattr(stub, NATIVE_TOOL_KEY, None)
         if isinstance(native, NativeTool):
             native_tool_map[native.tool_name] = stub
-        elif config_tools and ld_name in config_tools:
+        else:
             user_config_tools[ld_name] = config_tools[ld_name]
 
     return native_tool_map, user_config_tools, list(native_tool_map.keys())
