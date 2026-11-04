@@ -92,6 +92,14 @@ PRs are squash-merged with the PR title as the commit message, and release-pleas
 - **A breaking experimental change** uses `!` while the package is 0.x: `feat(beta)!:` bumps the minor version, which is what an experimental break is allowed. After 1.0, `!` would force a major release. Use `feat(beta):` without `!` instead, and say the change is breaking in the title.
 - **When a feature is promoted to core,** remove its rows from `changelog-sections`.
 
+## Cross-SDK Spec
+
+The behavioural spec for every SDK language is `TESTING.md` in `launchdarkly/ai-sdks-monorepo`, which also holds the `api-surface/` lists and `EXPERIMENTAL.md`.
+
+- **Check the spec before opening a PR that changes observable behaviour:** span names, span attributes or events, event payloads, error and retry semantics, handler or tool contracts, or public API. Grep `TESTING.md` for the affected section.
+- **If the change contradicts the spec or adds behaviour it doesn't cover,** open a companion PR in `ai-sdks-monorepo` and link it from the SDK PR.
+- **A change made in one language only** flags the spec with `<!-- verify: <language> -->`, and gets a parity follow-up in `launchdarkly/js-ai-sdk` (TypeScript).
+
 ## Package Hierarchy
 
 The monorepo is organized into three tiers plus a convenience barrel. Dependencies only flow **downward** — never sideways between packages in the same tier, and never upward.
