@@ -126,11 +126,12 @@ def record_evaluation_result(
     ``explanation`` is the criterion reason. It is written only when capture is
     on for this call, the same gate as the online judge. The reason still
     travels on the criterion event either way. This does not add a prompt, a
-    completion, or a tool payload.
+    completion, or a tool payload. Every criterion scores from 0 to 1, so the
+    event carries that range.
     """
     if not _resolved_capture(capture):
         explanation = None
-    _record_evaluation(span, name, score, explanation)
+    _record_evaluation(span, name, score, explanation, score_range=(0.0, 1.0))
 
 
 def _tracer() -> trace.Tracer:
@@ -146,10 +147,15 @@ def set_row_attributes(span: Span, run_id: str, row_index: int) -> None:
 
 
 def start_row_span(run_id: str, row_index: int) -> Span:
-    """Open the row's root span. The caller ends it after the row's criteria."""
+    """Open the row's root span. The caller ends it after the row's criteria.
+
+    ``invoke_workflow`` marks it as the run's envelope, so a viewer reads a
+    failed row as a failed run even when every span under it succeeded.
+    """
     span = _tracer().start_span(
         ROW_SPAN_NAME, context=trace.set_span_in_context(trace.INVALID_SPAN)
     )
+    span.set_attribute("gen_ai.operation.name", "invoke_workflow")
     set_row_attributes(span, run_id, row_index)
     return span
 

@@ -77,6 +77,7 @@ from .tools import (
     ToolImplementation,
     create_wire_tools,
     handler_config_tools,
+    return_tool_errors,
 )
 from .types import (
     DatasetRef,
@@ -753,7 +754,7 @@ class EvaluationsRunner:
             # One per row, not per run: rows generate concurrently against the
             # same tool map, so a shared recorder would splice their calls.
             recorder = TrajectoryRecorder()
-            row_tool_handlers = recorder.wrap(tool_handlers)
+            row_tool_handlers = return_tool_errors(recorder.wrap(tool_handlers))
             row_span: Any = trace.get_current_span()
             if row_spans is not None:
                 row_span = start_row_span(evaluation_run_id, row.row_index)

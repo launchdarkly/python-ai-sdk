@@ -352,7 +352,7 @@ async def test_plain_function_row_is_one_trace_with_the_exchange_tools_and_judge
 
     (row,) = by_name["launchdarkly.dataset_row"]
     assert row.parent is None
-    assert "gen_ai.operation.name" not in (row.attributes or {})
+    assert (row.attributes or {})["gen_ai.operation.name"] == "invoke_workflow"
     (evaluate,) = by_name["evaluate $ld:ai:judge:accuracy"]
     (tool,) = by_name["execute_tool lookup_order"]
     generation_chat, judge_chat = sorted(
@@ -915,3 +915,32 @@ def test_offline_spans_follow_the_capture_content_gate(
         assert "Where is Paris?" in str(kept["gen_ai.input.messages"])
     finally:
         _reset_for_testing()
+
+
+def test_row_root_is_an_invoke_workflow_envelope(
+    span_export: tuple[InMemorySpanExporter, list[str]],
+) -> None:
+    """A viewer reads the row root as the run's envelope, so a failed row shows as failed."""
+    exporter, _flushed = span_export
+    start_row_span(_RUN_ID, _ROW_INDEX).end()
+
+    (row,) = spans_by_name(exporter)["launchdarkly.dataset_row"]
+    assert (row.attributes or {})["gen_ai.operation.name"] == "invoke_workflow"
+
+
+def test_evaluation_result_carries_the_zero_to_one_range(
+    span_export: tuple[InMemorySpanExporter, list[str]],
+) -> None:
+    exporter, _flushed = span_export
+    evaluate = otel_trace.get_tracer("@launchdarkly/ai-server").start_span(
+        "evaluate accuracy"
+    )
+    record_evaluation_result(evaluate, "accuracy", 0.5)
+    evaluate.end()
+
+    (span,) = spans_by_name(exporter)["evaluate accuracy"]
+    (event,) = [e for e in span.events if e.name == "gen_ai.evaluation.result"]
+    attributes = event.attributes or {}
+    assert attributes["gen_ai.evaluation.score.value"] == 0.5
+    assert attributes["launchdarkly.evaluation.score.min"] == 0.0
+    assert attributes["launchdarkly.evaluation.score.max"] == 1.0
