@@ -11,10 +11,11 @@ Text deltas go to stdout. Run and tool events go to stderr, the same split as
 ``conversation_id`` and iterated outside it, the same shape as
 ``examples/streaming.py``.
 
-``TOOL_CALL_ARGS`` deltas and ``TOOL_CALL_RESULT`` content are empty unless
-``capture_content`` is on, through ``configure(options=SDKOptions(capture_content=True))``
-or the handler factory's ``capture_content=True``. The tool name and call id are
-always sent.
+``capture_content`` is on by default. Turn it off with
+``configure(options=SDKOptions(capture_content=False))`` or the handler
+factory's ``capture_content=False``: no ``TOOL_CALL_ARGS`` events are sent and
+``TOOL_CALL_RESULT`` content is ``""``. The tool name and call id are always
+sent.
 
 Usage (via main.py):
     python main.py agui-stream <flag-key> "<user input>"
