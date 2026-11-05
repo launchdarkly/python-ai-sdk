@@ -208,7 +208,7 @@ Call `init_client()` explicitly when you want to:
 - Initialize at startup before the first AI call (e.g. to avoid latency on the first request)
 - Fail fast at boot if `LD_SDK_KEY` is missing, rejected, or LaunchDarkly is unreachable
 
-A failed initialization is not cached, so the process recovers without a restart once LaunchDarkly is reachable again. The cost is that while it is not, every call that initializes lazily, `inspect_config()` included, waits up to 10 seconds for a new LaunchDarkly client before it fails, and concurrent calls each build their own in a worker thread. To keep an outage from adding that wait to every request, call `init_client()` at startup and handle its error there.
+A failed initialization is not cached, so the process recovers without a restart once LaunchDarkly is reachable again. The cost is that while it is not, every call that initializes lazily, `inspect_config()` included, waits up to 10 seconds for a new LaunchDarkly client before it fails. Concurrent calls share one attempt, so they build one client between them and all get its failure. To keep an outage from adding that wait to every request, call `init_client()` at startup and handle its error there.
 
 ```python
 import asyncio
