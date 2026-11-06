@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-1.0.0...launchdarkly-ai-server-1.0.0) (2026-11-06)
+
+
+### Experimental
+
+* **shadow-requests:** add experimental shadow_config wrapper ([#250](https://github.com/launchdarkly/python-ai-sdk/issues/250)) ([8b81491](https://github.com/launchdarkly/python-ai-sdk/commit/8b81491b46dfbbfce132f98cdb49320281ff2d3c))
+
+
+### Features
+
+* add max_retries to the messages handler factories ([#214](https://github.com/launchdarkly/python-ai-sdk/issues/214)) ([c08aea8](https://github.com/launchdarkly/python-ai-sdk/commit/c08aea84a6ef4558e6b943f4a302496f7f24d898))
+* **evaluations:** return tool errors to the model and mark eval spans for viewers ([#271](https://github.com/launchdarkly/python-ai-sdk/issues/271)) ([2ebda1d](https://github.com/launchdarkly/python-ai-sdk/commit/2ebda1d1ab949b4a2d9b2b0d1c366adffe4f738a))
+
+
+### Bug Fixes
+
+* **client:** concurrent first init_client calls share one attempt ([#255](https://github.com/launchdarkly/python-ai-sdk/issues/255)) ([b97b385](https://github.com/launchdarkly/python-ai-sdk/commit/b97b3850ade7693a45b7687fae221c170355af99))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-server-0.5.0...launchdarkly-ai-server-1.0.0) (2026-10-30)
 
 

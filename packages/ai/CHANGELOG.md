@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-1.0.0...launchdarkly-ai-python-1.0.0) (2026-11-06)
+
+
+### Experimental
+
+* **shadow-requests:** add experimental shadow_config wrapper ([#250](https://github.com/launchdarkly/python-ai-sdk/issues/250)) ([8b81491](https://github.com/launchdarkly/python-ai-sdk/commit/8b81491b46dfbbfce132f98cdb49320281ff2d3c))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-python-0.4.0...launchdarkly-ai-python-1.0.0) (2026-10-30)
 
 
