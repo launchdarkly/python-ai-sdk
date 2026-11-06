@@ -438,7 +438,7 @@ class EvaluationsModule:
             dataset_ref = DatasetRef(id=None, key=None)
             dataset_rows = [_render_inline_row(row) for row in inline_rows]
         evaluation = await asyncio.to_thread(
-            self._runner._create_evaluation,
+            self._runner._ensure_evaluation,
             self._project_key,
             key,
             run_generation,
