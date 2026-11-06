@@ -597,8 +597,12 @@ class EvaluationsRunner:
         }
         if include_key:
             body["key"] = key
-        if "parameters" in generation:
-            body["parameters"] = generation["parameters"]
+        # Always send parameters/promptSnippets — including {} — so a PATCH
+        # snapshot can clear previously set values (omitting the field leaves
+        # the old value on the evaluation).
+        body["parameters"] = (
+            generation["parameters"] if "parameters" in generation else {}
+        )
         if "instructions" in generation:
             body["messages"] = [
                 {"role": "system", "content": generation["instructions"]}
@@ -607,8 +611,11 @@ class EvaluationsRunner:
             body["messages"] = generation["messages"]
         else:
             body["messages"] = []
-        if "prompt_snippets" in generation:
-            body["promptSnippets"] = generation["prompt_snippets"]
+        body["promptSnippets"] = (
+            generation["prompt_snippets"]
+            if "prompt_snippets" in generation
+            else {}
+        )
         # Always send tools/criteria — including [] — so a PATCH snapshot can
         # clear pins that ingest still expects results for.
         body["tools"] = create_wire_tools(tools)
@@ -681,8 +688,10 @@ class EvaluationsRunner:
                     ) from error
 
         path = f"{collection}/{segment(key)}"
+        # Full-snapshot PATCH is idempotent: replaying the same body is a
+        # server no-op when nothing changed, so transient 5xx may be retried.
         raw = require_mapping(
-            self._api.patch(path, body=patch_body),
+            self._api.patch(path, body=patch_body, idempotent=True),
             description="offline evaluation",
         )
         return self._parse_evaluation_ref(raw, key)

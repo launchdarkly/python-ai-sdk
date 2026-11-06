@@ -327,6 +327,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "generationModel": "gpt-4o",
         "parameters": {"temperature": 0.2},
         "messages": [{"role": "system", "content": "Help the user."}],
+        "promptSnippets": {},
         "tools": [{"key": "lookup_order", "version": 7, "source": "library"}],
         "criteria": [],
     }
@@ -5719,11 +5720,45 @@ async def test_run_always_patches_existing_offline_evaluation() -> None:
         "name": "support-qa",
         "generationProvider": "OpenAI",
         "generationModel": "gpt-4o",
+        "parameters": {},
         "messages": [],
+        "promptSnippets": {},
         "tools": [],
         "criteria": [],
     }
     assert "key" not in patch["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_patches_empty_parameters_and_prompt_snippets_to_clear() -> None:
+    """Absent generation settings still send {} so PATCH clears prior values."""
+    existing = _existing_offline_evaluation(
+        parameters={"temperature": 0.9},
+        promptSnippets={"tone": "formal"},
+    )
+    patched = _existing_offline_evaluation(version=4)
+    transport = SequencedTransport(
+        _reuse_run_responses(existing, response(200, patched))
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    patch = next(
+        request for request in transport.requests if request["method"] == "PATCH"
+    )
+    assert patch["body"]["parameters"] == {}
+    assert patch["body"]["promptSnippets"] == {}
 
 
 @pytest.mark.asyncio
