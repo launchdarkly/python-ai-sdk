@@ -406,6 +406,20 @@ class TestPartitionTools:
         assert native_names == ["WebSearch"]
         assert user_tools == {}
 
+    def test_native_tool_absent_from_the_variation_is_not_enabled(self) -> None:
+        from launchdarkly_ai_claude_agents.builtins import ClaudeWebSearch
+        from launchdarkly_ai_server import NATIVE_TOOL_KEY
+
+        stub = lambda: None  # noqa: E731
+        setattr(stub, NATIVE_TOOL_KEY, ClaudeWebSearch)
+        for config_tools in (None, {}, {"other": {"name": "other"}}):
+            native_map, user_tools, native_names = _partition_tools(
+                config_tools, {"webSearch": stub}
+            )
+            assert native_map == {}
+            assert user_tools == {}
+            assert native_names == []
+
     def test_native_tool_aliases_map_ld_key_to_provider_name(self) -> None:
         from launchdarkly_ai_claude_agents.builtins import ClaudeWebSearch
         from launchdarkly_ai_server import NATIVE_TOOL_KEY
@@ -2496,14 +2510,45 @@ class TestHostOptionsAndBuiltinToolSet:
         read, bash = MagicMock(), MagicMock()
         setattr(read, NATIVE_TOOL_KEY, ClaudeRead)
         setattr(bash, NATIVE_TOOL_KEY, ClaudeBash)
+        handlers = {"read": read, "bash": bash}
+        listed = {
+            **BASE_CONFIG,
+            "tools": {
+                "read": {"name": "read", "type": "function", "parameters": {}},
+                "bash": {"name": "bash", "type": "function", "parameters": {}},
+            },
+        }
         opts = await _query_options(
             monkeypatch,
             create_claude_agents_handler(),
             path,
-            BASE_CONFIG,
-            {"read": read, "bash": bash},
+            listed,
+            handlers,
         )
         assert sorted(opts.tools) == ["Bash", "Read"]
+
+        for config in (
+            BASE_CONFIG,
+            {**BASE_CONFIG, "tools": {}},
+            {
+                **BASE_CONFIG,
+                "tools": {
+                    "search": {
+                        "name": "search",
+                        "type": "function",
+                        "parameters": {},
+                    }
+                },
+            },
+        ):
+            omitted = await _query_options(
+                monkeypatch,
+                create_claude_agents_handler(),
+                path,
+                config,
+                handlers,
+            )
+            assert omitted.tools == []
 
 
 class TestAbandonedToolSpansAreNotErrors:

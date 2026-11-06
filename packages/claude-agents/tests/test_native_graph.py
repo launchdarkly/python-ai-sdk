@@ -496,6 +496,7 @@ class TestToClaudeAgentsHostIsolation:
     @staticmethod
     async def _root_options(
         tool_handlers: dict[str, Any] | None = None,
+        graph_def: GraphDefinition | None = None,
     ) -> dict[str, Any]:
         mock_sdk = _make_sdk_mock("done")
         captured: list[dict[str, Any]] = []
@@ -509,7 +510,7 @@ class TestToClaudeAgentsHostIsolation:
             ),
         ):
             await to_claude_agents(
-                _make_def_promise(_make_graph_def()),
+                _make_def_promise(graph_def or _make_graph_def()),
                 opts={"tool_handlers": tool_handlers or {}},
             ).invoke("hi")
         assert len(captured) == 1
@@ -581,8 +582,35 @@ class TestToClaudeAgentsHostIsolation:
         assert opts["tools"] == []
 
     @pytest.mark.asyncio
-    async def test_sends_the_native_tool_names(self) -> None:
+    async def test_does_not_enable_a_native_tool_the_variation_omits(self) -> None:
         opts = await self._root_options({"run-bash": NativeTool("Bash")})
+        assert opts["tools"] == []
+
+    async def test_sends_the_native_tool_names(self) -> None:
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": "claude-3"},
+                        "instructions": "be helpful",
+                        "tools": {
+                            "run-bash": {
+                                "name": "run-bash",
+                                "type": "function",
+                                "parameters": {},
+                            }
+                        },
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+        opts = await self._root_options(
+            {"run-bash": NativeTool("Bash")}, graph_def=graph_def
+        )
         assert opts["tools"] == ["Bash"]
 
     @pytest.mark.asyncio
