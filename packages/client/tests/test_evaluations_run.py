@@ -328,6 +328,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "parameters": {"temperature": 0.2},
         "messages": [{"role": "system", "content": "Help the user."}],
         "tools": [{"key": "lookup_order", "version": 7, "source": "library"}],
+        "criteria": [],
     }
     assert transport.requests[6]["url"].endswith(
         "/api/v2/projects/proj/evaluations/11111111-1111-1111-1111-111111111111/runs"
@@ -4505,7 +4506,8 @@ async def test_an_empty_tools_list_runs_a_variation_with_no_tools() -> None:
         tools=[],
     )
 
-    assert "tools" not in evaluation_post(transport)
+    assert evaluation_post(transport)["tools"] == []
+    assert evaluation_post(transport)["criteria"] == []
 
 
 @pytest.mark.asyncio
@@ -5675,43 +5677,9 @@ def _reuse_run_responses(
 
 
 @pytest.mark.asyncio
-async def test_run_reuses_existing_offline_evaluation_without_patch() -> None:
-    """GET 200 with matching config skips PATCH and creates only a new run."""
-    transport = SequencedTransport(_reuse_run_responses(_existing_offline_evaluation()))
-    evals = init_evaluations(
-        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
-    )
-
-    async def handler(*args: object) -> dict[str, Any]:
-        return {"output": "ok"}
-
-    result = await evals.run(
-        key="support-qa",
-        dataset="golden",
-        handler=tagged(handler),
-        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
-    )
-
-    assert result.passed is True
-    assert recorded_paths(transport) == [
-        ("GET", "projects/proj/datasets/golden"),
-        ("GET", "projects/proj/datasets/golden/rows"),
-        ("GET", "projects/proj/offline-evaluations/support-qa"),
-        ("POST", "projects/proj/evaluations/evaluation-id/runs"),
-        ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
-    ]
-    assert not any(
-        request["method"] == "POST"
-        and request["url"].rstrip("/").endswith("/offline-evaluations")
-        for request in transport.requests
-    )
-    assert not any(request["method"] == "PATCH" for request in transport.requests)
-
-
-@pytest.mark.asyncio
-async def test_run_patches_offline_evaluation_when_config_differs() -> None:
-    """GET 200 with a different config PATCHes a full snapshot, then creates a run."""
-    existing = _existing_offline_evaluation(generationModel="gpt-4o-mini")
+async def test_run_always_patches_existing_offline_evaluation() -> None:
+    """GET 200 always PATCHes the full desired snapshot; server owns equality."""
+    existing = _existing_offline_evaluation()
     patched = _existing_offline_evaluation(version=4)
     transport = SequencedTransport(
         _reuse_run_responses(existing, response(200, patched))
@@ -5739,6 +5707,11 @@ async def test_run_patches_offline_evaluation_when_config_differs() -> None:
         ("POST", "projects/proj/evaluations/evaluation-id/runs"),
         ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
     ]
+    assert not any(
+        request["method"] == "POST"
+        and request["url"].rstrip("/").endswith("/offline-evaluations")
+        for request in transport.requests
+    )
     patch = next(
         request for request in transport.requests if request["method"] == "PATCH"
     )
@@ -5747,6 +5720,8 @@ async def test_run_patches_offline_evaluation_when_config_differs() -> None:
         "generationProvider": "OpenAI",
         "generationModel": "gpt-4o",
         "messages": [],
+        "tools": [],
+        "criteria": [],
     }
     assert "key" not in patch["body"]
 

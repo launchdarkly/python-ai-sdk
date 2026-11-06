@@ -609,36 +609,13 @@ class EvaluationsRunner:
             body["messages"] = []
         if "prompt_snippets" in generation:
             body["promptSnippets"] = generation["prompt_snippets"]
-        if tools:
-            body["tools"] = create_wire_tools(tools)
-        if criteria:
-            body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
+        # Always send tools/criteria — including [] — so a PATCH snapshot can
+        # clear pins that ingest still expects results for.
+        body["tools"] = create_wire_tools(tools)
+        body["criteria"] = [
+            criterion.to_criteria_wire() for criterion in (criteria or [])
+        ]
         return body
-
-    @staticmethod
-    def _evaluation_config_matches(
-        current: Mapping[str, Any], desired: Mapping[str, Any]
-    ) -> bool:
-        """Return whether ``current`` already matches the desired config snapshot.
-
-        Compares only the mutable fields the harness sends. Fields omitted from
-        ``desired`` because they are empty (``tools``, ``criteria``, optional
-        ``parameters`` / ``promptSnippets``) must also be empty or absent on
-        ``current``, so a no-op skip does not leave stale config in place.
-        """
-        for field, desired_val in desired.items():
-            current_val = current.get(field)
-            if field in ("tools", "criteria") and current_val is None:
-                current_val = []
-            if current_val != desired_val:
-                return False
-        for field in ("tools", "criteria"):
-            if field not in desired and current.get(field) not in (None, []):
-                return False
-        for field in ("parameters", "promptSnippets"):
-            if field not in desired and current.get(field) not in (None, {}):
-                return False
-        return True
 
     def _parse_evaluation_ref(self, raw: Mapping[str, Any], key: str) -> EvaluationRef:
         evaluation_id = require_string(raw, "id", "evaluation")
@@ -674,9 +651,10 @@ class EvaluationsRunner:
         """Reconcile a keyed offline evaluation via GET → POST|PATCH.
 
         First CI mint: GET 404 → POST ``…/offline-evaluations`` with ``key`` +
-        ``name`` (create-only). Steady state: GET 200 → PATCH only when the
-        desired config differs. A POST 409 race re-GETs and continues as the
-        update path. Runs still use legacy ``…/evaluations/{id}/runs``.
+        ``name`` (create-only). Steady state: GET 200 → always PATCH the full
+        desired snapshot; the server decides whether anything changed. A POST
+        409 race re-GETs and continues as the update path. Runs still use
+        legacy ``…/evaluations/{id}/runs``.
         """
         collection = f"projects/{segment(project_key)}/offline-evaluations"
         create_body = self._evaluation_config_body(
@@ -686,8 +664,7 @@ class EvaluationsRunner:
             key, generation, tools, criteria, include_key=False
         )
 
-        current = self._get_offline_evaluation(project_key, key)
-        if current is None:
+        if self._get_offline_evaluation(project_key, key) is None:
             try:
                 raw = require_mapping(
                     self._api.post(collection, body=create_body),
@@ -697,21 +674,18 @@ class EvaluationsRunner:
             except LDApiError as error:
                 if error.status != 409:
                     raise
-                current = self._get_offline_evaluation(project_key, key)
-                if current is None:
+                if self._get_offline_evaluation(project_key, key) is None:
                     raise EvaluationsError(
                         f"LaunchDarkly offline evaluation {key!r} reported a "
                         "key conflict but could not be re-fetched"
                     ) from error
 
-        if not self._evaluation_config_matches(current, patch_body):
-            path = f"{collection}/{segment(key)}"
-            raw = require_mapping(
-                self._api.patch(path, body=patch_body),
-                description="offline evaluation",
-            )
-            return self._parse_evaluation_ref(raw, key)
-        return self._parse_evaluation_ref(current, key)
+        path = f"{collection}/{segment(key)}"
+        raw = require_mapping(
+            self._api.patch(path, body=patch_body),
+            description="offline evaluation",
+        )
+        return self._parse_evaluation_ref(raw, key)
 
     def _create_evaluation_run(
         self,
