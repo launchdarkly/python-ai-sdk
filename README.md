@@ -97,6 +97,16 @@ From 1.0.0 every package in this SDK is released at the same version, so install
 
 Every third-party floor sits on the release line CI tests: the same major as the tested version for a 1.x or later library, the same minor for a 0.x one, where a minor release may break. A floor that was below that line was raised to the tested version; a floor already on it stayed where it was.
 
+<!-- experimental-features:start (generated; do not edit by hand) -->
+## Experimental features
+
+These features are experimental. Their names and behavior may change in a minor release, and every change is listed under **Experimental** in the changelog.
+
+| Feature | What it does | Import from | Changelog scope |
+| --- | --- | --- | --- |
+| [Shadow requests](packages/client/README.md#shadow-requests-experimental) | Run another AI Config variation in the background on the same input and report it as its own metrics, without changing the response. | `launchdarkly_ai_server.experimental.shadow_requests` | `shadow-requests` |
+<!-- experimental-features:end -->
+
 ## Quick Start
 
 ### 1. Install
