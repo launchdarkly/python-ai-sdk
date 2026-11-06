@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-litellm-messages-1.0.0...launchdarkly-ai-litellm-messages-1.0.0) (2026-11-06)
+
+
+### Features
+
+* add max_retries to the messages handler factories ([#214](https://github.com/launchdarkly/python-ai-sdk/issues/214)) ([c08aea8](https://github.com/launchdarkly/python-ai-sdk/commit/c08aea84a6ef4558e6b943f4a302496f7f24d898))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-litellm-messages-0.2.0...launchdarkly-ai-litellm-messages-1.0.0) (2026-10-30)
 
 
