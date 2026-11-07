@@ -247,6 +247,19 @@ class TestNativeAgent:
         lookup.assert_awaited_once_with({"key": "x"})
 
     @pytest.mark.asyncio
+    async def test_a_registered_tool_the_config_does_not_attach_is_not_given(
+        self, ai_runtime: MagicMock
+    ) -> None:
+        config = {
+            **CONFIG,
+            "tools": {"safe": {"description": "d", "parameters": {"type": "object"}}},
+        }
+        handlers = {"safe": AsyncMock(), "privileged": AsyncMock()}
+        await create_vercel_agents_handler()(config, "hello", handlers)
+        tools = ai_runtime.Agent.call_args.kwargs["tools"]
+        assert [tool.name for tool in tools] == ["safe"]
+
+    @pytest.mark.asyncio
     async def test_agent_receives_model_settings_as_request_params(
         self, ai_runtime: MagicMock
     ) -> None:

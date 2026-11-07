@@ -271,6 +271,21 @@ class TestAgentToolsAndRun:
         await tools[0].on_invoke_tool(SimpleNamespace(), '{"city":"Austin"}')
         weather.assert_awaited_once_with({"city": "Austin"})
 
+    async def test_a_registered_tool_the_config_does_not_attach_is_not_given(
+        self,
+    ) -> None:
+        agents = _agents_module()
+        config = {
+            **CONFIG,
+            "tools": {"safe": {"description": "d", "parameters": {}}},
+        }
+        handlers = {"safe": AsyncMock(), "privileged": AsyncMock()}
+        with _patch_agents(agents):
+            await create_litellm_agents_handler(model_factory=lambda *_: object())(
+                config, "q", handlers
+            )
+        assert [tool.name for tool in FakeAgent.created[0]["tools"]] == ["safe"]
+
     async def test_runner_receives_agent_prompt_and_max_turns(self) -> None:
         run = AsyncMock(
             return_value=SimpleNamespace(
