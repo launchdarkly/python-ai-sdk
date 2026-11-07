@@ -157,16 +157,15 @@ def _exposed_tool_keys(
 ) -> list[str]:
     """The tool keys this config offered the model, in declaration order.
 
-    The map handed to a handler can be wider -- ``config()`` merges a
-    ``Registry``'s tools in -- and only the offered set belongs in a trajectory.
-    Doubles as the "Tools available" list itself: a tool the config declares
-    but no implementation was registered for is still one the model could
-    call, so it belongs there even though the recorder can never observe it.
-    Excludes a routed graph node's synthetic ``__handoff_`` tools, for the
-    same reason ``TrajectoryRecorder.wrap`` excludes them from what it
-    records, and a ``NativeTool``: the provider executes it directly, so no
-    local recording is possible and listing it as available would read as
-    unused even when the model used it.
+    Doubles as the "Tools available" list itself, so it holds only what the
+    model could call: a config tool with a function implementation. A tool the
+    config declares but nothing implements is never offered, so listing it
+    would show a judge a tool the model never had. Excludes a routed graph
+    node's synthetic ``__handoff_`` tools, for the same reason
+    ``TrajectoryRecorder.wrap`` excludes them from what it records, and a
+    ``NativeTool``: the provider executes it directly, so no local recording is
+    possible and listing it as available would read as unused even when the
+    model used it.
     """
     tools = config.get("tools") if isinstance(config, dict) else None
     if not isinstance(tools, dict):
@@ -176,6 +175,7 @@ def _exposed_tool_keys(
         key
         for key in tools
         if not key.startswith(HANDOFF_TOOL_PREFIX)
+        and callable(handlers.get(key))
         and not isinstance(handlers.get(key), NativeTool)
     ]
 

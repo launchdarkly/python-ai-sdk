@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
-from launchdarkly_ai_server import NativeTool, ProviderHandler, config, graph
+from launchdarkly_ai_server import NativeTool, ProviderHandler, Registry, config, graph
 from launchdarkly_ai_server.tracking import execute_and_stream, execute_and_track
 
 CONTEXT = {"kind": "user", "key": "u1"}
@@ -160,16 +160,19 @@ async def test_config_scopes_tools_and_registry_tools(
         return_value=_variation({"safe": _tool("safe")})
     )
     seen: list[dict[str, Any]] = []
+    privileged = MagicMock()
     instance = config(
         key="flag",
         handler=_capturing_handler(seen),
-        tool_handlers={"safe": MagicMock(), "privileged": MagicMock()},
+        tool_handlers={"safe": MagicMock()},
+        registry=Registry(tools={"privileged": privileged, "safe": MagicMock()}),
     )
     if path == "invoke":
         await instance.invoke("q", CONTEXT)
     else:
         async for _ in instance.stream("q", CONTEXT):
             pass
+    privileged.assert_not_called()
     assert [set(m) for m in seen] == [{"safe"}]
 
 
