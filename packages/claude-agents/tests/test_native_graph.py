@@ -496,6 +496,7 @@ class TestToClaudeAgentsHostIsolation:
     @staticmethod
     async def _root_options(
         tool_handlers: dict[str, Any] | None = None,
+        attached: list[str] | None = None,
     ) -> dict[str, Any]:
         mock_sdk = _make_sdk_mock("done")
         captured: list[dict[str, Any]] = []
@@ -508,8 +509,22 @@ class TestToClaudeAgentsHostIsolation:
                 mock_sdk if n == "claude_agent_sdk" else __import__(n)
             ),
         ):
+            # The root attaches *attached*, or else every tool the test registers.
+            keys = attached if attached is not None else list(tool_handlers or {})
+            tools = {k: {"name": k, "type": "function"} for k in keys}
+            root = {
+                "key": "root",
+                "config": {
+                    "model": {"name": "claude-3"},
+                    "instructions": "be helpful",
+                    "tools": tools,
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [],
+                "is_terminal": True,
+            }
             await to_claude_agents(
-                _make_def_promise(_make_graph_def()),
+                _make_def_promise(_make_graph_def(nodes={"root": root})),
                 opts={"tool_handlers": tool_handlers or {}},
             ).invoke("hi")
         assert len(captured) == 1
@@ -584,6 +599,16 @@ class TestToClaudeAgentsHostIsolation:
     async def test_sends_the_native_tool_names(self) -> None:
         opts = await self._root_options({"run-bash": NativeTool("Bash")})
         assert opts["tools"] == ["Bash"]
+
+    @pytest.mark.asyncio
+    async def test_a_registered_native_tool_the_node_does_not_attach_is_not_sent(
+        self,
+    ) -> None:
+        opts = await self._root_options(
+            {"read": NativeTool("Read"), "run-bash": NativeTool("Bash")},
+            attached=["read"],
+        )
+        assert opts["tools"] == ["Read"]
 
     @pytest.mark.asyncio
     async def test_loads_no_host_settings_and_sends_no_cwd_by_default(self) -> None:
