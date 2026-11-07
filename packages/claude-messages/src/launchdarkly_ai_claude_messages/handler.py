@@ -259,8 +259,9 @@ def _build_tools(
             "input_schema": tool.get("parameters", {}),
         }
         for name, tool in config_tools.items()
-        # A missing handler still reaches the model; a NativeTool never does.
-        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
+        # Only a config tool with a function handler is offered: a missing handler or a
+        # NativeTool never reaches the model.
+        if is_function_tool(tool_handlers.get(name), name)
     ]
 
 
@@ -400,10 +401,9 @@ async def _run_tool_loop(
     *run_usage* is owned by the caller rather than created here, so a turn that raises does not take
     the run's spend with it.
     """
-    # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
-    # difference predates this span work and changes what the model is offered, not what the span
-    # reports, so it stays as it is: the catalog recorded below is the catalog actually sent.
     tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
+    # A tool name in a model response is untrusted: resolve it only against what was offered.
+    offered = {tool["name"] for tool in tools}
     extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)
     conversation = list(messages)
@@ -505,7 +505,11 @@ async def _run_tool_loop(
                     tool_span, capture_content, arguments=block.input
                 )
                 try:
-                    handler_fn = tool_handlers.get(block.name)
+                    handler_fn = (
+                        (tool_handlers or {}).get(block.name)
+                        if block.name in offered
+                        else None
+                    )
                     if not handler_fn or not callable(handler_fn):
                         raise ValueError(
                             f'No handler registered for tool "{block.name}"'
@@ -759,6 +763,8 @@ async def _stream_gen(
     )
 
     tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
+    # A tool name in a model response is untrusted: resolve it only against what was offered.
+    offered = {tool["name"] for tool in tools}
     tool_definitions = to_tool_definitions(tools)
     extra_params = _forwarded_parameters(config)
     max_tokens = extra_params.pop("max_tokens", 1024)
@@ -899,7 +905,11 @@ async def _stream_gen(
                     tool_span, capture_content, arguments=block.input
                 )
                 try:
-                    handler_fn = tool_handlers.get(block.name)
+                    handler_fn = (
+                        (tool_handlers or {}).get(block.name)
+                        if block.name in offered
+                        else None
+                    )
                     if not handler_fn or not callable(handler_fn):
                         raise ValueError(
                             f'No handler registered for tool "{block.name}"'

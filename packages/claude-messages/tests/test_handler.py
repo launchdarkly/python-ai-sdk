@@ -93,6 +93,11 @@ CONFIG = {
     "provider": {"name": "Anthropic"},
     "instructions": "Be helpful.",
 }
+# A handler offers, and runs, only the tools its config attaches.
+CONFIG_WITH_TOOL = {
+    **CONFIG,
+    "tools": {"myTool": {"type": "function", "parameters": {}}},
+}
 
 
 @pytest.fixture
@@ -320,7 +325,7 @@ class TestToolConversion:
             },
         }
         h = create_claude_messages_handler()
-        await h(config, "q", {}, {})
+        await h(config, "q", {name: lambda _: "" for name in config["tools"]}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         tools = call_kwargs.get("tools", [])
         assert len(tools) == 1
@@ -339,7 +344,7 @@ class TestToolConversion:
             },
         }
         h = create_claude_messages_handler()
-        await h(config, "q", {}, {})
+        await h(config, "q", {name: lambda _: "" for name in config["tools"]}, {})
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         assert len(call_kwargs.get("tools", [])) == 2
 
@@ -370,7 +375,7 @@ class TestToolConversion:
             },
         }
         h = create_claude_messages_handler()
-        await h(config, "q", {}, {})
+        await h(config, "q", {name: lambda _: "" for name in config["tools"]}, {})
         tools = mock_anthropic.messages.create.call_args.kwargs.get("tools", [])
         assert "custom" in tools[0]["input_schema"].get("properties", {})
 
@@ -890,7 +895,7 @@ class TestSpanTree:
 
         with ctx:
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "result"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "result"}, {}
             )
         assert len(rec.named("chat ")) == 2
 
@@ -910,7 +915,7 @@ class TestSpanTree:
 
         with ctx:
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "result"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "result"}, {}
             )
         tools = rec.named("execute_tool ")
         assert len(tools) == 1
@@ -936,7 +941,7 @@ class TestSpanTree:
 
         with ctx:
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert rec.named("execute_tool ")[0].context == ("context-of", rec.root)
 
@@ -954,7 +959,7 @@ class TestSpanTree:
 
         with ctx:
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
 
@@ -1033,7 +1038,7 @@ class TestRootSpanAttributes:
         variables = {"__ld": {"configKey": "k", "variationKey": "v", "runId": "r"}}
         with ctx:
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, variables
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, variables
             )
         for child in rec.spans[1:]:
             assert not [k for k in child.attributes if k.startswith("launchdarkly.")]
@@ -1060,7 +1065,7 @@ class TestRootSpanAttributes:
 
         with ctx:
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 30
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 3
@@ -1160,7 +1165,7 @@ class TestChatSpanAttributes:
 
         with ctx:
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         first = rec.named("chat ")[0]
         assert first.attributes["gen_ai.response.finish_reasons"] == ["tool_calls"]
@@ -1289,7 +1294,7 @@ class TestContentCapture:
 
         with ctx:
             await create_claude_messages_handler(capture_content=True)(
-                CONFIG, "q", {"myTool": lambda _: "72F"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "72F"}, {}
             )
         tool = rec.named("execute_tool ")[0]
         assert tool.attributes["gen_ai.tool.call.arguments"] == '{"city": "NYC"}'
@@ -1370,7 +1375,9 @@ class TestErrorHandling:
         from launchdarkly_ai_claude_messages import create_claude_messages_handler
 
         with ctx, pytest.raises(RuntimeError, match="tool exploded"):
-            await create_claude_messages_handler()(CONFIG, "q", {"myTool": _boom}, {})
+            await create_claude_messages_handler()(
+                CONFIG_WITH_TOOL, "q", {"myTool": _boom}, {}
+            )
         tool = rec.named("execute_tool ")[0]
         assert len(tool.exceptions) == 1
         assert StatusCode.ERROR in tool.statuses
@@ -1396,7 +1403,7 @@ class TestErrorHandling:
 
         with ctx, pytest.raises(RuntimeError):
             await create_claude_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 40
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 7
@@ -1637,7 +1644,12 @@ class TestStreaming:
                 return [
                     event
                     async for event in await handler.stream(
-                        CONFIG, "q", {"search": search}
+                        {
+                            **CONFIG,
+                            "tools": {"search": {"type": "function", "parameters": {}}},
+                        },
+                        "q",
+                        {"search": search},
                     )
                 ]
 
@@ -1726,7 +1738,15 @@ class TestStreaming:
         ):
             handler = create_claude_messages_handler()
             async for event in await handler.stream(
-                CONFIG, "q", {"boom": boom, "later": lambda _args: "ok"}
+                {
+                    **CONFIG,
+                    "tools": {
+                        "boom": {"type": "function", "parameters": {}},
+                        "later": {"type": "function", "parameters": {}},
+                    },
+                },
+                "q",
+                {"boom": boom, "later": lambda _args: "ok"},
             ):
                 seen.append(event)
         results = {
@@ -2368,7 +2388,7 @@ class TestToolSpanNeverLeaks:
 
         with ctx, pytest.raises(TypeError):
             await create_claude_messages_handler(capture_content=True)(
-                CONFIG, "q", {"myTool": lambda _: _Unserialisable()}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: _Unserialisable()}, {}
             )
 
         tool_spans = rec.named("execute_tool ")
@@ -2421,7 +2441,7 @@ class TestOpenToolSpanIsNeverLeaked:
         ctx, rec = _recording()
         with ctx, pytest.raises(asyncio.CancelledError):
             async for _ in await create_claude_messages_handler().stream(
-                CONFIG, "q", {"myTool": _cancelled_tool}
+                CONFIG_WITH_TOOL, "q", {"myTool": _cancelled_tool}
             ):
                 pass
 
@@ -3292,3 +3312,67 @@ class TestMaxRetries:
         assert factory.call_args.kwargs["max_retries"] == 6
         # config() takes no such argument, so leaving it in kwargs would raise TypeError.
         assert "max_retries" not in fake_config.call_args.kwargs
+
+
+_SAFE_TOOL = {"safe": {"type": "function", "parameters": {}}}
+
+
+class TestUnofferedToolsFailClosed:
+    """A tool name in a model response is untrusted. The handler resolves it only
+    against the tools it offered, and raises naming the tool otherwise: a name
+    registered nowhere, a registered tool the config does not attach, and an
+    attribute name all fail, and no registered handler runs."""
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    @pytest.mark.parametrize("name", ["ghost", "privileged", "__class__"])
+    async def test_rejects_a_tool_it_did_not_offer(
+        self, mock_anthropic: MagicMock, path: str, name: str
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        privileged = MagicMock(return_value="ran")
+        handlers = {"safe": MagicMock(return_value="ok"), "privileged": privileged}
+        config = {**CONFIG, "tools": _SAFE_TOOL}
+        h = create_claude_messages_handler()
+        with pytest.raises(ValueError, match=f'tool "{name}"'):
+            if path == "invoke":
+                mock_anthropic.messages.create = AsyncMock(
+                    return_value=_anthropic_response(
+                        [_tool_use_block(name)], stop_reason="tool_use"
+                    )
+                )
+                await h(config, "q", handlers, {})
+            else:
+                ctx, final = _make_stream_context([])
+                final.stop_reason = "tool_use"
+                final.content = [_tool_use_block(name)]
+                mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+                async for _ in await h.stream(config, "q", handlers, {}):
+                    pass
+        privileged.assert_not_called()
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_offers_only_config_tools_with_a_function_handler(
+        self, mock_anthropic: MagicMock, path: str
+    ) -> None:
+        from launchdarkly_ai_claude_messages import create_claude_messages_handler
+
+        config = {
+            **CONFIG,
+            "tools": {**_SAFE_TOOL, "missing": {"type": "function", "parameters": {}}},
+        }
+        handlers = {"safe": MagicMock(), "privileged": MagicMock()}
+        h = create_claude_messages_handler()
+        if path == "invoke":
+            mock_anthropic.messages.create = AsyncMock(
+                return_value=_anthropic_response([_text_block("done")])
+            )
+            await h(config, "q", handlers, {})
+            sent = mock_anthropic.messages.create.call_args.kwargs["tools"]
+        else:
+            ctx, _ = _make_stream_context(["done"])
+            mock_anthropic.messages.stream = MagicMock(return_value=ctx)
+            async for _ in await h.stream(config, "q", handlers, {}):
+                pass
+            sent = mock_anthropic.messages.stream.call_args.kwargs["tools"]
+        assert [t["name"] for t in sent] == ["safe"]
