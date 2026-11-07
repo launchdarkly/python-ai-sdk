@@ -210,10 +210,6 @@ def _build_agent_tools(
     config_tools: dict[str, Any],
     tool_handlers: Mapping[str, Callable[..., Any] | NativeTool],
 ) -> list[Any]:
-    # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK, which
-    # excludes an unregistered tool from the catalog entirely. This difference predates the span
-    # work and changes what the model is offered, not what a span reports, so it is left as it is;
-    # `to_tool_definitions` below records the catalog actually sent, whatever it is.
     import importlib
 
     agents_mod = importlib.import_module("agents")
@@ -221,8 +217,9 @@ def _build_agent_tools(
 
     result = []
     for name, tool_cfg in config_tools.items():
-        # A missing handler still reaches the model; a NativeTool never does.
-        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+        # Only a config tool with a function handler is offered: a missing handler or a
+        # NativeTool never reaches the model.
+        if not is_function_tool(tool_handlers.get(name), name):
             continue
 
         # on_invoke_tool receives (ToolContext, json_args_str); decode and dispatch.

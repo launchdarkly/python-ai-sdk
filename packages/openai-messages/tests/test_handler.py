@@ -95,6 +95,17 @@ CONFIG = {
 }
 
 
+def _with_tools(config: dict[str, Any], *names: str) -> dict[str, Any]:
+    """*config* attaching *names*: a handler offers, and runs, only attached tools."""
+    return {
+        **config,
+        "tools": {n: {"type": "function", "parameters": {}} for n in names},
+    }
+
+
+CONFIG_WITH_TOOL = _with_tools(CONFIG, "myTool")
+
+
 @pytest.fixture
 def mock_openai(mocker):
     mock_client = MagicMock()
@@ -299,7 +310,7 @@ class TestToolConversion:
             },
         }
         h = create_openai_messages_handler()
-        await h(config, "q", {}, {})
+        await h(config, "q", {name: lambda _: "" for name in config["tools"]}, {})
         kwargs = mock_openai.responses.create.call_args.kwargs
         tools = kwargs.get("tools", [])
         assert len(tools) == 1
@@ -317,7 +328,7 @@ class TestToolConversion:
             },
         }
         h = create_openai_messages_handler()
-        await h(config, "q", {}, {})
+        await h(config, "q", {name: lambda _: "" for name in config["tools"]}, {})
         tools = mock_openai.responses.create.call_args.kwargs.get("tools", [])
         assert len(tools) == 2
 
@@ -575,7 +586,7 @@ class TestSpanTree:
 
         with ctx:
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "result"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "result"}, {}
             )
         assert len(rec.named("chat ")) == 2
 
@@ -593,7 +604,7 @@ class TestSpanTree:
 
         with ctx:
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "result"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "result"}, {}
             )
         tools = rec.named("execute_tool ")
         assert len(tools) == 1
@@ -616,7 +627,7 @@ class TestSpanTree:
 
         with ctx:
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert rec.named("execute_tool ")[0].context == ("context-of", rec.root)
 
@@ -632,7 +643,7 @@ class TestSpanTree:
 
         with ctx:
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert [s.ended for s in rec.spans] == [1] * len(rec.spans)
 
@@ -709,7 +720,7 @@ class TestRootSpanAttributes:
         variables = {"__ld": {"configKey": "k", "variationKey": "v", "runId": "r"}}
         with ctx:
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, variables
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, variables
             )
         for child in rec.spans[1:]:
             assert not [k for k in child.attributes if k.startswith("launchdarkly.")]
@@ -733,7 +744,7 @@ class TestRootSpanAttributes:
 
         with ctx:
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 30
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 3
@@ -799,7 +810,7 @@ class TestChatSpanAttributes:
 
         with ctx:
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         first = rec.named("chat ")[0]
         assert first.attributes["gen_ai.response.finish_reasons"] == ["tool_calls"]
@@ -1048,7 +1059,7 @@ class TestContentCapture:
 
         with ctx:
             await create_openai_messages_handler(capture_content=True)(
-                CONFIG, "q", {"myTool": lambda _: "72F"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "72F"}, {}
             )
         tool = rec.named("execute_tool ")[0]
         assert tool.attributes["gen_ai.tool.call.arguments"] == '{"city": "NYC"}'
@@ -1124,7 +1135,9 @@ class TestErrorHandling:
         from launchdarkly_ai_openai_messages import create_openai_messages_handler
 
         with ctx, pytest.raises(RuntimeError, match="tool exploded"):
-            await create_openai_messages_handler()(CONFIG, "q", {"myTool": _boom}, {})
+            await create_openai_messages_handler()(
+                CONFIG_WITH_TOOL, "q", {"myTool": _boom}, {}
+            )
         tool = rec.named("execute_tool ")[0]
         assert len(tool.exceptions) == 1
         assert StatusCode.ERROR in tool.statuses
@@ -1148,7 +1161,7 @@ class TestErrorHandling:
 
         with ctx, pytest.raises(RuntimeError):
             await create_openai_messages_handler()(
-                CONFIG, "q", {"myTool": lambda _: "r"}, {}
+                CONFIG_WITH_TOOL, "q", {"myTool": lambda _: "r"}, {}
             )
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 40
         assert rec.root.attributes["gen_ai.usage.output_tokens"] == 7
@@ -1687,7 +1700,7 @@ class TestStreaming:
                 return [
                     event
                     async for event in await handler.stream(
-                        CONFIG, "q", {"search": search}
+                        _with_tools(CONFIG, "search"), "q", {"search": search}
                     )
                 ]
 
@@ -1730,7 +1743,9 @@ class TestStreaming:
             seen: list[dict[str, Any]] = []
             with pytest.raises(RuntimeError, match="nope"):
                 async for event in await handler.stream(
-                    CONFIG, "q", {"boom": boom, "later": lambda _args: "ok"}
+                    _with_tools(CONFIG, "boom", "later"),
+                    "q",
+                    {"boom": boom, "later": lambda _args: "ok"},
                 ):
                     seen.append(event)
         results = {
@@ -2682,7 +2697,7 @@ class TestOpenToolSpanIsNeverLeaked:
         ctx, rec = _recording()
         with ctx, pytest.raises(asyncio.CancelledError):
             async for _ in await create_openai_messages_handler().stream(
-                CONFIG, "q", {"my-tool": _cancelled_tool}
+                _with_tools(CONFIG, "my-tool"), "q", {"my-tool": _cancelled_tool}
             ):
                 pass
 
@@ -3180,3 +3195,61 @@ class TestMaxRetries:
         assert factory.call_args.kwargs["max_retries"] == 6
         # config() takes no such argument, so leaving it in kwargs would raise TypeError.
         assert "max_retries" not in fake_config.call_args.kwargs
+
+
+class TestUnofferedToolsFailClosed:
+    """A tool name in a model response is untrusted. The handler resolves it only
+    against the tools it offered, and raises naming the tool otherwise: a name
+    registered nowhere, a registered tool the config does not attach, and an
+    attribute name all fail, and no registered handler runs."""
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    @pytest.mark.parametrize("name", ["ghost", "privileged", "__class__"])
+    async def test_rejects_a_tool_it_did_not_offer(
+        self, mock_openai: MagicMock, path: str, name: str
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        privileged = MagicMock(return_value="ran")
+        handlers = {"safe": MagicMock(return_value="ok"), "privileged": privileged}
+        config = _with_tools(CONFIG, "safe")
+        h = create_openai_messages_handler()
+        with pytest.raises(ValueError, match=f'tool "{name}"'):
+            if path == "invoke":
+                mock_openai.responses.create = AsyncMock(
+                    return_value=_make_response(
+                        tool_calls=[{"name": name, "call_id": "c1"}]
+                    )
+                )
+                await h(config, "q", handlers, {})
+            else:
+                mock_openai.responses.stream = MagicMock(
+                    return_value=_make_openai_stream_context(
+                        [], output=[_function_call_item(name, "c1", {})]
+                    )
+                )
+                async for _ in await h.stream(config, "q", handlers, {}):
+                    pass
+        privileged.assert_not_called()
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_offers_only_config_tools_with_a_function_handler(
+        self, mock_openai: MagicMock, path: str
+    ) -> None:
+        from launchdarkly_ai_openai_messages import create_openai_messages_handler
+
+        config = _with_tools(CONFIG, "safe", "missing")
+        handlers = {"safe": MagicMock(), "privileged": MagicMock()}
+        h = create_openai_messages_handler()
+        if path == "invoke":
+            mock_openai.responses.create = AsyncMock(return_value=_make_response())
+            await h(config, "q", handlers, {})
+            sent = mock_openai.responses.create.call_args.kwargs["tools"]
+        else:
+            mock_openai.responses.stream = MagicMock(
+                return_value=_make_openai_stream_context(["done"])
+            )
+            async for _ in await h.stream(config, "q", handlers, {}):
+                pass
+            sent = mock_openai.responses.stream.call_args.kwargs["tools"]
+        assert [t["name"] for t in sent] == ["safe"]

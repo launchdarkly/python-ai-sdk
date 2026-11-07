@@ -91,6 +91,14 @@ CONFIG = {
 }
 
 
+def _with_tools(config: dict[str, Any], *names: str) -> dict[str, Any]:
+    """*config* attaching *names*: a handler offers, and runs, only attached tools."""
+    return {
+        **config,
+        "tools": {n: {"type": "function", "parameters": {}} for n in names},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Span recording, mirroring launchdarkly_ai_claude_messages' test approach.
 # ---------------------------------------------------------------------------
@@ -368,7 +376,7 @@ class TestToolConversion:
         }
         llm = _make_llm()
         h = create_langchain_messages_handler(llm=llm)
-        await h(config, "q", {}, {})
+        await h(config, "q", {name: lambda _: "" for name in config["tools"]}, {})
         llm.bind_tools.assert_called_once()
         tools_arg = llm.bind_tools.call_args[0][0]
         assert any(t.get("function", {}).get("name") == "search" for t in tools_arg)
@@ -386,7 +394,7 @@ class TestToolConversion:
         }
         llm = _make_llm()
         h = create_langchain_messages_handler(llm=llm)
-        await h(config, "q", {}, {})
+        await h(config, "q", {name: lambda _: "" for name in config["tools"]}, {})
         tools_arg = llm.bind_tools.call_args[0][0]
         assert len(tools_arg) == 3
 
@@ -1328,7 +1336,7 @@ class TestStreaming:
         events = [
             event
             async for event in await handler.stream(
-                CONFIG, "q", {"search": lambda _args: "found"}
+                _with_tools(CONFIG, "search"), "q", {"search": lambda _args: "found"}
             )
         ]
         results = {
@@ -1394,7 +1402,7 @@ class TestStreaming:
         events = [
             event
             async for event in await handler.stream(
-                CONFIG, "q", {"search": lambda _args: "found"}
+                _with_tools(CONFIG, "search"), "q", {"search": lambda _args: "found"}
             )
         ]
         args = "".join(
@@ -1457,7 +1465,9 @@ class TestStreaming:
         events = [
             event
             async for event in await handler.stream(
-                CONFIG, "q", {"search": search, "other": other}
+                _with_tools(CONFIG, "search", "other"),
+                "q",
+                {"search": search, "other": other},
             )
         ]
         starts = [
@@ -1936,7 +1946,7 @@ class TestStreamingUsageReported:
         llm = self._two_turn_llm(first_turn_usage=False)
         with ctx, pytest.raises(RuntimeError):
             async for _ in await create_langchain_messages_handler(llm=llm).stream(
-                CONFIG, "q", {"search": lambda _: "ok"}
+                _with_tools(CONFIG, "search"), "q", {"search": lambda _: "ok"}
             ):
                 pass
         # Zeros here would assert the run cost nothing. It is unknown, so nothing is written.
@@ -1950,7 +1960,7 @@ class TestStreamingUsageReported:
         llm = self._two_turn_llm(first_turn_usage=True)
         with ctx, pytest.raises(RuntimeError):
             async for _ in await create_langchain_messages_handler(llm=llm).stream(
-                CONFIG, "q", {"search": lambda _: "ok"}
+                _with_tools(CONFIG, "search"), "q", {"search": lambda _: "ok"}
             ):
                 pass
         assert rec.root.attributes["gen_ai.usage.input_tokens"] == 12
@@ -2107,7 +2117,7 @@ class TestOpenToolSpanIsNeverLeaked:
         ctx, rec = _recording()
         with ctx, pytest.raises(asyncio.CancelledError):
             async for _ in await create_langchain_messages_handler(llm=llm).stream(
-                CONFIG, "q", {"myTool": _cancelled_tool}
+                _with_tools(CONFIG, "myTool"), "q", {"myTool": _cancelled_tool}
             ):
                 pass
 
@@ -3303,3 +3313,64 @@ class TestMaxRetries:
         assert factory.call_args.kwargs["max_retries"] == 6
         # config() takes no such argument, so leaving it in kwargs would raise TypeError.
         assert "max_retries" not in fake_config.call_args.kwargs
+
+
+class TestUnofferedToolsFailClosed:
+    """A tool name in a model response is untrusted. The handler resolves it only
+    against the tools it offered, and raises naming the tool otherwise: a name
+    registered nowhere, a registered tool the config does not attach, and an
+    attribute name all fail, and no registered handler runs."""
+
+    @staticmethod
+    def _llm(name: str) -> MagicMock:
+        llm = _make_llm()
+        llm.bind_tools = MagicMock(return_value=llm)
+        msg = FakeAIMessage(tool_calls=[{"name": name, "id": "tc1", "args": {}}])
+        llm.ainvoke = AsyncMock(return_value=msg)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield msg
+
+        llm.astream = _astream
+        return llm
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    @pytest.mark.parametrize("name", ["ghost", "privileged", "__class__"])
+    async def test_rejects_a_tool_it_did_not_offer(self, path: str, name: str) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        privileged = MagicMock(return_value="ran")
+        handlers = {"safe": MagicMock(return_value="ok"), "privileged": privileged}
+        h = create_langchain_messages_handler(llm=self._llm(name))
+        config = _with_tools(CONFIG, "safe")
+        with pytest.raises(ValueError, match=f'tool "{name}"'):
+            if path == "invoke":
+                await h(config, "q", handlers, {})
+            else:
+                async for _ in await h.stream(config, "q", handlers, {}):
+                    pass
+        privileged.assert_not_called()
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_offers_only_config_tools_with_a_function_handler(
+        self, path: str
+    ) -> None:
+        from launchdarkly_ai_langchain_messages import create_langchain_messages_handler
+
+        llm = _make_llm()
+        llm.bind_tools = MagicMock(return_value=llm)
+
+        async def _astream(_msgs: Any) -> AsyncGenerator[Any, None]:
+            yield FakeAIMessage("done")
+
+        llm.astream = _astream
+        h = create_langchain_messages_handler(llm=llm)
+        config = _with_tools(CONFIG, "safe", "missing")
+        handlers = {"safe": MagicMock(), "privileged": MagicMock()}
+        if path == "invoke":
+            await h(config, "q", handlers, {})
+        else:
+            async for _ in await h.stream(config, "q", handlers, {}):
+                pass
+        (sent,) = llm.bind_tools.call_args.args
+        assert [t["function"]["name"] for t in sent] == ["safe"]

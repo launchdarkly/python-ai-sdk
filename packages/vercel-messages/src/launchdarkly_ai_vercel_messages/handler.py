@@ -296,14 +296,13 @@ async def _tool_result(
     parent: Any,
 ) -> Any:
     handler = executors.get(call.tool_name)
-    if handler is None:
-        return ai.tool_result_part(
-            call.tool_call_id,
-            tool_name=call.tool_name,
-            result=f"No handler registered for tool {call.tool_name!r}",
-            is_error=True,
-        )
     tool_span = start_tool_span(call.tool_name, call.tool_call_id, parent)
+    if handler is None:
+        # The tool name is untrusted model output. A name that was not offered fails the run,
+        # as in every other handler; it is not handed back to the model to retry.
+        error = ValueError(f'No handler registered for tool "{call.tool_name}"')
+        fail_span(tool_span, error)
+        raise error
     try:
         result = await _call_tool(handler, _tool_args(call))
     except BaseException as exc:
