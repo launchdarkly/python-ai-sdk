@@ -338,7 +338,14 @@ async def test_helpers_called_from_user_handler_and_tool_still_report(
     method: str,
 ) -> None:
     """Code the application passes in is outside the SDK, under invoke and stream alike."""
-    installed = await _install(_ENABLED_CONFIG)
+    installed = await _install(
+        {
+            **_ENABLED_CONFIG,
+            "tools": {
+                "lookup": {"name": "lookup", "type": "function", "parameters": {}}
+            },
+        }
+    )
     try:
 
         async def _lookup() -> str:

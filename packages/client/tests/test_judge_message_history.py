@@ -288,7 +288,11 @@ async def test_a_native_tool_is_not_recorded_online_either(
 
     result = await execute_and_track(
         config_key="c",
-        config={"model": {"name": "m"}, "provider": {"name": "TestProvider"}},
+        config={
+            "model": {"name": "m"},
+            "provider": {"name": "TestProvider"},
+            "tools": {"web_search": {"type": "function", "parameters": {}}},
+        },
         meta={"variationKey": "v", "version": 1},
         user_context=CONTEXT,
         handler=handler,  # type: ignore[arg-type]

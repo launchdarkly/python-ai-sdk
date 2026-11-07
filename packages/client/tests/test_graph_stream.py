@@ -608,7 +608,9 @@ class TestGraphStream:
         async def stream_fn(
             config, user_input, tool_handlers, variables, history=None
         ) -> AsyncGenerator:  # type: ignore[override]
-            await (tool_handlers or {})["lookup"]({"id": "A1"})
+            # Only the root attaches lookup, so only the root is handed it.
+            if "lookup" in (tool_handlers or {}):
+                await tool_handlers["lookup"]({"id": "A1"})
             yield {"type": "chunk", "text": "ok"}
             yield {"type": "done", "output": "ok", "usage": _usage}
 
@@ -797,7 +799,9 @@ class TestGraphStreamMultiEdge:
         async def stream_fn(
             config, user_input, tool_handlers, variables, history=None
         ) -> AsyncGenerator:  # type: ignore[override]
-            await (tool_handlers or {})["lookup"]({"id": "A1"})
+            # Only the root attaches lookup, so only the root is handed it.
+            if "lookup" in (tool_handlers or {}):
+                await tool_handlers["lookup"]({"id": "A1"})
             handoff = (tool_handlers or {}).get("__handoff_agent_b")
             if handoff:
                 handoff()
