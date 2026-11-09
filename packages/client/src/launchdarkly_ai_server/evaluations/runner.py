@@ -691,6 +691,8 @@ class EvaluationsRunner:
         self._api.post(path, idempotent=True)
 
     def _run_ref(self, raw: Mapping[str, Any]) -> EvaluationRunRef:
+        raw_verdict = raw.get("verdict")
+        verdict = parse_verdict(raw_verdict)
         return EvaluationRunRef(
             id=require_string(raw, "id", "evaluation run"),
             evaluation_id=require_string(raw, "evaluationId", "evaluation run"),
@@ -700,7 +702,12 @@ class EvaluationsRunner:
                 if raw.get("statusReason") is not None
                 else None
             ),
-            verdict=parse_verdict(raw.get("verdict")),
+            verdict=verdict,
+            unrecognized_verdict=(
+                str(raw_verdict)
+                if raw_verdict is not None and verdict is None
+                else None
+            ),
         )
 
     def _get_evaluation_run(

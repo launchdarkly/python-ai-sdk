@@ -591,9 +591,10 @@ class EvaluationsModule:
         Only called when the summary reports a pass rate threshold, so a
         verdict is expected. It is recorded just after the run completes, so
         the first read can still miss it. Recording is best-effort on the
-        server, so a verdict that never arrives, or a read that fails, gives
-        ``None`` and a warning rather than an error: the rows are already
-        accounted for, and ``passed`` falls back to the row counts.
+        server, so a verdict that never arrives, one this release does not
+        recognise, or a read that fails, gives ``None`` and a warning rather
+        than an error: the rows are already accounted for, and ``passed``
+        falls back to the row counts.
         """
         deadline = time.monotonic() + VERDICT_POLL_TIMEOUT_SECONDS
         while True:
@@ -614,6 +615,16 @@ class EvaluationsModule:
                 return None
             if run.verdict is not None:
                 return run.verdict
+            if run.unrecognized_verdict is not None:
+                # LaunchDarkly has ruled, with a verdict this release does not
+                # know. It is written once, so waiting longer cannot help.
+                logger.warning(
+                    "Evaluation run %s has verdict %r, which this SDK does not "
+                    "recognise. The result is judged on row counts instead.",
+                    run_id,
+                    run.unrecognized_verdict,
+                )
+                return None
             if run.state in _UNJUDGED_RUN_STATES:
                 return None
             remaining = deadline - time.monotonic()

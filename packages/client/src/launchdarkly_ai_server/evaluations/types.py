@@ -271,6 +271,7 @@ class EvaluationRunRef:
     state: str
     status_reason: str | None = None
     verdict: EvalVerdict | None = None
+    unrecognized_verdict: str | None = None
 
 
 #: LaunchDarkly's ruling on a criterion or a run against its pass rate

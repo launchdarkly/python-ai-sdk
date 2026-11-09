@@ -5773,6 +5773,33 @@ async def test_run_stops_waiting_for_a_verdict_on_a_cancelled_run(
 
 
 @pytest.mark.asyncio
+async def test_run_stops_waiting_on_an_unrecognised_verdict(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A verdict this release does not know is still a ruling, written once, so
+    run() stops reading at once rather than waiting out the deadline for a
+    verdict that will never change. The default deadline is left in place so
+    a harness that kept polling would make more than one request."""
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [run_item(verdict="maybe"), run_item(verdict="maybe")],
+    )
+
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.evaluations"):
+        result = await run_with_pass_rate(transport)
+
+    assert result.verdict is None
+    assert result.passed is False
+    assert len(get_run_requests(transport)) == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("'maybe'" in message for message in messages)
+    assert not any("seconds" in message for message in messages)
+
+
+@pytest.mark.asyncio
 async def test_run_does_not_raise_when_the_verdict_read_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
