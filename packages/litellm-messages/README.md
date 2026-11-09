@@ -34,7 +34,10 @@ result = await config(
 ```
 
 The evaluated AI Config model name is passed directly to LiteLLM, so standard
-LiteLLM model prefixes, gateways, and aliases are supported. Tool calls,
+LiteLLM model prefixes, gateways, and aliases are supported. The one rewrite is
+for Bedrock: a `bedrock/...` name, or a bare name when the provider is Bedrock,
+gets `model.region` (`us`, `global`, ...) prepended to the model id as its
+cross-region inference-profile prefix, unless the id already has one. Tool calls,
 structured output, multimodal history, and streaming are supported without
 constructing a provider-native client.
 
