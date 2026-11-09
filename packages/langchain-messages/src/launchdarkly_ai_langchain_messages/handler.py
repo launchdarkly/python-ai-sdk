@@ -39,7 +39,7 @@ from launchdarkly_ai_server import (
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.utils import bedrock_model_id, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -576,10 +576,7 @@ def _resolved_model_name(config: AiConfigRep, fallback_name: str = "") -> str:
     provider = str((config.get("provider") or {}).get("name") or "").lower()
     if provider != "bedrock":
         return name
-    prefix = str(model.get("region") or "")
-    if not prefix or name.startswith(f"{prefix}."):
-        return name
-    return f"{prefix}.{name}"
+    return bedrock_model_id(name, model.get("region"))
 
 
 def _config_for_model_call(config: AiConfigRep) -> AiConfigRep:
