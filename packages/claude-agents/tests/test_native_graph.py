@@ -540,14 +540,20 @@ class TestToClaudeAgentsHostIsolation:
             nodes={
                 "root": {
                     "key": "root",
-                    "config": {"model": {"name": "claude-3"}, "instructions": "root"},
+                    "config": {
+                        "model": {"name": "claude-root"},
+                        "instructions": "root",
+                    },
                     "meta": {"variationKey": "v1", "version": 1},
                     "edges": [{"source_key": "root", "target_key": "leaf"}],
                     "is_terminal": False,
                 },
                 "leaf": {
                     "key": "leaf",
-                    "config": {"model": {"name": "claude-3"}, "instructions": "leaf"},
+                    "config": {
+                        "model": {"name": "claude-leaf"},
+                        "instructions": "leaf",
+                    },
                     "meta": {"variationKey": "v1", "version": 1},
                     "edges": [],
                     "is_terminal": True,
@@ -609,6 +615,12 @@ class TestToClaudeAgentsHostIsolation:
             attached=["read"],
         )
         assert opts["tools"] == ["Read"]
+
+    @pytest.mark.asyncio
+    async def test_sends_each_node_its_configured_model(self) -> None:
+        root, leaf = await self._root_and_leaf_options()
+        assert root["model"] == "claude-root"
+        assert leaf["model"] == "claude-leaf"
 
     @pytest.mark.asyncio
     async def test_loads_no_host_settings_and_sends_no_cwd_by_default(self) -> None:

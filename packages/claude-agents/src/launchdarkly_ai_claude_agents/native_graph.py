@@ -170,6 +170,7 @@ async def _run_query(
 
     options = ClaudeAgentOptions(
         **params,
+        model=node.config["model"]["name"],
         # Explicitly set the available built-in tools (empty list disables all).
         # When no native tools are needed, disable built-in tools so Claude
         # cannot call WebSearch/Bash/etc. and get stuck waiting for permission
