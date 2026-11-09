@@ -162,12 +162,12 @@ inspect_config(config_key: str, context: dict[str, Any]) -> dict[str, Any]  [asy
 is_content_blocks(content: MessageContent) -> bool
 is_function_tool(handler: Any, name: str) -> TypeGuard[Callable[..., Any]]
 Judge  [class, @dataclass(frozen=True)]
-  __init__(key: str, threshold: float | None = DEFAULT_JUDGE_THRESHOLD, pass_rate_threshold: float | None = None, ground_truth_context: str | None = None)
+  __init__(key: str, threshold: float | None = DEFAULT_JUDGE_THRESHOLD, pass_rate_threshold: float | None = DEFAULT_PASS_RATE_THRESHOLD, ground_truth_context: str | None = None)
   __post_init__() -> None
   criterion_type: str  [property]
   ground_truth_context: str | None = None
   key: str
-  pass_rate_threshold: float | None = None
+  pass_rate_threshold: float | None = DEFAULT_PASS_RATE_THRESHOLD
   threshold: float | None = DEFAULT_JUDGE_THRESHOLD
   to_criteria_wire() -> dict[str, Any]
 JudgeResult  [class, @dataclass]
@@ -316,12 +316,12 @@ RunUsage  [class, @dataclass]
   reported: bool  [property]
   total: SpanUsage = field(default_factory=SpanUsage)
 Scorer  [class, @dataclass(frozen=True)]
-  __init__(name: str, fn: ScorerFn, threshold: float | None = 1.0, pass_rate_threshold: float | None = None, success_direction: SuccessDirection = 'higher_is_better')
+  __init__(name: str, fn: ScorerFn, threshold: float | None = 1.0, pass_rate_threshold: float | None = DEFAULT_PASS_RATE_THRESHOLD, success_direction: SuccessDirection = 'higher_is_better')
   __post_init__() -> None
   criterion_type: str  [property]
   fn: ScorerFn
   name: str
-  pass_rate_threshold: float | None = None
+  pass_rate_threshold: float | None = DEFAULT_PASS_RATE_THRESHOLD
   success_direction: SuccessDirection = 'higher_is_better'
   threshold: float | None = 1.0
   to_criteria_wire() -> dict[str, Any]
