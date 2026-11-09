@@ -35,7 +35,7 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.utils import litellm_model_name, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 
@@ -135,7 +135,7 @@ def _value(value: Any, name: str, default: Any = None) -> Any:
 
 
 def _model_name(config_value: AiConfigRep) -> str:
-    return str((config_value.get("model") or {}).get("name") or "")
+    return litellm_model_name(config_value)
 
 
 #: LiteLLM routes that build an OpenAI SDK client, the only code in LiteLLM that reads

@@ -39,7 +39,7 @@ from launchdarkly_ai_server import (
 )
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.utils import litellm_model_name, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 
@@ -149,13 +149,12 @@ def _model_config(config_value: AiConfigRep) -> tuple[str, dict[str, Any]]:
     """The model name and the forwarded ``model.parameters``: the ``ModelSettings`` keys plus
     ``max_turns`` for the run. The handler and the native graph both call this, so they forward
     the same keys."""
-    model = config_value.get("model") or {}
     parameters = select_forwarded_parameters(
         model_parameters(config_value),
         _MODEL_SETTINGS_FORWARDED_KEYS | {"max_turns"},
         mapping_keys=_MODEL_SETTINGS_MAPPING_KEYS,
     )
-    return str(model.get("name") or ""), parameters
+    return litellm_model_name(config_value), parameters
 
 
 def _litellm_model(

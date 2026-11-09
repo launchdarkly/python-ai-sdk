@@ -193,6 +193,67 @@ def validate_max_retries(max_retries: int | None) -> int | None:
     return max_retries
 
 
+#: Cross-region inference-profile prefixes Bedrock accepts in front of a model id.
+BEDROCK_INFERENCE_PROFILE_PREFIXES = (
+    "global.",
+    "us.",
+    "eu.",
+    "jp.",
+    "apac.",
+    "au.",
+    "us-gov.",
+)
+
+
+def bedrock_model_id(model_id: str, region: Any) -> str:
+    """
+    Returns a Bedrock *model_id* with ``model.region`` prepended once as its
+    cross-region inference-profile prefix: ``("anthropic.claude-x", "us")`` is
+    ``"us.anthropic.claude-x"``.
+
+    AI Config variations store that prefix (``us``, ``global``, ...) in
+    ``model.region``. *model_id* is returned unchanged when *region* is empty,
+    when it already starts with a cross-region prefix or with *region*, and for
+    an ARN. Callers decide whether the model is a Bedrock one; this never looks
+    at the provider.
+    """
+    prefix = region.strip().rstrip(".") if isinstance(region, str) else ""
+    if (
+        not prefix
+        or not model_id
+        or model_id.startswith(BEDROCK_INFERENCE_PROFILE_PREFIXES)
+        or model_id.startswith((f"{prefix}.", "arn:"))
+    ):
+        return model_id
+    return f"{prefix}.{model_id}"
+
+
+def litellm_model_name(config: AiConfigRep) -> str:
+    """
+    Returns the LiteLLM ``model`` string for *config*, with a Bedrock
+    ``model.region`` applied through :func:`bedrock_model_id`.
+
+    A ``bedrock/`` name gets the prefix on its last segment, so
+    ``bedrock/anthropic.claude-x`` and ``bedrock/converse/anthropic.claude-x``
+    both work. A bare name gets it only when the provider is Bedrock. Any other
+    name, and any name containing an ARN, is returned as configured.
+    """
+    model = config.get("model") if isinstance(config, dict) else None
+    model = model if isinstance(model, dict) else {}
+    name = str(model.get("name") or "")
+    region = model.get("region")
+    if name.startswith("bedrock/"):
+        if "arn:" in name:
+            return name
+        route, _, model_id = name.rpartition("/")
+        return f"{route}/{bedrock_model_id(model_id, region)}"
+    provider = config.get("provider") if isinstance(config, dict) else None
+    provider_name = provider.get("name") if isinstance(provider, dict) else None
+    if str(provider_name or "").lower() == "bedrock" and "/" not in name:
+        return bedrock_model_id(name, region)
+    return name
+
+
 def collapse_messages_to_instructions(config: AiConfigRep) -> AiConfigRep:
     """
     When only an agent handler is available for a messages-mode config, collapse
