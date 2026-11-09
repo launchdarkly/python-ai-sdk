@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from launchdarkly_ai_server.utils import bedrock_model_id
+
 from .process import SERVER_USERNAME
 
 # After the message POST returns, keep reading until this session's
@@ -37,10 +39,13 @@ def default_model(config: dict[str, Any]) -> tuple[str, str]:
     """Map an AI Config model onto an OpenCode provider id and model id.
 
     A ``provider/model`` name is split. Otherwise Bedrock and Gemini use
-    OpenCode's provider ids, and any other provider name is lowercased.
+    OpenCode's provider ids, and any other provider name is lowercased. An
+    ``amazon-bedrock`` model id gets ``model.region`` as its cross-region
+    inference-profile prefix.
     """
-    model = config.get("model") if isinstance(config.get("model"), dict) else {}
-    name = model.get("name") if isinstance(model, dict) else ""
+    model = config.get("model")
+    model = model if isinstance(model, dict) else {}
+    name = model.get("name")
     name = name if isinstance(name, str) else ""
     provider = (
         config.get("provider") if isinstance(config.get("provider"), dict) else {}
@@ -49,9 +54,12 @@ def default_model(config: dict[str, Any]) -> tuple[str, str]:
     provider_name = provider_name if isinstance(provider_name, str) else ""
     if "/" in name:
         provider_id, model_id = name.split("/", 1)
-        return provider_id, model_id
-    mapped = {"Bedrock": "amazon-bedrock", "Gemini": "google"}
-    return mapped.get(provider_name, provider_name.lower()), name
+    else:
+        mapped = {"Bedrock": "amazon-bedrock", "Gemini": "google"}
+        provider_id, model_id = mapped.get(provider_name, provider_name.lower()), name
+    if provider_id == "amazon-bedrock":
+        model_id = bedrock_model_id(model_id, model.get("region"))
+    return provider_id, model_id
 
 
 async def session_events(
