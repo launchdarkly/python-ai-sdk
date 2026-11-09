@@ -51,7 +51,10 @@ DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
 SUMMARY_POLL_INTERVAL_SECONDS = 2.0
 SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
 VERDICT_POLL_TIMEOUT_SECONDS = 30.0
-_UNJUDGED_RUN_STATES = frozenset({"CANCELLED", "PERMANENT_ERROR", "TEMPORARY_ERROR"})
+# The states besides COMPLETE that LaunchDarkly treats as terminal: a run in
+# them never completes, so it never gets a verdict. TEMPORARY_ERROR is left
+# out on purpose: it is a legacy state the server can still complete.
+_UNJUDGED_RUN_STATES = frozenset({"CANCELLED", "PERMANENT_ERROR"})
 INLINE_ROW_FIELDS = ("rowIdx", "input", "expectedOutput", "variables", "metadata")
 GENERATION_MODES = ("completion", "agent")
 

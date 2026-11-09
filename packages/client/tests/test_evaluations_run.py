@@ -5754,22 +5754,44 @@ async def test_run_falls_back_to_row_counts_when_no_verdict_arrives(
     assert any("no verdict" in record.getMessage() for record in caplog.records)
 
 
+@pytest.mark.parametrize("state", ["CANCELLED", "PERMANENT_ERROR"])
 @pytest.mark.asyncio
-async def test_run_stops_waiting_for_a_verdict_on_a_cancelled_run(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_run_stops_waiting_for_a_verdict_on_a_terminal_run(
+    monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:
     monkeypatch.setattr(
         "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
     )
     transport = verdict_run_transport(
         {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
-        [run_item(state="CANCELLED")],
+        [run_item(state=state)],
     )
 
     result = await run_with_pass_rate(transport)
 
     assert result.verdict is None
     assert len(get_run_requests(transport)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_waiting_through_temporary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TEMPORARY_ERROR is a legacy state the server can still complete, so it
+    is waited on like any other state short of COMPLETE."""
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [run_item(state="TEMPORARY_ERROR"), run_item(verdict="pass")],
+    )
+
+    result = await run_with_pass_rate(transport)
+
+    assert result.verdict == "pass"
+    assert result.passed is True
+    assert len(get_run_requests(transport)) == 2
 
 
 @pytest.mark.asyncio
