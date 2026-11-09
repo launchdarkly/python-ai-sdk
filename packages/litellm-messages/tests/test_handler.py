@@ -197,9 +197,27 @@ class TestFactoryAndTransport:
         self, provider: str, model: dict[str, Any], expected: str
     ) -> None:
         completion = AsyncMock(return_value=_response())
+        span = MagicMock()
+        trace = MagicMock()
+        tracer = trace.get_tracer.return_value
+        tracer.start_span.return_value = span
         config = {**CONFIG, "provider": {"name": provider}, "model": model}
-        await create_litellm_messages_handler(completion=completion)(config, "question")
+        with patch.object(handler_mod, "trace", trace):
+            await create_litellm_messages_handler(completion=completion)(
+                config, "question"
+            )
         assert completion.call_args.kwargs["model"] == expected
+        span_models = {
+            (call.args[0], call.args[1])
+            for call in span.set_attribute.call_args_list
+            if call.args[0] in ("gen_ai.request.model", "gen_ai.response.model")
+        }
+        assert span_models == {
+            ("gen_ai.request.model", expected),
+            ("gen_ai.response.model", expected),
+        }
+        span_names = [call.args[0] for call in tracer.start_span.call_args_list]
+        assert f"chat {expected}" in span_names
 
     async def test_never_constructs_a_provider_direct_client(self) -> None:
         completion = AsyncMock(return_value=_response())
