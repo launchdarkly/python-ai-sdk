@@ -611,6 +611,7 @@ class TestBedrockModelId:
             ("apac.anthropic.claude-opus-5-5", "us", "apac.anthropic.claude-opus-5-5"),
             ("ca.anthropic.claude-haiku-5-5", "us", "ca.anthropic.claude-haiku-5-5"),
             ("in.anthropic.claude-haiku-5-5", "us", "in.anthropic.claude-haiku-5-5"),
+            ("sa.anthropic.claude-haiku-5-5", "sa", "sa.anthropic.claude-haiku-5-5"),
             ("au.anthropic.claude-haiku-5-5", "eu", "au.anthropic.claude-haiku-5-5"),
             ("jp.anthropic.claude-haiku-5-5", "eu", "jp.anthropic.claude-haiku-5-5"),
             ("eu.anthropic.claude-haiku-5-5", "us", "eu.anthropic.claude-haiku-5-5"),

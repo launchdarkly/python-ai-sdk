@@ -220,6 +220,9 @@ def bedrock_model_id(model_id: str, region: Any) -> str:
     when it already starts with a cross-region prefix or with *region*, and for
     an ARN. Callers decide whether the model is a Bedrock one; this never looks
     at the provider.
+
+    *region* is that short inference-profile prefix, not an AWS Region:
+    ``us-east-1`` would be prepended as-is and Bedrock would reject the id.
     """
     prefix = region.strip().rstrip(".") if isinstance(region, str) else ""
     if (
