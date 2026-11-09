@@ -57,7 +57,7 @@ from launchdarkly_ai_server import (
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.utils import bedrock_model_id, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -653,6 +653,20 @@ def _rebuild_thinking(value: Mapping[str, Any]) -> dict[str, Any] | None:
     return thinking
 
 
+def _model_id(config: AiConfigRep) -> str:
+    """The ``model`` sent to the CLI. For a Bedrock config, ``model.region`` is the
+    inference-profile prefix and is applied by :func:`bedrock_model_id`: the CLI maps an
+    Anthropic-format id to a profile itself, but sends a bare ``anthropic.*`` Bedrock id as-is,
+    which Bedrock rejects for models that need an inference profile.
+    """
+    model = config["model"]
+    name: str = model["name"]
+    provider = config.get("provider") or {}
+    if str(provider.get("name") or "").lower() != "bedrock":
+        return name
+    return bedrock_model_id(name, model.get("region"))
+
+
 def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that become ``ClaudeAgentOptions`` fields: only
     :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
@@ -710,7 +724,7 @@ def _build_query_options(
     params = _options_parameters(config)
     kwargs: dict[str, Any] = {
         **params,
-        "model": config["model"]["name"],
+        "model": _model_id(config),
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
         "hooks": hooks or {},

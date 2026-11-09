@@ -44,7 +44,12 @@ from launchdarkly_ai_claude_agents.handler import (
     _partition_tools,
     create_claude_agents_handler,
 )
-from launchdarkly_ai_server import ConversationIdSpanProcessor, conversation_id
+from launchdarkly_ai_server import (
+    ConversationIdSpanProcessor,
+    conversation_id,
+    create_handler,
+)
+from launchdarkly_ai_server.utils import select_handler
 from tests.forwarding_spec import (
     CLAUDE_AGENTS,
     candidate_keys,
@@ -1677,6 +1682,109 @@ class TestModelParametersForwarding:
         options = await self._run_and_capture_options(config, monkeypatch)
         assert options.model == BASE_CONFIG["model"]["name"]
         assert options.system_prompt != "not-the-real-prompt"
+
+    @pytest.mark.parametrize(
+        ("provider", "model", "expected"),
+        [
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-sonnet-4-5-20250929-v1:0", "region": "us"},
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+            (
+                "bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": "global"},
+                "global.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "us.anthropic.claude-opus-5-5", "region": "us"},
+                "us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "eu.anthropic.claude-opus-5-5", "region": "us"},
+                "eu.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {
+                    "name": "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/p",
+                    "region": "us",
+                },
+                "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/p",
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5"},
+                "anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": ""},
+                "anthropic.claude-opus-5-5",
+            ),
+            (
+                "Anthropic",
+                {"name": "claude-opus-4-5", "region": "us"},
+                "claude-opus-4-5",
+            ),
+        ],
+    )
+    async def test_bedrock_region_is_the_inference_profile_prefix(
+        self,
+        provider: str,
+        model: dict[str, Any],
+        expected: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = {**BASE_CONFIG, "provider": {"name": provider}, "model": model}
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.model == expected
+
+    async def test_graph_fallback_sends_a_bedrock_node_with_its_region(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        handler = create_claude_agents_handler()
+        config = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-opus-5-5", "region": "us"},
+        }
+        selected = select_handler(config, {"mode": "agent"}, [handler], strict=False)
+        assert selected is handler
+        await selected(config, "q")
+        assert captured["options"].model == "us.anthropic.claude-opus-5-5"
+
+    async def test_retagged_for_bedrock_config_routes_and_sends_its_region(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        handler = create_handler(("Bedrock", "agent"), create_claude_agents_handler())
+        config = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-opus-5-5", "region": "global"},
+        }
+        selected = select_handler(config, {"mode": "agent"}, [handler])
+        assert selected is handler
+        await selected(config, "q")
+        assert captured["options"].model == "global.anthropic.claude-opus-5-5"
 
     async def test_unset_when_no_parameters(
         self, monkeypatch: pytest.MonkeyPatch
