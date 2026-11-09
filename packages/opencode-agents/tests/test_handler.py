@@ -331,6 +331,21 @@ class TestSurface:
             ),
             (
                 "Anthropic",
+                {"name": "bedrock/anthropic.claude-opus-5-5", "region": "us"},
+                ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "Bedrock/anthropic.claude-opus-5-5", "region": "global"},
+                ("amazon-bedrock", "global.anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Bedrock",
+                {"name": "bedrock/anthropic.claude-opus-5-5"},
+                ("amazon-bedrock", "anthropic.claude-opus-5-5"),
+            ),
+            (
+                "Anthropic",
                 {"name": "claude-opus-5-5", "region": "us"},
                 ("anthropic", "claude-opus-5-5"),
             ),

@@ -38,7 +38,8 @@ class OpenCodeHTTPError(RuntimeError):
 def default_model(config: dict[str, Any]) -> tuple[str, str]:
     """Map an AI Config model onto an OpenCode provider id and model id.
 
-    A ``provider/model`` name is split. Otherwise Bedrock and Gemini use
+    A ``provider/model`` name is split, and a ``bedrock/`` prefix becomes
+    OpenCode's ``amazon-bedrock`` provider id. Otherwise Bedrock and Gemini use
     OpenCode's provider ids, and any other provider name is lowercased. An
     ``amazon-bedrock`` model id gets ``model.region`` as its cross-region
     inference-profile prefix.
@@ -54,6 +55,8 @@ def default_model(config: dict[str, Any]) -> tuple[str, str]:
     provider_name = provider_name if isinstance(provider_name, str) else ""
     if "/" in name:
         provider_id, model_id = name.split("/", 1)
+        if provider_id.lower() == "bedrock":
+            provider_id = "amazon-bedrock"
     else:
         mapped = {"Bedrock": "amazon-bedrock", "Gemini": "google"}
         provider_id, model_id = mapped.get(provider_name, provider_name.lower()), name
