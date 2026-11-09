@@ -96,34 +96,12 @@ MODEL_FAMILY_CREATORS = (
 )
 
 
-#: Bedrock cross-region inference-profile prefixes
-#: (https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html).
-BEDROCK_INFERENCE_PROFILE_PREFIXES = (
-    "global",
-    "us",
-    "us-gov",
-    "eu",
-    "apac",
-    "au",
-    "jp",
-    "ca",
-    "in",
-)
+#: The ``geoRegion`` values AI Gateway accepts for ``inferenceRegion: {"scope": "zone"}``
+#: (https://vercel.com/docs/ai-gateway/security-and-compliance/regional-inference).
+_GATEWAY_GEO_REGIONS = frozenset({"us", "eu", "au", "jp"})
 
-#: The Bedrock profile prefixes that have an AI Gateway ``inferenceRegion`` equivalent
-#: (https://vercel.com/docs/ai-gateway/security-and-compliance/regional-inference). ``global`` is
-#: the Gateway's default, and sending it explicitly fails under a team-wide region pin, so it maps
-#: to no option at all.
-_GATEWAY_GEO_REGIONS: dict[str, str | None] = {
-    "global": None,
-    "us": "us",
-    "eu": "eu",
-    "au": "au",
-    "jp": "jp",
-}
-
-#: Bedrock's model-version suffix: ``-v1:0``, ``-v1``, and ``-1:0`` (``openai.gpt-oss-120b-1:0``).
-_BEDROCK_VERSION_SUFFIX = re.compile(r"-(?:v\d+(?::\d+)?|\d+:\d+)$")
+#: Bedrock's model-version suffix. No Gateway catalog id has one.
+_BEDROCK_VERSION_SUFFIX = re.compile(r"-v\d+:\d+$")
 
 
 def _provider_key(value: str) -> str:
@@ -135,50 +113,37 @@ def _creator_from_model(model: str) -> tuple[str, str] | None:
     for index, part in enumerate(parts[:-1]):
         creator = GATEWAY_CREATORS.get(_provider_key(part))
         if creator:
-            rest = ".".join(parts[index + 1 :])
-            return creator, _BEDROCK_VERSION_SUFFIX.sub("", rest)
+            return creator, ".".join(parts[index + 1 :])
     for pattern, creator in MODEL_FAMILY_CREATORS:
         if pattern.search(model):
             return creator, model
     return None
 
 
-def _bedrock_region(config: AiConfigRep) -> str | None:
-    """The configured Bedrock inference-profile prefix: the model id's own prefix, which is what
-    Bedrock itself would run, else ``model.region``."""
-    model = config.get("model") or {}
-    name = str(model.get("name") or "")
-    prefix, dot, _ = name.partition(".")
-    if dot and "/" not in name and prefix.lower() in BEDROCK_INFERENCE_PROFILE_PREFIXES:
-        return prefix.lower()
-    region = model.get("region")
-    if isinstance(region, str) and region.strip().rstrip("."):
-        return region.strip().rstrip(".").lower()
-    return None
-
-
 def gateway_inference_region(config: AiConfigRep) -> dict[str, Any] | None:
-    """The AI Gateway ``inferenceRegion`` for a Bedrock config, scoped to the ``bedrock`` provider.
+    """The AI Gateway ``inferenceRegion`` for a Bedrock config's ``model.region``, scoped to the
+    ``bedrock`` provider so fallbacks to other providers are not pinned.
 
-    Returns ``None`` for a config that is not Bedrock, has no region, or asks for ``global``.
-    Raises ``ValueError`` for a region the Gateway has no equivalent for.
+    ``model.region`` is a Bedrock cross-region inference-profile prefix such as ``us`` or ``eu``.
+    ``global`` (or no region) is the Gateway default, so nothing is sent: an explicit ``global``
+    fails under a team-wide region pin. A prefix the Gateway has no zone for (``apac``, ``ca``, ...)
+    raises ``ValueError`` rather than silently running the request in another region.
     """
     provider = str((config.get("provider") or {}).get("name") or "")
     if _provider_key(provider) not in {"bedrock", "amazonbedrock"}:
         return None
-    region = _bedrock_region(config)
-    if region is None:
+    configured = (config.get("model") or {}).get("region")
+    region = configured.strip().lower() if isinstance(configured, str) else ""
+    if not region or region == "global":
         return None
     if region not in _GATEWAY_GEO_REGIONS:
-        supported = ", ".join(sorted(_GATEWAY_GEO_REGIONS))
         raise ValueError(
-            f'Bedrock region "{region}" has no Vercel AI Gateway inferenceRegion equivalent. '
-            f"Use one of: {supported}, or pass the handler a model that calls Bedrock directly."
+            f'Bedrock model.region "{configured}" has no Vercel AI Gateway inference region. '
+            "The Gateway can pin Bedrock to us, eu, au or jp, or leave it global. "
+            "Set model.region to one of those, or pass the handler a model that calls Bedrock "
+            "directly."
         )
-    geo_region = _GATEWAY_GEO_REGIONS[region]
-    if geo_region is None:
-        return None
-    return {"providers": {"bedrock": {"scope": "zone", "geoRegion": geo_region}}}
+    return {"providers": {"bedrock": {"scope": "zone", "geoRegion": region}}}
 
 
 def gateway_model_id(config: AiConfigRep) -> str:
@@ -186,6 +151,7 @@ def gateway_model_id(config: AiConfigRep) -> str:
     model = str(config["model"]["name"])
     if "/" in model:
         return model
+    model = _BEDROCK_VERSION_SUFFIX.sub("", model)
 
     provider = str((config.get("provider") or {}).get("name") or "")
     provider_name = _provider_key(provider)

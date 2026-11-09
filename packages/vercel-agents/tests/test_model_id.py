@@ -67,10 +67,12 @@ def test_preserves_explicit_and_dotted_gateway_ids() -> None:
             "eu.anthropic.claude-opus-4-5-20251101-v1:0",
             "anthropic/claude-opus-4-5-20251101",
         ),
-        ("us.anthropic.claude-opus-4-6-v1", "anthropic/claude-opus-4-6"),
         ("us.anthropic.claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
         ("us.amazon.nova-pro-v1:0", "amazon/nova-pro"),
-        ("openai.gpt-oss-120b-1:0", "openai/gpt-oss-120b"),
+        (
+            "apac.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "anthropic/claude-sonnet-4-5-20250929",
+        ),
     ],
 )
 def test_strips_the_bedrock_profile_prefix_and_version_suffix(
@@ -80,6 +82,6 @@ def test_strips_the_bedrock_profile_prefix_and_version_suffix(
 
 
 def test_keeps_a_version_suffix_on_an_explicit_gateway_id() -> None:
-    assert gateway_model_id(config("Bedrock", "openai/gpt-oss-120b-1:0")) == (
-        "openai/gpt-oss-120b-1:0"
+    assert gateway_model_id(config("Bedrock", "anthropic/claude-sonnet-4-5-v1:0")) == (
+        "anthropic/claude-sonnet-4-5-v1:0"
     )
