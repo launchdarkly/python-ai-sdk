@@ -32,7 +32,7 @@ Repository = "https://github.com/launchdarkly/python-ai-sdk"
 "Bug Tracker" = "https://github.com/launchdarkly/python-ai-sdk/issues"
 
 [project.optional-dependencies]
-anthropic = ["langchain-anthropic>=1.4"]
+anthropic = ["langchain-anthropic>=1.7.8"]
 aws = ["langchain-aws>=1.7"]
 
 [build-system]
