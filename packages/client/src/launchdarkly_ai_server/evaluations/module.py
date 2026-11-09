@@ -38,6 +38,7 @@ from .types import (
     DatasetRef,
     DatasetRow,
     EvalRunResult,
+    EvalVerdict,
     GenerationConfig,
     GenerationOverrides,
     InlineDatasetRow,
@@ -49,6 +50,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_UI_BASE_URI = "https://app.launchdarkly.com"
 SUMMARY_POLL_INTERVAL_SECONDS = 2.0
 SUMMARY_POLL_TIMEOUT_SECONDS = 180.0
+VERDICT_POLL_TIMEOUT_SECONDS = 30.0
+_UNJUDGED_RUN_STATES = frozenset({"CANCELLED", "PERMANENT_ERROR", "TEMPORARY_ERROR"})
 INLINE_ROW_FIELDS = ("rowIdx", "input", "expectedOutput", "variables", "metadata")
 GENERATION_MODES = ("completion", "agent")
 
@@ -167,6 +170,19 @@ def _is_terminal_summary(summary: RunSummary) -> bool:
         summary.total_rows > 0
         and summary.pending_rows == 0
         and accounted_rows == summary.total_rows
+    )
+
+
+def _expects_verdict(summary: RunSummary) -> bool:
+    """Whether LaunchDarkly will rule on this run against a pass rate.
+
+    True when the summary reports at least one criterion with a pass rate
+    threshold. The thresholds come from the run's stored evaluation, not from
+    the criteria this process passed in, and an empty list is how LaunchDarkly
+    says it does not serve verdicts for this project.
+    """
+    return any(
+        criterion.pass_rate_threshold is not None for criterion in summary.criteria
     )
 
 
@@ -324,6 +340,9 @@ class EvaluationsModule:
         them render exactly as a stored dataset's do.
 
         The returned pass/fail result is derived from LaunchDarkly's run summary.
+        When a criterion sets ``pass_rate_threshold``, ``run`` also waits up to
+        ``VERDICT_POLL_TIMEOUT_SECONDS`` for LaunchDarkly's verdict on the run,
+        returns it as ``result.verdict``, and ``result.passed`` follows it.
         A CI script can exit with ``0 if result.passed else 1`` after awaiting
         this method. Large datasets may need a longer ``poll_timeout_seconds``
         and a wider ``poll_interval_seconds``; both default to
@@ -529,25 +548,86 @@ class EvaluationsModule:
             poll_interval_seconds,
             poll_timeout_seconds,
         )
+        verdict = (
+            await self._poll_verdict(
+                evaluation.id, evaluation_run.id, poll_interval_seconds
+            )
+            if _expects_verdict(summary)
+            else None
+        )
         url = (
             f"{self._ui_base_uri}/projects/{segment(self._project_key)}/ai/evaluations/"
             f"{segment(evaluation.id)}/runs/{segment(evaluation_run.id)}"
         )
         return EvalRunResult(
-            # failed_rows counts rows whose criteria were scored and did not
-            # meet their threshold, so a gate that ignores it exits 0 on a run
-            # where every row failed its judge. It was omissible while runs were
-            # generation-only -- a row either generated or errored, and nothing
-            # produced a fail -- and stops being so the moment criteria exist.
+            # A verdict is LaunchDarkly's ruling against the pass rate
+            # thresholds the caller set, so it decides. Without one, failed_rows
+            # counts rows whose criteria were scored and did not meet their
+            # threshold, so a gate that ignores it exits 0 on a run where every
+            # row failed its judge.
             passed=(
-                summary.error_rows == 0
-                and summary.failed_rows == 0
-                and summary.pending_rows == 0
+                verdict == "pass"
+                if verdict is not None
+                else (
+                    summary.error_rows == 0
+                    and summary.failed_rows == 0
+                    and summary.pending_rows == 0
+                )
             ),
             url=url,
             run_id=evaluation_run.id,
             summary=summary,
+            verdict=verdict,
         )
+
+    async def _poll_verdict(
+        self,
+        evaluation_id: str,
+        run_id: str,
+        poll_interval_seconds: float,
+    ) -> EvalVerdict | None:
+        """Wait briefly for LaunchDarkly to record the run's verdict.
+
+        Only called when the summary reports a pass rate threshold, so a
+        verdict is expected. It is recorded just after the run completes, so
+        the first read can still miss it. Recording is best-effort on the
+        server, so a verdict that never arrives, or a read that fails, gives
+        ``None`` and a warning rather than an error: the rows are already
+        accounted for, and ``passed`` falls back to the row counts.
+        """
+        deadline = time.monotonic() + VERDICT_POLL_TIMEOUT_SECONDS
+        while True:
+            try:
+                run = await asyncio.to_thread(
+                    self._runner._get_evaluation_run,
+                    self._project_key,
+                    evaluation_id,
+                    run_id,
+                )
+            except EvaluationsError as error:
+                logger.warning(
+                    "Could not read the verdict for evaluation run %s: %s. "
+                    "The result is judged on row counts instead.",
+                    run_id,
+                    error,
+                )
+                return None
+            if run.verdict is not None:
+                return run.verdict
+            if run.state in _UNJUDGED_RUN_STATES:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "Evaluation run %s has a pass rate threshold but no verdict "
+                    "was recorded within %g seconds (state %s). The result is "
+                    "judged on row counts instead.",
+                    run_id,
+                    VERDICT_POLL_TIMEOUT_SECONDS,
+                    run.state,
+                )
+                return None
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
 
     async def _poll_summary_until_terminal(
         self,

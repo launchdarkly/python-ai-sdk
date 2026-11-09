@@ -159,7 +159,9 @@ ROOT_SURFACE = frozenset(
         "Judge",
         "Scorer",
         "EvalRunResult",
+        "EvalVerdict",
         "RunSummary",
+        "CriterionSummary",
         "EvaluationsError",
     }
 )

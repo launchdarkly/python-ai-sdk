@@ -30,11 +30,13 @@ from .conversation import (
 from .evaluations import (
     AIConfig,
     Criterion,
+    CriterionSummary,
     DatasetRow,
     EvalRunResult,
     EvalTool,
     EvaluationsError,
     EvaluationsModule,
+    EvalVerdict,
     GenerationConfig,
     GenerationMode,
     GenerationOverrides,
@@ -340,7 +342,9 @@ __all__ = [  # noqa: RUF022
     "Scorer",
     # Evaluations from Code: results and errors
     "EvalRunResult",
+    "EvalVerdict",
     "RunSummary",
+    "CriterionSummary",
     "EvaluationsError",
 ]
 

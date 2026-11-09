@@ -27,6 +27,16 @@ ConversationIdSpanProcessor(_SpanProcessorBase)  [class]
 create_handler(provides_for: tuple[str, Literal['agent', 'messages']], fn: _HandlerFn, stream_fn: _StreamFn | None = None, capture_content: bool | None = None, *, providers: Sequence[str] | None = None) -> ProviderHandler
 create_run_usage() -> RunUsage
 Criterion = Judge | Scorer  [type]
+CriterionSummary  [class, @dataclass]
+  __init__(criterion_type: str, pass_rate_threshold: float | None = None, passed_rows: int = 0, failed_rows: int = 0, error_rows: int = 0, pass_rate: float | None = None, pass_rate_verdict: EvalVerdict | None = None)
+  criterion_type: str
+  error_rows: int = 0
+  failed_rows: int = 0
+  from_wire(data: Mapping[str, Any]) -> CriterionSummary  [classmethod]
+  pass_rate: float | None = None
+  pass_rate_threshold: float | None = None
+  pass_rate_verdict: EvalVerdict | None = None
+  passed_rows: int = 0
 DatasetRow  [class, @dataclass]
   __init__(row_index: int, input: str | None = None, expected_output: str | None = None, variables: dict[str, Any] = dict(), metadata: dict[str, Any] | None = None)
   expected_output: str | None = None
@@ -37,11 +47,12 @@ DatasetRow  [class, @dataclass]
 end_span_once(span: Any, tracker: set[int], abandoned: bool = False, cancelled: bool = False) -> None
 end_unfinished_spans(*spans: Any) -> None
 EvalRunResult  [class, @dataclass]
-  __init__(passed: bool, url: str, run_id: str, summary: RunSummary)
+  __init__(passed: bool, url: str, run_id: str, summary: RunSummary, verdict: EvalVerdict | None = None)
   passed: bool
   run_id: str
   summary: RunSummary
   url: str
+  verdict: EvalVerdict | None = None
 EvalTool  [class, @dataclass(frozen=True)]
   __init__(key: str, implementation: ToolImplementation, schema: dict[str, Any], description: str = '')
   __post_init__() -> None
@@ -61,6 +72,7 @@ EvaluationsModule  [class]
   sdk_key: str | None  [property]
   tools: ToolsClient  [property]
   ui_base_uri: str  [property]
+EvalVerdict = Literal['pass', 'fail']  [type]
 execute_and_stream(*, config_key: str, config: AiConfigRep, meta: VariationMeta, user_context: LDContext, handler: ProviderHandler, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, graph_key: str | None = None, history: list[dict[str, Any]] | None = None, evaluated_value: Any = None) -> AsyncGenerator[ExecuteStreamEvent, None]  [async]
 execute_and_track(*, config_key: str, config: AiConfigRep, meta: VariationMeta, user_context: LDContext, handler: ProviderHandler, user_input: str | None = None, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, variables: dict[str, Any] | None = None, graph_key: str | None = None, history: list[dict[str, Any]] | None = None, run_id: str | None = None, extra_track_data: dict[str, Any] | None = None, span_attributes: dict[str, Any] | None = None, feature_flag_event: bool = True, evaluated_value: Any = None) -> dict[str, Any]  [async]
 ExecuteStreamDoneEvent = dict[str, Any]
@@ -290,7 +302,8 @@ resolve_tools(registry: Registry | None, local_tools: Mapping[str, Callable[...,
 run_judge(task: JudgeTask, handlers: list[ProviderHandler]) -> JudgeRunResult | None  [async]
 run_judges(*, config: AiConfigRep, user_context: LDContext, handler: ProviderHandler, handlers: list[ProviderHandler] | None = None, user_input: str | None, llm_response: str, base_track_data: TrackData, tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None = None, graph_key: str | None = None, trajectory: str = '') -> dict[str, JudgeResult]  [async]
 RunSummary  [class, @dataclass]
-  __init__(total_rows: int = 0, passed_rows: int = 0, failed_rows: int = 0, error_rows: int = 0, pending_rows: int = 0)
+  __init__(total_rows: int = 0, passed_rows: int = 0, failed_rows: int = 0, error_rows: int = 0, pending_rows: int = 0, criteria: list[CriterionSummary] = list())
+  criteria: list[CriterionSummary] = field(default_factory=list)
   error_rows: int = 0
   failed_rows: int = 0
   from_wire(data: Mapping[str, Any] | None) -> RunSummary  [classmethod]

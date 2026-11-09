@@ -87,6 +87,7 @@ from .types import (
     GenerationConfig,
     ResolvedJudge,
     RunSummary,
+    parse_verdict,
 )
 
 logger = logging.getLogger(__name__)
@@ -699,6 +700,18 @@ class EvaluationsRunner:
                 if raw.get("statusReason") is not None
                 else None
             ),
+            verdict=parse_verdict(raw.get("verdict")),
+        )
+
+    def _get_evaluation_run(
+        self, project_key: str, evaluation_id: str, run_id: str
+    ) -> EvaluationRunRef:
+        path = (
+            f"projects/{segment(project_key)}/evaluations/{segment(evaluation_id)}"
+            f"/runs/{segment(run_id)}"
+        )
+        return self._run_ref(
+            require_mapping(self._api.get(path), description="evaluation run")
         )
 
     def _build_handler_config(
