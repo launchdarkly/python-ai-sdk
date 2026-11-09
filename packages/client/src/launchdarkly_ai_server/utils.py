@@ -193,15 +193,19 @@ def validate_max_retries(max_retries: int | None) -> int | None:
     return max_retries
 
 
-#: Cross-region inference-profile prefixes Bedrock accepts in front of a model id.
+#: Cross-region inference-profile prefixes Bedrock accepts in front of a model id: ``global`` and
+#: every geography AWS documents for system-defined inference profiles
+#: (https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html).
 BEDROCK_INFERENCE_PROFILE_PREFIXES = (
     "global.",
     "us.",
+    "us-gov.",
     "eu.",
-    "jp.",
     "apac.",
     "au.",
-    "us-gov.",
+    "jp.",
+    "ca.",
+    "in.",
 )
 
 
