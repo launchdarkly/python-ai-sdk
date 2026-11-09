@@ -654,15 +654,20 @@ def _rebuild_thinking(value: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _model_id(config: AiConfigRep) -> str:
-    """The ``model`` sent to the CLI. For a Bedrock config, ``model.region`` is the
-    inference-profile prefix and is applied by :func:`bedrock_model_id`: the CLI maps an
-    Anthropic-format id to a profile itself, but sends a bare ``anthropic.*`` Bedrock id as-is,
-    which Bedrock rejects for models that need an inference profile.
+    """The ``model`` sent to the CLI. For a Bedrock config with a bare ``anthropic.*`` id,
+    ``model.region`` is the inference-profile prefix and is applied by :func:`bedrock_model_id`:
+    the CLI sends that id as-is, which Bedrock rejects for models that need an inference profile.
+
+    Every other name goes through unchanged. The CLI maps an Anthropic-format id such as
+    ``claude-sonnet-4-5-20250929`` to a profile itself, and sends a prefixed one such as
+    ``eu.claude-sonnet-4-5-20250929`` as-is, which is no Bedrock model.
     """
     model = config["model"]
     name: str = model["name"]
     provider = config.get("provider") or {}
-    if str(provider.get("name") or "").lower() != "bedrock":
+    if str(provider.get("name") or "").lower() != "bedrock" or not name.startswith(
+        "anthropic."
+    ):
         return name
     return bedrock_model_id(name, model.get("region"))
 

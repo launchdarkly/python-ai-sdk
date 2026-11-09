@@ -1725,6 +1725,16 @@ class TestModelParametersForwarding:
                 "anthropic.claude-opus-5-5",
             ),
             (
+                "Bedrock",
+                {"name": "claude-sonnet-4-5-20250929", "region": "eu"},
+                "claude-sonnet-4-5-20250929",
+            ),
+            (
+                "Bedrock",
+                {"name": "sonnet", "region": "us"},
+                "sonnet",
+            ),
+            (
                 "Anthropic",
                 {"name": "claude-opus-4-5", "region": "us"},
                 "claude-opus-4-5",
