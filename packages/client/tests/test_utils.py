@@ -19,7 +19,12 @@ from launchdarkly_ai_server import (
     parse_usage,
     validate_max_retries,
 )
-from launchdarkly_ai_server.utils import make_graph_track_data, model_parameters
+from launchdarkly_ai_server.utils import (
+    bedrock_model_id,
+    litellm_model_name,
+    make_graph_track_data,
+    model_parameters,
+)
 
 # ---------------------------------------------------------------------------
 # ?3.1 parse_template
@@ -583,3 +588,104 @@ class TestValidateMaxRetries:
     def test_refuses_negatives_with_value_error(self, value: int) -> None:
         with pytest.raises(ValueError, match="max_retries"):
             validate_max_retries(value)
+
+
+class TestBedrockModelId:
+    @pytest.mark.parametrize(
+        ("model_id", "region", "expected"),
+        [
+            ("anthropic.claude-opus-5-5", "us", "us.anthropic.claude-opus-5-5"),
+            ("anthropic.claude-opus-5-5", "global", "global.anthropic.claude-opus-5-5"),
+            ("anthropic.claude-opus-5-5", " eu. ", "eu.anthropic.claude-opus-5-5"),
+            ("us.anthropic.claude-opus-5-5", "us", "us.anthropic.claude-opus-5-5"),
+            (
+                "global.anthropic.claude-opus-5-5",
+                "us",
+                "global.anthropic.claude-opus-5-5",
+            ),
+            (
+                "us-gov.anthropic.claude-opus-5-5",
+                "us",
+                "us-gov.anthropic.claude-opus-5-5",
+            ),
+            ("apac.anthropic.claude-opus-5-5", "us", "apac.anthropic.claude-opus-5-5"),
+            ("anthropic.claude-opus-5-5", None, "anthropic.claude-opus-5-5"),
+            ("anthropic.claude-opus-5-5", "", "anthropic.claude-opus-5-5"),
+            ("anthropic.claude-opus-5-5", 3, "anthropic.claude-opus-5-5"),
+            (
+                "arn:aws:bedrock:us-east-1:1:inference-profile/x",
+                "us",
+                "arn:aws:bedrock:us-east-1:1:inference-profile/x",
+            ),
+            ("", "us", ""),
+        ],
+    )
+    def test_prefix_is_applied_once(
+        self, model_id: str, region: Any, expected: str
+    ) -> None:
+        assert bedrock_model_id(model_id, region) == expected
+
+
+class TestLitellmModelName:
+    @staticmethod
+    def _config(name: str, provider: str = "LiteLLM", **model: Any) -> dict[str, Any]:
+        return {"provider": {"name": provider}, "model": {"name": name, **model}}
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            (
+                "bedrock/anthropic.claude-opus-5-5",
+                "bedrock/us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "bedrock/converse/anthropic.claude-opus-5-5",
+                "bedrock/converse/us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "bedrock/us.anthropic.claude-opus-5-5",
+                "bedrock/us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "bedrock/arn:aws:bedrock:us-east-1:1:application-inference-profile/abc",
+                "bedrock/arn:aws:bedrock:us-east-1:1:application-inference-profile/abc",
+            ),
+        ],
+    )
+    def test_bedrock_slash_form_prefixes_the_model_id(
+        self, name: str, expected: str
+    ) -> None:
+        assert litellm_model_name(self._config(name, region="us")) == expected
+
+    def test_bare_name_is_prefixed_for_the_bedrock_provider(self) -> None:
+        config = self._config("anthropic.claude-opus-5-5", "Bedrock", region="global")
+        assert litellm_model_name(config) == "global.anthropic.claude-opus-5-5"
+
+    def test_no_region_keeps_the_name(self) -> None:
+        assert (
+            litellm_model_name(self._config("bedrock/anthropic.claude-opus-5-5"))
+            == "bedrock/anthropic.claude-opus-5-5"
+        )
+        assert (
+            litellm_model_name(self._config("anthropic.claude-opus-5-5", "Bedrock"))
+            == "anthropic.claude-opus-5-5"
+        )
+
+    def test_non_bedrock_ignores_the_region(self) -> None:
+        assert (
+            litellm_model_name(self._config("anthropic/claude-sonnet-4", region="us"))
+            == "anthropic/claude-sonnet-4"
+        )
+        assert (
+            litellm_model_name(self._config("gpt-4o", "OpenAI", region="us"))
+            == "gpt-4o"
+        )
+        assert (
+            litellm_model_name(
+                self._config("anthropic/claude-x", "Bedrock", region="us")
+            )
+            == "anthropic/claude-x"
+        )
+
+    def test_missing_model_is_an_empty_name(self) -> None:
+        assert litellm_model_name({"provider": {"name": "Bedrock"}}) == ""
