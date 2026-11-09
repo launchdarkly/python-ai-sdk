@@ -40,16 +40,8 @@ class TestGatewayInferenceRegion:
         config = bedrock("anthropic.claude-sonnet-4-5-20250929-v1:0", region)
         assert gateway_inference_region(config) == bedrock_only(region)
 
-    def test_reads_the_profile_prefix_of_the_model_id(self) -> None:
-        config = bedrock("eu.anthropic.claude-sonnet-4-5-20250929-v1:0")
-        assert gateway_inference_region(config) == bedrock_only("eu")
-
-    def test_profile_prefix_wins_over_model_region(self) -> None:
-        config = bedrock("eu.anthropic.claude-sonnet-4-5-20250929-v1:0", "us")
-        assert gateway_inference_region(config) == bedrock_only("eu")
-
-    def test_normalizes_case_whitespace_and_trailing_dot(self) -> None:
-        config = bedrock("anthropic.claude-sonnet-4-5-20250929-v1:0", " US. ")
+    def test_normalizes_case_and_whitespace(self) -> None:
+        config = bedrock("anthropic.claude-sonnet-4-5-20250929-v1:0", " US ")
         assert gateway_inference_region(config) == bedrock_only("us")
 
     def test_applies_to_an_explicit_gateway_id(self) -> None:
@@ -59,7 +51,16 @@ class TestGatewayInferenceRegion:
 
     def test_global_sends_no_option(self) -> None:
         assert gateway_inference_region(bedrock("anthropic.claude-x", "global")) is None
-        assert gateway_inference_region(bedrock("global.anthropic.claude-x")) is None
+
+    def test_reads_model_region_not_the_model_id_prefix(self) -> None:
+        assert gateway_inference_region(bedrock("apac.anthropic.claude-x")) is None
+        assert gateway_inference_region(bedrock("apac.anthropic.claude-x", "eu")) == (
+            bedrock_only("eu")
+        )
+
+    def test_accepts_the_amazon_bedrock_spelling(self) -> None:
+        config = bedrock("anthropic.claude-x", "eu", provider="Amazon Bedrock")
+        assert gateway_inference_region(config) == bedrock_only("eu")
 
     @pytest.mark.parametrize("region", [None, "", "  "])
     def test_no_region_sends_no_option(self, region: str | None) -> None:
@@ -72,13 +73,10 @@ class TestGatewayInferenceRegion:
     @pytest.mark.parametrize("region", ["apac", "us-gov", "ca", "in", "us-east-1"])
     def test_rejects_a_region_the_gateway_cannot_honor(self, region: str) -> None:
         with pytest.raises(
-            ValueError, match=f'Bedrock region "{region}" has no Vercel AI Gateway'
+            ValueError,
+            match=f'Bedrock model.region "{region}" has no Vercel AI Gateway',
         ):
             gateway_inference_region(bedrock("anthropic.claude-x", region))
-
-    def test_rejects_an_unmappable_profile_prefix(self) -> None:
-        with pytest.raises(ValueError, match='Bedrock region "apac"'):
-            gateway_inference_region(bedrock("apac.anthropic.claude-x"))
 
 
 class _GatewayProvider:
@@ -118,7 +116,7 @@ async def test_region_is_on_the_outbound_gateway_request(
         raise httpx2.ConnectError("captured", request=request)
 
     monkeypatch.setattr(httpx2.AsyncClient, "send", send)
-    config = bedrock("us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    config = bedrock("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "us")
 
     with pytest.raises(Exception):  # noqa: B017 - the captured request never gets a response
         await create_vercel_messages_handler()(config, "hi")
