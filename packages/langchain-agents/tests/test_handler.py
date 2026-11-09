@@ -2707,6 +2707,29 @@ class TestModelSource:
         assert ctor.call_args.kwargs["model"] == "us.anthropic.claude-sonnet-4-5"
 
     @pytest.mark.asyncio
+    async def test_bedrock_region_skips_another_cross_region_prefix(self) -> None:
+        ctx, _rec = _recording()
+        llm = _FakeToolModel(replies=[_ai_message("bedrock")])
+        ctor = MagicMock(return_value=llm)
+        cfg = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {
+                "name": "global.anthropic.claude-sonnet-4-5",
+                "region": "us",
+            },
+        }
+        with (
+            ctx,
+            patch.dict(
+                "sys.modules",
+                {"langchain_aws": MagicMock(ChatBedrockConverse=ctor)},
+            ),
+        ):
+            await create_langchain_agents_handler()(cfg, "q")
+        assert ctor.call_args.kwargs["model"] == "global.anthropic.claude-sonnet-4-5"
+
+    @pytest.mark.asyncio
     async def test_bedrock_without_region_keeps_the_model_name(self) -> None:
         ctx, _rec = _recording()
         llm = _FakeToolModel(replies=[_ai_message("bedrock")])
