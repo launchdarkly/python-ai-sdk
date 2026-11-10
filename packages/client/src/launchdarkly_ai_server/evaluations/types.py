@@ -255,11 +255,17 @@ class ResolvedJudge:
 
 @dataclass
 class EvaluationRef:
-    """Identifiers returned after creating or reconciling an evaluation."""
+    """Identifiers returned after creating or reconciling an evaluation.
+
+    ``version`` is always set by ``_parse_evaluation_ref`` after a create or
+    PATCH response; a missing or non-integer response ``version`` raises
+    before an ``EvaluationRef`` is built. The field stays optional on the
+    type so constructing a ref in tests without a version remains valid.
+    """
 
     id: str
     key: str
-    version: int
+    version: int | None = None
 
 
 @dataclass
