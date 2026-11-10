@@ -350,6 +350,62 @@ class TestNativeGraphAdapter:
             "gemini/gemini-2.5-pro",
         }
 
+    async def test_default_factory_applies_the_bedrock_region_to_a_node(
+        self,
+    ) -> None:
+        definition = _definition()
+        child = definition.get_node("child")
+        assert child is not None
+        child.config["provider"] = {"name": "Bedrock"}
+        child.config["model"] = {
+            "name": "bedrock/anthropic.claude-opus-5-5",
+            "region": "us",
+        }
+        created_models: list[Any] = []
+        litellm_model = MagicMock(
+            side_effect=lambda **kwargs: (
+                created_models.append(kwargs),
+                object(),
+            )[1]
+        )
+        agents = SimpleNamespace(
+            Agent=MagicMock(
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    name=kwargs["name"], **kwargs
+                )
+            ),
+            Runner=SimpleNamespace(
+                run=AsyncMock(
+                    return_value=SimpleNamespace(
+                        final_output="done",
+                        context_wrapper=SimpleNamespace(
+                            usage=SimpleNamespace(input_tokens=1, output_tokens=1)
+                        ),
+                    )
+                )
+            ),
+            handoff=MagicMock(side_effect=lambda target: target),
+            FunctionTool=MagicMock(),
+            RunHooks=_FakeRunHooks,
+        )
+        real_import = __import__
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=lambda name: (
+                    agents if name == "agents" else real_import(name)
+                ),
+            ),
+            patch.object(handler_mod, "LitellmModel", litellm_model),
+        ):
+            await to_litellm_agents(_definition_awaitable_from(definition)).invoke(
+                "hello"
+            )
+        assert {call["model"] for call in created_models} == {
+            "anthropic/claude-sonnet-4",
+            "bedrock/us.anthropic.claude-opus-5-5",
+        }
+
     async def test_adapter_has_no_default_openai_fallback(self) -> None:
         fallback = MagicMock(side_effect=AssertionError("OpenAI fallback"))
         agents = SimpleNamespace(
