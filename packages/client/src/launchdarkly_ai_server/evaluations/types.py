@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Required, TypedDict
@@ -298,6 +299,25 @@ def _optional_float(value: Any) -> float | None:
     return float(value)
 
 
+def _count(value: Any) -> int:
+    """A row count, or 0 for a value that does not read as a finite number.
+
+    Criterion counts are informational and arrive after every row is
+    accounted for, so a malformed one should not fail the run. Numeric
+    strings and booleans are read as numbers.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return 0
+    if not isinstance(value, int | float) or not math.isfinite(value):
+        return 0
+    return int(value)
+
+
 @dataclass
 class CriterionSummary:
     """One criterion's row counts and its pass-rate outcome for a run.
@@ -320,9 +340,9 @@ class CriterionSummary:
         return cls(
             criterion_type=str(data.get("criterionType", "")),
             pass_rate_threshold=_optional_float(data.get("criterionPassRateThreshold")),
-            passed_rows=int(data.get("passed", 0) or 0),
-            failed_rows=int(data.get("failed", 0) or 0),
-            error_rows=int(data.get("error", 0) or 0),
+            passed_rows=_count(data.get("passed")),
+            failed_rows=_count(data.get("failed")),
+            error_rows=_count(data.get("error")),
             pass_rate=_optional_float(data.get("passRate")),
             pass_rate_verdict=parse_verdict(data.get("passRateVerdict")),
         )
