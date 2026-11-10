@@ -1785,7 +1785,7 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
             "criterionType": "$ld:ai:judge:accuracy",
             "kind": "judge",
             "judgeKey": "$ld:ai:judge:accuracy",
-            "options": {"threshold": 0.5},
+            "options": {"threshold": 0.5, "passRateThreshold": 0.95},
         }
     ]
     assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
@@ -2027,7 +2027,7 @@ def test_scorer_lower_is_better_reaches_the_criteria_wire() -> None:
         "criterionType": "policy-violations",
         "kind": "scorer",
         "successDirection": "lower_is_better",
-        "options": {"threshold": 0.0},
+        "options": {"threshold": 0.0, "passRateThreshold": 0.95},
     }
 
 
@@ -2038,20 +2038,23 @@ def test_judge_threshold_defaults_so_a_criterion_is_always_rulable() -> None:
         "criterionType": "$ld:ai:judge:accuracy",
         "kind": "judge",
         "judgeKey": "$ld:ai:judge:accuracy",
-        "options": {"threshold": 0.5},
+        "options": {"threshold": 0.5, "passRateThreshold": 0.95},
     }
 
 
-def test_pass_rate_threshold_is_only_sent_when_set() -> None:
-    """Pass rate has no client default yet, since LaunchDarkly does not act on
-    it; an unset one stays off the wire rather than claiming a gate."""
-    judge = Judge(key="$ld:ai:judge:accuracy")
-    scorer = Scorer(name="exact", fn=lambda row, output: 1.0, pass_rate_threshold=0.8)
+def test_explicit_none_pass_rate_threshold_falls_back_to_default() -> None:
+    """An explicit None must not drop passRateThreshold from the wire, or the
+    run would have no pass rate to gate on."""
+    judge = Judge(key="$ld:ai:judge:accuracy", pass_rate_threshold=None)
+    scorer = Scorer(name="exact", fn=lambda row, output: True, pass_rate_threshold=None)
 
-    assert judge.to_criteria_wire()["options"] == {"threshold": 0.5}
+    assert judge.to_criteria_wire()["options"] == {
+        "threshold": 0.5,
+        "passRateThreshold": 0.95,
+    }
     assert scorer.to_criteria_wire()["options"] == {
         "threshold": 1.0,
-        "passRateThreshold": 0.8,
+        "passRateThreshold": 0.95,
     }
 
 
@@ -2157,7 +2160,7 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
             "criterionType": "refund-exists",
             "kind": "scorer",
             "successDirection": "higher_is_better",
-            "options": {"threshold": 1.0},
+            "options": {"threshold": 1.0, "passRateThreshold": 0.95},
         }
     ]
     assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
@@ -5560,3 +5563,296 @@ async def test_invalid_score_warning_repeats_on_each_run(
 
     warnings = [r for r in caplog.records if "invalid score" in r.getMessage()]
     assert len(warnings) == 2
+
+
+def criterion_summary(
+    *,
+    threshold: float | None = 0.8,
+    pass_rate: float | None = None,
+    verdict: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "criterionType": "exact",
+        "criterionPassRateThreshold": threshold,
+        "passed": 9,
+        "failed": 1,
+        "error": 0,
+        "passRate": pass_rate,
+        "passRateVerdict": verdict,
+    }
+
+
+def verdict_run_transport(
+    summary: dict[str, Any], runs: list[HttpResponse]
+) -> SequencedTransport:
+    """Transport for a scorer run whose summary is followed by get-run reads."""
+    return SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page([{"rowIndex": 0, "input": "Question"}], total=1),
+            ),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(200, summary),
+            *runs,
+        ]
+    )
+
+
+def run_item(state: str = "COMPLETE", verdict: str | None = None) -> HttpResponse:
+    body: dict[str, Any] = {
+        "id": "run-id",
+        "evaluationId": "evaluation-id",
+        "state": state,
+    }
+    if verdict is not None:
+        body["verdict"] = verdict
+    return response(200, body)
+
+
+# Nine of ten rows passed: the row-count rule fails this run, a 0.8 pass rate
+# threshold passes it.
+NINE_OF_TEN = {"total": 10, "passed": 9, "failed": 1, "error": 0, "pending": 0}
+
+
+async def run_with_pass_rate(transport: SequencedTransport) -> Any:
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    return await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation=COMPLETION,
+        criteria=[
+            Scorer(name="exact", fn=lambda row, output: 1.0, pass_rate_threshold=0.8)
+        ],
+    )
+
+
+def get_run_requests(transport: SequencedTransport) -> list[dict[str, Any]]:
+    return [
+        request
+        for request in transport.requests
+        if request["method"] == "GET"
+        and request["url"].endswith("/evaluations/evaluation-id/runs/run-id")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("verdict", "passed"),
+    [("pass", True), ("fail", False)],
+)
+@pytest.mark.asyncio
+async def test_run_returns_the_verdict_and_passed_follows_it(
+    monkeypatch: pytest.MonkeyPatch, verdict: str, passed: bool
+) -> None:
+    """The verdict is LaunchDarkly's ruling against the pass rate threshold, so
+    it decides ``passed`` even when the row counts would say otherwise."""
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {
+            "statusCounts": NINE_OF_TEN,
+            "criterionSummaries": [
+                criterion_summary(pass_rate=0.9, verdict=verdict),
+            ],
+        },
+        [run_item(verdict=verdict)],
+    )
+
+    result = await run_with_pass_rate(transport)
+
+    assert result.verdict == verdict
+    assert result.passed is passed
+    assert len(get_run_requests(transport)) == 1
+    [criterion] = result.summary.criteria
+    assert criterion.criterion_type == "exact"
+    assert criterion.pass_rate_threshold == 0.8
+    assert criterion.pass_rate == 0.9
+    assert criterion.pass_rate_verdict == verdict
+    assert (criterion.passed_rows, criterion.failed_rows) == (9, 1)
+
+
+@pytest.mark.asyncio
+async def test_run_waits_for_a_verdict_recorded_after_the_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verdict is written just after the last result lands, so the first
+    read can still find the run without one."""
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [run_item(state="EVALUATED"), run_item(), run_item(verdict="pass")],
+    )
+
+    result = await run_with_pass_rate(transport)
+
+    assert result.verdict == "pass"
+    assert result.passed is True
+    assert len(get_run_requests(transport)) == 3
+
+
+@pytest.mark.parametrize(
+    "criterion_summaries",
+    [
+        pytest.param([], id="verdicts-not-served"),
+        pytest.param([criterion_summary(threshold=None)], id="no-pass-rate"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_does_not_read_a_verdict_it_cannot_get(
+    monkeypatch: pytest.MonkeyPatch, criterion_summaries: list[dict[str, Any]]
+) -> None:
+    """No pass rate threshold in the summary means LaunchDarkly will record no
+    verdict, so run() does not wait for one and keeps the row-count rule.
+
+    The thresholds come from the summary rather than the criteria passed in:
+    an empty list is how LaunchDarkly says it does not serve verdicts here.
+    """
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": criterion_summaries},
+        [],
+    )
+
+    result = await run_with_pass_rate(transport)
+
+    assert result.verdict is None
+    assert result.passed is False
+    assert get_run_requests(transport) == []
+
+
+@pytest.mark.asyncio
+async def test_run_falls_back_to_row_counts_when_no_verdict_arrives(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.VERDICT_POLL_TIMEOUT_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [run_item(state="EVALUATED")],
+    )
+
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.evaluations"):
+        result = await run_with_pass_rate(transport)
+
+    assert result.verdict is None
+    assert result.passed is False
+    assert len(get_run_requests(transport)) == 1
+    [warning] = [
+        record.getMessage()
+        for record in caplog.records
+        if "no verdict" in record.getMessage()
+    ]
+    assert "run-id" in warning
+    assert "within 0 seconds" in warning
+    assert "(state EVALUATED)" in warning
+
+
+@pytest.mark.parametrize("state", ["CANCELLED", "PERMANENT_ERROR"])
+@pytest.mark.asyncio
+async def test_run_stops_waiting_for_a_verdict_on_a_terminal_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, state: str
+) -> None:
+    """A run in a terminal state other than COMPLETE never gets a verdict, so
+    run() stops after one read, without a warning, and falls back to the row
+    counts. The default deadline is left in place so a harness that kept
+    polling would make a second request."""
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [run_item(state=state)],
+    )
+
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.evaluations"):
+        result = await run_with_pass_rate(transport)
+
+    assert result.verdict is None
+    assert result.passed is False
+    assert len(get_run_requests(transport)) == 1
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_waiting_through_temporary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TEMPORARY_ERROR is a legacy state the server can still complete, so it
+    is waited on like any other state short of COMPLETE."""
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [run_item(state="TEMPORARY_ERROR"), run_item(verdict="pass")],
+    )
+
+    result = await run_with_pass_rate(transport)
+
+    assert result.verdict == "pass"
+    assert result.passed is True
+    assert len(get_run_requests(transport)) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_stops_waiting_on_an_unrecognised_verdict(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A verdict this release does not know is still a ruling, written once, so
+    run() stops reading at once rather than waiting out the deadline for a
+    verdict that will never change. The default deadline is left in place so
+    a harness that kept polling would make more than one request."""
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
+    )
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [run_item(verdict="maybe"), run_item(verdict="maybe")],
+    )
+
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.evaluations"):
+        result = await run_with_pass_rate(transport)
+
+    assert result.verdict is None
+    assert result.passed is False
+    assert len(get_run_requests(transport)) == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("'maybe'" in message for message in messages)
+    assert not any("seconds" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_raise_when_the_verdict_read_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The rows are already accounted for, so a failed read of the verdict is a
+    warning and a row-count result, not a failed run."""
+    transport = verdict_run_transport(
+        {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
+        [response(403, {"message": "forbidden"})],
+    )
+
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.evaluations"):
+        result = await run_with_pass_rate(transport)
+
+    assert result.verdict is None
+    assert result.passed is False
+    assert len(get_run_requests(transport)) == 1
+    assert any(
+        "Could not read the verdict" in record.getMessage() for record in caplog.records
+    )

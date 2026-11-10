@@ -10,6 +10,7 @@ import pytest
 
 import launchdarkly_ai_server.lifecycle as lifecycle_module
 from launchdarkly_ai_server import (
+    CriterionSummary,
     EvalRunResult,
     EvaluationsError,
     RunSummary,
@@ -565,6 +566,94 @@ def test_run_summary_and_result() -> None:
     assert RunSummary.from_wire(None) == RunSummary()
     assert result.passed is False
     assert result.run_id == "run-1"
+    assert result.verdict is None
+    assert summary.criteria == []
+
+
+def test_run_summary_parses_criterion_summaries() -> None:
+    summary = RunSummary.from_wire(
+        {
+            "total": 10,
+            "passed": 9,
+            "failed": 1,
+            "error": 0,
+            "criterionSummaries": [
+                {
+                    "criterionType": "exact",
+                    "criterionPassRateThreshold": 0.8,
+                    "passed": 9,
+                    "failed": 1,
+                    "error": 0,
+                    "passRate": 0.9,
+                    "passRateVerdict": "pass",
+                },
+                {
+                    "criterionType": "tone",
+                    "criterionPassRateThreshold": None,
+                    "passed": 10,
+                    "failed": 0,
+                    "error": 0,
+                },
+                "not a mapping",
+            ],
+        }
+    )
+
+    assert summary.criteria == [
+        CriterionSummary(
+            criterion_type="exact",
+            pass_rate_threshold=0.8,
+            passed_rows=9,
+            failed_rows=1,
+            error_rows=0,
+            pass_rate=0.9,
+            pass_rate_verdict="pass",
+        ),
+        CriterionSummary(criterion_type="tone", passed_rows=10),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("nine", 0, id="non-numeric-string"),
+        pytest.param("", 0, id="empty-string"),
+        pytest.param(None, 0, id="null"),
+        pytest.param(float("nan"), 0, id="nan"),
+        pytest.param(float("inf"), 0, id="infinity"),
+        pytest.param("Infinity", 0, id="infinity-string"),
+        pytest.param({"n": 9}, 0, id="mapping"),
+        pytest.param("9", 9, id="numeric-string"),
+        pytest.param(" 9.7 ", 9, id="padded-float-string"),
+        pytest.param(9.7, 9, id="float"),
+        pytest.param(True, 1, id="true"),
+    ],
+)
+def test_a_criterion_count_is_read_as_the_js_sdk_reads_it(
+    value: object, expected: int
+) -> None:
+    """Every row is already accounted for when the criterion counts are read,
+    so a count that does not read as a finite number is 0 rather than an
+    error. Numeric strings and booleans are coerced, as ``Number()`` does."""
+    [criterion] = RunSummary.from_wire(
+        {
+            "criterionSummaries": [
+                {"criterionType": "x", "passed": value, "failed": value, "error": 2}
+            ]
+        }
+    ).criteria
+
+    assert (criterion.passed_rows, criterion.failed_rows) == (expected, expected)
+    assert criterion.error_rows == 2
+
+
+def test_an_unknown_verdict_is_treated_as_none() -> None:
+    """A verdict LaunchDarkly adds later is not guessed at as a pass or fail."""
+    [criterion] = RunSummary.from_wire(
+        {"criterionSummaries": [{"criterionType": "x", "passRateVerdict": "maybe"}]}
+    ).criteria
+
+    assert criterion.pass_rate_verdict is None
 
 
 def test_project_key_resolves_from_the_environment(monkeypatch) -> None:

@@ -10,8 +10,10 @@ from .module import EvaluationsModule, init_evaluations
 from .tools import EvalTool
 from .types import (
     AIConfig,
+    CriterionSummary,
     DatasetRow,
     EvalRunResult,
+    EvalVerdict,
     GenerationConfig,
     GenerationMode,
     GenerationOverrides,
@@ -23,9 +25,11 @@ __all__ = [
     "DEFAULT_BASE_URI",
     "AIConfig",
     "Criterion",
+    "CriterionSummary",
     "DatasetRow",
     "EvalRunResult",
     "EvalTool",
+    "EvalVerdict",
     "EvaluationsError",
     "EvaluationsModule",
     "GenerationConfig",
