@@ -83,6 +83,26 @@ to_claude_agents(
 
 Earlier versions passed no thinking setting when the config had none, so Claude Code chose one: adaptive thinking on models that support it, and a 31,999-token budget on others such as `claude-haiku-4-5`. A run now thinks only when its config asks. To keep thinking, set it in the config's model parameters, for example `{"thinking": {"type": "adaptive"}}`.
 
+### Amazon Bedrock
+
+Claude Code reaches Bedrock when `CLAUDE_CODE_USE_BEDROCK=1` is in the process environment, or in a settings source you load. A config cannot set it.
+
+For a config whose provider is Bedrock and whose model is a bare `anthropic.*` id, the handler sends `model.region` as the inference-profile prefix: `anthropic.claude-sonnet-4-5-20250929-v1:0` with region `us` is sent as `us.anthropic.claude-sonnet-4-5-20250929-v1:0`. Claude Code sends a bare `anthropic.*` id to Bedrock unchanged. An id that already has a prefix, an ARN, or a config without a region is sent as configured.
+
+An Anthropic-format id such as `claude-sonnet-4-5-20250929`, or an alias such as `sonnet`, is also sent as configured, whatever `model.region` says. Claude Code picks its inference profile itself, from an inference profile it discovers in your account or, without one, from the AWS region or `ANTHROPIC_BEDROCK_REGION_PREFIX`.
+
+The handler is tagged for the `Anthropic` provider, so `config()` needs it re-tagged to run a Bedrock config:
+
+```python
+from launchdarkly_ai_server import create_handler
+
+bedrock_handler = create_handler(("Bedrock", "agent"), create_claude_agents_handler())
+```
+
+`claude_graph()` already runs every node on its one handler, Bedrock nodes included.
+
+`to_claude_agents()` doesn't apply `model.region` yet; [#287](https://github.com/launchdarkly/python-ai-sdk/pull/287) will add it.
+
 ### Convenience wrapper
 
 ```python
