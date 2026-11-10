@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Required, TypedDict
@@ -276,6 +277,81 @@ class EvaluationRunRef:
     evaluation_id: str
     state: str
     status_reason: str | None = None
+    verdict: EvalVerdict | None = None
+    unrecognized_verdict: str | None = None
+
+
+#: LaunchDarkly's ruling on a criterion or a run against its pass rate
+#: threshold. The SDK only reads it; it never computes one.
+type EvalVerdict = Literal["pass", "fail"]
+
+
+def parse_verdict(value: Any) -> EvalVerdict | None:
+    """Return a known verdict, or ``None`` for an absent or unrecognised one.
+
+    LaunchDarkly may add verdicts later. One this release does not know is
+    treated as no verdict rather than guessed at as a pass or a fail.
+    """
+    if value == "pass":
+        return "pass"
+    if value == "fail":
+        return "fail"
+    return None
+
+
+def _optional_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def _count(value: Any) -> int:
+    """A row count, or 0 for a value that does not read as a finite number.
+
+    Criterion counts are informational and arrive after every row is
+    accounted for, so a malformed one should not fail the run. Numeric
+    strings and booleans are read as numbers.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return 0
+    if not isinstance(value, int | float) or not math.isfinite(value):
+        return 0
+    return int(value)
+
+
+@dataclass
+class CriterionSummary:
+    """One criterion's row counts and its pass-rate outcome for a run.
+
+    ``pass_rate`` and ``pass_rate_verdict`` are set once the run is complete
+    and the criterion has a ``pass_rate_threshold``. Errored rows count
+    against the pass rate.
+    """
+
+    criterion_type: str
+    pass_rate_threshold: float | None = None
+    passed_rows: int = 0
+    failed_rows: int = 0
+    error_rows: int = 0
+    pass_rate: float | None = None
+    pass_rate_verdict: EvalVerdict | None = None
+
+    @classmethod
+    def from_wire(cls, data: Mapping[str, Any]) -> CriterionSummary:
+        return cls(
+            criterion_type=str(data.get("criterionType", "")),
+            pass_rate_threshold=_optional_float(data.get("criterionPassRateThreshold")),
+            passed_rows=_count(data.get("passed")),
+            failed_rows=_count(data.get("failed")),
+            error_rows=_count(data.get("error")),
+            pass_rate=_optional_float(data.get("passRate")),
+            pass_rate_verdict=parse_verdict(data.get("passRateVerdict")),
+        )
 
 
 @dataclass
@@ -284,6 +360,9 @@ class RunSummary:
 
     The summary endpoint does not return run state, so terminal completion
     is derived from row accounting instead.
+
+    ``criteria`` holds each criterion's own counts and pass-rate outcome. It
+    is empty when LaunchDarkly does not report them for this project yet.
     """
 
     total_rows: int = 0
@@ -291,26 +370,50 @@ class RunSummary:
     failed_rows: int = 0
     error_rows: int = 0
     pending_rows: int = 0
+    criteria: list[CriterionSummary] = field(default_factory=list)
 
     @classmethod
     def from_wire(cls, data: Mapping[str, Any] | None) -> RunSummary:
         data = data or {}
         counts_value = data.get("statusCounts")
         counts = counts_value if isinstance(counts_value, Mapping) else data
+        criteria_value = data.get("criterionSummaries")
+        criteria = (
+            [
+                CriterionSummary.from_wire(item)
+                for item in criteria_value
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(criteria_value, list)
+            else []
+        )
         return cls(
             total_rows=int(counts.get("total", counts.get("total_rows", 0)) or 0),
             passed_rows=int(counts.get("passed", counts.get("passed_rows", 0)) or 0),
             failed_rows=int(counts.get("failed", counts.get("failed_rows", 0)) or 0),
             error_rows=int(counts.get("error", counts.get("error_rows", 0)) or 0),
             pending_rows=int(counts.get("pending", counts.get("pending_rows", 0)) or 0),
+            criteria=criteria,
         )
 
 
 @dataclass
 class EvalRunResult:
-    """The result of an evaluation run, derived from its row summary."""
+    """The result of an evaluation run.
+
+    ``verdict`` is LaunchDarkly's ruling on the whole run: ``"fail"`` when any
+    criterion missed its ``pass_rate_threshold``, ``"pass"`` otherwise.
+    Criteria without a pass rate threshold do not take part in it. It is
+    ``None`` when no criterion set a pass rate threshold, when LaunchDarkly
+    does not report verdicts for this project yet, or when the verdict was not
+    recorded in time.
+
+    ``passed`` follows ``verdict`` when there is one. Without one, ``passed``
+    is True only when no row failed, errored, or is still pending.
+    """
 
     passed: bool
     url: str
     run_id: str
     summary: RunSummary
+    verdict: EvalVerdict | None = None

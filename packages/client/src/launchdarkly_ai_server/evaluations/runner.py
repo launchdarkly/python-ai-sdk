@@ -87,6 +87,7 @@ from .types import (
     GenerationConfig,
     ResolvedJudge,
     RunSummary,
+    parse_verdict,
 )
 
 logger = logging.getLogger(__name__)
@@ -806,6 +807,8 @@ class EvaluationsRunner:
         self._api.post(path, idempotent=True)
 
     def _run_ref(self, raw: Mapping[str, Any]) -> EvaluationRunRef:
+        raw_verdict = raw.get("verdict")
+        verdict = parse_verdict(raw_verdict)
         return EvaluationRunRef(
             id=require_string(raw, "id", "evaluation run"),
             evaluation_id=require_string(raw, "evaluationId", "evaluation run"),
@@ -815,6 +818,23 @@ class EvaluationsRunner:
                 if raw.get("statusReason") is not None
                 else None
             ),
+            verdict=verdict,
+            unrecognized_verdict=(
+                str(raw_verdict)
+                if raw_verdict is not None and verdict is None
+                else None
+            ),
+        )
+
+    def _get_evaluation_run(
+        self, project_key: str, evaluation_id: str, run_id: str
+    ) -> EvaluationRunRef:
+        path = (
+            f"projects/{segment(project_key)}/evaluations/{segment(evaluation_id)}"
+            f"/runs/{segment(run_id)}"
+        )
+        return self._run_ref(
+            require_mapping(self._api.get(path), description="evaluation run")
         )
 
     def _build_handler_config(
