@@ -161,9 +161,11 @@ def start_row_span(run_id: str, row_index: int) -> Span:
 
 
 def _provider_name(config: Mapping[str, Any]) -> str:
+    """The configured provider, lower-cased, with Bedrock as its semconv value ``aws.bedrock``."""
     provider = config.get("provider")
     name = provider.get("name") if isinstance(provider, Mapping) else None
-    return name.lower() if isinstance(name, str) else ""
+    lowered = name.lower() if isinstance(name, str) else ""
+    return "aws.bedrock" if lowered == "bedrock" else lowered
 
 
 def _model_name(config: Mapping[str, Any]) -> str:

@@ -36,6 +36,7 @@ from launchdarkly_ai_server.evaluations.spans import (
     record_chat,
     record_evaluation_result,
     record_tool_calls,
+    set_config_model_identity,
     start_row_span,
 )
 from launchdarkly_ai_server.lifecycle import (
@@ -944,3 +945,22 @@ def test_evaluation_result_carries_the_zero_to_one_range(
     assert attributes["gen_ai.evaluation.score.value"] == 0.5
     assert attributes["launchdarkly.evaluation.score.min"] == 0.0
     assert attributes["launchdarkly.evaluation.score.max"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "expected"),
+    [
+        ("OpenAI", "openai"),
+        ("Bedrock", "aws.bedrock"),
+        ("bedrock", "aws.bedrock"),
+        ("", ""),
+    ],
+)
+def test_set_config_model_identity_provider(provider_name: str, expected: str) -> None:
+    span = MagicMock()
+    set_config_model_identity(
+        span, {"provider": {"name": provider_name}, "model": {"name": "m"}}
+    )
+    attributes = {c.args[0]: c.args[1] for c in span.set_attribute.call_args_list}
+    assert attributes["gen_ai.provider.name"] == expected
+    assert attributes["gen_ai.system"] == expected
