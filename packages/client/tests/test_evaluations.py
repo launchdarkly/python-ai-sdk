@@ -494,6 +494,32 @@ def test_idempotent_post_is_retried_after_a_server_error() -> None:
     assert len(transport.requests) == 2
 
 
+def test_patch_is_not_retried_after_a_server_error() -> None:
+    """Offline-evaluation PATCH must not blind-replay after 5xx (concurrent writers)."""
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=503, body='{"message": "unavailable"}'),
+            HttpResponse(status=200, body='{"id": "eval-1", "version": 2}'),
+        ]
+    )
+    client = LDApiClient(
+        api_key="api-token",
+        transport=transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    with pytest.raises(LDApiError) as excinfo:
+        client.patch(
+            "projects/proj/offline-evaluations/support-qa",
+            body={"generationProvider": "OpenAI"},
+        )
+
+    assert excinfo.value.status == 503
+    assert len(transport.requests) == 1
+
+
 def test_idempotent_post_is_replayed_after_a_transport_failure() -> None:
     attempts: list[str] = []
 
