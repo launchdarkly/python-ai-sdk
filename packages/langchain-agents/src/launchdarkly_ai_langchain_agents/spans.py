@@ -67,7 +67,8 @@ def serving_provider(config: AiConfigRep) -> str:
 
     ``gen_ai.provider.name`` names who served the request, and its semconv enum has no
     ``langchain`` member: LangChain is the framework, not the provider. Empty or missing
-    names fall back to ``openai``, and Bedrock is written ``aws.bedrock``, its semconv value and what the Bedrock handlers write. ``gen_ai.system`` stays the literal ``langchain``.
+    names fall back to ``openai``, and Bedrock is written ``aws.bedrock``, its semconv value.
+    ``gen_ai.system`` stays the literal ``langchain``.
     """
     provider = str((config.get("provider") or {}).get("name") or "openai").lower()
     return "aws.bedrock" if provider == "bedrock" else provider
