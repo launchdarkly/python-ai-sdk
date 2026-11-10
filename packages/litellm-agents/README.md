@@ -29,6 +29,10 @@ result = await config(
 ```
 
 Each evaluated config model is authoritative and creates its own `LitellmModel`.
+The one rewrite is for Bedrock: a `bedrock/...` name, or a bare name when the
+provider is Bedrock, gets `model.region` (`us`, `global`, ...) prepended to the
+model id as its cross-region inference-profile prefix, unless the id already has
+one.
 The package supports callable tools, structured output, streaming, the
 `litellm_graph` convenience wrapper, and `to_litellm_agents` for native Agents
 SDK handoffs.

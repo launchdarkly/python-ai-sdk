@@ -28,7 +28,7 @@ otel = [
     "opentelemetry-exporter-otlp-proto-http>=1.25",
 ]
 # The base SDK init_client() discovers at runtime; optional so BYOC installs stay lean.
-ld = ["launchdarkly-server-sdk>=9.18.3,<10"]
+ld = ["launchdarkly-server-sdk>=9.18.4,<10"]
 
 [build-system]
 requires = ["hatchling>=1.32,<2"]
