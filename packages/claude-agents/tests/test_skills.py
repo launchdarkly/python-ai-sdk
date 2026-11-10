@@ -593,9 +593,22 @@ class TestQueryOptions:
         assert fake.options.tools == ["Skill"]
         assert "Skill" not in fake.options.allowed_tools
 
+        unlisted = _FakeQuery()
+        monkeypatch.setattr(handler_mod, "query", unlisted)
+        await _run(handler, path, _config(("a", 1)), {"read": _read_stub()})
+        assert unlisted.options.tools == ["Skill"]
+
         with_read = _FakeQuery()
         monkeypatch.setattr(handler_mod, "query", with_read)
-        await _run(handler, path, _config(("a", 1)), {"read": _read_stub()})
+        await _run(
+            handler,
+            path,
+            _config(
+                ("a", 1),
+                tools={"read": {"name": "read", "type": "function", "parameters": {}}},
+            ),
+            {"read": _read_stub()},
+        )
         assert with_read.options.tools == ["Read", "Skill"]
         assert "Skill" not in with_read.options.allowed_tools
 
