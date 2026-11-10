@@ -587,35 +587,37 @@ class EvaluationsRunner:
     ) -> dict[str, Any]:
         """Build the offline-evaluation create/patch body for ``key``.
 
-        Create requires ``key`` + ``name``; PATCH is by path key and takes the
-        same mutable config fields as a full snapshot (no ``key`` in the body).
+        Create requires ``key`` + ``name`` (``name`` defaults to ``key``).
+        PATCH is by path key and takes the same mutable config fields as a
+        full snapshot — no ``key`` and no ``name``, so a UI rename survives
+        the next CI reconcile.
         """
         body: dict[str, Any] = {
-            "name": key,
             "generationProvider": generation["provider"],
             "generationModel": generation["model"],
         }
         if include_key:
             body["key"] = key
+            body["name"] = key
         # Always send parameters/promptSnippets — including {} — so a PATCH
         # snapshot can clear previously set values (omitting the field leaves
-        # the old value on the evaluation).
-        body["parameters"] = (
-            generation["parameters"] if "parameters" in generation else {}
-        )
+        # the old value on the evaluation). Explicit ``None`` becomes ``{}``,
+        # matching the TypeScript SDK wire shape.
+        parameters = generation["parameters"] if "parameters" in generation else {}
+        body["parameters"] = {} if parameters is None else parameters
         if "instructions" in generation:
             body["messages"] = [
                 {"role": "system", "content": generation["instructions"]}
             ]
         elif "messages" in generation:
-            body["messages"] = generation["messages"]
+            messages = generation["messages"]
+            body["messages"] = [] if messages is None else messages
         else:
             body["messages"] = []
-        body["promptSnippets"] = (
-            generation["prompt_snippets"]
-            if "prompt_snippets" in generation
-            else {}
+        snippets = (
+            generation["prompt_snippets"] if "prompt_snippets" in generation else {}
         )
+        body["promptSnippets"] = {} if snippets is None else snippets
         # Always send tools/criteria — including [] — so a PATCH snapshot can
         # clear pins that ingest still expects results for.
         body["tools"] = create_wire_tools(tools)
@@ -626,12 +628,24 @@ class EvaluationsRunner:
 
     def _parse_evaluation_ref(self, raw: Mapping[str, Any], key: str) -> EvaluationRef:
         evaluation_id = require_string(raw, "id", "evaluation")
-        response_key = raw.get("key", raw.get("name", raw.get("label", key)))
+        # Prefer ``key``, then ``name``, then ``label``, then the caller's key.
+        # An explicit JSON ``null`` must fall through (``dict.get`` does not).
+        response_key = key
+        for field in ("key", "name", "label"):
+            value = raw.get(field)
+            if isinstance(value, str) and value:
+                response_key = value
+                break
         version = raw.get("version")
+        # ``bool`` is a subclass of ``int``; reject it so ``True`` is not version 1.
+        if type(version) is not int:
+            raise EvaluationsError(
+                "LaunchDarkly evaluation response is missing integer field 'version'"
+            )
         return EvaluationRef(
             id=evaluation_id,
-            key=str(response_key),
-            version=version if isinstance(version, int) else None,
+            key=response_key,
+            version=version,
         )
 
     def _get_offline_evaluation(
@@ -690,10 +704,34 @@ class EvaluationsRunner:
         path = f"{collection}/{segment(key)}"
         # Full-snapshot PATCH is idempotent: replaying the same body is a
         # server no-op when nothing changed, so transient 5xx may be retried.
-        raw = require_mapping(
-            self._api.patch(path, body=patch_body, idempotent=True),
-            description="offline evaluation",
-        )
+        # A 409 optimistic-lock collision (concurrent writers on one key) is
+        # retried once after a re-GET; a second 409 becomes EvaluationsError.
+        try:
+            raw = require_mapping(
+                self._api.patch(path, body=patch_body, idempotent=True),
+                description="offline evaluation",
+            )
+        except LDApiError as error:
+            if error.status != 409:
+                raise
+            if self._get_offline_evaluation(project_key, key) is None:
+                raise EvaluationsError(
+                    f"LaunchDarkly offline evaluation {key!r} reported an "
+                    "update conflict but could not be re-fetched"
+                ) from error
+            try:
+                raw = require_mapping(
+                    self._api.patch(path, body=patch_body, idempotent=True),
+                    description="offline evaluation",
+                )
+            except LDApiError as retry_error:
+                if retry_error.status == 409:
+                    raise EvaluationsError(
+                        f"LaunchDarkly offline evaluation {key!r} could not be "
+                        "updated because another writer changed it; retry the "
+                        "run or serialize callers that share this key"
+                    ) from retry_error
+                raise
         return self._parse_evaluation_ref(raw, key)
 
     def _create_evaluation_run(

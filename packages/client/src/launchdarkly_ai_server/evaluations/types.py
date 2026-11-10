@@ -255,11 +255,11 @@ class ResolvedJudge:
 
 @dataclass
 class EvaluationRef:
-    """Identifiers returned after creating an evaluation."""
+    """Identifiers returned after creating or reconciling an evaluation."""
 
     id: str
     key: str
-    version: int | None = None
+    version: int
 
 
 @dataclass
