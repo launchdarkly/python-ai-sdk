@@ -307,6 +307,21 @@ class TestModelIdentity:
             config = {**CONFIG, "provider": {"name": configured}}
             assert module.serving_provider(config) == expected, configured
 
+    def test_a_bedrock_config_writes_aws_bedrock(self, handler_spans: Any) -> None:
+        # Semconv names Bedrock `aws.bedrock`. The handlers that put the configured provider on
+        # both keys map a name that lower-cases to `bedrock` to it.
+        package, module, tracer = handler_spans
+        if package not in ("opencode-agents", "vercel-messages", "vercel-agents"):
+            pytest.skip(
+                "covers the handlers that put the configured provider on both keys"
+            )
+        for configured in ("Bedrock", "bedrock"):
+            tracer.spans.clear()
+            module.start_root_span({**CONFIG, "provider": {"name": configured}}, {})
+            attrs = tracer.spans[0].attributes
+            assert attrs["gen_ai.provider.name"] == "aws.bedrock", configured
+            assert attrs["gen_ai.system"] == "aws.bedrock", configured
+
 
 # ─── The vocabulary lock ─────────────────────────────────────────────────────
 
