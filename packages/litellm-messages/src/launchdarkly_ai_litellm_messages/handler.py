@@ -164,7 +164,11 @@ def _retry_option(model: str) -> str:
 
 
 def _provider_name(config_value: AiConfigRep) -> str:
-    return str((config_value.get("provider") or {}).get("name") or "litellm").lower()
+    """The configured provider, lower-cased, with Bedrock as its semconv value ``aws.bedrock``."""
+    provider = str(
+        (config_value.get("provider") or {}).get("name") or "litellm"
+    ).lower()
+    return "aws.bedrock" if provider == "bedrock" else provider
 
 
 def _usage(value: Any) -> SpanUsage:

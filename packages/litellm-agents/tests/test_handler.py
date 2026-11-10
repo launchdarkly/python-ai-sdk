@@ -790,3 +790,21 @@ class TestForwardsExactlyTheCrossSdkList:
             _probe_candidates(), call, overrides=_SAMPLE_OVERRIDES
         )
         assert forwarded == LITELLM_AGENTS
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "expected"),
+    [("Bedrock", "aws.bedrock"), ("bedrock", "aws.bedrock"), ("Azure", "azure")],
+)
+def test_root_and_chat_spans_write_the_provider_name(
+    provider_name: str, expected: str
+) -> None:
+    recorder = SpanRecorder()
+    config = {**CONFIG, "provider": {"name": provider_name}}
+    with patch.object(handler_mod, "trace", recorder):
+        root = handler_mod._root_span(config, {})
+        handler_mod._model_span(config, handler_mod._parent_context(root))
+    assert len(recorder.spans) == 2
+    for span in recorder.spans:
+        assert span.attributes["gen_ai.provider.name"] == expected
+        assert span.attributes["gen_ai.system"] == "litellm"
