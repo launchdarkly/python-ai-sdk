@@ -1739,6 +1739,11 @@ class TestModelParametersForwarding:
                 {"name": "claude-opus-4-5", "region": "us"},
                 "claude-opus-4-5",
             ),
+            (
+                "Anthropic",
+                {"name": "anthropic.claude-opus-5-5", "region": "us"},
+                "anthropic.claude-opus-5-5",
+            ),
         ],
     )
     async def test_bedrock_region_is_the_inference_profile_prefix(

@@ -101,6 +101,8 @@ bedrock_handler = create_handler(("Bedrock", "agent"), create_claude_agents_hand
 
 `claude_graph()` already runs every node on its one handler, Bedrock nodes included.
 
+`to_claude_agents()` doesn't apply `model.region` yet; [#287](https://github.com/launchdarkly/python-ai-sdk/pull/287) will add it.
+
 ### Convenience wrapper
 
 ```python
