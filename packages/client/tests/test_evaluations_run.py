@@ -6064,9 +6064,7 @@ async def test_run_does_not_retry_reconcile_patch_after_5xx() -> None:
             },
         )
     assert excinfo.value.status == 503
-    assert (
-        sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
-    )
+    assert sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
 
 
 @pytest.mark.asyncio
@@ -6215,9 +6213,7 @@ async def test_run_wraps_failed_reget_after_patch_409() -> None:
     assert not isinstance(excinfo.value, LDApiError)
     assert isinstance(excinfo.value.__cause__, LDApiError)
     assert excinfo.value.__cause__.status == 403
-    assert (
-        sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
-    )
+    assert sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
 
 
 @pytest.mark.asyncio
