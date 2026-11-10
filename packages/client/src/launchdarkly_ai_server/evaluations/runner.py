@@ -628,14 +628,12 @@ class EvaluationsRunner:
 
     def _parse_evaluation_ref(self, raw: Mapping[str, Any], key: str) -> EvaluationRef:
         evaluation_id = require_string(raw, "id", "evaluation")
-        # Prefer ``key``, then ``name``, then ``label``, then the caller's key.
-        # An explicit JSON ``null`` must fall through (``dict.get`` does not).
-        response_key = key
-        for field in ("key", "name", "label"):
-            value = raw.get(field)
-            if isinstance(value, str) and value:
-                response_key = value
-                break
+        # Prefer a non-empty response ``key``. Do not fall through to ``name`` /
+        # ``label``: PATCH omits ``name`` so a UI rename can diverge from the
+        # stable key, and ``evaluationKey`` on events must stay that key. An
+        # explicit JSON ``null`` for ``key`` therefore uses the caller's key.
+        raw_key = raw.get("key")
+        response_key = raw_key if isinstance(raw_key, str) and raw_key else key
         version = raw.get("version")
         # ``bool`` is a subclass of ``int``; reject it so ``True`` is not version 1.
         if type(version) is not int:

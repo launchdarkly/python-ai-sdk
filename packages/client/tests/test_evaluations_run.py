@@ -5974,13 +5974,14 @@ async def test_run_requires_integer_evaluation_version() -> None:
         )
 
 
-def test_parse_evaluation_ref_falls_through_null_key() -> None:
+def test_parse_evaluation_ref_uses_caller_key_when_response_key_null() -> None:
+    """Null response key must not pick a renamed display name for evaluationKey."""
     runner = EvaluationsRunner(MagicMock())
     ref = runner._parse_evaluation_ref(
         {"id": "evaluation-id", "key": None, "name": "Display", "version": 2},
         "support-qa",
     )
-    assert ref == EvaluationRef(id="evaluation-id", key="Display", version=2)
+    assert ref == EvaluationRef(id="evaluation-id", key="support-qa", version=2)
 
 
 def test_parse_evaluation_ref_rejects_bool_version() -> None:
