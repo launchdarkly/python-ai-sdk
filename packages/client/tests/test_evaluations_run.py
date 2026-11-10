@@ -5995,6 +5995,7 @@ def test_parse_evaluation_ref_rejects_bool_version() -> None:
             "support-qa",
         )
 
+
 def criterion_summary(
     *,
     threshold: float | None = 0.8,
