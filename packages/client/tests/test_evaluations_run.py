@@ -5743,7 +5743,7 @@ async def test_run_falls_back_to_row_counts_when_no_verdict_arrives(
     )
     transport = verdict_run_transport(
         {"statusCounts": NINE_OF_TEN, "criterionSummaries": [criterion_summary()]},
-        [run_item()],
+        [run_item(state="EVALUATED")],
     )
 
     with caplog.at_level("WARNING", logger="launchdarkly_ai_server.evaluations"):
@@ -5751,14 +5751,26 @@ async def test_run_falls_back_to_row_counts_when_no_verdict_arrives(
 
     assert result.verdict is None
     assert result.passed is False
-    assert any("no verdict" in record.getMessage() for record in caplog.records)
+    assert len(get_run_requests(transport)) == 1
+    [warning] = [
+        record.getMessage()
+        for record in caplog.records
+        if "no verdict" in record.getMessage()
+    ]
+    assert "run-id" in warning
+    assert "within 0 seconds" in warning
+    assert "(state EVALUATED)" in warning
 
 
 @pytest.mark.parametrize("state", ["CANCELLED", "PERMANENT_ERROR"])
 @pytest.mark.asyncio
 async def test_run_stops_waiting_for_a_verdict_on_a_terminal_run(
-    monkeypatch: pytest.MonkeyPatch, state: str
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, state: str
 ) -> None:
+    """A run in a terminal state other than COMPLETE never gets a verdict, so
+    run() stops after one read, without a warning, and falls back to the row
+    counts. The default deadline is left in place so a harness that kept
+    polling would make a second request."""
     monkeypatch.setattr(
         "launchdarkly_ai_server.evaluations.module.SUMMARY_POLL_INTERVAL_SECONDS", 0
     )
@@ -5767,10 +5779,13 @@ async def test_run_stops_waiting_for_a_verdict_on_a_terminal_run(
         [run_item(state=state)],
     )
 
-    result = await run_with_pass_rate(transport)
+    with caplog.at_level("WARNING", logger="launchdarkly_ai_server.evaluations"):
+        result = await run_with_pass_rate(transport)
 
     assert result.verdict is None
+    assert result.passed is False
     assert len(get_run_requests(transport)) == 1
+    assert caplog.records == []
 
 
 @pytest.mark.asyncio
@@ -5837,6 +5852,7 @@ async def test_run_does_not_raise_when_the_verdict_read_fails(
 
     assert result.verdict is None
     assert result.passed is False
+    assert len(get_run_requests(transport)) == 1
     assert any(
         "Could not read the verdict" in record.getMessage() for record in caplog.records
     )
