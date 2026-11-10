@@ -714,7 +714,16 @@ class EvaluationsRunner:
         except LDApiError as error:
             if error.status != 409:
                 raise
-            if self._get_offline_evaluation(project_key, key) is None:
+            # Align with JS: any re-GET failure after a PATCH 409 (404 or
+            # otherwise) becomes EvaluationsError — do not leak a raw LDApiError.
+            try:
+                refetched = self._get_offline_evaluation(project_key, key)
+            except LDApiError as reget_error:
+                raise EvaluationsError(
+                    f"LaunchDarkly offline evaluation {key!r} reported an "
+                    "update conflict but could not be re-fetched"
+                ) from reget_error
+            if refetched is None:
                 raise EvaluationsError(
                     f"LaunchDarkly offline evaluation {key!r} reported an "
                     "update conflict but could not be re-fetched"

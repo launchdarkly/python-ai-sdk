@@ -22,7 +22,7 @@ from launchdarkly_ai_server import (
     create_handler,
     init_evaluations,
 )
-from launchdarkly_ai_server.evaluations.api import HttpResponse
+from launchdarkly_ai_server.evaluations.api import HttpResponse, LDApiError
 from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner, _describe_value
 from launchdarkly_ai_server.evaluations.tools import (
     create_wire_tools,
@@ -811,9 +811,21 @@ async def test_nan_poll_values_are_rejected(
         "support:qa",
         "support qa",
         "..",
+        "-leading",
+        ".leading",
+        "_leading",
         "a" * 129,
     ],
-    ids=["uppercase", "colon", "space", "dotdot", "too_long"],
+    ids=[
+        "uppercase",
+        "colon",
+        "space",
+        "dotdot",
+        "leading_hyphen",
+        "leading_dot",
+        "leading_underscore",
+        "too_long",
+    ],
 )
 @pytest.mark.asyncio
 async def test_run_rejects_invalid_offline_evaluation_keys_before_network(
@@ -834,6 +846,66 @@ async def test_run_rejects_invalid_offline_evaluation_keys_before_network(
             handler=tagged(handler),
             generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
         )
+
+
+@pytest.mark.parametrize("key", ["a.b_c-1", "support_qa.v1-prod"])
+@pytest.mark.asyncio
+async def test_run_accepts_valid_offline_evaluation_keys(key: str) -> None:
+    """Charset allows ``._-`` after a leading alnum."""
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(404, {"message": "Evaluation not found"}),
+            response(
+                201,
+                {
+                    "id": "evaluation-id",
+                    "key": key,
+                    "name": key,
+                    "version": 1,
+                },
+            ),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "statusCounts": {
+                        "total": 1,
+                        "passed": 1,
+                        "failed": 0,
+                        "error": 0,
+                        "pending": 0,
+                    }
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key=key,
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert result.passed is True
+    assert evaluation_post(transport)["key"] == key
+    assert evaluation_post(transport)["name"] == key
 
 
 @pytest.mark.asyncio
@@ -5713,7 +5785,9 @@ def _reuse_run_responses(
 
 
 @pytest.mark.asyncio
-async def test_run_always_patches_existing_offline_evaluation() -> None:
+async def test_run_always_patches_existing_offline_evaluation(
+    stub_sdk_client: MagicMock,
+) -> None:
     """GET 200 always PATCHes the full desired snapshot; server owns equality."""
     existing = _existing_offline_evaluation()
     patched = _existing_offline_evaluation(version=4)
@@ -5748,6 +5822,7 @@ async def test_run_always_patches_existing_offline_evaluation() -> None:
         and request["url"].rstrip("/").endswith("/offline-evaluations")
         for request in transport.requests
     )
+    assert not any(request["method"] == "PUT" for request in transport.requests)
     patch = next(
         request for request in transport.requests if request["method"] == "PATCH"
     )
@@ -5762,6 +5837,14 @@ async def test_run_always_patches_existing_offline_evaluation() -> None:
     }
     assert "key" not in patch["body"]
     assert "name" not in patch["body"]
+    # Events must carry the PATCH response version, not the prior GET version.
+    generation_events = [
+        call.args[2]
+        for call in stub_sdk_client.track.call_args_list
+        if call.args[0] == "$ld:ai:offline-evals:generation"
+    ]
+    assert generation_events[0]["evaluationVersion"] == 4
+    assert generation_events[0]["evaluationKey"] == "support-qa"
 
 
 @pytest.mark.asyncio
@@ -5862,6 +5945,155 @@ async def test_run_handles_create_conflict_by_reget_and_patch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_raises_when_create_conflict_reget_is_404() -> None:
+    """POST 409 then re-GET 404 → EvaluationsError (runner.py ~697-701)."""
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(404, {"message": "Evaluation not found"}),
+            response(409, {"code": "conflict", "message": "key already exists"}),
+            response(404, {"message": "Evaluation not found"}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(
+        EvaluationsError, match="key conflict but could not be re-fetched"
+    ):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert not any(request["method"] == "PATCH" for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_run_rethrows_non_404_on_by_key_get() -> None:
+    """A non-404 by-key GET is re-raised, not treated as missing (~661)."""
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(403, {"message": "forbidden"}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(LDApiError) as excinfo:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert excinfo.value.status == 403
+    assert not any(
+        request["method"] == "POST"
+        and request["url"].rstrip("/").endswith("/offline-evaluations")
+        for request in transport.requests
+    )
+    assert not any(request["method"] == "PATCH" for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_retry_reconcile_patch_after_5xx() -> None:
+    """Runner PATCH must not pass idempotent=True (~704-712); 5xx is not retried."""
+    existing = _existing_offline_evaluation()
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(200, existing),
+            response(503, {"message": "unavailable"}),
+            # Would be consumed if the runner marked PATCH idempotent.
+            response(200, _existing_offline_evaluation(version=4)),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(LDApiError) as excinfo:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert excinfo.value.status == 503
+    assert (
+        sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_never_issues_a_put() -> None:
+    existing = _existing_offline_evaluation()
+    patched = _existing_offline_evaluation(version=4)
+    transport = SequencedTransport(
+        _reuse_run_responses(existing, response(200, patched))
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert not any(request["method"] == "PUT" for request in transport.requests)
+
+
+@pytest.mark.asyncio
 async def test_run_retries_patch_conflict_once_after_reget() -> None:
     """PATCH 409 (optimistic lock) re-GETs and retries PATCH once."""
     existing = _existing_offline_evaluation(name="Friendly title")
@@ -5943,6 +6175,52 @@ async def test_run_raises_when_patch_conflicts_twice() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_wraps_failed_reget_after_patch_409() -> None:
+    """After PATCH 409, a non-404 re-GET becomes EvaluationsError (JS-aligned)."""
+    existing = _existing_offline_evaluation()
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(200, existing),
+            response(409, {"code": "conflict", "message": "version conflict"}),
+            response(403, {"message": "forbidden"}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(
+        EvaluationsError, match="update conflict but could not be re-fetched"
+    ) as excinfo:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert not isinstance(excinfo.value, LDApiError)
+    assert isinstance(excinfo.value.__cause__, LDApiError)
+    assert excinfo.value.__cause__.status == 403
+    assert (
+        sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_requires_integer_evaluation_version() -> None:
     transport = SequencedTransport(
         [
@@ -5975,6 +6253,21 @@ async def test_run_requires_integer_evaluation_version() -> None:
                 "mode": "completion",
             },
         )
+
+
+def test_parse_evaluation_ref_uses_response_key_when_present() -> None:
+    """Non-empty response ``key`` is used for evaluationKey (~636-638)."""
+    runner = EvaluationsRunner(MagicMock())
+    ref = runner._parse_evaluation_ref(
+        {
+            "id": "evaluation-id",
+            "key": "from-key",
+            "name": "from-name",
+            "version": 2,
+        },
+        "support-qa",
+    )
+    assert ref == EvaluationRef(id="evaluation-id", key="from-key", version=2)
 
 
 def test_parse_evaluation_ref_uses_caller_key_when_response_key_null() -> None:
