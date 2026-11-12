@@ -640,7 +640,8 @@ class TestRootSpanAttributes:
         ("provider_name", "expected"),
         [
             ("OpenAI", "openai"),
-            ("Bedrock", "bedrock"),
+            ("Bedrock", "aws.bedrock"),
+            ("bedrock", "aws.bedrock"),
             ("Azure", "azure"),
             ("Cohere", "cohere"),
             ("Typo", "typo"),
