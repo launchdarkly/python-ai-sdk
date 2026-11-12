@@ -658,10 +658,13 @@ def _rebuild_thinking(value: Mapping[str, Any]) -> dict[str, Any] | None:
     return thinking
 
 
-def _model_id(config: AiConfigRep) -> str:
+def _model_id(config: AiConfigRep) -> str | None:
     """The ``model`` sent to the CLI. For a Bedrock config with a bare ``anthropic.*`` id,
     ``model.region`` is the inference-profile prefix and is applied by :func:`bedrock_model_id`:
     the CLI sends that id as-is, which Bedrock rejects for models that need an inference profile.
+
+    ``None`` for an empty or whitespace-only name. Callers then omit ``model``, so the CLI runs its
+    default model rather than receiving ``""``.
 
     Every other name goes through unchanged. The CLI maps an Anthropic-format id such as
     ``claude-sonnet-4-5-20250929`` to a profile itself, and sends a prefixed one such as
@@ -669,6 +672,8 @@ def _model_id(config: AiConfigRep) -> str:
     """
     model = config["model"]
     name: str = model["name"]
+    if not name.strip():
+        return None
     provider = config.get("provider") or {}
     if str(provider.get("name") or "").lower() != "bedrock" or not name.startswith(
         "anthropic."
@@ -734,7 +739,6 @@ def _build_query_options(
     params = _options_parameters(config)
     kwargs: dict[str, Any] = {
         **params,
-        "model": _model_id(config),
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
         "hooks": hooks or {},
@@ -746,6 +750,9 @@ def _build_query_options(
         "tools": [*native_tool_names, *(extra_builtins or [])],
         **extra,
     }
+    model_id = _model_id(config)
+    if model_id is not None:
+        kwargs["model"] = model_id
     if system_prompt:
         kwargs["system_prompt"] = system_prompt
     return ClaudeAgentOptions(**kwargs)

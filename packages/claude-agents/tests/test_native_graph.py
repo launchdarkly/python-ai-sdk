@@ -655,6 +655,38 @@ class TestToClaudeAgentsHostIsolation:
         assert captured[0]["model"] == "us.anthropic.claude-opus-5-5"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["", "   "])
+    async def test_omits_model_for_a_blank_model_name(self, name: str) -> None:
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": name, "region": "us"},
+                        "instructions": "root",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+        mock_sdk = _make_sdk_mock("done")
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+        assert len(captured) == 1
+        assert "model" not in captured[0]
+
+    @pytest.mark.asyncio
     async def test_loads_no_host_settings_and_sends_no_cwd_by_default(self) -> None:
         for opts in await self._root_and_leaf_options():
             assert opts["setting_sources"] == []
