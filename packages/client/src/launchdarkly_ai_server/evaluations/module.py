@@ -358,8 +358,12 @@ class EvaluationsModule:
 
         ``generation`` must set ``provider``, ``model`` and ``mode``
         (``"completion"`` or ``"agent"``). Pass ``ai_config`` instead to start
-        from an existing AI Config variation. The AI Config supplies the mode.
-        The variation's model, provider, parameters, prompt and output format
+        from an existing AI Config. The AI Config supplies the mode. When
+        ``variation`` is set, that variation's latest version is the base.
+        When it is omitted, the base is the variation served for
+        ``{kind: "evaluation", key: <this run's key>}`` at that variation's
+        ``_ldMeta.version``. A missing version fails before any write. The
+        variation's model, provider, parameters, prompt and output format
         become the defaults, and ``generation`` can override them field by
         field (``parameters`` merge key by key), except ``mode``. When
         ``tools`` is omitted the variation's tools are used, so each needs an
@@ -393,14 +397,18 @@ class EvaluationsModule:
                 pool, run_generation, "generation"
             )
         else:
-            config_label = f"{ai_config.key!r}/{ai_config.variation!r}"
             (
                 run_generation,
                 generation_handler,
                 ai_config_variation,
+                variation_key,
             ) = await self._read_ai_config(
-                ai_config, cast(GenerationOverrides | None, generation), pool
+                ai_config,
+                cast(GenerationOverrides | None, generation),
+                pool,
+                key,
             )
+            config_label = f"{ai_config.key!r}/{variation_key!r}"
             if tools is None and ai_config_variation.tool_versions:
                 raise EvaluationsError(
                     f"AI Config variation {config_label} uses tools "
@@ -809,14 +817,24 @@ class EvaluationsModule:
         ai_config: AIConfig,
         overrides: GenerationOverrides | None,
         pool: list[EvalHandler],
-    ) -> tuple[GenerationConfig, EvalHandler, AIConfigVariation]:
+        evaluation_key: str,
+    ) -> tuple[GenerationConfig, EvalHandler, AIConfigVariation, str]:
         """Read an AI Config variation and select its generation handler.
 
         Each check runs as soon as the read that supplies its input returns:
         the mode after the AI Config read, the prompt after the variation
-        read, and the provider after the model config read.
+        read, and the provider after the model config read. An omitted
+        ``variation`` is resolved before those reads, so a missing served
+        version fails before any management-API write.
         """
-        label = f"AI Config {ai_config.key!r} variation {ai_config.variation!r}"
+        if ai_config.variation is None:
+            variation_key, version = await self._runner._served_variation(
+                ai_config.key, evaluation_key
+            )
+        else:
+            variation_key = ai_config.variation
+            version = None
+        label = f"AI Config {ai_config.key!r} variation {variation_key!r}"
         config_mode = await asyncio.to_thread(
             self._runner._fetch_ai_config_mode, self._project_key, ai_config.key
         )
@@ -835,7 +853,8 @@ class EvaluationsModule:
             self._runner._fetch_config_variation,
             self._project_key,
             ai_config.key,
-            ai_config.variation,
+            variation_key,
+            version=version,
         )
         prompt = _merge_generation(
             AIConfigVariation.from_api(latest, None, mode).generation, overrides
@@ -853,7 +872,7 @@ class EvaluationsModule:
         merged["mode"] = "agent" if mode == "agent" else "completion"
         generation = self._validate_generation(merged)
         handler = self._select_generation_handler(pool, generation, label)
-        return generation, handler, variation
+        return generation, handler, variation, variation_key
 
     @staticmethod
     def _validate_run_args(
@@ -944,12 +963,11 @@ class EvaluationsModule:
                 "generation.mode cannot be set with ai_config: the AI Config "
                 "supplies the mode"
             )
-        for name, value in (
-            ("ai_config.key", ai_config.key),
-            ("ai_config.variation", ai_config.variation),
-        ):
-            if not value.strip():
-                raise EvaluationsError(f"{name} must not be blank")
+        if not ai_config.key.strip():
+            raise EvaluationsError("ai_config.key must not be blank")
+        # ``None`` means "the served variation". A blank string is still an error.
+        if ai_config.variation is not None and not ai_config.variation.strip():
+            raise EvaluationsError("ai_config.variation must not be blank")
 
     @staticmethod
     def _validate_generation(generation: Mapping[str, Any]) -> GenerationConfig:
