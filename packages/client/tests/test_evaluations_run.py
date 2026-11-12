@@ -22,7 +22,7 @@ from launchdarkly_ai_server import (
     create_handler,
     init_evaluations,
 )
-from launchdarkly_ai_server.evaluations.api import HttpResponse
+from launchdarkly_ai_server.evaluations.api import HttpResponse, LDApiError
 from launchdarkly_ai_server.evaluations.runner import EvaluationsRunner, _describe_value
 from launchdarkly_ai_server.evaluations.tools import (
     create_wire_tools,
@@ -219,6 +219,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
                     total=2,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(
                 201,
                 {
@@ -300,6 +301,7 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
         "GET",
         "GET",
         "GET",
+        "GET",
         "POST",
         "POST",
         "GET",
@@ -312,18 +314,27 @@ async def test_complete_run_with_zero_failed_and_error_rows_passes(
     )
     assert "/projects/proj/datasets/golden/rows" in transport.requests[2]["url"]
     assert "mode=all" in transport.requests[2]["url"]
-    assert transport.requests[4]["body"] == {
+    assert transport.requests[4]["url"].endswith(
+        "/api/v2/projects/proj/offline-evaluations/support-qa-unique"
+    )
+    assert transport.requests[5]["url"].endswith(
+        "/api/v2/projects/proj/offline-evaluations"
+    )
+    assert transport.requests[5]["body"] == {
+        "key": "support-qa-unique",
         "name": "support-qa-unique",
         "generationProvider": "OpenAI",
         "generationModel": "gpt-4o",
         "parameters": {"temperature": 0.2},
         "messages": [{"role": "system", "content": "Help the user."}],
+        "promptSnippets": {},
         "tools": [{"key": "lookup_order", "version": 7, "source": "library"}],
+        "criteria": [],
     }
-    assert transport.requests[5]["url"].endswith(
+    assert transport.requests[6]["url"].endswith(
         "/api/v2/projects/proj/evaluations/11111111-1111-1111-1111-111111111111/runs"
     )
-    assert transport.requests[5]["body"] == {
+    assert transport.requests[6]["body"] == {
         "source": "api",
         "datasetId": "33333333-3333-3333-3333-333333333333",
     }
@@ -403,7 +414,8 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
                     total=1,
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {
@@ -438,7 +450,7 @@ async def test_generation_events_always_emit_without_flag_or_run_status_poll(
     client.variation = AsyncMock(side_effect=AssertionError("flag must not be read"))
 
     def flush_before_summary() -> None:
-        assert len(transport.requests) == 4
+        assert len(transport.requests) == 5
         assert transport.requests[-1]["url"].endswith("/evaluations/evaluation-id/runs")
 
     client.flush.side_effect = flush_before_summary
@@ -493,7 +505,8 @@ async def test_summary_is_polled_until_rows_are_accounted(
                     [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -549,7 +562,8 @@ async def test_summary_polling_completes_for_real_backend_summary_without_state(
                     [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {
@@ -614,7 +628,8 @@ async def test_summary_polling_ignores_missing_state_even_when_pending_is_zero(
                     [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -668,7 +683,8 @@ async def test_summary_polling_times_out_waiting_for_rows_to_be_accounted(
                     [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -715,7 +731,8 @@ async def test_poll_timeout_and_interval_are_configurable_per_run() -> None:
                     [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -787,6 +804,110 @@ async def test_nan_poll_values_are_rejected(
         )
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "Support-QA",
+        "support:qa",
+        "support qa",
+        "..",
+        "-leading",
+        ".leading",
+        "_leading",
+        "a" * 129,
+    ],
+    ids=[
+        "uppercase",
+        "colon",
+        "space",
+        "dotdot",
+        "leading_hyphen",
+        "leading_dot",
+        "leading_underscore",
+        "too_long",
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_rejects_invalid_offline_evaluation_keys_before_network(
+    key: str,
+) -> None:
+    """Server create charset / length — fail before dataset or tool I/O."""
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(EvaluationsError, match=r"key must match"):
+        await evals.run(
+            key=key,
+            dataset="golden",
+            handler=tagged(handler),
+            generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+        )
+
+
+@pytest.mark.parametrize("key", ["a.b_c-1", "support_qa.v1-prod"])
+@pytest.mark.asyncio
+async def test_run_accepts_valid_offline_evaluation_keys(key: str) -> None:
+    """Charset allows ``._-`` after a leading alnum."""
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(404, {"message": "Evaluation not found"}),
+            response(
+                201,
+                {
+                    "id": "evaluation-id",
+                    "key": key,
+                    "name": key,
+                    "version": 1,
+                },
+            ),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "statusCounts": {
+                        "total": 1,
+                        "passed": 1,
+                        "failed": 0,
+                        "error": 0,
+                        "pending": 0,
+                    }
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key=key,
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert result.passed is True
+    assert evaluation_post(transport)["key"] == key
+    assert evaluation_post(transport)["name"] == key
+
+
 @pytest.mark.asyncio
 async def test_run_uses_a_byoc_client_when_no_sdk_key_is_configured(
     monkeypatch: pytest.MonkeyPatch,
@@ -811,7 +932,8 @@ async def test_run_uses_a_byoc_client_when_no_sdk_key_is_configured(
                     [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -888,7 +1010,8 @@ async def test_failed_rows_fail_the_result() -> None:
                     [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "eval-key"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
             response(
                 201,
                 {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -977,6 +1100,29 @@ def recorded_paths(transport: SequencedTransport) -> list[tuple[str, str]]:
     ]
 
 
+def evaluation_post(transport: SequencedTransport) -> dict[str, Any]:
+    posts = [
+        request
+        for request in transport.requests
+        if request["method"] == "POST"
+        and request["url"].rstrip("/").endswith("/offline-evaluations")
+    ]
+    assert len(posts) == 1
+    body: dict[str, Any] = posts[0]["body"]
+    return body
+
+
+def evaluation_run_post(transport: SequencedTransport) -> dict[str, Any]:
+    posts = [
+        request
+        for request in transport.requests
+        if request["method"] == "POST" and request["url"].endswith("/runs")
+    ]
+    assert len(posts) == 1
+    body: dict[str, Any] = posts[0]["body"]
+    return body
+
+
 def hosted_dataset_responses() -> list[HttpResponse]:
     """Canned responses for a one-row hosted dataset run that passes."""
     return [
@@ -987,6 +1133,7 @@ def hosted_dataset_responses() -> list[HttpResponse]:
                 [{"rowIndex": 0, "input": "Order A19", "variables": {}}], total=1
             ),
         ),
+        response(404, {"message": "Evaluation not found"}),
         response(201, {"id": "evaluation-id", "name": "eval-key", "version": 3}),
         response(
             201,
@@ -1078,7 +1225,8 @@ async def test_inline_tool_runs_without_reading_the_tool_api() -> None:
     assert recorded_paths(transport) == [
         ("GET", "projects/proj/datasets/golden"),
         ("GET", "projects/proj/datasets/golden/rows"),
-        ("POST", "projects/proj/evaluations"),
+        ("GET", "projects/proj/offline-evaluations/eval-key"),
+        ("POST", "projects/proj/offline-evaluations"),
         ("POST", "projects/proj/evaluations/evaluation-id/runs"),
         ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
     ]
@@ -1089,7 +1237,7 @@ async def test_inline_tool_runs_without_reading_the_tool_api() -> None:
         "an inline tool must not be looked up in the AI library"
     )
 
-    assert transport.requests[2]["body"]["tools"] == [
+    assert evaluation_post(transport)["tools"] == [
         {
             "key": "lookup_order",
             "schema": ORDER_SCHEMA,
@@ -1132,7 +1280,7 @@ async def test_inline_tool_description_defaults_to_empty_string() -> None:
         generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
-    assert transport.requests[2]["body"]["tools"] == [
+    assert evaluation_post(transport)["tools"] == [
         {
             "key": "lookup_order",
             "schema": ORDER_SCHEMA,
@@ -1193,7 +1341,7 @@ async def test_mixed_library_and_inline_tools_each_keep_their_own_source() -> No
     assert [
         path for method, path in recorded_paths(transport) if "ai-tools" in path
     ] == ["projects/proj/ai-tools/lookup_order"]
-    assert transport.requests[3]["body"]["tools"] == [
+    assert evaluation_post(transport)["tools"] == [
         {"key": "lookup_order", "version": 7, "source": "library"},
         {
             "key": "refund_order",
@@ -1409,7 +1557,7 @@ async def test_native_tool_on_its_own_still_resolves_from_the_library() -> None:
     )
 
     assert recorded_paths(transport)[0] == ("GET", "projects/proj/ai-tools/web_search")
-    assert transport.requests[3]["body"]["tools"] == [
+    assert evaluation_post(transport)["tools"] == [
         {"key": "web_search", "version": 2, "source": "library"}
     ]
 
@@ -1588,6 +1736,7 @@ async def test_complete_run_with_error_rows_does_not_pass(
                     total=2,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(
                 201,
                 {
@@ -1687,6 +1836,7 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
                     total=1,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -1780,7 +1930,7 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
     # than default it to a deepeval metric and reject the key. successDirection
     # is deliberately absent: LaunchDarkly injects it from the judge's AI Config
     # on the way through, so the SDK must not assert a direction of its own.
-    assert transport.requests[2]["body"]["criteria"] == [
+    assert evaluation_post(transport)["criteria"] == [
         {
             "criterionType": "$ld:ai:judge:accuracy",
             "kind": "judge",
@@ -1788,7 +1938,10 @@ async def test_run_with_ld_judge_emits_per_criterion_evaluation_event(
             "options": {"threshold": 0.5, "passRateThreshold": 0.95},
         }
     ]
-    assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
+    assert evaluation_run_post(transport) == {
+        "source": "api",
+        "datasetId": "dataset-id",
+    }
     events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
     judge_event = next(event for event in events if event.get("kind") == "judge")
     assert judge_event["criterionType"] == "$ld:ai:judge:accuracy"
@@ -1848,6 +2001,7 @@ async def test_run_with_ld_judge_never_sends_a_verdict(
                     total=1,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -1949,7 +2103,8 @@ async def test_judges_resolve_once_per_run_not_once_per_row(
                     total=3,
                 ),
             ),
-            response(201, {"id": "evaluation-id", "name": "support-qa"}),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "version": 1}),
             response(
                 201,
                 {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -2116,6 +2271,7 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
                     total=1,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -2155,7 +2311,7 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
     assert result.passed is True
     # A scorer has no LaunchDarkly-side config, so unlike a judge it declares
     # its own direction and the proxy leaves it alone.
-    assert transport.requests[2]["body"]["criteria"] == [
+    assert evaluation_post(transport)["criteria"] == [
         {
             "criterionType": "refund-exists",
             "kind": "scorer",
@@ -2163,7 +2319,10 @@ async def test_run_with_deterministic_scorer_emits_scorer_evaluation_event(
             "options": {"threshold": 1.0, "passRateThreshold": 0.95},
         }
     ]
-    assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
+    assert evaluation_run_post(transport) == {
+        "source": "api",
+        "datasetId": "dataset-id",
+    }
     events = [call.args[2] for call in stub_sdk_client.track.call_args_list]
     scorer_event = next(event for event in events if event.get("kind") == "scorer")
     assert scorer_event["projectKey"] == "proj"
@@ -2207,6 +2366,7 @@ def judge_run_transport(*, summary: dict[str, Any] | None = None) -> SequencedTr
                     total=1,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -2473,6 +2633,7 @@ async def test_missing_expected_output_renders_empty_judge_variables(
                 200,
                 dataset_page([{"rowIndex": 7, "input": "Question"}], total=1),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -2523,6 +2684,7 @@ async def test_structured_output_reaches_the_judge_as_json(
                 200,
                 dataset_page([{"rowIndex": 0, "input": "Question"}], total=1),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -2644,6 +2806,7 @@ async def test_a_row_that_did_not_generate_is_never_scored(
                     total=2,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -3420,6 +3583,7 @@ async def test_criteria_run_concurrently_within_the_concurrency_bound(
                     total=3,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -3487,6 +3651,7 @@ def tool_run_transport(*, rows: int = 1) -> SequencedTransport:
                     total=rows,
                 ),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -3861,7 +4026,8 @@ def fetched_run_responses(variation_page: dict[str, Any]) -> list[HttpResponse]:
             200,
             dataset_page([{"rowIndex": 0, "input": "hello", "variables": {}}], total=1),
         ),
-        response(201, {"id": "evaluation-id", "name": "eval-key"}),
+        response(404, {"message": "Evaluation not found"}),
+        response(201, {"id": "evaluation-id", "name": "eval-key", "version": 1}),
         response(
             201,
             {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
@@ -3879,17 +4045,6 @@ def fetched_run_responses(variation_page: dict[str, Any]) -> list[HttpResponse]:
             },
         ),
     ]
-
-
-def evaluation_post(transport: SequencedTransport) -> dict[str, Any]:
-    posts = [
-        request
-        for request in transport.requests
-        if request["method"] == "POST" and request["url"].endswith("/evaluations")
-    ]
-    assert len(posts) == 1
-    body: dict[str, Any] = posts[0]["body"]
-    return body
 
 
 @pytest.mark.asyncio
@@ -4334,7 +4489,7 @@ async def test_a_schema_changed_after_construction_is_not_what_is_sent() -> None
         generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
     )
 
-    assert transport.requests[2]["body"]["tools"][0]["schema"] == ORDER_SCHEMA
+    assert evaluation_post(transport)["tools"][0]["schema"] == ORDER_SCHEMA
     assert seen["parameters"] == ORDER_SCHEMA
     assert tool.schema == ORDER_SCHEMA
     assert tool.to_create_wire()["schema"] == ORDER_SCHEMA
@@ -4459,7 +4614,8 @@ async def test_an_empty_tools_list_runs_a_variation_with_no_tools() -> None:
         tools=[],
     )
 
-    assert "tools" not in evaluation_post(transport)
+    assert evaluation_post(transport)["tools"] == []
+    assert evaluation_post(transport)["criteria"] == []
 
 
 @pytest.mark.asyncio
@@ -4491,9 +4647,12 @@ async def test_a_tool_from_another_project_is_rejected() -> None:
         )
 
 
+INLINE_EVALUATION_MISSING = response(404, {"message": "Evaluation not found"})
 INLINE_EVALUATION = response(
-    201, {"id": "evaluation-id", "name": "inline-eval", "version": 1}
+    201,
+    {"id": "evaluation-id", "name": "inline-eval", "key": "inline-eval", "version": 1},
 )
+INLINE_ENSURE = [INLINE_EVALUATION_MISSING, INLINE_EVALUATION]
 
 
 INLINE_RUN = response(
@@ -4546,7 +4705,7 @@ async def test_inline_dataset_uploads_rows_before_any_event_and_omits_dataset_id
 ) -> None:
     calls: list[str] = []
     transport = SequencedTransport(
-        [INLINE_EVALUATION, INLINE_RUN, response(200, {}), inline_summary(2)]
+        [*INLINE_ENSURE, INLINE_RUN, response(200, {}), inline_summary(2)]
     )
 
     def logging_transport(
@@ -4592,9 +4751,12 @@ async def test_inline_dataset_uploads_rows_before_any_event_and_omits_dataset_id
 
     assert result.passed is True
     assert not any("/datasets/" in request["url"] for request in transport.requests)
-    assert transport.requests[1]["url"].endswith("/evaluations/evaluation-id/runs")
-    assert transport.requests[1]["body"] == {"source": "api"}
-    upload = transport.requests[2]
+    assert transport.requests[0]["url"].endswith("/offline-evaluations/inline-eval")
+    assert transport.requests[1]["url"].endswith("/offline-evaluations")
+    assert transport.requests[1]["body"]["key"] == "inline-eval"
+    assert transport.requests[2]["url"].endswith("/evaluations/evaluation-id/runs")
+    assert transport.requests[2]["body"] == {"source": "api"}
+    upload = transport.requests[3]
     assert upload["method"] == "POST"
     assert upload["url"].endswith(
         "/projects/proj/evaluations/evaluation-id/runs/run-id/dataset-rows"
@@ -4636,6 +4798,7 @@ async def test_inline_dataset_uploads_rows_before_any_event_and_omits_dataset_id
 async def test_inline_dataset_uploads_in_batches_of_500() -> None:
     transport = SequencedTransport(
         [
+            INLINE_EVALUATION_MISSING,
             INLINE_EVALUATION,
             INLINE_RUN,
             response(200, {}),
@@ -4666,7 +4829,7 @@ async def test_inline_dataset_criterion_events_omit_dataset_id(
     stub_sdk_client: MagicMock,
 ) -> None:
     transport = SequencedTransport(
-        [INLINE_EVALUATION, INLINE_RUN, response(200, {}), inline_summary(1)]
+        [*INLINE_ENSURE, INLINE_RUN, response(200, {}), inline_summary(1)]
     )
 
     await init_evaluations(
@@ -4776,6 +4939,7 @@ async def test_malformed_inline_rows_fail_before_any_request(
 async def test_inline_upload_is_retried_after_a_server_error() -> None:
     transport = SequencedTransport(
         [
+            INLINE_EVALUATION_MISSING,
             INLINE_EVALUATION,
             INLINE_RUN,
             response(503, {"message": "unavailable"}),
@@ -4803,6 +4967,7 @@ async def test_failed_inline_upload_stops_the_run_before_generation(
 ) -> None:
     transport = SequencedTransport(
         [
+            INLINE_EVALUATION_MISSING,
             INLINE_EVALUATION,
             INLINE_RUN,
             response(400, {"message": "bad rows"}),
@@ -4837,6 +5002,7 @@ async def test_failed_inline_upload_stops_the_run_before_generation(
 async def test_run_is_cancelled_when_a_later_upload_batch_fails() -> None:
     transport = SequencedTransport(
         [
+            INLINE_EVALUATION_MISSING,
             INLINE_EVALUATION,
             INLINE_RUN,
             response(200, {}),
@@ -4869,6 +5035,7 @@ async def test_failed_cancel_does_not_mask_the_upload_error(
 ) -> None:
     transport = SequencedTransport(
         [
+            INLINE_EVALUATION_MISSING,
             INLINE_EVALUATION,
             INLINE_RUN,
             response(400, {"message": "bad rows"}),
@@ -4898,6 +5065,7 @@ async def test_hosted_dataset_event_identity_is_unchanged(
         [
             response(200, {"id": "dataset-id", "key": "golden"}),
             response(200, dataset_page([{"rowIndex": 2, "input": "hello"}], total=1)),
+            INLINE_EVALUATION_MISSING,
             INLINE_EVALUATION,
             INLINE_RUN,
             inline_summary(1),
@@ -4913,7 +5081,10 @@ async def test_hosted_dataset_event_identity_is_unchanged(
         generation=INLINE_GENERATION,
     )
 
-    assert transport.requests[3]["body"] == {"source": "api", "datasetId": "dataset-id"}
+    assert evaluation_run_post(transport) == {
+        "source": "api",
+        "datasetId": "dataset-id",
+    }
     assert not any(is_upload(request) for request in transport.requests)
     event = stub_sdk_client.track.call_args.args[2]
     identity = {
@@ -5406,6 +5577,7 @@ def scorer_run_transport() -> SequencedTransport:
                 200,
                 dataset_page([{"rowIndex": 7, "input": "Question"}], total=1),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,
@@ -5565,6 +5737,554 @@ async def test_invalid_score_warning_repeats_on_each_run(
     assert len(warnings) == 2
 
 
+def _existing_offline_evaluation(**overrides: Any) -> dict[str, Any]:
+    body = {
+        "id": "evaluation-id",
+        "key": "support-qa",
+        "name": "support-qa",
+        "version": 3,
+        "generationProvider": "OpenAI",
+        "generationModel": "gpt-4o",
+        "messages": [],
+        "tools": [],
+        "criteria": [],
+    }
+    body.update(overrides)
+    return body
+
+
+def _reuse_run_responses(
+    evaluation: dict[str, Any],
+    *extra_before_run: HttpResponse,
+) -> list[HttpResponse]:
+    return [
+        response(200, {"id": "dataset-id", "name": "golden"}),
+        response(
+            200,
+            dataset_page([{"rowIndex": 0, "input": "hello", "variables": {}}], total=1),
+        ),
+        response(200, evaluation),
+        *extra_before_run,
+        response(
+            201,
+            {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+        ),
+        response(
+            200,
+            {
+                "statusCounts": {
+                    "total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "error": 0,
+                    "pending": 0,
+                }
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_always_patches_existing_offline_evaluation(
+    stub_sdk_client: MagicMock,
+) -> None:
+    """GET 200 always PATCHes the full desired snapshot; server owns equality."""
+    existing = _existing_offline_evaluation()
+    patched = _existing_offline_evaluation(version=4)
+    transport = SequencedTransport(
+        _reuse_run_responses(existing, response(200, patched))
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert result.passed is True
+    assert recorded_paths(transport) == [
+        ("GET", "projects/proj/datasets/golden"),
+        ("GET", "projects/proj/datasets/golden/rows"),
+        ("GET", "projects/proj/offline-evaluations/support-qa"),
+        ("PATCH", "projects/proj/offline-evaluations/support-qa"),
+        ("POST", "projects/proj/evaluations/evaluation-id/runs"),
+        ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
+    ]
+    assert not any(
+        request["method"] == "POST"
+        and request["url"].rstrip("/").endswith("/offline-evaluations")
+        for request in transport.requests
+    )
+    assert not any(request["method"] == "PUT" for request in transport.requests)
+    patch = next(
+        request for request in transport.requests if request["method"] == "PATCH"
+    )
+    assert patch["body"] == {
+        "generationProvider": "OpenAI",
+        "generationModel": "gpt-4o",
+        "parameters": {},
+        "messages": [],
+        "promptSnippets": {},
+        "tools": [],
+        "criteria": [],
+    }
+    assert "key" not in patch["body"]
+    assert "name" not in patch["body"]
+    # Events must carry the PATCH response version, not the prior GET version.
+    generation_events = [
+        call.args[2]
+        for call in stub_sdk_client.track.call_args_list
+        if call.args[0] == "$ld:ai:offline-evals:generation"
+    ]
+    assert generation_events[0]["evaluationVersion"] == 4
+    assert generation_events[0]["evaluationKey"] == "support-qa"
+
+
+@pytest.mark.asyncio
+async def test_run_patches_empty_parameters_and_prompt_snippets_to_clear() -> None:
+    """Absent generation settings still send {} so PATCH clears prior values."""
+    existing = _existing_offline_evaluation(
+        parameters={"temperature": 0.9},
+        promptSnippets={"tone": "formal"},
+    )
+    patched = _existing_offline_evaluation(version=4)
+    transport = SequencedTransport(
+        _reuse_run_responses(existing, response(200, patched))
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    patch = next(
+        request for request in transport.requests if request["method"] == "PATCH"
+    )
+    assert patch["body"]["parameters"] == {}
+    assert patch["body"]["promptSnippets"] == {}
+
+
+@pytest.mark.asyncio
+async def test_run_handles_create_conflict_by_reget_and_patch() -> None:
+    """POST 409 after GET 404 re-GETs and continues on the update path."""
+    existing = _existing_offline_evaluation(generationModel="gpt-4o-mini")
+    patched = _existing_offline_evaluation(version=4)
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(404, {"message": "Evaluation not found"}),
+            response(409, {"code": "conflict", "message": "key already exists"}),
+            response(200, existing),
+            response(200, patched),
+            response(
+                201,
+                {"id": "run-id", "evaluationId": "evaluation-id", "state": "PENDING"},
+            ),
+            response(
+                200,
+                {
+                    "statusCounts": {
+                        "total": 1,
+                        "passed": 1,
+                        "failed": 0,
+                        "error": 0,
+                        "pending": 0,
+                    }
+                },
+            ),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert result.passed is True
+    assert recorded_paths(transport) == [
+        ("GET", "projects/proj/datasets/golden"),
+        ("GET", "projects/proj/datasets/golden/rows"),
+        ("GET", "projects/proj/offline-evaluations/support-qa"),
+        ("POST", "projects/proj/offline-evaluations"),
+        ("GET", "projects/proj/offline-evaluations/support-qa"),
+        ("PATCH", "projects/proj/offline-evaluations/support-qa"),
+        ("POST", "projects/proj/evaluations/evaluation-id/runs"),
+        ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
+    ]
+    assert evaluation_post(transport)["key"] == "support-qa"
+    assert evaluation_post(transport)["name"] == "support-qa"
+
+
+@pytest.mark.asyncio
+async def test_run_raises_when_create_conflict_reget_is_404() -> None:
+    """POST 409 then re-GET 404 → EvaluationsError (runner.py ~697-701)."""
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(404, {"message": "Evaluation not found"}),
+            response(409, {"code": "conflict", "message": "key already exists"}),
+            response(404, {"message": "Evaluation not found"}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(
+        EvaluationsError, match="key conflict but could not be re-fetched"
+    ):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert not any(request["method"] == "PATCH" for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_run_rethrows_non_404_on_by_key_get() -> None:
+    """A non-404 by-key GET is re-raised, not treated as missing (~661)."""
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(403, {"message": "forbidden"}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(LDApiError) as excinfo:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert excinfo.value.status == 403
+    assert not any(
+        request["method"] == "POST"
+        and request["url"].rstrip("/").endswith("/offline-evaluations")
+        for request in transport.requests
+    )
+    assert not any(request["method"] == "PATCH" for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_retry_reconcile_patch_after_5xx() -> None:
+    """Runner PATCH must not pass idempotent=True (~704-712); 5xx is not retried."""
+    existing = _existing_offline_evaluation()
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(200, existing),
+            response(503, {"message": "unavailable"}),
+            # Would be consumed if the runner marked PATCH idempotent.
+            response(200, _existing_offline_evaluation(version=4)),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(LDApiError) as excinfo:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert excinfo.value.status == 503
+    assert sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
+
+
+@pytest.mark.asyncio
+async def test_run_never_issues_a_put() -> None:
+    existing = _existing_offline_evaluation()
+    patched = _existing_offline_evaluation(version=4)
+    transport = SequencedTransport(
+        _reuse_run_responses(existing, response(200, patched))
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert not any(request["method"] == "PUT" for request in transport.requests)
+
+
+@pytest.mark.asyncio
+async def test_run_retries_patch_conflict_once_after_reget() -> None:
+    """PATCH 409 (optimistic lock) re-GETs and retries PATCH once."""
+    existing = _existing_offline_evaluation(name="Friendly title")
+    patched = _existing_offline_evaluation(version=5, name="Friendly title")
+    transport = SequencedTransport(
+        _reuse_run_responses(
+            existing,
+            response(409, {"code": "conflict", "message": "version conflict"}),
+            response(200, existing),
+            response(200, patched),
+        )
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert result.passed is True
+    assert recorded_paths(transport) == [
+        ("GET", "projects/proj/datasets/golden"),
+        ("GET", "projects/proj/datasets/golden/rows"),
+        ("GET", "projects/proj/offline-evaluations/support-qa"),
+        ("PATCH", "projects/proj/offline-evaluations/support-qa"),
+        ("GET", "projects/proj/offline-evaluations/support-qa"),
+        ("PATCH", "projects/proj/offline-evaluations/support-qa"),
+        ("POST", "projects/proj/evaluations/evaluation-id/runs"),
+        ("GET", "projects/proj/evaluations/evaluation-id/runs/run-id/summary"),
+    ]
+    for request in transport.requests:
+        if request["method"] == "PATCH":
+            assert "name" not in request["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_raises_when_patch_conflicts_twice() -> None:
+    existing = _existing_offline_evaluation()
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(200, existing),
+            response(409, {"code": "conflict", "message": "version conflict"}),
+            response(200, existing),
+            response(409, {"code": "conflict", "message": "version conflict"}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(EvaluationsError, match="another writer changed it"):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_wraps_failed_reget_after_patch_409() -> None:
+    """After PATCH 409, a non-404 re-GET becomes EvaluationsError (JS-aligned)."""
+    existing = _existing_offline_evaluation()
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(200, existing),
+            response(409, {"code": "conflict", "message": "version conflict"}),
+            response(403, {"message": "forbidden"}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(
+        EvaluationsError, match="update conflict but could not be re-fetched"
+    ) as excinfo:
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+    assert not isinstance(excinfo.value, LDApiError)
+    assert isinstance(excinfo.value.__cause__, LDApiError)
+    assert excinfo.value.__cause__.status == 403
+    assert sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
+
+
+@pytest.mark.asyncio
+async def test_run_requires_integer_evaluation_version() -> None:
+    transport = SequencedTransport(
+        [
+            response(200, {"id": "dataset-id", "name": "golden"}),
+            response(
+                200,
+                dataset_page(
+                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
+                ),
+            ),
+            response(404, {"message": "Evaluation not found"}),
+            response(201, {"id": "evaluation-id", "name": "support-qa", "key": None}),
+        ]
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    with pytest.raises(EvaluationsError, match="missing integer field 'version'"):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(handler),
+            generation={
+                "provider": "OpenAI",
+                "model": "gpt-4o",
+                "mode": "completion",
+            },
+        )
+
+
+def test_parse_evaluation_ref_uses_response_key_when_present() -> None:
+    """Non-empty response ``key`` is used for evaluationKey (~636-638)."""
+    runner = EvaluationsRunner(MagicMock())
+    ref = runner._parse_evaluation_ref(
+        {
+            "id": "evaluation-id",
+            "key": "from-key",
+            "name": "from-name",
+            "version": 2,
+        },
+        "support-qa",
+    )
+    assert ref == EvaluationRef(id="evaluation-id", key="from-key", version=2)
+
+
+def test_parse_evaluation_ref_uses_caller_key_when_response_key_null() -> None:
+    """Null response key must not pick a renamed display name for evaluationKey."""
+    runner = EvaluationsRunner(MagicMock())
+    ref = runner._parse_evaluation_ref(
+        {"id": "evaluation-id", "key": None, "name": "Display", "version": 2},
+        "support-qa",
+    )
+    assert ref == EvaluationRef(id="evaluation-id", key="support-qa", version=2)
+
+
+def test_parse_evaluation_ref_rejects_bool_version() -> None:
+    runner = EvaluationsRunner(MagicMock())
+    with pytest.raises(EvaluationsError, match="missing integer field 'version'"):
+        runner._parse_evaluation_ref(
+            {"id": "evaluation-id", "key": "support-qa", "version": True},
+            "support-qa",
+        )
+
+
 def criterion_summary(
     *,
     threshold: float | None = 0.8,
@@ -5593,6 +6313,7 @@ def verdict_run_transport(
                 200,
                 dataset_page([{"rowIndex": 0, "input": "Question"}], total=1),
             ),
+            response(404, {"message": "Evaluation not found"}),
             response(201, {"id": "evaluation-id", "name": "support-qa", "version": 3}),
             response(
                 201,

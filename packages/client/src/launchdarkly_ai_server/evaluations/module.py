@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast, overload
@@ -57,6 +58,10 @@ VERDICT_POLL_TIMEOUT_SECONDS = 30.0
 _UNJUDGED_RUN_STATES = frozenset({"CANCELLED", "PERMANENT_ERROR"})
 INLINE_ROW_FIELDS = ("rowIdx", "input", "expectedOutput", "variables", "metadata")
 GENERATION_MODES = ("completion", "agent")
+# Match the server create rule (``validate_evaluation_key``): lowercase, start
+# alnum, then ``._-``, at most 128 characters. Checked before any network I/O.
+_OFFLINE_EVALUATION_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_OFFLINE_EVALUATION_KEY_MAX_LENGTH = 128
 
 
 def _render_inline_row(row: DatasetRow) -> DatasetRow:
@@ -460,7 +465,7 @@ class EvaluationsModule:
             dataset_ref = DatasetRef(id=None, key=None)
             dataset_rows = [_render_inline_row(row) for row in inline_rows]
         evaluation = await asyncio.to_thread(
-            self._runner._create_evaluation,
+            self._runner._ensure_evaluation,
             self._project_key,
             key,
             run_generation,
@@ -861,6 +866,14 @@ class EvaluationsModule:
         for name, value in (("key", key),):
             if not value.strip():
                 raise EvaluationsError(f"{name} must not be blank")
+        if (
+            len(key) > _OFFLINE_EVALUATION_KEY_MAX_LENGTH
+            or not _OFFLINE_EVALUATION_KEY_RE.fullmatch(key)
+        ):
+            raise EvaluationsError(
+                "key must match '^[a-z0-9][a-z0-9._-]*$' and be at most "
+                f"{_OFFLINE_EVALUATION_KEY_MAX_LENGTH} characters, got {key!r}"
+            )
         if concurrency < 1:
             raise EvaluationsError("concurrency must be at least 1")
         for name, seconds in (

@@ -328,6 +328,30 @@ def test_requests_carry_token_auth_and_json_body() -> None:
     assert request["body"] == {"key": "support-qa"}
 
 
+def test_patch_sends_json_body() -> None:
+    transport = RecordingTransport(
+        [HttpResponse(status=200, body='{"id": "eval-1", "version": 2}')]
+    )
+    client = LDApiClient(api_key="api-token", transport=transport)
+
+    result = client.patch(
+        "projects/proj/offline-evaluations/support-qa",
+        body={"name": "support-qa", "generationProvider": "OpenAI"},
+    )
+
+    assert result == {"id": "eval-1", "version": 2}
+    request = transport.requests[0]
+    assert request["method"] == "PATCH"
+    assert request["url"] == (
+        f"{DEFAULT_BASE_URI}/api/v2/projects/proj/offline-evaluations/support-qa"
+    )
+    assert request["headers"]["Content-Type"] == "application/json"
+    assert request["body"] == {
+        "name": "support-qa",
+        "generationProvider": "OpenAI",
+    }
+
+
 def test_get_encodes_query_params_and_omits_none() -> None:
     transport = RecordingTransport([HttpResponse(status=200, body='{"items": []}')])
     client = LDApiClient(
@@ -469,6 +493,32 @@ def test_idempotent_post_is_retried_after_a_server_error() -> None:
         "runs/run-id/dataset-rows", body={"rows": []}, idempotent=True
     ) == {"ok": True}
     assert len(transport.requests) == 2
+
+
+def test_patch_is_not_retried_after_a_server_error() -> None:
+    """Offline-evaluation PATCH must not blind-replay after 5xx (concurrent writers)."""
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=503, body='{"message": "unavailable"}'),
+            HttpResponse(status=200, body='{"id": "eval-1", "version": 2}'),
+        ]
+    )
+    client = LDApiClient(
+        api_key="api-token",
+        transport=transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    with pytest.raises(LDApiError) as excinfo:
+        client.patch(
+            "projects/proj/offline-evaluations/support-qa",
+            body={"generationProvider": "OpenAI"},
+        )
+
+    assert excinfo.value.status == 503
+    assert len(transport.requests) == 1
 
 
 def test_idempotent_post_is_replayed_after_a_transport_failure() -> None:
