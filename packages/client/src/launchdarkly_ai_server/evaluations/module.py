@@ -26,6 +26,7 @@ from .criteria import Criterion, Judge
 from .runner import (
     EvalHandler,
     EvaluationsRunner,
+    _ConfigLink,
     _provides_for,
     describe_handlers,
     prompt_mode_error,
@@ -365,7 +366,10 @@ class EvaluationsModule:
         ``_ldMeta.version``. A missing version fails before any write. The
         variation's model, provider, parameters, prompt and output format
         become the defaults, and ``generation`` can override them field by
-        field (``parameters`` merge key by key), except ``mode``. When
+        field (``parameters`` merge key by key), except ``mode``. The
+        reconcile POST and PATCH send ``configKey``, ``variationKey`` and
+        ``variationVersion`` (the variation's version). An override replaces
+        that content and does not drop the link. When
         ``tools`` is omitted the variation's tools are used, so each needs an
         implementation; pass ``tools`` to replace the set. When ``criteria`` is
         omitted the variation's attached judges run; pass ``criteria`` (even
@@ -390,6 +394,7 @@ class EvaluationsModule:
         pinned_tool_versions: dict[str, int] = {}
         config_label = ""
         client = await self._resolve_client()
+        link: _ConfigLink | None = None
         if ai_config is None:
             run_generation = self._validate_generation(
                 cast(dict[str, Any], dict(generation or {}))
@@ -402,14 +407,14 @@ class EvaluationsModule:
                 run_generation,
                 generation_handler,
                 ai_config_variation,
-                variation_key,
+                link,
             ) = await self._read_ai_config(
                 ai_config,
                 cast(GenerationOverrides | None, generation),
                 pool,
                 key,
             )
-            config_label = f"{ai_config.key!r}/{variation_key!r}"
+            config_label = f"{ai_config.key!r}/{link.variation_key!r}"
             if tools is None and ai_config_variation.tool_versions:
                 raise EvaluationsError(
                     f"AI Config variation {config_label} uses tools "
@@ -479,6 +484,7 @@ class EvaluationsModule:
             run_generation,
             run_tools,
             run_criteria,
+            link,
         )
         evaluation_run = await asyncio.to_thread(
             self._runner._create_evaluation_run,
@@ -818,7 +824,7 @@ class EvaluationsModule:
         overrides: GenerationOverrides | None,
         pool: list[EvalHandler],
         evaluation_key: str,
-    ) -> tuple[GenerationConfig, EvalHandler, AIConfigVariation, str]:
+    ) -> tuple[GenerationConfig, EvalHandler, AIConfigVariation, _ConfigLink]:
         """Read an AI Config variation and select its generation handler.
 
         Each check runs as soon as the read that supplies its input returns:
@@ -872,7 +878,18 @@ class EvaluationsModule:
         merged["mode"] = "agent" if mode == "agent" else "completion"
         generation = self._validate_generation(merged)
         handler = self._select_generation_handler(pool, generation, label)
-        return generation, handler, variation, variation_key
+        raw_version = latest.get("version")
+        # ``bool`` is an ``int``. Do not send ``True`` as variation version 1.
+        if type(raw_version) is not int:
+            raise EvaluationsError(
+                f"{label} has no integer variation version (got {raw_version!r})"
+            )
+        return (
+            generation,
+            handler,
+            variation,
+            _ConfigLink(ai_config.key, variation_key, raw_version),
+        )
 
     @staticmethod
     def _validate_run_args(

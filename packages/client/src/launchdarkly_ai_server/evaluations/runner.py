@@ -306,6 +306,19 @@ def _finish_criterion_span(
             span.set_attribute("error.type", code)
 
 
+@dataclass(frozen=True)
+class _ConfigLink:
+    """AI Config identity sent on offline-evaluation create and patch.
+
+    ``variation_version`` is the variation's version. It is not the
+    evaluation's version and not the linked model-config version.
+    """
+
+    config_key: str
+    variation_key: str
+    variation_version: int
+
+
 def _served_identity(config_key: str, extracted: Mapping[str, Any]) -> tuple[str, int]:
     """Read the served variation key and version from the raw flag payload.
 
@@ -654,13 +667,15 @@ class EvaluationsRunner:
         criteria: list[Criterion] | None = None,
         *,
         include_key: bool,
+        link: _ConfigLink | None = None,
     ) -> dict[str, Any]:
         """Build the offline-evaluation create/patch body for ``key``.
 
         Create requires ``key`` + ``name`` (``name`` defaults to ``key``).
         PATCH is by path key and takes the same mutable config fields as a
         full snapshot — no ``key`` and no ``name``, so a UI rename survives
-        the next CI reconcile.
+        the next CI reconcile. When ``link`` is set, both bodies send
+        ``configKey``, ``variationKey`` and ``variationVersion``.
         """
         body: dict[str, Any] = {
             "generationProvider": generation["provider"],
@@ -694,6 +709,12 @@ class EvaluationsRunner:
         body["criteria"] = [
             criterion.to_criteria_wire() for criterion in (criteria or [])
         ]
+        # A generation override replaces the variation's content and still
+        # sends the link. variationVersion is the variation's version.
+        if link is not None:
+            body["configKey"] = link.config_key
+            body["variationKey"] = link.variation_key
+            body["variationVersion"] = link.variation_version
         return body
 
     def _parse_evaluation_ref(self, raw: Mapping[str, Any], key: str) -> EvaluationRef:
@@ -736,6 +757,7 @@ class EvaluationsRunner:
         generation: GenerationConfig,
         tools: Sequence[EvalTool],
         criteria: list[Criterion] | None = None,
+        link: _ConfigLink | None = None,
     ) -> EvaluationRef:
         """Reconcile a keyed offline evaluation via GET → POST|PATCH.
 
@@ -743,14 +765,15 @@ class EvaluationsRunner:
         ``name`` (create-only). Steady state: GET 200 → always PATCH the full
         desired snapshot; the server decides whether anything changed. A POST
         409 race re-GETs and continues as the update path. Runs still use
-        legacy ``…/evaluations/{id}/runs``.
+        legacy ``…/evaluations/{id}/runs``. A config link is sent on both the
+        create and the patch.
         """
         collection = f"projects/{segment(project_key)}/offline-evaluations"
         create_body = self._evaluation_config_body(
-            key, generation, tools, criteria, include_key=True
+            key, generation, tools, criteria, include_key=True, link=link
         )
         patch_body = self._evaluation_config_body(
-            key, generation, tools, criteria, include_key=False
+            key, generation, tools, criteria, include_key=False, link=link
         )
 
         if self._get_offline_evaluation(project_key, key) is None:
