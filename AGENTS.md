@@ -74,6 +74,79 @@ them mypy-clean under `strict` is a separate piece of work.
 The `UP046` rule (PEP 695 `type` statement syntax for generic classes) is **ignored** in `pyproject.toml`. Do not convert `class Foo(Generic[T]):` to PEP 695 syntax — it is a deliberate migration decision.
 
 
+## Language idioms
+
+The public contract is shared with the JavaScript and Go SDKs. Everything else is
+written the way a Python developer expects: see [PEP 8](https://peps.python.org/pep-0008/),
+[PEP 484](https://peps.python.org/pep-0484/) and the [typing docs](https://typing.python.org/).
+The Ruff and mypy settings in `pyproject.toml` are the enforced subset. Do not port
+another SDK's shape into Python. If the contract and an idiom conflict, the contract
+wins: raise the conflict.
+
+### What never varies
+Public behaviour, defaults, telemetry, wire payloads, usage IDs and error
+*conditions*. A name is the contract's name in snake_case (`initEvaluations` →
+`init_evaluations`). Types keep PascalCase.
+
+### Errors
+Raise exceptions; never return a `(value, error)` pair. A bad argument raises the
+built-in (`ValueError`, `TypeError`). A feature whose callers need to catch its
+failures defines one public exception for them (`EvaluationsError`,
+`OpenCodeSessionError`, `TypesafeQuestionError`), subclassing `Exception` or the
+closest built-in. Inside `except`, chain with `from exc` to keep the cause. A
+result type that carries an error field is used only where the contract defines
+one (`ParseFailure`, `ReconcileAction.error`). Never swallow an exception unless
+the contract specifies a safe fallback for that call (as it does for
+`inspect_config`).
+
+### Layout
+Public names are exported from the package root through `__init__.py` and listed
+in `__all__`. A feature may be a subpackage (`evaluations/`) that the root
+re-exports. Experimental features are submodules of
+`launchdarkly_ai_server.experimental` (`experimental.shadow_requests`), never
+re-exported from the root. The public modules are the ones with an API report;
+other modules are internal, and helpers inside a module have a leading underscore.
+A public module's `__all__` lists nothing that is not supported API.
+
+### Naming
+PEP 8: `snake_case` functions, methods and keyword arguments; `PascalCase` classes;
+`UPPER_CASE` constants. A closed string set is a `Literal[...]`, and the runtime
+check still stays for untyped callers.
+
+### Concurrency
+I/O-bound public calls are `async def` when the feature is async in the contract.
+No blocking I/O inside a coroutine; move it off the loop with `asyncio.to_thread`.
+Use `async with` / `try`/`finally` for cleanup, and close async generators on early
+exit.
+
+### Options
+New optional settings are keyword-only parameters (`*,`) with defaults. A mapping
+of settings passed through to a provider is a `TypedDict(total=False)` (the
+`*NativeGraphOptions` types), not a bare `dict`. Durations are seconds as `float`,
+unless the contract or a wrapped library fixes a unit (`force_flush(timeout_millis=...)`
+follows OpenTelemetry). Config and value types are `@dataclass(frozen=True)`
+(`AIConfig`, `EvalTool`, `SDKOptions`); changing one means `dataclasses.replace`.
+Result and record types (`EvalRunResult`, `JudgeResult`) are plain `@dataclass`.
+
+### Testing
+`pytest`, under `packages/<package>/tests/`; tests that span packages (API report,
+cross-handler parity, packaging) live in the root `tests/`. Use fakes, or a fake
+server on loopback, and never the external network. mypy `strict` covers
+`packages/*/src` (`make typecheck`). The API report test fails when a public
+signature changes.
+
+### Docs
+A docstring on every public class, function and method you add or change. Reuse
+the other SDKs' wording for the same concept.
+
+### Dependencies
+The core package keeps runtime dependencies to a minimum. A provider SDK is a
+dependency only of its own handler package. Avoid a dependency unless it is widely
+used, maintained, and does something well specified.
+
+### References
+`make lint`, `make format-check`, `make typecheck`, `make test`, `make api-report-check`.
+
 ## Public API Reports
 
 Every public module has a committed API report at `packages/<package>/api-report/<module>.txt`: each name in its `__all__`, one per line, with its full signature, and a class's public members indented below it. The reports are the public API contract.
