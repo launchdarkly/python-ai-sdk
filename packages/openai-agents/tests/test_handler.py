@@ -571,10 +571,16 @@ class TestToolConversion:
         if captured:
             assert not captured[0].get("tools")
 
-    async def test_tool_not_found_throws(self) -> None:
-        tools = _build_agent_tools({"my-tool": {"description": "d"}}, {})
-        with pytest.raises(ValueError, match="No handler"):
-            await tools[0].on_invoke_tool(MagicMock(), "{}")
+    async def test_a_config_tool_with_no_handler_is_not_offered(self) -> None:
+        """The model never learns of a tool nothing implements, so it cannot call it."""
+        assert _build_agent_tools({"my-tool": {"description": "d"}}, {}) == []
+
+    async def test_offers_only_attached_tools_with_a_function_handler(self) -> None:
+        tools = _build_agent_tools(
+            {"safe": {"description": "d"}, "missing": {"description": "d"}},
+            {"safe": AsyncMock(), "privileged": AsyncMock()},
+        )
+        assert [t.name for t in tools] == ["safe"]
 
     async def test_tool_handler_throws_propagates(self) -> None:
         async def _bad(args: Any) -> str:

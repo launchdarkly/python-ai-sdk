@@ -220,9 +220,6 @@ def _forwarded_parameters(config: AiConfigRep) -> dict[str, Any]:
 def _build_tools(
     config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
-    # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK. That
-    # difference predates this span work and changes what the model is offered, not what the span
-    # reports, so it stays as it is: the catalog recorded on the span is the catalog actually sent.
     return [
         {
             "type": "function",
@@ -232,8 +229,9 @@ def _build_tools(
             "strict": False,
         }
         for name, tool in config_tools.items()
-        # A missing handler still reaches the model; a NativeTool never does.
-        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
+        # Only a config tool with a function handler is offered: a missing handler or a
+        # NativeTool never reaches the model.
+        if is_function_tool(tool_handlers.get(name), name)
     ]
 
 
@@ -456,6 +454,9 @@ def _create_openai_messages_handler(
 
         try:
             tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
+            # A tool name in a model response is untrusted: resolve it only against what was
+            # offered.
+            offered = {tool["name"] for tool in tools}
             input_messages = _build_input_messages(config, user_input, vs, history)
             tool_definitions = to_tool_definitions(tools)
 
@@ -515,7 +516,7 @@ def _create_openai_messages_handler(
                     )
                     try:
                         args = json.loads(tc.arguments)
-                        handler_fn = th.get(tc.name)
+                        handler_fn = th.get(tc.name) if tc.name in offered else None
                         if not handler_fn or not callable(handler_fn):
                             raise ValueError(
                                 f'No handler registered for tool "{tc.name}"'
@@ -670,6 +671,8 @@ async def _stream_gen(
     emitter = TurnEmitter(capture_content=capture_content)
     try:
         tools = _build_tools(config.get("tools") or {}, tool_handlers or {})
+        # A tool name in a model response is untrusted: resolve it only against what was offered.
+        offered = {tool["name"] for tool in tools}
         input_messages = _build_input_messages(config, user_input, variables, history)
         tool_definitions = to_tool_definitions(tools)
 
@@ -780,7 +783,11 @@ async def _stream_gen(
                 )
                 try:
                     args = json.loads(tc.arguments)
-                    handler_fn = tool_handlers.get(tc.name)
+                    handler_fn = (
+                        (tool_handlers or {}).get(tc.name)
+                        if tc.name in offered
+                        else None
+                    )
                     if not handler_fn or not callable(handler_fn):
                         raise ValueError(f'No handler registered for tool "{tc.name}"')
                     result = (

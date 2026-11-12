@@ -421,7 +421,7 @@ def _built_tool(config_tools: dict[str, Any], handlers: dict[str, Any]) -> Any:
 
 class TestToolExecutionLoop:
     @pytest.mark.asyncio
-    async def test_tool_not_found_throws(self) -> None:
+    async def test_a_config_tool_with_no_handler_is_not_offered(self) -> None:
         mocks = _make_langchain_mock()
         captured_fns: list[Any] = []
 
@@ -437,11 +437,11 @@ class TestToolExecutionLoop:
             )
             from launchdarkly_ai_langchain_agents.handler import _build_agent_tools
 
-            _build_agent_tools(config["tools"], {})  # no handler registered
+            built = _build_agent_tools(config["tools"], {})  # no handler registered
 
-        if captured_fns:
-            with pytest.raises(ValueError, match="No handler"):
-                await captured_fns[0](key="val")
+        # The model never learns of a tool nothing implements, so it cannot call it.
+        assert built == []
+        assert captured_fns == []
 
     @pytest.mark.asyncio
     async def test_native_tool_is_not_registered(self) -> None:

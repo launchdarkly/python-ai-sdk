@@ -2623,10 +2623,35 @@ class TestHostOptionsAndBuiltinToolSet:
             monkeypatch,
             create_claude_agents_handler(),
             path,
-            BASE_CONFIG,
+            {
+                **BASE_CONFIG,
+                "tools": {
+                    "read": {"name": "read", "type": "function"},
+                    "bash": {"name": "bash", "type": "function"},
+                },
+            },
             {"read": read, "bash": bash},
         )
         assert sorted(opts.tools) == ["Bash", "Read"]
+
+    async def test_a_registered_native_tool_the_config_does_not_attach_is_not_sent(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        """Registering ClaudeBash for one variation must not turn on a shell for another."""
+        from launchdarkly_ai_claude_agents import ClaudeBash, ClaudeRead
+        from launchdarkly_ai_server import NATIVE_TOOL_KEY
+
+        read, bash = MagicMock(), MagicMock()
+        setattr(read, NATIVE_TOOL_KEY, ClaudeRead)
+        setattr(bash, NATIVE_TOOL_KEY, ClaudeBash)
+        opts = await _query_options(
+            monkeypatch,
+            create_claude_agents_handler(),
+            path,
+            {**BASE_CONFIG, "tools": {"read": {"name": "read", "type": "function"}}},
+            {"read": read, "bash": bash},
+        )
+        assert opts.tools == ["Read"]
 
 
 class TestAbandonedToolSpansAreNotErrors:
