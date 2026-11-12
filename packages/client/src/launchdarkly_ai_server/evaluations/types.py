@@ -120,17 +120,19 @@ class ResolvedTool:
 
 @dataclass(frozen=True)
 class AIConfig:
-    """Identifies an existing AI Config variation to seed an evaluation run.
+    """Identifies an existing AI Config to seed an evaluation run.
 
-    ``key`` is the AI Config key and ``variation`` is the variation key. The two
-    are only meaningful together, since a variation key is scoped to its config.
-    ``run()`` reads the variation's latest version from the management API.
+    ``key`` is the AI Config key. ``variation``, when set, is a variation key
+    scoped to that config, and ``run()`` reads that variation's latest version
+    from the management API. Omit ``variation`` and ``run()`` evaluates the
+    config for ``{kind: "evaluation", key: <evaluation key>}`` and uses the
+    served variation at its ``_ldMeta.version``. A missing version is an error.
     This is a reference, not the config itself; see ``AiConfigRep`` for the
     evaluated payload.
     """
 
     key: str
-    variation: str
+    variation: str | None = None
 
 
 @dataclass
