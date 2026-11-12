@@ -30,7 +30,7 @@ from launchdarkly_ai_server.parameter_forwarding import select_forwarded_paramet
 from launchdarkly_ai_server.utils import model_parameters
 
 from ._version import PACKAGE_NAME, __version__
-from .model_id import gateway_model_id
+from .model_id import gateway_inference_region, gateway_model_id
 from .spans import (
     fail_span,
     finish_model_span,
@@ -86,7 +86,8 @@ _INFERENCE_PARAMS_FORWARDED_KEYS = frozenset(
 #: * ``routing``: endpoint and routing selection.
 #: * ``context_management``: server-side state.
 #: * ``provider_params``: carries credentials, data-retention and timeout settings.
-#: * ``extra_headers``, ``extra_query``, ``extra_body``: raw request injection.
+#: * ``extra_headers``, ``extra_query``, ``extra_body``: raw request injection. The handler itself
+#:   sets ``extra_body`` for a Bedrock region on a Gateway model (:func:`build_request_params`).
 _INFERENCE_PARAMS_EXCLUDED_FIELDS = frozenset(
     {
         "metadata",
@@ -147,7 +148,19 @@ def _reasoning_effort(value: Any) -> tuple[bool, str | None]:
     return True, None if effort == "none" else effort
 
 
-def build_request_params(config: AiConfigRep, runtime: Any = None) -> Any:
+def _is_gateway_model(model: Any) -> bool:
+    return (
+        getattr(getattr(model, "provider", None), "provider_class_id", None)
+        == "gateway"
+    )
+
+
+def build_request_params(
+    config: AiConfigRep, runtime: Any = None, *, model: Any = None
+) -> Any:
+    """``ai.InferenceRequestParams`` for *config*. When *model* is an AI Gateway model, a Bedrock
+    region becomes ``providerOptions.gateway.inferenceRegion``, sent through ``extra_body``, which
+    the library merges key by key into the gateway options it writes itself."""
     runtime = runtime or ai
     params = select_forwarded_parameters(
         _renamed_parameters(model_parameters(config)), _INFERENCE_PARAMS_FORWARDED_KEYS
@@ -194,6 +207,13 @@ def build_request_params(config: AiConfigRep, runtime: Any = None) -> Any:
         )
     if isinstance(params.get("prompt_cache_key"), str):
         kwargs["cache"] = runtime.CacheParams(key=params["prompt_cache_key"])
+    inference_region = (
+        gateway_inference_region(config) if _is_gateway_model(model) else None
+    )
+    if inference_region is not None:
+        kwargs["extra_body"] = {
+            "providerOptions": {"gateway": {"inferenceRegion": inference_region}}
+        }
     return runtime.InferenceRequestParams(**kwargs)
 
 
@@ -536,10 +556,11 @@ def _create_vercel_agents_handler(
             agent = ai.Agent(
                 tools=build_agent_tools(cfg.get("tools"), tool_handlers, parent=parent)
             )
+            resolved_model = await resolve_model(model, cfg)
             run_kwargs: dict[str, Any] = {
-                "model": await resolve_model(model, cfg),
+                "model": resolved_model,
                 "messages": build_messages(cfg, user_input, vs, history),
-                "params": build_request_params(cfg),
+                "params": build_request_params(cfg, model=resolved_model),
             }
             if cfg.get("outputFormat"):
                 run_kwargs["output_type"] = build_output_type(cfg["outputFormat"])
@@ -593,10 +614,11 @@ def _create_vercel_agents_handler(
             agent = ai.Agent(
                 tools=build_agent_tools(cfg.get("tools"), tool_handlers, parent=parent)
             )
+            resolved_model = await resolve_model(model, cfg)
             async with agent.run(
-                model=await resolve_model(model, cfg),
+                model=resolved_model,
                 messages=build_messages(cfg, user_input, vs, history),
-                params=build_request_params(cfg),
+                params=build_request_params(cfg, model=resolved_model),
             ) as provider_stream:
                 async for event in provider_stream:
                     text = turns.observe(event)
