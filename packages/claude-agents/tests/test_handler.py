@@ -1757,6 +1757,19 @@ class TestModelParametersForwarding:
         options = await self._run_and_capture_options(config, monkeypatch)
         assert options.model == expected
 
+    @pytest.mark.parametrize("provider", ["Anthropic", "Bedrock"])
+    @pytest.mark.parametrize("name", ["", "   "])
+    async def test_a_blank_model_name_leaves_the_cli_default(
+        self, provider: str, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "provider": {"name": provider},
+            "model": {"name": name, "region": "us"},
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.model is None
+
     async def test_graph_fallback_sends_a_bedrock_node_with_its_region(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
