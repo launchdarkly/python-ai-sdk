@@ -306,6 +306,52 @@ def _finish_criterion_span(
             span.set_attribute("error.type", code)
 
 
+def _served_identity(config_key: str, extracted: Mapping[str, Any]) -> tuple[str, int]:
+    """Read the served variation key and version from the raw flag payload.
+
+    ``extract_variation`` copies ``_ldMeta.version`` onto ``meta`` and fills in
+    ``1`` when the field is absent. That default must not become a run: only
+    the raw ``value`` still shows that the version was missing.
+    """
+    value = extracted.get("value")
+    raw_meta: Any = value.get("_ldMeta") if isinstance(value, Mapping) else None
+    ld_meta = raw_meta if isinstance(raw_meta, Mapping) else {}
+    version = ld_meta.get("version")
+    # ``bool`` is an ``int``, so ``True`` must not become version 1.
+    if type(version) is not int:
+        raise EvaluationsError(
+            f"AI Config {config_key!r} served a variation with no integer "
+            f"_ldMeta.version (got {version!r})"
+        )
+    variation_key = ld_meta.get("variationKey")
+    if not isinstance(variation_key, str) or not variation_key.strip():
+        raise EvaluationsError(
+            f"AI Config {config_key!r} served a variation with no variation key"
+        )
+    return variation_key, version
+
+
+def _select_variation_version(
+    versions: list[Mapping[str, Any]],
+    description: str,
+    version: int | None,
+) -> Mapping[str, Any]:
+    """Pick ``version``, or the greatest version when ``version`` is omitted."""
+    if version is None:
+        return max(versions, key=lambda item: int(item["version"]))
+    selected = next(
+        (
+            item
+            for item in versions
+            if type(item.get("version")) is int and item["version"] == version
+        ),
+        None,
+    )
+    if selected is None:
+        raise EvaluationsError(f"LaunchDarkly {description} has no version {version}")
+    return selected
+
+
 class EvaluationsRunner:
     """Private API operations and orchestration used by EvaluationsModule.run()."""
 
@@ -339,16 +385,39 @@ class EvaluationsRunner:
             )
         return mode
 
+    async def _served_variation(
+        self, config_key: str, evaluation_key: str
+    ) -> tuple[str, int]:
+        """Return the variation key and version the SDK serves for this run.
+
+        The context is always ``{kind: "evaluation", key: evaluation_key}``.
+        There is no caller context and no project-key fallback. A disabled or
+        undelivered variation is an :class:`EvaluationsError`.
+        """
+        context = {"kind": "evaluation", "key": evaluation_key}
+        try:
+            extracted = await extract_variation(config_key, context)
+        except Exception as error:
+            raise EvaluationsError(
+                f"Failed to resolve the served variation of AI Config "
+                f"{config_key!r} for evaluation {evaluation_key!r}: {error}"
+            ) from error
+        return _served_identity(config_key, extracted)
+
     def _fetch_config_variation(
         self,
         project_key: str,
         config_key: str,
         variation_key: str,
+        *,
+        version: int | None = None,
     ) -> Mapping[str, Any]:
-        """Read the latest version of an AI Config variation by key.
+        """Read one version of an AI Config variation by key.
 
-        Raises :class:`EvaluationsError` when the variation does not exist,
-        has no versions, or has a ``modelConfigKey`` that is not a string.
+        ``version`` selects that version. Omit it to read the latest. A served
+        version older than the latest is valid and is not warned about. Raises
+        :class:`EvaluationsError` when the variation does not exist, has no
+        matching version, or has a ``modelConfigKey`` that is not a string.
         """
         description = f"AI Config variation {config_key!r}/{variation_key!r}"
         path = (
@@ -363,7 +432,7 @@ class EvaluationsRunner:
                     f"LaunchDarkly {description} was not found in project {project_key!r}"
                 ) from error
             raise
-        # The endpoint returns every version of the variation; evaluate the latest.
+        # The endpoint returns every version of the variation.
         items = raw.get("items")
         versions = [
             item
@@ -372,15 +441,15 @@ class EvaluationsRunner:
         ]
         if not versions:
             raise EvaluationsError(f"LaunchDarkly {description} has no versions")
-        latest = max(versions, key=lambda item: int(item["version"]))
+        selected = _select_variation_version(versions, description, version)
         # Absent or empty means that the variation links no model config.
-        model_config_key = latest.get("modelConfigKey")
+        model_config_key = selected.get("modelConfigKey")
         if model_config_key is not None and not isinstance(model_config_key, str):
             raise EvaluationsError(
                 f"LaunchDarkly {description} has a non-string modelConfigKey: "
                 f"{model_config_key!r}"
             )
-        return latest
+        return selected
 
     def _fetch_linked_model_config(
         self, project_key: str, variation: Mapping[str, Any]

@@ -848,6 +848,36 @@ async def test_run_rejects_invalid_offline_evaluation_keys_before_network(
         )
 
 
+@pytest.mark.parametrize("key", ["", " ", "\t"])
+@pytest.mark.asyncio
+async def test_run_rejects_a_blank_key_before_any_network_call(
+    key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank evaluation key is an error before flag evaluation or HTTP."""
+
+    async def fake_extract_variation(*args: object, **kwargs: object) -> dict[str, Any]:
+        raise AssertionError("blank key must not resolve a variation")
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    evals = init_evaluations(
+        project_key="proj", api_key="token", transport=failing_transport
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    with pytest.raises(EvaluationsError, match="key must not be blank"):
+        await evals.run(
+            key=key,
+            dataset="golden",
+            handler=tagged(handler, ("OpenAI", "agent")),
+            ai_config=AIConfig(key="support-agent"),
+        )
+
+
 @pytest.mark.parametrize("key", ["a.b_c-1", "support_qa.v1-prod"])
 @pytest.mark.asyncio
 async def test_run_accepts_valid_offline_evaluation_keys(key: str) -> None:
@@ -4048,7 +4078,16 @@ def fetched_run_responses(variation_page: dict[str, Any]) -> list[HttpResponse]:
 
 
 @pytest.mark.asyncio
-async def test_run_seeds_generation_from_the_latest_ai_config_variation() -> None:
+async def test_run_seeds_generation_from_the_latest_ai_config_variation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_extract_variation(*args: object, **kwargs: object) -> dict[str, Any]:
+        raise AssertionError("an explicit variation must not be evaluated")
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
     transport = SequencedTransport(fetched_run_responses(config_variation_page()))
     evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
     seen_configs: list[dict[str, Any]] = []
@@ -4218,6 +4257,228 @@ async def test_unknown_variation_fails_before_any_records_are_created() -> None:
         )
 
     assert [request["method"] for request in transport.requests] == ["GET", "GET"]
+
+
+def served_flag(
+    variation_key: str = "concise",
+    version: Any = 1,
+    *,
+    omit_version: bool = False,
+    omit_variation_key: bool = False,
+) -> dict[str, Any]:
+    """What ``extract_variation`` returns for one served AI Config variation.
+
+    ``meta.version`` is ``1`` when the raw version is omitted, which is the
+    default ``extract_variation`` fills in. The eval path must ignore it.
+    """
+    ld_meta: dict[str, Any] = {"enabled": True}
+    if not omit_variation_key:
+        ld_meta["variationKey"] = variation_key
+    if not omit_version:
+        ld_meta["version"] = version
+    return {
+        "config": {"instructions": "flag payload, not the run content"},
+        "meta": {"enabled": True, "variationKey": variation_key, "version": 1},
+        "value": {
+            "_ldMeta": ld_meta,
+            "instructions": "flag payload, not the run content",
+        },
+    }
+
+
+def patch_served_variation(
+    monkeypatch: pytest.MonkeyPatch,
+    extracted: dict[str, Any] | Exception,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Replace flag evaluation and record ``(config_key, context)`` calls."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_extract_variation(
+        config_key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        seen.append((config_key, dict(context)))
+        if isinstance(extracted, Exception):
+            raise extracted
+        return extracted
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_omitted_variation_uses_the_served_version_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older served version is the base. The flag payload is not."""
+    seen = patch_served_variation(monkeypatch, served_flag("concise", 1))
+    transport = SequencedTransport(fetched_run_responses(config_variation_page()))
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    async def handler(config: dict[str, Any], *args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler, ("OpenAI", "agent")),
+        ai_config=AIConfig(key="support-agent"),
+    )
+
+    assert seen == [
+        ("support-agent", {"kind": "evaluation", "key": "support-qa"}),
+    ]
+    assert transport.requests[1]["url"].endswith(
+        "/ai-configs/support-agent/variations/concise"
+    )
+    body = evaluation_post(transport)
+    assert body["messages"] == [{"role": "system", "content": "stale prompt"}]
+    assert "flag payload, not the run content" not in json.dumps(body)
+    assert result.url == (
+        "https://app.launchdarkly.com/projects/proj/ai/evaluations/"
+        "evaluation-id/runs/run-id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_generation_override_replaces_served_variation_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_served_variation(monkeypatch, served_flag("concise", 1))
+    transport = SequencedTransport(fetched_run_responses(config_variation_page()))
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler, ("OpenAI", "agent")),
+        ai_config=AIConfig(key="support-agent"),
+        generation={"model": "gpt-4o-mini", "instructions": "Candidate prompt"},
+    )
+
+    body = evaluation_post(transport)
+    assert body["generationModel"] == "gpt-4o-mini"
+    assert body["messages"] == [{"role": "system", "content": "Candidate prompt"}]
+    assert body["generationProvider"] == "OpenAI"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "version",
+    [pytest.param(None, id="missing"), True, 1.0, "1"],
+)
+async def test_missing_served_version_fails_before_any_write(
+    monkeypatch: pytest.MonkeyPatch, version: Any
+) -> None:
+    """Do not use the version-1 default ``extract_variation`` fills in."""
+    omit_version = version is None
+    patch_served_variation(
+        monkeypatch,
+        served_flag("concise", version, omit_version=omit_version),
+    )
+    transport = SequencedTransport([])
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=r"_ldMeta\.version"):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
+            ai_config=AIConfig(key="support-agent"),
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omit_variation_key", [True, False])
+async def test_served_variation_without_a_key_fails_before_any_write(
+    monkeypatch: pytest.MonkeyPatch, omit_variation_key: bool
+) -> None:
+    variation_key = "" if not omit_variation_key else "concise"
+    patch_served_variation(
+        monkeypatch,
+        served_flag(
+            variation_key,
+            7,
+            omit_variation_key=omit_variation_key,
+        ),
+    )
+    transport = SequencedTransport([])
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="no variation key"):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
+            ai_config=AIConfig(key="support-agent"),
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (RuntimeError("Variation 'support-agent' is disabled."), "disabled"),
+        (
+            RuntimeError(
+                "Variation 'support-agent' returned None (flag may be disabled)."
+            ),
+            "returned None",
+        ),
+    ],
+)
+async def test_undelivered_served_variation_fails_before_any_write(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, message: str
+) -> None:
+    patch_served_variation(monkeypatch, error)
+    transport = SequencedTransport([])
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match=message):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
+            ai_config=AIConfig(key="support-agent"),
+        )
+
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_served_version_missing_from_the_api_fails_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_served_variation(monkeypatch, served_flag("concise", 7))
+    transport = SequencedTransport(
+        [
+            response(200, AGENT_AI_CONFIG),
+            response(200, config_variation_page()),
+        ]
+    )
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    with pytest.raises(EvaluationsError, match="has no version 7"):
+        await evals.run(
+            key="support-qa",
+            dataset="golden",
+            handler=tagged(successful_handler, ("OpenAI", "agent")),
+            ai_config=AIConfig(key="support-agent"),
+        )
+
+    assert [request["method"] for request in transport.requests] == ["GET", "GET"]
+    assert not any(
+        request["method"] in {"POST", "PATCH"} for request in transport.requests
+    )
 
 
 @pytest.mark.asyncio
