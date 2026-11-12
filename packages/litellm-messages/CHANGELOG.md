@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-litellm-messages-1.0.0...launchdarkly-ai-litellm-messages-1.1.0) (2026-11-12)
+
+
+### Features
+
+* add max_retries to the messages handler factories ([#214](https://github.com/launchdarkly/python-ai-sdk/issues/214)) ([c08aea8](https://github.com/launchdarkly/python-ai-sdk/commit/c08aea84a6ef4558e6b943f4a302496f7f24d898))
+
+
+### Bug Fixes
+
+* **litellm-messages:** apply Bedrock model.region inference-profile prefix ([#284](https://github.com/launchdarkly/python-ai-sdk/issues/284)) ([e489d6d](https://github.com/launchdarkly/python-ai-sdk/commit/e489d6d548679befa4c3ccacf194207a734d6320))
+* **tools:** hand each handler only the tools its config attaches ([#279](https://github.com/launchdarkly/python-ai-sdk/issues/279)) ([4c786ef](https://github.com/launchdarkly/python-ai-sdk/commit/4c786eff17bbf48720b2fcdc35c0ae13871cfcb1))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-litellm-messages-0.2.0...launchdarkly-ai-litellm-messages-1.0.0) (2026-10-30)
 
 

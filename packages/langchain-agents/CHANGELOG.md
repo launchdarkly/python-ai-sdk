@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-1.0.0...launchdarkly-ai-langchain-agents-1.0.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **langchain-agents:** resolve the Bedrock model id through the shared prefix helper ([#285](https://github.com/launchdarkly/python-ai-sdk/issues/285)) ([ecb5192](https://github.com/launchdarkly/python-ai-sdk/commit/ecb5192ac66a351112c0d7e9a8e30e5238c9ba9d))
+* **tools:** hand each handler only the tools its config attaches ([#279](https://github.com/launchdarkly/python-ai-sdk/issues/279)) ([4c786ef](https://github.com/launchdarkly/python-ai-sdk/commit/4c786eff17bbf48720b2fcdc35c0ae13871cfcb1))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-agents-0.3.0...launchdarkly-ai-langchain-agents-1.0.0) (2026-10-30)
 
 
