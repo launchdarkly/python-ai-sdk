@@ -4343,6 +4343,53 @@ async def test_omitted_variation_uses_the_served_version_content(
 
 
 @pytest.mark.asyncio
+async def test_served_variation_initializes_the_client_with_the_evaluations_sdk_key(
+    monkeypatch: pytest.MonkeyPatch, stub_sdk_client: MagicMock
+) -> None:
+    """The served-variation read must not initialize the SDK without the key."""
+    monkeypatch.delenv("LD_SDK_KEY", raising=False)
+    events: list[str] = []
+
+    async def recording_init_client(options: dict[str, Any]) -> MagicMock:
+        events.append(f"init_client:{options.get('sdkKey')}")
+        return stub_sdk_client
+
+    async def fake_extract_variation(
+        config_key: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        events.append("extract_variation")
+        return served_flag("concise", 1)
+
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.module.init_client",
+        recording_init_client,
+    )
+    monkeypatch.setattr(
+        "launchdarkly_ai_server.evaluations.runner.extract_variation",
+        fake_extract_variation,
+    )
+    transport = SequencedTransport(fetched_run_responses(config_variation_page()))
+    evals = init_evaluations(
+        project_key="proj",
+        api_key="token",
+        sdk_key="explicit-sdk-key",
+        transport=transport,
+    )
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler, ("OpenAI", "agent")),
+        ai_config=AIConfig(key="support-agent"),
+    )
+
+    assert events == ["init_client:explicit-sdk-key", "extract_variation"]
+
+
+@pytest.mark.asyncio
 async def test_generation_override_replaces_served_variation_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

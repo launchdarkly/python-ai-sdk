@@ -389,6 +389,7 @@ class EvaluationsModule:
         run_tool_handlers = tool_handlers(run_tools)
         pinned_tool_versions: dict[str, int] = {}
         config_label = ""
+        client = await self._resolve_client()
         if ai_config is None:
             run_generation = self._validate_generation(
                 cast(dict[str, Any], dict(generation or {}))
@@ -439,7 +440,6 @@ class EvaluationsModule:
         ld_judges = [
             criterion for criterion in run_criteria if isinstance(criterion, Judge)
         ]
-        client = await self._resolve_client()
 
         # The management API client is synchronous; running it in a worker thread
         # keeps the caller's event loop free.
