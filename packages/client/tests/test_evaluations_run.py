@@ -1142,6 +1142,15 @@ def evaluation_post(transport: SequencedTransport) -> dict[str, Any]:
     return body
 
 
+def assert_variation_link(
+    body: dict[str, Any], variation_key: str, variation_version: int
+) -> None:
+    """The reconcile body pins the variation, not the evaluation or model config."""
+    assert body["configKey"] == "support-agent"
+    assert body["variationKey"] == variation_key
+    assert body["variationVersion"] == variation_version
+
+
 def evaluation_run_post(transport: SequencedTransport) -> dict[str, Any]:
     posts = [
         request
@@ -4123,6 +4132,9 @@ async def test_run_seeds_generation_from_the_latest_ai_config_variation(
     assert body["messages"] == [
         {"role": "system", "content": "You are a support agent."}
     ]
+    # Latest variation version is 2. Model-config version 3 and the created
+    # evaluation's version 1 must not be sent as variationVersion.
+    assert_variation_link(body, "control", 2)
     assert seen_configs[0]["provider"] == {"name": "OpenAI"}
     assert seen_configs[0]["instructions"] == "You are a support agent."
 
@@ -4152,8 +4164,9 @@ async def test_explicit_generation_overrides_the_fetched_variation() -> None:
     assert body["generationModel"] == "gpt-4o-mini"
     # parameters merge key by key rather than replacing the fetched set.
     assert body["parameters"] == {"max_tokens": 100, "temperature": 0.1}
-    # The override replaces the fetched instructions.
+    # The override replaces the fetched instructions and keeps the link.
     assert body["messages"] == [{"role": "system", "content": "Candidate prompt"}]
+    assert_variation_link(body, "control", 2)
 
 
 @pytest.mark.asyncio
@@ -4336,6 +4349,8 @@ async def test_omitted_variation_uses_the_served_version_content(
     body = evaluation_post(transport)
     assert body["messages"] == [{"role": "system", "content": "stale prompt"}]
     assert "flag payload, not the run content" not in json.dumps(body)
+    # Served version 1, not the latest management-API version 2.
+    assert_variation_link(body, "concise", 1)
     assert result.url == (
         "https://app.launchdarkly.com/projects/proj/ai/evaluations/"
         "evaluation-id/runs/run-id"
@@ -4412,6 +4427,52 @@ async def test_generation_override_replaces_served_variation_fields(
     assert body["generationModel"] == "gpt-4o-mini"
     assert body["messages"] == [{"role": "system", "content": "Candidate prompt"}]
     assert body["generationProvider"] == "OpenAI"
+    assert_variation_link(body, "concise", 1)
+
+
+@pytest.mark.asyncio
+async def test_patch_resends_the_served_link_with_overridden_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing evaluation is patched, not unlinked, when content changes."""
+    patch_served_variation(monkeypatch, served_flag("concise", 1))
+    responses = fetched_run_responses(config_variation_page())
+    responses[5] = response(
+        200,
+        {"id": "evaluation-id", "key": "support-qa", "name": "Renamed", "version": 3},
+    )
+    responses[6] = response(
+        200,
+        {"id": "evaluation-id", "key": "support-qa", "name": "Renamed", "version": 4},
+    )
+    transport = SequencedTransport(responses)
+    evals = init_evaluations(project_key="proj", api_key="token", transport=transport)
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "generated"}
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler, ("OpenAI", "agent")),
+        ai_config=AIConfig(key="support-agent"),
+        generation={"model": "gpt-4o-mini"},
+    )
+
+    patches = [
+        request for request in transport.requests if request["method"] == "PATCH"
+    ]
+    assert len(patches) == 1
+    body = patches[0]["body"]
+    assert body["generationModel"] == "gpt-4o-mini"
+    assert body["messages"] == [{"role": "system", "content": "stale prompt"}]
+    assert_variation_link(body, "concise", 1)
+    assert "key" not in body
+    assert "name" not in body
+    assert result.url == (
+        "https://app.launchdarkly.com/projects/proj/ai/evaluations/"
+        "evaluation-id/runs/run-id"
+    )
 
 
 @pytest.mark.asyncio
