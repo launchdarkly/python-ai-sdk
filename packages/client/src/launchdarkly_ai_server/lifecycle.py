@@ -130,6 +130,11 @@ def note_ai_invocation() -> None:
     _ai_invoked = True
 
 
+def _existing_client() -> LDClientInterface | None:
+    """Returns the client already set up, or ``None``. Never starts one."""
+    return _client
+
+
 def get_client() -> LDClientInterface:
     """
     Returns the singleton LaunchDarkly client.
@@ -764,14 +769,28 @@ async def extract_variation(
     return _parse_variation(config_key, raw)
 
 
+async def _extract_existing_variation(
+    config_key: str, context: dict[str, Any]
+) -> dict[str, Any]:
+    """Like :func:`extract_variation`, but uses the client already set up and
+    never starts one, raising when there is none."""
+    raw, _ = await _fetch_variation(config_key, context, existing_client_only=True)
+    return _parse_variation(config_key, raw)
+
+
 async def _fetch_variation(
-    config_key: str, context: dict[str, Any], *, with_reason: bool = False
+    config_key: str,
+    context: dict[str, Any],
+    *,
+    with_reason: bool = False,
+    existing_client_only: bool = False,
 ) -> tuple[Any, Any]:
     """The raw variation value, and its evaluation reason when ``with_reason`` is set
     and the client has ``variation_detail``. Otherwise the reason is ``None``."""
     from .utils import to_ld_context  # late import avoids circular dependency
 
-    await init_client()
+    if not existing_client_only:
+        await init_client()
     client = get_client()
     # The real ldclient.variation() expects an ldclient.Context, not a plain dict.
     # Convert when running against the real SDK; test mocks accept dicts directly.
