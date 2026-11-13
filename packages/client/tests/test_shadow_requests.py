@@ -64,8 +64,10 @@ def _entry(**overrides: Any) -> dict[str, Any]:
     return entry
 
 
-def _variation_b(enabled: bool = True) -> dict[str, Any]:
-    return {
+def _variation_b(
+    enabled: bool = True, judges: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    variation: dict[str, Any] = {
         "_ldMeta": {
             "enabled": enabled,
             "variationKey": "b",
@@ -78,8 +80,10 @@ def _variation_b(enabled: bool = True) -> dict[str, Any]:
         "provider": {"name": "ShadowProvider"},
         "instructions": "Shadow.",
         "tools": {"search": {"name": "search", "type": "function", "parameters": {}}},
-        "judgeConfiguration": {"judges": [{"key": "j", "samplingRate": 1}]},
     }
+    if judges is not None:
+        variation["judgeConfiguration"] = {"judges": judges}
+    return variation
 
 
 def _variation_a(
@@ -645,7 +649,6 @@ class TestRunning:
         assert call["variables"]["topic"] == "x"
         assert call["config"]["instructions"] == "Shadow."
         assert "tools" not in call["config"]
-        assert "judgeConfiguration" not in call["config"]
         assert "_ldMeta" not in call["config"]
         assert not call["tools"]
 
@@ -1073,3 +1076,198 @@ class TestFailureEdges:
         _, _, b = await _invoke(_make_client(_variation_a(variations={"b": variation})))
         assert len(b.calls) == 1
         assert "tools" not in b.calls[0]["config"]
+
+
+JUDGE_VERDICT = '{"score": 0.8, "reasoning": "good"}'
+
+
+def _judge_variation() -> dict[str, Any]:
+    return {
+        "_ldMeta": {
+            "enabled": True,
+            "variationKey": "jv",
+            "version": 1,
+            "mode": "judge",
+        },
+        "model": {"name": "judge-model"},
+        "provider": {"name": "JudgeProvider"},
+        "instructions": "Judge.",
+        "evaluationMetricKey": "judge-score",
+    }
+
+
+def _judged_client(
+    b_rate: float = 1, a_judged: bool = False
+) -> tuple[MagicMock, dict[str, Any]]:
+    value = _variation_a(
+        variations={"b": _variation_b(judges=[{"key": "j", "samplingRate": b_rate}])}
+    )
+    if a_judged:
+        value["judgeConfiguration"] = {"judges": [{"key": "j", "samplingRate": 1}]}
+    client = _make_client(value)
+
+    async def variation(key: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return _judge_variation() if key == "j" else value
+
+    client.variation = AsyncMock(side_effect=variation)
+    return client, value
+
+
+def _judge_events(client: MagicMock) -> list[dict[str, Any]]:
+    return [d for n, d in _events(client) if n == "judge-score"]
+
+
+async def _invoke_judged(
+    client: MagicMock,
+    *,
+    b: _Recorder | None = None,
+    judge: _Recorder | None = None,
+    **shadow_args: Any,
+) -> tuple[Any, _Recorder, _Recorder, _Recorder]:
+    _use(client)
+    a = _Recorder("TestProvider", "real answer")
+    b = b or _Recorder("ShadowProvider", "shadow answer")
+    judge = judge or _Recorder("JudgeProvider", JUDGE_VERDICT)
+    response = await shadow_config(
+        key="flag", handler=[a.handler, b.handler, judge.handler], **shadow_args
+    ).invoke("question", CONTEXT)
+    await sr._wait_for_shadows_for_testing()
+    return response, a, b, judge
+
+
+class TestJudges:
+    async def test_judge_scores_the_shadow_response(self) -> None:
+        client, _ = _judged_client()
+        response, _, b, judge = await _invoke_judged(client)
+        assert response.response == "real answer"
+        assert len(b.calls) == 1
+        assert len(judge.calls) == 1
+        assert judge.calls[0]["variables"]["response_to_evaluate"] == "shadow answer"
+        assert judge.calls[0]["variables"]["input"] == "question"
+
+    async def test_judge_runs_after_the_caller_returns(self) -> None:
+        client, _ = _judged_client()
+        _use(client)
+        a = _Recorder("TestProvider", "real answer")
+        b = _Recorder("ShadowProvider", "shadow answer")
+        judge = _Recorder("JudgeProvider", JUDGE_VERDICT)
+        await shadow_config(
+            key="flag", handler=[a.handler, b.handler, judge.handler]
+        ).invoke("question", CONTEXT)
+        assert judge.calls == []
+        await sr._wait_for_shadows_for_testing()
+        assert len(judge.calls) == 1
+
+    async def test_shadow_judge_event_is_tracked_under_the_shadow(self) -> None:
+        client, _ = _judged_client(a_judged=True)
+        await _invoke_judged(client)
+        shadow = [d for d in _judge_events(client) if d.get("isShadow")]
+        real = [d for d in _judge_events(client) if not d.get("isShadow")]
+        assert len(shadow) == 1
+        assert len(real) == 1
+        assert shadow[0]["variationKey"] == "b"
+        assert shadow[0]["shadowRequestId"] == "shadow-1"
+        assert shadow[0]["primaryVariationKey"] == "a"
+        assert shadow[0]["judgeConfigKey"] == "j"
+        assert shadow[0]["runId"] == real[0]["runId"]
+        assert not SHADOW_FIELDS & real[0].keys()
+
+    @pytest.mark.parametrize(("rate", "runs"), [(0, 0), (1, 1)])
+    async def test_judge_sampling_rate_applies(self, rate: float, runs: int) -> None:
+        client, _ = _judged_client(b_rate=rate)
+        _, _, b, judge = await _invoke_judged(client)
+        assert len(b.calls) == 1
+        assert len(judge.calls) == runs
+        assert len(_judge_events(client)) == runs
+
+    @pytest.mark.parametrize(
+        "b",
+        [
+            _Recorder("ShadowProvider", error=RuntimeError("boom")),
+            _Recorder("ShadowProvider", sleep_s=1),
+        ],
+        ids=["error", "timeout"],
+    )
+    async def test_no_judge_when_the_shadow_fails(self, b: _Recorder) -> None:
+        client, _ = _judged_client()
+        _, _, _, judge = await _invoke_judged(client, b=b, shadow_timeout_s=0.05)
+        assert judge.calls == []
+        assert _judge_events(client) == []
+
+    async def test_judge_failure_is_not_a_shadow_failure(self) -> None:
+        client, _ = _judged_client()
+        task = await _deferred_task_judged(client)
+        judge = _Recorder("JudgeProvider", "not json")
+        result = await run_shadow(
+            task, [_Recorder("ShadowProvider", "shadow answer").handler, judge.handler]
+        )
+        assert len(judge.calls) == 1
+        assert result.error is None
+        assert result.judge_results is None
+        assert "$ld:ai:generation:success" in [e[0] for e in _shadow_events(client)]
+
+    async def test_timeout_does_not_cover_judges(self) -> None:
+        client, _ = _judged_client()
+        task = dataclasses.replace(await _deferred_task_judged(client), timeout_s=0.2)
+        judge = _Recorder("JudgeProvider", JUDGE_VERDICT, sleep_s=0.3)
+        result = await run_shadow(
+            task, [_Recorder("ShadowProvider", "shadow answer").handler, judge.handler]
+        )
+        assert result.error is None
+        assert result.judge_results is not None
+        assert result.judge_results["j"].score == 0.8
+
+    async def test_result_carries_judge_results_only_when_a_judge_ran(self) -> None:
+        client, _ = _judged_client()
+        task = await _deferred_task_judged(client)
+        handlers = [
+            _Recorder("ShadowProvider", "shadow answer").handler,
+            _Recorder("JudgeProvider", JUDGE_VERDICT).handler,
+        ]
+        judged = await run_shadow(task, handlers)
+        assert judged.judge_results is not None
+        assert judged.judge_results["j"].score == 0.8
+        assert "shadow answer" not in repr(judged)
+
+        unjudged = await run_shadow(
+            await _deferred_task(_make_client(_variation_a())), handlers
+        )
+        assert unjudged.judge_results is None
+
+    async def test_skip_judges_applies_to_the_served_variation_only(self) -> None:
+        client, _ = _judged_client(a_judged=True)
+        response, _, _, judge = await _invoke_judged(client, skip_judges=True)
+        assert response.judge_tasks is not None
+        assert len(judge.calls) == 1
+        assert [d.get("isShadow") for d in _judge_events(client)] == [True]
+
+    async def test_deferred_and_background_emit_the_same_judge_events(self) -> None:
+        background, _ = _judged_client()
+        await _invoke_judged(background)
+
+        deferred, _ = _judged_client()
+        task = await _deferred_task_judged(deferred)
+        deferred.track.reset_mock()
+        await run_shadow(
+            task,
+            [
+                _Recorder("ShadowProvider", "shadow answer").handler,
+                _Recorder("JudgeProvider", JUDGE_VERDICT).handler,
+            ],
+        )
+        assert _without_run_id(_shadow_events(background)) == _without_run_id(
+            _shadow_events(deferred)
+        )
+
+    async def test_judged_task_survives_pickle(self) -> None:
+        client, _ = _judged_client()
+        task = await _deferred_task_judged(client)
+        assert pickle.loads(pickle.dumps(task)) == task
+        assert task.shadow_config["judgeConfiguration"]["judges"][0]["key"] == "j"
+
+
+async def _deferred_task_judged(client: MagicMock) -> ShadowTask:
+    tasks: list[ShadowTask] = []
+    await _invoke_judged(client, on_task=tasks.append)
+    assert len(tasks) == 1
+    return tasks[0]
