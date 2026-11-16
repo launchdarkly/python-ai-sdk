@@ -84,20 +84,22 @@ another SDK's shape into Python. If the contract and an idiom conflict, the cont
 wins: raise the conflict.
 
 ### What never varies
-Public behaviour, defaults, telemetry, wire payloads, usage IDs and error
-*conditions*. A name is the contract's name in snake_case (`initEvaluations` →
+Public behaviour, defaults, telemetry (span names, attributes, events), wire
+payloads, usage IDs and error *conditions* (what fails, and before or after which
+I/O). A name is the contract's name in snake_case (`initEvaluations` →
 `init_evaluations`). Types keep PascalCase.
 
 ### Errors
-Raise exceptions; never return a `(value, error)` pair. A bad argument raises the
-built-in (`ValueError`, `TypeError`). A feature whose callers need to catch its
-failures defines one public exception for them (`EvaluationsError`,
-`OpenCodeSessionError`, `TypesafeQuestionError`), subclassing `Exception` or the
-closest built-in. Inside `except`, chain with `from exc` to keep the cause. A
+A public call raises; it never returns a `(value, error)` pair. A bad argument
+raises `ValueError` or `TypeError`, or the feature's exception when it has one.
+A feature whose callers need to catch its failures defines one public exception
+for them (`EvaluationsError`, `OpenCodeSessionError`, `TypesafeQuestionError`),
+subclassing `Exception` or the closest built-in. Inside `except`, chain with `from exc` to keep the cause. A
 result type that carries an error field is used only where the contract defines
-one (`ParseFailure`, `ReconcileAction.error`). Never swallow an exception unless
-the contract specifies a safe fallback for that call (as it does for
-`inspect_config`).
+one (`ParseFailure`, `ReconcileAction.error`). Catch an exception only to handle
+it, to wrap it, to return a fallback the contract defines (`inspect_config`), or
+to keep an optional step (telemetry, usage reporting, cleanup in `shutdown`) from
+failing the call.
 
 ### Layout
 Public names are exported from the package root through `__init__.py` and listed
@@ -105,17 +107,19 @@ in `__all__`. A feature may be a subpackage (`evaluations/`) that the root
 re-exports. Experimental features are submodules of
 `launchdarkly_ai_server.experimental` (`experimental.shadow_requests`), never
 re-exported from the root. The public modules are the ones with an API report;
-other modules are internal, and helpers inside a module have a leading underscore.
+other modules are internal, and helpers inside a public module have a leading
+underscore.
 A public module's `__all__` lists nothing that is not supported API.
 
 ### Naming
 PEP 8: `snake_case` functions, methods and keyword arguments; `PascalCase` classes;
-`UPPER_CASE` constants. A closed string set is a `Literal[...]`, and the runtime
-check still stays for untyped callers.
+`UPPER_CASE` constants. A closed string set in the public API is a
+`Literal[...]`, and the runtime check still stays for untyped callers.
 
 ### Concurrency
 I/O-bound public calls are `async def` when the feature is async in the contract.
-No blocking I/O inside a coroutine; move it off the loop with `asyncio.to_thread`.
+No blocking I/O inside a coroutine; move it off the loop with `asyncio.to_thread`,
+or a thread of its own when the call can block for long (`init_client`).
 Use `async with` / `try`/`finally` for cleanup, and close async generators on early
 exit.
 
@@ -125,13 +129,16 @@ of settings passed through to a provider is a `TypedDict(total=False)` (the
 `*NativeGraphOptions` types), not a bare `dict`. Durations are seconds as `float`,
 unless the contract or a wrapped library fixes a unit (`force_flush(timeout_millis=...)`
 follows OpenTelemetry). Config and value types are `@dataclass(frozen=True)`
-(`AIConfig`, `EvalTool`, `SDKOptions`); changing one means `dataclasses.replace`.
-Result and record types (`EvalRunResult`, `JudgeResult`) are plain `@dataclass`.
+(`AIConfig`, `EvalTool`, `SDKOptions`, `Skill`); changing one means
+`dataclasses.replace`. A result type is frozen when the contract makes it
+immutable (`ReconcileReport`), otherwise a plain `@dataclass` (`EvalRunResult`,
+`JudgeResult`).
 
 ### Testing
 `pytest`, under `packages/<package>/tests/`; tests that span packages (API report,
-cross-handler parity, packaging) live in the root `tests/`. Use fakes, or a fake
-server on loopback, and never the external network. mypy `strict` covers
+cross-handler parity, packaging) live in the root `tests/`. Use fakes. No test
+touches the external network or a LaunchDarkly endpoint; a fake server binds to
+loopback and is closed in teardown. mypy `strict` covers
 `packages/*/src` (`make typecheck`). The API report test fails when a public
 signature changes.
 
@@ -141,8 +148,9 @@ the other SDKs' wording for the same concept.
 
 ### Dependencies
 The core package keeps runtime dependencies to a minimum. A provider SDK is a
-dependency only of its own handler package. Avoid a dependency unless it is widely
-used, maintained, and does something well specified.
+dependency only of the handler packages that call it (`openai` for the OpenAI and
+LiteLLM agents handlers), never of `launchdarkly-ai-server`. Avoid a dependency
+unless it is widely used, maintained, and does something well specified.
 
 ### References
 `make lint`, `make format-check`, `make typecheck`, `make test`, `make api-report-check`.
