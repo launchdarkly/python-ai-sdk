@@ -98,8 +98,9 @@ from launchdarkly_ai_server import (
 ```
 
 An experimental feature is exported only from its module under
-`launchdarkly_ai_server.experimental`, and its names may change in a minor release. No feature
-is experimental now. No core public type, function or `init_client` option may name an
+`launchdarkly_ai_server.experimental`, and its names may change in a minor release. Shadow
+requests (`launchdarkly_ai_server.experimental.shadow_requests`) is the one experimental
+feature now. No core public type, function or `init_client` option may name an
 experimental feature. Agent Skills and Evaluations from Code are core and are exported from
 the package root. `lifecycle` imports no Evaluations from Code module. For Agent Skills,
 `shutdown` still reaches its state only through an internal hook (it clears the skill store),
@@ -660,7 +661,7 @@ Do not undo any of these as a simplification:
   invisible under a plain `logging.basicConfig()`.
 - **`ld.skills.integrity_failure` is documented for customers to match on.** Do not rename it
   casually. Agent Skills is core, so a rename is a breaking change: it needs a `!` commit (a
-  minor bump while on 0.x, a major after 1.0) in every SDK at once and a changelog entry,
+  major release) in every SDK at once and a changelog entry,
   because a rename silently breaks customers' alerts.
 - **`sort_keys=True` makes the line byte-identical across SDKs** (modulo `language`), since
   the other implementations build the object in alphabetical key order.

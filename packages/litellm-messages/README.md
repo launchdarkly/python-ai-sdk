@@ -1,7 +1,5 @@
 # `launchdarkly-ai-litellm-messages`
 
-**Experimental.** This package stays on 0.x until the Python and JavaScript LiteLLM integrations match.
-
 Provider-agnostic LaunchDarkly AI Config handler backed by LiteLLM's in-process
 `acompletion` API.
 
