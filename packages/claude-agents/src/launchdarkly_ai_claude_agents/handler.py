@@ -57,7 +57,7 @@ from launchdarkly_ai_server import (
 from launchdarkly_ai_server.agui import TurnEmitter
 from launchdarkly_ai_server.lifecycle import effective_capture_content
 from launchdarkly_ai_server.parameter_forwarding import select_forwarded_parameters
-from launchdarkly_ai_server.utils import model_parameters
+from launchdarkly_ai_server.utils import bedrock_model_id, model_parameters
 
 from ._version import PACKAGE_NAME, __version__
 from .spans import (
@@ -240,10 +240,15 @@ def _partition_tools(
     user_config_tools: dict[str, Any] = {}
 
     for ld_name, stub in tool_handlers.items():
+        # Only tools the active config attaches are enabled. A native tool grants a host
+        # capability (ClaudeBash runs commands), so registering one for another variation must not
+        # turn it on here.
+        if not config_tools or ld_name not in config_tools:
+            continue
         native = getattr(stub, NATIVE_TOOL_KEY, None)
         if isinstance(native, NativeTool):
             native_tool_map[native.tool_name] = stub
-        elif config_tools and ld_name in config_tools:
+        else:
             user_config_tools[ld_name] = config_tools[ld_name]
 
     return native_tool_map, user_config_tools, list(native_tool_map.keys())
@@ -653,6 +658,30 @@ def _rebuild_thinking(value: Mapping[str, Any]) -> dict[str, Any] | None:
     return thinking
 
 
+def _model_id(config: AiConfigRep) -> str | None:
+    """The ``model`` sent to the CLI. For a Bedrock config with a bare ``anthropic.*`` id,
+    ``model.region`` is the inference-profile prefix and is applied by :func:`bedrock_model_id`:
+    the CLI sends that id as-is, which Bedrock rejects for models that need an inference profile.
+
+    ``None`` for an empty or whitespace-only name. Callers then omit ``model``, so the CLI runs its
+    default model rather than receiving ``""``.
+
+    Every other name goes through unchanged. The CLI maps an Anthropic-format id such as
+    ``claude-sonnet-4-5-20250929`` to a profile itself, and sends a prefixed one such as
+    ``eu.claude-sonnet-4-5-20250929`` as-is, which is no Bedrock model.
+    """
+    model = config["model"]
+    name: str = model["name"]
+    if not name.strip():
+        return None
+    provider = config.get("provider") or {}
+    if str(provider.get("name") or "").lower() != "bedrock" or not name.startswith(
+        "anthropic."
+    ):
+        return name
+    return bedrock_model_id(name, model.get("region"))
+
+
 def _options_parameters(config: AiConfigRep) -> dict[str, Any]:
     """The config's ``model.parameters`` that become ``ClaudeAgentOptions`` fields: only
     :data:`_CLAUDE_AGENT_OPTIONS_FORWARDED_KEYS`, with malformed object values dropped and
@@ -710,7 +739,6 @@ def _build_query_options(
     params = _options_parameters(config)
     kwargs: dict[str, Any] = {
         **params,
-        "model": config["model"]["name"],
         "allowed_tools": all_allowed if all_allowed else [],
         "mcp_servers": {TOOL_MCP_NAME: tool_mcp} if tool_mcp else {},
         "hooks": hooks or {},
@@ -722,6 +750,9 @@ def _build_query_options(
         "tools": [*native_tool_names, *(extra_builtins or [])],
         **extra,
     }
+    model_id = _model_id(config)
+    if model_id is not None:
+        kwargs["model"] = model_id
     if system_prompt:
         kwargs["system_prompt"] = system_prompt
     return ClaudeAgentOptions(**kwargs)

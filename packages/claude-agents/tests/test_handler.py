@@ -44,7 +44,12 @@ from launchdarkly_ai_claude_agents.handler import (
     _partition_tools,
     create_claude_agents_handler,
 )
-from launchdarkly_ai_server import ConversationIdSpanProcessor, conversation_id
+from launchdarkly_ai_server import (
+    ConversationIdSpanProcessor,
+    conversation_id,
+    create_handler,
+)
+from launchdarkly_ai_server.utils import select_handler
 from tests.forwarding_spec import (
     CLAUDE_AGENTS,
     candidate_keys,
@@ -1678,6 +1683,137 @@ class TestModelParametersForwarding:
         assert options.model == BASE_CONFIG["model"]["name"]
         assert options.system_prompt != "not-the-real-prompt"
 
+    @pytest.mark.parametrize(
+        ("provider", "model", "expected"),
+        [
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-sonnet-4-5-20250929-v1:0", "region": "us"},
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+            (
+                "bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": "global"},
+                "global.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "us.anthropic.claude-opus-5-5", "region": "us"},
+                "us.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "eu.anthropic.claude-opus-5-5", "region": "us"},
+                "eu.anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {
+                    "name": "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/p",
+                    "region": "us",
+                },
+                "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/p",
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5"},
+                "anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "anthropic.claude-opus-5-5", "region": ""},
+                "anthropic.claude-opus-5-5",
+            ),
+            (
+                "Bedrock",
+                {"name": "claude-sonnet-4-5-20250929", "region": "eu"},
+                "claude-sonnet-4-5-20250929",
+            ),
+            (
+                "Bedrock",
+                {"name": "sonnet", "region": "us"},
+                "sonnet",
+            ),
+            (
+                "Anthropic",
+                {"name": "claude-opus-4-5", "region": "us"},
+                "claude-opus-4-5",
+            ),
+            (
+                "Anthropic",
+                {"name": "anthropic.claude-opus-5-5", "region": "us"},
+                "anthropic.claude-opus-5-5",
+            ),
+        ],
+    )
+    async def test_bedrock_region_is_the_inference_profile_prefix(
+        self,
+        provider: str,
+        model: dict[str, Any],
+        expected: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = {**BASE_CONFIG, "provider": {"name": provider}, "model": model}
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.model == expected
+
+    @pytest.mark.parametrize("provider", ["Anthropic", "Bedrock"])
+    @pytest.mark.parametrize("name", ["", "   "])
+    async def test_a_blank_model_name_leaves_the_cli_default(
+        self, provider: str, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = {
+            **BASE_CONFIG,
+            "provider": {"name": provider},
+            "model": {"name": name, "region": "us"},
+        }
+        options = await self._run_and_capture_options(config, monkeypatch)
+        assert options.model is None
+
+    async def test_graph_fallback_sends_a_bedrock_node_with_its_region(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        handler = create_claude_agents_handler()
+        config = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-opus-5-5", "region": "us"},
+        }
+        selected = select_handler(config, {"mode": "agent"}, [handler], strict=False)
+        assert selected is handler
+        await selected(config, "q")
+        assert captured["options"].model == "us.anthropic.claude-opus-5-5"
+
+    async def test_retagged_for_bedrock_config_routes_and_sends_its_region(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+            captured["options"] = kwargs["options"]
+            yield assistant_message()
+            yield result_message()
+
+        monkeypatch.setattr(handler_mod, "query", _query)
+        handler = create_handler(("Bedrock", "agent"), create_claude_agents_handler())
+        config = {
+            **BASE_CONFIG,
+            "provider": {"name": "Bedrock"},
+            "model": {"name": "anthropic.claude-opus-5-5", "region": "global"},
+        }
+        selected = select_handler(config, {"mode": "agent"}, [handler])
+        assert selected is handler
+        await selected(config, "q")
+        assert captured["options"].model == "global.anthropic.claude-opus-5-5"
+
     async def test_unset_when_no_parameters(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2500,10 +2636,35 @@ class TestHostOptionsAndBuiltinToolSet:
             monkeypatch,
             create_claude_agents_handler(),
             path,
-            BASE_CONFIG,
+            {
+                **BASE_CONFIG,
+                "tools": {
+                    "read": {"name": "read", "type": "function"},
+                    "bash": {"name": "bash", "type": "function"},
+                },
+            },
             {"read": read, "bash": bash},
         )
         assert sorted(opts.tools) == ["Bash", "Read"]
+
+    async def test_a_registered_native_tool_the_config_does_not_attach_is_not_sent(
+        self, monkeypatch: pytest.MonkeyPatch, path: str
+    ) -> None:
+        """Registering ClaudeBash for one variation must not turn on a shell for another."""
+        from launchdarkly_ai_claude_agents import ClaudeBash, ClaudeRead
+        from launchdarkly_ai_server import NATIVE_TOOL_KEY
+
+        read, bash = MagicMock(), MagicMock()
+        setattr(read, NATIVE_TOOL_KEY, ClaudeRead)
+        setattr(bash, NATIVE_TOOL_KEY, ClaudeBash)
+        opts = await _query_options(
+            monkeypatch,
+            create_claude_agents_handler(),
+            path,
+            {**BASE_CONFIG, "tools": {"read": {"name": "read", "type": "function"}}},
+            {"read": read, "bash": bash},
+        )
+        assert opts.tools == ["Read"]
 
 
 class TestAbandonedToolSpansAreNotErrors:

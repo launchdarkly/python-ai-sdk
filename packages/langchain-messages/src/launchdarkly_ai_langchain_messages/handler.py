@@ -396,10 +396,6 @@ _CHAT_BEDROCK_CONVERSE_EXCLUDED_KEYS = _LANGCHAIN_RUNTIME_KEYS | {
 def _build_tools(
     config_tools: dict[str, Any], tool_handlers: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
-    # Not filtered to the tools that have a registered handler, unlike the TypeScript SDK's
-    # `buildTools`. That difference predates this span work and changes what the model is offered,
-    # not what the span reports, so it stays as it is: the catalog recorded below (via
-    # `to_tool_definitions`) is the catalog actually sent.
     return [
         {
             "type": "function",
@@ -410,8 +406,9 @@ def _build_tools(
             },
         }
         for name, tool in config_tools.items()
-        # A missing handler still reaches the model; a NativeTool never does.
-        if name not in tool_handlers or is_function_tool(tool_handlers[name], name)
+        # Only a config tool with a function handler is offered: a missing handler or a
+        # NativeTool never reaches the model.
+        if is_function_tool(tool_handlers.get(name), name)
     ]
 
 
@@ -888,6 +885,9 @@ def _create_langchain_messages_handler(
             base_model = await _resolve_base_model(config, llm, importlib, max_retries)
 
             tool_defs = _build_tools(config.get("tools") or {}, tool_handlers or {})
+            # A tool name in a model response is untrusted: resolve it only against what was
+            # offered.
+            offered = {tool["function"]["name"] for tool in tool_defs}
             output_format = config.get("outputFormat")
 
             # CASE 1: outputFormat only, no tools -> withStructuredOutput (all providers).
@@ -1058,7 +1058,9 @@ def _create_langchain_messages_handler(
                             tool_span, capture_content, arguments=tc.get("args")
                         )
                         try:
-                            handler_fn = th.get(tc["name"])
+                            handler_fn = (
+                                th.get(tc["name"]) if tc["name"] in offered else None
+                            )
                             if not handler_fn or not callable(handler_fn):
                                 raise ValueError(
                                     f'No handler registered for tool "{tc["name"]}"'
@@ -1208,6 +1210,8 @@ async def _stream_gen(
     initial_messages = _build_messages(config, user_input, variables, history)
 
     tool_defs = _build_tools(config.get("tools") or {}, tool_handlers or {})
+    # A tool name in a model response is untrusted: resolve it only against what was offered.
+    offered = {tool["function"]["name"] for tool in tool_defs}
     tool_model = base_model.bind_tools(tool_defs) if tool_defs else base_model
     tool_definitions = to_tool_definitions(tool_defs)
     conversation_messages = list(initial_messages)
@@ -1444,7 +1448,11 @@ async def _stream_gen(
                     tool_span, capture_content, arguments=tc.get("args")
                 )
                 try:
-                    handler_fn = tool_handlers.get(tc["name"])
+                    handler_fn = (
+                        (tool_handlers or {}).get(tc["name"])
+                        if tc["name"] in offered
+                        else None
+                    )
                     if not handler_fn or not callable(handler_fn):
                         raise ValueError(
                             f'No handler registered for tool "{tc["name"]}"'

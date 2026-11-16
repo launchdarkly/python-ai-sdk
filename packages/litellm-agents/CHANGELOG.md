@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-litellm-agents-1.0.0...launchdarkly-ai-litellm-agents-1.0.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **litellm-agents:** apply Bedrock model.region inference-profile prefix ([#283](https://github.com/launchdarkly/python-ai-sdk/issues/283)) ([edf9b5c](https://github.com/launchdarkly/python-ai-sdk/commit/edf9b5c8b556b59131d405a23f79cff9075a4c22))
+* **tools:** hand each handler only the tools its config attaches ([#279](https://github.com/launchdarkly/python-ai-sdk/issues/279)) ([4c786ef](https://github.com/launchdarkly/python-ai-sdk/commit/4c786eff17bbf48720b2fcdc35c0ae13871cfcb1))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-litellm-agents-0.2.0...launchdarkly-ai-litellm-agents-1.0.0) (2026-10-30)
 
 

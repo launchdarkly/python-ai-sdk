@@ -496,6 +496,7 @@ class TestToClaudeAgentsHostIsolation:
     @staticmethod
     async def _root_options(
         tool_handlers: dict[str, Any] | None = None,
+        attached: list[str] | None = None,
     ) -> dict[str, Any]:
         mock_sdk = _make_sdk_mock("done")
         captured: list[dict[str, Any]] = []
@@ -508,8 +509,22 @@ class TestToClaudeAgentsHostIsolation:
                 mock_sdk if n == "claude_agent_sdk" else __import__(n)
             ),
         ):
+            # The root attaches *attached*, or else every tool the test registers.
+            keys = attached if attached is not None else list(tool_handlers or {})
+            tools = {k: {"name": k, "type": "function"} for k in keys}
+            root = {
+                "key": "root",
+                "config": {
+                    "model": {"name": "claude-3"},
+                    "instructions": "be helpful",
+                    "tools": tools,
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [],
+                "is_terminal": True,
+            }
             await to_claude_agents(
-                _make_def_promise(_make_graph_def()),
+                _make_def_promise(_make_graph_def(nodes={"root": root})),
                 opts={"tool_handlers": tool_handlers or {}},
             ).invoke("hi")
         assert len(captured) == 1
@@ -525,14 +540,20 @@ class TestToClaudeAgentsHostIsolation:
             nodes={
                 "root": {
                     "key": "root",
-                    "config": {"model": {"name": "claude-3"}, "instructions": "root"},
+                    "config": {
+                        "model": {"name": "claude-root"},
+                        "instructions": "root",
+                    },
                     "meta": {"variationKey": "v1", "version": 1},
                     "edges": [{"source_key": "root", "target_key": "leaf"}],
                     "is_terminal": False,
                 },
                 "leaf": {
                     "key": "leaf",
-                    "config": {"model": {"name": "claude-3"}, "instructions": "leaf"},
+                    "config": {
+                        "model": {"name": "claude-leaf"},
+                        "instructions": "leaf",
+                    },
                     "meta": {"variationKey": "v1", "version": 1},
                     "edges": [],
                     "is_terminal": True,
@@ -584,6 +605,86 @@ class TestToClaudeAgentsHostIsolation:
     async def test_sends_the_native_tool_names(self) -> None:
         opts = await self._root_options({"run-bash": NativeTool("Bash")})
         assert opts["tools"] == ["Bash"]
+
+    @pytest.mark.asyncio
+    async def test_a_registered_native_tool_the_node_does_not_attach_is_not_sent(
+        self,
+    ) -> None:
+        opts = await self._root_options(
+            {"read": NativeTool("Read"), "run-bash": NativeTool("Bash")},
+            attached=["read"],
+        )
+        assert opts["tools"] == ["Read"]
+
+    @pytest.mark.asyncio
+    async def test_sends_each_node_its_configured_model(self) -> None:
+        root, leaf = await self._root_and_leaf_options()
+        assert root["model"] == "claude-root"
+        assert leaf["model"] == "claude-leaf"
+
+    @pytest.mark.asyncio
+    async def test_sends_a_bedrock_node_its_region_prefixed_model(self) -> None:
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "provider": {"name": "Bedrock"},
+                        "model": {"name": "anthropic.claude-opus-5-5", "region": "us"},
+                        "instructions": "root",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+        mock_sdk = _make_sdk_mock("done")
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+        assert len(captured) == 1
+        assert captured[0]["model"] == "us.anthropic.claude-opus-5-5"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["", "   "])
+    async def test_omits_model_for_a_blank_model_name(self, name: str) -> None:
+        graph_def = _make_graph_def(
+            nodes={
+                "root": {
+                    "key": "root",
+                    "config": {
+                        "model": {"name": name, "region": "us"},
+                        "instructions": "root",
+                    },
+                    "meta": {"variationKey": "v1", "version": 1},
+                    "edges": [],
+                    "is_terminal": True,
+                }
+            }
+        )
+        mock_sdk = _make_sdk_mock("done")
+        captured: list[dict[str, Any]] = []
+        mock_sdk.ClaudeAgentOptions = MagicMock(
+            side_effect=lambda **kw: (captured.append(kw), kw)[1]
+        )
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_sdk if n == "claude_agent_sdk" else __import__(n)
+            ),
+        ):
+            await to_claude_agents(_make_def_promise(graph_def)).invoke("hi")
+        assert len(captured) == 1
+        assert "model" not in captured[0]
 
     @pytest.mark.asyncio
     async def test_loads_no_host_settings_and_sends_no_cwd_by_default(self) -> None:

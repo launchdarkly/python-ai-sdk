@@ -8,7 +8,7 @@ import asyncio
 import json
 import sys
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,7 +20,7 @@ from launchdarkly_ai_langchain_agents.native_graph import (
     _to_neutral_history,
     to_lang_graph,
 )
-from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
 from tests.forwarding_spec import (
     LANGCHAIN_CHAT_OPENAI,
     candidate_keys,
@@ -1124,7 +1124,7 @@ class TestToLangGraphLangChainSpecific:
 
     @pytest.mark.asyncio
     async def test_config_tools_creates_tool_node(self) -> None:
-        """When config.tools is non-empty, a ToolNode must be created and wired."""
+        """When a node attaches a tool that has a handler, a ToolNode must be created and wired."""
         ai_msg = _make_ai_msg()
         mocks = _make_langgraph_mocks(ai_msg)
 
@@ -1147,7 +1147,10 @@ class TestToLangGraphLangChainSpecific:
         )
 
         with _patch_imports(mocks):
-            await to_lang_graph(_make_def_promise(graph_def)).invoke("hi")
+            await to_lang_graph(
+                _make_def_promise(graph_def),
+                {"tool_handlers": {"calculate": lambda _args: "4"}},
+            ).invoke("hi")
 
         assert mocks["langgraph.prebuilt"].ToolNode.called, (
             "ToolNode was not called despite config.tools being non-empty"
@@ -1723,3 +1726,56 @@ class TestToNeutralHistory:
             ("human", "[Tool result] t: three"),
         ]
         assert all(not getattr(m, "tool_calls", None) for m in out)
+
+
+class TestToolsFailClosed:
+    """The handler and every node offer only attached tools that have a function handler."""
+
+    @staticmethod
+    def _offered(build: Any) -> list[str]:
+        names: list[str] = []
+
+        def _capture_tool(name: Any, fn: Any = None, **_kw: Any) -> Any:
+            names.append(name)
+            return fn
+
+        mock_lc_tools = MagicMock()
+        mock_lc_tools.tool = MagicMock(side_effect=_capture_tool)
+        with patch(
+            "importlib.import_module",
+            side_effect=lambda n: (
+                mock_lc_tools if n == "langchain_core.tools" else __import__(n)
+            ),
+        ):
+            build()
+        return names
+
+    TOOLS: ClassVar[dict[str, Any]] = {
+        "safe": {"description": "d", "parameters": {}},
+        "missing": {"description": "d", "parameters": {}},
+        "web": {"description": "d", "parameters": {}},
+    }
+    HANDLERS: ClassVar[dict[str, Any]] = {
+        "safe": lambda a: "ok",
+        "privileged": lambda a: "ran",
+        "web": NativeTool("web_search"),
+    }
+
+    def test_handler_offers_only_attached_tools_with_a_function_handler(self) -> None:
+        from launchdarkly_ai_langchain_agents.handler import _build_agent_tools
+
+        assert self._offered(lambda: _build_agent_tools(self.TOOLS, self.HANDLERS)) == [
+            "safe"
+        ]
+
+    def test_node_offers_only_attached_tools_with_a_function_handler(self) -> None:
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {"tools": self.TOOLS},
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+        assert self._offered(lambda: _build_node_tools(node, self.HANDLERS)) == ["safe"]
