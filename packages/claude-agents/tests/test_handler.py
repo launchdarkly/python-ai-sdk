@@ -2527,6 +2527,21 @@ class TestHostOptionsAndBuiltinToolSet:
         )
         assert sorted(opts.tools) == ["Bash", "Read"]
 
+        only_read = {
+            **BASE_CONFIG,
+            "tools": {
+                "read": {"name": "read", "type": "function", "parameters": {}},
+            },
+        }
+        partial = await _query_options(
+            monkeypatch,
+            create_claude_agents_handler(),
+            path,
+            only_read,
+            handlers,
+        )
+        assert partial.tools == ["Read"]
+
         for config in (
             BASE_CONFIG,
             {**BASE_CONFIG, "tools": {}},
