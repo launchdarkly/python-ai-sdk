@@ -186,7 +186,7 @@ A `Skill` call shows up in traces as an `execute_tool Skill` span.
 
 A run has no Claude Code built-in tools (`Read`, `Bash`, and the rest) unless its config attaches them. Tools you define in the flag config are always available to the model through the handler's MCP server, whatever built-ins are attached.
 
-This package exports `NativeTool` sentinels for Claude Code built-in capabilities. Place them as values in `tool_handlers` to enable the corresponding native Claude tool without writing a handler function:
+This package exports `NativeTool` sentinels for Claude Code built-in capabilities. Map a tool key to its sentinel in `tool_handlers`. The built-in is enabled only when the variation's tools include that same key. Registering the sentinel does not enable it on its own:
 
 | Export | Claude SDK tool name |
 |---|---|
@@ -211,6 +211,8 @@ result = await config(
     handler=[create_claude_agents_handler()],
 ).invoke("What are the latest LD release notes?", {"kind": "user", "key": "user-123"})
 ```
+
+The variation for `my-ai-config-flag` has to include a tool named `web-search`. Without that key, the run gets no `WebSearch`.
 
 ## Environment Variables
 
