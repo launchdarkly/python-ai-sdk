@@ -945,7 +945,7 @@ Install with `pip install "launchdarkly-ai-server[otel]"`; see [OTel Setup](#ote
 
 | Package | Why |
 |---|---|
-| `launchdarkly-server-sdk>=9.18.3,<10` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. An extra, not a dependency, because the BYOC path (`init_client(client=...)`) supplies its own client and should not have to install an unused SDK. Declared at all so pip can resolve a compatible version: before the extra existed, nothing bounded it. Absent ⇒ a `RuntimeError` naming the `pip install`, only on the path that needs it. |
+| `launchdarkly-server-sdk>=9.18.4,<10` | The LaunchDarkly server SDK, reached by `importlib.import_module("ldclient")` (falling back to `launchdarkly_server_sdk`) inside `init_client()`'s options path. An extra, not a dependency, because the BYOC path (`init_client(client=...)`) supplies its own client and should not have to install an unused SDK. Declared at all so pip can resolve a compatible version: before the extra existed, nothing bounded it. Absent ⇒ a `RuntimeError` naming the `pip install`, only on the path that needs it. |
 
 Install with `pip install "launchdarkly-ai-server[ld]"`.
 
@@ -953,9 +953,9 @@ Install with `pip install "launchdarkly-ai-server[ld]"`.
 
 | Package | Why |
 |---|---|
-| `launchdarkly-server-sdk>=9.0`, and the `otel` extra mirrored (`opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`) | Each dynamically-resolved or optional package is repeated in the dev group so the test suite can import it. Something that is *only* optional would not be installed in this workspace and the tests covering its present-and-working path could not run. |
+| `launchdarkly-server-sdk>=9.18.4`, and the `otel` extra mirrored (`opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`) | Each dynamically-resolved or optional package is repeated in the dev group so the test suite can import it. Something that is *only* optional would not be installed in this workspace and the tests covering its present-and-working path could not run. |
 | `pytest>=8`, `pytest-asyncio>=0.24` | Test runner and the async support the whole suite relies on. `asyncio_mode = "auto"` is set at the workspace root, which is why no test in this package carries an `@pytest.mark.asyncio`. |
-| `mypy>=1.10` (`strict`), `ruff>=0.15` | Type checker and linter/formatter. `mypy` strict mode is the only thing enforcing the `Literal[...]` closed set on `ReconcileAction.action` — unlike `write_skills`'s `on_unavailable`, which is also checked at runtime because the value can arrive from untyped code. |
+| `mypy>=2.4.0` (`strict`), `ruff>=0.15.20` | Type checker and linter/formatter. `mypy` strict mode is the only thing enforcing the `Literal[...]` closed set on `ReconcileAction.action` — unlike `write_skills`'s `on_unavailable`, which is also checked at runtime because the value can arrive from untyped code. |
 
 ---
 

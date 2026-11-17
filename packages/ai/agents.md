@@ -8,9 +8,9 @@ This document describes the role, structure, and constraints of the `launchdarkl
 
 **Tier 0 — Convenience wrapper.**
 
-This package is a pure re-export barrel that re-exports the entire public surface of `launchdarkly-ai-server` and carries `launchdarkly-server-sdk` as a hard (non-peer) dependency. No new logic lives here.
+This package is a pure re-export barrel that re-exports the entire public surface of `launchdarkly-ai-server`. Its only dependency is `launchdarkly-ai-server>=1.0.0,<2`; the LaunchDarkly server SDK (`launchdarkly-server-sdk`) comes only through the `[ld]` extra. No new logic lives here.
 
-Its purpose: Python application developers install this single package and get both the LaunchDarkly AI SDK and the Python server SDK in one step, without managing `launchdarkly-server-sdk` as a peer dependency themselves.
+Its purpose: Python application developers install this single package, as `pip install "launchdarkly-ai-python[ld]"`, and get both the LaunchDarkly AI SDK and the Python server SDK in one step.
 
 ---
 
@@ -39,7 +39,7 @@ Every symbol available from `launchdarkly-ai-server` is available from `launchda
 | Dependency | Why |
 |---|---|
 | `launchdarkly-ai-server` | The package being re-exported |
-| `launchdarkly-server-sdk` | Carried as a hard dep so consumers don't need to install it manually; auto-discovered by `init_client()` via dynamic import |
+| `launchdarkly-server-sdk` (`[ld]` extra only) | Pulled in through `launchdarkly-ai-server[ld]`, not a hard dependency; auto-discovered by `init_client()` via dynamic import. Without it, `init_client()` raises a `RuntimeError` on the options path |
 
 ---
 
@@ -66,13 +66,13 @@ For OTLP endpoint configuration see the [`launchdarkly-ai-server` agents.md](../
 
 **Short answer for standard Python apps:**
 
-- **You don't need to call it** — lazy init runs automatically on the first `config().invoke()` call as long as `LD_SDK_KEY` is set.
+- **You don't need to call it** — lazy init runs automatically on the first `config().invoke()` call as long as `LD_SDK_KEY` is set and the `[ld]` extra is installed.
 - **Call it explicitly** when you need custom `serviceName`/`environment`, a custom OTLP endpoint, or want to pre-warm the connection before the first user request:
   ```python
   from launchdarkly_ai_python import init_client
   await init_client({"serviceName": "my-service", "environment": "production"})
   ```
-- **For BYOC / custom runtimes**, use `launchdarkly-ai-server` directly and pass a pre-initialized client: `await init_client(my_custom_client)`. Do not use this package for custom runtimes — it carries `launchdarkly-server-sdk` as a hard dependency which may conflict.
+- **For BYOC / custom runtimes**, pass a pre-initialized client: `await init_client(my_custom_client)`. Install without the `[ld]` extra, since you supply your own client.
 
 ---
 
