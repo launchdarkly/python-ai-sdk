@@ -20,6 +20,13 @@ from .types import (
     RunSummary,
     Usage,
 )
+from .workflow import (
+    EvaluatorContext,
+    EvaluatorWorkflow,
+    FunctionalEvaluator,
+    StepResult,
+    WorkflowResult,
+)
 
 __all__ = [
     "DEFAULT_BASE_URI",
@@ -32,6 +39,9 @@ __all__ = [
     "EvalVerdict",
     "EvaluationsError",
     "EvaluationsModule",
+    "EvaluatorContext",
+    "EvaluatorWorkflow",
+    "FunctionalEvaluator",
     "GenerationConfig",
     "GenerationMode",
     "GenerationOverrides",
@@ -39,6 +49,8 @@ __all__ = [
     "LDApiError",
     "RunSummary",
     "Scorer",
+    "StepResult",
     "Usage",
+    "WorkflowResult",
     "init_evaluations",
 ]

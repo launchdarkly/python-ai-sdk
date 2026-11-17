@@ -45,6 +45,7 @@ from .types import (
     InlineDatasetRow,
     RunSummary,
 )
+from .workflow import EvaluatorsClient, WorkflowsClient
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,8 @@ class EvaluationsModule:
         self._ui_base_uri = ui_base_uri.rstrip("/")
         self._runner = EvaluationsRunner(api_client)
         self._tools = ToolsClient(api_client, project_key)
+        self._evaluators = EvaluatorsClient(api_client, project_key)
+        self._workflows = WorkflowsClient(self._evaluators)
 
     @property
     def project_key(self) -> str:
@@ -254,6 +257,16 @@ class EvaluationsModule:
     def tools(self) -> ToolsClient:
         """Reader for tools in the LaunchDarkly tool library."""
         return self._tools
+
+    @property
+    def evaluators(self) -> EvaluatorsClient:
+        """Reader for functional evaluators: judges that run your code."""
+        return self._evaluators
+
+    @property
+    def workflows(self) -> WorkflowsClient:
+        """Reader for evaluator workflows: ordered chains of judges and evaluators."""
+        return self._workflows
 
     @property
     def sdk_key(self) -> str | None:
