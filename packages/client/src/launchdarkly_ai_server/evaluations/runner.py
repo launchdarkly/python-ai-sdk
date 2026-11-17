@@ -701,9 +701,9 @@ class EvaluationsRunner:
                     ) from error
 
         path = f"{collection}/{segment(key)}"
-        # PATCH is idempotent: the server applies the same full snapshot at
-        # most once, so replaying it after a 5xx or transport failure is a
-        # no-op. A 409 (another writer claimed the next version) is retried
+        # The server applies only what changed, so replaying the same snapshot
+        # is a no-op; a changed snapshot overwrites by design. A 409 (another
+        # writer claimed the next version) is retried
         # once after a re-GET; a second 409 becomes EvaluationsError.
         try:
             raw = require_mapping(
