@@ -495,8 +495,30 @@ def test_idempotent_post_is_retried_after_a_server_error() -> None:
     assert len(transport.requests) == 2
 
 
-def test_patch_is_not_retried_after_a_server_error() -> None:
-    """Offline-evaluation PATCH must not blind-replay after 5xx (concurrent writers)."""
+def test_idempotent_patch_is_retried_after_a_server_error() -> None:
+    transport = RecordingTransport(
+        [
+            HttpResponse(status=503, body='{"message": "unavailable"}'),
+            HttpResponse(status=200, body='{"id": "eval-1", "version": 2}'),
+        ]
+    )
+    client = LDApiClient(
+        api_key="api-token",
+        transport=transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.patch(
+        "projects/proj/offline-evaluations/support-qa",
+        body={"generationProvider": "OpenAI"},
+        idempotent=True,
+    ) == {"id": "eval-1", "version": 2}
+    assert len(transport.requests) == 2
+
+
+def test_unmarked_patch_is_not_retried_after_a_server_error() -> None:
     transport = RecordingTransport(
         [
             HttpResponse(status=503, body='{"message": "unavailable"}'),
@@ -512,13 +534,41 @@ def test_patch_is_not_retried_after_a_server_error() -> None:
     )
 
     with pytest.raises(LDApiError) as excinfo:
-        client.patch(
-            "projects/proj/offline-evaluations/support-qa",
-            body={"generationProvider": "OpenAI"},
-        )
+        client.patch("projects/proj/offline-evaluations/support-qa", body={})
 
     assert excinfo.value.status == 503
     assert len(transport.requests) == 1
+
+
+def test_idempotent_patch_is_replayed_after_a_transport_failure() -> None:
+    attempts: list[str] = []
+
+    def flaky_transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        attempts.append(method)
+        if len(attempts) == 1:
+            raise TimeoutError("timed out")
+        return HttpResponse(status=200, body='{"id": "eval-1", "version": 2}')
+
+    client = LDApiClient(
+        api_key="api-token",
+        transport=flaky_transport,
+        max_retries=2,
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    )
+
+    assert client.patch(
+        "projects/proj/offline-evaluations/support-qa",
+        body={"generationProvider": "OpenAI"},
+        idempotent=True,
+    ) == {"id": "eval-1", "version": 2}
+    assert attempts == ["PATCH", "PATCH"]
 
 
 def test_idempotent_post_is_replayed_after_a_transport_failure() -> None:

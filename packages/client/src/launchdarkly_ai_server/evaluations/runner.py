@@ -701,14 +701,13 @@ class EvaluationsRunner:
                     ) from error
 
         path = f"{collection}/{segment(key)}"
-        # Do not mark PATCH idempotent: a timed-out success that retries can
-        # overwrite a newer snapshot from another writer. 5xx / transport
-        # failures raise; callers that share a key must serialize or re-run.
-        # A 409 optimistic-lock collision is retried once after a re-GET; a
-        # second 409 becomes EvaluationsError.
+        # PATCH is idempotent: the server applies the same full snapshot at
+        # most once, so replaying it after a 5xx or transport failure is a
+        # no-op. A 409 (another writer claimed the next version) is retried
+        # once after a re-GET; a second 409 becomes EvaluationsError.
         try:
             raw = require_mapping(
-                self._api.patch(path, body=patch_body),
+                self._api.patch(path, body=patch_body, idempotent=True),
                 description="offline evaluation",
             )
         except LDApiError as error:
@@ -730,7 +729,7 @@ class EvaluationsRunner:
                 ) from error
             try:
                 raw = require_mapping(
-                    self._api.patch(path, body=patch_body),
+                    self._api.patch(path, body=patch_body, idempotent=True),
                     description="offline evaluation",
                 )
             except LDApiError as retry_error:
