@@ -22,6 +22,7 @@ from launchdarkly_ai_server import (
     LDContext,
     NativeGraphRunner,
     NativeTool,
+    _config_with_skill_tools,
     get_client,
     make_track_data,
     report_usage,
@@ -140,7 +141,7 @@ async def _run_query(
         node.config, input_text, variables, history, prompt
     )
     native_tool_map, user_config_tools, native_tool_names = _partition_tools(
-        node.config.get("tools"), wrapped
+        _config_with_skill_tools(node.key, node.config).get("tools"), wrapped
     )
 
     tool_mcp = (

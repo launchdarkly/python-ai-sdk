@@ -640,6 +640,25 @@ class TestVersionTranslation:
         assert raw["name"] == "PDF Extraction"
         assert raw["contentType"] == "text/markdown"
 
+    @pytest.mark.parametrize(
+        "tools",
+        [[{"type": "function", "name": "t", "parameters": {}}], "not-a-list"],
+        ids=["array", "string"],
+    )
+    def test_the_envelope_tools_are_held_as_delivered(self, tools: Any) -> None:
+        """TESTING.md 3.25: the transport copies ``tools`` and leaves parsing to
+        the accessor, so every store behaves the same."""
+        wire = put_skill()
+        wire["object"]["tools"] = tools
+        raw = _store_object_from_put(wire)
+        assert raw is not None
+        assert raw["tools"] == tools
+
+    def test_an_envelope_without_tools_has_no_tools_key(self) -> None:
+        raw = _store_object_from_put(put_skill())
+        assert raw is not None
+        assert "tools" not in raw
+
     def test_an_absent_envelope_field_is_absent_rather_than_defaulted(self) -> None:
         wire = put_skill()
         del wire["object"]["name"]

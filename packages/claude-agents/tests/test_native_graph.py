@@ -5,7 +5,8 @@ Tests for the native graph adapter (to_claude_agents) plus Anthropic-specific sp
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import hashlib
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,7 +14,14 @@ import pytest
 
 import launchdarkly_ai_claude_agents.native_graph as _claude_ng
 from launchdarkly_ai_claude_agents.native_graph import to_claude_agents
-from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
+from launchdarkly_ai_server import (
+    GraphDefinition,
+    GraphEdge,
+    GraphNode,
+    InMemorySkillStore,
+    NativeTool,
+    set_skill_store,
+)
 from tests.forwarding_spec import (
     CLAUDE_AGENTS,
     candidate_keys,
@@ -1605,3 +1613,129 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
             (f.name for f in dataclasses.fields(ClaudeAgentOptions)), CLAUDE_AGENTS
         )
         assert await probe_forwarded_keys(candidates, call) == CLAUDE_AGENTS
+
+
+_WEATHER_SKILL_BODY = "---\nname: W\n---\nWeather.\n"
+
+
+@pytest.fixture
+def weather_skill_store() -> Iterator[None]:
+    """A store holding skill ``weather`` v1, which pins the ``get-weather`` tool."""
+    set_skill_store(
+        InMemorySkillStore(
+            {
+                "weather:1": {
+                    "key": "weather",
+                    "version": 1,
+                    "content": _WEATHER_SKILL_BODY,
+                    "contentHash": hashlib.sha256(
+                        _WEATHER_SKILL_BODY.encode()
+                    ).hexdigest(),
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get-weather",
+                            "description": "d",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    try:
+        yield
+    finally:
+        set_skill_store(None)
+
+
+@pytest.mark.asyncio
+async def test_native_graph_adapters_offer_a_nodes_skill_tools(
+    weather_skill_store: None,
+) -> None:
+    """TESTING.md §3.21a: the root attaches the weather skill and gets ``get-weather`` beside its
+    own tool and its handoff tool; the leaf does not attach it and does not get it."""
+    graph_def = _make_graph_def(
+        nodes={
+            "root": {
+                "key": "root",
+                "config": {
+                    "model": {"name": "claude-root"},
+                    "provider": {"name": "Anthropic"},
+                    "instructions": "root",
+                    "tools": {"lookup": {"name": "lookup", "type": "function"}},
+                    "skills": [{"key": "weather", "version": 1}],
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [{"source_key": "root", "target_key": "leaf"}],
+                "is_terminal": False,
+            },
+            "leaf": {
+                "key": "leaf",
+                "config": {
+                    "model": {"name": "claude-leaf"},
+                    "provider": {"name": "Anthropic"},
+                    "instructions": "leaf",
+                    "tools": {"leaf-tool": {"name": "leaf-tool", "type": "function"}},
+                },
+                "meta": {"variationKey": "v1", "version": 1},
+                "edges": [],
+                "is_terminal": True,
+            },
+        },
+        edges=[{"source_key": "root", "target_key": "leaf"}],
+    )
+    leaf_tool: list[Any] = []
+    created_tools: list[str] = []
+
+    def _tool_factory(name: str, desc: str, schema: Any) -> Any:
+        def _dec(fn: Any) -> Any:
+            created_tools.append(name)
+            if "leaf" in name and name != "leaf-tool":
+                leaf_tool.append(fn)
+            return fn
+
+        return _dec
+
+    mock_sdk = _make_sdk_mock("done")
+    mock_sdk.tool = MagicMock(side_effect=_tool_factory)
+    captured: list[dict[str, Any]] = []
+    mock_sdk.ClaudeAgentOptions = MagicMock(
+        side_effect=lambda **kw: (captured.append(kw), kw)[1]
+    )
+    result_msg = _make_result_msg("done")
+
+    async def _query(**kwargs: Any) -> AsyncIterator[Any]:
+        if kwargs["options"].get("system_prompt") == "root":
+            await leaf_tool[0]({"input": "sub-query"})
+        yield result_msg
+
+    mock_sdk.query = _query
+    with patch(
+        "importlib.import_module",
+        side_effect=lambda n: mock_sdk if n == "claude_agent_sdk" else __import__(n),
+    ):
+        await to_claude_agents(
+            _make_def_promise(graph_def),
+            opts={
+                "tool_handlers": {
+                    "get-weather": AsyncMock(return_value="sunny"),
+                    "lookup": AsyncMock(return_value="found"),
+                    "leaf-tool": AsyncMock(return_value="leafed"),
+                }
+            },
+        ).invoke("hi")
+
+    by_node = {kw["system_prompt"]: kw for kw in captured}
+    assert sorted(by_node) == ["leaf", "root"]
+    root, leaf = by_node["root"], by_node["leaf"]
+    # The root keeps its own tool, gains the skill's, and keeps its handoff to the leaf.
+    assert sorted(root["allowed_tools"]) == [
+        "mcp__tool-mcp__get-weather",
+        "mcp__tool-mcp__lookup",
+    ]
+    assert set(root["mcp_servers"]) == {"tool-mcp", "subagents"}
+    assert any("leaf" in n and n != "leaf-tool" for n in created_tools)
+    # The leaf does not attach the skill, so it is offered only its own tool.
+    assert leaf["allowed_tools"] == ["mcp__tool-mcp__leaf-tool"]
+    assert "get-weather" not in str(leaf["allowed_tools"])

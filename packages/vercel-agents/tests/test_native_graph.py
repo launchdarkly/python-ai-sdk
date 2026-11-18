@@ -7,6 +7,8 @@ history, usage, telemetry, and cleanup without gateway credentials or I/O.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -14,7 +16,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import launchdarkly_ai_vercel_agents.native_graph as native_graph_mod
-from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from launchdarkly_ai_server import (
+    GraphDefinition,
+    GraphEdge,
+    GraphNode,
+    InMemorySkillStore,
+    set_skill_store,
+)
 from launchdarkly_ai_vercel_agents.native_graph import to_vercel_agents
 
 
@@ -510,3 +518,75 @@ class TestTelemetryAndCleanup:
         ):
             await to_vercel_agents(_definition(_graph())).invoke("hello")
         span.end.assert_called_once()
+
+
+_WEATHER_SKILL_BODY = "---\nname: W\n---\nWeather.\n"
+
+
+@pytest.fixture
+def weather_skill_store() -> Iterator[None]:
+    """A store holding skill ``weather`` v1, which pins the ``get-weather`` tool."""
+    set_skill_store(
+        InMemorySkillStore(
+            {
+                "weather:1": {
+                    "key": "weather",
+                    "version": 1,
+                    "content": _WEATHER_SKILL_BODY,
+                    "contentHash": hashlib.sha256(
+                        _WEATHER_SKILL_BODY.encode()
+                    ).hexdigest(),
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get-weather",
+                            "description": "d",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    try:
+        yield
+    finally:
+        set_skill_store(None)
+
+
+@pytest.mark.asyncio
+async def test_native_graph_adapters_offer_a_nodes_skill_tools(
+    ai_runtime: MagicMock, weather_skill_store: None
+) -> None:
+    """TESTING.md §3.21a: the root attaches the weather skill and gets ``get-weather`` beside its
+    own tool and its handoff tool; the leaf does not attach it and does not get it."""
+    definition = _graph(include_node_tool=True)
+    assert definition.root is not None
+    leaf = definition.get_node("leaf")
+    assert leaf is not None
+    definition.root.config["skills"] = [{"key": "weather", "version": 1}]
+    leaf.config["tools"] = {
+        "leaf-tool": {"description": "d", "parameters": {"type": "object"}}
+    }
+    await to_vercel_agents(
+        _definition(definition),
+        {
+            "tool_handlers": {
+                "get-weather": MagicMock(return_value="sunny"),
+                "lookup": MagicMock(return_value="found"),
+                "leaf-tool": MagicMock(return_value="leafed"),
+            }
+        },
+    ).invoke("hello")
+
+    assert ai_runtime.Agent.call_count == 2
+    root_tools = ai_runtime.Agent.call_args_list[0].kwargs["tools"]
+    leaf_tools = ai_runtime.Agent.call_args_list[1].kwargs["tools"]
+    # The root keeps its own tool, gains the skill's, and keeps its handoff to the leaf.
+    assert [tool.name for tool in root_tools] == [
+        "lookup",
+        "get-weather",
+        "transfer_to_leaf",
+    ]
+    # The leaf does not attach the skill, so it is offered only its own tool.
+    assert [tool.name for tool in leaf_tools] == ["leaf-tool"]

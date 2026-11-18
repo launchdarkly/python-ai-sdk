@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,7 +15,13 @@ import launchdarkly_ai_litellm_agents.graph as graph_mod
 import launchdarkly_ai_litellm_agents.handler as handler_mod
 import launchdarkly_ai_litellm_agents.native_graph as native_graph_mod
 from launchdarkly_ai_litellm_agents import litellm_graph, to_litellm_agents
-from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from launchdarkly_ai_server import (
+    GraphDefinition,
+    GraphEdge,
+    GraphNode,
+    InMemorySkillStore,
+    set_skill_store,
+)
 from tests.forwarding_spec import (
     LITELLM_AGENTS,
     candidate_keys,
@@ -763,3 +771,100 @@ class TestNativeGraphForwarding:
         assert factory_parameters == {"temperature": 0.1}
         assert settings.temperature == 0.1
         assert not find_leaks((settings, run_kwargs))
+
+
+_WEATHER_SKILL_BODY = "---\nname: W\n---\nWeather.\n"
+
+
+@pytest.fixture
+def weather_skill_store() -> Iterator[None]:
+    """A store holding skill ``weather`` v1, which pins the ``get-weather`` tool."""
+    set_skill_store(
+        InMemorySkillStore(
+            {
+                "weather:1": {
+                    "key": "weather",
+                    "version": 1,
+                    "content": _WEATHER_SKILL_BODY,
+                    "contentHash": hashlib.sha256(
+                        _WEATHER_SKILL_BODY.encode()
+                    ).hexdigest(),
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get-weather",
+                            "description": "d",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    try:
+        yield
+    finally:
+        set_skill_store(None)
+
+
+@pytest.mark.asyncio
+async def test_native_graph_adapters_offer_a_nodes_skill_tools(
+    weather_skill_store: None,
+) -> None:
+    """TESTING.md §3.21a: the root attaches the weather skill and gets ``get-weather`` beside its
+    own tool and its handoff; the child does not attach it and does not get it."""
+    definition = _definition()
+    assert definition.root is not None
+    child_node = definition.get_node("child")
+    assert child_node is not None
+    schema = {"description": "d", "parameters": {"type": "object", "properties": {}}}
+    definition.root.config["tools"] = {"lookup": schema}
+    definition.root.config["skills"] = [{"key": "weather", "version": 1}]
+    child_node.config["tools"] = {"leaf-tool": schema}
+    created: list[dict[str, Any]] = []
+    agents = SimpleNamespace(
+        Agent=MagicMock(
+            side_effect=lambda **kwargs: (
+                created.append(kwargs),
+                SimpleNamespace(**kwargs),
+            )[1]
+        ),
+        Runner=SimpleNamespace(
+            run=AsyncMock(
+                return_value=SimpleNamespace(
+                    final_output="done",
+                    context_wrapper=SimpleNamespace(
+                        usage=SimpleNamespace(input_tokens=1, output_tokens=1)
+                    ),
+                )
+            )
+        ),
+        handoff=MagicMock(side_effect=lambda target: target),
+        FunctionTool=MagicMock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs)),
+        RunHooks=_FakeRunHooks,
+    )
+    real_import = __import__
+    with patch(
+        "importlib.import_module",
+        side_effect=lambda name: agents if name == "agents" else real_import(name),
+    ):
+        await to_litellm_agents(
+            _definition_awaitable_from(definition),
+            opts={
+                "model_factory": lambda *_: object(),
+                "tool_handlers": {
+                    "get-weather": AsyncMock(return_value="sunny"),
+                    "lookup": AsyncMock(return_value="found"),
+                    "leaf-tool": AsyncMock(return_value="leafed"),
+                },
+            },
+        ).invoke("query")
+
+    by_name = {entry["name"]: entry for entry in created}
+    assert sorted(by_name) == ["child", "root"]
+    root, child = by_name["root"], by_name["child"]
+    # The root keeps its own tool, gains the skill's, and keeps its handoff to the child.
+    assert [t.name for t in root["tools"]] == ["lookup", "get-weather"]
+    assert [h.name for h in root["handoffs"]] == ["child"]
+    # The child does not attach the skill, so it is offered only its own tool.
+    assert [t.name for t in child["tools"]] == ["leaf-tool"]

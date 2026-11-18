@@ -30,7 +30,7 @@ No other `launchdarkly-ai-*` package may define or duplicate these. They import 
 | `src/launchdarkly_ai_server/types.py` | All shared Python types — `AiConfigRep`, `ProviderHandler`, `LDContext`, `NativeTool`, etc. |
 | `src/launchdarkly_ai_server/types_validation.py` | `parse_ai_config` — validates flag variation shape; `is_valid_skill_key` / `is_valid_skill_version` / `skill_key_rejection_reason` (the canonical key-grammar explanation every layer quotes) |
 | `src/launchdarkly_ai_server/skills.py` | Agent Skills, retrieval half — `skill_refs`, `get_skill`/`get_skills`/`all_skills`, `InMemorySkillStore`, and the store/telemetry injection points `_set_store` / `_set_emitter_for_testing` |
-| `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, store resolution, and `config_with_skill_tools`. Imported by `skills.py`, the materialization layer, and (for skill tools) `client.py`, `graph.py` and shadow requests; imports none of them |
+| `src/launchdarkly_ai_server/skills_core.py` | Shared skills internals — the `SkillStore` seam, module state, the telemetry seam and its three recorders, integrity verification, store resolution, and `_config_with_skill_tools`. Imported by `skills.py`, the materialization layer, and (for skill tools) `client.py`, `graph.py` and shadow requests; the package root re-exports `_config_with_skill_tools` for the native graph adapters. Imports none of them |
 | `src/launchdarkly_ai_server/skills_fdv2.py` | Agent Skills, delivery transport — the FDv2 protocol, the wire-key/`version` translation, the held object set, and `LaunchDarklySkillStore`. Sits **below** the store interface; imports `skills_core` only, and nothing imports it |
 | `src/launchdarkly_ai_server/skills_watch.py` | Agent Skills, eager re-reconcile — `watch_skills` / `SkillWatcher`, wiring the store's change listener, and for a `SkillSource` the base client's `flag_tracker` listener, to `write_skills`. Sits **above** `skills_fs` and modifies none of it |
 | `src/launchdarkly_ai_server/skills_source.py` | Agent Skills, config-scoped requested set — `config_skills(key, context)`, which evaluates one AI Config per read and classifies every failure as a raised read, never `[]`. With `skills_watch`, the only skills module that imports `lifecycle`, and it takes only `get_client` |
@@ -530,15 +530,19 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   `contentHash` or `key`, so both are shape-checked and redacted before reaching a signal or
   a log line.
 - **Skill tools are not covered by `contentHash`.** It hashes only the markdown, so
-  `Skill.tools` is shape-checked (`skills_core.parse_skill_tools`: an array, each entry with a
-  string `name` and an object `parameters`) and a bad entry is dropped with a warning, never an
-  integrity failure. A tool name reaches a log line only if it matches `_SAFE_TOOL_NAME`.
-  Tools live in memory only: `write_skills` writes none to disk or to the manifest.
-- **Skill tools join a config in one place.** `skills_core.config_with_skill_tools` appends
-  the tools of a variation's skills after `config["tools"]`, which keeps `config["tools"]` the
-  tool allowlist. `config()`, graph node resolution and shadow variations call it once each,
-  so no handler package reads skills itself. Do not call it twice on one config: the second
-  pass would see the skill tools as the variation's own and warn.
+  `Skill.tools` is shape-checked instead (`skills_core.parse_skill_tools`: an array, each entry
+  a `function` tool with a string `name` and an object `parameters`, no repeated name). A bad
+  entry is dropped with a warning, never an integrity failure. A tool name reaches a log line
+  only if it matches `_SAFE_TOOL_NAME`, otherwise it is named `tools[i]`. Tools live in memory
+  only: `write_skills` writes none to disk or to the manifest.
+- **Skill tools join a config through one function.** `_config_with_skill_tools(config_key,
+  config)` appends the tools of a variation's skills after `config["tools"]`, which keeps
+  `config["tools"]` the tool allowlist. `config()` (invoke and stream), `graph()` node
+  execution, shadow variations and the five native graph adapters each call it once.
+  `GraphNode.config` and `inspect_config` keep the variation's own tools, so an adapter given a
+  resolved graph merges exactly once. Do not call it on a config it already returned: the
+  second pass would see the skill tools as the variation's own and warn. It reads through
+  `resolve_from_store`, never the public accessors, so it reports no usage.
 - **`write_skills` re-validates the key** before any filesystem call, regardless of upstream
   validation — a key becomes a directory name.
 - **Never write through a symlink** — skill directory or target file, on both the write and

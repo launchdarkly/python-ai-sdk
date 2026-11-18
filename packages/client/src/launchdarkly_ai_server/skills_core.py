@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol, get_args
 
 from .shutdown_hooks import register_shutdown_hook
-from .types import Skill, SkillOutcomeReason, SkillReference
+from .types import AiConfigRep, Skill, SkillOutcomeReason, SkillReference
 from .types_validation import (
     is_valid_skill_key,
     is_valid_skill_version,
@@ -179,9 +179,9 @@ _NOOP_EMITTER: _TelemetryEmitter = _NoOpEmitter()
 _store: SkillStore | None = None
 _emitter: _TelemetryEmitter = _NOOP_EMITTER
 """Never ``None``; "no emitter" is the no-op emitter."""
-_warned_no_store_for_tools = False
-"""Whether ``config_with_skill_tools`` has already warned that no store is
-configured, so a config with skills does not warn on every call."""
+_warned_skill_tools: set[tuple[Any, ...]] = set()
+"""Skill-tool warnings already logged. An envelope for a key and version never
+changes and handlers read skills on every run, so each warns once per process."""
 
 
 def set_store(store: Any) -> None:
@@ -198,10 +198,10 @@ def set_emitter(emitter: Any) -> None:
 
 def clear_state() -> None:
     """Drops both the store and the emitter."""
-    global _store, _emitter, _warned_no_store_for_tools
+    global _store, _emitter
     _store = None
     _emitter = _NOOP_EMITTER
-    _warned_no_store_for_tools = False
+    _warned_skill_tools.clear()
 
 
 # Registered on load, so core's ``shutdown()`` clears this state without
@@ -564,8 +564,16 @@ def verify_raw_skill(raw: Any) -> Skill | None:
         content_hash=verified.content_hash,
         name=name if isinstance(name, str) else None,
         description=description if isinstance(description, str) else None,
-        tools=parse_skill_tools(key, raw),
+        tools=parse_skill_tools(key, version, raw),
     )
+
+
+def _warn_once(identity: tuple[Any, ...], message: str, *args: Any) -> None:
+    """Logs a skill-tool warning the first time *identity* is seen."""
+    if identity in _warned_skill_tools:
+        return
+    _warned_skill_tools.add(identity)
+    logger.warning(message, *args)
 
 
 def _tool_label(tool: Any, index: int) -> str:
@@ -574,43 +582,57 @@ def _tool_label(tool: Any, index: int) -> str:
     name = tool.get("name") if isinstance(tool, dict) else None
     if isinstance(name, str) and _SAFE_TOOL_NAME.match(name):
         return f"'{name}'"
-    return f"at index {index}"
+    return f"tools[{index}]"
 
 
-def parse_skill_tools(key: str, raw: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+def parse_skill_tools(
+    key: str, version: int, raw: dict[str, Any]
+) -> tuple[dict[str, Any], ...]:
     """
     The usable tool definitions in a raw skill object, in author order.
 
     Bad tool data drops only that tool, with a warning: the skill is still
     returned and no integrity failure is recorded, since ``contentHash`` does not
-    cover tools. An entry needs a string ``name`` and an object ``parameters``.
+    cover tools. An entry needs a string ``name``, ``type`` ``"function"`` and an
+    object ``parameters``, and a repeated ``name`` keeps the first.
     """
     if "tools" not in raw:
         return ()
     raw_tools = raw["tools"]
     if not isinstance(raw_tools, list):
-        logger.warning(
-            "Skill '%s' has tools that are not an array; none of its tools are "
-            "offered.",
+        _warn_once(
+            ("tools", key, version),
+            "Skill '%s' version %d has tools that are not an array; none of its "
+            "tools are offered.",
             key,
+            version,
         )
         return ()
     tools: list[dict[str, Any]] = []
+    names: set[str] = set()
     for index, tool in enumerate(raw_tools):
         if (
             not isinstance(tool, dict)
             or not isinstance(tool.get("name"), str)
+            or tool.get("type") != "function"
             or not isinstance(tool.get("parameters"), dict)
         ):
-            logger.warning(
-                "Skill '%s' tool %s is missing a string name or an object "
-                "parameters, so it is not offered.",
-                key,
-                _tool_label(tool, index),
-            )
+            problem = "is not a function tool with a string name and object parameters"
+        elif tool["name"] in names:
+            problem = "repeats an earlier tool's name"
+        else:
+            names.add(tool["name"])
+            # A fresh copy per call, so a change to one never reaches the store.
+            tools.append(copy.deepcopy(tool))
             continue
-        # A copy, so a handler that edits a config's tools cannot reach the store.
-        tools.append(copy.deepcopy(tool))
+        _warn_once(
+            ("tool", key, version, index),
+            "Skill '%s' version %d tool %s %s, so it is not offered.",
+            key,
+            version,
+            _tool_label(tool, index),
+            problem,
+        )
     return tuple(tools)
 
 
@@ -788,76 +810,80 @@ def resolve_from_store(
     return Resolution(reason="ok", skill=skill)
 
 
-def config_with_skill_tools(config: Any) -> Any:
+def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRep:
     """
     *config* with the tools of the skills it attaches added to ``tools``.
 
     Skill tools come after the variation's own, in the variation's skills
     order, and an exact duplicate is skipped. On a shared key the variation's
     definition wins, and between two skills the first one does, each with a
-    warning. Never raises: a skill whose tools cannot be read adds none, and
-    *config* itself is returned when nothing is added.
+    warning. Never raises: a skill that cannot be read adds no tools, no store
+    means no skill tools, and *config* itself is returned when nothing is added.
+    Reads through core retrieval, so it reports no accessor usage.
     """
-    global _warned_no_store_for_tools
     if not isinstance(config, dict) or not config.get("skills"):
         return config
     refs = config["skills"]
     rejection = skills_field_rejection_reason(refs)
     if rejection is not None:
         logger.warning(
-            "The AI Config's skills field is invalid (%s), so no skill tools are "
-            "offered.",
+            "AI Config '%s' has an invalid skills field (%s), so no skill tools "
+            "are offered.",
+            config_key,
             rejection,
         )
         return config
     store = get_store()
     if store is None:
-        if not _warned_no_store_for_tools:
-            _warned_no_store_for_tools = True
-            logger.warning(
-                "The AI Config attaches skills but no skill store is configured, "
-                "so their tools are not offered. Configure one with "
-                "set_skill_store(store)."
-            )
+        # Skills may be attached for write_skills alone, so this is not an error.
         return config
 
     own = config.get("tools")
     own_tools: dict[str, Any] = own if isinstance(own, dict) else {}
     merged = dict(own_tools)
-    added = False
+    first_from: dict[str, str] = {}
     for ref in refs:
-        resolution = resolve_from_store(store, ref["key"], ref["version"])
+        skill_key, version = ref["key"], ref["version"]
+        resolution = resolve_from_store(store, skill_key, version)
         if resolution.skill is None:
-            logger.warning(
+            _warn_once(
+                ("unavailable", skill_key, version),
                 "Skill '%s' version %d is unavailable (%s), so its tools are not "
-                "offered.",
-                ref["key"],
-                ref["version"],
+                "offered for AI Config '%s'.",
+                skill_key,
+                version,
                 resolution.reason,
+                config_key,
             )
             continue
         for index, tool in enumerate(resolution.skill.tools):
             name = tool["name"]
             if name in own_tools:
-                logger.warning(
-                    "Skill '%s' and the variation both define tool %s; the "
-                    "variation's definition is used.",
-                    ref["key"],
+                _warn_once(
+                    ("variation", config_key, skill_key, version, name),
+                    "AI Config '%s' and skill '%s' version %d both define tool "
+                    "%s; the variation's definition is used.",
+                    config_key,
+                    skill_key,
+                    version,
                     _tool_label(tool, index),
                 )
-                continue
-            if name in merged:
+            elif name in merged:
                 if merged[name] != tool:
-                    logger.warning(
-                        "Skill '%s' defines tool %s differently from an earlier "
-                        "skill; the earlier definition is used.",
-                        ref["key"],
+                    _warn_once(
+                        ("skill", config_key, skill_key, version, name),
+                        "AI Config '%s': skill '%s' version %d defines tool %s "
+                        "differently from skill %s; the first definition is used.",
+                        config_key,
+                        skill_key,
+                        version,
                         _tool_label(tool, index),
+                        first_from[name],
                     )
-                continue
-            merged[name] = tool
-            added = True
-    if not added:
+            else:
+                merged[name] = tool
+                first_from[name] = f"'{skill_key}' version {version}"
+    if not first_from:
         return config
     return {**config, "tools": merged}
 
