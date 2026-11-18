@@ -996,3 +996,35 @@ def test_root_and_chat_spans_write_the_provider_name(
     for span in recorder.spans:
         assert span.attributes["gen_ai.provider.name"] == expected
         assert span.attributes["gen_ai.system"] == "litellm"
+
+
+class TestUnofferedToolsFailClosed:
+    """A tool name in a model response is untrusted. The handler resolves it only
+    against the tools it offered, and raises naming the tool otherwise: a name
+    registered nowhere, a registered tool the config does not attach, and an
+    attribute name all fail, and no registered handler runs."""
+
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    @pytest.mark.parametrize("name", ["ghost", "privileged", "__class__"])
+    async def test_rejects_a_tool_it_did_not_offer(self, path: str, name: str) -> None:
+        privileged = AsyncMock(return_value="ran")
+        handlers = {"safe": AsyncMock(return_value="ok"), "privileged": privileged}
+        config = {**CONFIG, "tools": {"safe": {"description": "", "parameters": {}}}}
+        if path == "invoke":
+            completion = AsyncMock(
+                return_value=_response(None, tool_calls=[_tool_call(name, "c1", "{}")])
+            )
+        else:
+            delta = SimpleNamespace(
+                index=0, id="c1", function=SimpleNamespace(name=name, arguments="{}")
+            )
+            completion = AsyncMock(
+                return_value=FakeStream([_chunk(tool_calls=[delta])])
+            )
+        handler = create_litellm_messages_handler(completion=completion)
+        with pytest.raises(ValueError, match=f'tool "{name}"'):
+            if path == "invoke":
+                await handler(config, "q", handlers)
+            else:
+                await _events(await handler.stream(config, "q", handlers))
+        privileged.assert_not_awaited()

@@ -523,6 +523,10 @@ def _create_litellm_messages_handler(
         values = variables or {}
         messages = _build_messages(config_value, user_input, values, history)
         tools = _build_tools(config_value, handlers)
+        # A tool name in a model response is untrusted: dispatch only to what was offered.
+        offered = {
+            t["function"]["name"]: handlers[t["function"]["name"]] for t in tools
+        }
         root = _root_span(config_value, values, capture_content=capture_content)
         parent = _parent_context(root)
         total = SpanUsage()
@@ -606,7 +610,7 @@ def _create_litellm_messages_handler(
                 messages.extend(
                     await _execute_tools(
                         calls,
-                        handlers,
+                        offered,
                         parent,
                         ended,
                         capture_content=capture_content,
@@ -667,6 +671,8 @@ async def _stream(
 ) -> AsyncGenerator[dict[str, Any], None]:
     messages = _build_messages(config_value, user_input, variables, history)
     tools = _build_tools(config_value, handlers)
+    # A tool name in a model response is untrusted: dispatch only to what was offered.
+    offered = {t["function"]["name"]: handlers[t["function"]["name"]] for t in tools}
     root = _root_span(config_value, variables, capture_content=capture_content)
     parent = _parent_context(root)
     total = SpanUsage()
@@ -785,7 +791,7 @@ async def _stream(
             messages.extend(
                 await _execute_tools(
                     calls,
-                    handlers,
+                    offered,
                     parent,
                     ended,
                     capture_content=capture_content,

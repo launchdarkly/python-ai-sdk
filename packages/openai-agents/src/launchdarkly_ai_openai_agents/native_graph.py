@@ -80,14 +80,16 @@ def _build_node_tools(
 
     result = []
     for name, tool_cfg in node.config["tools"].items():
-        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+        # Only a config tool with a function handler is offered: a missing handler or a
+        # NativeTool never reaches the model.
+        if not is_function_tool(tool_handlers.get(name), name):
             continue
 
         # on_invoke_tool receives (ToolContext, json_args_str); decode and dispatch.
         async def _execute(_ctx: Any, args_str: str, _name: str = name) -> str:
             handler = tool_handlers.get(_name)
             if not handler or isinstance(handler, NativeTool):
-                return ""
+                raise ValueError(f'No handler registered for tool "{_name}"')
             try:
                 args = json.loads(args_str) if args_str else {}
             except (json.JSONDecodeError, ValueError):

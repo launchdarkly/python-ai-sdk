@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-1.0.0...launchdarkly-ai-claude-agents-1.0.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **claude-agents:** pass each node's configured model in to_claude_agents ([#287](https://github.com/launchdarkly/python-ai-sdk/issues/287)) ([2b0ceac](https://github.com/launchdarkly/python-ai-sdk/commit/2b0ceac01a5251833cd8957ecb5419df0deb5587))
+* **tools:** hand each handler only the tools its config attaches ([#279](https://github.com/launchdarkly/python-ai-sdk/issues/279)) ([4c786ef](https://github.com/launchdarkly/python-ai-sdk/commit/4c786eff17bbf48720b2fcdc35c0ae13871cfcb1))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-claude-agents-0.3.0...launchdarkly-ai-claude-agents-1.0.0) (2026-10-30)
 
 

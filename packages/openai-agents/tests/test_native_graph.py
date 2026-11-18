@@ -15,7 +15,7 @@ from launchdarkly_ai_openai_agents.native_graph import (
     _build_node_tools,
     to_openai_agents,
 )
-from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode
+from launchdarkly_ai_server import GraphDefinition, GraphEdge, GraphNode, NativeTool
 from tests.forwarding_spec import (
     OPENAI_AGENTS,
     candidate_keys,
@@ -1327,3 +1327,33 @@ class TestNativeGraphForwardsExactlyTheCrossSdkList:
             )
             == OPENAI_AGENTS
         )
+
+
+class TestNodeToolsFailClosed:
+    """A node offers only its attached tools that have a function handler."""
+
+    async def test_offers_only_attached_tools_with_a_function_handler(self) -> None:
+        node = _to_graph_node(
+            {
+                "key": "root",
+                "config": {
+                    "tools": {
+                        "safe": {"description": "d", "parameters": {}},
+                        "missing": {"description": "d", "parameters": {}},
+                        "web": {"description": "d", "parameters": {}},
+                    },
+                },
+                "meta": {},
+                "edges": [],
+                "is_terminal": True,
+            }
+        )
+        tools = _build_node_tools(
+            node,
+            {
+                "safe": lambda a: "ok",
+                "privileged": lambda a: "ran",
+                "web": NativeTool("web_search"),
+            },
+        )
+        assert [t.name for t in tools] == ["safe"]

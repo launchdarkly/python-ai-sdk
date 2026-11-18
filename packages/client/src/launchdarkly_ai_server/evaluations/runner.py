@@ -577,7 +577,90 @@ class EvaluationsRunner:
             )
         return rows
 
-    def _create_evaluation(
+    def _evaluation_config_body(
+        self,
+        key: str,
+        generation: GenerationConfig,
+        tools: Sequence[EvalTool],
+        criteria: list[Criterion] | None = None,
+        *,
+        include_key: bool,
+    ) -> dict[str, Any]:
+        """Build the offline-evaluation create/patch body for ``key``.
+
+        Create requires ``key`` + ``name`` (``name`` defaults to ``key``).
+        PATCH is by path key and takes the same mutable config fields as a
+        full snapshot — no ``key`` and no ``name``, so a UI rename survives
+        the next CI reconcile.
+        """
+        body: dict[str, Any] = {
+            "generationProvider": generation["provider"],
+            "generationModel": generation["model"],
+        }
+        if include_key:
+            body["key"] = key
+            body["name"] = key
+        # Always send parameters/promptSnippets — including {} — so a PATCH
+        # snapshot can clear previously set values (omitting the field leaves
+        # the old value on the evaluation). Explicit ``None`` becomes ``{}``,
+        # matching the TypeScript SDK wire shape.
+        parameters = generation["parameters"] if "parameters" in generation else {}
+        body["parameters"] = {} if parameters is None else parameters
+        if "instructions" in generation:
+            body["messages"] = [
+                {"role": "system", "content": generation["instructions"]}
+            ]
+        elif "messages" in generation:
+            messages = generation["messages"]
+            body["messages"] = [] if messages is None else messages
+        else:
+            body["messages"] = []
+        snippets = (
+            generation["prompt_snippets"] if "prompt_snippets" in generation else {}
+        )
+        body["promptSnippets"] = {} if snippets is None else snippets
+        # Always send tools/criteria — including [] — so a PATCH snapshot can
+        # clear pins that ingest still expects results for.
+        body["tools"] = create_wire_tools(tools)
+        body["criteria"] = [
+            criterion.to_criteria_wire() for criterion in (criteria or [])
+        ]
+        return body
+
+    def _parse_evaluation_ref(self, raw: Mapping[str, Any], key: str) -> EvaluationRef:
+        evaluation_id = require_string(raw, "id", "evaluation")
+        # Prefer a non-empty response ``key``. Do not fall through to ``name`` /
+        # ``label``: PATCH omits ``name`` so a UI rename can diverge from the
+        # stable key, and ``evaluationKey`` on events must stay that key. An
+        # explicit JSON ``null`` for ``key`` therefore uses the caller's key.
+        raw_key = raw.get("key")
+        response_key = raw_key if isinstance(raw_key, str) and raw_key else key
+        version = raw.get("version")
+        # ``bool`` is a subclass of ``int``; reject it so ``True`` is not version 1.
+        if type(version) is not int:
+            raise EvaluationsError(
+                "LaunchDarkly evaluation response is missing integer field 'version'"
+            )
+        return EvaluationRef(
+            id=evaluation_id,
+            key=response_key,
+            version=version,
+        )
+
+    def _get_offline_evaluation(
+        self, project_key: str, key: str
+    ) -> Mapping[str, Any] | None:
+        path = f"projects/{segment(project_key)}/offline-evaluations/{segment(key)}"
+        try:
+            return require_mapping(
+                self._api.get(path), description="offline evaluation"
+            )
+        except LDApiError as error:
+            if error.status == 404:
+                return None
+            raise
+
+    def _ensure_evaluation(
         self,
         project_key: str,
         key: str,
@@ -585,38 +668,80 @@ class EvaluationsRunner:
         tools: Sequence[EvalTool],
         criteria: list[Criterion] | None = None,
     ) -> EvaluationRef:
-        body: dict[str, Any] = {
-            "name": key,
-            "generationProvider": generation["provider"],
-            "generationModel": generation["model"],
-        }
-        if "parameters" in generation:
-            body["parameters"] = generation["parameters"]
-        if "instructions" in generation:
-            body["messages"] = [
-                {"role": "system", "content": generation["instructions"]}
-            ]
-        elif "messages" in generation:
-            body["messages"] = generation["messages"]
-        else:
-            body["messages"] = []
-        if "prompt_snippets" in generation:
-            body["promptSnippets"] = generation["prompt_snippets"]
-        if tools:
-            body["tools"] = create_wire_tools(tools)
-        if criteria:
-            body["criteria"] = [criterion.to_criteria_wire() for criterion in criteria]
+        """Reconcile a keyed offline evaluation via GET → POST|PATCH.
 
-        path = f"projects/{segment(project_key)}/evaluations"
-        raw = require_mapping(self._api.post(path, body=body), description="evaluation")
-        evaluation_id = require_string(raw, "id", "evaluation")
-        response_key = raw.get("name", raw.get("label", key))
-        version = raw.get("version")
-        return EvaluationRef(
-            id=evaluation_id,
-            key=str(response_key),
-            version=version if isinstance(version, int) else None,
+        First CI mint: GET 404 → POST ``…/offline-evaluations`` with ``key`` +
+        ``name`` (create-only). Steady state: GET 200 → always PATCH the full
+        desired snapshot; the server decides whether anything changed. A POST
+        409 race re-GETs and continues as the update path. Runs still use
+        legacy ``…/evaluations/{id}/runs``.
+        """
+        collection = f"projects/{segment(project_key)}/offline-evaluations"
+        create_body = self._evaluation_config_body(
+            key, generation, tools, criteria, include_key=True
         )
+        patch_body = self._evaluation_config_body(
+            key, generation, tools, criteria, include_key=False
+        )
+
+        if self._get_offline_evaluation(project_key, key) is None:
+            try:
+                raw = require_mapping(
+                    self._api.post(collection, body=create_body),
+                    description="offline evaluation",
+                )
+                return self._parse_evaluation_ref(raw, key)
+            except LDApiError as error:
+                if error.status != 409:
+                    raise
+                if self._get_offline_evaluation(project_key, key) is None:
+                    raise EvaluationsError(
+                        f"LaunchDarkly offline evaluation {key!r} reported a "
+                        "key conflict but could not be re-fetched"
+                    ) from error
+
+        path = f"{collection}/{segment(key)}"
+        # Do not mark PATCH idempotent: a timed-out success that retries can
+        # overwrite a newer snapshot from another writer. 5xx / transport
+        # failures raise; callers that share a key must serialize or re-run.
+        # A 409 optimistic-lock collision is retried once after a re-GET; a
+        # second 409 becomes EvaluationsError.
+        try:
+            raw = require_mapping(
+                self._api.patch(path, body=patch_body),
+                description="offline evaluation",
+            )
+        except LDApiError as error:
+            if error.status != 409:
+                raise
+            # Align with JS: any re-GET failure after a PATCH 409 (404 or
+            # otherwise) becomes EvaluationsError — do not leak a raw LDApiError.
+            try:
+                refetched = self._get_offline_evaluation(project_key, key)
+            except LDApiError as reget_error:
+                raise EvaluationsError(
+                    f"LaunchDarkly offline evaluation {key!r} reported an "
+                    "update conflict but could not be re-fetched"
+                ) from reget_error
+            if refetched is None:
+                raise EvaluationsError(
+                    f"LaunchDarkly offline evaluation {key!r} reported an "
+                    "update conflict but could not be re-fetched"
+                ) from error
+            try:
+                raw = require_mapping(
+                    self._api.patch(path, body=patch_body),
+                    description="offline evaluation",
+                )
+            except LDApiError as retry_error:
+                if retry_error.status == 409:
+                    raise EvaluationsError(
+                        f"LaunchDarkly offline evaluation {key!r} could not be "
+                        "updated because another writer changed it; retry the "
+                        "run or serialize callers that share this key"
+                    ) from retry_error
+                raise
+        return self._parse_evaluation_ref(raw, key)
 
     def _create_evaluation_run(
         self,

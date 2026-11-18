@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-messages-1.0.0...launchdarkly-ai-langchain-messages-1.1.0) (2026-11-12)
+
+
+### Features
+
+* add max_retries to the messages handler factories ([#214](https://github.com/launchdarkly/python-ai-sdk/issues/214)) ([c08aea8](https://github.com/launchdarkly/python-ai-sdk/commit/c08aea84a6ef4558e6b943f4a302496f7f24d898))
+
+
+### Bug Fixes
+
+* **langchain-messages:** resolve the Bedrock model id through the shared prefix helper ([#286](https://github.com/launchdarkly/python-ai-sdk/issues/286)) ([9bc966a](https://github.com/launchdarkly/python-ai-sdk/commit/9bc966a06510e92d5f6721181830ea0f6db407f6))
+* **tools:** hand each handler only the tools its config attaches ([#279](https://github.com/launchdarkly/python-ai-sdk/issues/279)) ([4c786ef](https://github.com/launchdarkly/python-ai-sdk/commit/4c786eff17bbf48720b2fcdc35c0ae13871cfcb1))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-langchain-messages-0.3.0...launchdarkly-ai-langchain-messages-1.0.0) (2026-10-30)
 
 
