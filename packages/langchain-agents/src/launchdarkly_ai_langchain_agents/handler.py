@@ -401,8 +401,9 @@ def _build_agent_tools(
 
     result = []
     for name, tool_cfg in config_tools.items():
-        # A missing handler still reaches the model; a NativeTool never does.
-        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+        # Only a config tool with a function handler is offered: a missing handler or a
+        # NativeTool never reaches the model.
+        if not is_function_tool(tool_handlers.get(name), name):
             continue
         schema = tool_cfg.get("parameters") or {}
 

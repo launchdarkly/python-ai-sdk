@@ -726,3 +726,46 @@ class _CancelledContext:
 
     async def __aexit__(self, *_args: Any) -> None:
         return None
+
+
+class TestUnofferedToolsFailClosed:
+    """A tool name in a model response is untrusted. The handler resolves it only
+    against the tools it offered, and raises naming the tool otherwise: a name
+    registered nowhere, a registered tool the config does not attach, and an
+    attribute name all fail, and no registered handler runs."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    @pytest.mark.parametrize("name", ["ghost", "privileged", "__class__"])
+    async def test_rejects_a_tool_it_did_not_offer(
+        self, ai_runtime: MagicMock, path: str, name: str
+    ) -> None:
+        config = {**CONFIG, "tools": {"safe": {"description": "", "parameters": {}}}}
+        call = SimpleNamespace(tool_call_id="tc-1", tool_name=name, tool_args={})
+        ai_runtime.stream.side_effect = [FakeStream(text="", tool_calls=[call])]
+        privileged = AsyncMock(return_value="ran")
+        handlers = {"safe": AsyncMock(return_value="ok"), "privileged": privileged}
+        handler = create_vercel_messages_handler()
+        with pytest.raises(ValueError, match=f'tool "{name}"'):
+            if path == "invoke":
+                await handler(config, "hello", handlers)
+            else:
+                async for _ in await handler.stream(config, "hello", handlers):
+                    pass
+        privileged.assert_not_awaited()
+        ai_runtime.tool_result_part.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["invoke", "stream"])
+    async def test_a_registered_tool_the_config_does_not_attach_is_not_offered(
+        self, ai_runtime: MagicMock, path: str
+    ) -> None:
+        config = {**CONFIG, "tools": {"safe": {"description": "", "parameters": {}}}}
+        handlers = {"safe": AsyncMock(), "privileged": AsyncMock()}
+        handler = create_vercel_messages_handler()
+        if path == "invoke":
+            await handler(config, "hello", handlers)
+        else:
+            async for _ in await handler.stream(config, "hello", handlers):
+                pass
+        assert [tool.name for tool in _stream_kwargs(ai_runtime)["tools"]] == ["safe"]

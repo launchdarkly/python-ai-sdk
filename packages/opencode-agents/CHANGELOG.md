@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-opencode-agents-1.0.0...launchdarkly-ai-opencode-agents-1.0.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **opencode-agents:** apply Bedrock model.region inference-profile prefix ([#282](https://github.com/launchdarkly/python-ai-sdk/issues/282)) ([349a7ad](https://github.com/launchdarkly/python-ai-sdk/commit/349a7ad099edc4749a916c4dc3cab34a28171189))
+
 ## [1.0.0](https://github.com/launchdarkly/python-ai-sdk/compare/launchdarkly-ai-opencode-agents-0.3.0...launchdarkly-ai-opencode-agents-1.0.0) (2026-10-30)
 
 

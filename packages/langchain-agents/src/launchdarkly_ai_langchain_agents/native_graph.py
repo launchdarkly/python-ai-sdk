@@ -164,14 +164,16 @@ def _build_node_tools(
 
     result = []
     for name, tool_cfg in node.config["tools"].items():
-        if name in tool_handlers and not is_function_tool(tool_handlers[name], name):
+        # Only a config tool with a function handler is offered: a missing handler or a
+        # NativeTool never reaches the model.
+        if not is_function_tool(tool_handlers.get(name), name):
             continue
         schema = tool_cfg.get("parameters") or {}
 
         async def _handler(_name: str = name, **kwargs: Any) -> str:
             fn = tool_handlers.get(_name)
             if not fn or isinstance(fn, NativeTool):
-                return ""
+                raise ValueError(f'No handler registered for tool "{_name}"')
             # Handlers may be sync or async. Same rule as handler._build_agent_tools
             # and tracking.wrap_tool_handlers — awaiting a plain return raises.
             result = fn(kwargs)

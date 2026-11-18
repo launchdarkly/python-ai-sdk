@@ -133,22 +133,39 @@ def wrap_tool_handlers(
     return wrapped
 
 
+def _scope_tool_handlers(
+    config: AiConfigRep,
+    tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
+) -> dict[str, Callable[..., Any] | NativeTool]:
+    """The registered tools the active config attaches, and no others.
+
+    ``config()`` and ``graph()`` resolve every tool the application registered,
+    across all variations. ``config["tools"]`` is the allowlist for this one, so
+    a handler only ever receives the tools in it: a tool the model names that
+    this variation did not attach has no implementation to reach. No ``tools``
+    means no tools.
+    """
+    tools = config.get("tools") if isinstance(config, dict) else None
+    if not isinstance(tools, dict) or not tool_handlers:
+        return {}
+    return {key: tool_handlers[key] for key in tools if key in tool_handlers}
+
+
 def _exposed_tool_keys(
     config: AiConfigRep,
     tool_handlers: Mapping[str, Callable[..., Any] | NativeTool] | None,
 ) -> list[str]:
     """The tool keys this config offered the model, in declaration order.
 
-    The map handed to a handler can be wider -- ``config()`` merges a
-    ``Registry``'s tools in -- and only the offered set belongs in a trajectory.
-    Doubles as the "Tools available" list itself: a tool the config declares
-    but no implementation was registered for is still one the model could
-    call, so it belongs there even though the recorder can never observe it.
-    Excludes a routed graph node's synthetic ``__handoff_`` tools, for the
-    same reason ``TrajectoryRecorder.wrap`` excludes them from what it
-    records, and a ``NativeTool``: the provider executes it directly, so no
-    local recording is possible and listing it as available would read as
-    unused even when the model used it.
+    Doubles as the "Tools available" list itself, so it holds only what the
+    model could call: a config tool with a function implementation. A tool the
+    config declares but nothing implements is never offered, so listing it
+    would show a judge a tool the model never had. Excludes a routed graph
+    node's synthetic ``__handoff_`` tools, for the same reason
+    ``TrajectoryRecorder.wrap`` excludes them from what it records, and a
+    ``NativeTool``: the provider executes it directly, so no local recording is
+    possible and listing it as available would read as unused even when the
+    model used it.
     """
     tools = config.get("tools") if isinstance(config, dict) else None
     if not isinstance(tools, dict):
@@ -158,6 +175,7 @@ def _exposed_tool_keys(
         key
         for key in tools
         if not key.startswith(HANDOFF_TOOL_PREFIX)
+        and callable(handlers.get(key))
         and not isinstance(handlers.get(key), NativeTool)
     ]
 
@@ -253,10 +271,11 @@ async def execute_and_track(
     # the recorder still sees a NativeTool and skips it -- wrapping the tracked
     # map would record the callable stub instead and show a judge a tool call
     # with an empty result. One recorder per invocation; they run concurrently.
+    tool_handlers = _scope_tool_handlers(config, tool_handlers)
     exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
     recorder = TrajectoryRecorder()
     tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+        recorder.wrap(tool_handlers, exposed=exposed_tool_keys),
         ld_ctx,
         track_data,
     )
@@ -348,10 +367,11 @@ async def execute_and_stream(
     client = get_client()
     ld_ctx = to_ld_context(client, user_context)
 
+    tool_handlers = _scope_tool_handlers(config, tool_handlers)
     exposed_tool_keys = _exposed_tool_keys(config, tool_handlers)
     recorder = TrajectoryRecorder()
     tracked_tool_handlers = wrap_tool_handlers(
-        recorder.wrap(tool_handlers or {}, exposed=exposed_tool_keys),
+        recorder.wrap(tool_handlers, exposed=exposed_tool_keys),
         ld_ctx,
         track_data,
     )
