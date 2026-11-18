@@ -571,11 +571,15 @@ def verify_raw_skill(raw: Any) -> Skill | None:
     )
 
 
-def _warn_once(identity: tuple[Any, ...], message: str, *args: Any) -> None:
-    """Logs a skill-tool warning the first time *identity* is seen."""
+def _warn_once(
+    identity: tuple[Any, ...], message: str, *args: Any, remember: bool = True
+) -> None:
+    """Logs a skill-tool warning the first time *identity* is seen. With
+    ``remember=False`` it logs without using up that first time."""
     if identity in _warned_skill_tools:
         return
-    _warned_skill_tools.add(identity)
+    if remember:
+        _warned_skill_tools.add(identity)
     logger.warning(message, *args)
 
 
@@ -866,6 +870,8 @@ def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRe
                 version,
                 resolution.reason,
                 config_key,
+                # A miss before initial data arrives must not hide the one after.
+                remember=store_is_initialized(store),
             )
             continue
         for index, tool in enumerate(resolution.skill.tools):

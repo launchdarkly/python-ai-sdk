@@ -602,11 +602,14 @@ the variation's skills order, and skip a tool already offered with the same defi
 Register an implementation for a skill tool in `tool_handlers` as you would for a variation
 tool: a handler receives the implementations for the variation's tools and its skills' tools,
 and no others. If a variation and one of its skills define the same tool, the variation's
-definition is used and a warning is logged. `inspect_config()` and `GraphNode.config` show only
+definition is used and a warning is logged, even when the two definitions are identical:
+LaunchDarkly rejects any tool key shared by a variation and its skills, so a shared key means
+stale data. `inspect_config()` and `GraphNode.config` show only
 the variation's own tools. A skill that cannot be read, or no configured skill store, adds no
 tools and the run goes on. A tool entry that is not a `function` tool with a string `name` and
 an object `parameters`, or that repeats a name, is dropped with a warning, and the rest of the
-skill is still returned. Each of these warnings is logged once per process.
+skill is still returned. Each of these warnings is logged once per process, except that a
+skill missed before the store has its initial data warns again once it has.
 
 `contentHash` covers only the markdown, not the tools: a skill's tools are protected by the
 transport, not by a hash you can check on disk. `write_skills` writes no tools to disk or to

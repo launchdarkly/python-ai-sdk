@@ -542,7 +542,10 @@ Store data is **untrusted input**; the transport is not part of the trust bounda
   a shadow runs with no tools and no `tool_handlers`, so it gets no skill tools either.
   `GraphNode.config` and `inspect_config` keep the variation's own tools, so an adapter given a
   resolved graph merges exactly once. Do not call it on a config it already returned: the
-  second pass would see the skill tools as the variation's own and warn. It reads through
+  second pass would see the skill tools as the variation's own and warn. A skill tool whose
+  key is also a variation tool always warns, even when the definitions are identical, because
+  the server rejects any key a variation shares with its skills; the Go SDK does the same. It
+  reads through
   `resolve_from_store`, never the public accessors, so it reports no usage.
 - **`write_skills` re-validates the key** before any filesystem call, regardless of upstream
   validation — a key becomes a directory name.

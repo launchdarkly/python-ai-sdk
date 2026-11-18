@@ -452,7 +452,7 @@ async def _build_graph(
                 else str(result["response"])
             )
 
-            # Judge against the node's original config, not the routing-augmented one.
+            # Judge against the node's run config (skill tools included), not the handoff one.
             judge_results = await run_judges(
                 config=run_config(node),
                 user_context=context,
@@ -719,7 +719,7 @@ async def _build_graph(
                 track_data = projector.done.get("track_data") or track_data
                 trajectory = projector.done.get("trajectory") or trajectory
 
-            # Judge against the node's original config, not the routing-augmented one.
+            # Judge against the node's run config (skill tools included), not the handoff one.
             judge_results = await run_judges(
                 config=run_config(node),
                 user_context=context,

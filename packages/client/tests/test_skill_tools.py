@@ -796,3 +796,30 @@ async def test_a_routed_graph_node_keeps_its_own_skill_and_handoff_tools(
     assert {"own", "get-weather"} <= set(root_handlers)
     for cfg, handlers in seen[1:]:
         assert "get-weather" not in cfg["tools"] and "get-weather" not in handlers
+
+
+def test_an_unreadable_skill_before_the_store_initializes_still_warns_after(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _store()
+    ready = False
+    store.is_initialized = lambda: ready  # type: ignore[attr-defined]
+    set_skill_store(store)
+    cfg = _cfg(skills=[_ref("s")])
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        _config_with_skill_tools("k", cfg)
+        ready = True
+        _config_with_skill_tools("k", cfg)
+        _config_with_skill_tools("k", cfg)
+    assert len([w for w in _warnings(caplog) if "unavailable" in w]) == 2
+
+
+async def test_a_257_character_tool_name_is_not_quoted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    long_name = "a" * 257
+    set_skill_store(_store(_envelope(tools=[{"name": long_name}])))
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        await get_skill(SKILL)
+    text = "\n".join(_warnings(caplog))
+    assert "tools[0]" in text and long_name not in text
