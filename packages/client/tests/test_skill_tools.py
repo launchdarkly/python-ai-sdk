@@ -727,15 +727,43 @@ class TestOfferingSkillTools:
         assert set(seen[0][1]) == {"t"}
         assert list(seen[0][0]["tools"]) == ["t"]
 
-    def test_shadow_variations_offer_their_skill_tools(self) -> None:
+    def test_shadow_variations_get_no_skill_tools(self) -> None:
+        """A shadow runs with no tools (README) and no tool handlers, so the
+        skill tools are not merged in and the store is not read."""
         from launchdarkly_ai_server.experimental.shadow_requests import (
             _shadow_variation,
         )
 
-        set_skill_store(_store(_envelope("s", tools=[_tool("t")])))
-        parsed = _shadow_variation("k", _variation(skills=[_ref("s")]))
+        store = _store(_envelope("s", tools=[_tool("t")]))
+        store.get_object = MagicMock(wraps=store.get_object)  # type: ignore[method-assign]
+        set_skill_store(store)
+        parsed = _shadow_variation(
+            "k", _variation(tools={"own": _tool("own")}, skills=[_ref("s")])
+        )
         assert parsed is not None
-        assert list(parsed[0]["tools"]) == ["t"]
+        assert "tools" not in parsed[0]
+        store.get_object.assert_not_called()
+
+    def test_an_exact_duplicate_compares_the_five_tool_fields_only(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A missing field equals only a missing one; a field outside the five
+        does not make two definitions differ."""
+        no_description = _tool("t")
+        del no_description["description"]
+        null_description = {**_tool("t"), "description": None}
+        extra = {**_tool("u"), "extra": 1}
+        set_skill_store(
+            _store(
+                _envelope("a", tools=[no_description, _tool("u")]),
+                _envelope("b", tools=[null_description, extra]),
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            merged = _config_with_skill_tools("k", _cfg(skills=[_ref("a"), _ref("b")]))
+        assert merged["tools"] == {"t": no_description, "u": _tool("u")}
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1 and "'t'" in warnings[0]
 
 
 async def test_a_routed_graph_node_keeps_its_own_skill_and_handoff_tools(

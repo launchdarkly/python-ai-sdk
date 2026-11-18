@@ -61,6 +61,9 @@ _SAFE_TOOL_NAME = re.compile(r"\A[A-Za-z0-9._-]{1,256}\Z")
 """What a tool name must look like to be quoted in a log line; tool names are
 store-supplied, like every other field here."""
 
+_TOOL_FIELDS = ("type", "name", "description", "parameters", "customParameters")
+"""The fields that make two tool definitions the same tool."""
+
 _SIGNAL_INTEGRITY_FAILURE = "AgentControl Skill Integrity Failure"
 _SIGNAL_MATERIALIZED = "AgentControl Skill Materialized"
 _SIGNAL_REVOKED = "AgentControl Skill Revoked Received"
@@ -810,6 +813,15 @@ def resolve_from_store(
     return Resolution(reason="ok", skill=skill)
 
 
+def _same_tool(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Whether all five tool fields are deeply equal; a missing field equals only
+    a missing one."""
+    return all(
+        (field in a) == (field in b) and a.get(field) == b.get(field)
+        for field in _TOOL_FIELDS
+    )
+
+
 def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRep:
     """
     *config* with the tools of the skills it attaches added to ``tools``.
@@ -869,7 +881,7 @@ def _config_with_skill_tools(config_key: str, config: AiConfigRep) -> AiConfigRe
                     _tool_label(tool, index),
                 )
             elif name in merged:
-                if merged[name] != tool:
+                if not _same_tool(merged[name], tool):
                     _warn_once(
                         ("skill", config_key, skill_key, version, name),
                         "AI Config '%s': skill '%s' version %d defines tool %s "

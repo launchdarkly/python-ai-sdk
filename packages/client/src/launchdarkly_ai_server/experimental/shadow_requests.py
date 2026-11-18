@@ -31,7 +31,6 @@ from ..lifecycle import _fetch_variation, _parse_variation
 from ..registry import resolve_handlers
 from ..sdk_usage import report_usage
 from ..shutdown_hooks import register_shutdown_hook
-from ..skills_core import _config_with_skill_tools
 from ..tracking import execute_and_track, make_track_data
 from ..types import (
     AiConfigRep,
@@ -335,7 +334,8 @@ def _shadow_variation(
         )
     except RuntimeError:
         return None
-    return _config_with_skill_tools(config_key, parsed["config"]), parsed["meta"]
+    # No skill tools either: a shadow runs with no tools (README), and tool_handlers=None.
+    return parsed["config"], parsed["meta"]
 
 
 def _select_tasks(
