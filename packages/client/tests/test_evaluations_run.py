@@ -6027,44 +6027,78 @@ async def test_run_rethrows_non_404_on_by_key_get() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_does_not_retry_reconcile_patch_after_5xx() -> None:
-    """Runner PATCH must not pass idempotent=True (~704-712); 5xx is not retried."""
+async def test_run_retries_reconcile_patch_after_5xx() -> None:
+    """The reconcile PATCH is idempotent, so a 503 is retried and the run succeeds."""
     existing = _existing_offline_evaluation()
     transport = SequencedTransport(
-        [
-            response(200, {"id": "dataset-id", "name": "golden"}),
-            response(
-                200,
-                dataset_page(
-                    [{"rowIndex": 0, "input": "hello", "variables": {}}], total=1
-                ),
-            ),
-            response(200, existing),
+        _reuse_run_responses(
+            existing,
             response(503, {"message": "unavailable"}),
-            # Would be consumed if the runner marked PATCH idempotent.
             response(200, _existing_offline_evaluation(version=4)),
-        ]
+        )
     )
     evals = init_evaluations(
         project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
     )
+    evals._api._sleep = lambda _: None
 
     async def handler(*args: object) -> dict[str, Any]:
         return {"output": "ok"}
 
-    with pytest.raises(LDApiError) as excinfo:
-        await evals.run(
-            key="support-qa",
-            dataset="golden",
-            handler=tagged(handler),
-            generation={
-                "provider": "OpenAI",
-                "model": "gpt-4o",
-                "mode": "completion",
-            },
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert result.passed is True
+    patches = [r for r in transport.requests if r["method"] == "PATCH"]
+    assert len(patches) == 2
+    assert patches[0]["body"] == patches[1]["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_retries_reconcile_patch_after_a_transport_failure() -> None:
+    existing = _existing_offline_evaluation()
+    sequenced = SequencedTransport(
+        _reuse_run_responses(
+            existing, response(200, _existing_offline_evaluation(version=4))
         )
-    assert excinfo.value.status == 503
-    assert sum(1 for request in transport.requests if request["method"] == "PATCH") == 1
+    )
+    patch_attempts = 0
+
+    def transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> HttpResponse:
+        nonlocal patch_attempts
+        if method == "PATCH":
+            patch_attempts += 1
+            if patch_attempts == 1:
+                raise TimeoutError("timed out")
+        return sequenced(method, url, headers, body, timeout)
+
+    evals = init_evaluations(
+        project_key="proj", api_key="token", sdk_key="sdk-key", transport=transport
+    )
+    evals._api._sleep = lambda _: None
+
+    async def handler(*args: object) -> dict[str, Any]:
+        return {"output": "ok"}
+
+    result = await evals.run(
+        key="support-qa",
+        dataset="golden",
+        handler=tagged(handler),
+        generation={"provider": "OpenAI", "model": "gpt-4o", "mode": "completion"},
+    )
+
+    assert result.passed is True
+    assert patch_attempts == 2
 
 
 @pytest.mark.asyncio
